@@ -741,7 +741,9 @@ async def _safe_anext(ait):
 
 async def _with_sse_keepalive(
     generator: AsyncIterator[str],
+    http_request: Optional["FastAPIRequest"] = None,
     interval: float = 30.0,
+    disconnect_poll: float = 2.0,
 ) -> AsyncIterator[str]:
     """Wrap an SSE generator to send periodic keep-alive comments.
 
@@ -749,20 +751,49 @@ async def _with_sse_keepalive(
     causing clients with read timeouts (like Claude Code) to disconnect.
     This wrapper sends SSE comments (: keep-alive) that are ignored by
     SSE parsers but keep the HTTP connection alive.
+
+    When http_request is provided, also polls for client disconnect
+    between prefill steps. This detects cancellation during long prefills
+    where uvicorn's ASGI disconnect message is not delivered until after
+    the generator yields.
     """
     ait = generator.__aiter__()
     task = None
+    keepalive_elapsed = 0.0
     try:
         while True:
             task = asyncio.ensure_future(_safe_anext(ait))
+            keepalive_elapsed = 0.0
             while not task.done():
-                done, _ = await asyncio.wait({task}, timeout=interval)
-                if not done:
+                # Use shorter poll interval for disconnect detection,
+                # accumulate time for keepalive emission
+                wait_time = disconnect_poll if http_request else interval
+                done, _ = await asyncio.wait({task}, timeout=wait_time)
+                if done:
+                    break
+                # Check for client disconnect
+                if http_request is not None:
+                    try:
+                        if await http_request.is_disconnected():
+                            logger.info("Client disconnected during streaming, cancelling")
+                            task.cancel()
+                            try:
+                                await task
+                            except (asyncio.CancelledError, StopAsyncIteration):
+                                pass
+                            return
+                    except Exception:
+                        pass  # is_disconnected() can fail if scope is already closed
+                # Send keepalive at the configured interval
+                keepalive_elapsed += wait_time
+                if keepalive_elapsed >= interval:
+                    keepalive_elapsed = 0.0
                     yield ": keep-alive\n\n"
-            result = task.result()
-            if result is _KEEPALIVE_SENTINEL:
-                return
-            yield result
+            if task.done():
+                result = task.result()
+                if result is _KEEPALIVE_SENTINEL:
+                    return
+                yield result
     finally:
         if task is not None and not task.done():
             task.cancel()
@@ -1071,7 +1102,10 @@ async def create_completion(
 
     if request.stream:
         return StreamingResponse(
-            _with_sse_keepalive(stream_completion(engine, prompts[0], request)),
+            _with_sse_keepalive(
+                stream_completion(engine, prompts[0], request),
+                http_request=http_request,
+            ),
             media_type="text/event-stream",
         )
 
@@ -1215,7 +1249,10 @@ async def create_chat_completion(
 
     if request.stream:
         return StreamingResponse(
-            _with_sse_keepalive(stream_chat_completion(engine, messages, request, **chat_kwargs)),
+            _with_sse_keepalive(
+                stream_chat_completion(engine, messages, request, **chat_kwargs),
+                http_request=http_request,
+            ),
             media_type="text/event-stream",
         )
 
@@ -1814,7 +1851,10 @@ async def create_anthropic_message(
 
     if request.stream:
         return StreamingResponse(
-            _with_sse_keepalive(stream_anthropic_messages(engine, messages, request, **chat_kwargs)),
+            _with_sse_keepalive(
+                stream_anthropic_messages(engine, messages, request, **chat_kwargs),
+                http_request=http_request,
+            ),
             media_type="text/event-stream",
         )
 
