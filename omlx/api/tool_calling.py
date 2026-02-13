@@ -116,6 +116,56 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     return cleaned, tool_calls
 
 
+def _parse_namespaced_tool_calls(text: str, namespace: str) -> Tuple[str, Optional[List[ToolCall]]]:
+    """
+    Parse namespaced tool call tags like <minimax:tool_call>...</minimax:tool_call>.
+
+    Handles the <invoke name="func"><parameter name="key">value</parameter></invoke>
+    format used by MiniMax and similar models.
+
+    Returns:
+        Tuple of (cleaned_text, tool_calls or None)
+    """
+    tool_calls = []
+    tag_start = f'<{namespace}:tool_call>'
+    tag_end = f'</{namespace}:tool_call>'
+    pattern = re.escape(tag_start) + r'(.*?)' + re.escape(tag_end)
+    matches = re.findall(pattern, text, re.DOTALL)
+
+    for match in matches:
+        content = match.strip()
+        # Parse <invoke name="func_name">...<parameter name="key">value</parameter>...</invoke>
+        for invoke_match in re.finditer(
+            r'<invoke\s+name="([^"]+)">(.*?)</invoke>', content, re.DOTALL
+        ):
+            func_name = invoke_match.group(1)
+            params_text = invoke_match.group(2)
+            arguments = {}
+            for pm in re.finditer(
+                r'<parameter\s+name="([^"]+)">(.*?)</parameter>', params_text, re.DOTALL
+            ):
+                key = pm.group(1)
+                val = pm.group(2).strip()
+                try:
+                    arguments[key] = json.loads(val)
+                except (json.JSONDecodeError, ValueError):
+                    arguments[key] = val
+            tool_calls.append(ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                type="function",
+                function=FunctionCall(
+                    name=func_name,
+                    arguments=json.dumps(arguments, ensure_ascii=False),
+                ),
+            ))
+
+    if not tool_calls:
+        return text, None
+
+    cleaned = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+    return cleaned, tool_calls
+
+
 def parse_tool_calls(
     text: str,
     tokenizer: Any,
@@ -187,9 +237,15 @@ def parse_tool_calls(
                 ).strip()
                 return cleaned_text, tool_calls
 
-    # Fallback: parse XML <tool_call> tags (GLM, generic formats)
+    # Fallback: parse XML <tool_call> tags (GLM, Qwen, generic formats)
     if '<tool_call>' in cleaned_text:
         return _parse_xml_tool_calls(cleaned_text)
+
+    # Fallback: namespaced tool_call tags (e.g. <minimax:tool_call>)
+    ns_match = re.search(r'<(\w+):tool_call>', cleaned_text)
+    if ns_match:
+        ns = ns_match.group(1)
+        return _parse_namespaced_tool_calls(cleaned_text, ns)
 
     return cleaned_text, None
 
