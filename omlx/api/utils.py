@@ -76,7 +76,6 @@ def extract_text_content(
 
         # Handle tool response messages (role="tool")
         if role == "tool":
-            # Format tool result as assistant context
             tool_call_id = getattr(msg, 'tool_call_id', None) or ''
             tool_content = content if content else ""
             # Apply truncation if configured
@@ -85,28 +84,74 @@ def extract_text_content(
                 tool_content = truncate_tool_result(
                     tool_content, max_tool_result_tokens, tokenizer
                 )
-            processed_messages.append({
-                "role": "user",  # mlx-lm expects user/assistant roles
-                "content": f"[Tool Result ({tool_call_id})]: {tool_content}"
-            })
+            # Preserve structured format for models with native tool calling
+            # so the chat template renders tool results in the model's native format
+            if getattr(tokenizer, 'has_tool_calling', False):
+                processed_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": tool_content,
+                })
+            else:
+                processed_messages.append({
+                    "role": "user",  # mlx-lm expects user/assistant roles
+                    "content": f"[Tool Result ({tool_call_id})]: {tool_content}"
+                })
             continue
 
         # Handle assistant messages with tool_calls
         if role == "assistant" and hasattr(msg, 'tool_calls') and msg.tool_calls:
-            # Format tool calls as part of the assistant message
-            tool_calls_text = []
-            for tc in msg.tool_calls:
-                if isinstance(tc, dict):
-                    func = tc.get("function", {})
-                    name = func.get("name", "unknown")
-                    args = func.get("arguments", "{}")
-                    tool_calls_text.append(f"[Calling tool: {name}({args})]")
+            msg_dict = {"role": role, "content": content if content else ""}
 
-            text = content if content else ""
-            if tool_calls_text:
-                text = (text + "\n" if text else "") + "\n".join(tool_calls_text)
+            # Preserve structured tool_calls for models with native tool calling
+            # so the chat template renders them in the model's native format.
+            # Without this, models mimic text-formatted tool calls from history
+            # instead of generating their native parseable format.
+            if getattr(tokenizer, 'has_tool_calling', False):
+                tool_calls_list = []
+                for tc in msg.tool_calls:
+                    if isinstance(tc, dict):
+                        func = tc.get("function", {})
+                        tool_calls_list.append({
+                            "id": tc.get("id", ""),
+                            "function": {
+                                "name": func.get("name", ""),
+                                "arguments": _try_parse_json(
+                                    func.get("arguments", "{}")
+                                ),
+                            }
+                        })
+                    else:
+                        args_str = (
+                            getattr(tc.function, 'arguments', '{}')
+                            if hasattr(tc, 'function') else '{}'
+                        )
+                        tool_calls_list.append({
+                            "id": getattr(tc, 'id', ''),
+                            "function": {
+                                "name": (
+                                    getattr(tc.function, 'name', '')
+                                    if hasattr(tc, 'function') else ''
+                                ),
+                                "arguments": _try_parse_json(args_str),
+                            }
+                        })
+                msg_dict["tool_calls"] = tool_calls_list
+            else:
+                # Text fallback for models without native tool calling
+                tool_calls_text = []
+                for tc in msg.tool_calls:
+                    if isinstance(tc, dict):
+                        func = tc.get("function", {})
+                        name = func.get("name", "unknown")
+                        args = func.get("arguments", "{}")
+                        tool_calls_text.append(f"[Calling tool: {name}({args})]")
+                text = msg_dict["content"]
+                if tool_calls_text:
+                    text = (text + "\n" if text else "") + "\n".join(tool_calls_text)
+                msg_dict["content"] = text
 
-            processed_messages.append({"role": role, "content": text})
+            processed_messages.append(msg_dict)
             continue
 
         # Handle None content

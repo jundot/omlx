@@ -166,6 +166,42 @@ def _parse_namespaced_tool_calls(text: str, namespace: str) -> Tuple[str, Option
     return cleaned, tool_calls
 
 
+def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
+    """
+    Fallback parser for [Calling tool: name(args)] format.
+
+    This format can appear when models mimic text-formatted tool calls
+    from conversation history. Parses the JSON arguments from within
+    the parentheses.
+
+    Returns:
+        Tuple of (cleaned_text, tool_calls or None)
+    """
+    tool_calls = []
+    pattern = r'\[Calling tool:\s*(\w+)\(({.*?})\)\]'
+    for match in re.finditer(pattern, text, re.DOTALL):
+        name = match.group(1)
+        args_str = match.group(2)
+        try:
+            arguments = json.loads(args_str)
+        except (json.JSONDecodeError, ValueError):
+            arguments = {"raw": args_str}
+        tool_calls.append(ToolCall(
+            id=f"call_{uuid.uuid4().hex[:8]}",
+            type="function",
+            function=FunctionCall(
+                name=name,
+                arguments=json.dumps(arguments, ensure_ascii=False),
+            ),
+        ))
+
+    if not tool_calls:
+        return text, None
+
+    cleaned = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+    return cleaned, tool_calls
+
+
 def parse_tool_calls(
     text: str,
     tokenizer: Any,
@@ -246,6 +282,10 @@ def parse_tool_calls(
     if ns_match:
         ns = ns_match.group(1)
         return _parse_namespaced_tool_calls(cleaned_text, ns)
+
+    # Fallback: [Calling tool: name(args)] format (from text-formatted history)
+    if '[Calling tool:' in cleaned_text:
+        return _parse_bracket_tool_calls(cleaned_text)
 
     return cleaned_text, None
 

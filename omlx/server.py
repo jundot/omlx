@@ -774,15 +774,17 @@ async def _with_sse_keepalive(
                 # Check for client disconnect
                 if http_request is not None:
                     try:
-                        if await http_request.is_disconnected():
-                            logger.info("Client disconnected during streaming, cancelling")
+                        disconnected = await http_request.is_disconnected()
+                        if disconnected:
+                            logger.info("Client disconnected during streaming (is_disconnected), cancelling")
                             task.cancel()
                             try:
                                 await task
                             except (asyncio.CancelledError, StopAsyncIteration):
                                 pass
                             return
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"is_disconnected() check failed: {e}")
                         pass  # is_disconnected() can fail if scope is already closed
                 # Send keepalive at the configured interval
                 keepalive_elapsed += wait_time
@@ -1668,8 +1670,6 @@ async def stream_anthropic_messages(
                 yield create_text_delta_event(index=0, text=chunk)
 
             if output.finished:
-                # Log final accumulated text
-                logger.info(f"Anthropic stream finished: {len(accumulated_text)} chars, text='{accumulated_text[:100]}...'")
                 break
     except Exception as e:
         logger.error(f"Error during Anthropic streaming: {e}")
