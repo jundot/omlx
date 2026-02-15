@@ -928,3 +928,281 @@ class TestPagedSSDCacheManagerCacheList:
         assert isinstance(loaded_data[0], list)
         assert loaded_data[0][0][0].shape == (1, 1, 32, 128)
         assert loaded_data[0][0][1].shape == (1, 1, 32, 0)
+
+
+class TestAsyncWriteAndTimeoutLoad:
+    """Tests for the async write / timeout load deadlock fix.
+
+    These tests verify:
+    - save_block() returns immediately (non-blocking)
+    - Pending writes are served on load (zero I/O)
+    - Load timeout returns None (cache miss) instead of blocking
+    - Writer thread errors clean up index entries
+    - close() gracefully shuts down background threads
+    """
+
+    @pytest.fixture
+    def mx(self):
+        """Import MLX or skip."""
+        try:
+            import mlx.core as mx
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    @pytest.fixture
+    def ssd_cache(self, tmp_path):
+        """Create a PagedSSDCacheManager for testing."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=100 * 1024**2,
+        )
+        yield manager
+        manager.close()
+
+    def test_save_block_non_blocking(self, ssd_cache, mx, tmp_path):
+        """Verify save_block() returns immediately and file appears async."""
+        block_hash = b"async_save_test_hash"
+        cache_data = [
+            (mx.zeros((1, 8, 64, 64)), mx.zeros((1, 8, 64, 64)))
+            for _ in range(4)
+        ]
+
+        t0 = time.time()
+        result = ssd_cache.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=64,
+            model_name="test-model",
+            layer_cache_types=["KVCache"] * 4,
+        )
+        elapsed = t0 - time.time()  # Negative means fast return
+
+        assert result is True
+        # save_block should return almost instantly (< 1s),
+        # not wait for disk I/O
+        assert abs(elapsed) < 1.0
+
+        # Block should be in index (optimistic update)
+        assert ssd_cache.has_block(block_hash)
+
+        # Wait for background writer to finish
+        import time as time_mod
+        for _ in range(50):  # Wait up to 5s
+            file_path = ssd_cache._get_file_path(block_hash)
+            if file_path.exists():
+                break
+            time_mod.sleep(0.1)
+
+        assert file_path.exists(), "File should appear after background write"
+
+    def test_pending_writes_served_on_load(self, ssd_cache, mx):
+        """Verify that a block saved then immediately loaded is served from memory."""
+        block_hash = b"pending_load_test_ha"
+        cache_data = [
+            (mx.zeros((1, 8, 32, 64)), mx.ones((1, 8, 32, 64)))
+            for _ in range(2)
+        ]
+
+        ssd_cache.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=32,
+            model_name="test-model",
+            layer_cache_types=["KVCache", "KVCache"],
+        )
+
+        # Immediately load — should come from _pending_writes, not disk
+        loaded = ssd_cache.load_block(block_hash)
+        assert loaded is not None
+        assert len(loaded) == 2
+        assert loaded[0][0].shape == (1, 8, 32, 64)
+        assert loaded[0][1].shape == (1, 8, 32, 64)
+
+    def test_pending_writes_served_on_load_with_metadata(self, ssd_cache, mx):
+        """Verify load_block_with_metadata also reads from pending writes."""
+        block_hash = b"pending_meta_test_ha"
+        cache_data = [
+            (mx.zeros((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))
+        ]
+
+        ssd_cache.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=16,
+            model_name="test-model",
+            layer_cache_types=["KVCache"],
+            layer_meta_states=[(16,)],
+        )
+
+        loaded_data, metadata = ssd_cache.load_block_with_metadata(block_hash)
+        assert loaded_data is not None
+        assert metadata is not None
+        assert metadata["num_layers"] == 1
+        assert metadata["token_count"] == 16
+        assert metadata["model_name"] == "test-model"
+        assert metadata["layer_cache_types"] == ["KVCache"]
+
+    def test_load_error_returns_none(self, ssd_cache, mx):
+        """Verify that a corrupted file returns None and cleans up index."""
+        block_hash = b"error_test_hash_1234"
+        cache_data = [
+            (mx.zeros((1, 8, 32, 64)), mx.zeros((1, 8, 32, 64)))
+        ]
+
+        # Save and wait for background write to complete
+        ssd_cache.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=32,
+        )
+        import time as time_mod
+        for _ in range(50):
+            with ssd_cache._pending_writes_lock:
+                if block_hash not in ssd_cache._pending_writes:
+                    break
+            time_mod.sleep(0.1)
+
+        # Mock mx.load to simulate a corrupted file
+        with patch("mlx.core.load", side_effect=OSError("corrupted file")):
+            loaded = ssd_cache.load_block(block_hash)
+            assert loaded is None  # Should return None, not raise
+
+        # Block should be removed from index (corrupted entry cleanup)
+        assert not ssd_cache.has_block(block_hash)
+
+    def test_load_no_executor_deadlock(self, ssd_cache, mx):
+        """Regression test: _load_executor must not exist (prevents deadlock)."""
+        # The old implementation used ThreadPoolExecutor(max_workers=1) which
+        # caused deadlocks when mx.load() in a worker thread contested Metal
+        # GPU resources with the main inference thread. Verify it's gone.
+        assert not hasattr(ssd_cache, '_load_executor'), (
+            "_load_executor should not exist — it causes Metal GPU deadlocks"
+        )
+
+    def test_sequential_loads_no_queue_blocking(self, ssd_cache, mx):
+        """Regression test: consecutive loads must not block each other."""
+        import time as time_mod
+
+        # Save 5 different blocks
+        hashes = []
+        for i in range(5):
+            block_hash = f"seq_load_test_{i:04d}_".encode()[:20]
+            hashes.append(block_hash)
+            cache_data = [
+                (mx.zeros((1, 8, 32, 64)), mx.zeros((1, 8, 32, 64)))
+            ]
+            ssd_cache.save_block(block_hash, cache_data, token_count=32)
+
+        # Wait for all pending writes to flush
+        for _ in range(100):
+            with ssd_cache._pending_writes_lock:
+                if not ssd_cache._pending_writes:
+                    break
+            time_mod.sleep(0.1)
+
+        # Load all 5 blocks sequentially — should complete quickly
+        t0 = time_mod.time()
+        for block_hash in hashes:
+            loaded = ssd_cache.load_block(block_hash)
+            assert loaded is not None, f"Failed to load {block_hash!r}"
+            assert len(loaded) == 1
+        elapsed = time_mod.time() - t0
+
+        # 5 loads from SSD should complete in well under 5s
+        # (each ~2ms read + reconstruction)
+        assert elapsed < 5.0, (
+            f"Sequential loads took {elapsed:.1f}s — possible queue blocking"
+        )
+
+    def test_writer_error_handling(self, ssd_cache, mx):
+        """Verify that writer errors clean up the index."""
+        block_hash = b"writer_error_test_ha"
+        cache_data = [
+            (mx.zeros((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))
+        ]
+
+        # Temporarily break the save path by making the file path unwritable
+        file_path = ssd_cache._get_file_path(block_hash)
+        subdir = file_path.parent
+
+        # Create a file where the directory should be (prevents writing)
+        # Instead, we'll patch mx.save_safetensors to raise
+        import time as time_mod
+
+        with patch("mlx.core.save_safetensors", side_effect=OSError("Disk full")):
+            result = ssd_cache.save_block(
+                block_hash=block_hash,
+                cache_data=cache_data,
+                token_count=16,
+            )
+            # With temp-file approach, mx.save_safetensors runs on the main
+            # thread in save_block. If it raises, save_block returns False
+            # immediately and the block is never added to the index.
+            assert result is False
+
+        # Block should never have been added to the index
+        assert not ssd_cache.has_block(block_hash)
+
+    def test_graceful_shutdown(self, tmp_path, mx):
+        """Verify close() stops the writer thread."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "shutdown_cache",
+            max_size_bytes=100 * 1024**2,
+        )
+
+        # Save a block to ensure writer is active
+        block_hash = b"shutdown_test_hash_1"
+        cache_data = [(mx.zeros((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))]
+        manager.save_block(block_hash, cache_data, 16)
+
+        # Close should stop the writer thread
+        manager.close()
+
+        assert not manager._writer_thread.is_alive()
+
+    def test_save_existing_block_still_touches(self, ssd_cache, mx):
+        """Verify saving an existing block just touches LRU (unchanged behavior)."""
+        block_hash = b"touch_existing_test_"
+        cache_data = [(mx.zeros((1, 8, 32, 64)), mx.zeros((1, 8, 32, 64)))]
+
+        ssd_cache.save_block(block_hash, cache_data, 32)
+        initial_saves = ssd_cache._stats["saves"]
+
+        # Second save should just touch, not re-enqueue
+        ssd_cache.save_block(block_hash, cache_data, 32)
+        assert ssd_cache._stats["saves"] == initial_saves
+        assert ssd_cache._stats["hits"] >= 1
+
+    def test_save_and_load_round_trip_after_flush(self, ssd_cache, mx):
+        """Verify full round-trip: save -> flush -> load from disk."""
+        import time as time_mod
+
+        block_hash = b"round_trip_flush_tes"
+        cache_data = [
+            (mx.zeros((1, 8, 64, 64)), mx.ones((1, 8, 64, 64)))
+            for _ in range(4)
+        ]
+
+        ssd_cache.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=64,
+            model_name="test-model",
+            layer_cache_types=["KVCache"] * 4,
+        )
+
+        # Wait for background write to complete
+        for _ in range(50):
+            with ssd_cache._pending_writes_lock:
+                if block_hash not in ssd_cache._pending_writes:
+                    break
+            time_mod.sleep(0.1)
+
+        # Now load should come from disk, not pending writes
+        loaded = ssd_cache.load_block(block_hash)
+        assert loaded is not None
+        assert len(loaded) == 4
+        for keys, values in loaded:
+            assert keys.shape == (1, 8, 64, 64)
+            assert values.shape == (1, 8, 64, 64)
