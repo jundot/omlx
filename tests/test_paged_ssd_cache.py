@@ -976,12 +976,12 @@ class TestAsyncWriteAndTimeoutLoad:
             model_name="test-model",
             layer_cache_types=["KVCache"] * 4,
         )
-        elapsed = t0 - time.time()  # Negative means fast return
+        elapsed = time.time() - t0
 
         assert result is True
         # save_block should return almost instantly (< 1s),
         # not wait for disk I/O
-        assert abs(elapsed) < 1.0
+        assert elapsed < 1.0
 
         # Block should be in index (optimistic update)
         assert ssd_cache.has_block(block_hash)

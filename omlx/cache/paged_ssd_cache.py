@@ -47,7 +47,20 @@ except ImportError:
 
 
 # --- Async I/O constants ---
-_MAX_PENDING_WRITES = 64      # Max write queue depth (backpressure)
+def _compute_max_pending_writes() -> int:
+    """Compute max pending writes queue depth based on system memory.
+
+    Scales proportionally: 512GB = 64, 32GB = 4, minimum 4.
+    """
+    try:
+        total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        total_gb = total_bytes / (1024 ** 3)
+        return max(4, min(64, int(total_gb / 8)))
+    except (ValueError, OSError):
+        return 8  # Safe default
+
+
+_MAX_PENDING_WRITES = _compute_max_pending_writes()
 
 
 def _has_zero_dim(tensor: Any) -> bool:
@@ -316,22 +329,6 @@ class PagedSSDCacheIndex:
         """Get number of indexed blocks."""
         with self._lock:
             return len(self._index)
-
-    def update_file_size(
-        self, block_hash: bytes, new_file_size: int, new_file_path: Optional[Path] = None
-    ) -> None:
-        """Update the file size (and optionally path) for an indexed block.
-
-        Used by the background writer to correct the estimated size after
-        the actual file has been written to disk.
-        """
-        with self._lock:
-            if block_hash in self._index:
-                meta = self._index[block_hash]
-                self._total_size += new_file_size - meta.file_size
-                meta.file_size = new_file_size
-                if new_file_path is not None:
-                    meta.file_path = new_file_path
 
     def get_all_hashes(self) -> List[bytes]:
         """Get all indexed block hashes."""
@@ -624,6 +621,14 @@ class PagedSSDCacheManager(CacheManager):
             if block_hash in self._pending_writes:
                 self._stats["hits"] += 1
                 return True
+
+        # Check queue capacity before doing expensive GPU/disk work
+        if self._write_queue.full():
+            logger.warning(
+                f"SSD cache write queue full, skipping save for "
+                f"{block_hash.hex()[:16]}"
+            )
+            return False
 
         file_path = self._get_file_path(block_hash)
 
