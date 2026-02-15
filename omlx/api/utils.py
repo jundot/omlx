@@ -16,29 +16,37 @@ from .openai_models import Message
 # =============================================================================
 
 # Pattern to match special tokens that should be removed from output
-# Keeps <think>...</think> blocks intact for reasoning models
 SPECIAL_TOKENS_PATTERN = re.compile(
     r'<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|'
     r'<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|'
     r'</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]'
 )
 
+# Pattern to strip <think>...</think> reasoning blocks from output
+THINKING_PATTERN = re.compile(r'<think>.*?</think>', re.DOTALL)
+# Also handle case where <think> tag is missing but </think> is present
+# (some models emit thinking content before </think> without explicit <think> tag)
+THINKING_TAIL_PATTERN = re.compile(r'^.*?</think>\s*', re.DOTALL)
+
 
 def clean_output_text(text: str) -> str:
     """
-    Clean model output by removing special tokens.
-
-    Keeps <think>...</think> blocks intact for reasoning models.
+    Clean model output by removing special tokens and thinking blocks.
 
     Args:
         text: Raw model output
 
     Returns:
-        Cleaned text with special tokens removed
+        Cleaned text with special tokens and <think> blocks removed
     """
     if not text:
         return text
     text = SPECIAL_TOKENS_PATTERN.sub('', text)
+    # Remove <think>...</think> blocks (reasoning content)
+    text = THINKING_PATTERN.sub('', text)
+    # Handle partial thinking: content before </think> with no <think> tag
+    if '</think>' in text and '<think>' not in text:
+        text = THINKING_TAIL_PATTERN.sub('', text)
     return text.strip()
 
 
