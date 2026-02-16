@@ -1276,14 +1276,24 @@
                                                     <span class="text-xs text-neutral-400" x-text="'&#9829; ' + model.likes"></span>
                                                 </div>
                                             </div>
-                                            <button @click="downloadRecommended(model.repo_id)"
-                                                    :disabled="hfDownloading"
-                                                    class="px-3.5 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100
-                                                           hover:bg-neutral-900 hover:text-white rounded-lg transition-all
-                                                           disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 shrink-0 ml-4">
-                                                <i data-lucide="download" class="w-3.5 h-3.5"></i>
-                                                Download
-                                            </button>
+                                            <div class="flex items-center gap-2 shrink-0 ml-4">
+                                                <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
+                                                      class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">
+                                                    Tight fit
+                                                </span>
+                                                <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
+                                                      class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200">
+                                                    High OOM risk
+                                                </span>
+                                                <button @click="downloadRecommended(model.repo_id)"
+                                                        :disabled="hfDownloading"
+                                                        class="px-3.5 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100
+                                                               hover:bg-neutral-900 hover:text-white rounded-lg transition-all
+                                                               disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
+                                                    <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                                                    Download
+                                                </button>
+                                            </div>
                                         </div>
                                     </template>
                                 </div>
@@ -1305,14 +1315,24 @@
                                                     <span class="text-xs text-neutral-400" x-text="'&#9829; ' + model.likes"></span>
                                                 </div>
                                             </div>
-                                            <button @click="downloadRecommended(model.repo_id)"
-                                                    :disabled="hfDownloading"
-                                                    class="px-3.5 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100
-                                                           hover:bg-neutral-900 hover:text-white rounded-lg transition-all
-                                                           disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 shrink-0 ml-4">
-                                                <i data-lucide="download" class="w-3.5 h-3.5"></i>
-                                                Download
-                                            </button>
+                                            <div class="flex items-center gap-2 shrink-0 ml-4">
+                                                <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
+                                                      class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">
+                                                    Tight fit
+                                                </span>
+                                                <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
+                                                      class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200">
+                                                    High OOM risk
+                                                </span>
+                                                <button @click="downloadRecommended(model.repo_id)"
+                                                        :disabled="hfDownloading"
+                                                        class="px-3.5 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100
+                                                               hover:bg-neutral-900 hover:text-white rounded-lg transition-all
+                                                               disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
+                                                    <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                                                    Download
+                                                </button>
+                                            </div>
                                         </div>
                                     </template>
                                 </div>
@@ -2622,6 +2642,15 @@
             downloadRecommended(repoId) {
                 this.hfRepoId = repoId;
                 this.startHFDownload();
+            },
+
+            getMemoryFitStatus(sizeBytes) {
+                const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
+                if (!totalBytes || !sizeBytes) return 'safe';
+                const ratio = sizeBytes / totalBytes;
+                if (ratio > 0.95) return 'danger';
+                if (ratio > 0.80) return 'warning';
+                return 'safe';
             },
 
             formatDownloads(count) {
