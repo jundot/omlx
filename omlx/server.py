@@ -639,13 +639,11 @@ def init_server(
     _server_state.global_settings = global_settings
 
     # Configure CORS middleware from settings
-    cors_origins = ["*"]  # default: allow all origins
-    if global_settings and hasattr(global_settings, "server"):
-        cors_origins = getattr(global_settings.server, "cors_origins", ["*"])
+    cors_origins = global_settings.server.cors_origins if global_settings else ["*"]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )

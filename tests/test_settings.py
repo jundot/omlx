@@ -1131,3 +1131,33 @@ class TestClaudeCodeSettings:
         settings = ClaudeCodeSettings.from_dict({})
         assert settings.context_scaling_enabled is False
         assert settings.target_context_size == 200000
+
+
+class TestCORSMiddleware:
+    """Test that CORS middleware is correctly applied to the server."""
+
+    def test_cors_preflight(self):
+        """Test that CORS preflight requests get proper response headers."""
+        from fastapi.testclient import TestClient
+
+        from omlx.server import app, init_server
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings(base_path=Path(tmpdir))
+            init_server(
+                model_dir=tmpdir,
+                max_model_memory=0,
+                global_settings=settings,
+            )
+
+            client = TestClient(app)
+            resp = client.options(
+                "/v1/models",
+                headers={
+                    "Origin": "https://example.com",
+                    "Access-Control-Request-Method": "GET",
+                },
+            )
+            assert resp.status_code == 200
+            assert "access-control-allow-origin" in resp.headers
+            assert resp.headers["access-control-allow-origin"] == "*"
