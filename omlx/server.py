@@ -53,6 +53,7 @@ from typing import Optional, Union
 import secrets
 
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse as _BaseStreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -636,6 +637,19 @@ def init_server(
     # Store API key
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
+
+    # Configure CORS middleware from settings
+    cors_origins = ["*"]  # default: allow all origins
+    if global_settings and hasattr(global_settings, "server"):
+        cors_origins = getattr(global_settings.server, "cors_origins", ["*"])
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    logger.info(f"CORS origins: {cors_origins}")
 
     # Initialize model settings manager
     base_path = Path(global_settings.base_path) if global_settings else Path(model_dir)
