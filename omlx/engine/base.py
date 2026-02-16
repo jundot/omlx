@@ -66,6 +66,7 @@ class BaseEngine(ABC):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
         stop: Optional[List[str]] = None,
         **kwargs,
     ) -> GenerationOutput:
@@ -77,6 +78,7 @@ class BaseEngine(ABC):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
+            top_k: Top-k sampling (0 = disabled)
             stop: Stop sequences
             **kwargs: Additional model-specific parameters
 
@@ -92,6 +94,7 @@ class BaseEngine(ABC):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
         stop: Optional[List[str]] = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
@@ -103,6 +106,7 @@ class BaseEngine(ABC):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
+            top_k: Top-k sampling (0 = disabled)
             stop: Stop sequences
             **kwargs: Additional model-specific parameters
 
@@ -118,6 +122,7 @@ class BaseEngine(ABC):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
         tools: Optional[List[dict]] = None,
         **kwargs,
     ) -> GenerationOutput:
@@ -129,6 +134,7 @@ class BaseEngine(ABC):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
+            top_k: Top-k sampling (0 = disabled)
             tools: Optional tool definitions
             **kwargs: Additional model-specific parameters
 
@@ -144,6 +150,7 @@ class BaseEngine(ABC):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
         tools: Optional[List[dict]] = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
@@ -155,6 +162,7 @@ class BaseEngine(ABC):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
+            top_k: Top-k sampling (0 = disabled)
             tools: Optional tool definitions
             **kwargs: Additional model-specific parameters
 
