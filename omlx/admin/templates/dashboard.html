@@ -1662,7 +1662,7 @@
                     <div class="grid grid-cols-2 gap-4">
                         <div>
                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Repetition Penalty</label>
-                            <input type="number" x-model.number="modelSettings.repetition_penalty" step="0.05" min="1" placeholder="1.0 (disabled)"
+                            <input type="number" x-model.number="modelSettings.repetition_penalty" step="0.05" min="0" placeholder="Default"
                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                         </div>
                         <div class="flex items-end">
@@ -2103,10 +2103,10 @@
                         body: JSON.stringify({
                             max_context_window: this.modelSettings.max_context_window || null,
                             max_tokens: this.modelSettings.max_tokens || null,
-                            temperature: this.modelSettings.temperature ?? null,
-                            top_p: this.modelSettings.top_p ?? null,
-                            top_k: this.modelSettings.top_k ?? null,
-                            repetition_penalty: this.modelSettings.repetition_penalty ?? null,
+                            temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
+                            top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,
+                            top_k: Number.isFinite(this.modelSettings.top_k) ? this.modelSettings.top_k : null,
+                            repetition_penalty: Number.isFinite(this.modelSettings.repetition_penalty) ? this.modelSettings.repetition_penalty : null,
                             force_sampling: this.modelSettings.force_sampling,
                             max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                 ? (this.modelSettings.max_tool_result_tokens || null)
@@ -2143,12 +2143,14 @@
                     const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/generation_config`);
                     if (response.ok) {
                         const data = await response.json();
-                        if (data.temperature !== undefined) this.modelSettings.temperature = data.temperature;
-                        if (data.top_p !== undefined) this.modelSettings.top_p = data.top_p;
-                        if (data.top_k !== undefined) this.modelSettings.top_k = data.top_k;
-                        if (data.repetition_penalty !== undefined) this.modelSettings.repetition_penalty = data.repetition_penalty;
+                        // Set values from config, clear everything else to Default (null)
+                        this.modelSettings.max_context_window = data.max_context_window ?? null;
+                        this.modelSettings.temperature = data.temperature ?? null;
+                        this.modelSettings.top_p = data.top_p ?? null;
+                        this.modelSettings.top_k = data.top_k ?? null;
+                        this.modelSettings.repetition_penalty = data.repetition_penalty ?? null;
                     } else if (response.status === 404) {
-                        alert('No generation_config.json found for this model');
+                        alert('No config defaults found for this model');
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {

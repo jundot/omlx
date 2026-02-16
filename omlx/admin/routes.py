@@ -878,25 +878,27 @@ async def update_model_settings(
     from ..model_settings import ModelSettings
     current_settings = settings_manager.get_settings(model_id)
 
-    # Apply updates
-    if request.max_context_window is not None:
+    # Apply updates — use model_fields_set to distinguish "sent as null"
+    # (clear to default) from "not sent" (don't touch).
+    sent = request.model_fields_set
+    if "max_context_window" in sent:
         current_settings.max_context_window = request.max_context_window
-    if request.max_tokens is not None:
+    if "max_tokens" in sent:
         current_settings.max_tokens = request.max_tokens
-    if request.temperature is not None:
+    if "temperature" in sent:
         current_settings.temperature = request.temperature
-    if request.top_p is not None:
+    if "top_p" in sent:
         current_settings.top_p = request.top_p
-    if request.top_k is not None:
+    if "top_k" in sent:
         current_settings.top_k = request.top_k
-    if request.repetition_penalty is not None:
+    if "repetition_penalty" in sent:
         current_settings.repetition_penalty = request.repetition_penalty
-    if request.force_sampling is not None:
+    if "force_sampling" in sent:
         current_settings.force_sampling = request.force_sampling
-    if request.max_tool_result_tokens is not None:
+    if "max_tool_result_tokens" in sent:
         # 0 means disable (reset to None)
         current_settings.max_tool_result_tokens = (
-            request.max_tool_result_tokens if request.max_tool_result_tokens > 0 else None
+            request.max_tool_result_tokens if request.max_tool_result_tokens and request.max_tool_result_tokens > 0 else None
         )
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
@@ -924,19 +926,19 @@ async def get_generation_config(
     is_admin: bool = Depends(require_admin),
 ):
     """
-    Read generation_config.json for a model and return sampling defaults.
+    Read model config files and return recommended defaults.
 
-    Parses the HuggingFace-standard generation_config.json file from the
-    model's directory and extracts recommended sampling parameters.
+    Reads generation_config.json for sampling parameters and config.json
+    for max_context_window (max_position_embeddings).
 
     Args:
         model_id: The model identifier.
 
     Returns:
-        JSON with sampling parameters from generation_config.json.
+        JSON with recommended parameters from the model's config files.
 
     Raises:
-        HTTPException: 404 if model or file not found, 500 if parse error.
+        HTTPException: 404 if model not found or no config files exist.
     """
     import json as json_module
 
@@ -948,43 +950,57 @@ async def get_generation_config(
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
-    # Find generation_config.json in model directory
     model_path = Path(entry.model_path)
-    gen_config_path = model_path / "generation_config.json"
-    if not gen_config_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"No generation_config.json found for {model_id}",
-        )
-
-    try:
-        with open(gen_config_path, "r", encoding="utf-8") as f:
-            gen_config = json_module.load(f)
-    except (json_module.JSONDecodeError, OSError) as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to parse generation_config.json: {e}",
-        )
-
-    # Extract sampling parameters
     result = {}
 
-    # Temperature: if do_sample is false, effective temperature is 0
-    do_sample = gen_config.get("do_sample", True)
-    if "temperature" in gen_config:
-        if not do_sample:
-            result["temperature"] = 0.0
-        else:
-            result["temperature"] = gen_config["temperature"]
+    # Read generation_config.json for sampling parameters
+    gen_config_path = model_path / "generation_config.json"
+    if gen_config_path.exists():
+        try:
+            with open(gen_config_path, "r", encoding="utf-8") as f:
+                gen_config = json_module.load(f)
 
-    if "top_p" in gen_config:
-        result["top_p"] = gen_config["top_p"]
+            # Temperature: if do_sample is false, effective temperature is 0
+            do_sample = gen_config.get("do_sample", True)
+            if "temperature" in gen_config:
+                result["temperature"] = 0.0 if not do_sample else gen_config["temperature"]
 
-    if "top_k" in gen_config:
-        result["top_k"] = gen_config["top_k"]
+            if "top_p" in gen_config:
+                result["top_p"] = gen_config["top_p"]
 
-    if "repetition_penalty" in gen_config:
-        result["repetition_penalty"] = gen_config["repetition_penalty"]
+            if "top_k" in gen_config:
+                result["top_k"] = gen_config["top_k"]
+
+            if "repetition_penalty" in gen_config:
+                result["repetition_penalty"] = gen_config["repetition_penalty"]
+
+        except (json_module.JSONDecodeError, OSError) as e:
+            logger.warning(f"Failed to parse generation_config.json for {model_id}: {e}")
+
+    # Read config.json for max_position_embeddings → max_context_window
+    config_path = model_path / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                model_config = json_module.load(f)
+
+            max_pos = (
+                model_config.get("max_position_embeddings")
+                or model_config.get("max_seq_len")
+                or model_config.get("seq_length")
+                or model_config.get("n_positions")
+            )
+            if max_pos and isinstance(max_pos, int):
+                result["max_context_window"] = max_pos
+
+        except (json_module.JSONDecodeError, OSError) as e:
+            logger.warning(f"Failed to parse config.json for {model_id}: {e}")
+
+    if not result:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No config files with defaults found for {model_id}",
+        )
 
     return result
 
