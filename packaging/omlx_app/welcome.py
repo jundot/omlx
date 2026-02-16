@@ -34,6 +34,8 @@ from AppKit import (
 )
 from Foundation import NSData, NSObject
 
+from .server_manager import PortConflict
+
 logger = logging.getLogger(__name__)
 
 WINDOW_WIDTH = 540
@@ -513,7 +515,11 @@ class WelcomeWindowController(NSObject):
             return
 
         self.server_manager.update_config(self.config)
-        self.server_manager.start()
+        result = self.server_manager.start()
+
+        if isinstance(result, PortConflict):
+            self._handle_port_conflict(result)
+            return
 
         self.start_button.setEnabled_(False)
         self.start_button.setTitle_("Starting...")
@@ -521,7 +527,10 @@ class WelcomeWindowController(NSObject):
         self.status_label.setStringValue_("Server is starting...")
         self.status_label.setTextColor_(NSColor.systemGreenColor())
 
-        # Start timer to check server status
+        self._start_status_timer()
+
+    def _start_status_timer(self):
+        """Start the timer that polls server startup status."""
         from Foundation import NSDefaultRunLoopMode, NSRunLoop, NSTimer
 
         self.status_check_timer = (
@@ -532,6 +541,64 @@ class WelcomeWindowController(NSObject):
         NSRunLoop.currentRunLoop().addTimer_forMode_(
             self.status_check_timer, NSDefaultRunLoopMode
         )
+
+    def _handle_port_conflict(self, conflict: PortConflict):
+        """Handle a port conflict inline in the wizard UI."""
+        from AppKit import NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn
+
+        if conflict.is_omlx:
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("oMLX Server Already Running")
+            pid_info = f" (PID {conflict.pid})" if conflict.pid else ""
+            alert.setInformativeText_(
+                f"An oMLX server is already running on port "
+                f"{self.config.port}{pid_info}.\n\n"
+                f"You can adopt it (monitor without restarting) "
+                f"or kill it and start a new one."
+            )
+            alert.addButtonWithTitle_("Adopt")
+            alert.addButtonWithTitle_("Kill & Restart")
+            alert.addButtonWithTitle_("Cancel")
+
+            response = alert.runModal()
+            if response == NSAlertFirstButtonReturn:
+                if self.server_manager.adopt():
+                    self.start_button.setEnabled_(False)
+                    self.start_button.setTitle_("Server Running")
+                    self.status_label.setStringValue_(
+                        "Adopted existing server."
+                    )
+                    self.status_label.setTextColor_(NSColor.systemGreenColor())
+                else:
+                    self.status_label.setStringValue_(
+                        "Failed to adopt — server may have stopped."
+                    )
+                    self.status_label.setTextColor_(NSColor.systemRedColor())
+            elif response == NSAlertSecondButtonReturn:
+                if conflict.pid:
+                    self.server_manager._kill_external_server(conflict.pid)
+                    import time
+                    time.sleep(0.5)
+                result = self.server_manager.start()
+                if isinstance(result, PortConflict):
+                    self.status_label.setStringValue_(
+                        "Port still in use. Try again."
+                    )
+                    self.status_label.setTextColor_(NSColor.systemRedColor())
+                else:
+                    self.start_button.setEnabled_(False)
+                    self.start_button.setTitle_("Starting...")
+                    self.status_label.setStringValue_("Server is starting...")
+                    self.status_label.setTextColor_(NSColor.systemGreenColor())
+                    self._start_status_timer()
+            # Cancel: do nothing
+        else:
+            pid_info = f" (PID {conflict.pid})" if conflict.pid else ""
+            self.status_label.setStringValue_(
+                f"Port {self.config.port} is in use by another "
+                f"application{pid_info}. Change the port above."
+            )
+            self.status_label.setTextColor_(NSColor.systemRedColor())
 
     def checkServerStatus_(self, timer):
         """Check if server has started or failed."""

@@ -33,7 +33,7 @@ from AppKit import (
 from Foundation import NSData, NSObject, NSRunLoop, NSDefaultRunLoopMode, NSTimer
 
 from .config import ServerConfig
-from .server_manager import ServerManager, ServerStatus
+from .server_manager import PortConflict, ServerManager, ServerStatus
 
 logger = logging.getLogger(__name__)
 
@@ -130,8 +130,11 @@ class OMLXAppDelegate(NSObject):
             )
             self.welcome_controller.showWindow()
         elif self.config.start_server_on_launch:
-            self.server_manager.start()
-            self._update_status_display()
+            result = self.server_manager.start()
+            if isinstance(result, PortConflict):
+                self._handle_port_conflict(result)
+            else:
+                self._update_status_display()
 
     # --- Icon management ---
 
@@ -548,10 +551,66 @@ class OMLXAppDelegate(NSObject):
 
     # --- Menu actions ---
 
+    def _handle_port_conflict(self, conflict: PortConflict) -> None:
+        """Show a dialog for port conflicts and handle user choice."""
+        from AppKit import NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn
+
+        alert = NSAlert.alloc().init()
+
+        if conflict.is_omlx:
+            alert.setMessageText_("oMLX Server Already Running")
+            pid_info = f" (PID {conflict.pid})" if conflict.pid else ""
+            alert.setInformativeText_(
+                f"An oMLX server is already running on port "
+                f"{self.server_manager.config.port}{pid_info}.\n\n"
+                f"You can adopt it (monitor without restarting) "
+                f"or kill it and start a new one."
+            )
+            alert.addButtonWithTitle_("Adopt")
+            alert.addButtonWithTitle_("Kill & Restart")
+            alert.addButtonWithTitle_("Cancel")
+
+            response = alert.runModal()
+            if response == NSAlertFirstButtonReturn:
+                if not self.server_manager.adopt():
+                    self.server_manager._update_status(
+                        ServerStatus.ERROR, "Failed to adopt — server may have stopped"
+                    )
+            elif response == NSAlertSecondButtonReturn:
+                if conflict.pid:
+                    self.server_manager._kill_external_server(conflict.pid)
+                    import time
+                    time.sleep(0.5)
+                result = self.server_manager.start()
+                if isinstance(result, PortConflict):
+                    self.server_manager._update_status(
+                        ServerStatus.ERROR, "Port still in use after kill"
+                    )
+            # Cancel: do nothing
+        else:
+            alert.setMessageText_(f"Port {self.server_manager.config.port} In Use")
+            pid_info = f" (PID {conflict.pid})" if conflict.pid else ""
+            alert.setInformativeText_(
+                f"Port {self.server_manager.config.port} is in use by another "
+                f"application{pid_info}.\n\n"
+                f"Change the port in Preferences."
+            )
+            alert.addButtonWithTitle_("Open Preferences")
+            alert.addButtonWithTitle_("Cancel")
+
+            response = alert.runModal()
+            if response == NSAlertFirstButtonReturn:
+                self.openPreferences_(None)
+
+        self._update_status_display()
+
     @objc.IBAction
     def startServer_(self, sender):
         """Start the server."""
-        self.server_manager.start()
+        result = self.server_manager.start()
+        if isinstance(result, PortConflict):
+            self._handle_port_conflict(result)
+            return
         self._update_status_display()
 
     @objc.IBAction
