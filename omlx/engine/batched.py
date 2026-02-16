@@ -228,6 +228,7 @@ class BatchedEngine(BaseEngine):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
         **kwargs,
     ) -> GenerationOutput:
@@ -239,6 +240,7 @@ class BatchedEngine(BaseEngine):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
+            repetition_penalty: Repetition penalty (1.0 = disabled)
             stop: Stop sequences
             **kwargs: Additional model-specific parameters
 
@@ -254,6 +256,7 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            repetition_penalty=repetition_penalty,
             stop=stop or [],
         )
 
@@ -279,6 +282,7 @@ class BatchedEngine(BaseEngine):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
@@ -290,6 +294,7 @@ class BatchedEngine(BaseEngine):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
+            repetition_penalty: Repetition penalty (1.0 = disabled)
             stop: Stop sequences
             **kwargs: Additional model-specific parameters
 
@@ -305,6 +310,7 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            repetition_penalty=repetition_penalty,
             stop=stop or [],
         )
 
@@ -352,6 +358,7 @@ class BatchedEngine(BaseEngine):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        repetition_penalty: float = 1.0,
         tools: list[dict] | None = None,
         **kwargs,
     ) -> GenerationOutput:
@@ -363,6 +370,7 @@ class BatchedEngine(BaseEngine):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
+            repetition_penalty: Repetition penalty (1.0 = disabled)
             tools: Optional tool definitions
             **kwargs: Additional model-specific parameters
 
@@ -386,6 +394,7 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            repetition_penalty=repetition_penalty,
             **kwargs,
         )
 
@@ -395,6 +404,7 @@ class BatchedEngine(BaseEngine):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        repetition_penalty: float = 1.0,
         tools: list[dict] | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
@@ -406,6 +416,7 @@ class BatchedEngine(BaseEngine):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
+            repetition_penalty: Repetition penalty (1.0 = disabled)
             tools: Optional tool definitions
             **kwargs: Additional model-specific parameters
 
@@ -429,6 +440,7 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            repetition_penalty=repetition_penalty,
             **kwargs,
         ):
             yield output

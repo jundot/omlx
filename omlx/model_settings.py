@@ -28,6 +28,7 @@ class ModelSettings:
         temperature: Sampling temperature (None = use global default).
         top_p: Nucleus sampling probability (None = use global default).
         top_k: Top-k sampling parameter (None = use global default).
+        repetition_penalty: Repetition penalty (None = use default 1.0, i.e. disabled).
         force_sampling: Force sampling even with temperature=0.
         is_pinned: Keep model loaded in memory.
         is_default: Use this model when no model is specified.
@@ -41,6 +42,7 @@ class ModelSettings:
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
+    repetition_penalty: Optional[float] = None
     force_sampling: bool = False
     max_tool_result_tokens: Optional[int] = None
 

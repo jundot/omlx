@@ -209,6 +209,7 @@ class SamplingDefaults:
     temperature: float = 1.0
     top_p: float = 0.95
     top_k: int = 40
+    repetition_penalty: float = 1.0
     force_sampling: bool = False
 
 
@@ -467,7 +468,7 @@ def get_sampling_params(
     req_temperature: float | None,
     req_top_p: float | None,
     model_id: str | None = None,
-) -> tuple[float, float, int]:
+) -> tuple[float, float, int, float]:
     """
     Get effective sampling parameters with per-model settings support.
 
@@ -476,7 +477,7 @@ def get_sampling_params(
     - Otherwise: request > model settings > global defaults
 
     Returns:
-        tuple of (temperature, top_p, top_k)
+        tuple of (temperature, top_p, top_k, repetition_penalty)
     """
     global_sampling = _server_state.sampling
 
@@ -527,12 +528,19 @@ def get_sampling_params(
         else:
             top_k = global_sampling.top_k
 
+    # Repetition penalty: model settings > global default (1.0)
+    if model_settings and model_settings.repetition_penalty is not None:
+        repetition_penalty = model_settings.repetition_penalty
+    else:
+        repetition_penalty = getattr(global_sampling, 'repetition_penalty', 1.0)
+
     logger.debug(
-        f"Sampling params: temperature={temperature}, top_p={top_p}, top_k={top_k}"
+        f"Sampling params: temperature={temperature}, top_p={top_p}, top_k={top_k}, "
+        f"repetition_penalty={repetition_penalty}"
         f"{' (forced)' if force else ''}"
         f"{f' (model: {model_id})' if model_id else ''}"
     )
-    return temperature, top_p, top_k
+    return temperature, top_p, top_k, repetition_penalty
 
 
 def get_max_context_window(model_id: str | None = None) -> int | None:
@@ -656,6 +664,7 @@ def init_server(
             temperature=global_settings.sampling.temperature,
             top_p=global_settings.sampling.top_p,
             top_k=global_settings.sampling.top_k,
+            repetition_penalty=getattr(global_settings.sampling, 'repetition_penalty', 1.0),
         )
     else:
         _server_state.sampling = SamplingDefaults()
@@ -1120,7 +1129,7 @@ async def create_completion(
     total_prompt_tokens = 0
     total_cached_tokens = 0
 
-    temperature, top_p, top_k = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty = get_sampling_params(
         request.temperature, request.top_p, request.model
     )
 
@@ -1133,6 +1142,7 @@ async def create_completion(
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
+                repetition_penalty=repetition_penalty,
                 stop=request.stop,
             ),
         )
@@ -1237,7 +1247,7 @@ async def create_chat_completion(
     validate_context_window(num_prompt_tokens, request.model)
 
     # Prepare kwargs
-    temperature, top_p, top_k = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty = get_sampling_params(
         request.temperature, request.top_p, request.model
     )
     chat_kwargs = {
@@ -1245,6 +1255,7 @@ async def create_chat_completion(
         "temperature": temperature,
         "top_p": top_p,
         "top_k": top_k,
+        "repetition_penalty": repetition_penalty,
     }
 
     # Add tools if provided
@@ -1386,7 +1397,7 @@ async def stream_completion(
     first_token_time = None
     last_output = None
 
-    temperature, top_p, top_k = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty = get_sampling_params(
         request.temperature, request.top_p, request.model
     )
     async for output in engine.stream_generate(
@@ -1395,6 +1406,7 @@ async def stream_completion(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        repetition_penalty=repetition_penalty,
         stop=request.stop,
     ):
         if first_token_time is None and output.new_text:
@@ -1819,7 +1831,7 @@ async def create_anthropic_message(
         )
 
     # Prepare kwargs
-    temperature, top_p, top_k = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty = get_sampling_params(
         request.temperature, request.top_p, request.model
     )
 
@@ -1836,6 +1848,7 @@ async def create_anthropic_message(
         "temperature": temperature,
         "top_p": top_p,
         "top_k": top_k,
+        "repetition_penalty": repetition_penalty,
     }
 
     # Add tools if provided

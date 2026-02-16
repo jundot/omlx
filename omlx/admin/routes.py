@@ -51,6 +51,7 @@ class ModelSettingsRequest(BaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
+    repetition_penalty: Optional[float] = None
     force_sampling: Optional[bool] = None
     max_tool_result_tokens: Optional[int] = None
     is_pinned: Optional[bool] = None
@@ -88,6 +89,7 @@ class GlobalSettingsRequest(BaseModel):
     sampling_temperature: Optional[float] = None
     sampling_top_p: Optional[float] = None
     sampling_top_k: Optional[int] = None
+    sampling_repetition_penalty: Optional[float] = None
 
     # Claude Code settings
     claude_code_context_scaling_enabled: Optional[bool] = None
@@ -316,6 +318,7 @@ def _apply_sampling_settings_runtime(
     temperature: Optional[float],
     top_p: Optional[float],
     top_k: Optional[int],
+    repetition_penalty: Optional[float] = None,
 ) -> tuple[bool, str]:
     """
     Apply sampling default settings at runtime.
@@ -348,6 +351,10 @@ def _apply_sampling_settings_runtime(
     if top_k is not None:
         _server_state.sampling.top_k = top_k
         changes.append(f"top_k={top_k}")
+
+    if repetition_penalty is not None:
+        _server_state.sampling.repetition_penalty = repetition_penalty
+        changes.append(f"repetition_penalty={repetition_penalty}")
 
     if changes:
         return True, f"Sampling defaults updated: {', '.join(changes)}"
@@ -798,6 +805,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "temperature": settings.temperature,
                 "top_p": settings.top_p,
                 "top_k": settings.top_k,
+                "repetition_penalty": settings.repetition_penalty,
                 "force_sampling": settings.force_sampling,
                 "max_tool_result_tokens": settings.max_tool_result_tokens,
                 "is_pinned": settings.is_pinned,
@@ -881,6 +889,8 @@ async def update_model_settings(
         current_settings.top_p = request.top_p
     if request.top_k is not None:
         current_settings.top_k = request.top_k
+    if request.repetition_penalty is not None:
+        current_settings.repetition_penalty = request.repetition_penalty
     if request.force_sampling is not None:
         current_settings.force_sampling = request.force_sampling
     if request.max_tool_result_tokens is not None:
@@ -906,6 +916,77 @@ async def update_model_settings(
         "model_id": model_id,
         "settings": current_settings.to_dict(),
     }
+
+
+@router.get("/api/models/{model_id}/generation_config")
+async def get_generation_config(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """
+    Read generation_config.json for a model and return sampling defaults.
+
+    Parses the HuggingFace-standard generation_config.json file from the
+    model's directory and extracts recommended sampling parameters.
+
+    Args:
+        model_id: The model identifier.
+
+    Returns:
+        JSON with sampling parameters from generation_config.json.
+
+    Raises:
+        HTTPException: 404 if model or file not found, 500 if parse error.
+    """
+    import json as json_module
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    # Find generation_config.json in model directory
+    model_path = Path(entry.model_path)
+    gen_config_path = model_path / "generation_config.json"
+    if not gen_config_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No generation_config.json found for {model_id}",
+        )
+
+    try:
+        with open(gen_config_path, "r", encoding="utf-8") as f:
+            gen_config = json_module.load(f)
+    except (json_module.JSONDecodeError, OSError) as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to parse generation_config.json: {e}",
+        )
+
+    # Extract sampling parameters
+    result = {}
+
+    # Temperature: if do_sample is false, effective temperature is 0
+    do_sample = gen_config.get("do_sample", True)
+    if "temperature" in gen_config:
+        if not do_sample:
+            result["temperature"] = 0.0
+        else:
+            result["temperature"] = gen_config["temperature"]
+
+    if "top_p" in gen_config:
+        result["top_p"] = gen_config["top_p"]
+
+    if "top_k" in gen_config:
+        result["top_k"] = gen_config["top_k"]
+
+    if "repetition_penalty" in gen_config:
+        result["repetition_penalty"] = gen_config["repetition_penalty"]
+
+    return result
 
 
 # =============================================================================
@@ -974,6 +1055,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "temperature": global_settings.sampling.temperature,
             "top_p": global_settings.sampling.top_p,
             "top_k": global_settings.sampling.top_k,
+            "repetition_penalty": global_settings.sampling.repetition_penalty,
         },
         "auth": {
             "api_key_set": bool(global_settings.auth.api_key),
@@ -1123,6 +1205,9 @@ async def update_global_settings(
     if request.sampling_top_k is not None:
         global_settings.sampling.top_k = request.sampling_top_k
         sampling_changed = True
+    if request.sampling_repetition_penalty is not None:
+        global_settings.sampling.repetition_penalty = request.sampling_repetition_penalty
+        sampling_changed = True
 
     if sampling_changed:
         success, msg = _apply_sampling_settings_runtime(
@@ -1131,6 +1216,7 @@ async def update_global_settings(
             request.sampling_temperature,
             request.sampling_top_p,
             request.sampling_top_k,
+            request.sampling_repetition_penalty,
         )
         if success:
             runtime_applied.append("sampling")

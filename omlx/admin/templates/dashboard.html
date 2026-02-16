@@ -883,6 +883,14 @@
                                     <input type="number" x-model.number="globalSettings.sampling.top_k" min="0"
                                            class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Repetition Penalty</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">1.0 = disabled</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.sampling.repetition_penalty" step="0.05" min="1"
+                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
                             </div>
                         </div>
 
@@ -1100,7 +1108,7 @@
                                     </div>
 
                                     <!-- Sampling Settings Row (if any settings configured) - hidden for embedding/reranker models -->
-                                    <div x-show="(!model.model_type || model.model_type === 'llm') && model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens)"
+                                    <div x-show="(!model.model_type || model.model_type === 'llm') && model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.repetition_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens)"
                                          class="px-6 pb-4 -mt-2">
                                         <div class="ml-11 flex flex-wrap gap-2">
                                             <template x-if="model.settings?.max_context_window">
@@ -1126,6 +1134,11 @@
                                             <template x-if="model.settings?.top_k !== null && model.settings?.top_k !== undefined">
                                                 <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-purple-50 text-purple-700 border border-purple-200">
                                                     top_k: <span class="ml-1" x-text="model.settings.top_k"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.repetition_penalty !== null && model.settings?.repetition_penalty !== undefined">
+                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-pink-50 text-pink-700 border border-pink-200">
+                                                    rep_penalty: <span class="ml-1" x-text="model.settings.repetition_penalty"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.max_tool_result_tokens">
@@ -1646,6 +1659,22 @@
                         </div>
                     </div>
 
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Repetition Penalty</label>
+                            <input type="number" x-model.number="modelSettings.repetition_penalty" step="0.05" min="1" placeholder="1.0 (disabled)"
+                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                        </div>
+                        <div class="flex items-end">
+                            <button type="button" @click="loadGenerationDefaults"
+                                    :disabled="loadingGenDefaults"
+                                    class="w-full px-4 py-2.5 text-sm font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-xl border border-neutral-200 transition-all disabled:opacity-50">
+                                <span x-show="!loadingGenDefaults">Load Defaults</span>
+                                <span x-show="loadingGenDefaults">Loading...</span>
+                            </button>
+                        </div>
+                    </div>
+
                     <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
                         <div class="flex items-center justify-between">
                             <div>
@@ -1722,7 +1751,7 @@
                 model: { model_dir: '', max_model_memory: '' },
                 scheduler: { max_num_seqs: 8, prefill_batch_size: 8, completion_batch_size: 8 },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto' },
-                sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 40 },
+                sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 40, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
                 auth: { api_key_set: false, api_key: '' },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000 },
@@ -1759,11 +1788,13 @@
                 temperature: null,
                 top_p: null,
                 top_k: null,
+                repetition_penalty: null,
                 force_sampling: false,
                 enableToolResultLimit: false,
                 max_tool_result_tokens: null,
             },
             savingModelSettings: false,
+            loadingGenDefaults: false,
 
             // Status tab state
             stats: {
@@ -1961,6 +1992,7 @@
                             sampling_temperature: this.globalSettings.sampling.temperature,
                             sampling_top_p: this.globalSettings.sampling.top_p,
                             sampling_top_k: this.globalSettings.sampling.top_k,
+                            sampling_repetition_penalty: this.globalSettings.sampling.repetition_penalty,
                             mcp_config: this.globalSettings.mcp.config_path,
                             ...(this.globalSettings.auth.api_key ? { api_key: this.globalSettings.auth.api_key } : {}),
                         }),
@@ -2051,6 +2083,7 @@
                     temperature: settings.temperature ?? null,
                     top_p: settings.top_p ?? null,
                     top_k: settings.top_k ?? null,
+                    repetition_penalty: settings.repetition_penalty ?? null,
                     force_sampling: settings.force_sampling || false,
                     enableToolResultLimit: !!(settings.max_tool_result_tokens),
                     max_tool_result_tokens: settings.max_tool_result_tokens || null,
@@ -2073,6 +2106,7 @@
                             temperature: this.modelSettings.temperature ?? null,
                             top_p: this.modelSettings.top_p ?? null,
                             top_k: this.modelSettings.top_k ?? null,
+                            repetition_penalty: this.modelSettings.repetition_penalty ?? null,
                             force_sampling: this.modelSettings.force_sampling,
                             max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                 ? (this.modelSettings.max_tool_result_tokens || null)
@@ -2099,6 +2133,33 @@
                     alert('Failed to save model settings');
                 } finally {
                     this.savingModelSettings = false;
+                }
+            },
+
+            async loadGenerationDefaults() {
+                if (!this.selectedModel) return;
+                this.loadingGenDefaults = true;
+                try {
+                    const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/generation_config`);
+                    if (response.ok) {
+                        const data = await response.json();
+                        if (data.temperature !== undefined) this.modelSettings.temperature = data.temperature;
+                        if (data.top_p !== undefined) this.modelSettings.top_p = data.top_p;
+                        if (data.top_k !== undefined) this.modelSettings.top_k = data.top_k;
+                        if (data.repetition_penalty !== undefined) this.modelSettings.repetition_penalty = data.repetition_penalty;
+                    } else if (response.status === 404) {
+                        alert('No generation_config.json found for this model');
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await response.json();
+                        alert(data.detail || 'Failed to load generation config');
+                    }
+                } catch (err) {
+                    console.error('Failed to load generation config:', err);
+                    alert('Failed to load generation config');
+                } finally {
+                    this.loadingGenDefaults = false;
                 }
             },
 

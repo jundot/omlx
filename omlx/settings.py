@@ -286,6 +286,7 @@ class SamplingSettings:
     temperature: float = 1.0
     top_p: float = 0.95
     top_k: int = 40
+    repetition_penalty: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -295,6 +296,7 @@ class SamplingSettings:
             "temperature": self.temperature,
             "top_p": self.top_p,
             "top_k": self.top_k,
+            "repetition_penalty": self.repetition_penalty,
         }
 
     @classmethod
@@ -306,6 +308,7 @@ class SamplingSettings:
             temperature=data.get("temperature", 1.0),
             top_p=data.get("top_p", 0.95),
             top_k=data.get("top_k", 40),
+            repetition_penalty=data.get("repetition_penalty", 1.0),
         )
 
 
