@@ -3,12 +3,14 @@
 import logging
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import requests
 
@@ -23,6 +25,13 @@ class ServerStatus(Enum):
     RUNNING = "running"
     STOPPING = "stopping"
     ERROR = "error"
+
+
+@dataclass
+class PortConflict:
+    """Returned by start() when the port is already in use."""
+    pid: Optional[int]
+    is_omlx: bool
 
 
 def get_bundled_python() -> str:
@@ -54,6 +63,7 @@ class ServerManager:
         self._status_callback: Optional[Callable[[ServerStatus], None]] = None
         self._health_check_thread: Optional[threading.Thread] = None
         self._stop_health_check = threading.Event()
+        self._adopted = False
 
     @property
     def status(self) -> ServerStatus:
@@ -92,7 +102,13 @@ class ServerManager:
         while not self._stop_health_check.is_set():
             if self._status == ServerStatus.RUNNING:
                 if not self.check_health():
-                    if self._process and self._process.poll() is not None:
+                    if self._adopted:
+                        self._adopted = False
+                        self._update_status(
+                            ServerStatus.ERROR,
+                            "External server stopped",
+                        )
+                    elif self._process and self._process.poll() is not None:
                         exit_code = self._process.returncode
                         self._update_status(
                             ServerStatus.ERROR,
@@ -104,10 +120,89 @@ class ServerManager:
                     self._update_status(ServerStatus.RUNNING)
             self._stop_health_check.wait(5)
 
-    def start(self) -> bool:
+    def _is_port_in_use(self) -> bool:
+        """Check if the configured port is already in use."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                s.connect(("127.0.0.1", self.config.port))
+                return True
+        except (ConnectionRefusedError, OSError):
+            return False
+
+    def _is_omlx_server(self) -> bool:
+        """Check if the process on the port is an oMLX server."""
+        try:
+            resp = requests.get(self._get_health_url(), timeout=2)
+            return resp.status_code == 200
+        except requests.RequestException:
+            return False
+
+    def _find_port_owner_pid(self) -> Optional[int]:
+        """Find the PID of the process holding the configured port."""
+        try:
+            result = subprocess.run(
+                ["lsof", "-ti", f":{self.config.port}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                # lsof may return multiple PIDs; take the first
+                return int(result.stdout.strip().splitlines()[0])
+        except Exception as e:
+            logger.debug(f"lsof failed: {e}")
+        return None
+
+    def _kill_external_server(self, pid: int) -> bool:
+        """Kill an external process by PID (SIGTERM, then SIGKILL)."""
+        try:
+            os.kill(pid, signal.SIGTERM)
+            # Wait up to 5 seconds for process to exit
+            import time
+            for _ in range(50):
+                time.sleep(0.1)
+                try:
+                    os.kill(pid, 0)  # Check if still alive
+                except OSError:
+                    return True  # Process exited
+            # Still alive — force kill
+            os.kill(pid, signal.SIGKILL)
+            time.sleep(0.5)
+            return True
+        except OSError as e:
+            logger.error(f"Failed to kill PID {pid}: {e}")
+            return False
+
+    def adopt(self) -> bool:
+        """Adopt an externally-running oMLX server without owning the process."""
+        if not self._is_omlx_server():
+            return False
+
+        self._adopted = True
+        self._process = None
+        self._update_status(ServerStatus.RUNNING)
+
+        # Start health check loop to monitor the external server
+        self._stop_health_check.clear()
+        self._health_check_thread = threading.Thread(
+            target=self._health_check_loop,
+            daemon=True,
+        )
+        self._health_check_thread.start()
+
+        logger.info(f"Adopted external oMLX server on port {self.config.port}")
+        return True
+
+    def start(self) -> Union[bool, PortConflict]:
         if self._status in (ServerStatus.RUNNING, ServerStatus.STARTING):
             return False
 
+        # Check for port conflict before launching
+        if self._is_port_in_use():
+            is_omlx = self._is_omlx_server()
+            pid = self._find_port_owner_pid()
+            return PortConflict(pid=pid, is_omlx=is_omlx)
+
+        self._adopted = False
         args = self.config.build_serve_args()
         self._update_status(ServerStatus.STARTING)
 
@@ -148,6 +243,15 @@ class ServerManager:
         if self._status not in (ServerStatus.RUNNING, ServerStatus.STARTING):
             return False
 
+        # Adopted server: just stop monitoring, don't kill anything
+        if self._adopted:
+            self._stop_health_check.set()
+            if self._health_check_thread:
+                self._health_check_thread.join(timeout=2)
+            self._adopted = False
+            self._update_status(ServerStatus.STOPPED)
+            return True
+
         if not self._process:
             self._update_status(ServerStatus.STOPPED)
             return True
@@ -181,13 +285,15 @@ class ServerManager:
             self._update_status(ServerStatus.ERROR, str(e))
             return False
 
-    def restart(self) -> bool:
+    def restart(self) -> Union[bool, PortConflict]:
         self.stop()
         import time
         time.sleep(1)
         return self.start()
 
     def is_running(self) -> bool:
+        if self._adopted:
+            return self._status == ServerStatus.RUNNING
         return self._process is not None and self._process.poll() is None
 
     def update_config(self, config: ServerConfig) -> None:
