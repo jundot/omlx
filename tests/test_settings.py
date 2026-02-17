@@ -38,19 +38,31 @@ class TestServerSettings:
         assert settings.host == "127.0.0.1"
         assert settings.port == 8000
         assert settings.log_level == "info"
+        assert settings.cors_origins == ["*"]
 
     def test_custom_values(self):
         """Test custom values."""
-        settings = ServerSettings(host="0.0.0.0", port=9000, log_level="debug")
+        settings = ServerSettings(
+            host="0.0.0.0",
+            port=9000,
+            log_level="debug",
+            cors_origins=["https://example.com"],
+        )
         assert settings.host == "0.0.0.0"
         assert settings.port == 9000
         assert settings.log_level == "debug"
+        assert settings.cors_origins == ["https://example.com"]
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
         settings = ServerSettings(host="127.0.0.1", port=8000, log_level="info")
         result = settings.to_dict()
-        assert result == {"host": "127.0.0.1", "port": 8000, "log_level": "info"}
+        assert result == {
+            "host": "127.0.0.1",
+            "port": 8000,
+            "log_level": "info",
+            "cors_origins": ["*"],
+        }
 
     def test_from_dict(self):
         """Test creation from dictionary."""
@@ -59,6 +71,20 @@ class TestServerSettings:
         assert settings.host == "0.0.0.0"
         assert settings.port == 9000
         assert settings.log_level == "debug"
+        assert settings.cors_origins == ["*"]  # default
+
+    def test_from_dict_with_cors_origins(self):
+        """Test creation from dictionary with cors_origins."""
+        data = {
+            "host": "0.0.0.0",
+            "port": 9000,
+            "cors_origins": ["https://chat.example.com", "http://localhost:3000"],
+        }
+        settings = ServerSettings.from_dict(data)
+        assert settings.cors_origins == [
+            "https://chat.example.com",
+            "http://localhost:3000",
+        ]
 
     def test_from_dict_with_defaults(self):
         """Test creation from partial dictionary uses defaults."""
@@ -67,6 +93,7 @@ class TestServerSettings:
         assert settings.host == "127.0.0.1"  # default
         assert settings.port == 9000
         assert settings.log_level == "info"  # default
+        assert settings.cors_origins == ["*"]  # default
 
 
 class TestModelSettings:
@@ -453,6 +480,52 @@ class TestGlobalSettings:
             assert data["version"] == "1.0"
             assert data["server"]["port"] == 9001
             assert data["auth"]["api_key"] == "saved-key"
+
+    def test_save_and_load_cors_origins(self):
+        """Test saving and loading cors_origins through settings file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings(base_path=Path(tmpdir))
+            settings.server.cors_origins = ["https://chat.example.com"]
+            settings.save()
+
+            loaded = GlobalSettings.load(base_path=tmpdir)
+            assert loaded.server.cors_origins == ["https://chat.example.com"]
+
+    def test_load_cors_origins_from_file(self):
+        """Test loading cors_origins from settings.json."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "settings.json"
+            settings_file.write_text(
+                json.dumps(
+                    {
+                        "version": "1.0",
+                        "server": {
+                            "port": 8000,
+                            "cors_origins": [
+                                "https://chat.example.com",
+                                "http://localhost:3000",
+                            ],
+                        },
+                    }
+                )
+            )
+
+            settings = GlobalSettings.load(base_path=tmpdir)
+            assert settings.server.cors_origins == [
+                "https://chat.example.com",
+                "http://localhost:3000",
+            ]
+
+    def test_load_without_cors_origins_uses_default(self):
+        """Test that missing cors_origins in settings.json uses default ['*']."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "settings.json"
+            settings_file.write_text(
+                json.dumps({"version": "1.0", "server": {"port": 9000}})
+            )
+
+            settings = GlobalSettings.load(base_path=tmpdir)
+            assert settings.server.cors_origins == ["*"]
 
     def test_save_creates_directory(self):
         """Test save creates base directory if needed."""
@@ -1058,3 +1131,33 @@ class TestClaudeCodeSettings:
         settings = ClaudeCodeSettings.from_dict({})
         assert settings.context_scaling_enabled is False
         assert settings.target_context_size == 200000
+
+
+class TestCORSMiddleware:
+    """Test that CORS middleware is correctly applied to the server."""
+
+    def test_cors_preflight(self):
+        """Test that CORS preflight requests get proper response headers."""
+        from fastapi.testclient import TestClient
+
+        from omlx.server import app, init_server
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings(base_path=Path(tmpdir))
+            init_server(
+                model_dir=tmpdir,
+                max_model_memory=0,
+                global_settings=settings,
+            )
+
+            client = TestClient(app)
+            resp = client.options(
+                "/v1/models",
+                headers={
+                    "Origin": "https://example.com",
+                    "Access-Control-Request-Method": "GET",
+                },
+            )
+            assert resp.status_code == 200
+            assert "access-control-allow-origin" in resp.headers
+            assert resp.headers["access-control-allow-origin"] == "*"

@@ -100,6 +100,10 @@ def convert_anthropic_to_internal(
                     prefix = "[Tool Error" if is_error else "[Tool Result"
                     text_parts.append(f"{prefix} ({tool_use_id})]: {result_content}")
 
+                elif block_type == "thinking":
+                    # Thinking blocks are ignored (reasoning content is not passed to model)
+                    continue
+
             combined_text = "\n".join(text_parts) if text_parts else ""
             processed_messages.append({"role": role, "content": combined_text})
         else:
@@ -257,6 +261,10 @@ def convert_anthropic_to_internal_harmony(
                         "tool_use_id": tool_use_id,
                         "content": result_content,
                     })
+
+                elif block_type == "thinking":
+                    # Thinking blocks are ignored (reasoning content is not passed to model)
+                    continue
 
             # Build message(s) based on what we found
             if role == "assistant":

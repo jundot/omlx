@@ -228,6 +228,7 @@ class BatchedEngine(BaseEngine):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
         **kwargs,
@@ -240,6 +241,7 @@ class BatchedEngine(BaseEngine):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
+            top_k: Top-k sampling (0 = disabled)
             repetition_penalty: Repetition penalty (1.0 = disabled)
             stop: Stop sequences
             **kwargs: Additional model-specific parameters
@@ -256,6 +258,7 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
             repetition_penalty=repetition_penalty,
             stop=stop or [],
         )
@@ -282,6 +285,7 @@ class BatchedEngine(BaseEngine):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
         **kwargs,
@@ -294,6 +298,7 @@ class BatchedEngine(BaseEngine):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
+            top_k: Top-k sampling (0 = disabled)
             repetition_penalty: Repetition penalty (1.0 = disabled)
             stop: Stop sequences
             **kwargs: Additional model-specific parameters
@@ -310,6 +315,7 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
             repetition_penalty=repetition_penalty,
             stop=stop or [],
         )
@@ -358,6 +364,7 @@ class BatchedEngine(BaseEngine):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
         repetition_penalty: float = 1.0,
         tools: list[dict] | None = None,
         **kwargs,
@@ -370,6 +377,7 @@ class BatchedEngine(BaseEngine):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
+            top_k: Top-k sampling (0 = disabled)
             repetition_penalty: Repetition penalty (1.0 = disabled)
             tools: Optional tool definitions
             **kwargs: Additional model-specific parameters
@@ -394,6 +402,7 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
             repetition_penalty=repetition_penalty,
             **kwargs,
         )
@@ -404,6 +413,7 @@ class BatchedEngine(BaseEngine):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
         repetition_penalty: float = 1.0,
         tools: list[dict] | None = None,
         **kwargs,
@@ -416,6 +426,7 @@ class BatchedEngine(BaseEngine):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
+            top_k: Top-k sampling (0 = disabled)
             repetition_penalty: Repetition penalty (1.0 = disabled)
             tools: Optional tool definitions
             **kwargs: Additional model-specific parameters
@@ -440,6 +451,7 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
             repetition_penalty=repetition_penalty,
             **kwargs,
         ):
