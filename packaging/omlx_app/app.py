@@ -317,7 +317,7 @@ class OMLXAppDelegate(NSObject):
             status_color = NSColor.systemGreenColor()
         elif status == ServerStatus.STARTING:
             status_text = "● oMLX Server is starting..."
-            status_color = NSColor.systemYellowColor()
+            status_color = NSColor.systemOrangeColor()
         elif status == ServerStatus.ERROR:
             status_text = "● oMLX Server error"
             status_color = NSColor.systemRedColor()

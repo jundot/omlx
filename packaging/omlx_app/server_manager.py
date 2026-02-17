@@ -139,14 +139,13 @@ class ServerManager:
             return False
 
     def _find_port_owner_pid(self) -> Optional[int]:
-        """Find the PID of the process holding the configured port."""
+        """Find the PID of the process listening on the configured port."""
         try:
             result = subprocess.run(
-                ["lsof", "-ti", f":{self.config.port}"],
+                ["lsof", "-ti", f":{self.config.port}", "-sTCP:LISTEN"],
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode == 0 and result.stdout.strip():
-                # lsof may return multiple PIDs; take the first
                 return int(result.stdout.strip().splitlines()[0])
         except Exception as e:
             logger.debug(f"lsof failed: {e}")
