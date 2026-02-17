@@ -51,12 +51,21 @@ class ContentBlockToolResult(BaseModel):
     is_error: bool | None = None
 
 
+class ContentBlockThinking(BaseModel):
+    """Thinking content block for reasoning models (e.g., Claude Opus 4.6)."""
+
+    type: Literal["thinking"] = "thinking"
+    thinking: str
+    signature: str | None = None
+
+
 # Union type for all content blocks
 ContentBlock = (
     ContentBlockText
     | ContentBlockImage
     | ContentBlockToolUse
     | ContentBlockToolResult
+    | ContentBlockThinking
 )
 
 
