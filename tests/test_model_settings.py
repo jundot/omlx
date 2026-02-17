@@ -21,6 +21,7 @@ class TestModelSettings:
         assert settings.temperature is None
         assert settings.top_p is None
         assert settings.top_k is None
+        assert settings.repetition_penalty is None
         assert settings.force_sampling is False
         assert settings.is_pinned is False
         assert settings.is_default is False
@@ -40,6 +41,7 @@ class TestModelSettings:
         assert "is_pinned" in d
         assert "max_tokens" not in d  # None should be excluded
         assert "max_context_window" not in d  # None should be excluded
+        assert "repetition_penalty" not in d  # None should be excluded
 
     def test_to_dict_preserves_zero_values(self):
         """Test to_dict preserves zero values (not treated as None)."""
@@ -64,13 +66,23 @@ class TestModelSettings:
         """Test creating from dictionary."""
         data = {
             "temperature": 0.8,
+            "repetition_penalty": 1.3,
             "is_pinned": True,
             "invalid_key": "should be ignored"
         }
         settings = ModelSettings.from_dict(data)
         assert settings.temperature == 0.8
+        assert settings.repetition_penalty == 1.3
         assert settings.is_pinned is True
         assert not hasattr(settings, "invalid_key")
+
+    def test_repetition_penalty_roundtrip(self):
+        """Test repetition_penalty survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(repetition_penalty=1.5)
+        d = original.to_dict()
+        assert d["repetition_penalty"] == 1.5
+        restored = ModelSettings.from_dict(d)
+        assert restored.repetition_penalty == 1.5
 
 
 class TestModelSettingsManager:
@@ -137,6 +149,19 @@ class TestModelSettingsManager:
             assert loaded.temperature == 0.0
             assert loaded.top_p == 0.0
             assert loaded.top_k == 0
+
+    def test_repetition_penalty_persist(self):
+        """Test repetition_penalty survives save/load cycle."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            settings = ModelSettings(repetition_penalty=1.3)
+            manager.set_settings("test-model", settings)
+
+            # Reload from file
+            manager2 = ModelSettingsManager(Path(tmpdir))
+            loaded = manager2.get_settings("test-model")
+            assert loaded.repetition_penalty == 1.3
 
     def test_exclusive_default(self):
         """Test only one model can be default."""

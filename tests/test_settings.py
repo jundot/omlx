@@ -170,9 +170,9 @@ class TestSchedulerSettings:
     def test_defaults(self):
         """Test default values."""
         settings = SchedulerSettings()
-        assert settings.max_num_seqs == 256
+        assert settings.max_num_seqs == 8
         assert settings.prefill_batch_size == 8
-        assert settings.completion_batch_size == 32
+        assert settings.completion_batch_size == 8
 
     def test_custom_values(self):
         """Test custom values."""
@@ -188,9 +188,9 @@ class TestSchedulerSettings:
         settings = SchedulerSettings()
         result = settings.to_dict()
         assert result == {
-            "max_num_seqs": 256,
+            "max_num_seqs": 8,
             "prefill_batch_size": 8,
-            "completion_batch_size": 32,
+            "completion_batch_size": 8,
         }
 
     def test_from_dict(self):
@@ -384,7 +384,7 @@ class TestGlobalSettings:
             assert settings.server.host == "127.0.0.1"
             assert settings.server.port == 8000
             assert settings.model.max_model_memory == "auto"
-            assert settings.scheduler.max_num_seqs == 256
+            assert settings.scheduler.max_num_seqs == 8
             assert settings.cache.enabled is True
             assert settings.auth.api_key is None
             assert settings.mcp.config_path is None
@@ -1070,6 +1070,7 @@ class TestSamplingSettings:
         assert settings.temperature == 1.0
         assert settings.top_p == 0.95
         assert settings.top_k == 40
+        assert settings.repetition_penalty == 1.0
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
@@ -1077,18 +1078,21 @@ class TestSamplingSettings:
         d = settings.to_dict()
         assert d["max_context_window"] == 4096
         assert "max_tokens" in d
+        assert "repetition_penalty" in d
 
     def test_from_dict(self):
         """Test creation from dictionary."""
-        data = {"max_context_window": 8192, "max_tokens": 1024}
+        data = {"max_context_window": 8192, "max_tokens": 1024, "repetition_penalty": 1.2}
         settings = SamplingSettings.from_dict(data)
         assert settings.max_context_window == 8192
         assert settings.max_tokens == 1024
+        assert settings.repetition_penalty == 1.2
 
     def test_from_dict_defaults(self):
         """Test from_dict uses defaults for missing fields."""
         settings = SamplingSettings.from_dict({})
         assert settings.max_context_window == 32768
+        assert settings.repetition_penalty == 1.0
 
 
 class TestClaudeCodeSettings:

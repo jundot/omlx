@@ -23,7 +23,7 @@ import pytest
 # Import the modules under test
 sys.path.insert(0, str(Path(__file__).parent.parent / "packaging"))
 from omlx_app.config import ServerConfig, get_app_support_dir, get_config_path, get_log_path
-from omlx_app.server_manager import ServerManager, ServerStatus
+from omlx_app.server_manager import PortConflict, ServerManager, ServerStatus
 
 
 class TestServerConfig:
@@ -490,11 +490,12 @@ class TestServerManager:
         result = manager.start()
         assert result is False
 
+    @patch.object(ServerManager, "_is_port_in_use", return_value=False)
     @patch("omlx_app.server_manager.subprocess.Popen")
     @patch("omlx_app.server_manager.get_log_path")
     @patch("builtins.open", new_callable=MagicMock)
     def test_start_success(
-        self, mock_open, mock_log_path, mock_popen, manager: ServerManager, tmp_path
+        self, mock_open, mock_log_path, mock_popen, mock_port_check, manager: ServerManager, tmp_path
     ):
         """Test successful server start."""
         mock_log_path.return_value = tmp_path / "server.log"
@@ -518,10 +519,11 @@ class TestServerManager:
         # Clean up the health check thread
         manager._stop_health_check.set()
 
+    @patch.object(ServerManager, "_is_port_in_use", return_value=False)
     @patch("omlx_app.server_manager.subprocess.Popen")
     @patch("omlx_app.server_manager.get_log_path")
     def test_start_popen_exception(
-        self, mock_log_path, mock_popen, manager: ServerManager, tmp_path
+        self, mock_log_path, mock_popen, mock_port_check, manager: ServerManager, tmp_path
     ):
         """Test start handles Popen exception."""
         mock_log_path.return_value = tmp_path / "server.log"
@@ -634,6 +636,121 @@ class TestServerManager:
         mock_stop.assert_called_once()
         mock_start.assert_called_once()
         assert result is True
+
+
+class TestPortConflict:
+    """Tests for port conflict detection and handling."""
+
+    @pytest.fixture
+    def config(self, tmp_path) -> ServerConfig:
+        """Create a test config."""
+        return ServerConfig(
+            base_path=str(tmp_path / "base"),
+            port=8765,
+            model_dir=str(tmp_path / "models"),
+        )
+
+    @pytest.fixture
+    def manager(self, config: ServerConfig) -> ServerManager:
+        """Create a ServerManager instance."""
+        return ServerManager(config)
+
+    def test_port_conflict_dataclass(self):
+        """Test PortConflict dataclass fields."""
+        conflict = PortConflict(pid=12345, is_omlx=True)
+        assert conflict.pid == 12345
+        assert conflict.is_omlx is True
+
+        conflict_no_pid = PortConflict(pid=None, is_omlx=False)
+        assert conflict_no_pid.pid is None
+        assert conflict_no_pid.is_omlx is False
+
+    @patch.object(ServerManager, "_find_port_owner_pid", return_value=12345)
+    @patch.object(ServerManager, "_is_omlx_server", return_value=True)
+    @patch.object(ServerManager, "_is_port_in_use", return_value=True)
+    def test_start_returns_port_conflict_omlx(
+        self, mock_port, mock_omlx, mock_pid, manager: ServerManager
+    ):
+        """Test start returns PortConflict when port is used by oMLX."""
+        result = manager.start()
+        assert isinstance(result, PortConflict)
+        assert result.pid == 12345
+        assert result.is_omlx is True
+
+    @patch.object(ServerManager, "_find_port_owner_pid", return_value=99999)
+    @patch.object(ServerManager, "_is_omlx_server", return_value=False)
+    @patch.object(ServerManager, "_is_port_in_use", return_value=True)
+    def test_start_returns_port_conflict_not_omlx(
+        self, mock_port, mock_omlx, mock_pid, manager: ServerManager
+    ):
+        """Test start returns PortConflict when port is used by another app."""
+        result = manager.start()
+        assert isinstance(result, PortConflict)
+        assert result.pid == 99999
+        assert result.is_omlx is False
+
+    @patch.object(ServerManager, "_is_omlx_server", return_value=True)
+    def test_adopt_success(self, mock_omlx, manager: ServerManager):
+        """Test adopting an existing oMLX server."""
+        result = manager.adopt()
+        assert result is True
+        assert manager.status == ServerStatus.RUNNING
+        assert manager._adopted is True
+        assert manager._process is None
+
+        # Clean up the health check thread
+        manager._stop_health_check.set()
+        if manager._health_check_thread:
+            manager._health_check_thread.join(timeout=2)
+
+    @patch.object(ServerManager, "_is_omlx_server", return_value=False)
+    def test_adopt_failure(self, mock_omlx, manager: ServerManager):
+        """Test adopt fails when target is not oMLX."""
+        result = manager.adopt()
+        assert result is False
+        assert manager._adopted is False
+
+    def test_stop_adopted_server(self, manager: ServerManager):
+        """Test stopping an adopted server doesn't kill processes."""
+        manager._adopted = True
+        manager._status = ServerStatus.RUNNING
+        manager._process = None
+
+        result = manager.stop()
+
+        assert result is True
+        assert manager.status == ServerStatus.STOPPED
+        assert manager._adopted is False
+
+    def test_is_running_adopted(self, manager: ServerManager):
+        """Test is_running for adopted servers."""
+        manager._adopted = True
+        manager._status = ServerStatus.RUNNING
+        assert manager.is_running() is True
+
+        manager._status = ServerStatus.ERROR
+        assert manager.is_running() is False
+
+    @patch("omlx_app.server_manager.subprocess.run")
+    def test_find_port_owner_pid(self, mock_run, manager: ServerManager):
+        """Test finding PID of the process on the port."""
+        mock_run.return_value = Mock(returncode=0, stdout="12345\n")
+        assert manager._find_port_owner_pid() == 12345
+
+    @patch("omlx_app.server_manager.subprocess.run")
+    def test_find_port_owner_pid_no_process(self, mock_run, manager: ServerManager):
+        """Test finding PID when no process is listening."""
+        mock_run.return_value = Mock(returncode=1, stdout="")
+        assert manager._find_port_owner_pid() is None
+
+    @patch("omlx_app.server_manager.os.kill")
+    def test_kill_external_server(self, mock_kill, manager: ServerManager):
+        """Test killing an external server process."""
+        # Process exits after SIGTERM
+        mock_kill.side_effect = [None, OSError("No such process")]
+        result = manager._kill_external_server(12345)
+        assert result is True
+        mock_kill.assert_any_call(12345, signal.SIGTERM)
 
 
 class TestPathHelpers:
