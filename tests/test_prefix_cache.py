@@ -1273,3 +1273,348 @@ class TestPrefixCacheCacheList:
         result = cache.reconstruct_cache(block_table)
         # Should return None because CacheList layer has placeholder
         assert result is None
+
+
+class TestWalkBackTruncation:
+    """Tests for walk-back truncation of non-sliceable caches."""
+
+    @pytest.fixture
+    def mx(self):
+        """Import MLX or skip."""
+        try:
+            import mlx.core as mx
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    # ------------------------------------------------------------------
+    # _is_placeholder_state
+    # ------------------------------------------------------------------
+
+    def test_is_placeholder_state_detects_placeholder(self, mx):
+        """Placeholder tuple with shape (1,) should be detected."""
+        placeholder = (mx.zeros((1,)), mx.zeros((1,)))
+        assert BlockAwarePrefixCache._is_placeholder_state(placeholder) is True
+
+    def test_is_placeholder_state_rejects_real_arrays_cache(self, mx):
+        """Real ArraysCache state should not be flagged as placeholder."""
+        real_state = (mx.ones((1, 3, 64)), mx.ones((1, 32, 128, 128)))
+        assert BlockAwarePrefixCache._is_placeholder_state(real_state) is False
+
+    def test_is_placeholder_state_rejects_kv_cache(self, mx):
+        """Standard 4D KVCache tensors should not be flagged."""
+        kv_state = (mx.ones((1, 8, 4, 64)), mx.ones((1, 8, 4, 64)))
+        assert BlockAwarePrefixCache._is_placeholder_state(kv_state) is False
+
+    def test_is_placeholder_state_rejects_list(self, mx):
+        """CacheList real data (list format) should not be flagged."""
+        cache_list_data = [
+            (mx.ones((1, 8, 4, 64)), mx.ones((1, 8, 4, 64))),
+        ]
+        assert BlockAwarePrefixCache._is_placeholder_state(cache_list_data) is False
+
+    # ------------------------------------------------------------------
+    # _find_walk_back_truncation_point
+    # ------------------------------------------------------------------
+
+    def test_walk_back_no_truncation_when_last_block_valid(self, mx):
+        """No truncation when the last block has real state."""
+        model = MockModel(num_layers=2)
+        paged_cache = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=None,
+        )
+
+        placeholder = (mx.zeros((1,)), mx.zeros((1,)))
+        real_state = (mx.ones((1, 3, 64)), mx.ones((1, 32, 128, 128)))
+        kv = (mx.ones((1, 8, 4, 64)), mx.ones((1, 8, 4, 64)))
+
+        all_block_data = [
+            [kv, placeholder],  # block 0
+            [kv, real_state],   # block 1 (last, valid)
+        ]
+        layer_cache_types = ["KVCache", "ArraysCache"]
+
+        result = cache._find_walk_back_truncation_point(
+            all_block_data, layer_cache_types
+        )
+        assert result is None  # No truncation needed
+
+    def test_walk_back_multi_turn_pattern(self, mx):
+        """Walk-back finds the latest block with valid ArraysCache state.
+
+        Simulates multi-turn pattern:
+        A[p] B[p] C[real] D[p] E[real] F[p]
+        Should walk back to E (index 4).
+        """
+        model = MockModel(num_layers=2)
+        paged_cache = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=None,
+        )
+
+        placeholder = (mx.zeros((1,)), mx.zeros((1,)))
+        real_state = (mx.ones((1, 3, 64)), mx.ones((1, 32, 128, 128)))
+        kv = (mx.ones((1, 8, 4, 64)), mx.ones((1, 8, 4, 64)))
+
+        # A[p] B[p] C[real] D[p] E[real] F[p]
+        all_block_data = [
+            [kv, placeholder],  # A
+            [kv, placeholder],  # B
+            [kv, real_state],   # C (turn 1 last block)
+            [kv, placeholder],  # D
+            [kv, real_state],   # E (turn 2 last block)
+            [kv, placeholder],  # F (last loaded, placeholder)
+        ]
+        layer_cache_types = ["KVCache", "ArraysCache"]
+
+        result = cache._find_walk_back_truncation_point(
+            all_block_data, layer_cache_types
+        )
+        assert result == 4  # Block E (index 4)
+
+    def test_walk_back_all_placeholders_returns_none(self, mx):
+        """All blocks have placeholders -- no valid fallback exists."""
+        model = MockModel(num_layers=2)
+        paged_cache = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=None,
+        )
+
+        placeholder = (mx.zeros((1,)), mx.zeros((1,)))
+        kv = (mx.ones((1, 8, 4, 64)), mx.ones((1, 8, 4, 64)))
+
+        all_block_data = [
+            [kv, placeholder],
+            [kv, placeholder],
+            [kv, placeholder],
+        ]
+        layer_cache_types = ["KVCache", "ArraysCache"]
+
+        result = cache._find_walk_back_truncation_point(
+            all_block_data, layer_cache_types
+        )
+        assert result is None  # No valid block found
+
+    def test_walk_back_skips_rotating_kv_cache(self, mx):
+        """RotatingKVCache placeholders should not trigger walk-back."""
+        model = MockModel(num_layers=2)
+        paged_cache = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=None,
+        )
+
+        placeholder = (mx.zeros((1,)), mx.zeros((1,)))
+        kv = (mx.ones((1, 8, 4, 64)), mx.ones((1, 8, 4, 64)))
+
+        # Both layers are types with built-in recovery
+        all_block_data = [
+            [kv, placeholder],
+            [kv, placeholder],
+        ]
+        layer_cache_types = ["KVCache", "RotatingKVCache"]
+
+        result = cache._find_walk_back_truncation_point(
+            all_block_data, layer_cache_types
+        )
+        assert result is None  # RotatingKVCache excluded from walk-back
+
+    # ------------------------------------------------------------------
+    # Full reconstruct_cache integration with walk-back
+    # ------------------------------------------------------------------
+
+    def test_reconstruct_arrays_cache_walks_back_to_valid_block(self, mx):
+        """Partial match should walk back instead of rejecting entirely.
+
+        3 blocks: block0[p] block1[real] block2[p]
+        Should truncate to blocks 0-1, returning valid cache.
+        """
+        from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+
+        mock_ssd = MagicMock(spec=PagedSSDCacheManager)
+
+        model = MockModel(num_layers=2)
+        paged_cache = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        # Allocate 3 blocks
+        blocks = []
+        for i in range(3):
+            b = paged_cache.allocate_block()
+            b.block_hash = f"hash{i}".encode()
+            b.token_count = 4
+            b.ref_count = 2  # Simulate fetch_cache having incremented ref
+            blocks.append(b)
+
+        block_table = BlockTable(
+            request_id="req-001",
+            block_ids=[b.block_id for b in blocks],
+            num_tokens=12,
+        )
+
+        kv_slice = (mx.ones((1, 8, 4, 64)), mx.ones((1, 8, 4, 64)))
+        placeholder = (mx.zeros((1,)), mx.zeros((1,)))
+        conv_state = mx.ones((1, 3, 64))
+        ssm_state = mx.ones((1, 32, 128, 128))
+        real_state = (conv_state, ssm_state)
+
+        metadata = {
+            "model_name": "test-model",
+            "num_layers": 2,
+            "layer_cache_types": ["KVCache", "ArraysCache"],
+            "layer_meta_states": [(), ()],
+        }
+
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([kv_slice, placeholder], metadata),   # block 0: placeholder
+            ([kv_slice, real_state], metadata),     # block 1: real state (turn 1 last)
+            ([kv_slice, placeholder], metadata),    # block 2: placeholder
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        # Should NOT be None -- walk-back recovered blocks 0-1
+        assert result is not None
+        assert len(result) == 2  # 2 layers reconstructed
+
+        # block_table should be truncated to 2 blocks
+        assert len(block_table.block_ids) == 2
+        assert block_table.num_tokens == 8
+
+        # Block 2 ref_count should have been decremented (freed)
+        assert blocks[2].ref_count == 1
+
+    def test_reconstruct_all_placeholders_still_rejects(self, mx):
+        """When no block has valid state, walk-back finds nothing and
+        the existing per-layer rejection returns None."""
+        from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+
+        mock_ssd = MagicMock(spec=PagedSSDCacheManager)
+
+        model = MockModel(num_layers=2)
+        paged_cache = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        blocks = []
+        for i in range(2):
+            b = paged_cache.allocate_block()
+            b.block_hash = f"hash{i}".encode()
+            b.token_count = 4
+            blocks.append(b)
+
+        block_table = BlockTable(
+            request_id="req-001",
+            block_ids=[b.block_id for b in blocks],
+            num_tokens=8,
+        )
+
+        kv_slice = (mx.ones((1, 8, 4, 64)), mx.ones((1, 8, 4, 64)))
+        placeholder = (mx.zeros((1,)), mx.zeros((1,)))
+
+        metadata = {
+            "model_name": "test-model",
+            "num_layers": 2,
+            "layer_cache_types": ["KVCache", "ArraysCache"],
+            "layer_meta_states": [(), ()],
+        }
+
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([kv_slice, placeholder], metadata),
+            ([kv_slice, placeholder], metadata),
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        # Should still return None -- all placeholders, no walk-back target
+        assert result is None
+
+    def test_partial_reconstruction_frees_dropped_blocks(self, mx):
+        """Blocks dropped during partial reconstruction should have
+        their ref_counts decremented."""
+        from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+
+        mock_ssd = MagicMock(spec=PagedSSDCacheManager)
+
+        model = MockModel(num_layers=1)
+        paged_cache = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        block1 = paged_cache.allocate_block()
+        block1.block_hash = b"hash1"
+        block1.token_count = 4
+        block1.ref_count = 2  # Simulate fetch_cache increment
+
+        block2 = paged_cache.allocate_block()
+        block2.block_hash = b"hash2"
+        block2.token_count = 4
+        block2.ref_count = 2  # Simulate fetch_cache increment
+
+        block_table = BlockTable(
+            request_id="req-001",
+            block_ids=[block1.block_id, block2.block_id],
+            num_tokens=8,
+        )
+
+        kv_slice = (mx.ones((1, 8, 4, 64)), mx.ones((1, 8, 4, 64)))
+
+        # First block loads fine, second fails
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([kv_slice], {
+                "model_name": "test-model",
+                "num_layers": 1,
+                "layer_cache_types": ["KVCache"],
+                "layer_meta_states": [()],
+            }),
+            (None, None),  # Second block fails to load
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        # Should partially reconstruct with block1 only
+        assert result is not None
+        assert len(block_table.block_ids) == 1
+        assert block_table.num_tokens == 4
+
+        # block2 ref_count should have been decremented
+        assert block2.ref_count == 1

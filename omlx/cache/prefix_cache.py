@@ -784,6 +784,89 @@ class BlockAwarePrefixCache(CacheManager):
             logger.warning(f"Failed to extract block tensor slice: {e}")
             return None
 
+    @staticmethod
+    def _is_placeholder_state(data) -> bool:
+        """Check if block layer data is a last-block-only placeholder.
+
+        Non-sliceable cache types (ArraysCache, CacheList with non-sliceable
+        sub-caches) store real state only in the last block of each save
+        operation. All other blocks get a placeholder: ``(mx.zeros((1,)),
+        mx.zeros((1,)))``.
+
+        Returns True if *data* is such a placeholder.
+        """
+        # CacheList real sub-cache data is stored as a list, never a placeholder
+        if isinstance(data, list):
+            return False
+        if isinstance(data, tuple) and len(data) == 2:
+            first = data[0]
+            if hasattr(first, 'shape') and first.shape == (1,):
+                return True
+        return False
+
+    def _find_walk_back_truncation_point(
+        self,
+        all_block_data: List[List[Any]],
+        layer_cache_types: Optional[List[str]],
+    ) -> Optional[int]:
+        """Find the latest block where all non-sliceable layers have valid state.
+
+        In multi-turn conversations, intermediate blocks can accumulate real
+        ArraysCache/CacheList state from prior save operations while later
+        blocks only have placeholders.  This method walks backwards from the
+        last loaded block to locate the most recent block where **every**
+        non-sliceable layer (excluding RotatingKVCache, which has its own
+        empty-cache recovery) carries real state.
+
+        Returns:
+            0-based block index (inclusive) to truncate to, or ``None`` if
+            no truncation is needed (last block already valid) or no valid
+            fallback block exists.
+        """
+        if not all_block_data or not layer_cache_types:
+            return None
+
+        num_layers = len(all_block_data[0])
+        last_idx = len(all_block_data) - 1
+
+        # Identify "problematic" layers: placeholder in the last block AND
+        # not RotatingKVCache (which has its own empty-cache + window-padding
+        # recovery path).
+        problematic_layers: List[int] = []
+        for layer_idx in range(num_layers):
+            cache_type = (
+                layer_cache_types[layer_idx]
+                if layer_idx < len(layer_cache_types)
+                else 'KVCache'
+            )
+            # KVCache is always per-block sliced; RotatingKVCache has its own
+            # recovery.  Only check types that use last-block-only storage
+            # without a built-in fallback.
+            if cache_type in ('KVCache', 'RotatingKVCache'):
+                continue
+            if layer_idx < len(all_block_data[last_idx]):
+                if self._is_placeholder_state(all_block_data[last_idx][layer_idx]):
+                    problematic_layers.append(layer_idx)
+
+        if not problematic_layers:
+            return None  # Last block already has valid state for all layers
+
+        # Walk backwards to find the latest block where ALL problematic
+        # layers have real (non-placeholder) state.
+        for block_idx in range(last_idx - 1, -1, -1):
+            block_data = all_block_data[block_idx]
+            all_valid = True
+            for layer_idx in problematic_layers:
+                if layer_idx < len(block_data) and self._is_placeholder_state(
+                    block_data[layer_idx]
+                ):
+                    all_valid = False
+                    break
+            if all_valid:
+                return block_idx
+
+        return None  # No valid fallback -- fall through to existing rejection
+
     def _clone_tensor(self, tensor: Any) -> Any:
         """Clone a tensor slice to avoid holding the full backing buffer."""
         try:
@@ -988,6 +1071,7 @@ class BlockAwarePrefixCache(CacheManager):
             layer_cache_types = None
             first_block_meta_states = None   # meta_states from first block
             last_block_meta_states = None    # meta_states from last block (for non-sliceable caches)
+            all_block_meta_states = []       # per-block meta_states for walk-back truncation
 
             for idx, block_id in enumerate(block_table.block_ids):
                 block = self.paged_cache.allocated_blocks.get(block_id)
@@ -1069,6 +1153,7 @@ class BlockAwarePrefixCache(CacheManager):
                         first_block_meta_states = block_layer_meta_states
                     # Always update last to track the most recent
                     last_block_meta_states = block_layer_meta_states
+                    all_block_meta_states.append(block_layer_meta_states)
 
                 # Validate loaded data (pass cache types for hybrid models)
                 if not self._validate_block_cache_data(block_data, layer_cache_types):
@@ -1085,7 +1170,14 @@ class BlockAwarePrefixCache(CacheManager):
             # If we have fewer valid blocks than requested, update block_table
             if valid_block_count < len(block_table.block_ids):
                 if valid_block_count == 0:
+                    # Free ref_counts for all blocks before returning
+                    for bid in block_table.block_ids:
+                        self.paged_cache.free_block(bid)
                     return None  # No valid blocks at all
+
+                # Free ref_counts for blocks we are about to drop
+                for bid in block_table.block_ids[valid_block_count:]:
+                    self.paged_cache.free_block(bid)
 
                 # Truncate block_table to valid prefix
                 original_blocks = len(block_table.block_ids)
@@ -1103,6 +1195,44 @@ class BlockAwarePrefixCache(CacheManager):
             num_layers = len(all_block_data[0])
             if num_layers == 0:
                 return None
+
+            # --- Pre-scan: walk-back truncation for non-sliceable caches ---
+            # If the last loaded block has a placeholder for any non-sliceable
+            # layer (ArraysCache, non-sliceable CacheList), walk backwards to
+            # find the latest block where ALL such layers carry real state.
+            # This recovers intermediate blocks from multi-turn conversations
+            # instead of rejecting the entire cache.
+            if all_block_data and layer_cache_types:
+                trunc_idx = self._find_walk_back_truncation_point(
+                    all_block_data, layer_cache_types
+                )
+                if trunc_idx is not None:
+                    new_count = trunc_idx + 1
+                    dropped_count = len(all_block_data) - new_count
+
+                    # Free ref_counts for dropped blocks
+                    for bid in block_table.block_ids[new_count:]:
+                        self.paged_cache.free_block(bid)
+
+                    # Truncate data structures
+                    all_block_data = all_block_data[:new_count]
+                    block_table.block_ids = block_table.block_ids[:new_count]
+                    valid_token_count = sum(
+                        self.paged_cache.allocated_blocks[bid].token_count
+                        for bid in block_table.block_ids
+                        if bid in self.paged_cache.allocated_blocks
+                    )
+                    block_table.num_tokens = valid_token_count
+
+                    # Update meta_states to the truncation-point block
+                    if trunc_idx < len(all_block_meta_states):
+                        last_block_meta_states = all_block_meta_states[trunc_idx]
+
+                    logger.info(
+                        f"Walk-back truncation: dropped {dropped_count} trailing "
+                        f"block(s) with placeholder non-sliceable state, keeping "
+                        f"{new_count} block(s) ({valid_token_count} tokens)"
+                    )
 
             # Build model cache config if we have type info
             model_cache_config = None
