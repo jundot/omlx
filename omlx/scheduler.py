@@ -20,7 +20,15 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import mlx.core as mx
-from mlx_lm.generate import BatchGenerator, generation_stream
+from mlx_lm.generate import (
+    Batch as MLXBatch,
+    BatchGenerator,
+    _left_pad_prompts,
+    _make_cache,
+    _merge_caches,
+    _right_pad_prompts,
+    generation_stream,
+)
 from mlx_lm.sample_utils import make_sampler, make_logits_processors
 
 from pathlib import Path
@@ -70,6 +78,274 @@ except ImportError:
     HAS_HARMONY_ADAPTER = False
 
 logger = logging.getLogger(__name__)
+
+
+class _BoundarySnapshotBatchGenerator(BatchGenerator):
+    """BatchGenerator with boundary-aligned prefill snapshot callbacks."""
+
+    def __init__(
+        self,
+        *args: Any,
+        boundary_block_size: int = 0,
+        prefill_boundary_callback: Optional[Callable[[int, List[Any], int], None]] = None,
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+        self._boundary_block_size = max(0, int(boundary_block_size))
+        self._prefill_boundary_callback = prefill_boundary_callback
+
+    def _boundary_capture_enabled(self) -> bool:
+        return (
+            self._boundary_block_size > 0
+            and self._prefill_boundary_callback is not None
+        )
+
+    @staticmethod
+    def _cache_layer_token_count(cache_obj: Any) -> int:
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)) and sub_caches:
+            return max(
+                _BoundarySnapshotBatchGenerator._cache_layer_token_count(sub_cache)
+                for sub_cache in sub_caches
+            )
+
+        offset = getattr(cache_obj, "offset", None)
+        if isinstance(offset, (int, float)):
+            return int(offset)
+
+        size_fn = getattr(cache_obj, "size", None)
+        if callable(size_fn):
+            try:
+                return int(size_fn())
+            except Exception:
+                return 0
+
+        return 0
+
+    @staticmethod
+    def _cache_base_sizes(caches: Tuple[List[Any], ...]) -> List[int]:
+        base_sizes: List[int] = []
+        for cache_list in caches:
+            try:
+                base_sizes.append(
+                    max(
+                        _BoundarySnapshotBatchGenerator._cache_layer_token_count(c)
+                        for c in cache_list
+                    )
+                )
+            except Exception:
+                base_sizes.append(0)
+        return base_sizes
+
+    def _next_boundary_limited_step(
+        self,
+        processed_tokens: int,
+        lengths: List[int],
+        base_sizes: List[int],
+        max_allowed: int,
+    ) -> int:
+        n_to_process = min(self.prefill_step_size, max_allowed)
+        if n_to_process <= 1:
+            return max(1, n_to_process)
+
+        block_size = self._boundary_block_size
+        next_delta: Optional[int] = None
+
+        for length, base in zip(lengths, base_sizes):
+            prefill_limit = max(length - 1, 0)
+            if processed_tokens >= prefill_limit:
+                continue
+
+            current_prefill = min(processed_tokens, prefill_limit)
+            current_total = base + current_prefill
+            final_total = base + prefill_limit
+            next_boundary = ((current_total // block_size) + 1) * block_size
+            if next_boundary > final_total:
+                continue
+
+            target_prefill = next_boundary - base
+            delta = target_prefill - processed_tokens
+            if delta <= 0:
+                continue
+
+            next_delta = delta if next_delta is None else min(next_delta, delta)
+
+        if next_delta is not None:
+            n_to_process = min(n_to_process, next_delta)
+
+        return max(1, n_to_process)
+
+    def _emit_boundary_snapshots(
+        self,
+        *,
+        uids: List[int],
+        lengths: List[int],
+        base_sizes: List[int],
+        prompt_cache: List[Any],
+        emitted: Dict[int, int],
+        processed_tokens: Optional[int] = None,
+        use_full_prompt_lengths: bool = False,
+    ) -> None:
+        if not self._boundary_capture_enabled() or self._prefill_boundary_callback is None:
+            return
+
+        for idx, uid in enumerate(uids):
+            length = lengths[idx]
+            base = base_sizes[idx]
+            if use_full_prompt_lengths:
+                total_tokens = base + max(length, 0)
+            else:
+                if processed_tokens is None:
+                    continue
+                prefill_done = min(processed_tokens, max(length - 1, 0))
+                total_tokens = base + prefill_done
+
+            if total_tokens <= 0 or total_tokens % self._boundary_block_size != 0:
+                continue
+            if emitted.get(uid, -1) >= total_tokens:
+                continue
+
+            try:
+                snapshot_cache = [c.extract(idx) for c in prompt_cache]
+                self._prefill_boundary_callback(uid, snapshot_cache, total_tokens)
+                emitted[uid] = total_tokens
+            except Exception as e:
+                logger.debug(
+                    f"Prefill boundary snapshot callback failed for uid={uid}: {e}"
+                )
+
+    def _process_prompts(self, prompts):
+        uids, inputs, max_tokens, caches, samplers, logits_processors = zip(*prompts)
+
+        lengths = [len(p) for p in inputs]
+        max_length = max(lengths)
+        padding = [max_length - l for l in lengths]
+
+        self._stats.prompt_tokens += sum(lengths)
+
+        tokens = [mx.array(inp) for inp in inputs]
+        processed_tokens = 0
+        boundary_enabled = self._boundary_capture_enabled()
+        base_sizes = self._cache_base_sizes(caches) if boundary_enabled else []
+        emitted_boundaries: Dict[int, int] = {uid: -1 for uid in uids}
+
+        # New prompts so
+        #   1. Left-pad the inputs
+        #   2. Process
+        if all(c[0].empty() for c in caches):
+            inputs = _left_pad_prompts(inputs, max_length=max_length)
+            prompt_cache = _make_cache(self.model, padding, self.max_kv_size)
+
+            while inputs.shape[1] > 1:
+                max_allowed = inputs.shape[1] - 1
+                if boundary_enabled:
+                    n_to_process = self._next_boundary_limited_step(
+                        processed_tokens,
+                        lengths,
+                        base_sizes,
+                        max_allowed,
+                    )
+                else:
+                    n_to_process = min(self.prefill_step_size, max_allowed)
+
+                self.model(inputs[:, :n_to_process], cache=prompt_cache)
+                mx.eval([c.state for c in prompt_cache])
+                inputs = inputs[:, n_to_process:]
+                processed_tokens += n_to_process
+                self.prompt_progress_callback(
+                    [
+                        (uid, processed_tokens, length)
+                        for uid, length in zip(uids, lengths)
+                    ]
+                )
+                self._emit_boundary_snapshots(
+                    uids=list(uids),
+                    lengths=lengths,
+                    base_sizes=base_sizes,
+                    prompt_cache=prompt_cache,
+                    emitted=emitted_boundaries,
+                    processed_tokens=processed_tokens,
+                )
+
+        # Further prompt processing so we need to
+        #   1. Merge the KV caches and prepare for right padded prompts
+        #   2. Right pad the inputs
+        #   2. Process
+        #   3. Finalize the KV caches so they are left padded again
+        else:
+            last_inputs = mx.array([p[-1:] for p in inputs])
+            inputs = _right_pad_prompts(inputs, max_length=max_length)
+            prompt_cache = _merge_caches(caches)
+
+            for c in prompt_cache:
+                # subtract one from lengths since we don't process the last token during prefill
+                c.prepare(lengths=[l - 1 for l in lengths], right_padding=padding)
+
+            while inputs.shape[1] > 1:
+                max_allowed = inputs.shape[1] - 1
+                if boundary_enabled:
+                    n_to_process = self._next_boundary_limited_step(
+                        processed_tokens,
+                        lengths,
+                        base_sizes,
+                        max_allowed,
+                    )
+                else:
+                    n_to_process = min(self.prefill_step_size, max_allowed)
+
+                self.model(inputs[:, :n_to_process], cache=prompt_cache)
+                mx.eval([c.state for c in prompt_cache])
+                inputs = inputs[:, n_to_process:]
+                processed_tokens += n_to_process
+                self.prompt_progress_callback(
+                    [
+                        (uid, processed_tokens, length)
+                        for uid, length in zip(uids, lengths)
+                    ]
+                )
+                self._emit_boundary_snapshots(
+                    uids=list(uids),
+                    lengths=lengths,
+                    base_sizes=base_sizes,
+                    prompt_cache=prompt_cache,
+                    emitted=emitted_boundaries,
+                    processed_tokens=processed_tokens,
+                )
+                mx.clear_cache()
+
+            mx.eval([c.state for c in prompt_cache])
+            inputs = last_inputs
+
+        for c in prompt_cache:
+            c.finalize()
+        mx.clear_cache()
+
+        y, logprobs = self._step(
+            inputs, prompt_cache, samplers, logits_processors, tokens
+        )
+
+        self._emit_boundary_snapshots(
+            uids=list(uids),
+            lengths=lengths,
+            base_sizes=base_sizes,
+            prompt_cache=prompt_cache,
+            emitted=emitted_boundaries,
+            use_full_prompt_lengths=True,
+        )
+
+        mx.async_eval(y, logprobs)
+
+        return MLXBatch(
+            list(uids),
+            y,
+            logprobs,
+            list(max_tokens),
+            [0] * len(uids),
+            prompt_cache,
+            list(samplers),
+            list(logits_processors),
+            tokens,
+        )
 
 
 class SchedulingPolicy(Enum):
@@ -164,6 +440,10 @@ class Scheduler:
         self.model = model
         self.tokenizer = tokenizer
         self.config = config or SchedulerConfig()
+
+        # For strict RotatingKVCache reuse, align paged cache block size to
+        # the model's rotating window size when paged cache is enabled.
+        self._align_block_size_with_rotating_window()
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -305,6 +585,71 @@ class Scheduler:
 
         return max_blocks
 
+    def _collect_rotating_window_sizes(
+        self,
+        cache_obj: Any,
+        window_sizes: Set[int],
+    ) -> None:
+        """Collect rotating window sizes recursively from cache objects."""
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)):
+            for sub_cache in sub_caches:
+                self._collect_rotating_window_sizes(sub_cache, window_sizes)
+
+        class_name = type(cache_obj).__name__
+        if class_name in ("RotatingKVCache", "BatchRotatingKVCache"):
+            max_size = getattr(cache_obj, "max_size", 0)
+            if isinstance(max_size, int) and max_size > 0:
+                window_sizes.add(max_size)
+
+    def _detect_rotating_window_sizes(self) -> Set[int]:
+        """Detect rotating window sizes from model.make_cache() if available."""
+        if not hasattr(self.model, "make_cache"):
+            return set()
+
+        try:
+            cache_list = self.model.make_cache()
+        except Exception as e:
+            logger.debug(f"Failed to inspect model rotating window sizes: {e}")
+            return set()
+
+        window_sizes: Set[int] = set()
+        for cache_obj in cache_list:
+            self._collect_rotating_window_sizes(cache_obj, window_sizes)
+
+        return window_sizes
+
+    def _align_block_size_with_rotating_window(self) -> None:
+        """
+        Align paged cache block size with RotatingKVCache window size.
+
+        Strict rotating snapshot restore assumes block boundaries coincide with
+        the rotating window size.
+        """
+        if not self.config.paged_ssd_cache_dir:
+            return
+
+        window_sizes = self._detect_rotating_window_sizes()
+        if not window_sizes:
+            return
+
+        if len(window_sizes) > 1:
+            raise ValueError(
+                "Multiple RotatingKVCache window sizes detected "
+                f"({sorted(window_sizes)}). Set a single aligned block size or "
+                "disable paged cache for this model."
+            )
+
+        target_block_size = next(iter(window_sizes))
+        if self.config.paged_cache_block_size != target_block_size:
+            logger.warning(
+                "Aligning paged cache block_size=%s to RotatingKVCache "
+                "window_size=%s for strict boundary snapshots",
+                self.config.paged_cache_block_size,
+                target_block_size,
+            )
+            self.config.paged_cache_block_size = target_block_size
+
     def _get_stop_tokens(self) -> Set[int]:
         """Get stop token IDs from tokenizer."""
         stop_tokens = set()
@@ -444,7 +789,7 @@ class Scheduler:
         if sampling_params.stop_token_ids:
             stop_tokens.update(sampling_params.stop_token_ids)
 
-        return BatchGenerator(
+        return _BoundarySnapshotBatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
             stop_tokens=stop_tokens,
@@ -453,6 +798,12 @@ class Scheduler:
             prefill_batch_size=self.config.prefill_batch_size,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
+            boundary_block_size=self.config.paged_cache_block_size,
+            prefill_boundary_callback=(
+                self._on_prefill_boundary_snapshot
+                if self.block_aware_cache is not None
+                else None
+            ),
         )
 
     def _build_sampler_and_processors(
@@ -499,12 +850,13 @@ class Scheduler:
 
         class_name = type(cache_obj).__name__
 
-        # RotatingKVCache already has window-padding recovery logic.
-        if class_name in ("RotatingKVCache", "BatchRotatingKVCache"):
-            return False
-
-        # Arrays-like stateful caches need boundary-safe snapshots.
-        if class_name in ("ArraysCache", "SizedArraysCache"):
+        # Stateful non-sliceable caches require boundary-safe snapshots.
+        if class_name in (
+            "RotatingKVCache",
+            "BatchRotatingKVCache",
+            "ArraysCache",
+            "SizedArraysCache",
+        ):
             return True
 
         if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
@@ -518,6 +870,48 @@ class Scheduler:
             return True
 
         return False
+
+    def _cache_list_needs_boundary_snapshot(self, cache_list: List[Any]) -> bool:
+        """Return True if any layer cache requires boundary snapshots."""
+        if not cache_list:
+            return False
+        return any(
+            self._cache_tree_has_stateful_non_sliceable(layer_cache)
+            for layer_cache in cache_list
+        )
+
+    def _on_prefill_boundary_snapshot(
+        self,
+        uid: int,
+        snapshot_cache: List[Any],
+        token_count: int,
+    ) -> None:
+        """Record boundary snapshots captured during prefill processing."""
+        if self.block_aware_cache is None:
+            return
+
+        block_size = self.config.paged_cache_block_size
+        if block_size <= 0 or token_count <= 0 or token_count % block_size != 0:
+            return
+
+        request_id = self.uid_to_request_id.get(uid)
+        if request_id is None:
+            return
+
+        if not self._cache_list_needs_boundary_snapshot(snapshot_cache):
+            return
+
+        prev_snapshot = self._boundary_cache_snapshots.get(request_id)
+        if prev_snapshot is not None and prev_snapshot[1] >= token_count:
+            return
+
+        self._boundary_cache_snapshots[request_id] = (snapshot_cache, token_count)
+        self._boundary_snapshot_required = True
+        logger.debug(
+            "Captured prefill boundary cache snapshot for %s at %s tokens",
+            request_id,
+            token_count,
+        )
 
     def _detect_boundary_snapshot_need(self) -> bool:
         """
@@ -694,6 +1088,109 @@ class Scheduler:
 
         return True
 
+    def _normalize_rotating_snapshot_state(
+        self,
+        layer_cache: Any,
+        state: Tuple[Any, Any],
+        meta_state: Any,
+    ) -> Tuple[Tuple[Any, Any], Tuple[str, str, str, str]]:
+        """
+        Normalize RotatingKVCache state into merge-safe canonical form.
+
+        Boundary snapshots captured mid-prefill can expose oversized rotating
+        buffers (e.g., max_size + chunk_size - 1). Those states are valid for
+        in-flight prefill but break BatchRotatingKVCache.merge() after SSD
+        restore because merge expects per-request rotating buffers capped to
+        max_size. This method canonicalizes to the latest max_size tokens.
+        """
+        if not isinstance(state, (list, tuple)) or len(state) < 2:
+            return state, tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
+
+        keys = state[0]
+        values = state[1]
+        if keys is None or values is None or not hasattr(keys, "shape"):
+            return state, tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
+
+        try:
+            keep = int(meta_state[0]) if meta_state and len(meta_state) >= 1 else int(getattr(layer_cache, "keep", 0))
+            max_size = int(meta_state[1]) if meta_state and len(meta_state) >= 2 else int(getattr(layer_cache, "max_size", keys.shape[2]))
+            offset = int(meta_state[2]) if meta_state and len(meta_state) >= 3 else int(getattr(layer_cache, "offset", keys.shape[2]))
+            idx = int(meta_state[3]) if meta_state and len(meta_state) >= 4 else int(getattr(layer_cache, "_idx", keys.shape[2]))
+        except Exception:
+            return state, tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
+
+        ordered_keys = keys
+        ordered_values = values
+        temporal_order = getattr(layer_cache, "_temporal_order", None)
+        if callable(temporal_order):
+            try:
+                ordered_keys = temporal_order(keys)
+                ordered_values = temporal_order(values)
+            except Exception:
+                ordered_keys = keys
+                ordered_values = values
+
+        original_len = int(ordered_keys.shape[2]) if len(ordered_keys.shape) >= 3 else 0
+        normalized_keys = ordered_keys
+        normalized_values = ordered_values
+
+        if max_size > 0 and original_len > max_size:
+            if keep > 0 and keep < max_size:
+                tail_len = max_size - keep
+                normalized_keys = mx.concatenate(
+                    [
+                        ordered_keys[..., :keep, :],
+                        ordered_keys[..., -tail_len:, :],
+                    ],
+                    axis=2,
+                )
+                normalized_values = mx.concatenate(
+                    [
+                        ordered_values[..., :keep, :],
+                        ordered_values[..., -tail_len:, :],
+                    ],
+                    axis=2,
+                )
+            else:
+                normalized_keys = ordered_keys[..., -max_size:, :]
+                normalized_values = ordered_values[..., -max_size:, :]
+
+            try:
+                normalized_keys = mx.contiguous(normalized_keys)
+                normalized_values = mx.contiguous(normalized_values)
+            except Exception:
+                pass
+
+        normalized_len = int(normalized_keys.shape[2]) if len(normalized_keys.shape) >= 3 else 0
+        effective_offset = max(0, offset)
+        if max_size > 0 and effective_offset >= max_size:
+            normalized_idx = min(normalized_len, max_size)
+        elif effective_offset > 0:
+            normalized_idx = min(normalized_len, effective_offset)
+        else:
+            normalized_idx = min(normalized_len, max(0, idx))
+
+        normalized_meta = (
+            str(keep),
+            str(max_size),
+            str(offset),
+            str(normalized_idx),
+        )
+
+        if original_len != normalized_len or idx != normalized_idx:
+            logger.debug(
+                "Normalized RotatingKVCache snapshot: len %s->%s, idx %s->%s, "
+                "offset=%s, max_size=%s",
+                original_len,
+                normalized_len,
+                idx,
+                normalized_idx,
+                offset,
+                max_size,
+            )
+
+        return (normalized_keys, normalized_values), normalized_meta
+
     def _extract_cache_states(
         self,
         raw_cache: List[Any],
@@ -787,6 +1284,14 @@ class Scheduler:
 
                 if hasattr(layer_cache, 'state'):
                     state = layer_cache.state
+                    meta = getattr(layer_cache, 'meta_state', ())
+
+                    if class_name in ('RotatingKVCache', 'BatchRotatingKVCache'):
+                        state, meta = self._normalize_rotating_snapshot_state(
+                            layer_cache,
+                            state,
+                            meta,
+                        )
 
                     # Handle different state formats
                     if isinstance(state, (list, tuple)) and len(state) >= 2:
@@ -803,7 +1308,6 @@ class Scheduler:
                                 )
                                 return [], None  # Return empty - cache is corrupted
 
-                        meta = getattr(layer_cache, 'meta_state', ())
                         extracted.append({
                             'state': state,
                             'meta_state': meta,
@@ -895,6 +1399,51 @@ class Scheduler:
                     request.shared_prefix_blocks = len(block_table.block_ids)
                     # Recalculate remaining_tokens in case block_table was truncated
                     request.remaining_tokens = request.prompt_token_ids[block_table.num_tokens:]
+                    # For exact prefix hits we need cache state at (N-1) and the
+                    # last prompt token as input to produce the first decode logit.
+                    # Reusing cache state at N and feeding the last token again
+                    # shifts the model state and can change greedy output.
+                    if len(request.remaining_tokens) == 0 and request.cached_tokens > 0:
+                        if self._cache_list_needs_boundary_snapshot(request.prompt_cache):
+                            # Stateful non-sliceable caches (Rotating/Arrays)
+                            # cannot be safely converted from N to N-1 state
+                            # without cache-type-specific logic.
+                            if self.paged_cache_manager is not None:
+                                self.paged_cache_manager.delete_block_table(request.request_id)
+                            request.prompt_cache = None
+                            request.block_table = None
+                            request.cached_tokens = 0
+                            request.shared_prefix_blocks = 0
+                            request.remaining_tokens = request.prompt_token_ids
+                            logger.debug(
+                                f"Request {request.request_id}: exact cache hit with "
+                                f"stateful cache type, falling back to full prefill "
+                                f"for deterministic kickoff"
+                            )
+                        elif self._trim_prompt_cache_for_generation(request.prompt_cache):
+                            request.cached_tokens = max(0, request.cached_tokens - 1)
+                            request.remaining_tokens = request.prompt_token_ids[-1:]
+                            logger.debug(
+                                f"Request {request.request_id}: exact cache hit adjusted "
+                                f"to N-1 state for generation kickoff "
+                                f"(cached_tokens={request.cached_tokens}, "
+                                f"remaining={len(request.remaining_tokens)})"
+                            )
+                        else:
+                            # Fallback to full recompute when cache layers cannot
+                            # be safely trimmed by one token (e.g., non-trimmable
+                            # recurrent state caches).
+                            if self.paged_cache_manager is not None:
+                                self.paged_cache_manager.delete_block_table(request.request_id)
+                            request.prompt_cache = None
+                            request.block_table = None
+                            request.cached_tokens = 0
+                            request.shared_prefix_blocks = 0
+                            request.remaining_tokens = request.prompt_token_ids
+                            logger.debug(
+                                f"Request {request.request_id}: exact cache hit could "
+                                f"not be trimmed safely, falling back to full prefill"
+                            )
                     if block_table.num_tokens < original_tokens:
                         logger.debug(
                             f"Request {request.request_id}: partial cache hit, "
@@ -930,6 +1479,34 @@ class Scheduler:
         logger.debug(
             f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
         )
+
+    def _trim_prompt_cache_for_generation(self, cache_list: List[Any]) -> bool:
+        """Trim each cache layer by one token for exact-hit generation kickoff."""
+        if not cache_list:
+            return False
+
+        for cache_obj in cache_list:
+            if not self._trim_cache_tree_by_one(cache_obj):
+                return False
+        return True
+
+    def _trim_cache_tree_by_one(self, cache_obj: Any) -> bool:
+        """Trim one token from cache object (recursively for CacheList)."""
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)):
+            return all(self._trim_cache_tree_by_one(sub_cache) for sub_cache in sub_caches)
+
+        trim_fn = getattr(cache_obj, "trim", None)
+        if not callable(trim_fn):
+            return False
+
+        try:
+            trimmed = trim_fn(1)
+            if trimmed is None:
+                return True
+            return int(trimmed) >= 1
+        except Exception:
+            return False
 
     def _remove_uid_from_active_batch(self, uid: int) -> None:
         """Remove UID from active batch safely on generation_stream."""

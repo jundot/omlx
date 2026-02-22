@@ -403,6 +403,40 @@ class RotatingKVCacheHandler(CacheTypeHandler):
             offset = state.get("offset", keys.shape[2])
             _idx = state.get("_idx", 0)
 
+        # Backward-compatible canonicalization for oversized rotating snapshots.
+        # Older snapshots could persist prefill-internal states where seq_len >
+        # max_size (e.g., max_size + chunk_size - 1). Those states are not
+        # merge-safe when reintroduced as per-request prompt caches.
+        if (
+            hasattr(keys, "shape")
+            and len(keys.shape) >= 3
+            and max_size > 0
+            and keys.shape[2] > max_size
+        ):
+            if keep > 0 and keep < max_size and HAS_MLX and mx is not None:
+                tail_len = max_size - keep
+                keys = mx.concatenate(
+                    [keys[..., :keep, :], keys[..., -tail_len:, :]],
+                    axis=2,
+                )
+                values = mx.concatenate(
+                    [values[..., :keep, :], values[..., -tail_len:, :]],
+                    axis=2,
+                )
+            else:
+                keys = keys[..., -max_size:, :]
+                values = values[..., -max_size:, :]
+
+            if HAS_MLX and mx is not None:
+                keys = mx.contiguous(keys)
+                values = mx.contiguous(values)
+
+            _idx = min(max_size, keys.shape[2])
+
+        if hasattr(keys, "shape") and len(keys.shape) >= 3:
+            seq_len = keys.shape[2]
+            _idx = min(max(0, int(_idx)), seq_len, max_size if max_size > 0 else seq_len)
+
         cache = RotatingKVCache(max_size=max_size, keep=keep)
         cache.keys = keys
         cache.values = values

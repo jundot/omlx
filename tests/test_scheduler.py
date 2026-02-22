@@ -243,6 +243,108 @@ class TestSchedulerAddRequest:
         assert len(scheduler.requests) == 5
         assert len(scheduler.waiting) == 5
 
+    def test_add_request_exact_cache_hit_trims_one_token(
+        self, mock_model, mock_tokenizer
+    ):
+        """Exact cache hit should use (N-1) cache + last token for kickoff."""
+        from omlx.cache.paged_cache import BlockTable
+
+        class TrimCache:
+            def __init__(self):
+                self.trim_calls = 0
+
+            def trim(self, n):
+                self.trim_calls += 1
+                return n
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+
+        block_table = BlockTable(request_id="req-exact", block_ids=[1, 2], num_tokens=4)
+        trim_cache_a = TrimCache()
+        trim_cache_b = TrimCache()
+
+        scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [])
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [trim_cache_a, trim_cache_b]
+
+        request = Request(
+            request_id="req-exact",
+            prompt=[11, 12, 13, 14],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert request.cached_tokens == 3
+        assert request.remaining_tokens == [14]
+        assert request.prompt_cache is not None
+        assert trim_cache_a.trim_calls == 1
+        assert trim_cache_b.trim_calls == 1
+
+    def test_add_request_exact_cache_hit_falls_back_if_not_trimmable(
+        self, mock_model, mock_tokenizer
+    ):
+        """Exact cache hit should fallback when any layer cannot trim."""
+        from omlx.cache.paged_cache import BlockTable
+
+        class NonTrimmableCache:
+            pass
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+
+        block_table = BlockTable(request_id="req-fallback", block_ids=[3], num_tokens=4)
+        scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [])
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [NonTrimmableCache()]
+
+        request = Request(
+            request_id="req-fallback",
+            prompt=[21, 22, 23, 24],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert request.cached_tokens == 0
+        assert request.remaining_tokens == [21, 22, 23, 24]
+        assert request.prompt_cache is None
+        scheduler.paged_cache_manager.delete_block_table.assert_called_once_with("req-fallback")
+
+    def test_add_request_exact_cache_hit_rotating_forces_fallback(
+        self, mock_model, mock_tokenizer
+    ):
+        """Rotating cache exact hit should fallback to full prefill."""
+        from omlx.cache.paged_cache import BlockTable
+
+        RotatingCacheWithTrim = type(
+            "RotatingKVCache",
+            (),
+            {"trim": lambda self, n: n},
+        )
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+
+        block_table = BlockTable(request_id="req-rotating", block_ids=[9], num_tokens=4)
+        scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [])
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [RotatingCacheWithTrim()]
+
+        request = Request(
+            request_id="req-rotating",
+            prompt=[31, 32, 33, 34],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert request.cached_tokens == 0
+        assert request.remaining_tokens == [31, 32, 33, 34]
+        assert request.prompt_cache is None
+        scheduler.paged_cache_manager.delete_block_table.assert_called_once_with("req-rotating")
+
 
 class TestSchedulerAbortRequest:
     """Tests for Scheduler.abort_request()."""
@@ -686,6 +788,116 @@ class TestSchedulerBoundarySnapshots:
             mock_mx.synchronize.assert_called()
             mock_mx.stream.assert_called()
 
+    def test_prefill_boundary_snapshot_records_rotating_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        """Prefill callback should store rotating boundary snapshots."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+
+        request = Request(
+            request_id="req-prefill-boundary",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        uid = 77
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+        scheduler.request_id_to_uid[request.request_id] = uid
+        scheduler.uid_to_request_id[uid] = request.request_id
+
+        RotatingStub = type("RotatingKVCache", (), {})
+        snapshot_cache = [RotatingStub()]
+
+        scheduler._on_prefill_boundary_snapshot(uid, snapshot_cache, 4)
+
+        assert scheduler._boundary_cache_snapshots[request.request_id][0] == snapshot_cache
+        assert scheduler._boundary_cache_snapshots[request.request_id][1] == 4
+        assert scheduler._boundary_snapshot_required is True
+
+    def test_prefill_boundary_snapshot_ignores_non_boundary_token_count(
+        self, mock_model, mock_tokenizer
+    ):
+        """Prefill callback should ignore non-boundary token counts."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+
+        request = Request(
+            request_id="req-prefill-non-boundary",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        uid = 78
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+        scheduler.request_id_to_uid[request.request_id] = uid
+        scheduler.uid_to_request_id[uid] = request.request_id
+
+        RotatingStub = type("RotatingKVCache", (), {})
+        scheduler._on_prefill_boundary_snapshot(uid, [RotatingStub()], 3)
+
+        assert request.request_id not in scheduler._boundary_cache_snapshots
+
+
+class TestSchedulerRotatingBlockAlignment:
+    """Tests for rotating window/block-size alignment."""
+
+    def test_aligns_block_size_to_rotating_window(self, mock_tokenizer):
+        RotatingStub = type("RotatingKVCache", (), {})
+
+        class RotatingModel:
+            def __init__(self):
+                self.config = MagicMock()
+                self.config.num_hidden_layers = 1
+
+            def make_cache(self):
+                cache = RotatingStub()
+                cache.max_size = 128
+                return [cache]
+
+        scheduler = Scheduler(
+            model=RotatingModel(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=256),
+        )
+        scheduler.config.paged_ssd_cache_dir = "/tmp/cache"
+        scheduler._align_block_size_with_rotating_window()
+
+        assert scheduler.config.paged_cache_block_size == 128
+
+    def test_multiple_rotating_window_sizes_raise(self, mock_tokenizer):
+        RotatingStub = type("RotatingKVCache", (), {})
+
+        class MultiRotatingModel:
+            def __init__(self):
+                self.config = MagicMock()
+                self.config.num_hidden_layers = 2
+
+            def make_cache(self):
+                c1 = RotatingStub()
+                c1.max_size = 128
+                c2 = RotatingStub()
+                c2.max_size = 256
+                return [c1, c2]
+
+        scheduler = Scheduler(
+            model=MultiRotatingModel(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=256),
+        )
+        scheduler.config.paged_ssd_cache_dir = "/tmp/cache"
+
+        with pytest.raises(ValueError):
+            scheduler._align_block_size_with_rotating_window()
+
     def test_cleanup_finished_skips_remove_when_uid_not_in_active_batch(
         self, mock_model, mock_tokenizer
     ):
@@ -818,3 +1030,38 @@ class TestExtractCacheStatesCacheList:
         assert len(extracted) == 1
         assert extracted[0]['class_name'] == 'CacheList'
         assert isinstance(extracted[0]['state'], list)
+
+
+class TestExtractCacheStatesRotatingNormalization:
+    """Tests for RotatingKVCache snapshot normalization during extraction."""
+
+    def test_extract_cache_states_normalizes_oversized_rotating_snapshot(
+        self, mock_model, mock_tokenizer
+    ):
+        """Oversized rotating snapshot should be canonicalized to max_size."""
+        mx = pytest.importorskip("mlx.core")
+        cache_mod = pytest.importorskip("mlx_lm.models.cache")
+        RotatingKVCache = cache_mod.RotatingKVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        rotating = RotatingKVCache(max_size=128, keep=0)
+        rotating.keys = mx.arange(255).reshape(1, 1, 255, 1)
+        rotating.values = mx.arange(1000, 1255).reshape(1, 1, 255, 1)
+        rotating.offset = 1280
+        rotating._idx = 255
+
+        expected_keys = rotating.keys[..., -128:, :]
+        expected_values = rotating.values[..., -128:, :]
+
+        extracted, _ = scheduler._extract_cache_states([rotating])
+
+        assert len(extracted) == 1
+        normalized_keys, normalized_values = extracted[0]["state"]
+        normalized_meta = tuple(extracted[0]["meta_state"])
+
+        assert normalized_keys.shape == (1, 1, 128, 1)
+        assert normalized_values.shape == (1, 1, 128, 1)
+        assert bool(mx.all(normalized_keys == expected_keys).item())
+        assert bool(mx.all(normalized_values == expected_values).item())
+        assert normalized_meta == ("0", "128", "1280", "128")
