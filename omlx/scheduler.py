@@ -143,27 +143,28 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         lengths: List[int],
         base_sizes: List[int],
         max_allowed: int,
+        target_boundaries: List[Optional[int]],
     ) -> int:
         n_to_process = min(self.prefill_step_size, max_allowed)
         if n_to_process <= 1:
             return max(1, n_to_process)
 
-        block_size = self._boundary_block_size
         next_delta: Optional[int] = None
 
-        for length, base in zip(lengths, base_sizes):
+        for length, base, target_boundary in zip(lengths, base_sizes, target_boundaries):
+            if target_boundary is None:
+                continue
+
             prefill_limit = max(length - 1, 0)
             if processed_tokens >= prefill_limit:
                 continue
 
             current_prefill = min(processed_tokens, prefill_limit)
             current_total = base + current_prefill
-            final_total = base + prefill_limit
-            next_boundary = ((current_total // block_size) + 1) * block_size
-            if next_boundary > final_total:
+            if current_total >= target_boundary:
                 continue
 
-            target_prefill = next_boundary - base
+            target_prefill = target_boundary - base
             delta = target_prefill - processed_tokens
             if delta <= 0:
                 continue
@@ -227,6 +228,20 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         processed_tokens = 0
         boundary_enabled = self._boundary_capture_enabled()
         base_sizes = self._cache_base_sizes(caches) if boundary_enabled else []
+        target_boundaries: List[Optional[int]] = []
+        if boundary_enabled:
+            block_size = self._boundary_block_size
+            for length, base in zip(lengths, base_sizes):
+                full_total = base + max(length, 0)
+                if full_total <= 0 or full_total % block_size == 0:
+                    target_boundaries.append(None)
+                    continue
+
+                # Capture only the last full boundary below the full prompt
+                # length. This avoids splitting prefill at every boundary.
+                target_boundary = (full_total // block_size) * block_size
+                target_boundaries.append(target_boundary if target_boundary > base else None)
+
         emitted_boundaries: Dict[int, int] = {uid: -1 for uid in uids}
 
         # New prompts so
@@ -244,6 +259,7 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                         lengths,
                         base_sizes,
                         max_allowed,
+                        target_boundaries,
                     )
                 else:
                     n_to_process = min(self.prefill_step_size, max_allowed)
@@ -289,6 +305,7 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                         lengths,
                         base_sizes,
                         max_allowed,
+                        target_boundaries,
                     )
                 else:
                     n_to_process = min(self.prefill_step_size, max_allowed)
