@@ -1088,6 +1088,109 @@ class Scheduler:
 
         return True
 
+    def _normalize_rotating_snapshot_state(
+        self,
+        layer_cache: Any,
+        state: Tuple[Any, Any],
+        meta_state: Any,
+    ) -> Tuple[Tuple[Any, Any], Tuple[str, str, str, str]]:
+        """
+        Normalize RotatingKVCache state into merge-safe canonical form.
+
+        Boundary snapshots captured mid-prefill can expose oversized rotating
+        buffers (e.g., max_size + chunk_size - 1). Those states are valid for
+        in-flight prefill but break BatchRotatingKVCache.merge() after SSD
+        restore because merge expects per-request rotating buffers capped to
+        max_size. This method canonicalizes to the latest max_size tokens.
+        """
+        if not isinstance(state, (list, tuple)) or len(state) < 2:
+            return state, tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
+
+        keys = state[0]
+        values = state[1]
+        if keys is None or values is None or not hasattr(keys, "shape"):
+            return state, tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
+
+        try:
+            keep = int(meta_state[0]) if meta_state and len(meta_state) >= 1 else int(getattr(layer_cache, "keep", 0))
+            max_size = int(meta_state[1]) if meta_state and len(meta_state) >= 2 else int(getattr(layer_cache, "max_size", keys.shape[2]))
+            offset = int(meta_state[2]) if meta_state and len(meta_state) >= 3 else int(getattr(layer_cache, "offset", keys.shape[2]))
+            idx = int(meta_state[3]) if meta_state and len(meta_state) >= 4 else int(getattr(layer_cache, "_idx", keys.shape[2]))
+        except Exception:
+            return state, tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
+
+        ordered_keys = keys
+        ordered_values = values
+        temporal_order = getattr(layer_cache, "_temporal_order", None)
+        if callable(temporal_order):
+            try:
+                ordered_keys = temporal_order(keys)
+                ordered_values = temporal_order(values)
+            except Exception:
+                ordered_keys = keys
+                ordered_values = values
+
+        original_len = int(ordered_keys.shape[2]) if len(ordered_keys.shape) >= 3 else 0
+        normalized_keys = ordered_keys
+        normalized_values = ordered_values
+
+        if max_size > 0 and original_len > max_size:
+            if keep > 0 and keep < max_size:
+                tail_len = max_size - keep
+                normalized_keys = mx.concatenate(
+                    [
+                        ordered_keys[..., :keep, :],
+                        ordered_keys[..., -tail_len:, :],
+                    ],
+                    axis=2,
+                )
+                normalized_values = mx.concatenate(
+                    [
+                        ordered_values[..., :keep, :],
+                        ordered_values[..., -tail_len:, :],
+                    ],
+                    axis=2,
+                )
+            else:
+                normalized_keys = ordered_keys[..., -max_size:, :]
+                normalized_values = ordered_values[..., -max_size:, :]
+
+            try:
+                normalized_keys = mx.contiguous(normalized_keys)
+                normalized_values = mx.contiguous(normalized_values)
+            except Exception:
+                pass
+
+        normalized_len = int(normalized_keys.shape[2]) if len(normalized_keys.shape) >= 3 else 0
+        effective_offset = max(0, offset)
+        if max_size > 0 and effective_offset >= max_size:
+            normalized_idx = min(normalized_len, max_size)
+        elif effective_offset > 0:
+            normalized_idx = min(normalized_len, effective_offset)
+        else:
+            normalized_idx = min(normalized_len, max(0, idx))
+
+        normalized_meta = (
+            str(keep),
+            str(max_size),
+            str(offset),
+            str(normalized_idx),
+        )
+
+        if original_len != normalized_len or idx != normalized_idx:
+            logger.debug(
+                "Normalized RotatingKVCache snapshot: len %s->%s, idx %s->%s, "
+                "offset=%s, max_size=%s",
+                original_len,
+                normalized_len,
+                idx,
+                normalized_idx,
+                offset,
+                max_size,
+            )
+
+        return (normalized_keys, normalized_values), normalized_meta
+
     def _extract_cache_states(
         self,
         raw_cache: List[Any],
@@ -1181,6 +1284,14 @@ class Scheduler:
 
                 if hasattr(layer_cache, 'state'):
                     state = layer_cache.state
+                    meta = getattr(layer_cache, 'meta_state', ())
+
+                    if class_name in ('RotatingKVCache', 'BatchRotatingKVCache'):
+                        state, meta = self._normalize_rotating_snapshot_state(
+                            layer_cache,
+                            state,
+                            meta,
+                        )
 
                     # Handle different state formats
                     if isinstance(state, (list, tuple)) and len(state) >= 2:
@@ -1197,7 +1308,6 @@ class Scheduler:
                                 )
                                 return [], None  # Return empty - cache is corrupted
 
-                        meta = getattr(layer_cache, 'meta_state', ())
                         extracted.append({
                             'state': state,
                             'meta_state': meta,

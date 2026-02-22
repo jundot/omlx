@@ -928,3 +928,38 @@ class TestExtractCacheStatesCacheList:
         assert len(extracted) == 1
         assert extracted[0]['class_name'] == 'CacheList'
         assert isinstance(extracted[0]['state'], list)
+
+
+class TestExtractCacheStatesRotatingNormalization:
+    """Tests for RotatingKVCache snapshot normalization during extraction."""
+
+    def test_extract_cache_states_normalizes_oversized_rotating_snapshot(
+        self, mock_model, mock_tokenizer
+    ):
+        """Oversized rotating snapshot should be canonicalized to max_size."""
+        mx = pytest.importorskip("mlx.core")
+        cache_mod = pytest.importorskip("mlx_lm.models.cache")
+        RotatingKVCache = cache_mod.RotatingKVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        rotating = RotatingKVCache(max_size=128, keep=0)
+        rotating.keys = mx.arange(255).reshape(1, 1, 255, 1)
+        rotating.values = mx.arange(1000, 1255).reshape(1, 1, 255, 1)
+        rotating.offset = 1280
+        rotating._idx = 255
+
+        expected_keys = rotating.keys[..., -128:, :]
+        expected_values = rotating.values[..., -128:, :]
+
+        extracted, _ = scheduler._extract_cache_states([rotating])
+
+        assert len(extracted) == 1
+        normalized_keys, normalized_values = extracted[0]["state"]
+        normalized_meta = tuple(extracted[0]["meta_state"])
+
+        assert normalized_keys.shape == (1, 1, 128, 1)
+        assert normalized_values.shape == (1, 1, 128, 1)
+        assert bool(mx.all(normalized_keys == expected_keys).item())
+        assert bool(mx.all(normalized_values == expected_values).item())
+        assert normalized_meta == ("0", "128", "1280", "128")
