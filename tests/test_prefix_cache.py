@@ -1411,8 +1411,8 @@ class TestWalkBackTruncation:
         )
         assert result is None  # No valid block found
 
-    def test_walk_back_skips_rotating_kv_cache(self, mx):
-        """RotatingKVCache placeholders should not trigger walk-back."""
+    def test_walk_back_includes_rotating_kv_cache(self, mx):
+        """RotatingKVCache placeholders should walk back to latest valid block."""
         model = MockModel(num_layers=2)
         paged_cache = PagedCacheManager(
             block_size=4, max_blocks=100, model_name="test-model",
@@ -1425,11 +1425,12 @@ class TestWalkBackTruncation:
         )
 
         placeholder = (mx.zeros((1,)), mx.zeros((1,)))
+        rotating_real = (mx.ones((1, 8, 4, 64)), mx.ones((1, 8, 4, 64)))
         kv = (mx.ones((1, 8, 4, 64)), mx.ones((1, 8, 4, 64)))
 
-        # Both layers are types with built-in recovery
+        # Last block placeholder, previous block valid rotating state.
         all_block_data = [
-            [kv, placeholder],
+            [kv, rotating_real],
             [kv, placeholder],
         ]
         layer_cache_types = ["KVCache", "RotatingKVCache"]
@@ -1437,7 +1438,7 @@ class TestWalkBackTruncation:
         result = cache._find_walk_back_truncation_point(
             all_block_data, layer_cache_types
         )
-        assert result is None  # RotatingKVCache excluded from walk-back
+        assert result == 0
 
     # ------------------------------------------------------------------
     # Full reconstruct_cache integration with walk-back
@@ -1510,6 +1511,68 @@ class TestWalkBackTruncation:
 
         # Block 2 ref_count should have been decremented (freed)
         assert blocks[2].ref_count == 1
+
+    def test_reconstruct_rotating_cache_walks_back_to_valid_block(self, mx):
+        """Rotating partial match should walk back to latest valid block."""
+        from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+
+        mock_ssd = MagicMock(spec=PagedSSDCacheManager)
+
+        model = MockModel(num_layers=2)
+        paged_cache = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        # Allocate 3 blocks
+        blocks = []
+        for i in range(3):
+            b = paged_cache.allocate_block()
+            b.block_hash = f"hash{i}".encode()
+            b.token_count = 4
+            b.ref_count = 2  # Simulate fetch_cache having incremented ref
+            blocks.append(b)
+
+        block_table = BlockTable(
+            request_id="req-001",
+            block_ids=[b.block_id for b in blocks],
+            num_tokens=12,
+        )
+
+        kv_slice = (mx.ones((1, 8, 4, 64)), mx.ones((1, 8, 4, 64)))
+        placeholder = (mx.zeros((1,)), mx.zeros((1,)))
+        rotating_real = (mx.ones((1, 8, 4, 64)), mx.ones((1, 8, 4, 64)))
+
+        metadata = {
+            "model_name": "test-model",
+            "num_layers": 2,
+            "layer_cache_types": ["KVCache", "RotatingKVCache"],
+            "layer_meta_states": [(), (0, 4, 4, 4)],
+        }
+
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([kv_slice, placeholder], metadata),     # block 0: placeholder
+            ([kv_slice, rotating_real], metadata),   # block 1: real rotating state
+            ([kv_slice, placeholder], metadata),     # block 2: placeholder
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        # Should recover blocks 0-1 via walk-back.
+        assert result is not None
+        assert len(result) == 2
+        assert len(block_table.block_ids) == 2
+        assert block_table.num_tokens == 8
+        assert blocks[2].ref_count == 1
+
+        rotating_cache = result[1]
+        assert hasattr(rotating_cache, "max_size")
+        assert rotating_cache.max_size == 4
 
     def test_reconstruct_all_placeholders_still_rejects(self, mx):
         """When no block has valid state, walk-back finds nothing and

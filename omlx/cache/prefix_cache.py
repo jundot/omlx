@@ -617,8 +617,8 @@ class BlockAwarePrefixCache(CacheManager):
           to preserve layer count while minimizing storage
 
         During restore, a partial prefix match that ends on a placeholder block
-        is rejected. Exact block-boundary matches restore the last full rotating
-        state directly (no window-padding recomputation).
+        first attempts walk-back truncation to the latest block with valid
+        non-sliceable state. If no such block exists, the cache hit is rejected.
 
         Args:
             cache_data: List of layer states, each containing 'state': (keys, values)
@@ -812,11 +812,10 @@ class BlockAwarePrefixCache(CacheManager):
         """Find the latest block where all non-sliceable layers have valid state.
 
         In multi-turn conversations, intermediate blocks can accumulate real
-        ArraysCache/CacheList state from prior save operations while later
-        blocks only have placeholders.  This method walks backwards from the
-        last loaded block to locate the most recent block where **every**
-        non-sliceable layer (excluding RotatingKVCache, which has its own
-        empty-cache recovery) carries real state.
+        non-sliceable state (ArraysCache/RotatingKVCache/CacheList) from prior
+        save operations while later blocks only have placeholders. This method
+        walks backwards from the last loaded block to locate the most recent
+        block where **every** non-sliceable layer carries real state.
 
         Returns:
             0-based block index (inclusive) to truncate to, or ``None`` if
@@ -829,9 +828,8 @@ class BlockAwarePrefixCache(CacheManager):
         num_layers = len(all_block_data[0])
         last_idx = len(all_block_data) - 1
 
-        # Identify "problematic" layers: placeholder in the last block AND
-        # not RotatingKVCache (which has its own empty-cache + window-padding
-        # recovery path).
+        # Identify "problematic" layers: non-sliceable layer type with
+        # placeholder state in the last matched block.
         problematic_layers: List[int] = []
         for layer_idx in range(num_layers):
             cache_type = (
@@ -839,10 +837,8 @@ class BlockAwarePrefixCache(CacheManager):
                 if layer_idx < len(layer_cache_types)
                 else 'KVCache'
             )
-            # KVCache is always per-block sliced; RotatingKVCache has its own
-            # recovery.  Only check types that use last-block-only storage
-            # without a built-in fallback.
-            if cache_type in ('KVCache', 'RotatingKVCache'):
+            handler = CacheTypeRegistry.get_handler_by_class_name(cache_type)
+            if handler.supports_block_slicing:
                 continue
             if layer_idx < len(all_block_data[last_idx]):
                 if self._is_placeholder_state(all_block_data[last_idx][layer_idx]):
@@ -1198,10 +1194,10 @@ class BlockAwarePrefixCache(CacheManager):
 
             # --- Pre-scan: walk-back truncation for non-sliceable caches ---
             # If the last loaded block has a placeholder for any non-sliceable
-            # layer (ArraysCache, non-sliceable CacheList), walk backwards to
-            # find the latest block where ALL such layers carry real state.
-            # This recovers intermediate blocks from multi-turn conversations
-            # instead of rejecting the entire cache.
+            # layer (ArraysCache/RotatingKVCache/non-sliceable CacheList), walk
+            # backwards to find the latest block where ALL such layers carry
+            # real state. This recovers intermediate blocks from multi-turn
+            # conversations instead of rejecting the entire cache.
             if all_block_data and layer_cache_types:
                 trunc_idx = self._find_walk_back_truncation_point(
                     all_block_data, layer_cache_types
