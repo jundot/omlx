@@ -3,8 +3,7 @@
 Tests for hybrid caching with RotatingKVCache support.
 
 This module tests the last-block-only storage strategy for RotatingKVCache
-layers and the window padding mechanism that ensures sliding window quality
-during partial prefix restore.
+layers and strict partial-prefix rejection for boundary-safe restore.
 """
 
 import math
@@ -524,8 +523,8 @@ class TestDetectWindowPaddingFromBlocks:
         assert result.get_max_window_size() == 2048
 
 
-class TestFetchCacheWindowPadding:
-    """Tests for fetch_cache with window padding integration."""
+class TestFetchCachePrefixMatching:
+    """Tests for fetch_cache prefix matching behavior."""
 
     @pytest.fixture
     def paged_cache(self):
@@ -590,11 +589,10 @@ class TestFetchCacheWindowPadding:
         assert block_table is not None
         assert len(remaining) == 256
 
-    def test_fetch_cache_window_padding_eliminates_all_blocks(
+    def test_fetch_cache_hit_with_rotating_keeps_matched_blocks(
         self, prefix_cache, paged_cache, mock_ssd_cache
     ):
-        """Test window padding eliminates all blocks when too few matched."""
-        # Only 1 block matched, but window padding needs 4 blocks (1024/256=4)
+        """Rotating models no longer prune matched blocks via window padding."""
         tokens = list(range(256))
         block = paged_cache.allocate_block()
         block.token_count = 256
@@ -617,9 +615,9 @@ class TestFetchCacheWindowPadding:
         extended_tokens = tokens + list(range(256, 512))
         block_table, remaining = prefix_cache.fetch_cache("req-001", extended_tokens)
 
-        # Should be cache miss because padding eliminates the single matched block
-        assert block_table is None
-        assert remaining == extended_tokens
+        assert block_table is not None
+        assert block_table.num_tokens == 256
+        assert remaining == extended_tokens[256:]
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
@@ -877,10 +875,10 @@ class TestReconstructCachePartialRestore:
         mock.save_block.return_value = True
         return mock
 
-    def test_partial_restore_creates_empty_rotating_cache(
+    def test_partial_restore_rejects_rotating_placeholder(
         self, paged_cache, mock_ssd_cache
     ):
-        """Test partial restore creates empty RotatingKVCache for placeholder-only blocks."""
+        """Partial prefix match with Rotating placeholder must be rejected."""
         model = MockModel(num_layers=2)
         prefix_cache = BlockAwarePrefixCache(
             model=model,
@@ -924,39 +922,12 @@ class TestReconstructCachePartialRestore:
 
         result = prefix_cache.reconstruct_cache(block_table)
 
-        assert result is not None
-        assert len(result) == 2
+        assert result is None
 
-        # Layer 0 (KVCache): should have concatenated keys/values
-        kv_cache = result[0]
-        assert hasattr(kv_cache, 'keys')
-        assert hasattr(kv_cache, 'values')
-        assert kv_cache.keys.shape[2] == 512  # 2 blocks * 256
-
-        # Layer 1 (RotatingKVCache): should be empty with offset matching KVCache
-        rot_cache = result[1]
-        assert hasattr(rot_cache, 'max_size')
-        assert rot_cache.max_size == 1024
-        assert rot_cache.keep == 4
-        assert rot_cache.offset == 512  # Matches valid_token_count
-        # Zero-length keys (not None) so mlx-lm uses Continuation mode
-        assert rot_cache.keys is not None
-        assert rot_cache.keys.shape == (1, 8, 0, 64)
-        assert rot_cache._idx == 0
-        assert not rot_cache.empty()
-        # size() must report 0 for correct merge padding
-        assert rot_cache.size() == 0
-
-    def test_full_restore_still_creates_empty_rotating(
+    def test_full_restore_reconstructs_rotating_state(
         self, paged_cache, mock_ssd_cache
     ):
-        """Test that even with valid RotatingKVCache data, empty cache is created.
-
-        This is by design: stored RotatingKVCache data may be stale due to block
-        hash deduplication (same hash stored by different requests with different
-        RotatingKVCache state). Always creating empty and relying on window padding
-        to reprocess ensures correctness.
-        """
+        """Exact block match should restore full RotatingKVCache state."""
         model = MockModel(num_layers=2)
         prefix_cache = BlockAwarePrefixCache(
             model=model,
@@ -1004,14 +975,15 @@ class TestReconstructCachePartialRestore:
         kv_cache = result[0]
         assert kv_cache.keys.shape[2] == 256
 
-        # Layer 1 (RotatingKVCache): always empty (ignores stored data)
+        # Layer 1 (RotatingKVCache): reconstructed from stored state
         rot_cache = result[1]
         assert rot_cache.max_size == 1024
         assert rot_cache.keep == 4
-        assert rot_cache.offset == 256  # Matches valid_token_count
+        assert rot_cache.offset == 500
         assert rot_cache.keys is not None
-        assert rot_cache.keys.shape == (1, 8, 0, 64)  # Zero-length, not full data
-        assert rot_cache._idx == 0
+        assert rot_cache.keys.shape == (1, 8, 1024, 64)
+        assert rot_cache.values.shape == (1, 8, 1024, 64)
+        assert rot_cache._idx == 100
 
 
 class TestModelCacheConfigCacheList:

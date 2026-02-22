@@ -212,11 +212,6 @@ class BlockAwarePrefixCache(CacheManager):
         """
         Find cached prefix blocks for the given tokens.
 
-        For models with RotatingKVCache layers (e.g., Gemma3), applies window
-        padding to ensure the sliding window is fully populated when generation
-        starts. This trades a small amount of cache hit rate for guaranteed
-        quality by reprocessing padding tokens.
-
         Args:
             request_id: Unique request identifier
             tokens: Input token sequence
@@ -233,30 +228,6 @@ class BlockAwarePrefixCache(CacheManager):
         shared_block_ids, remaining = self.paged_cache.find_shared_prefix(tokens)
 
         if shared_block_ids:
-            # Apply window padding for hybrid models with RotatingKVCache
-            model_cache_config = self._detect_window_padding_from_blocks(shared_block_ids)
-            if model_cache_config:
-                blocks_to_restore = self._apply_window_padding(
-                    len(shared_block_ids), model_cache_config
-                )
-                if blocks_to_restore == 0:
-                    # Padding overhead exceeds benefit, treat as cache miss
-                    self._misses += 1
-                    logger.debug(
-                        f"Cache miss for {request_id}: window padding eliminates "
-                        f"all {len(shared_block_ids)} matched blocks"
-                    )
-                    return None, tokens
-                if blocks_to_restore < len(shared_block_ids):
-                    logger.info(
-                        f"Window padding: restoring {blocks_to_restore}/{len(shared_block_ids)} "
-                        f"blocks to guarantee RotatingKVCache quality"
-                    )
-                    # Recalculate remaining tokens for fewer blocks
-                    trimmed_token_count = blocks_to_restore * self.block_size
-                    remaining = tokens[trimmed_token_count:]
-                    shared_block_ids = shared_block_ids[:blocks_to_restore]
-
             # Create block table for this request with shared blocks
             block_table = self.paged_cache.create_block_table(request_id)
 
@@ -283,28 +254,6 @@ class BlockAwarePrefixCache(CacheManager):
         best_match = self._find_best_prefix_match(tokens)
         if best_match:
             prefix_len, matched_block_ids, num_blocks = best_match
-
-            # Apply window padding for hybrid models
-            effective_block_ids = matched_block_ids[:num_blocks]
-            model_cache_config = self._detect_window_padding_from_blocks(effective_block_ids)
-            if model_cache_config:
-                blocks_to_restore = self._apply_window_padding(
-                    num_blocks, model_cache_config
-                )
-                if blocks_to_restore == 0:
-                    self._misses += 1
-                    logger.debug(
-                        f"Cache miss for {request_id}: window padding eliminates "
-                        f"all {num_blocks} matched blocks"
-                    )
-                    return None, tokens
-                if blocks_to_restore < num_blocks:
-                    logger.info(
-                        f"Window padding: restoring {blocks_to_restore}/{num_blocks} "
-                        f"blocks to guarantee RotatingKVCache quality"
-                    )
-                    num_blocks = blocks_to_restore
-                    prefix_len = num_blocks * self.block_size
 
             # Fork the matched blocks
             block_table = self.paged_cache.create_block_table(request_id)
@@ -667,9 +616,9 @@ class BlockAwarePrefixCache(CacheManager):
         - Non-last blocks: stores a placeholder (mx.zeros((1,)), mx.zeros((1,)))
           to preserve layer count while minimizing storage
 
-        This "last-block-only" strategy ensures that the same final RotatingKVCache
-        state is NOT incorrectly duplicated across all blocks. Only the last block
-        carries the valid sliding window state.
+        During restore, a partial prefix match that ends on a placeholder block
+        is rejected. Exact block-boundary matches restore the last full rotating
+        state directly (no window-padding recomputation).
 
         Args:
             cache_data: List of layer states, each containing 'state': (keys, values)
@@ -1278,43 +1227,6 @@ class BlockAwarePrefixCache(CacheManager):
                     )
                     return None
 
-                if cache_type_name == 'RotatingKVCache':
-                    # Always create empty RotatingKVCache for partial prefix restore.
-                    # Stored RotatingKVCache data in blocks may be stale (from a
-                    # different request where the block was the last block), and
-                    # block deduplication means the data is never overwritten.
-                    # Window padding ensures enough remaining tokens are reprocessed
-                    # to fully populate the sliding window from scratch.
-                    #
-                    # The empty cache uses zero-length keys (not None) so that
-                    # mlx-lm's BatchGenerator uses Continuation mode instead of
-                    # Fresh Start mode (which would ignore ALL cached KVCache data).
-                    meta_state = None
-                    if last_block_meta_states and layer_idx < len(last_block_meta_states):
-                        meta_state = last_block_meta_states[layer_idx]
-                    if meta_state is None and first_block_meta_states and layer_idx < len(first_block_meta_states):
-                        meta_state = first_block_meta_states[layer_idx]
-
-                    empty_cache = self._create_empty_rotating_cache(
-                        meta_state,
-                        kvcache_offset=valid_token_count,
-                        kv_shape_ref=self._find_kv_shape_ref(all_block_data, layer_cache_types),
-                    )
-                    if empty_cache is not None:
-                        logger.debug(
-                            f"RotatingKVCache layer {layer_idx}: creating empty cache "
-                            f"with offset={valid_token_count} "
-                            f"(will be filled during padding reprocessing)"
-                        )
-                        reconstructed_caches.append(empty_cache)
-                        continue
-                    else:
-                        logger.error(
-                            f"RotatingKVCache layer {layer_idx}: "
-                            f"cannot create empty cache (missing meta_state)"
-                        )
-                        return None
-
                 # Get meta_state for this layer based on cache type
                 meta_state = None
                 if not handler.supports_block_slicing:
@@ -1339,8 +1251,19 @@ class BlockAwarePrefixCache(CacheManager):
                     latest_values = layer_states[-1].get('values')
 
                     if cache_type_name == 'RotatingKVCache':
-                        # RotatingKVCache: use last valid 4D state
-                        # Placeholders have already been filtered out above
+                        # RotatingKVCache: strict last-block restore.
+                        # If the last matched block is a placeholder, we only
+                        # had a partial prefix hit and must reject.
+                        if (hasattr(latest_keys, 'shape')
+                                and latest_keys.shape == (1,)):
+                            logger.info(
+                                f"RotatingKVCache layer {layer_idx}: partial prefix "
+                                f"match detected (placeholder in last matched "
+                                f"block). Rejecting cache to prevent stale "
+                                f"sliding-window state."
+                            )
+                            return None
+
                         latest_state = {
                             'keys': latest_keys,
                             'values': latest_values,
@@ -1354,8 +1277,7 @@ class BlockAwarePrefixCache(CacheManager):
                         # match — the real state lives in a later block that
                         # was not matched. We must reject the entire cache
                         # because GDN recurrent state cannot be partially
-                        # reconstructed (unlike RotatingKVCache which can be
-                        # repopulated via window padding).
+                        # reconstructed.
                         if (hasattr(latest_keys, 'shape')
                                 and latest_keys.shape == (1,)):
                             logger.info(

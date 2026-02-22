@@ -686,6 +686,116 @@ class TestSchedulerBoundarySnapshots:
             mock_mx.synchronize.assert_called()
             mock_mx.stream.assert_called()
 
+    def test_prefill_boundary_snapshot_records_rotating_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        """Prefill callback should store rotating boundary snapshots."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+
+        request = Request(
+            request_id="req-prefill-boundary",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        uid = 77
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+        scheduler.request_id_to_uid[request.request_id] = uid
+        scheduler.uid_to_request_id[uid] = request.request_id
+
+        RotatingStub = type("RotatingKVCache", (), {})
+        snapshot_cache = [RotatingStub()]
+
+        scheduler._on_prefill_boundary_snapshot(uid, snapshot_cache, 4)
+
+        assert scheduler._boundary_cache_snapshots[request.request_id][0] == snapshot_cache
+        assert scheduler._boundary_cache_snapshots[request.request_id][1] == 4
+        assert scheduler._boundary_snapshot_required is True
+
+    def test_prefill_boundary_snapshot_ignores_non_boundary_token_count(
+        self, mock_model, mock_tokenizer
+    ):
+        """Prefill callback should ignore non-boundary token counts."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+
+        request = Request(
+            request_id="req-prefill-non-boundary",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        uid = 78
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+        scheduler.request_id_to_uid[request.request_id] = uid
+        scheduler.uid_to_request_id[uid] = request.request_id
+
+        RotatingStub = type("RotatingKVCache", (), {})
+        scheduler._on_prefill_boundary_snapshot(uid, [RotatingStub()], 3)
+
+        assert request.request_id not in scheduler._boundary_cache_snapshots
+
+
+class TestSchedulerRotatingBlockAlignment:
+    """Tests for rotating window/block-size alignment."""
+
+    def test_aligns_block_size_to_rotating_window(self, mock_tokenizer):
+        RotatingStub = type("RotatingKVCache", (), {})
+
+        class RotatingModel:
+            def __init__(self):
+                self.config = MagicMock()
+                self.config.num_hidden_layers = 1
+
+            def make_cache(self):
+                cache = RotatingStub()
+                cache.max_size = 128
+                return [cache]
+
+        scheduler = Scheduler(
+            model=RotatingModel(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=256),
+        )
+        scheduler.config.paged_ssd_cache_dir = "/tmp/cache"
+        scheduler._align_block_size_with_rotating_window()
+
+        assert scheduler.config.paged_cache_block_size == 128
+
+    def test_multiple_rotating_window_sizes_raise(self, mock_tokenizer):
+        RotatingStub = type("RotatingKVCache", (), {})
+
+        class MultiRotatingModel:
+            def __init__(self):
+                self.config = MagicMock()
+                self.config.num_hidden_layers = 2
+
+            def make_cache(self):
+                c1 = RotatingStub()
+                c1.max_size = 128
+                c2 = RotatingStub()
+                c2.max_size = 256
+                return [c1, c2]
+
+        scheduler = Scheduler(
+            model=MultiRotatingModel(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=256),
+        )
+        scheduler.config.paged_ssd_cache_dir = "/tmp/cache"
+
+        with pytest.raises(ValueError):
+            scheduler._align_block_size_with_rotating_window()
+
     def test_cleanup_finished_skips_remove_when_uid_not_in_active_batch(
         self, mock_model, mock_tokenizer
     ):
