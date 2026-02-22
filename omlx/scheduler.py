@@ -1399,6 +1399,51 @@ class Scheduler:
                     request.shared_prefix_blocks = len(block_table.block_ids)
                     # Recalculate remaining_tokens in case block_table was truncated
                     request.remaining_tokens = request.prompt_token_ids[block_table.num_tokens:]
+                    # For exact prefix hits we need cache state at (N-1) and the
+                    # last prompt token as input to produce the first decode logit.
+                    # Reusing cache state at N and feeding the last token again
+                    # shifts the model state and can change greedy output.
+                    if len(request.remaining_tokens) == 0 and request.cached_tokens > 0:
+                        if self._cache_list_needs_boundary_snapshot(request.prompt_cache):
+                            # Stateful non-sliceable caches (Rotating/Arrays)
+                            # cannot be safely converted from N to N-1 state
+                            # without cache-type-specific logic.
+                            if self.paged_cache_manager is not None:
+                                self.paged_cache_manager.delete_block_table(request.request_id)
+                            request.prompt_cache = None
+                            request.block_table = None
+                            request.cached_tokens = 0
+                            request.shared_prefix_blocks = 0
+                            request.remaining_tokens = request.prompt_token_ids
+                            logger.debug(
+                                f"Request {request.request_id}: exact cache hit with "
+                                f"stateful cache type, falling back to full prefill "
+                                f"for deterministic kickoff"
+                            )
+                        elif self._trim_prompt_cache_for_generation(request.prompt_cache):
+                            request.cached_tokens = max(0, request.cached_tokens - 1)
+                            request.remaining_tokens = request.prompt_token_ids[-1:]
+                            logger.debug(
+                                f"Request {request.request_id}: exact cache hit adjusted "
+                                f"to N-1 state for generation kickoff "
+                                f"(cached_tokens={request.cached_tokens}, "
+                                f"remaining={len(request.remaining_tokens)})"
+                            )
+                        else:
+                            # Fallback to full recompute when cache layers cannot
+                            # be safely trimmed by one token (e.g., non-trimmable
+                            # recurrent state caches).
+                            if self.paged_cache_manager is not None:
+                                self.paged_cache_manager.delete_block_table(request.request_id)
+                            request.prompt_cache = None
+                            request.block_table = None
+                            request.cached_tokens = 0
+                            request.shared_prefix_blocks = 0
+                            request.remaining_tokens = request.prompt_token_ids
+                            logger.debug(
+                                f"Request {request.request_id}: exact cache hit could "
+                                f"not be trimmed safely, falling back to full prefill"
+                            )
                     if block_table.num_tokens < original_tokens:
                         logger.debug(
                             f"Request {request.request_id}: partial cache hit, "
@@ -1434,6 +1479,34 @@ class Scheduler:
         logger.debug(
             f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
         )
+
+    def _trim_prompt_cache_for_generation(self, cache_list: List[Any]) -> bool:
+        """Trim each cache layer by one token for exact-hit generation kickoff."""
+        if not cache_list:
+            return False
+
+        for cache_obj in cache_list:
+            if not self._trim_cache_tree_by_one(cache_obj):
+                return False
+        return True
+
+    def _trim_cache_tree_by_one(self, cache_obj: Any) -> bool:
+        """Trim one token from cache object (recursively for CacheList)."""
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)):
+            return all(self._trim_cache_tree_by_one(sub_cache) for sub_cache in sub_caches)
+
+        trim_fn = getattr(cache_obj, "trim", None)
+        if not callable(trim_fn):
+            return False
+
+        try:
+            trimmed = trim_fn(1)
+            if trimmed is None:
+                return True
+            return int(trimmed) >= 1
+        except Exception:
+            return False
 
     def _remove_uid_from_active_batch(self, uid: int) -> None:
         """Remove UID from active batch safely on generation_stream."""

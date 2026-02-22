@@ -243,6 +243,108 @@ class TestSchedulerAddRequest:
         assert len(scheduler.requests) == 5
         assert len(scheduler.waiting) == 5
 
+    def test_add_request_exact_cache_hit_trims_one_token(
+        self, mock_model, mock_tokenizer
+    ):
+        """Exact cache hit should use (N-1) cache + last token for kickoff."""
+        from omlx.cache.paged_cache import BlockTable
+
+        class TrimCache:
+            def __init__(self):
+                self.trim_calls = 0
+
+            def trim(self, n):
+                self.trim_calls += 1
+                return n
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+
+        block_table = BlockTable(request_id="req-exact", block_ids=[1, 2], num_tokens=4)
+        trim_cache_a = TrimCache()
+        trim_cache_b = TrimCache()
+
+        scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [])
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [trim_cache_a, trim_cache_b]
+
+        request = Request(
+            request_id="req-exact",
+            prompt=[11, 12, 13, 14],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert request.cached_tokens == 3
+        assert request.remaining_tokens == [14]
+        assert request.prompt_cache is not None
+        assert trim_cache_a.trim_calls == 1
+        assert trim_cache_b.trim_calls == 1
+
+    def test_add_request_exact_cache_hit_falls_back_if_not_trimmable(
+        self, mock_model, mock_tokenizer
+    ):
+        """Exact cache hit should fallback when any layer cannot trim."""
+        from omlx.cache.paged_cache import BlockTable
+
+        class NonTrimmableCache:
+            pass
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+
+        block_table = BlockTable(request_id="req-fallback", block_ids=[3], num_tokens=4)
+        scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [])
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [NonTrimmableCache()]
+
+        request = Request(
+            request_id="req-fallback",
+            prompt=[21, 22, 23, 24],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert request.cached_tokens == 0
+        assert request.remaining_tokens == [21, 22, 23, 24]
+        assert request.prompt_cache is None
+        scheduler.paged_cache_manager.delete_block_table.assert_called_once_with("req-fallback")
+
+    def test_add_request_exact_cache_hit_rotating_forces_fallback(
+        self, mock_model, mock_tokenizer
+    ):
+        """Rotating cache exact hit should fallback to full prefill."""
+        from omlx.cache.paged_cache import BlockTable
+
+        RotatingCacheWithTrim = type(
+            "RotatingKVCache",
+            (),
+            {"trim": lambda self, n: n},
+        )
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+
+        block_table = BlockTable(request_id="req-rotating", block_ids=[9], num_tokens=4)
+        scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [])
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [RotatingCacheWithTrim()]
+
+        request = Request(
+            request_id="req-rotating",
+            prompt=[31, 32, 33, 34],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert request.cached_tokens == 0
+        assert request.remaining_tokens == [31, 32, 33, 34]
+        assert request.prompt_cache is None
+        scheduler.paged_cache_manager.delete_block_table.assert_called_once_with("req-rotating")
+
 
 class TestSchedulerAbortRequest:
     """Tests for Scheduler.abort_request()."""
