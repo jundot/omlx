@@ -282,6 +282,7 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     emitted=emitted_boundaries,
                     processed_tokens=processed_tokens,
                 )
+                mx.clear_cache()
 
         # Further prompt processing so we need to
         #   1. Merge the KV caches and prepare for right padded prompts
