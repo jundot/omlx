@@ -406,6 +406,14 @@ class SchedulerConfig:
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
     mlx_cache_cleanup_interval: int = 32  # Steps between mx.clear_cache() calls
 
+    # KV cache memory budget (user-facing setting)
+    max_kv_cache_memory: str = "auto"  # "auto", "disabled", or size like "8GB"
+    # Runtime-calculated max KV cache tokens per request (set during Scheduler init)
+    max_kv_size: Optional[int] = None
+    # Internal fields set by engine_pool for multi-model scenarios
+    _model_weight_bytes: Optional[int] = None
+    _available_kv_memory: Optional[int] = None
+
 
 @dataclass
 class SchedulerOutput:
@@ -585,6 +593,73 @@ class Scheduler:
 
         # Step counter for periodic cleanup
         self._step_counter = 0
+
+        # Calculate max_kv_size from memory budget if not already set
+        self._resolve_max_kv_size()
+
+    def _resolve_max_kv_size(self) -> None:
+        """Calculate max_kv_size from max_kv_cache_memory setting.
+
+        Only applies to models WITHOUT ``make_cache()``.  Models with
+        ``make_cache()`` (MLA, hybrid, ArraysCache) already manage their own
+        cache structure, and mlx-lm's BatchGenerator ignores ``max_kv_size``
+        for them.
+        """
+        if self.config.max_kv_size is not None:
+            # Already explicitly set (e.g., by engine_pool for multi-model)
+            return
+        if self.config.max_kv_cache_memory.strip().lower() == "disabled":
+            logger.info("KV cache memory limit: disabled (no max_kv_size)")
+            return
+
+        # Models with make_cache() have their own bounded cache management;
+        # BatchGenerator ignores max_kv_size for them.
+        if hasattr(self.model, "make_cache"):
+            logger.info(
+                "KV cache memory limit: skipped (model has make_cache, "
+                "BatchGenerator manages cache internally)"
+            )
+            return
+
+        try:
+            from .utils.kv_memory import (
+                calculate_max_kv_size,
+                calculate_per_token_kv_bytes,
+                resolve_kv_cache_memory_bytes,
+            )
+            from .utils.hardware import format_bytes
+
+            per_token = calculate_per_token_kv_bytes(self.model)
+            if per_token is None:
+                logger.warning(
+                    "Could not determine per-token KV bytes from model config; "
+                    "max_kv_size will not be set"
+                )
+                return
+
+            budget = resolve_kv_cache_memory_bytes(
+                setting=self.config.max_kv_cache_memory,
+                model_weight_bytes=self.config._model_weight_bytes or 0,
+                available_override=self.config._available_kv_memory,
+            )
+            if budget is None:
+                return
+
+            max_kv_size = calculate_max_kv_size(
+                model=self.model,
+                budget_bytes=budget,
+                max_concurrent=self.config.completion_batch_size,
+            )
+            if max_kv_size is not None:
+                self.config.max_kv_size = max_kv_size
+                logger.info(
+                    f"KV cache limit: max_kv_size={max_kv_size:,} tokens/request "
+                    f"(budget={format_bytes(budget)}, "
+                    f"per_token={format_bytes(per_token)}, "
+                    f"concurrent={self.config.completion_batch_size})"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to calculate max_kv_size: {e}")
 
     def _calculate_max_blocks(self) -> int:
         """
@@ -811,7 +886,7 @@ class Scheduler:
         if sampling_params.stop_token_ids:
             stop_tokens.update(sampling_params.stop_token_ids)
 
-        return _BoundarySnapshotBatchGenerator(
+        kwargs = dict(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
             stop_tokens=stop_tokens,
@@ -827,6 +902,9 @@ class Scheduler:
                 else None
             ),
         )
+        if self.config.max_kv_size is not None:
+            kwargs["max_kv_size"] = self.config.max_kv_size
+        return _BoundarySnapshotBatchGenerator(**kwargs)
 
     def _build_sampler_and_processors(
         self, sampling_params: SamplingParams

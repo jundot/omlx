@@ -348,9 +348,24 @@ class EnginePool:
                 engine = RerankerEngine(model_name=entry.model_path)
             else:
                 # BatchedEngine with continuous batching (default)
+                # Create per-model scheduler config with KV memory budget
+                import copy
+
+                model_scheduler_config = copy.copy(self._scheduler_config)
+                if model_scheduler_config.max_kv_cache_memory != "disabled":
+                    available_for_kv = (
+                        self._max_model_memory
+                        - self._current_model_memory
+                        - entry.estimated_size
+                    )
+                    model_scheduler_config._available_kv_memory = max(
+                        available_for_kv, 1 * 1024**3
+                    )
+                    model_scheduler_config._model_weight_bytes = entry.estimated_size
+
                 engine = BatchedEngine(
                     model_name=entry.model_path,
-                    scheduler_config=self._scheduler_config,
+                    scheduler_config=model_scheduler_config,
                 )
 
             await engine.start()

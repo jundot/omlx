@@ -221,6 +221,7 @@ class TestSchedulerSettings:
             "max_num_seqs": 8,
             "prefill_batch_size": 8,
             "completion_batch_size": 8,
+            "max_kv_cache_memory": "auto",
         }
 
     def test_from_dict(self):

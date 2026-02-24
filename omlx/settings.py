@@ -198,10 +198,16 @@ class SchedulerSettings:
     max_num_seqs: int = 8
     prefill_batch_size: int = 8
     completion_batch_size: int = 8
+    max_kv_cache_memory: str = "auto"  # "auto", "disabled", or size like "8GB"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return asdict(self)
+        return {
+            "max_num_seqs": self.max_num_seqs,
+            "prefill_batch_size": self.prefill_batch_size,
+            "completion_batch_size": self.completion_batch_size,
+            "max_kv_cache_memory": self.max_kv_cache_memory,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SchedulerSettings:
@@ -210,6 +216,7 @@ class SchedulerSettings:
             max_num_seqs=data.get("max_num_seqs", 8),
             prefill_batch_size=data.get("prefill_batch_size", 8),
             completion_batch_size=data.get("completion_batch_size", 8),
+            max_kv_cache_memory=data.get("max_kv_cache_memory", "auto"),
         )
 
 
@@ -541,6 +548,8 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_COMPLETION_BATCH_SIZE: {completion_batch}"
                 )
+        if max_kv_cache_mem := os.getenv("OMLX_MAX_KV_CACHE_MEMORY"):
+            self.scheduler.max_kv_cache_memory = max_kv_cache_mem
 
         # Cache settings
         if cache_enabled := os.getenv("OMLX_CACHE_ENABLED"):
@@ -600,6 +609,11 @@ class GlobalSettings:
             and args.completion_batch_size is not None
         ):
             self.scheduler.completion_batch_size = args.completion_batch_size
+        if (
+            hasattr(args, "max_kv_cache_memory")
+            and args.max_kv_cache_memory is not None
+        ):
+            self.scheduler.max_kv_cache_memory = args.max_kv_cache_memory
 
         # Cache settings
         if hasattr(args, "cache_enabled") and args.cache_enabled is not None:
@@ -758,6 +772,7 @@ class GlobalSettings:
             max_num_seqs=self.scheduler.max_num_seqs,
             prefill_batch_size=self.scheduler.prefill_batch_size,
             completion_batch_size=self.scheduler.completion_batch_size,
+            max_kv_cache_memory=self.scheduler.max_kv_cache_memory,
         )
 
     def to_dict(self) -> dict[str, Any]:

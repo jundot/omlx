@@ -14,7 +14,7 @@
                 base_path: '',
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info' },
                 model: { model_dirs: [''], max_model_memory: '' },
-                scheduler: { max_num_seqs: 8, prefill_batch_size: 8, completion_batch_size: 8 },
+                scheduler: { max_num_seqs: 8, prefill_batch_size: 8, completion_batch_size: 8, max_kv_cache_memory: 'auto' },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto' },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 40, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
@@ -28,6 +28,9 @@
             // Cache slider (0-100%)
             cachePercent: 10,
             editingCache: false,
+            // KV cache slider (0-100% of 80% system memory)
+            kvCachePercent: 0,
+            kvCacheAuto: true,
 
             // Models
             models: [],
@@ -203,6 +206,14 @@
                         // Sync the memory string value from percent
                         this.updateMemoryFromSlider();
 
+                        // Calculate KV cache slider state from stored value
+                        const kvState = this.parseKvCacheToState(
+                            this.globalSettings.scheduler.max_kv_cache_memory,
+                            this.globalSettings.system.total_memory_bytes
+                        );
+                        this.kvCacheAuto = kvState.auto;
+                        this.kvCachePercent = kvState.percent;
+
                         // Calculate cache percent from stored value (based on free space)
                         this.cachePercent = this.parseCacheToPercent(
                             this.globalSettings.cache.ssd_cache_max_size,
@@ -269,6 +280,7 @@
                             max_num_seqs: this.globalSettings.scheduler.max_num_seqs,
                             prefill_batch_size: this.globalSettings.scheduler.prefill_batch_size,
                             completion_batch_size: this.globalSettings.scheduler.completion_batch_size,
+                            max_kv_cache_memory: this.globalSettings.scheduler.max_kv_cache_memory,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
@@ -986,6 +998,49 @@
                     const bytes = gb * 1024 * 1024 * 1024;
                     this.cachePercent = Math.round((bytes / freeBytes) * 100);
                 }
+            },
+
+            // Parse KV cache setting to slider state
+            parseKvCacheToState(setting, totalBytes) {
+                if (!setting || setting === 'auto') return { auto: true, percent: 0 };
+                if (setting === 'disabled') return { auto: false, percent: 0 };
+                const maxBytes = totalBytes * 0.8;
+                if (!maxBytes) return { auto: true, percent: 0 };
+                const match = setting.match(/^(\d+(?:\.\d+)?)\s*(GB|MB|TB)?$/i);
+                if (!match) return { auto: true, percent: 0 };
+                let bytes = parseFloat(match[1]);
+                const unit = (match[2] || 'GB').toUpperCase();
+                if (unit === 'TB') bytes *= 1024 * 1024 * 1024 * 1024;
+                else if (unit === 'GB') bytes *= 1024 * 1024 * 1024;
+                else if (unit === 'MB') bytes *= 1024 * 1024;
+                const percent = Math.round((bytes / maxBytes) * 100);
+                return { auto: false, percent: Math.min(100, Math.max(0, percent)) };
+            },
+
+            // Convert KV cache percent to setting string
+            kvCachePercentToString(percent, totalBytes) {
+                if (percent === 0) return 'disabled';
+                const maxBytes = totalBytes * 0.8;
+                const bytes = Math.floor((percent / 100) * maxBytes);
+                const gb = Math.floor(bytes / (1024 * 1024 * 1024));
+                return gb < 1 ? 'disabled' : `${gb}GB`;
+            },
+
+            // Display string for KV cache slider
+            getKvCacheDisplay() {
+                if (this.kvCachePercent === 0) return 'Disabled';
+                const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
+                const maxBytes = totalBytes * 0.8;
+                const bytes = Math.floor((this.kvCachePercent / 100) * maxBytes);
+                const gb = Math.round(bytes / (1024 * 1024 * 1024));
+                return gb < 1 ? 'Disabled' : `${gb}GB`;
+            },
+
+            // Update KV cache setting from slider
+            updateKvCacheFromSlider() {
+                const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
+                this.globalSettings.scheduler.max_kv_cache_memory =
+                    this.kvCachePercentToString(this.kvCachePercent, totalBytes);
             },
 
             // Sort models

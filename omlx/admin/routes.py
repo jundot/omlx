@@ -76,6 +76,7 @@ class GlobalSettingsRequest(BaseModel):
     max_num_seqs: Optional[int] = None
     prefill_batch_size: Optional[int] = None
     completion_batch_size: Optional[int] = None
+    max_kv_cache_memory: Optional[str] = None
 
     # Cache settings
     cache_enabled: Optional[bool] = None
@@ -1087,6 +1088,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "max_num_seqs": global_settings.scheduler.max_num_seqs,
             "prefill_batch_size": global_settings.scheduler.prefill_batch_size,
             "completion_batch_size": global_settings.scheduler.completion_batch_size,
+            "max_kv_cache_memory": global_settings.scheduler.max_kv_cache_memory,
         },
         "cache": {
             "enabled": global_settings.cache.enabled,
@@ -1213,6 +1215,8 @@ async def update_global_settings(
         global_settings.scheduler.prefill_batch_size = request.prefill_batch_size
     if request.completion_batch_size is not None:
         global_settings.scheduler.completion_batch_size = request.completion_batch_size
+    if request.max_kv_cache_memory is not None:
+        global_settings.scheduler.max_kv_cache_memory = request.max_kv_cache_memory
 
     # Apply cache settings
     cache_changed = False
