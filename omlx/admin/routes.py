@@ -371,6 +371,18 @@ templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 static_dir = Path(__file__).parent / "static"
 
 
+def _static_version(path: str) -> str:
+    """Append file mtime as query string for cache busting."""
+    file_path = static_dir / path
+    if file_path.is_file():
+        mtime = int(file_path.stat().st_mtime)
+        return f"/admin/static/{path}?v={mtime}"
+    return f"/admin/static/{path}"
+
+
+templates.env.globals["static"] = _static_version
+
+
 # =============================================================================
 # State Getters (set by server.py)
 # =============================================================================

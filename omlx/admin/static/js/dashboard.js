@@ -714,7 +714,9 @@
                 const rpad = (s, w) => s.toString().padEnd(w);
                 let lines = [];
 
-                lines.push(`oMLX Benchmark — ${this.benchModelId}`);
+                lines.push('oMLX - LLM inference, optimized for your Mac');
+                lines.push('https://github.com/jundot/omlx');
+                lines.push(`Benchmark Model: ${this.benchModelId}`);
                 lines.push('='.repeat(80));
 
                 // Single Request Results

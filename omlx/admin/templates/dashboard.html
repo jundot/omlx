@@ -3,7 +3,7 @@
 {% block title %}Dashboard - oMLX Admin{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="/admin/static/css/dashboard.css">
+<link rel="stylesheet" href="{{ static('css/dashboard.css') }}">
 {% endblock %}
 
 {% block content %}
@@ -42,5 +42,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/admin/static/js/dashboard.js"></script>
+<script src="{{ static('js/dashboard.js') }}"></script>
 {% endblock %}
