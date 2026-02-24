@@ -8,6 +8,7 @@ This module provides HTTP routes for the admin panel including:
 - Global settings management
 """
 
+import asyncio
 import logging
 import os
 import shutil
@@ -1804,3 +1805,157 @@ async def delete_hf_model(
         logger.info("Model pool refreshed after deletion")
 
     return {"success": True, "message": f"Model '{model_name}' deleted"}
+
+
+# =============================================================================
+# Benchmark API Routes
+# =============================================================================
+
+
+@router.post("/api/bench/start")
+async def start_benchmark(
+    request: Request,
+    is_admin: bool = Depends(require_admin),
+):
+    """Start a benchmark run.
+
+    Validates the model, creates a benchmark run, and starts it
+    as an asyncio background task.
+    """
+    from .benchmark import (
+        BenchmarkRequest,
+        cleanup_old_runs,
+        create_run,
+        run_benchmark,
+    )
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    body = await request.json()
+    try:
+        bench_request = BenchmarkRequest(**body)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Validate model exists and is an LLM
+    entry = engine_pool.get_entry(bench_request.model_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model not found: {bench_request.model_id}"
+        )
+    if entry.model_type not in ("llm", None):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model {bench_request.model_id} is not an LLM (type: {entry.model_type})",
+        )
+
+    # Cleanup old runs
+    cleanup_old_runs()
+
+    # Create and start the benchmark
+    run = create_run(bench_request)
+    total_tests = len(bench_request.prompt_lengths) + len(bench_request.batch_sizes) * 2
+
+    run.task = asyncio.create_task(run_benchmark(run, engine_pool))
+
+    logger.info(
+        f"Benchmark started: {run.bench_id} model={bench_request.model_id} "
+        f"tests={total_tests}"
+    )
+
+    return {
+        "bench_id": run.bench_id,
+        "status": "started",
+        "total_tests": total_tests,
+    }
+
+
+@router.get("/api/bench/{bench_id}/stream")
+async def stream_benchmark(
+    bench_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Stream benchmark progress via Server-Sent Events."""
+    import json
+
+    from fastapi.responses import StreamingResponse
+
+    from .benchmark import get_run
+
+    run = get_run(bench_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Benchmark not found: {bench_id}")
+
+    async def event_generator():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(run.queue.get(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    # Send keepalive
+                    yield ": keepalive\n\n"
+                    continue
+
+                yield f"data: {json.dumps(event)}\n\n"
+
+                # Stop streaming on terminal events
+                if event.get("type") in ("done", "error"):
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/api/bench/{bench_id}/cancel")
+async def cancel_benchmark(
+    bench_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Cancel a running benchmark."""
+    from .benchmark import get_run
+
+    run = get_run(bench_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Benchmark not found: {bench_id}")
+
+    if run.status != "running":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Benchmark is not running (status: {run.status})",
+        )
+
+    if run.task and not run.task.done():
+        run.task.cancel()
+
+    return {"status": "cancelled", "bench_id": bench_id}
+
+
+@router.get("/api/bench/{bench_id}/results")
+async def get_benchmark_results(
+    bench_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Get results from a completed benchmark."""
+    from .benchmark import get_run
+
+    run = get_run(bench_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Benchmark not found: {bench_id}")
+
+    return {
+        "bench_id": run.bench_id,
+        "status": run.status,
+        "results": run.results,
+        "error": run.error_message if run.error_message else None,
+    }
