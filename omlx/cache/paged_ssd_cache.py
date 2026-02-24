@@ -22,12 +22,15 @@ import logging
 import os
 import queue
 import shutil
+import struct
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 from omlx.utils.formatting import format_bytes
 from .interface import CacheManager
@@ -50,14 +53,18 @@ except ImportError:
 def _compute_max_pending_writes() -> int:
     """Compute max pending writes queue depth based on system memory.
 
-    Scales proportionally: 512GB = 64, 32GB = 4, minimum 4.
+    The background writer now handles full safetensors file writes (not just
+    renames), so the queue needs to be deeper to absorb burst saves from
+    large requests (e.g., 64 blocks per 4096-token request).
+
+    Scales proportionally: 512GB = 256, 32GB = 32, minimum 32.
     """
     try:
         total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
         total_gb = total_bytes / (1024 ** 3)
-        return max(4, min(64, int(total_gb / 8)))
+        return max(32, min(256, int(total_gb / 2)))
     except (ValueError, OSError):
-        return 8  # Safe default
+        return 32  # Safe default
 
 
 _MAX_PENDING_WRITES = _compute_max_pending_writes()
@@ -76,6 +83,151 @@ def _encode_shape(shape) -> str:
 def _decode_shape(shape_str: str) -> tuple:
     """Decode shape string back to tuple of ints."""
     return tuple(int(d) for d in shape_str.split(","))
+
+
+# --- Safetensors dtype mapping for background-thread-safe serialization ---
+# These mappings enable writing safetensors files without any mx/Metal API,
+# bypassing the bfloat16 limitation that blocked PR #16 v2 (numpy doesn't
+# support bfloat16, but safetensors format natively does via "BF16" dtype).
+
+_MX_TO_ST_DTYPE: Dict[Any, str] = {}
+_ST_TO_MX_DTYPE: Dict[str, Any] = {}
+_ST_DTYPE_TO_NP: Dict[str, Any] = {}
+
+if HAS_MLX:
+    _MX_TO_ST_DTYPE = {
+        mx.float16: "F16",
+        mx.float32: "F32",
+        mx.bfloat16: "BF16",
+        mx.int8: "I8",
+        mx.int16: "I16",
+        mx.int32: "I32",
+        mx.int64: "I64",
+        mx.uint8: "U8",
+        mx.uint16: "U16",
+        mx.uint32: "U32",
+        mx.uint64: "U64",
+        mx.bool_: "BOOL",
+    }
+    _ST_TO_MX_DTYPE = {v: k for k, v in _MX_TO_ST_DTYPE.items()}
+
+_ST_DTYPE_TO_NP = {
+    "F16": np.float16,
+    "F32": np.float32,
+    "BF16": np.uint16,  # bfloat16 handled via uint16 view
+    "I8": np.int8,
+    "I16": np.int16,
+    "I32": np.int32,
+    "I64": np.int64,
+    "U8": np.uint8,
+    "U16": np.uint16,
+    "U32": np.uint32,
+    "U64": np.uint64,
+    "BOOL": np.bool_,
+}
+
+
+def _extract_tensor_bytes(arr: "mx.array") -> Tuple[bytes, str, List[int]]:
+    """Extract raw bytes from an evaluated mx.array.
+
+    Must be called from the inference thread after mx.eval() (Metal-safe).
+    The returned bytes can be written to disk from any thread without mx API.
+
+    For bfloat16 arrays, uses view(uint16) trick since Python's buffer
+    protocol doesn't support bfloat16 directly.
+
+    Args:
+        arr: Evaluated MLX array (must have been mx.eval'd).
+
+    Returns:
+        Tuple of (raw_bytes, safetensors_dtype_string, shape_list).
+    """
+    dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
+    shape = list(arr.shape)
+    if arr.dtype == mx.bfloat16:
+        u16 = arr.view(mx.uint16)
+        mx.eval(u16)  # noqa: S307
+        raw = bytes(memoryview(u16))
+    else:
+        raw = bytes(memoryview(arr))
+    return raw, dtype_str, shape
+
+
+def _restore_tensor_from_bytes(
+    raw: bytes, dtype_str: str, shape: List[int]
+) -> "mx.array":
+    """Restore an mx.array from raw bytes extracted by _extract_tensor_bytes.
+
+    No Metal API required — uses numpy as intermediary.
+
+    Args:
+        raw: Raw tensor bytes.
+        dtype_str: Safetensors dtype string (e.g., "F16", "BF16").
+        shape: Tensor shape as list of ints.
+
+    Returns:
+        Restored mx.array with correct dtype and shape.
+    """
+    np_dtype = _ST_DTYPE_TO_NP[dtype_str]
+    np_arr = np.frombuffer(raw, dtype=np_dtype)
+    arr = mx.array(np_arr)
+    if dtype_str == "BF16":
+        arr = arr.view(mx.bfloat16)
+    return arr.reshape(shape)
+
+
+def _write_safetensors_no_mx(
+    path: str,
+    tensors_raw: Dict[str, Tuple[bytes, str, List[int]]],
+    metadata: Optional[Dict[str, str]] = None,
+) -> int:
+    """Write a safetensors file without any mx/Metal API calls.
+
+    Safe to call from background threads. Produces files fully compatible
+    with mx.load(path, return_metadata=True).
+
+    The safetensors binary format:
+      [8 bytes: header_size as little-endian uint64]
+      [header_size bytes: JSON header]
+      [remaining bytes: concatenated tensor data]
+
+    Args:
+        path: Output file path (must include .safetensors extension).
+        tensors_raw: Dict of {name: (raw_bytes, dtype_str, shape)}.
+        metadata: Optional string-to-string metadata dict.
+
+    Returns:
+        Total file size in bytes.
+    """
+    offset = 0
+    header_tensors = {}
+    all_data = []
+
+    for name, (raw, dtype_str, shape) in tensors_raw.items():
+        header_tensors[name] = {
+            "dtype": dtype_str,
+            "shape": shape,
+            "data_offsets": [offset, offset + len(raw)],
+        }
+        all_data.append(raw)
+        offset += len(raw)
+
+    header_dict = dict(header_tensors)
+    if metadata:
+        header_dict["__metadata__"] = metadata
+
+    header_json = json.dumps(header_dict, separators=(",", ":")).encode("utf-8")
+    # Safetensors spec: header must be 8-byte aligned
+    pad = (8 - len(header_json) % 8) % 8
+    header_json += b" " * pad
+
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(header_json)))
+        f.write(header_json)
+        for d in all_data:
+            f.write(d)
+
+    return 8 + len(header_json) + offset
 
 
 def parse_size(size_str: str) -> int:
@@ -330,6 +482,19 @@ class PagedSSDCacheIndex:
         with self._lock:
             return len(self._index)
 
+    def update_file_size(self, block_hash: bytes, actual_size: int) -> None:
+        """Update file size for a block after background write completes.
+
+        Args:
+            block_hash: Block content hash.
+            actual_size: Actual file size in bytes.
+        """
+        with self._lock:
+            entry = self._index.get(block_hash)
+            if entry is not None:
+                self._total_size += (actual_size - entry.file_size)
+                entry.file_size = actual_size
+
     def get_all_hashes(self) -> List[bytes]:
         """Get all indexed block hashes."""
         with self._lock:
@@ -523,10 +688,13 @@ class PagedSSDCacheManager(CacheManager):
     def _writer_loop(self) -> None:
         """Background writer that drains the write queue.
 
-        Runs in a dedicated daemon thread. Atomically renames temp files
-        (written by the main thread via mx.save_safetensors) to their
-        final paths. This avoids any mx/Metal API calls from this thread,
-        preventing Metal command buffer assertion failures.
+        Runs in a dedicated daemon thread. Writes full safetensors files
+        using pure Python I/O (no mx/Metal API calls), then atomically
+        renames temp files to their final paths.
+
+        This is safe because save_block() extracts tensor data as raw bytes
+        on the inference thread (Metal-safe), and this thread only performs
+        standard file I/O operations.
         """
         while not self._writer_shutdown.is_set():
             try:
@@ -537,13 +705,26 @@ class PagedSSDCacheManager(CacheManager):
             if item is None:  # Sentinel for shutdown
                 break
 
-            block_hash, temp_path, file_path = item
+            block_hash, tensors_raw, metadata, file_path = item
+            temp_path = None
 
             try:
-                # Atomic rename: temp file was already written by main thread
+                # Write safetensors file using pure Python (no mx/Metal API)
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = file_path.with_name(
+                    file_path.stem + "_tmp.safetensors"
+                )
+                actual_size = _write_safetensors_no_mx(
+                    str(temp_path), tensors_raw, metadata
+                )
+
+                # Atomic rename to final path
                 os.rename(str(temp_path), str(file_path))
 
-                # Check if block was evicted while rename was pending
+                # Update index with actual file size
+                self._index.update_file_size(block_hash, actual_size)
+
+                # Check if block was evicted while write was pending
                 if not self._index.contains(block_hash):
                     logger.debug(
                         f"Block {block_hash.hex()[:16]} evicted during write, "
@@ -556,22 +737,20 @@ class PagedSSDCacheManager(CacheManager):
 
             except Exception as e:
                 logger.error(
-                    f"Background rename failed for {block_hash.hex()[:16]}: {e}"
+                    f"Background write failed for {block_hash.hex()[:16]}: {e}"
                 )
                 self._stats["errors"] += 1
-                # Remove from index since file wasn't finalized
+                # Remove from index since file wasn't written
                 self._index.remove(block_hash)
                 # Clean up temp and final files
                 for p in (temp_path, file_path):
                     try:
-                        if isinstance(p, Path) and p.exists():
+                        if p is not None and isinstance(p, Path) and p.exists():
                             p.unlink()
-                        elif isinstance(p, str) and os.path.exists(p):
-                            os.unlink(p)
                     except Exception:
                         pass
             finally:
-                # Always remove from pending writes
+                # Always remove from pending writes after file is on disk
                 with self._pending_writes_lock:
                     self._pending_writes.pop(block_hash, None)
 
@@ -702,27 +881,27 @@ class PagedSSDCacheManager(CacheManager):
             if arrays:
                 mx.eval(*arrays.values())  # noqa: S307 — MLX tensor eval, not Python eval
 
-            # Write to a temp file on the main thread using mx.save_safetensors.
-            # This preserves all dtypes (including bfloat16) and is Metal-safe
-            # because it runs on the inference thread. The background writer
-            # thread then atomically renames the temp file to the final path.
-            # This avoids calling any mx/Metal API from the background thread,
-            # which would cause Metal assertion failures.
-            #
-            # Note: mx.save_safetensors auto-appends ".safetensors" to the path,
-            # so we pass a stem without extension and track the actual output path.
-            temp_stem = file_path.with_name(file_path.stem + "_tmp")
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            mx.save_safetensors(str(temp_stem), arrays, metadata)
-            temp_path = temp_stem.with_suffix('.safetensors')
-            actual_size = temp_path.stat().st_size
+            # Extract raw bytes from evaluated tensors on the inference thread.
+            # This is Metal-safe because it uses memoryview() on evaluated arrays.
+            # For bfloat16, we use view(uint16) trick since Python's buffer
+            # protocol doesn't support bfloat16 directly.
+            # The background writer thread then writes the safetensors file
+            # using pure Python I/O — no mx/Metal API calls needed.
+            tensors_raw = {}
+            for name, arr in arrays.items():
+                tensors_raw[name] = _extract_tensor_bytes(arr)
 
-            # Add to index with actual file size
+            # Estimate file size from raw bytes (actual size set by background writer)
+            estimated_size = (
+                sum(len(raw) for raw, _, _ in tensors_raw.values()) + 1024
+            )
+
+            # Add to index with estimated file size
             now = time.time()
             block_metadata = PagedSSDBlockMetadata(
                 block_hash=block_hash,
                 file_path=file_path,
-                file_size=actual_size,
+                file_size=estimated_size,
                 token_count=token_count,
                 created_at=now,
                 last_access=now,
@@ -733,22 +912,22 @@ class PagedSSDCacheManager(CacheManager):
             )
             self._index.add(block_metadata)
 
-            # Store in pending writes for immediate read-back (zero I/O).
-            # Arrays are still mx tensors here (not numpy) since we saved
-            # from the main thread.
+            # Store in pending writes for immediate read-back.
+            # Uses raw bytes (not mx tensors) so mx.arrays can be GC'd,
+            # releasing Metal resources sooner.
             with self._pending_writes_lock:
                 self._pending_writes[block_hash] = {
-                    'arrays': arrays,
+                    'tensors_raw': tensors_raw,
                     'file_metadata': metadata,
                     'num_layers': len(cache_data),
                     'layer_cache_types': layer_cache_types,
                     'block_metadata': block_metadata,
                 }
 
-            # Enqueue atomic rename for background thread
+            # Enqueue full file write for background thread
             try:
                 self._write_queue.put_nowait(
-                    (block_hash, temp_path, file_path)
+                    (block_hash, tensors_raw, metadata, file_path)
                 )
             except queue.Full:
                 logger.warning(
@@ -758,31 +937,18 @@ class PagedSSDCacheManager(CacheManager):
                 self._index.remove(block_hash)
                 with self._pending_writes_lock:
                     self._pending_writes.pop(block_hash, None)
-                # Clean up temp file
-                try:
-                    temp_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
                 return False
 
             self._stats["saves"] += 1
             logger.debug(
                 f"Enqueued block for SSD cache write: {block_hash.hex()[:16]}..., "
-                f"size={format_bytes(actual_size)}"
+                f"size={format_bytes(estimated_size)}"
             )
             return True
 
         except Exception as e:
             logger.error(f"Failed to prepare block for SSD cache: {e}")
             self._stats["errors"] += 1
-            # Clean up temp file if it was partially written
-            try:
-                if 'temp_path' in locals():
-                    temp_path.unlink(missing_ok=True)
-                elif 'temp_stem' in locals():
-                    temp_stem.with_suffix('.safetensors').unlink(missing_ok=True)
-            except Exception:
-                pass
             return False
 
     def _reconstruct_cache_data(
@@ -871,6 +1037,23 @@ class PagedSSDCacheManager(CacheManager):
 
         return cache_data
 
+    @staticmethod
+    def _arrays_from_tensors_raw(
+        tensors_raw: Dict[str, Tuple[bytes, str, List[int]]]
+    ) -> Dict[str, "mx.array"]:
+        """Convert raw bytes dict back to mx.array dict for _reconstruct_cache_data.
+
+        Args:
+            tensors_raw: Dict of {name: (raw_bytes, dtype_str, shape)}.
+
+        Returns:
+            Dict of {name: mx.array} with correct dtypes and shapes.
+        """
+        arrays = {}
+        for name, (raw, dtype_str, shape) in tensors_raw.items():
+            arrays[name] = _restore_tensor_from_bytes(raw, dtype_str, shape)
+        return arrays
+
     def load_block(
         self,
         block_hash: bytes,
@@ -878,7 +1061,7 @@ class PagedSSDCacheManager(CacheManager):
         """
         Load a KV cache block from SSD storage.
 
-        Checks pending writes first (zero I/O), then falls back to disk
+        Checks pending writes first (in-memory, no I/O), then falls back to disk
         read with a timeout to prevent inference deadlocks.
 
         Args:
@@ -899,8 +1082,9 @@ class PagedSSDCacheManager(CacheManager):
             pending = self._pending_writes.get(block_hash)
 
         if pending is not None:
+            arrays = self._arrays_from_tensors_raw(pending['tensors_raw'])
             cache_data = self._reconstruct_cache_data(
-                pending['arrays'], pending['file_metadata'],
+                arrays, pending['file_metadata'],
                 pending['num_layers'], pending['layer_cache_types'],
             )
             if cache_data is not None:
@@ -1003,8 +1187,9 @@ class PagedSSDCacheManager(CacheManager):
 
         if pending is not None:
             blk_meta = pending['block_metadata']
+            arrays = self._arrays_from_tensors_raw(pending['tensors_raw'])
             cache_data = self._reconstruct_cache_data(
-                pending['arrays'], pending['file_metadata'],
+                arrays, pending['file_metadata'],
                 pending['num_layers'], pending['layer_cache_types'],
             )
             if cache_data is None:
@@ -1379,10 +1564,11 @@ class PagedSSDCacheManager(CacheManager):
         except queue.Full:
             pass  # Writer will check shutdown flag on next iteration
 
-        # Wait for writer to finish pending writes
-        self._writer_thread.join(timeout=30)
+        # Wait for writer to finish pending writes (increased timeout for full
+        # file writes instead of just renames)
+        self._writer_thread.join(timeout=60)
         if self._writer_thread.is_alive():
-            logger.warning("SSD cache writer thread did not stop within 30s")
+            logger.warning("SSD cache writer thread did not stop within 60s")
 
         logger.debug("PagedSSDCacheManager closed")
 
