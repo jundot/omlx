@@ -129,8 +129,8 @@
                                         <th class="text-left px-4 py-3 font-semibold text-neutral-600">Test</th>
                                         <th class="text-right px-4 py-3 font-semibold text-neutral-600">TTFT (ms)</th>
                                         <th class="text-right px-4 py-3 font-semibold text-neutral-600">TPOT (ms/tok)</th>
-                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">tg TPS</th>
                                         <th class="text-right px-4 py-3 font-semibold text-neutral-600">pp TPS</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">tg TPS</th>
                                         <th class="text-right px-4 py-3 font-semibold text-neutral-600">E2E Latency</th>
                                         <th class="text-right px-4 py-3 font-semibold text-neutral-600">Throughput</th>
                                         <th class="text-right px-4 py-3 font-semibold text-neutral-600">Peak Mem</th>
@@ -142,8 +142,8 @@
                                             <td class="px-4 py-3 font-medium text-neutral-900" x-text="'pp' + r.pp + '/tg' + r.tg"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.ttft_ms.toFixed(1)"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.tpot_ms.toFixed(2)"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.gen_tps.toFixed(1) + ' tok/s'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.processing_tps.toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.gen_tps.toFixed(1) + ' tok/s'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.total_throughput.toFixed(1) + ' tok/s'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFormatMemory(r.peak_memory_bytes)"></td>
@@ -161,7 +161,7 @@
                                 <i data-lucide="layers" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Continuous Batching — Same Prompt</span>
                             </div>
-                            <span class="text-xs text-neutral-400">pp1024 / tg128 · prefix cache reuse</span>
+                            <span class="text-xs text-neutral-400">pp1024 / tg128 · partial prefix cache hit</span>
                         </div>
                         <div class="overflow-x-auto">
                             <table class="w-full text-sm">
