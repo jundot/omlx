@@ -430,9 +430,17 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         # unique prompts for different-prompt tests.
         max_batch = max(request.batch_sizes) if request.batch_sizes else 0
 
-        # Same prompt: all requests use the identical prompt (tests cache reuse)
-        same_prompt = _generate_prompt(tokenizer, 1024)
-        same_prompts = [same_prompt] * max_batch
+        # Same prompt with variant suffix: all requests share the same prefix
+        # but differ in the last few tokens. This ensures partial prefix cache
+        # hits (3 out of 4 blocks) instead of an exact hit, which would fall
+        # back to full prefill on stateful cache types (e.g. RotatingKVCache).
+        base_prompt = _generate_prompt(tokenizer, 1024)
+        base_tokens = tokenizer.encode(base_prompt)
+        same_prompts = []
+        for i in range(max_batch):
+            suffix_tokens = tokenizer.encode(f" variant-{i}")
+            modified = base_tokens[: -len(suffix_tokens)] + suffix_tokens
+            same_prompts.append(tokenizer.decode(modified[:1024]))
 
         # Different prompts: each request has a unique UUID prefix (no cache hits)
         diff_prompts = [_generate_prompt(tokenizer, 1024) for _ in range(max_batch)]
