@@ -94,11 +94,34 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         self._boundary_block_size = max(0, int(boundary_block_size))
         self._prefill_boundary_callback = prefill_boundary_callback
 
+    # Cache class names known to be sliceable (no boundary snapshots needed).
+    _KNOWN_SLICEABLE = frozenset({"KVCache", "BatchKVCache", "QuantizedKVCache"})
+
     def _boundary_capture_enabled(self) -> bool:
         return (
             self._boundary_block_size > 0
             and self._prefill_boundary_callback is not None
         )
+
+    @staticmethod
+    def _prompt_cache_needs_snapshots(prompt_cache: List[Any]) -> bool:
+        """Return True if any layer cache is non-sliceable (needs snapshots).
+
+        Checks the batch cache objects created during prefill. If all layers
+        are known-sliceable types (e.g. BatchKVCache), boundary snapshots
+        are unnecessary and can be skipped entirely.
+        """
+        known = _BoundarySnapshotBatchGenerator._KNOWN_SLICEABLE
+        for cache_obj in prompt_cache:
+            # Handle CacheList which nests sub-caches.
+            sub_caches = getattr(cache_obj, "caches", None)
+            if isinstance(sub_caches, (list, tuple)):
+                for sub in sub_caches:
+                    if type(sub).__name__ not in known:
+                        return True
+            elif type(cache_obj).__name__ not in known:
+                return True
+        return False
 
     @staticmethod
     def _cache_layer_token_count(cache_obj: Any) -> int:
@@ -251,6 +274,12 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             inputs = _left_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _make_cache(self.model, padding, self.max_kv_size)
 
+            # Disable boundary capture if all layers are sliceable (e.g.
+            # pure BatchKVCache models).  This avoids unnecessary prefill
+            # step-size limiting and expensive cache extraction.
+            if boundary_enabled and not self._prompt_cache_needs_snapshots(prompt_cache):
+                boundary_enabled = False
+
             while inputs.shape[1] > 1:
                 max_allowed = inputs.shape[1] - 1
                 if boundary_enabled:
@@ -293,6 +322,10 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             last_inputs = mx.array([p[-1:] for p in inputs])
             inputs = _right_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _merge_caches(caches)
+
+            # Disable boundary capture for sliceable-only caches.
+            if boundary_enabled and not self._prompt_cache_needs_snapshots(prompt_cache):
+                boundary_enabled = False
 
             for c in prompt_cache:
                 # subtract one from lengths since we don't process the last token during prefill
@@ -405,14 +438,6 @@ class SchedulerConfig:
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
     mlx_cache_cleanup_interval: int = 32  # Steps between mx.clear_cache() calls
-
-    # KV cache memory budget (user-facing setting)
-    max_kv_cache_memory: str = "auto"  # "auto", "disabled", or size like "8GB"
-    # Runtime-calculated max KV cache tokens per request (set during Scheduler init)
-    max_kv_size: Optional[int] = None
-    # Internal fields set by engine_pool for multi-model scenarios
-    _model_weight_bytes: Optional[int] = None
-    _available_kv_memory: Optional[int] = None
 
 
 @dataclass
@@ -593,73 +618,6 @@ class Scheduler:
 
         # Step counter for periodic cleanup
         self._step_counter = 0
-
-        # Calculate max_kv_size from memory budget if not already set
-        self._resolve_max_kv_size()
-
-    def _resolve_max_kv_size(self) -> None:
-        """Calculate max_kv_size from max_kv_cache_memory setting.
-
-        Only applies to models WITHOUT ``make_cache()``.  Models with
-        ``make_cache()`` (MLA, hybrid, ArraysCache) already manage their own
-        cache structure, and mlx-lm's BatchGenerator ignores ``max_kv_size``
-        for them.
-        """
-        if self.config.max_kv_size is not None:
-            # Already explicitly set (e.g., by engine_pool for multi-model)
-            return
-        if self.config.max_kv_cache_memory.strip().lower() == "disabled":
-            logger.info("KV cache memory limit: disabled (no max_kv_size)")
-            return
-
-        # Models with make_cache() have their own bounded cache management;
-        # BatchGenerator ignores max_kv_size for them.
-        if hasattr(self.model, "make_cache"):
-            logger.info(
-                "KV cache memory limit: skipped (model has make_cache, "
-                "BatchGenerator manages cache internally)"
-            )
-            return
-
-        try:
-            from .utils.kv_memory import (
-                calculate_max_kv_size,
-                calculate_per_token_kv_bytes,
-                resolve_kv_cache_memory_bytes,
-            )
-            from .utils.hardware import format_bytes
-
-            per_token = calculate_per_token_kv_bytes(self.model)
-            if per_token is None:
-                logger.warning(
-                    "Could not determine per-token KV bytes from model config; "
-                    "max_kv_size will not be set"
-                )
-                return
-
-            budget = resolve_kv_cache_memory_bytes(
-                setting=self.config.max_kv_cache_memory,
-                model_weight_bytes=self.config._model_weight_bytes or 0,
-                available_override=self.config._available_kv_memory,
-            )
-            if budget is None:
-                return
-
-            max_kv_size = calculate_max_kv_size(
-                model=self.model,
-                budget_bytes=budget,
-                max_concurrent=self.config.completion_batch_size,
-            )
-            if max_kv_size is not None:
-                self.config.max_kv_size = max_kv_size
-                logger.info(
-                    f"KV cache limit: max_kv_size={max_kv_size:,} tokens/request "
-                    f"(budget={format_bytes(budget)}, "
-                    f"per_token={format_bytes(per_token)}, "
-                    f"concurrent={self.config.completion_batch_size})"
-                )
-        except Exception as e:
-            logger.warning(f"Failed to calculate max_kv_size: {e}")
 
     def _calculate_max_blocks(self) -> int:
         """
@@ -886,7 +844,7 @@ class Scheduler:
         if sampling_params.stop_token_ids:
             stop_tokens.update(sampling_params.stop_token_ids)
 
-        kwargs = dict(
+        return _BoundarySnapshotBatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
             stop_tokens=stop_tokens,
@@ -902,9 +860,6 @@ class Scheduler:
                 else None
             ),
         )
-        if self.config.max_kv_size is not None:
-            kwargs["max_kv_size"] = self.config.max_kv_size
-        return _BoundarySnapshotBatchGenerator(**kwargs)
 
     def _build_sampler_and_processors(
         self, sampling_params: SamplingParams
@@ -949,6 +904,14 @@ class Scheduler:
             )
 
         class_name = type(cache_obj).__name__
+
+        # Known sliceable cache types — no boundary snapshots needed.
+        if class_name in (
+            "KVCache",
+            "BatchKVCache",
+            "QuantizedKVCache",
+        ):
+            return False
 
         # Stateful non-sliceable caches require boundary-safe snapshots.
         if class_name in (

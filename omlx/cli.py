@@ -269,17 +269,6 @@ Example directory structure:
         help="Max sequences for mlx-lm BatchGenerator completion phase (token generation). (default: 32)",
     )
 
-    # KV cache memory budget
-    serve_parser.add_argument(
-        "--max-kv-cache-memory",
-        type=str,
-        default=None,
-        help=(
-            "KV cache memory budget per model: 'auto' (default, calculates from "
-            "available RAM), 'disabled' (no limit), or explicit size like '8GB'."
-        ),
-    )
-
     # paged SSD cache options
     serve_parser.add_argument(
         "--paged-ssd-cache-dir",
