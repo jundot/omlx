@@ -18,8 +18,20 @@ from omlx.cache.paged_ssd_cache import (
     PagedSSDBlockMetadata,
     PagedSSDCacheIndex,
     PagedSSDCacheManager,
+    _extract_tensor_bytes,
+    _restore_tensor_from_bytes,
+    _write_safetensors_no_mx,
     parse_size,
 )
+
+
+def _has_mlx() -> bool:
+    """Check if MLX is available."""
+    try:
+        import mlx.core  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 class TestParseSize:
@@ -1116,33 +1128,38 @@ class TestAsyncWriteAndTimeoutLoad:
         )
 
     def test_writer_error_handling(self, ssd_cache, mx):
-        """Verify that writer errors clean up the index."""
+        """Verify that background writer errors clean up the index."""
         block_hash = b"writer_error_test_ha"
         cache_data = [
             (mx.zeros((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))
         ]
 
-        # Temporarily break the save path by making the file path unwritable
-        file_path = ssd_cache._get_file_path(block_hash)
-        subdir = file_path.parent
-
-        # Create a file where the directory should be (prevents writing)
-        # Instead, we'll patch mx.save_safetensors to raise
+        # Patch _write_safetensors_no_mx to simulate disk error in background writer
         import time as time_mod
-
-        with patch("mlx.core.save_safetensors", side_effect=OSError("Disk full")):
+        with patch(
+            "omlx.cache.paged_ssd_cache._write_safetensors_no_mx",
+            side_effect=OSError("Disk full"),
+        ):
             result = ssd_cache.save_block(
                 block_hash=block_hash,
                 cache_data=cache_data,
                 token_count=16,
             )
-            # With temp-file approach, mx.save_safetensors runs on the main
-            # thread in save_block. If it raises, save_block returns False
-            # immediately and the block is never added to the index.
-            assert result is False
+            # save_block() succeeds (bytes extracted, queued for background write)
+            assert result is True
 
-        # Block should never have been added to the index
+            # Wait for background writer to process and fail
+            for _ in range(50):
+                if ssd_cache._write_queue.empty():
+                    break
+                time_mod.sleep(0.05)
+            time_mod.sleep(0.1)
+
+        # Background writer should have removed the block from index on error
         assert not ssd_cache.has_block(block_hash)
+        # And from pending writes
+        with ssd_cache._pending_writes_lock:
+            assert block_hash not in ssd_cache._pending_writes
 
     def test_graceful_shutdown(self, tmp_path, mx):
         """Verify close() stops the writer thread."""
@@ -1206,3 +1223,209 @@ class TestAsyncWriteAndTimeoutLoad:
         for keys, values in loaded:
             assert keys.shape == (1, 8, 64, 64)
             assert values.shape == (1, 8, 64, 64)
+
+
+# =============================================================================
+# Async Background Write Tests
+# =============================================================================
+
+
+@pytest.mark.skipif(not _has_mlx(), reason="MLX not available")
+class TestAsyncBackgroundWrite:
+    """Tests for the async background write pipeline (no-mx safetensors)."""
+
+    @pytest.fixture
+    def mx(self):
+        import mlx.core as mx
+        return mx
+
+    def test_extract_and_restore_float32(self, mx):
+        """Round-trip test for float32 tensors."""
+        original = mx.random.normal((2, 4, 8))
+        mx.eval(original)
+        raw, dtype_str, shape = _extract_tensor_bytes(original)
+        assert dtype_str == "F32"
+        assert shape == [2, 4, 8]
+        restored = _restore_tensor_from_bytes(raw, dtype_str, shape)
+        assert restored.dtype == mx.float32
+        assert restored.shape == (2, 4, 8)
+        assert mx.allclose(original, restored).item()
+
+    def test_extract_and_restore_float16(self, mx):
+        """Round-trip test for float16 tensors."""
+        original = mx.random.normal((3, 5)).astype(mx.float16)
+        mx.eval(original)
+        raw, dtype_str, shape = _extract_tensor_bytes(original)
+        assert dtype_str == "F16"
+        restored = _restore_tensor_from_bytes(raw, dtype_str, shape)
+        assert restored.dtype == mx.float16
+        assert mx.allclose(original, restored).item()
+
+    def test_extract_and_restore_bfloat16(self, mx):
+        """Round-trip test for bfloat16 tensors (the key dtype for this feature)."""
+        original = mx.random.normal((4, 8, 16)).astype(mx.bfloat16)
+        mx.eval(original)
+        raw, dtype_str, shape = _extract_tensor_bytes(original)
+        assert dtype_str == "BF16"
+        assert shape == [4, 8, 16]
+        restored = _restore_tensor_from_bytes(raw, dtype_str, shape)
+        assert restored.dtype == mx.bfloat16
+        assert restored.shape == (4, 8, 16)
+        # Compare as float32 to avoid bfloat16 precision issues
+        assert mx.allclose(
+            original.astype(mx.float32), restored.astype(mx.float32)
+        ).item()
+
+    def test_extract_and_restore_int_types(self, mx):
+        """Round-trip test for integer dtypes."""
+        for mx_dtype, st_str in [
+            (mx.int8, "I8"), (mx.int32, "I32"), (mx.uint8, "U8"),
+        ]:
+            original = mx.array([1, 2, 3, 4], dtype=mx_dtype)
+            mx.eval(original)
+            raw, dtype_str, shape = _extract_tensor_bytes(original)
+            assert dtype_str == st_str
+            restored = _restore_tensor_from_bytes(raw, dtype_str, shape)
+            assert restored.dtype == mx_dtype
+            assert mx.array_equal(original, restored).item()
+
+    def test_write_safetensors_no_mx_roundtrip(self, mx, tmp_path):
+        """Write safetensors without mx API, then load with mx.load()."""
+        t1 = mx.random.normal((2, 3, 4))
+        t2 = mx.ones((5,), dtype=mx.float16)
+        mx.eval(t1, t2)
+
+        tensors_raw = {
+            "tensor_a": _extract_tensor_bytes(t1),
+            "tensor_b": _extract_tensor_bytes(t2),
+        }
+        metadata = {"test_key": "test_value", "block_hash": "abc123"}
+
+        out_path = str(tmp_path / "test.safetensors")
+        file_size = _write_safetensors_no_mx(out_path, tensors_raw, metadata)
+        assert file_size > 0
+
+        # Load with mx.load and verify
+        loaded_arrays, loaded_meta = mx.load(out_path, return_metadata=True)
+        assert "tensor_a" in loaded_arrays
+        assert "tensor_b" in loaded_arrays
+        assert loaded_meta["test_key"] == "test_value"
+        assert loaded_meta["block_hash"] == "abc123"
+        assert mx.allclose(t1, loaded_arrays["tensor_a"]).item()
+        assert mx.allclose(t2, loaded_arrays["tensor_b"]).item()
+
+    def test_write_safetensors_bfloat16_roundtrip(self, mx, tmp_path):
+        """Verify bfloat16 safetensors file is loadable by mx.load."""
+        original = mx.random.normal((8, 16, 32)).astype(mx.bfloat16)
+        mx.eval(original)
+
+        tensors_raw = {"kv_cache": _extract_tensor_bytes(original)}
+        out_path = str(tmp_path / "bf16_test.safetensors")
+        _write_safetensors_no_mx(out_path, tensors_raw)
+
+        loaded, _ = mx.load(out_path, return_metadata=True)
+        assert loaded["kv_cache"].dtype == mx.bfloat16
+        assert loaded["kv_cache"].shape == (8, 16, 32)
+        assert mx.allclose(
+            original.astype(mx.float32),
+            loaded["kv_cache"].astype(mx.float32),
+        ).item()
+
+    def test_save_block_uses_background_write(self, tmp_path, mx):
+        """Verify save_block enqueues bytes for background writer (no mx.save_safetensors)."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "async_test",
+            max_size_bytes=100 * 1024**2,
+        )
+
+        block_hash = b"async_write_test_hsh"
+        cache_data = [
+            (mx.ones((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))
+        ]
+
+        # Patch mx.save_safetensors to ensure it's NOT called
+        with patch("mlx.core.save_safetensors") as mock_save:
+            result = manager.save_block(
+                block_hash=block_hash,
+                cache_data=cache_data,
+                token_count=16,
+            )
+            assert result is True
+            # mx.save_safetensors should NOT be called (we use _write_safetensors_no_mx)
+            mock_save.assert_not_called()
+
+        # pending_writes should store tensors_raw (bytes), not arrays (mx.array)
+        with manager._pending_writes_lock:
+            pending = manager._pending_writes.get(block_hash)
+        assert pending is not None
+        assert 'tensors_raw' in pending
+        assert 'arrays' not in pending  # Old key should not exist
+
+        # Wait for background write and verify file exists
+        for _ in range(50):
+            file_path = manager._get_file_path(block_hash)
+            if file_path.exists():
+                break
+            time.sleep(0.05)
+        assert file_path.exists()
+
+        # Verify file is loadable by mx.load
+        loaded, meta = mx.load(str(file_path), return_metadata=True)
+        assert "layer_0_keys" in loaded
+        assert "layer_0_values" in loaded
+        assert meta["block_hash"] == block_hash.hex()
+
+        manager.close()
+
+    def test_pending_writes_bytes_readback(self, tmp_path, mx):
+        """Verify load_block can restore mx.arrays from bytes-based pending_writes."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "readback_test",
+            max_size_bytes=100 * 1024**2,
+        )
+
+        block_hash = b"readback_test_hash__"
+        original_keys = mx.random.normal((1, 8, 32, 64))
+        original_values = mx.random.normal((1, 8, 32, 64))
+        mx.eval(original_keys, original_values)
+        cache_data = [(original_keys, original_values)]
+
+        manager.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=32,
+        )
+
+        # Load immediately from pending_writes (before background write completes)
+        loaded = manager.load_block(block_hash)
+        assert loaded is not None
+        assert len(loaded) == 1
+        keys, values = loaded[0]
+        assert mx.allclose(original_keys, keys).item()
+        assert mx.allclose(original_values, values).item()
+
+        manager.close()
+
+    def test_index_update_file_size(self):
+        """Verify PagedSSDCacheIndex.update_file_size works correctly."""
+        index = PagedSSDCacheIndex(max_size_bytes=1000)
+        block_hash = b"size_update_test____"
+        metadata = PagedSSDBlockMetadata(
+            block_hash=block_hash,
+            file_path=Path("/tmp/test.safetensors"),
+            file_size=100,
+            token_count=16,
+            created_at=time.time(),
+            last_access=time.time(),
+            num_layers=1,
+        )
+        index.add(metadata)
+        assert index.total_size == 100
+
+        # Update to actual size
+        index.update_file_size(block_hash, 150)
+        assert index.total_size == 150
+
+        # Non-existent hash should be no-op
+        index.update_file_size(b"nonexistent_hash____", 999)
+        assert index.total_size == 150
