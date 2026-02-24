@@ -82,6 +82,9 @@ version = {attr = "omlx._version.__version__"}
 where = ["."]
 include = ["omlx*"]
 
+[tool.setuptools.package-data]
+"omlx.admin" = ["templates/**/*.html", "static/**/*"]
+
 [tool.black]
 line-length = 88
 target-version = ["py310", "py311", "py312", "py313"]

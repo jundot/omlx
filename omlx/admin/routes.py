@@ -565,13 +565,24 @@ async def chat_page(request: Request, is_admin: bool = Depends(require_admin)):
     )
 
 
-@router.get("/static/{filename}")
-async def admin_static(filename: str):
-    """Serve static files for admin panel (logos, etc.)."""
-    file_path = static_dir / filename
-    if not file_path.is_file() or not file_path.resolve().is_relative_to(static_dir.resolve()):
+@router.get("/static/{path:path}")
+async def admin_static(path: str):
+    """Serve static files for admin panel (CSS, JS, fonts, logos, etc.)."""
+    file_path = static_dir / path
+    if not file_path.is_file() or not file_path.resolve().is_relative_to(
+        static_dir.resolve()
+    ):
         raise HTTPException(status_code=404, detail="File not found")
-    media_types = {".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon"}
+    media_types = {
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".ico": "image/x-icon",
+        ".css": "text/css",
+        ".js": "application/javascript",
+        ".woff2": "font/woff2",
+        ".woff": "font/woff",
+        ".ttf": "font/ttf",
+    }
     media_type = media_types.get(file_path.suffix, "application/octet-stream")
     return FileResponse(file_path, media_type=media_type)
 

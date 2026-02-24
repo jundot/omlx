@@ -4,22 +4,22 @@
 
 {% block head %}
 <!-- Markdown rendering -->
-<script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/lib/marked.umd.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/marked-highlight@2.0.6/lib/index.umd.js"></script>
+<script src="/admin/static/js/marked.umd.js"></script>
+<script src="/admin/static/js/marked-highlight.umd.js"></script>
 
 <!-- Code highlighting -->
-<link rel="stylesheet" id="hljs-light-theme" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
-<link rel="stylesheet" id="hljs-dark-theme" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" disabled>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/javascript.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<link rel="stylesheet" id="hljs-light-theme" href="/admin/static/css/hljs-github.min.css">
+<link rel="stylesheet" id="hljs-dark-theme" href="/admin/static/css/hljs-github-dark.min.css" disabled>
+<script src="/admin/static/js/highlight.min.js"></script>
+<script src="/admin/static/js/hljs-python.min.js"></script>
+<script src="/admin/static/js/hljs-javascript.min.js"></script>
+<script src="/admin/static/js/hljs-bash.min.js"></script>
+<script src="/admin/static/js/hljs-json.min.js"></script>
 
 <!-- Math rendering with KaTeX -->
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+<link rel="stylesheet" href="/admin/static/css/katex.min.css">
+<script defer src="/admin/static/js/katex.min.js"></script>
+<script defer src="/admin/static/js/katex-auto-render.min.js"></script>
 
 <style>
     /* CSS Variables for theming */

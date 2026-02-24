@@ -104,3 +104,6 @@ packaging/_build/
 
 # Generated engine commit metadata (build-time artifact)
 omlx/_engine_commits.json
+
+# Tailwind CSS standalone CLI binary (download on demand via build_css.py)
+omlx/admin/tailwindcss-*
