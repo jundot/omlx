@@ -906,7 +906,7 @@ class TestCacheListHandlerWithMLX:
         return CacheListHandler()
 
     def test_reconstruct_cache_with_kvcache_subs(self, handler, mx):
-        """Test reconstructing CacheList with KVCache sub-caches (fallback path)."""
+        """Test reconstructing CacheList with KVCache sub-caches."""
         keys1 = mx.zeros((1, 8, 32, 64))
         values1 = mx.zeros((1, 8, 32, 64))
         keys2 = mx.zeros((1, 8, 32, 64))
@@ -922,14 +922,45 @@ class TestCacheListHandlerWithMLX:
 
         cache = handler.reconstruct_cache(state, meta_state)
 
-        # Should succeed via CacheList.from_state() or fallback
         assert cache is not None
-        # The returned cache should have .caches attribute
         assert hasattr(cache, "caches")
         assert len(cache.caches) == 2
 
+    def test_reconstruct_cache_kvcache_no_fallback(self, handler, mx):
+        """Test CacheList with KVCache sub-caches succeeds via from_state()
+        without falling back to manual reconstruction (GLM-5 scenario)."""
+        keys1 = mx.zeros((1, 8, 64, 64))
+        values1 = mx.zeros((1, 8, 64, 64))
+        keys2 = mx.zeros((1, 8, 64, 64))
+        values2 = mx.zeros((1, 8, 64, 64))
+
+        state = {
+            "sub_states": [(keys1, values1), (keys2, values2)],
+        }
+        # Simulate the meta_state that prefix_cache creates after fix:
+        # empty strings for KVCache sub-caches (no meta_state needed)
+        meta_state = (
+            ["KVCache", "KVCache"],
+            ["", ""],
+        )
+
+        import logging
+        from unittest.mock import patch
+
+        with patch.object(
+            logging.getLogger("omlx.cache.type_handlers"), "debug"
+        ) as mock_debug:
+            cache = handler.reconstruct_cache(state, meta_state)
+
+        assert cache is not None
+        assert hasattr(cache, "caches")
+        assert len(cache.caches) == 2
+        # Verify from_state() succeeded without fallback
+        for call_args in mock_debug.call_args_list:
+            assert "from_state() unavailable or failed" not in str(call_args)
+
     def test_reconstruct_cache_mixed_types(self, handler, mx):
-        """Test reconstructing CacheList with ArraysCache + KVCache (fallback path)."""
+        """Test reconstructing CacheList with ArraysCache + KVCache."""
         # ArraysCache sub-state: list of arrays
         arrays_state = [mx.zeros((1, 16)), mx.zeros((1, 32))]
         # KVCache sub-state: (keys, values)

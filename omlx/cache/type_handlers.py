@@ -805,11 +805,20 @@ class CacheListHandler(CacheTypeHandler):
             )
             return None
 
+        # Sanitize sub_meta_states for sub-cache types that don't support
+        # meta_state (inherit _BaseCache's strict setter which rejects
+        # truthy values).  Use "" to match _BaseCache.meta_state getter.
+        _NO_META_STATE_TYPES = frozenset({"KVCache", "ConcatenateKVCache", "ArraysCache"})
+        sanitized_sub_meta_states = [
+            "" if cls_name in _NO_META_STATE_TYPES else sub_meta
+            for cls_name, sub_meta in zip(class_names, sub_meta_states)
+        ]
+
         # Try new mlx-lm CacheList.from_state() first
         try:
             from mlx_lm.models.cache import CacheList
 
-            return CacheList.from_state(sub_states, (class_names, sub_meta_states))
+            return CacheList.from_state(sub_states, (class_names, sanitized_sub_meta_states))
         except (ImportError, AttributeError, TypeError, KeyError, Exception) as e:
             logger.debug(f"CacheList.from_state() unavailable or failed: {e}")
 

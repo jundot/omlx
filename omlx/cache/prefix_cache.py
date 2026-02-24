@@ -1322,9 +1322,14 @@ class BlockAwarePrefixCache(CacheManager):
                                         (actual_seq_len,) + tuple(orig_sub_meta[1:])
                                     )
                                 else:
-                                    adjusted_sub_metas.append((actual_seq_len,))
+                                    # Sub-cache has no real meta_state (e.g.,
+                                    # KVCache returns "").  Preserve empty value
+                                    # — offset inferred from tensor shape.
+                                    adjusted_sub_metas.append(
+                                        orig_sub_meta if orig_sub_meta else ""
+                                    )
                             else:
-                                adjusted_sub_metas.append((actual_seq_len,))
+                                adjusted_sub_metas.append("")
                         meta_state = (class_names, adjusted_sub_metas)
 
                     cache = handler.reconstruct_cache(
