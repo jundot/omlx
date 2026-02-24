@@ -43,8 +43,8 @@ class TestSchedulerConfig:
         assert config.paged_ssd_cache_dir is None
         assert config.paged_ssd_cache_max_size == 100 * 1024 * 1024 * 1024  # 100GB
         assert config.model_name == ""
-        assert config.gc_cleanup_interval == 10
-        assert config.mlx_cache_cleanup_interval == 10
+        assert config.gc_cleanup_interval == 0
+        assert config.mlx_cache_cleanup_interval == 32
 
     def test_custom_values(self):
         """Test SchedulerConfig with custom values."""
@@ -347,10 +347,10 @@ class TestSchedulerAddRequest:
 
 
 class TestSchedulerAbortRequest:
-    """Tests for Scheduler.abort_request()."""
+    """Tests for Scheduler.abort_request() (deferred abort pattern)."""
 
-    def test_abort_waiting_request(self, mock_model, mock_tokenizer):
-        """Test aborting a waiting request."""
+    def test_abort_enqueues_request(self, mock_model, mock_tokenizer):
+        """Test abort_request() enqueues for deferred processing."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
         request = Request(
@@ -362,18 +362,38 @@ class TestSchedulerAbortRequest:
 
         result = scheduler.abort_request("test-001")
 
+        # abort_request always returns True (enqueue is always successful)
         assert result is True
+        # Request should still be in waiting (not yet processed)
+        assert "test-001" in scheduler._pending_abort_ids
+
+    def test_abort_waiting_request(self, mock_model, mock_tokenizer):
+        """Test aborting a waiting request via deferred processing."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="test-001",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.add_request(request)
+
+        scheduler.abort_request("test-001")
+        scheduler._process_pending_aborts()
+
         assert request.status == RequestStatus.FINISHED_ABORTED
         assert request not in scheduler.waiting
         assert "test-001" in scheduler.finished_req_ids
 
     def test_abort_nonexistent_request(self, mock_model, mock_tokenizer):
-        """Test aborting a non-existent request returns False."""
+        """Test aborting a non-existent request is silently ignored."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
         result = scheduler.abort_request("nonexistent")
-
-        assert result is False
+        # Enqueue always succeeds
+        assert result is True
+        # Processing a non-existent abort is a no-op
+        scheduler._process_pending_aborts()
 
     def test_abort_sets_finish_reason(self, mock_model, mock_tokenizer):
         """Test aborting sets correct finish reason."""
@@ -386,13 +406,14 @@ class TestSchedulerAbortRequest:
         )
         scheduler.add_request(request)
         scheduler.abort_request("test-001")
+        scheduler._process_pending_aborts()
 
         assert request.get_finish_reason() == "abort"
 
-    def test_abort_running_request_removes_on_generation_stream(
+    def test_abort_running_request_removes_from_batch(
         self, mock_model, mock_tokenizer
     ):
-        """Abort must remove active UID on generation_stream."""
+        """Abort must remove active UID from BatchGenerator."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
         request = Request(
@@ -413,12 +434,10 @@ class TestSchedulerAbortRequest:
         scheduler.batch_generator = MagicMock()
         scheduler.batch_generator.active_batch = MagicMock(uids=[uid])
 
-        with patch("omlx.scheduler.mx") as mock_mx:
-            result = scheduler.abort_request("req-run")
+        scheduler.abort_request("req-run")
+        scheduler._process_pending_aborts()
 
-        assert result is True
         scheduler.batch_generator.remove.assert_called_once_with([uid])
-        mock_mx.stream.assert_called_once()
 
     def test_abort_running_request_skips_remove_when_uid_not_in_active_batch(
         self, mock_model, mock_tokenizer
@@ -445,6 +464,7 @@ class TestSchedulerAbortRequest:
         scheduler.batch_generator.active_batch = MagicMock(uids=[999])
 
         scheduler.abort_request("req-run-missing")
+        scheduler._process_pending_aborts()
 
         scheduler.batch_generator.remove.assert_not_called()
 
@@ -926,10 +946,10 @@ class TestSchedulerRotatingBlockAlignment:
 
         scheduler.batch_generator.remove.assert_not_called()
 
-    def test_cleanup_finished_removes_on_generation_stream_when_uid_active(
+    def test_cleanup_finished_removes_uid_from_active_batch(
         self, mock_model, mock_tokenizer
     ):
-        """_cleanup_finished should remove active UID on generation_stream."""
+        """_cleanup_finished should remove active UID from batch."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
         request = Request(
@@ -950,11 +970,9 @@ class TestSchedulerRotatingBlockAlignment:
         scheduler.batch_generator = MagicMock()
         scheduler.batch_generator.active_batch = MagicMock(uids=[uid])
 
-        with patch("omlx.scheduler.mx") as mock_mx:
-            scheduler._cleanup_finished({"req-remove-active"})
+        scheduler._cleanup_finished({"req-remove-active"})
 
         scheduler.batch_generator.remove.assert_called_once_with([uid])
-        mock_mx.stream.assert_called_once()
 
 
 class TestExtractCacheStatesCacheList:

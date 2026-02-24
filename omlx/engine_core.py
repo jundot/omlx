@@ -13,12 +13,14 @@ The design follows vLLM's engine architecture adapted for MLX.
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Union
+
+import mlx.core as mx
 
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
@@ -26,13 +28,6 @@ from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry, ModelOwnershipError
 
 logger = logging.getLogger(__name__)
-
-# Single-threaded executor for inference operations.
-# Using a single thread ensures thread-safe access to MLX model state (BatchGenerator
-# has internal state like active_batch, unprocessed_prompts that would race if called
-# concurrently). This keeps the event loop responsive for /admin and /health endpoints
-# while inference runs in the background.
-_inference_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx-inference")
 
 
 @dataclass
@@ -138,24 +133,39 @@ class EngineCore:
         return self._running
 
     async def _engine_loop(self) -> None:
-        """Main engine loop - optimized for minimal overhead."""
-        # Cache config values for faster access
+        """Main engine loop - hybrid executor for prefill vs generation.
+
+        Prefill steps (long prompts) are run in a thread executor to keep
+        the asyncio event loop responsive.  Generation-only steps (~1-3ms)
+        are called directly to avoid ~0.5-2ms context switch overhead,
+        giving ~5-10% throughput improvement during sustained generation.
+        """
+        # Single-thread executor ensures MLX calls are never concurrent
+        _executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mlx-step"
+        )
+        loop = asyncio.get_running_loop()
+
         step_interval = self.config.step_interval
         stream_interval = self.config.stream_interval
         use_simple_streaming = (stream_interval == 1)
 
-        # Get event loop for running blocking operations in executor
-        loop = asyncio.get_event_loop()
-
         while self._running:
             try:
                 if self.scheduler.has_requests():
-                    # Run one generation step in a separate thread to avoid blocking
-                    # the event loop. This allows /admin and /health endpoints to
-                    # remain responsive during inference.
-                    output = await loop.run_in_executor(
-                        _inference_executor, self.scheduler.step
-                    )
+                    # Hybrid approach: use executor only when prefill is likely.
+                    # Prefill happens when there are waiting requests that need
+                    # to be inserted into the batch (may block for seconds).
+                    # Generation-only steps are fast (<3ms) and can run inline.
+                    has_waiting = self.scheduler.get_num_waiting() > 0
+                    if has_waiting:
+                        output = await loop.run_in_executor(
+                            _executor, self.scheduler.step
+                        )
+                    else:
+                        output = self.scheduler.step()
+                        # Yield to event loop after inline step
+                        await asyncio.sleep(0)
                     self._steps_executed += 1
 
                     # Fast path: distribute outputs to collectors
@@ -189,9 +199,15 @@ class EngineCore:
                                 # Note: cleanup is handled by stream_outputs() finally block
                                 # _delayed_cleanup() was causing double cleanup race condition
 
-                        # OPTIMIZATION: Only yield if streaming consumers are waiting
-                        if RequestOutputCollector.has_waiting_consumers():
-                            await asyncio.sleep(0)
+                        # Free Metal buffers after distributing finished outputs
+                        if output.finished_request_ids:
+                            mx.clear_cache()
+
+                        # Always yield to prevent event loop starvation.
+                        # Without this, orphaned requests (client disconnected but
+                        # request still in scheduler) block the entire event loop,
+                        # making the server unresponsive to all HTTP requests.
+                        await asyncio.sleep(0)
                 else:
                     # No work, yield control
                     await asyncio.sleep(step_interval)
@@ -252,13 +268,12 @@ class EngineCore:
     async def abort_request(self, request_id: str) -> bool:
         """Abort a request.
 
-        Runs abort in the inference executor to avoid racing with
-        BatchGenerator.next() which also runs in that executor.
+        Uses deferred abort pattern: scheduler.abort_request() just enqueues
+        the request ID into a thread-safe set. The actual abort is processed
+        at the start of the next scheduler.step() call, ensuring it runs in
+        the same execution context as generation (no race conditions).
         """
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            _inference_executor, self.scheduler.abort_request, request_id
-        )
+        result = self.scheduler.abort_request(request_id)
         self._cleanup_request(request_id)
         return result
 

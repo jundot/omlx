@@ -402,8 +402,8 @@ class SchedulerConfig:
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
 
     # GC/cleanup settings (memory optimization)
-    gc_cleanup_interval: int = 10  # Steps between gc.collect() calls
-    mlx_cache_cleanup_interval: int = 10  # Steps between mx.clear_cache() calls
+    gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
+    mlx_cache_cleanup_interval: int = 32  # Steps between mx.clear_cache() calls
 
 
 @dataclass
@@ -467,6 +467,10 @@ class Scheduler:
         self.running: Dict[str, Request] = {}  # Running requests by ID
         self.requests: Dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: Set[str] = set()  # Recently finished
+
+        # Thread-safe set for deferred aborts (main thread → executor thread)
+        # CPython GIL guarantees set.add() and `x in set` are atomic.
+        self._pending_abort_ids: Set[str] = set()
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: Dict[str, int] = {}
@@ -1538,15 +1542,39 @@ class Scheduler:
         if not isinstance(batch_uids, list) or uid not in batch_uids:
             return
 
-        # BatchGenerator.remove() internally calls batch.filter(). Run that
-        # filter on generation_stream to avoid moving cache tensors to the
-        # default stream and triggering cross-stream write conflicts next step.
-        with mx.stream(generation_stream):
-            self.batch_generator.remove([uid])
+        self.batch_generator.remove([uid])
 
     def abort_request(self, request_id: str) -> bool:
         """
-        Abort a request.
+        Enqueue a request for deferred abort.
+
+        The actual abort is processed at the start of the next step() call,
+        ensuring thread safety with the hybrid executor pattern. CPython GIL
+        guarantees set.add() is atomic.
+
+        Args:
+            request_id: The request ID to abort
+
+        Returns:
+            True (abort is always enqueued)
+        """
+        self._pending_abort_ids.add(request_id)
+        logger.debug(f"Enqueued deferred abort for request {request_id}")
+        return True
+
+    def _process_pending_aborts(self) -> None:
+        """Drain and process pending abort requests.
+
+        Called from step() to ensure aborts are processed in the same
+        execution context as generation (thread-safe).
+        """
+        while self._pending_abort_ids:
+            request_id = self._pending_abort_ids.pop()
+            self._do_abort_request(request_id)
+
+    def _do_abort_request(self, request_id: str) -> bool:
+        """
+        Actually abort a request. Must be called from the step() context.
 
         Args:
             request_id: The request ID to abort
@@ -2156,8 +2184,12 @@ class Scheduler:
         """
         output = SchedulerOutput()
 
+        # Process pending aborts FIRST (thread-safe with hybrid executor)
+        self._process_pending_aborts()
+
         # Check memory pressure and evict if needed (tiered cache)
-        self._check_memory_pressure()
+        if self.memory_monitor is not None:
+            self._check_memory_pressure()
 
         for attempt in range(max_retries + 1):
             try:
@@ -2176,18 +2208,6 @@ class Scheduler:
                         output.outputs = outputs
                         output.finished_request_ids = finished_ids
                         self._cleanup_finished(finished_ids)
-
-                        # Explicit cleanup to prevent memory leak from Response objects
-                        # Each Response contains logprobs (mx.array) and prompt_cache references
-                        del responses
-
-                        # Periodic cleanup when requests finish
-                        # This helps free MLX arrays that are no longer referenced
-                        if finished_ids:
-                            gc.collect()
-                            # Clear MLX internal memory cache to release unused tensors
-                            # This is critical for freeing logprobs arrays (~800KB each)
-                            mx.clear_cache()
 
                 # Success - break out of retry loop
                 break
@@ -2222,12 +2242,18 @@ class Scheduler:
         # Clear finished tracking for next step
         self.finished_req_ids = set()
 
-        # Periodic cleanup (in addition to cleanup when requests finish)
+        # Periodic Metal cache cleanup
         self._step_counter += 1
-        if self._step_counter % self.config.gc_cleanup_interval == 0:
-            gc.collect()
-        if self._step_counter % self.config.mlx_cache_cleanup_interval == 0:
+        if (
+            self.config.mlx_cache_cleanup_interval > 0
+            and self._step_counter % self.config.mlx_cache_cleanup_interval == 0
+        ):
             mx.clear_cache()
+        if (
+            self.config.gc_cleanup_interval > 0
+            and self._step_counter % self.config.gc_cleanup_interval == 0
+        ):
+            gc.collect()
 
         return output
 
@@ -2261,9 +2287,12 @@ class Scheduler:
 
     def reset(self) -> None:
         """Reset the scheduler state."""
-        # Abort all requests
+        # Drain any pending deferred aborts
+        self._pending_abort_ids.clear()
+
+        # Abort all requests directly (reset is synchronous)
         for request_id in list(self.requests.keys()):
-            self.abort_request(request_id)
+            self._do_abort_request(request_id)
 
         self.waiting.clear()
         self.running.clear()

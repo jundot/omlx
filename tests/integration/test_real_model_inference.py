@@ -384,8 +384,9 @@ class TestSchedulerWithRealModel:
         for _ in range(5):
             scheduler.step()
 
-        # Cancel the request
+        # Cancel the request (deferred abort - enqueue then process)
         scheduler.abort_request("to-cancel")
+        scheduler._process_pending_aborts()
 
         # Verify cancelled - check running dict is empty
         assert len(scheduler.running) == 0
