@@ -102,6 +102,7 @@ class TestModelSettings:
     def test_defaults(self):
         """Test default values."""
         settings = ModelSettings()
+        assert settings.model_dirs == []
         assert settings.model_dir is None
         assert settings.max_model_memory == "auto"
 
@@ -131,37 +132,66 @@ class TestModelSettings:
         settings = ModelSettings(max_model_memory="1TB")
         assert settings.get_max_model_memory_bytes() == 1024**4
 
-    def test_get_model_dir_default(self):
-        """Test default model directory."""
-        settings = ModelSettings(model_dir=None)
+    def test_get_model_dirs_default(self):
+        """Test default model directories."""
+        settings = ModelSettings()
         base_path = Path("/tmp/omlx")
+        assert settings.get_model_dirs(base_path) == [Path("/tmp/omlx/models")]
         assert settings.get_model_dir(base_path) == Path("/tmp/omlx/models")
 
-    def test_get_model_dir_custom(self):
-        """Test custom model directory."""
-        settings = ModelSettings(model_dir="/custom/models")
+    def test_get_model_dirs_custom(self):
+        """Test custom model directories."""
+        settings = ModelSettings(model_dirs=["/custom/models"])
         base_path = Path("/tmp/omlx")
-        assert settings.get_model_dir(base_path) == Path("/custom/models")
+        assert settings.get_model_dirs(base_path) == [Path("/custom/models")]
 
-    def test_get_model_dir_with_tilde(self):
-        """Test model directory with tilde expansion."""
-        settings = ModelSettings(model_dir="~/models")
+    def test_get_model_dirs_multiple(self):
+        """Test multiple model directories."""
+        settings = ModelSettings(model_dirs=["/path/a", "/path/b"])
         base_path = Path("/tmp/omlx")
-        result = settings.get_model_dir(base_path)
-        assert "~" not in str(result)  # Should be expanded
+        result = settings.get_model_dirs(base_path)
+        assert len(result) == 2
+        assert result[0] == Path("/path/a")
+        assert result[1] == Path("/path/b")
+        # get_model_dir returns the first (primary) directory
+        assert settings.get_model_dir(base_path) == Path("/path/a")
+
+    def test_get_model_dirs_with_tilde(self):
+        """Test model directory with tilde expansion."""
+        settings = ModelSettings(model_dirs=["~/models"])
+        base_path = Path("/tmp/omlx")
+        result = settings.get_model_dirs(base_path)
+        assert "~" not in str(result[0])  # Should be expanded
+
+    def test_get_model_dirs_backward_compat(self):
+        """Test backward compatibility: model_dir fallback when model_dirs is empty."""
+        settings = ModelSettings(model_dir="/legacy/models")
+        base_path = Path("/tmp/omlx")
+        assert settings.get_model_dirs(base_path) == [Path("/legacy/models")]
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
-        settings = ModelSettings(model_dir="/models", max_model_memory="32GB")
+        settings = ModelSettings(model_dirs=["/models"], max_model_memory="32GB")
         result = settings.to_dict()
-        assert result == {"model_dir": "/models", "max_model_memory": "32GB"}
+        assert result == {
+            "model_dirs": ["/models"],
+            "model_dir": "/models",
+            "max_model_memory": "32GB",
+        }
 
     def test_from_dict(self):
         """Test creation from dictionary."""
-        data = {"model_dir": "/models", "max_model_memory": "64GB"}
+        data = {"model_dirs": ["/models"], "max_model_memory": "64GB"}
         settings = ModelSettings.from_dict(data)
-        assert settings.model_dir == "/models"
+        assert settings.model_dirs == ["/models"]
         assert settings.max_model_memory == "64GB"
+
+    def test_from_dict_backward_compat(self):
+        """Test from_dict migrates old model_dir to model_dirs."""
+        data = {"model_dir": "/legacy/models", "max_model_memory": "64GB"}
+        settings = ModelSettings.from_dict(data)
+        assert settings.model_dirs == ["/legacy/models"]
+        assert settings.model_dir == "/legacy/models"
 
 
 class TestSchedulerSettings:
@@ -438,7 +468,8 @@ class TestGlobalSettings:
             assert settings.server.host == "0.0.0.0"
             assert settings.server.port == 9000
             assert settings.server.log_level == "debug"
-            assert settings.model.model_dir == "/models"
+            assert settings.model.model_dirs == ["/models"]  # Migrated from model_dir
+            assert settings.model.model_dir == "/models"  # Backward compat field
             assert settings.model.max_model_memory == "64GB"
             assert settings.scheduler.max_num_seqs == 128
             assert settings.cache.enabled is False
@@ -1149,7 +1180,7 @@ class TestCORSMiddleware:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = GlobalSettings(base_path=Path(tmpdir))
             init_server(
-                model_dir=tmpdir,
+                model_dirs=[tmpdir],
                 max_model_memory=0,
                 global_settings=settings,
             )

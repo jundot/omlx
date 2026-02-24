@@ -269,6 +269,49 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
     return models
 
 
+def discover_models_from_dirs(
+    model_dirs: list[Path],
+) -> dict[str, DiscoveredModel]:
+    """
+    Scan multiple model directories and merge results.
+
+    Each directory is scanned using discover_models(). On model_id conflicts,
+    the first directory's model takes priority (earlier directory wins).
+
+    Args:
+        model_dirs: List of paths to directories containing model subdirectories
+
+    Returns:
+        Dictionary mapping model_id to DiscoveredModel
+    """
+    merged: dict[str, DiscoveredModel] = {}
+
+    for model_dir in model_dirs:
+        if not model_dir.exists():
+            logger.warning(f"Model directory does not exist, skipping: {model_dir}")
+            continue
+        if not model_dir.is_dir():
+            logger.warning(f"Not a directory, skipping: {model_dir}")
+            continue
+
+        try:
+            discovered = discover_models(model_dir)
+        except ValueError as e:
+            logger.warning(f"Skipping directory {model_dir}: {e}")
+            continue
+
+        for model_id, info in discovered.items():
+            if model_id in merged:
+                logger.warning(
+                    f"Duplicate model_id '{model_id}' found in {model_dir}, "
+                    f"keeping version from {merged[model_id].model_path}"
+                )
+                continue
+            merged[model_id] = info
+
+    return merged
+
+
 def format_size(size_bytes: int) -> str:
     """Format byte size as human-readable string."""
     for unit in ["B", "KB", "MB", "GB", "TB"]:

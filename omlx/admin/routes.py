@@ -68,7 +68,8 @@ class GlobalSettingsRequest(BaseModel):
     log_level: Optional[str] = None
 
     # Model settings
-    model_dir: Optional[str] = None
+    model_dirs: Optional[List[str]] = None
+    model_dir: Optional[str] = None  # Deprecated: kept for backward compatibility
     max_model_memory: Optional[str] = None
 
     # Scheduler settings
@@ -156,14 +157,15 @@ def _apply_log_level_runtime(level: str) -> None:
     logging.getLogger("uvicorn.access").setLevel(log_level)
 
 
-async def _apply_model_dir_runtime(model_dir: str) -> tuple[bool, str]:
+async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     """
-    Apply model directory change at runtime by re-scanning models.
+    Apply model directories change at runtime by re-scanning models.
 
     This will:
-    1. Unload all currently loaded models
-    2. Clear the entries dictionary
-    3. Re-discover models from the new directory
+    1. Validate all directories
+    2. Unload all currently loaded models
+    3. Clear the entries dictionary
+    4. Re-discover models from the new directories
 
     Returns:
         Tuple of (success, message)
@@ -174,12 +176,13 @@ async def _apply_model_dir_runtime(model_dir: str) -> tuple[bool, str]:
     if _server_state.engine_pool is None:
         return False, "Engine pool not initialized"
 
-    # Validate model directory exists
-    model_path = Path(model_dir).expanduser().resolve()
-    if not model_path.exists():
-        return False, f"Model directory does not exist: {model_dir}"
-    if not model_path.is_dir():
-        return False, f"Path is not a directory: {model_dir}"
+    # Validate all model directories
+    for model_dir in model_dirs:
+        model_path = Path(model_dir).expanduser().resolve()
+        if not model_path.exists():
+            return False, f"Model directory does not exist: {model_dir}"
+        if not model_path.is_dir():
+            return False, f"Path is not a directory: {model_dir}"
 
     pool = _server_state.engine_pool
 
@@ -200,13 +203,17 @@ async def _apply_model_dir_runtime(model_dir: str) -> tuple[bool, str]:
     pool._entries.clear()
     pool._current_model_memory = 0
 
-    # Re-discover models from new directory
+    # Re-discover models from new directories
     try:
-        pool.discover_models(str(model_path), pinned_models)
+        pool.discover_models(model_dirs, pinned_models)
     except Exception as e:
         return False, f"Failed to discover models: {e}"
 
-    return True, f"Re-discovered {pool.model_count} models from {model_dir}"
+    dir_count = len(model_dirs)
+    return True, (
+        f"Re-discovered {pool.model_count} models "
+        f"from {dir_count} director{'ies' if dir_count > 1 else 'y'}"
+    )
 
 
 async def _apply_max_model_memory_runtime(max_memory_bytes: int) -> tuple[bool, str]:
@@ -1070,7 +1077,10 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "log_level": global_settings.server.log_level,
         },
         "model": {
-            "model_dir": global_settings.model.model_dir or str(global_settings.model.get_model_dir(global_settings.base_path)),
+            "model_dirs": [
+                str(d) for d in global_settings.model.get_model_dirs(global_settings.base_path)
+            ],
+            "model_dir": str(global_settings.model.get_model_dir(global_settings.base_path)),
             "max_model_memory": global_settings.model.max_model_memory,
         },
         "scheduler": {
@@ -1161,20 +1171,25 @@ async def update_global_settings(
         runtime_applied.append("log_level")
 
     # Apply model settings
-    if request.model_dir is not None:
-        old_model_dir = global_settings.model.model_dir
-        # Apply model_dir at runtime if changed
-        if request.model_dir != old_model_dir:
-            success, msg = await _apply_model_dir_runtime(request.model_dir)
+    new_dirs = None
+    if request.model_dirs is not None:
+        new_dirs = [d for d in request.model_dirs if d.strip()]
+    elif request.model_dir is not None:
+        new_dirs = [request.model_dir]
+
+    if new_dirs is not None:
+        old_dirs = global_settings.model.model_dirs
+        if new_dirs != old_dirs:
+            success, msg = await _apply_model_dirs_runtime(new_dirs)
             if success:
-                global_settings.model.model_dir = request.model_dir
-                runtime_applied.append("model_dir")
+                global_settings.model.model_dirs = new_dirs
+                global_settings.model.model_dir = new_dirs[0] if new_dirs else None
+                runtime_applied.append("model_dirs")
                 logger.info(msg)
             else:
-                # Revert to old value and return error
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Failed to change model directory: {msg}"
+                    detail=f"Failed to change model directories: {msg}"
                 )
 
     if request.max_model_memory is not None and request.max_model_memory != "":
@@ -1696,24 +1711,27 @@ async def get_recommended_models(is_admin: bool = Depends(require_admin)):
 
 @router.get("/api/hf/models")
 async def list_hf_models(is_admin: bool = Depends(require_admin)):
-    """List models in the model directory with disk size info."""
+    """List models in all model directories with disk size info."""
     global_settings = _get_global_settings()
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    model_dir = Path(
-        global_settings.model.model_dir
-        or global_settings.model.get_model_dir(global_settings.base_path)
-    )
+    model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
 
     models = []
-    if model_dir.exists():
+    seen_names: set[str] = set()
+    for model_dir in model_dirs:
+        if not model_dir.exists():
+            continue
         for subdir in sorted(model_dir.iterdir()):
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
 
             if (subdir / "config.json").exists():
                 # Level 1: direct model folder
+                if subdir.name in seen_names:
+                    continue
+                seen_names.add(subdir.name)
                 total_size = sum(
                     f.stat().st_size for f in subdir.rglob("*") if f.is_file()
                 )
@@ -1732,6 +1750,9 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                         continue
                     if not (child / "config.json").exists():
                         continue
+                    if child.name in seen_names:
+                        continue
+                    seen_names.add(child.name)
 
                     total_size = sum(
                         f.stat().st_size
@@ -1762,28 +1783,37 @@ async def delete_hf_model(
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    model_dir = Path(
-        global_settings.model.model_dir
-        or global_settings.model.get_model_dir(global_settings.base_path)
-    )
-    # Search for model in both flat and org-folder layouts
-    model_path = model_dir / model_name
-    if not (model_path.is_dir() and (model_path / "config.json").exists()):
+    model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
+
+    # Search for model across all directories in both flat and org-folder layouts
+    model_path = None
+    parent_model_dir = None
+    for model_dir in model_dirs:
+        if not model_dir.exists():
+            continue
+        candidate = model_dir / model_name
+        if candidate.is_dir() and (candidate / "config.json").exists():
+            model_path = candidate
+            parent_model_dir = model_dir
+            break
         # Try two-level: search inside organization folders
-        model_path = None
         for subdir in model_dir.iterdir():
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
             candidate = subdir / model_name
             if candidate.is_dir() and (candidate / "config.json").exists():
                 model_path = candidate
+                parent_model_dir = model_dir
                 break
-        if model_path is None:
-            raise HTTPException(status_code=404, detail="Model not found")
+        if model_path is not None:
+            break
 
-    # Validate path traversal
+    if model_path is None:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    # Validate path traversal against parent model directory
     try:
-        if not model_path.resolve().is_relative_to(model_dir.resolve()):
+        if not model_path.resolve().is_relative_to(parent_model_dir.resolve()):
             raise HTTPException(status_code=400, detail="Invalid model name")
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid model name")
@@ -1813,7 +1843,9 @@ async def delete_hf_model(
             pinned_models = settings_manager.get_pinned_model_ids()
 
         engine_pool._entries.pop(model_name, None)
-        engine_pool.discover_models(str(model_dir), pinned_models)
+        engine_pool.discover_models(
+            [str(d) for d in model_dirs], pinned_models
+        )
         logger.info("Model pool refreshed after deletion")
 
     return {"success": True, "message": f"Model '{model_name}' deleted"}

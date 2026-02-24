@@ -13,7 +13,7 @@
             globalSettings: {
                 base_path: '',
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info' },
-                model: { model_dir: '', max_model_memory: '' },
+                model: { model_dirs: [''], max_model_memory: '' },
                 scheduler: { max_num_seqs: 8, prefill_batch_size: 8, completion_batch_size: 8 },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto' },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 40, repetition_penalty: 1.0 },
@@ -177,11 +177,15 @@
                     if (response.ok) {
                         const data = await response.json();
                         // Deep merge to preserve defaults for missing fields
+                        // Handle model_dirs: prefer list, fallback to single model_dir
+                        const modelDirs = data.model?.model_dirs?.length
+                            ? data.model.model_dirs
+                            : (data.model?.model_dir ? [data.model.model_dir] : ['']);
                         this.globalSettings = {
                             ...this.globalSettings,
                             ...data,
                             server: { ...this.globalSettings.server, ...data.server },
-                            model: { ...this.globalSettings.model, ...data.model },
+                            model: { ...this.globalSettings.model, ...data.model, model_dirs: modelDirs },
                             scheduler: { ...this.globalSettings.scheduler, ...data.scheduler },
                             cache: { ...this.globalSettings.cache, ...data.cache },
                             sampling: { ...this.globalSettings.sampling, ...data.sampling },
@@ -224,7 +228,7 @@
                 const s = this.globalSettings;
                 if (!s.server.host) errors.push('Host');
                 if (!s.server.port) errors.push('Port');
-                if (!s.model.model_dir) errors.push('Model Directory');
+                if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
                 if (!s.scheduler.max_num_seqs) errors.push('Max Sequences');
                 if (!s.scheduler.prefill_batch_size) errors.push('Prefill Batch Size');
                 if (!s.scheduler.completion_batch_size) errors.push('Completion Batch Size');
@@ -260,7 +264,7 @@
                             host: this.globalSettings.server.host,
                             port: this.globalSettings.server.port,
                             log_level: this.globalSettings.server.log_level,
-                            model_dir: this.globalSettings.model.model_dir,
+                            model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             max_model_memory: this.globalSettings.model.max_model_memory,
                             max_num_seqs: this.globalSettings.scheduler.max_num_seqs,
                             prefill_batch_size: this.globalSettings.scheduler.prefill_batch_size,

@@ -126,22 +126,37 @@ class ServerSettings:
 class ModelSettings:
     """Model configuration settings."""
 
-    model_dir: str | None = None  # None means ~/.omlx/models
+    model_dirs: list[str] = field(default_factory=list)  # [] means ~/.omlx/models
+    model_dir: str | None = None  # Deprecated: kept for backward compatibility
     max_model_memory: str = "auto"  # "auto" means 80% of RAM
 
-    def get_model_dir(self, base_path: Path) -> Path:
+    def get_model_dirs(self, base_path: Path) -> list[Path]:
         """
-        Get the resolved model directory path.
+        Get the resolved model directory paths.
 
         Args:
             base_path: Base oMLX directory.
 
         Returns:
-            Resolved model directory path.
+            List of resolved model directory paths.
         """
+        if self.model_dirs:
+            return [Path(d).expanduser().resolve() for d in self.model_dirs]
         if self.model_dir:
-            return Path(self.model_dir).expanduser().resolve()
-        return base_path / "models"
+            return [Path(self.model_dir).expanduser().resolve()]
+        return [base_path / "models"]
+
+    def get_model_dir(self, base_path: Path) -> Path:
+        """
+        Get the primary (first) resolved model directory path.
+
+        Args:
+            base_path: Base oMLX directory.
+
+        Returns:
+            Resolved primary model directory path.
+        """
+        return self.get_model_dirs(base_path)[0]
 
     def get_max_model_memory_bytes(self) -> int:
         """
@@ -157,14 +172,20 @@ class ModelSettings:
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
-            "model_dir": self.model_dir,
+            "model_dirs": self.model_dirs,
+            "model_dir": self.model_dirs[0] if self.model_dirs else self.model_dir,
             "max_model_memory": self.max_model_memory,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ModelSettings:
         """Create from dictionary."""
+        model_dirs = data.get("model_dirs", [])
+        # Backward compatibility: migrate old model_dir to model_dirs
+        if not model_dirs and data.get("model_dir"):
+            model_dirs = [data["model_dir"]]
         return cls(
+            model_dirs=model_dirs,
             model_dir=data.get("model_dir"),
             max_model_memory=data.get("max_model_memory", "auto"),
         )
@@ -496,7 +517,9 @@ class GlobalSettings:
 
         # Model settings
         if model_dir := os.getenv("OMLX_MODEL_DIR"):
-            self.model.model_dir = model_dir
+            dirs = [d.strip() for d in model_dir.split(",") if d.strip()]
+            self.model.model_dirs = dirs
+            self.model.model_dir = dirs[0] if dirs else None
         if max_model_memory := os.getenv("OMLX_MAX_MODEL_MEMORY"):
             self.model.max_model_memory = max_model_memory
 
@@ -561,7 +584,9 @@ class GlobalSettings:
 
         # Model settings
         if hasattr(args, "model_dir") and args.model_dir is not None:
-            self.model.model_dir = args.model_dir
+            dirs = [d.strip() for d in args.model_dir.split(",") if d.strip()]
+            self.model.model_dirs = dirs
+            self.model.model_dir = dirs[0] if dirs else None
         if hasattr(args, "max_model_memory") and args.max_model_memory is not None:
             self.model.max_model_memory = args.max_model_memory
 
@@ -622,7 +647,7 @@ class GlobalSettings:
         """Create necessary directories if they don't exist."""
         directories = [
             self.base_path,
-            self.model.get_model_dir(self.base_path),
+            *self.model.get_model_dirs(self.base_path),
             self.cache.get_ssd_cache_dir(self.base_path),
             self.logging.get_log_dir(self.base_path),
         ]

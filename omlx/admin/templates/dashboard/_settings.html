@@ -127,12 +127,31 @@
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
-                                <div class="flex items-center justify-between px-6 py-4">
-                                    <div class="flex items-center gap-2">
-                                        <label class="text-sm text-neutral-700">Model Directory</label>
+                                <div class="px-6 py-4">
+                                    <div class="flex items-center justify-between mb-3">
+                                        <div class="flex items-center gap-2">
+                                            <label class="text-sm text-neutral-700">Model Directories</label>
+                                        </div>
+                                        <button @click="globalSettings.model.model_dirs.push(''); $nextTick(() => lucide.createIcons())"
+                                                class="flex items-center gap-1 text-xs px-2 py-1 text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-colors">
+                                            <i data-lucide="plus" class="w-3.5 h-3.5"></i>
+                                            <span>Add</span>
+                                        </button>
                                     </div>
-                                    <input type="text" x-model="globalSettings.model.model_dir"
-                                           class="w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                    <div class="flex flex-col gap-2">
+                                        <template x-for="(dir, index) in globalSettings.model.model_dirs" :key="index">
+                                            <div class="flex items-center gap-2">
+                                                <input type="text" x-model="globalSettings.model.model_dirs[index]"
+                                                       class="flex-1 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs"
+                                                       :placeholder="index === 0 ? 'Primary model directory' : 'Additional model directory'">
+                                                <button @click="if (globalSettings.model.model_dirs.length > 1) globalSettings.model.model_dirs.splice(index, 1)"
+                                                        class="flex-shrink-0 p-1.5 rounded-lg transition-colors"
+                                                        :class="globalSettings.model.model_dirs.length > 1 ? 'text-neutral-400 hover:text-red-500 hover:bg-red-50' : 'text-neutral-200 cursor-not-allowed'">
+                                                    <i data-lucide="minus" class="w-3.5 h-3.5"></i>
+                                                </button>
+                                            </div>
+                                        </template>
+                                    </div>
                                 </div>
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div class="flex items-center gap-2">

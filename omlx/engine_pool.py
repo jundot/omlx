@@ -100,17 +100,29 @@ class EnginePool:
         """Number of currently loaded models."""
         return sum(1 for e in self._entries.values() if e.engine is not None)
 
-    def discover_models(self, model_dir: str, pinned_models: list[str] | None = None) -> None:
+    def discover_models(
+        self, model_dirs: str | list[str], pinned_models: list[str] | None = None
+    ) -> None:
         """
-        Discover models in the specified directory.
+        Discover models in the specified directory or directories.
 
         Args:
-            model_dir: Path to directory containing model subdirectories
+            model_dirs: Path or list of paths to directories containing model subdirectories
             pinned_models: List of model IDs to pin (never evict)
         """
         from pathlib import Path
 
-        discovered = discover_models(Path(model_dir))
+        from .model_discovery import discover_models_from_dirs
+
+        if isinstance(model_dirs, str):
+            dirs = [Path(model_dirs)]
+        else:
+            dirs = [Path(d) for d in model_dirs]
+
+        if len(dirs) == 1:
+            discovered = discover_models(dirs[0])
+        else:
+            discovered = discover_models_from_dirs(dirs)
 
         pinned_set = set(pinned_models or [])
 

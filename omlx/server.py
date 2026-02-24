@@ -615,17 +615,17 @@ def validate_context_window(
 
 
 def init_server(
-    model_dir: str,
+    model_dirs: str | list[str],
     max_model_memory: int,
     scheduler_config=None,
     api_key: str | None = None,
     global_settings: object | None = None,
 ):
     """
-    Initialize server with model directory for multi-model serving.
+    Initialize server with model directories for multi-model serving.
 
     Args:
-        model_dir: Path to directory containing model subdirectories
+        model_dirs: Path or list of paths to directories containing model subdirectories
         max_model_memory: Maximum memory for loaded models in bytes
         scheduler_config: Scheduler config for BatchedEngine
         api_key: API key for authentication (optional)
@@ -681,11 +681,18 @@ def init_server(
     else:
         _server_state.sampling = SamplingDefaults()
 
-    model_path = Path(model_dir)
-    if not model_path.exists():
-        # Create directory if it doesn't exist (for first-time setup)
-        model_path.mkdir(parents=True, exist_ok=True)
-        logger.warning(f"Model directory created (empty): {model_dir}")
+    # Normalize model_dirs to list
+    if isinstance(model_dirs, str):
+        dir_list = [model_dirs]
+    else:
+        dir_list = list(model_dirs)
+
+    # Create directories if needed
+    for md in dir_list:
+        model_path = Path(md)
+        if not model_path.exists():
+            model_path.mkdir(parents=True, exist_ok=True)
+            logger.warning(f"Model directory created (empty): {md}")
 
     # Create engine pool
     _server_state.engine_pool = EnginePool(
@@ -694,10 +701,12 @@ def init_server(
     )
 
     # Discover models (use pinned models from settings file)
-    _server_state.engine_pool.discover_models(model_dir, pinned_models)
+    _server_state.engine_pool.discover_models(dir_list, pinned_models)
 
     if _server_state.engine_pool.model_count == 0:
-        logger.warning(f"No models found in {model_dir}. Add models to serve them.")
+        logger.warning(
+            f"No models found in {', '.join(dir_list)}. Add models to serve them."
+        )
 
     # Set default model (from settings file, fallback to first model)
     available_models = _server_state.engine_pool.get_model_ids()
@@ -736,11 +745,11 @@ def init_server(
         """Re-discover models when a HuggingFace download completes."""
         if _server_state.engine_pool and _server_state.settings_manager:
             pinned = _server_state.settings_manager.get_pinned_model_ids()
-            _server_state.engine_pool.discover_models(model_dir, pinned)
+            _server_state.engine_pool.discover_models(dir_list, pinned)
             logger.info("Model pool refreshed after download completion")
 
     _server_state.hf_downloader = HFDownloader(
-        model_dir=model_dir,
+        model_dir=dir_list[0],  # Downloads go to primary directory
         on_complete=_refresh_models_after_download,
     )
     set_hf_downloader(_server_state.hf_downloader)

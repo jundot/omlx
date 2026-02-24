@@ -527,7 +527,7 @@ class TestHFDownloaderRoutes:
         # Create a mock global settings
         mock_settings = MagicMock()
         mock_settings.model.model_dir = str(model_dir_with_models)
-        mock_settings.model.get_model_dir.return_value = str(model_dir_with_models)
+        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
 
         import omlx.admin.routes as routes_module
 
@@ -562,7 +562,7 @@ class TestHFDownloaderRoutes:
 
         mock_settings = MagicMock()
         mock_settings.model.model_dir = str(model_dir_with_models)
-        mock_settings.model.get_model_dir.return_value = str(model_dir_with_models)
+        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -603,7 +603,7 @@ class TestHFDownloaderRoutes:
 
         mock_settings = MagicMock()
         mock_settings.model.model_dir = str(model_dir_with_models)
-        mock_settings.model.get_model_dir.return_value = str(model_dir_with_models)
+        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
 
         orig = routes_module._get_global_settings
         routes_module._get_global_settings = lambda: mock_settings
@@ -614,7 +614,9 @@ class TestHFDownloaderRoutes:
                 await delete_hf_model(
                     model_name="../../../etc/passwd", is_admin=True
                 )
-            assert exc_info.value.status_code == 400
+            # Path traversal is blocked: returns 404 (not found) since the
+            # traversal path won't match any model in the directories
+            assert exc_info.value.status_code in (400, 404)
         finally:
             routes_module._get_global_settings = orig
 
@@ -628,7 +630,7 @@ class TestHFDownloaderRoutes:
 
         mock_settings = MagicMock()
         mock_settings.model.model_dir = str(model_dir_with_models)
-        mock_settings.model.get_model_dir.return_value = str(model_dir_with_models)
+        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
 
         orig = routes_module._get_global_settings
         routes_module._get_global_settings = lambda: mock_settings

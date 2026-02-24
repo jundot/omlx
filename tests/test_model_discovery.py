@@ -11,6 +11,7 @@ from omlx.model_discovery import (
     DiscoveredModel,
     detect_model_type,
     discover_models,
+    discover_models_from_dirs,
     estimate_model_size,
     format_size,
 )
@@ -459,3 +460,69 @@ class TestTwoLevelDiscovery:
         assert models["llama-3b"].model_path == str(
             tmp_path / "mlx-community" / "llama-3b"
         )
+
+
+class TestDiscoverModelsFromDirs:
+    """Tests for discover_models_from_dirs function."""
+
+    def _make_model(self, path, model_type="llama"):
+        """Helper to create a mock model directory."""
+        path.mkdir(parents=True, exist_ok=True)
+        config = {
+            "model_type": model_type,
+            "architectures": ["LlamaForCausalLM"],
+        }
+        (path / "config.json").write_text(json.dumps(config))
+        # Create a small safetensors file
+        (path / "model.safetensors").write_bytes(b"\x00" * 100)
+
+    def test_multiple_dirs(self, tmp_path):
+        """Test discovering models from multiple directories."""
+        dir_a = tmp_path / "dir_a"
+        dir_b = tmp_path / "dir_b"
+        self._make_model(dir_a / "model-1")
+        self._make_model(dir_b / "model-2")
+
+        models = discover_models_from_dirs([dir_a, dir_b])
+        assert "model-1" in models
+        assert "model-2" in models
+        assert len(models) == 2
+
+    def test_first_directory_wins_on_conflict(self, tmp_path):
+        """Test that first directory takes priority on model_id conflicts."""
+        dir_a = tmp_path / "dir_a"
+        dir_b = tmp_path / "dir_b"
+        self._make_model(dir_a / "same-model")
+        self._make_model(dir_b / "same-model")
+
+        models = discover_models_from_dirs([dir_a, dir_b])
+        assert len(models) == 1
+        assert models["same-model"].model_path == str(dir_a / "same-model")
+
+    def test_empty_list(self, tmp_path):
+        """Test with empty directory list."""
+        models = discover_models_from_dirs([])
+        assert models == {}
+
+    def test_nonexistent_directory_skipped(self, tmp_path):
+        """Test that non-existent directories are skipped with warning."""
+        dir_a = tmp_path / "dir_a"
+        self._make_model(dir_a / "model-1")
+        nonexistent = tmp_path / "does_not_exist"
+
+        models = discover_models_from_dirs([dir_a, nonexistent])
+        assert "model-1" in models
+        assert len(models) == 1
+
+    def test_mixed_valid_invalid_dirs(self, tmp_path):
+        """Test with a mix of valid, empty, and non-existent directories."""
+        dir_valid = tmp_path / "valid"
+        dir_empty = tmp_path / "empty"
+        dir_empty.mkdir(parents=True)
+        self._make_model(dir_valid / "model-1")
+
+        models = discover_models_from_dirs(
+            [dir_valid, dir_empty, tmp_path / "nonexistent"]
+        )
+        assert "model-1" in models
+        assert len(models) == 1

@@ -104,8 +104,9 @@ def serve_command(args):
     from .server import app, init_server
     from .config import parse_size
 
+    model_dirs = settings.model.get_model_dirs(settings.base_path)
     print(f"Base path: {settings.base_path}")
-    print(f"Model directory: {settings.model.get_model_dir(settings.base_path)}")
+    print(f"Model directories: {', '.join(str(d) for d in model_dirs)}")
     print(f"Max model memory: {settings.model.max_model_memory}")
 
     # Store MCP config path for FastAPI startup
@@ -158,7 +159,7 @@ def serve_command(args):
     # Note: pinned_models and default_model are managed via admin page (model_settings.json)
     # Sampling parameters (max_tokens, temperature, etc.) are per-model settings
     init_server(
-        model_dir=str(settings.model.get_model_dir(settings.base_path)),
+        model_dirs=[str(d) for d in model_dirs],
         max_model_memory=settings.model.get_max_model_memory_bytes(),
         scheduler_config=scheduler_config,
         api_key=settings.auth.api_key,
