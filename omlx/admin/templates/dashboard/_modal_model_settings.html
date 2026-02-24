@@ -1,0 +1,138 @@
+    <!-- Model Settings Modal -->
+    <div x-show="showModelSettingsModal" x-cloak
+         class="fixed inset-0 z-50 overflow-y-auto"
+         x-transition:enter="transition ease-out duration-200"
+         x-transition:enter-start="opacity-0"
+         x-transition:enter-end="opacity-100"
+         x-transition:leave="transition ease-in duration-150"
+         x-transition:leave-start="opacity-100"
+         x-transition:leave-end="opacity-0">
+        <!-- Backdrop -->
+        <div class="fixed inset-0 bg-black/50" @click="showModelSettingsModal = false"></div>
+
+        <!-- Modal -->
+        <div class="flex min-h-full items-center justify-center p-4">
+            <div class="relative bg-white rounded-3xl shadow-2xl w-full max-w-lg p-8"
+                 @click.stop
+                 x-transition:enter="transition ease-out duration-200"
+                 x-transition:enter-start="opacity-0 scale-95"
+                 x-transition:enter-end="opacity-100 scale-100"
+                 x-transition:leave="transition ease-in duration-150"
+                 x-transition:leave-start="opacity-100 scale-100"
+                 x-transition:leave-end="opacity-0 scale-95">
+
+                <!-- Header -->
+                <div class="flex items-center justify-between mb-6">
+                    <div>
+                        <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-1">Model Settings</h3>
+                        <h4 class="text-xl font-bold tracking-tight text-neutral-900" x-text="selectedModel?.name || selectedModel?.id"></h4>
+                    </div>
+                    <button @click="showModelSettingsModal = false"
+                            class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-full transition-all">
+                        <i data-lucide="x" class="w-5 h-5"></i>
+                    </button>
+                </div>
+
+                <!-- Sampling Parameters -->
+                <div class="space-y-5">
+                    <div>
+                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Max Context Window</label>
+                        <input type="number" x-model.number="modelSettings.max_context_window" placeholder="Default" min="1"
+                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Max Tokens</label>
+                            <input type="number" x-model.number="modelSettings.max_tokens" placeholder="Default"
+                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Temperature</label>
+                            <input type="number" x-model.number="modelSettings.temperature" step="0.1" min="0" max="2" placeholder="Default"
+                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Top P</label>
+                            <input type="number" x-model.number="modelSettings.top_p" step="0.05" min="0" max="1" placeholder="Default"
+                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Top K</label>
+                            <input type="number" x-model.number="modelSettings.top_k" min="0" placeholder="Default"
+                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Repetition Penalty</label>
+                            <input type="number" x-model.number="modelSettings.repetition_penalty" step="0.05" min="0" placeholder="Default"
+                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                        </div>
+                        <div class="flex items-end">
+                            <button type="button" @click="loadGenerationDefaults"
+                                    :disabled="loadingGenDefaults"
+                                    class="w-full px-4 py-2.5 text-sm font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-xl border border-neutral-200 transition-all disabled:opacity-50">
+                                <span x-show="!loadingGenDefaults">Load Defaults</span>
+                                <span x-show="loadingGenDefaults">Loading...</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <span class="text-sm font-medium text-neutral-700">Limit Tool Result Tokens</span>
+                                <p class="text-xs text-neutral-500 mt-0.5">Truncate large tool results (e.g. file reads) to a token limit</p>
+                            </div>
+                            <button type="button" @click="modelSettings.enableToolResultLimit = !modelSettings.enableToolResultLimit; if (!modelSettings.enableToolResultLimit) modelSettings.max_tool_result_tokens = null;"
+                                    :class="modelSettings.enableToolResultLimit ? 'bg-black' : 'bg-neutral-200'"
+                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                <span :class="modelSettings.enableToolResultLimit ? 'translate-x-5' : 'translate-x-0'"
+                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                            </button>
+                        </div>
+                        <div x-show="modelSettings.enableToolResultLimit" x-transition class="pt-1">
+                            <input type="number" x-model.number="modelSettings.max_tool_result_tokens" placeholder="e.g. 2000" min="100" step="100"
+                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                        </div>
+                    </div>
+
+                    <div class="flex items-center justify-between p-4 bg-neutral-50 rounded-xl">
+                        <div>
+                            <span class="text-sm font-medium text-neutral-700">Force Sampling</span>
+                            <p class="text-xs text-neutral-500 mt-0.5">Override request sampling parameters with configured values</p>
+                        </div>
+                        <button type="button" @click="modelSettings.force_sampling = !modelSettings.force_sampling"
+                                :class="modelSettings.force_sampling ? 'bg-black' : 'bg-neutral-200'"
+                                class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                            <span :class="modelSettings.force_sampling ? 'translate-x-5' : 'translate-x-0'"
+                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                        </button>
+                    </div>
+
+                    <p class="text-xs text-neutral-400 text-center">Leave empty to use global defaults</p>
+                </div>
+
+                <!-- Actions -->
+                <div class="flex items-center justify-end gap-3 mt-8">
+                    <button @click="showModelSettingsModal = false"
+                            class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">
+                        Cancel
+                    </button>
+                    <button @click="saveModelSettings"
+                            :disabled="savingModelSettings"
+                            class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full
+                                   hover:bg-neutral-800 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:ring-offset-2
+                                   transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed">
+                        <span x-show="!savingModelSettings">Save</span>
+                        <span x-show="savingModelSettings">Saving...</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>

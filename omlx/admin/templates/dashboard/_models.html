@@ -1,0 +1,327 @@
+            <div x-show="mainTab === 'models'" x-cloak>
+                <div class="animate-fade-in-up">
+                    <!-- Header -->
+                    <div class="mb-8">
+                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">Models</h2>
+                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">Model Manager</h3>
+                        <p class="text-sm text-neutral-500 mt-2">Download models from HuggingFace and manage local models.</p>
+                    </div>
+
+                    <!-- Download Form Section -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="cloud-download" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Download from HuggingFace</span>
+                            </div>
+                        </div>
+                        <div class="px-6 py-5">
+                            <div class="flex items-end gap-4">
+                                <div class="flex-1">
+                                    <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">Repository ID</label>
+                                    <input type="text" x-model="hfRepoId"
+                                           @keydown.enter="startHFDownload()"
+                                           placeholder="mlx-community/Llama-3-8B-4bit"
+                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm
+                                                  focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all
+                                                  bg-white font-mono text-xs"
+                                    >
+                                </div>
+                                <div class="w-48">
+                                    <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">
+                                        HF Token <span class="text-neutral-400 normal-case">(optional)</span>
+                                    </label>
+                                    <input type="password" x-model="hfToken"
+                                           @keydown.enter="startHFDownload()"
+                                           placeholder="hf_..."
+                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm
+                                                  focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all
+                                                  bg-white font-mono text-xs"
+                                    >
+                                </div>
+                                <button @click="startHFDownload()"
+                                        :disabled="hfDownloading || !hfRepoId.trim()"
+                                        class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full
+                                               hover:bg-neutral-800 transition-all disabled:opacity-50 disabled:cursor-not-allowed
+                                               flex items-center gap-2 whitespace-nowrap">
+                                    <i data-lucide="download" class="w-4 h-4"></i>
+                                    Download
+                                </button>
+                            </div>
+                            <!-- Error message -->
+                            <div x-show="hfError" x-cloak
+                                 class="mt-3 px-4 py-2.5 bg-red-50 border border-red-200 text-red-700 text-sm rounded-xl flex items-center gap-2">
+                                <i data-lucide="alert-circle" class="w-4 h-4 shrink-0"></i>
+                                <span x-text="hfError"></span>
+                            </div>
+                            <!-- Success message -->
+                            <div x-show="hfSuccess" x-cloak
+                                 class="mt-3 px-4 py-2.5 bg-green-50 border border-green-200 text-green-700 text-sm rounded-xl flex items-center gap-2">
+                                <i data-lucide="check-circle" class="w-4 h-4 shrink-0"></i>
+                                <span x-text="hfSuccess"></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Recommended Models Section -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="star" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Recommended Models</span>
+                                <span x-show="globalSettings.system.total_memory" x-cloak
+                                      class="text-xs text-neutral-400" x-text="'for ' + globalSettings.system.total_memory + ' system'"></span>
+                            </div>
+                            <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5">
+                                <button @click="hfRecommendedTab = 'trending'"
+                                        :class="hfRecommendedTab === 'trending'
+                                            ? 'bg-white text-neutral-900 shadow-sm'
+                                            : 'text-neutral-500 hover:text-neutral-700'"
+                                        class="px-3 py-1 text-xs font-medium rounded-md transition-all">
+                                    Trending
+                                </button>
+                                <button @click="hfRecommendedTab = 'popular'"
+                                        :class="hfRecommendedTab === 'popular'
+                                            ? 'bg-white text-neutral-900 shadow-sm'
+                                            : 'text-neutral-500 hover:text-neutral-700'"
+                                        class="px-3 py-1 text-xs font-medium rounded-md transition-all">
+                                    Popular
+                                </button>
+                            </div>
+                        </div>
+                        <!-- Loading state -->
+                        <div x-show="hfRecommendedLoading" x-cloak class="px-6 py-12 text-center">
+                            <div class="inline-block w-5 h-5 border-2 border-neutral-300 border-t-neutral-600 rounded-full animate-spin mb-3"></div>
+                            <p class="text-sm text-neutral-500">Loading recommendations...</p>
+                        </div>
+                        <!-- Empty state (not loaded yet, not loading) -->
+                        <div x-show="!hfRecommendedLoading && !hfRecommendedLoaded" x-cloak class="px-6 py-12 text-center">
+                            <i data-lucide="star" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
+                            <p class="text-sm text-neutral-500">Click to load recommended models.</p>
+                            <button @click="loadRecommendedModels()"
+                                    class="mt-3 px-4 py-2 text-xs font-medium text-neutral-600 hover:text-neutral-800
+                                           bg-neutral-100 hover:bg-neutral-200 rounded-lg transition-all">
+                                Load Recommendations
+                            </button>
+                        </div>
+                        <!-- Model list -->
+                        <template x-if="hfRecommendedLoaded && !hfRecommendedLoading">
+                            <div>
+                                <!-- Trending tab -->
+                                <div x-show="hfRecommendedTab === 'trending'" class="divide-y divide-neutral-100">
+                                    <template x-if="hfRecommended.trending.length === 0">
+                                        <div class="px-6 py-8 text-center">
+                                            <p class="text-sm text-neutral-500">No trending models found for your system.</p>
+                                        </div>
+                                    </template>
+                                    <template x-for="model in hfRecommended.trending" :key="model.repo_id">
+                                        <div class="px-6 py-3.5 flex items-center justify-between hover:bg-neutral-50 transition-colors">
+                                            <div class="min-w-0 flex-1">
+                                                <a :href="'https://huggingface.co/' + model.repo_id" target="_blank" rel="noopener noreferrer"
+                                                   class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors" x-text="model.name"></a>
+                                                <div class="flex items-center gap-3 mt-0.5">
+                                                    <span class="text-xs text-neutral-400" x-text="model.size_formatted"></span>
+                                                    <span class="text-xs text-neutral-400" x-text="'&#11015; ' + formatDownloads(model.downloads)"></span>
+                                                    <span class="text-xs text-neutral-400" x-text="'&#9829; ' + model.likes"></span>
+                                                </div>
+                                            </div>
+                                            <div class="flex items-center gap-2 shrink-0 ml-4">
+                                                <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
+                                                      class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">
+                                                    Tight fit
+                                                </span>
+                                                <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
+                                                      class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200">
+                                                    High OOM risk
+                                                </span>
+                                                <button @click="downloadRecommended(model.repo_id)"
+                                                        :disabled="hfDownloading"
+                                                        class="px-3.5 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100
+                                                               hover:bg-neutral-900 hover:text-white rounded-lg transition-all
+                                                               disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
+                                                    <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                                                    Download
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </template>
+                                </div>
+                                <!-- Popular tab -->
+                                <div x-show="hfRecommendedTab === 'popular'" class="divide-y divide-neutral-100">
+                                    <template x-if="hfRecommended.popular.length === 0">
+                                        <div class="px-6 py-8 text-center">
+                                            <p class="text-sm text-neutral-500">No popular models found for your system.</p>
+                                        </div>
+                                    </template>
+                                    <template x-for="model in hfRecommended.popular" :key="model.repo_id">
+                                        <div class="px-6 py-3.5 flex items-center justify-between hover:bg-neutral-50 transition-colors">
+                                            <div class="min-w-0 flex-1">
+                                                <a :href="'https://huggingface.co/' + model.repo_id" target="_blank" rel="noopener noreferrer"
+                                                   class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors" x-text="model.name"></a>
+                                                <div class="flex items-center gap-3 mt-0.5">
+                                                    <span class="text-xs text-neutral-400" x-text="model.size_formatted"></span>
+                                                    <span class="text-xs text-neutral-400" x-text="'&#11015; ' + formatDownloads(model.downloads)"></span>
+                                                    <span class="text-xs text-neutral-400" x-text="'&#9829; ' + model.likes"></span>
+                                                </div>
+                                            </div>
+                                            <div class="flex items-center gap-2 shrink-0 ml-4">
+                                                <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
+                                                      class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">
+                                                    Tight fit
+                                                </span>
+                                                <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
+                                                      class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200">
+                                                    High OOM risk
+                                                </span>
+                                                <button @click="downloadRecommended(model.repo_id)"
+                                                        :disabled="hfDownloading"
+                                                        class="px-3.5 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100
+                                                               hover:bg-neutral-900 hover:text-white rounded-lg transition-all
+                                                               disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
+                                                    <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                                                    Download
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </template>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+
+                    <!-- Download Queue Section -->
+                    <template x-if="hfTasks.length > 0">
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="list" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Download Queue</span>
+                                </div>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <template x-for="task in hfTasks" :key="task.task_id">
+                                    <div class="px-6 py-4">
+                                        <div class="flex items-center justify-between">
+                                            <div class="flex-1 min-w-0">
+                                                <div class="flex items-center gap-2 flex-wrap">
+                                                    <span class="text-sm font-medium text-neutral-900 truncate" x-text="task.repo_id"></span>
+                                                    <span class="px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider rounded-full shrink-0"
+                                                          :class="{
+                                                              'bg-blue-50 text-blue-700 border border-blue-200': task.status === 'downloading',
+                                                              'bg-green-50 text-green-700 border border-green-200': task.status === 'completed',
+                                                              'bg-red-50 text-red-700 border border-red-200': task.status === 'failed',
+                                                              'bg-neutral-100 text-neutral-600 border border-neutral-200': task.status === 'pending',
+                                                              'bg-orange-50 text-orange-700 border border-orange-200': task.status === 'cancelled',
+                                                          }"
+                                                          x-text="task.status"></span>
+                                                </div>
+                                                <!-- Error message -->
+                                                <p x-show="task.error" x-cloak class="text-xs text-red-500 mt-1.5 truncate" x-text="task.error"></p>
+                                                <!-- Progress bar for downloading -->
+                                                <template x-if="task.status === 'downloading'">
+                                                    <div class="mt-2.5">
+                                                        <div class="h-1.5 bg-neutral-100 rounded-full overflow-hidden">
+                                                            <div class="h-full bg-neutral-900 rounded-full transition-all duration-500"
+                                                                 :style="'width: ' + (task.total_size > 0 ? task.progress : 100) + '%'"
+                                                                 :class="task.total_size <= 0 ? 'animate-pulse' : ''"></div>
+                                                        </div>
+                                                        <div class="flex items-center gap-3 mt-1.5 text-xs text-neutral-400">
+                                                            <template x-if="task.total_size > 0">
+                                                                <span x-text="formatProgress(task)"></span>
+                                                            </template>
+                                                            <template x-if="task.total_size <= 0">
+                                                                <span>Downloading...</span>
+                                                            </template>
+                                                        </div>
+                                                    </div>
+                                                </template>
+                                            </div>
+                                            <!-- Actions -->
+                                            <div class="flex items-center gap-2 ml-4 shrink-0">
+                                                <button x-show="task.status === 'downloading' || task.status === 'pending'" x-cloak
+                                                        @click="cancelHFDownload(task.task_id)"
+                                                        class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
+                                                        title="Cancel download">
+                                                    <i data-lucide="x" class="w-4 h-4"></i>
+                                                </button>
+                                                <button x-show="task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'" x-cloak
+                                                        @click="removeHFTask(task.task_id)"
+                                                        class="p-1.5 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all"
+                                                        title="Remove from list">
+                                                    <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+                    </template>
+
+                    <!-- Local Models Section -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="hard-drive" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Local Models</span>
+                                <span class="text-xs text-neutral-400" x-text="hfModels.length + ' models'"></span>
+                            </div>
+                            <button @click="loadHFModels()"
+                                    class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700
+                                           hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5">
+                                <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>
+                                Refresh
+                            </button>
+                        </div>
+                        <!-- Model list -->
+                        <div class="divide-y divide-neutral-100">
+                            <template x-if="hfModels.length === 0">
+                                <div class="px-6 py-12 text-center">
+                                    <i data-lucide="inbox" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
+                                    <p class="text-sm text-neutral-500">No models found in model directory.</p>
+                                </div>
+                            </template>
+                            <template x-for="model in hfModels" :key="model.name">
+                                <div class="px-6 py-3 flex items-center justify-between hover:bg-neutral-50 transition-colors">
+                                    <div class="min-w-0 flex-1 flex items-center gap-2">
+                                        <span class="text-sm font-medium text-neutral-900 truncate" x-text="model.name"></span>
+                                        <span class="text-xs text-neutral-400 flex-shrink-0" x-text="'(' + model.size_formatted + ')'"></span>
+                                        <button x-data="{ copied: false }"
+                                                @click.stop="copyToClipboard(model.name); copied = true; setTimeout(() => copied = false, 2000)"
+                                                class="p-1 rounded-md transition-all flex-shrink-0"
+                                                :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                                                title="Copy model name">
+                                            <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                            <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                        </button>
+                                    </div>
+                                    <div class="flex items-center gap-2 ml-4 shrink-0">
+                                        <!-- Delete button -->
+                                        <template x-if="hfDeleteConfirm !== model.name">
+                                            <button @click="hfDeleteConfirm = model.name"
+                                                    class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
+                                                    title="Delete model">
+                                                <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                            </button>
+                                        </template>
+                                        <!-- Delete confirmation -->
+                                        <template x-if="hfDeleteConfirm === model.name">
+                                            <div class="flex items-center gap-2">
+                                                <span class="text-xs text-red-600">Delete?</span>
+                                                <button @click="deleteHFModel(model.name)"
+                                                        class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                                    Yes
+                                                </button>
+                                                <button @click="hfDeleteConfirm = null"
+                                                        class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                                    No
+                                                </button>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+            </div>

@@ -1,0 +1,212 @@
+            <div x-show="mainTab === 'status'" x-cloak>
+                <div class="animate-fade-in-up">
+                    <!-- Serving Stats Header -->
+                    <div class="flex items-end justify-between mb-8">
+                        <div>
+                            <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">Status</h2>
+                            <h3 class="text-2xl font-bold tracking-tight text-neutral-900">Serving Stats</h3>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <button @click="clearStats()"
+                                    class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5"
+                                    title="Clear all metrics">
+                                <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
+                                Clear
+                            </button>
+                            <select x-model="selectedStatsModel"
+                                    @change="loadStats()"
+                                    class="px-3 py-1.5 text-xs font-medium border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                <option value="">All Models</option>
+                                <template x-for="m in llmModels" :key="m.id">
+                                    <option :value="m.id" x-text="m.id"></option>
+                                </template>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Three Stat Cards -->
+                    <div class="grid grid-cols-3 gap-6 mb-8">
+                        <!-- Total Tokens Served -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-8 text-center">
+                            <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">Total Tokens Processed</p>
+                            <p class="font-bold tracking-tight text-neutral-900 transition-all"
+                               :class="getStatFontClass(stats.total_prompt_tokens)"
+                               x-text="formatNumber(stats.total_prompt_tokens)"></p>
+                        </div>
+
+                        <!-- Cached Tokens Served -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-8 text-center">
+                            <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">Cached Tokens</p>
+                            <p class="font-bold tracking-tight text-neutral-900 transition-all"
+                               :class="getStatFontClass(stats.total_cached_tokens)"
+                               x-text="formatNumber(stats.total_cached_tokens)"></p>
+                        </div>
+
+                        <!-- Cache Efficiency -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-8 text-center">
+                            <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">Cache Efficiency</p>
+                            <p class="font-bold tracking-tight text-neutral-900 transition-all"
+                               :class="getStatFontClass(stats.cache_efficiency)"
+                               x-text="stats.cache_efficiency.toFixed(1) + '%'"></p>
+                        </div>
+                    </div>
+
+                    <!-- Speed Stats -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="gauge" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Average Speed</span>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 divide-x divide-neutral-100">
+                            <div class="p-6">
+                                <p class="text-xs text-neutral-500 mb-1">Prompt Processing <span class="text-neutral-400">(excl. cached)</span></p>
+                                <p class="text-2xl font-bold text-neutral-900" x-text="stats.avg_prefill_tps.toFixed(1) + ' tok/s'"></p>
+                            </div>
+                            <div class="p-6">
+                                <p class="text-xs text-neutral-500 mb-1">Token Generation</p>
+                                <p class="text-2xl font-bold text-neutral-900" x-text="stats.avg_generation_tps.toFixed(1) + ' tok/s'"></p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- API Endpoints -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="link" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">API Endpoints</span>
+                            </div>
+                        </div>
+                        <div class="divide-y divide-neutral-100">
+                            <div class="flex items-center justify-between px-6 py-4">
+                                <label class="text-sm text-neutral-700 font-medium">OpenAI API</label>
+                                <div class="flex items-center gap-2">
+                                    <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
+                                          x-text="'http://localhost:' + stats.port + '/v1'"></code>
+                                    <button x-data="{ copied: false }"
+                                            @click="copyToClipboard('http://localhost:' + stats.port + '/v1'); copied = true; setTimeout(() => copied = false, 2000)"
+                                            class="p-1.5 rounded-lg transition-all"
+                                            :class="copied ? 'text-green-500' : 'text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100'"
+                                            title="Copy">
+                                        <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                        <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="flex items-center justify-between px-6 py-4">
+                                <label class="text-sm text-neutral-700 font-medium">Claude API</label>
+                                <div class="flex items-center gap-2">
+                                    <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
+                                          x-text="'http://localhost:' + stats.port"></code>
+                                    <button x-data="{ copied: false }"
+                                            @click="copyToClipboard('http://localhost:' + stats.port); copied = true; setTimeout(() => copied = false, 2000)"
+                                            class="p-1.5 rounded-lg transition-all"
+                                            :class="copied ? 'text-green-500' : 'text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100'"
+                                            title="Copy">
+                                        <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                        <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Claude Code with oMLX -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="terminal" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Claude Code with oMLX</span>
+                            </div>
+                        </div>
+                        <div class="px-6 py-5">
+                            <div class="flex gap-4 items-start">
+                                <!-- Left: Model Selector -->
+                                <div class="w-64 flex-shrink-0">
+                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Model</label>
+                                    <select x-model="selectedClaudeModel"
+                                            class="w-full px-3 py-2.5 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                        <template x-for="m in llmModels" :key="m.id">
+                                            <option :value="m.id" x-text="m.id"></option>
+                                        </template>
+                                    </select>
+                                </div>
+
+                                <!-- Right: Command -->
+                                <div class="flex-1 min-w-0">
+                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Command</label>
+                                    <div class="relative group">
+                                        <pre class="px-4 py-3 pr-12 bg-neutral-100 text-neutral-800 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all leading-relaxed"
+                                             x-text="claudeCodeCommand"></pre>
+                                        <button x-data="{ copied: false }"
+                                                @click="copyToClipboard(claudeCodeCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                                class="absolute top-2.5 right-2.5 p-1.5 rounded-md transition-all opacity-0 group-hover:opacity-100"
+                                                :class="copied ? 'text-green-500 opacity-100' : 'bg-white/80 text-neutral-400 hover:text-neutral-700'"
+                                                title="Copy command">
+                                            <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                            <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Context Scaling for Claude Code -->
+                            <div class="mt-4 pt-4 border-t border-neutral-100">
+                                <div class="flex gap-4 items-center">
+                                    <div class="flex items-center gap-3">
+                                        <label class="text-xs font-bold uppercase tracking-wider text-neutral-500">Context Scaling for Claude Code</label>
+                                        <button type="button"
+                                                @click="globalSettings.claude_code.context_scaling_enabled = !globalSettings.claude_code.context_scaling_enabled; saveClaudeCodeSettings()"
+                                                :class="globalSettings.claude_code.context_scaling_enabled ? 'bg-neutral-900' : 'bg-neutral-200'"
+                                                class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full transition-colors duration-200">
+                                            <span :class="globalSettings.claude_code.context_scaling_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="inline-block h-5 w-5 transform rounded-full bg-white shadow mt-0.5 ml-0.5 transition duration-200"></span>
+                                        </button>
+                                    </div>
+
+                                    <div class="flex items-center gap-2" x-show="globalSettings.claude_code.context_scaling_enabled" x-cloak>
+                                        <label class="text-xs font-bold uppercase tracking-wider text-neutral-500 whitespace-nowrap">Target Context Size</label>
+                                        <input type="number"
+                                               x-model.number="globalSettings.claude_code.target_context_size"
+                                               @change="saveClaudeCodeSettings()"
+                                               min="1024" step="1024"
+                                               class="w-32 px-3 py-1.5 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                        <span class="text-xs text-neutral-400">tokens</span>
+                                    </div>
+                                </div>
+                                <p class="mt-2 text-xs text-neutral-400 leading-relaxed">Scales token usage so Claude Code's auto-compact triggers correctly with smaller context models.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Engine Versions -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="cpu" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Engine Versions</span>
+                            </div>
+                        </div>
+                        <div class="divide-y divide-neutral-100">
+                            <template x-for="[key, engine] in Object.entries(stats.engines || {})" :key="key">
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <label class="text-sm text-neutral-700 font-medium" x-text="engine.name"></label>
+                                    <div class="flex items-center gap-2">
+                                        <template x-if="engine.commit && engine.url">
+                                            <a :href="engine.url" target="_blank" rel="noopener noreferrer"
+                                               class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono text-blue-600 hover:text-blue-800 hover:bg-blue-50 transition-all"
+                                               x-text="engine.commit.substring(0, 7)"></a>
+                                        </template>
+                                        <template x-if="!engine.commit">
+                                            <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
+                                                  x-text="engine.version || 'unknown'"></code>
+                                        </template>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+            </div>

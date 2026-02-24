@@ -1,0 +1,334 @@
+            <div x-show="mainTab === 'bench'" x-cloak>
+                <div class="animate-fade-in-up">
+                    <!-- Header -->
+                    <div class="mb-8">
+                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">Benchmark</h2>
+                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">Performance Benchmark</h3>
+                        <p class="text-sm text-neutral-500 mt-2">Measure inference speed for single requests and continuous batching. All other models will be unloaded before benchmarking.</p>
+                    </div>
+
+                    <!-- Configuration Card -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="settings-2" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Configuration</span>
+                            </div>
+                        </div>
+
+                        <div class="px-6 py-5 space-y-5">
+                            <!-- Model Selector -->
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700 mb-2">Model</label>
+                                <select x-model="benchModelId"
+                                        :disabled="benchRunning"
+                                        class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                    <option value="">Select a model...</option>
+                                    <template x-for="m in models.filter(m => m.model_type === 'llm' || !m.model_type)" :key="m.id">
+                                        <option :value="m.id" x-text="m.id + ' (' + (m.estimated_size ? (m.estimated_size / 1073741824).toFixed(1) + ' GB' : 'unknown') + ')'"></option>
+                                    </template>
+                                </select>
+                            </div>
+
+                            <!-- Single Request Config -->
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700 mb-2">Single Request Tests</label>
+                                <div class="flex flex-wrap items-center gap-4">
+                                    <template x-for="pp in [1024, 4096, 8192, 16384, 32768, 65536]" :key="pp">
+                                        <label class="flex items-center gap-2 cursor-pointer">
+                                            <input type="checkbox"
+                                                   x-model="benchPromptLengths[pp]"
+                                                   :disabled="benchRunning"
+                                                   class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                            <span class="text-sm text-neutral-600" x-text="'pp' + pp"></span>
+                                        </label>
+                                    </template>
+                                </div>
+                                <p class="text-xs text-neutral-400 mt-1.5">Generation length: 128 tokens (fixed)</p>
+                            </div>
+
+                            <!-- Batch Config -->
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700 mb-2">Continuous Batching Tests</label>
+                                <div class="flex flex-wrap items-center gap-4">
+                                    <template x-for="bs in [2, 4, 8]" :key="bs">
+                                        <label class="flex items-center gap-2 cursor-pointer">
+                                            <input type="checkbox"
+                                                   x-model="benchBatchSizes[bs]"
+                                                   :disabled="benchRunning"
+                                                   class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                            <span class="text-sm text-neutral-600" x-text="bs + 'x batch'"></span>
+                                        </label>
+                                    </template>
+                                </div>
+                                <p class="text-xs text-neutral-400 mt-1.5">Batch tests use pp1024 / tg128</p>
+                            </div>
+
+                            <!-- Run / Cancel Button -->
+                            <div class="flex items-center gap-3 pt-2">
+                                <button x-show="!benchRunning"
+                                        @click="startBenchmark()"
+                                        :disabled="!benchModelId || Object.values(benchPromptLengths).every(v => !v)"
+                                        class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
+                                    <i data-lucide="play" class="w-4 h-4"></i>
+                                    Run Benchmark
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Progress Section -->
+                    <div x-show="benchRunning && benchProgress" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <div class="px-6 py-4">
+                            <div class="flex items-center justify-between mb-3">
+                                <span class="text-sm font-medium text-neutral-700" x-text="benchProgress?.message || 'Preparing...'"></span>
+                                <div class="flex items-center gap-3">
+                                    <span class="text-sm text-neutral-500" x-text="benchProgress?.current + ' / ' + benchProgress?.total"></span>
+                                    <button @click="cancelBenchmark()"
+                                            class="px-3 py-1 bg-neutral-900 text-white text-xs font-medium rounded-lg hover:bg-neutral-800 transition-all flex items-center gap-1">
+                                        <i data-lucide="square" class="w-3 h-3"></i>
+                                        Cancel
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="w-full bg-neutral-200 rounded-full h-2">
+                                <div class="bg-neutral-900 h-2 rounded-full transition-all duration-500"
+                                     :style="'width: ' + (benchProgress?.total > 0 ? (benchProgress.current / benchProgress.total * 100) : 0) + '%'"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Running indicator (no progress yet) -->
+                    <div x-show="benchRunning && !benchProgress" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <div class="px-6 py-4 flex items-center gap-3">
+                            <div class="w-5 h-5 border-2 border-neutral-300 border-t-neutral-900 rounded-full animate-spin"></div>
+                            <span class="text-sm text-neutral-600">Starting benchmark...</span>
+                        </div>
+                    </div>
+
+                    <!-- Error -->
+                    <div x-show="benchError" x-cloak class="bg-red-50 border border-red-200 rounded-2xl px-6 py-4 mb-6">
+                        <div class="flex items-center gap-2 text-red-700">
+                            <i data-lucide="alert-circle" class="w-4 h-4"></i>
+                            <span class="text-sm font-medium" x-text="benchError"></span>
+                        </div>
+                    </div>
+
+                    <!-- Single Request Results -->
+                    <div x-show="benchSingleResults.length > 0" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="zap" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Single Request Results</span>
+                            </div>
+                        </div>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm">
+                                <thead>
+                                    <tr class="border-b border-neutral-200 bg-neutral-50">
+                                        <th class="text-left px-4 py-3 font-semibold text-neutral-600">Test</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">TTFT (ms)</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">TPOT (ms/tok)</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">tg TPS</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">pp TPS</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">E2E Latency</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">Throughput</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">Peak Mem</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <template x-for="r in benchSingleResults" :key="r.pp">
+                                        <tr class="border-b border-neutral-100 hover:bg-neutral-50">
+                                            <td class="px-4 py-3 font-medium text-neutral-900" x-text="'pp' + r.pp + '/tg' + r.tg"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.ttft_ms.toFixed(1)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.tpot_ms.toFixed(2)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.gen_tps.toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.processing_tps.toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.total_throughput.toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFormatMemory(r.peak_memory_bytes)"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Batch Results: Same Prompt (cache reuse) -->
+                    <div x-show="benchBatchSameResults.length > 0" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="layers" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Continuous Batching — Same Prompt</span>
+                            </div>
+                            <span class="text-xs text-neutral-400">pp1024 / tg128 · prefix cache reuse</span>
+                        </div>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm">
+                                <thead>
+                                    <tr class="border-b border-neutral-200 bg-neutral-50">
+                                        <th class="text-left px-4 py-3 font-semibold text-neutral-600">Batch Size</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">tg TPS</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">Speedup</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">pp TPS</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">pp TPS/req</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">Avg TTFT (ms)</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">E2E Latency</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <!-- 1x baseline from single request -->
+                                    <tr x-show="benchSingleResults.some(r => r.pp === 1024)" class="border-b border-neutral-100 bg-neutral-50/50">
+                                        <td class="px-4 py-3 font-medium text-neutral-500">1x (baseline)</td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.gen_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500">1.00x</td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="benchSingleResults.find(r => r.pp === 1024)?.ttft_ms?.toFixed(1) || '-'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.e2e_latency_s?.toFixed(3) || '-') + 's'"></td>
+                                    </tr>
+                                    <template x-for="r in benchBatchSameResults" :key="r.batch_size">
+                                        <tr class="border-b border-neutral-100 hover:bg-neutral-50">
+                                            <td class="px-4 py-3 font-medium text-neutral-900" x-text="r.batch_size + 'x'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.tg_tps.toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium" :class="benchGetSpeedup(r) >= 1.5 ? 'text-green-600' : 'text-neutral-700'" x-text="benchGetSpeedup(r).toFixed(2) + 'x'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.pp_tps.toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(r.pp_tps / r.batch_size).toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.avg_ttft_ms.toFixed(1)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Batch Results: Different Prompts (no cache) -->
+                    <div x-show="benchBatchDiffResults.length > 0" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="layers" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Continuous Batching — Different Prompts</span>
+                            </div>
+                            <span class="text-xs text-neutral-400">pp1024 / tg128 · no cache reuse</span>
+                        </div>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm">
+                                <thead>
+                                    <tr class="border-b border-neutral-200 bg-neutral-50">
+                                        <th class="text-left px-4 py-3 font-semibold text-neutral-600">Batch Size</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">tg TPS</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">Speedup</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">pp TPS</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">pp TPS/req</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">Avg TTFT (ms)</th>
+                                        <th class="text-right px-4 py-3 font-semibold text-neutral-600">E2E Latency</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <!-- 1x baseline from single request -->
+                                    <tr x-show="benchSingleResults.some(r => r.pp === 1024)" class="border-b border-neutral-100 bg-neutral-50/50">
+                                        <td class="px-4 py-3 font-medium text-neutral-500">1x (baseline)</td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.gen_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500">1.00x</td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="benchSingleResults.find(r => r.pp === 1024)?.ttft_ms?.toFixed(1) || '-'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.e2e_latency_s?.toFixed(3) || '-') + 's'"></td>
+                                    </tr>
+                                    <template x-for="r in benchBatchDiffResults" :key="r.batch_size">
+                                        <tr class="border-b border-neutral-100 hover:bg-neutral-50">
+                                            <td class="px-4 py-3 font-medium text-neutral-900" x-text="r.batch_size + 'x'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.tg_tps.toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium" :class="benchGetSpeedup(r) >= 1.5 ? 'text-green-600' : 'text-neutral-700'" x-text="benchGetSpeedup(r).toFixed(2) + 'x'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.pp_tps.toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(r.pp_tps / r.batch_size).toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.avg_ttft_ms.toFixed(1)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Benchmark Results (Text Export) -->
+                    <div x-show="benchSingleResults.length > 0 || benchBatchSameResults.length > 0 || benchBatchDiffResults.length > 0" x-cloak
+                         class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <button @click="benchShowText = !benchShowText"
+                                class="w-full flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200 hover:bg-neutral-150 transition-colors">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="clipboard-copy" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Benchmark Results (Text — Copy & Paste)</span>
+                            </div>
+                            <i data-lucide="chevron-down" class="w-4 h-4 text-neutral-400 transition-transform" :class="benchShowText && 'rotate-180'"></i>
+                        </button>
+                        <div x-show="benchShowText" x-collapse x-cloak>
+                            <div class="px-4 py-3 flex justify-end border-b border-neutral-200">
+                                <button @click="benchCopyText()"
+                                        class="px-4 py-1.5 bg-neutral-900 text-white text-xs font-medium rounded-lg hover:bg-neutral-800 transition-all flex items-center gap-1.5">
+                                    <i data-lucide="copy" class="w-3.5 h-3.5"></i>
+                                    <span x-text="benchCopied ? 'Copied!' : 'Copy'"></span>
+                                </button>
+                            </div>
+                            <div class="bg-neutral-900 rounded-b-2xl">
+                                <textarea
+                                    x-ref="benchTextarea"
+                                    :value="benchBuildText()"
+                                    readonly
+                                    class="w-full h-[400px] px-4 py-4 bg-neutral-900 text-green-400 font-mono text-xs leading-relaxed resize-none focus:outline-none"
+                                ></textarea>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Metrics Reference -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <button @click="benchShowMetrics = !benchShowMetrics"
+                                class="w-full flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200 hover:bg-neutral-150 transition-colors">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="book-open" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Metrics Reference</span>
+                            </div>
+                            <i data-lucide="chevron-down" class="w-4 h-4 text-neutral-400 transition-transform" :class="benchShowMetrics && 'rotate-180'"></i>
+                        </button>
+                        <div x-show="benchShowMetrics" x-collapse x-cloak class="px-6 py-4">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                                <div class="space-y-3">
+                                    <div>
+                                        <span class="font-semibold text-neutral-900">TTFT</span>
+                                        <span class="text-neutral-400 ml-1">(Time to First Token)</span>
+                                        <p class="text-neutral-500 mt-0.5">Latency until the model starts responding. Measures prompt processing (prefill) speed. Lower is better.</p>
+                                    </div>
+                                    <div>
+                                        <span class="font-semibold text-neutral-900">TPOT</span>
+                                        <span class="text-neutral-400 ml-1">(Time Per Output Token)</span>
+                                        <p class="text-neutral-500 mt-0.5">Average time between each generated token. Measures decode speed. Lower is better.</p>
+                                    </div>
+                                    <div>
+                                        <span class="font-semibold text-neutral-900">tg TPS</span>
+                                        <span class="text-neutral-400 ml-1">(Token Generation TPS)</span>
+                                        <p class="text-neutral-500 mt-0.5">Output tokens generated per second. Inverse of TPOT. Higher is better.</p>
+                                    </div>
+                                </div>
+                                <div class="space-y-3">
+                                    <div>
+                                        <span class="font-semibold text-neutral-900">pp TPS</span>
+                                        <span class="text-neutral-400 ml-1">(Prompt Processing TPS)</span>
+                                        <p class="text-neutral-500 mt-0.5">Input/prompt tokens processed per second during prefill. Higher is better.</p>
+                                    </div>
+                                    <div>
+                                        <span class="font-semibold text-neutral-900">E2E Latency</span>
+                                        <span class="text-neutral-400 ml-1">(End-to-End)</span>
+                                        <p class="text-neutral-500 mt-0.5">Total time from request submission to complete response. Includes prefill + generation.</p>
+                                    </div>
+                                    <div>
+                                        <span class="font-semibold text-neutral-900">Total Throughput</span>
+                                        <p class="text-neutral-500 mt-0.5">Overall tokens (input + output) per second. Measures total system utilization.</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>

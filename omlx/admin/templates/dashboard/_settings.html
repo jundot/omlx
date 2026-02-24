@@ -1,0 +1,591 @@
+            <div x-show="mainTab === 'settings'" x-cloak>
+            <!-- Tab Navigation -->
+            <div class="flex items-center gap-2 mb-10 animate-fade-in-up">
+                <button
+                    @click="activeTab = 'global'"
+                    :class="activeTab === 'global'
+                        ? 'bg-neutral-900 text-white'
+                        : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
+                    class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200"
+                >
+                    Global Settings
+                </button>
+                <button
+                    @click="activeTab = 'models'"
+                    :class="activeTab === 'models'
+                        ? 'bg-neutral-900 text-white'
+                        : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
+                    class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200"
+                >
+                    Model Settings
+                </button>
+            </div>
+
+            <!-- Global Settings Tab -->
+            <div x-show="activeTab === 'global'" x-cloak>
+                <div class="animate-fade-in-up">
+                    <!-- Header -->
+                    <div class="mb-8">
+                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">Global Settings</h2>
+                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">Server Configuration</h3>
+                        <p class="text-sm text-neutral-500 mt-2">
+                            Settings marked with <span class="px-1 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">Restart</span> require server restart.
+                        </p>
+                    </div>
+
+                    <!-- Settings Sections -->
+                    <div class="space-y-4">
+
+                        <!-- Auth & Info Section -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="shield" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Auth & Info</span>
+                                </div>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Base Path</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">Read-only</p>
+                                    </div>
+                                    <span class="text-sm text-neutral-700 font-mono" x-text="globalSettings.base_path || '~/.omlx'"></span>
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">API Key</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">Min 4 chars, no whitespace</p>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <input :type="showApiKey ? 'text' : 'password'"
+                                               x-model="globalSettings.auth.api_key"
+                                               placeholder="Enter API key"
+                                               class="w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                        <button type="button" @click="showApiKey = !showApiKey; $nextTick(() => lucide.createIcons())"
+                                                class="p-2 rounded-lg hover:bg-neutral-100 transition-colors text-neutral-400 hover:text-neutral-600"
+                                                title="Toggle visibility">
+                                            <template x-if="!showApiKey">
+                                                <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>
+                                            </template>
+                                            <template x-if="showApiKey">
+                                                <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49"/><path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"/><path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"/><path d="m2 2 20 20"/></svg>
+                                            </template>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Server Section -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="server" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Server</span>
+                                </div>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div class="flex items-center gap-2">
+                                        <label class="text-sm text-neutral-700">Host</label>
+                                        <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">Restart</span>
+                                    </div>
+                                    <input type="text" x-model="globalSettings.server.host"
+                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div class="flex items-center gap-2">
+                                        <label class="text-sm text-neutral-700">Port</label>
+                                        <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">Restart</span>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.server.port"
+                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div class="flex items-center gap-2">
+                                        <label class="text-sm text-neutral-700">Log Level</label>
+                                    </div>
+                                    <select x-model="globalSettings.server.log_level"
+                                            class="w-48 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="error">error</option>
+                                        <option value="warning">warning</option>
+                                        <option value="info">info (default)</option>
+                                        <option value="debug">debug</option>
+                                        <option value="trace">trace - includes full content</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Model Section -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Model</span>
+                                </div>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div class="flex items-center gap-2">
+                                        <label class="text-sm text-neutral-700">Model Directory</label>
+                                    </div>
+                                    <input type="text" x-model="globalSettings.model.model_dir"
+                                           class="w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div class="flex items-center gap-2">
+                                        <label class="text-sm text-neutral-700">Max Model Memory</label>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <input type="range" min="0" max="100" step="5"
+                                               x-model.number="memoryPercent"
+                                               @input="updateMemoryFromSlider()"
+                                               class="w-32 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer
+                                                      [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
+                                                      [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
+                                                      [&::-webkit-slider-thumb]:shadow-sm">
+                                        <span class="text-sm text-neutral-600 w-28 text-right">
+                                            <span x-text="memoryPercent + '%'"></span>
+                                            <span class="text-neutral-400">(<span x-text="getMemoryDisplay()"></span>)</span>
+                                        </span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Batching Section -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="layers" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Batching</span>
+                                </div>
+                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+                                    Restart needed
+                                </span>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Max Sequences</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">Maximum concurrent requests processed in parallel</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.scheduler.max_num_seqs"
+                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Prefill Batch Size</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">Batch size for prompt encoding phase</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.scheduler.prefill_batch_size"
+                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Completion Batch Size</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">Batch size for token generation phase</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.scheduler.completion_batch_size"
+                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Cache Section -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="hard-drive" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Cache</span>
+                                </div>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div class="flex items-center gap-2">
+                                        <label class="text-sm text-neutral-700">Cache Enabled</label>
+                                    </div>
+                                    <button type="button" @click="globalSettings.cache.enabled = !globalSettings.cache.enabled"
+                                            :class="globalSettings.cache.enabled ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.cache.enabled ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div class="flex items-center gap-2">
+                                        <label class="text-sm text-neutral-700">SSD Cache Directory</label>
+                                    </div>
+                                    <input type="text" x-model="globalSettings.cache.ssd_cache_dir"
+                                           class="w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div class="flex items-center gap-2">
+                                        <label class="text-sm text-neutral-700">Max Cache Size</label>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <input type="range" min="0" max="100" step="5"
+                                               x-model.number="cachePercent"
+                                               @input="updateCacheFromSlider()"
+                                               class="w-32 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer
+                                                      [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
+                                                      [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
+                                                      [&::-webkit-slider-thumb]:shadow-sm">
+                                        <span class="text-sm text-neutral-600 w-28 text-right inline-flex items-center justify-end gap-0">
+                                            <span x-text="cachePercent + '%'"></span>
+                                            <span class="text-neutral-400 ml-1">(</span><span x-show="!editingCache" @click="editingCache = true" class="cursor-pointer hover:text-neutral-900" x-text="cacheSizeGB"></span><input x-show="editingCache"
+                                                   type="number"
+                                                   :value="cacheSizeGB"
+                                                   @change="updateCacheFromInput($event.target.value); editingCache = false"
+                                                   @blur="editingCache = false"
+                                                   @keydown.enter="updateCacheFromInput($event.target.value); editingCache = false"
+                                                   @keydown.escape="editingCache = false"
+                                                   x-init="if (editingCache) { $nextTick(() => $el.focus()) }"
+                                                   class="w-12 px-1 text-sm text-right border border-neutral-900 rounded focus:outline-none"
+                                                   min="0"
+                                                   step="1"><span class="text-neutral-400">GB)</span>
+                                        </span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Sampling Defaults Section -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="sliders" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Generation Defaults</span>
+                                </div>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Max Context Window</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">Reject prompts exceeding this token limit</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.sampling.max_context_window" min="1" max="2097152"
+                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <label class="text-sm text-neutral-700">Max Tokens</label>
+                                    <input type="number" x-model.number="globalSettings.sampling.max_tokens" min="1" max="131072"
+                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Temperature</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">0.0 = deterministic, 2.0 = max randomness</p>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <input type="range" min="0" max="2" step="0.1"
+                                               x-model.number="globalSettings.sampling.temperature"
+                                               class="w-24 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer
+                                                      [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
+                                                      [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer">
+                                        <input type="number" x-model.number="globalSettings.sampling.temperature" step="0.1" min="0" max="2"
+                                               class="w-20 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                    </div>
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Top P</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">Nucleus sampling threshold</p>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <input type="range" min="0" max="1" step="0.05"
+                                               x-model.number="globalSettings.sampling.top_p"
+                                               class="w-24 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer
+                                                      [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
+                                                      [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer">
+                                        <input type="number" x-model.number="globalSettings.sampling.top_p" step="0.05" min="0" max="1"
+                                               class="w-20 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                    </div>
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Top K</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">0 = disabled</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.sampling.top_k" min="0"
+                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Repetition Penalty</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">1.0 = disabled</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.sampling.repetition_penalty" step="0.05" min="1"
+                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- MCP Section -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="plug" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">MCP</span>
+                                </div>
+                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+                                    Restart needed
+                                </span>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <label class="text-sm text-neutral-700">Config Path</label>
+                                    <input type="text" x-model="globalSettings.mcp.config_path" placeholder="Path to MCP config"
+                                           class="w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                </div>
+                            </div>
+                        </div>
+
+                    </div>
+
+                    <!-- Save Button -->
+                    <div class="mt-10 flex items-center justify-between">
+                        <div>
+                            <!-- Success Message -->
+                            <div x-show="saveSuccess" x-cloak
+                                 x-transition:enter="transition ease-out duration-200"
+                                 x-transition:leave="transition ease-in duration-150"
+                                 class="flex items-center gap-2 text-sm text-neutral-700">
+                                <i data-lucide="check-circle" class="w-4 h-4"></i>
+                                <span x-text="saveMessage"></span>
+                            </div>
+                            <!-- Error Message -->
+                            <div x-show="saveError" x-cloak
+                                 x-transition:enter="transition ease-out duration-200"
+                                 x-transition:leave="transition ease-in duration-150"
+                                 class="flex items-center gap-2 text-sm text-red-600">
+                                <i data-lucide="alert-circle" class="w-4 h-4"></i>
+                                <span x-text="saveError"></span>
+                            </div>
+                        </div>
+                        <button
+                            @click="saveGlobalSettings"
+                            :disabled="saving"
+                            class="px-8 py-3 bg-neutral-900 text-white text-sm font-semibold
+                                   rounded-full hover:bg-neutral-800 focus:outline-none focus:ring-2
+                                   focus:ring-neutral-900 focus:ring-offset-2 transition-all duration-200
+                                   transform hover:scale-105 active:scale-95
+                                   disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
+                        >
+                            <span x-show="!saving">Save Settings</span>
+                            <span x-show="saving" class="flex items-center">
+                                <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                </svg>
+                                Saving...
+                            </span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Model Settings Tab -->
+            <div x-show="activeTab === 'models'" x-cloak>
+                <div class="animate-fade-in-up">
+                    <!-- Header -->
+                    <div class="mb-8">
+                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">Model Settings</h2>
+                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">Available Models</h3>
+                        <p class="text-sm text-neutral-500 mt-2">Configure per-model settings including sampling parameters.</p>
+                    </div>
+
+                    <!-- Loading State -->
+                    <div x-show="loadingModels" class="p-12 text-center">
+                        <svg class="animate-spin h-8 w-8 text-neutral-400 mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        <p class="mt-3 text-sm text-neutral-500">Loading models...</p>
+                    </div>
+
+                    <!-- Empty State -->
+                    <div x-show="!loadingModels && models.length === 0" class="bg-white rounded-2xl border border-neutral-200 p-12 text-center">
+                        <div class="w-16 h-16 bg-neutral-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
+                            <i data-lucide="package-x" class="w-8 h-8 text-neutral-400"></i>
+                        </div>
+                        <h4 class="text-lg font-semibold text-neutral-900 mb-2">No models found</h4>
+                        <p class="text-sm text-neutral-500">Add models to your model directory to get started.</p>
+                    </div>
+
+                    <!-- Model Table -->
+                    <div x-show="!loadingModels && models.length > 0" class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <!-- Table Header -->
+                        <div class="flex items-center gap-4 px-6 py-3 bg-neutral-50 border-b border-neutral-200 text-xs font-bold uppercase tracking-wider text-neutral-500">
+                            <div class="flex-1 min-w-0 flex items-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('id')">
+                                Model
+                                <span x-show="sortBy === 'id'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                            </div>
+                            <div class="w-20 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('type')">
+                                Type
+                                <span x-show="sortBy === 'type'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                            </div>
+                            <div class="w-20 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('size')">
+                                Size
+                                <span x-show="sortBy === 'size'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                            </div>
+                            <div class="w-20 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('loaded')">
+                                Status
+                                <span x-show="sortBy === 'loaded'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                            </div>
+                            <div class="w-12 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('pinned')">
+                                Pin
+                                <span x-show="sortBy === 'pinned'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                            </div>
+                            <div class="w-14 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_default')">
+                                Default
+                                <span x-show="sortBy === 'is_default'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                            </div>
+                            <div class="w-10 text-center"></div>
+                        </div>
+
+                        <!-- Table Body -->
+                        <div class="divide-y divide-neutral-100">
+                            <template x-for="model in sortedModels" :key="model.id">
+                                <div class="hover:bg-neutral-50 transition-colors">
+                                    <!-- Main Row -->
+                                    <div class="flex items-center gap-4 px-6 py-4">
+                                        <!-- Model Name -->
+                                        <div class="flex-1 min-w-0 flex items-center gap-3">
+                                            <div class="w-8 h-8 bg-neutral-100 rounded-lg flex items-center justify-center flex-shrink-0">
+                                                <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
+                                            </div>
+                                            <p class="text-sm font-medium text-neutral-900 truncate" x-text="model.id"></p>
+                                            <button x-data="{ copied: false }"
+                                                    @click.stop="copyToClipboard(model.id); copied = true; setTimeout(() => copied = false, 2000)"
+                                                    class="p-1 rounded-md transition-all flex-shrink-0"
+                                                    :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                                                    title="Copy model name">
+                                                <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                            </button>
+                                        </div>
+
+                                        <!-- Type -->
+                                        <div class="w-20 text-center flex-shrink-0">
+                                            <span class="px-2 py-0.5 text-xs font-medium rounded-full bg-neutral-100 text-neutral-600"
+                                                  x-text="model.model_type || 'llm'"></span>
+                                        </div>
+
+                                        <!-- Size -->
+                                        <div class="w-20 text-center flex-shrink-0">
+                                            <span class="text-sm text-neutral-600" x-text="model.estimated_size_formatted || '-'"></span>
+                                        </div>
+
+                                        <!-- Status -->
+                                        <div class="w-20 text-center flex-shrink-0">
+                                            <span :class="model.loaded
+                                                      ? 'bg-neutral-900 text-white'
+                                                      : 'bg-white text-neutral-500 border border-neutral-200'"
+                                                  class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1">
+                                                <span :class="model.loaded ? 'bg-white' : 'bg-neutral-400'"
+                                                      class="w-1.5 h-1.5 rounded-full"></span>
+                                                <span x-text="model.loaded ? 'Loaded' : 'Ready'"></span>
+                                            </span>
+                                        </div>
+
+                                        <!-- Pin Toggle -->
+                                        <div class="w-12 flex justify-center flex-shrink-0">
+                                            <button
+                                                @click="updateModelSetting(model.id, 'is_pinned', !model.pinned)"
+                                                :class="model.pinned ? 'bg-black' : 'bg-neutral-200'"
+                                                class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
+                                            >
+                                                <span
+                                                    :class="model.pinned ? 'translate-x-4' : 'translate-x-0'"
+                                                    class="block w-4 h-4 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
+                                                ></span>
+                                            </button>
+                                        </div>
+
+                                        <!-- Default Radio (only for LLM models) -->
+                                        <div class="w-14 flex justify-center flex-shrink-0">
+                                            <template x-if="model.model_type === 'llm' || !model.model_type">
+                                                <button
+                                                    @click="updateModelSetting(model.id, 'is_default', true)"
+                                                    :class="model.is_default
+                                                        ? 'bg-black border-black'
+                                                        : 'bg-white border-neutral-300 hover:border-neutral-400'"
+                                                    class="w-4 h-4 rounded-full border-2 flex items-center justify-center transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
+                                                >
+                                                    <span x-show="model.is_default" class="w-1.5 h-1.5 bg-white rounded-full"></span>
+                                                </button>
+                                            </template>
+                                            <template x-if="model.model_type && model.model_type !== 'llm'">
+                                                <span class="text-xs text-neutral-300">—</span>
+                                            </template>
+                                        </div>
+
+                                        <!-- Actions (icon only) - hidden for embedding/reranker models -->
+                                        <div class="w-10 flex justify-center flex-shrink-0">
+                                            <button
+                                                x-show="!model.model_type || model.model_type === 'llm'"
+                                                @click="openModelSettings(model)"
+                                                class="p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all"
+                                                title="Sampling Settings"
+                                            >
+                                                <i data-lucide="settings" class="w-4 h-4"></i>
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <!-- Sampling Settings Row (if any settings configured) - hidden for embedding/reranker models -->
+                                    <div x-show="(!model.model_type || model.model_type === 'llm') && model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.repetition_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens)"
+                                         class="px-6 pb-4 -mt-2">
+                                        <div class="ml-11 flex flex-wrap gap-2">
+                                            <template x-if="model.settings?.max_context_window">
+                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-700 border border-amber-200">
+                                                    ctx_window: <span class="ml-1" x-text="model.settings.max_context_window"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.max_tokens">
+                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-blue-50 text-blue-700 border border-blue-200">
+                                                    max_tokens: <span class="ml-1" x-text="model.settings.max_tokens"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.temperature !== null && model.settings?.temperature !== undefined">
+                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-orange-50 text-orange-700 border border-orange-200">
+                                                    temp: <span class="ml-1" x-text="model.settings.temperature"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.top_p !== null && model.settings?.top_p !== undefined">
+                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-green-50 text-green-700 border border-green-200">
+                                                    top_p: <span class="ml-1" x-text="model.settings.top_p"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.top_k !== null && model.settings?.top_k !== undefined">
+                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-purple-50 text-purple-700 border border-purple-200">
+                                                    top_k: <span class="ml-1" x-text="model.settings.top_k"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.repetition_penalty !== null && model.settings?.repetition_penalty !== undefined">
+                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-pink-50 text-pink-700 border border-pink-200">
+                                                    rep_penalty: <span class="ml-1" x-text="model.settings.repetition_penalty"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.max_tool_result_tokens">
+                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-teal-50 text-teal-700 border border-teal-200">
+                                                    tool_result_tokens: <span class="ml-1" x-text="model.settings.max_tool_result_tokens"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.force_sampling">
+                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200">
+                                                    force_sampling
+                                                </span>
+                                            </template>
+                                        </div>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            </div>

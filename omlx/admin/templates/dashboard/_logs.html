@@ -1,0 +1,95 @@
+            <div x-show="mainTab === 'logs'" x-cloak>
+                <div class="animate-fade-in-up">
+                    <!-- Header -->
+                    <div class="mb-8">
+                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">Logs</h2>
+                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">Server Logs</h3>
+                        <p class="text-sm text-neutral-500 mt-2">View real-time server logs with auto-refresh.</p>
+                    </div>
+
+                    <!-- Controls -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-4">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="terminal" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Log Viewer</span>
+                            </div>
+
+                            <!-- Auto-refresh indicator -->
+                            <div x-show="logAutoRefresh" class="flex items-center gap-2 text-sm text-green-600">
+                                <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
+                                Auto-refresh
+                            </div>
+                        </div>
+
+                        <div class="flex flex-wrap items-center gap-4 px-6 py-4">
+                            <!-- Lines input -->
+                            <div class="flex items-center gap-2">
+                                <label class="text-sm text-neutral-600">Lines:</label>
+                                <input type="number" x-model.number="logLines" min="10" max="10000" step="100"
+                                       class="w-24 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                            </div>
+
+                            <!-- Refresh interval input -->
+                            <div class="flex items-center gap-2">
+                                <label class="text-sm text-neutral-600">Refresh:</label>
+                                <input type="number" x-model.number="logRefreshInterval" min="0" max="300" step="1"
+                                       @change="restartLogRefresh()"
+                                       class="w-20 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                <span class="text-sm text-neutral-400">sec (0=off)</span>
+                            </div>
+
+                            <!-- Log file selector -->
+                            <div class="flex items-center gap-2">
+                                <label class="text-sm text-neutral-600">File:</label>
+                                <select x-model="logFile" @change="loadLogs()"
+                                        class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white">
+                                    <template x-for="f in logAvailableFiles" :key="f">
+                                        <option :value="f" x-text="f"></option>
+                                    </template>
+                                </select>
+                            </div>
+
+                            <!-- Manual refresh button -->
+                            <button @click="loadLogs()"
+                                    :disabled="logLoading"
+                                    class="px-4 py-2 bg-neutral-900 text-white text-sm font-medium rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-50">
+                                <span x-show="!logLoading">Refresh</span>
+                                <span x-show="logLoading">Loading...</span>
+                            </button>
+
+                            <!-- Auto-scroll toggle -->
+                            <div class="flex items-center gap-2">
+                                <button type="button" @click="logAutoScroll = !logAutoScroll"
+                                        :class="logAutoScroll ? 'bg-black' : 'bg-neutral-200'"
+                                        class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none">
+                                    <span :class="logAutoScroll ? 'translate-x-4' : 'translate-x-0'"
+                                          class="block w-4 h-4 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                </button>
+                                <label class="text-sm text-neutral-600">Auto-scroll</label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Log Content -->
+                    <div class="bg-neutral-900 rounded-2xl overflow-hidden">
+                        <div class="flex items-center justify-between px-4 py-2 bg-neutral-800 border-b border-neutral-700">
+                            <span class="text-xs text-neutral-400" x-text="'Showing ' + logLines + ' of ' + logTotalLines + ' lines'"></span>
+                            <span class="text-xs text-neutral-500" x-text="logFile"></span>
+                        </div>
+                        <textarea
+                            x-ref="logTextarea"
+                            x-model="logContent"
+                            readonly
+                            class="w-full h-[600px] px-4 py-4 bg-neutral-900 text-green-400 font-mono text-xs leading-relaxed resize-none focus:outline-none"
+                            placeholder="No logs available. Start the server to generate logs."
+                        ></textarea>
+                    </div>
+
+                    <!-- Stats -->
+                    <div class="mt-4 flex items-center justify-between text-sm text-neutral-500">
+                        <span x-show="logLastUpdated" x-text="'Last updated: ' + logLastUpdated"></span>
+                        <span x-show="logError" class="text-red-500" x-text="logError"></span>
+                    </div>
+                </div>
+            </div>
