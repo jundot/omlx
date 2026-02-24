@@ -29,6 +29,9 @@ def _has_cli_overrides(args) -> bool:
     # max_model_memory: default="auto"
     if hasattr(args, "max_model_memory") and args.max_model_memory != "auto":
         return True
+    # max_process_memory: default=None (don't save None)
+    if hasattr(args, "max_process_memory") and args.max_process_memory is not None:
+        return True
     # host: default="127.0.0.1"
     if hasattr(args, "host") and args.host != "127.0.0.1":
         return True
@@ -108,6 +111,7 @@ def serve_command(args):
     print(f"Base path: {settings.base_path}")
     print(f"Model directories: {', '.join(str(d) for d in model_dirs)}")
     print(f"Max model memory: {settings.model.max_model_memory}")
+    print(f"Max process memory: {settings.memory.max_process_memory}")
 
     # Store MCP config path for FastAPI startup
     if args.mcp_config:
@@ -226,6 +230,15 @@ Example directory structure:
         type=str,
         default=None,
         help="Maximum memory for loaded models (e.g., 32GB). Default: 80%% of system memory.",
+    )
+    serve_parser.add_argument(
+        "--max-process-memory",
+        type=str,
+        default=None,
+        help=(
+            "Max total process memory as percentage of system RAM (10-99%%), "
+            "'auto' (RAM - 8GB), or 'disabled'. Default: auto."
+        ),
     )
 
     # Server options

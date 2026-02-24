@@ -153,21 +153,111 @@
                                         </template>
                                     </div>
                                 </div>
+                            </div>
+                        </div>
+
+                        <!-- Memory Management Section -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="gauge" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Memory Management</span>
+                                </div>
+                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">
+                                    Live
+                                </span>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <!-- Memory Limit (Total) -->
                                 <div class="flex items-center justify-between px-6 py-4">
-                                    <div class="flex items-center gap-2">
-                                        <label class="text-sm text-neutral-700">Max Model Memory</label>
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Memory Limit (Total)</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">
+                                            Total memory limit for oMLX process (models + KV cache + overhead).
+                                            <br>
+                                            Exceeding this triggers immediate LRU model eviction.
+                                            <strong>Auto</strong>: system RAM &minus; 8GB.
+                                        </p>
                                     </div>
                                     <div class="flex items-center gap-3">
+                                        <label class="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
+                                            <input type="checkbox" x-model="processMemoryAuto"
+                                                   @change="if(processMemoryAuto) { globalSettings.memory.max_process_memory = 'auto'; } else { updateProcessMemoryFromSlider(); }"
+                                                   class="rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                            <span class="text-xs text-neutral-500">Auto</span>
+                                        </label>
+                                        <input type="range" min="0" max="99" step="1"
+                                               x-model.number="processMemoryPercent"
+                                               :disabled="processMemoryAuto"
+                                               @input="updateProcessMemoryFromSlider()"
+                                               class="w-32 h-1.5 rounded-full appearance-none transition-all duration-200"
+                                               :class="processMemoryAuto
+                                                   ? 'bg-neutral-100 cursor-not-allowed [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-neutral-300 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-not-allowed'
+                                                   : 'bg-neutral-200 cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:shadow-sm'">
+                                        <span class="text-sm w-28 text-right transition-all duration-200"
+                                              :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-600'">
+                                            <span x-text="processMemoryAuto ? 'Auto' : (processMemoryPercent === 0 ? 'Off' : processMemoryPercent + '%')"></span>
+                                            <span :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'">(<span x-text="getProcessMemoryDisplay()"></span>)</span>
+                                        </span>
+                                    </div>
+                                </div>
+                                <!-- Memory Limit (Models Only) -->
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div class="flex items-center gap-2">
+                                        <label class="text-sm text-neutral-700">Memory Limit (Models Only)</label>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <label class="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
+                                            <input type="checkbox" x-model="modelMemoryAuto"
+                                                   @change="if(modelMemoryAuto) { memoryPercent = 90; updateMemoryFromSlider(); }"
+                                                   class="rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                            <span class="text-xs text-neutral-500">Auto</span>
+                                        </label>
                                         <input type="range" min="0" max="100" step="5"
                                                x-model.number="memoryPercent"
+                                               :disabled="modelMemoryAuto"
                                                @input="updateMemoryFromSlider()"
-                                               class="w-32 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer
-                                                      [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
-                                                      [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
-                                                      [&::-webkit-slider-thumb]:shadow-sm">
-                                        <span class="text-sm text-neutral-600 w-28 text-right">
-                                            <span x-text="memoryPercent + '%'"></span>
-                                            <span class="text-neutral-400">(<span x-text="getMemoryDisplay()"></span>)</span>
+                                               class="w-32 h-1.5 rounded-full appearance-none transition-all duration-200"
+                                               :class="modelMemoryAuto
+                                                   ? 'bg-neutral-100 cursor-not-allowed [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-neutral-300 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-not-allowed'
+                                                   : 'bg-neutral-200 cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:shadow-sm'">
+                                        <span class="text-sm w-28 text-right transition-all duration-200"
+                                              :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-600'">
+                                            <span x-text="modelMemoryAuto ? 'Auto' : memoryPercent + '%'"></span>
+                                            <span :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'">(<span x-text="getMemoryDisplay()"></span>)</span>
+                                        </span>
+                                    </div>
+                                </div>
+                                <!-- Memory Limit (Cache Only) -->
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Memory Limit (Cache Only)</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">
+                                            Memory budget for KV cache (0&ndash;80% of system RAM). Prevents kernel panic from GPU memory exhaustion.
+                                            <br>
+                                            <strong>Auto</strong>: calculated from available memory at model load time.
+                                            <strong>0%</strong>: disabled (no limit).
+                                        </p>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <label class="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
+                                            <input type="checkbox" x-model="kvCacheAuto"
+                                                   @change="if(kvCacheAuto) { globalSettings.scheduler.max_kv_cache_memory = 'auto' }"
+                                                   class="rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                            <span class="text-xs text-neutral-500">Auto</span>
+                                        </label>
+                                        <input type="range" min="0" max="100" step="5"
+                                               x-model.number="kvCachePercent"
+                                               :disabled="kvCacheAuto"
+                                               @input="updateKvCacheFromSlider()"
+                                               class="w-32 h-1.5 rounded-full appearance-none transition-all duration-200"
+                                               :class="kvCacheAuto
+                                                   ? 'bg-neutral-100 cursor-not-allowed [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-neutral-300 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-not-allowed'
+                                                   : 'bg-neutral-200 cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:shadow-sm'">
+                                        <span class="text-sm w-28 text-right transition-all duration-200"
+                                              :class="kvCacheAuto ? 'text-neutral-300' : 'text-neutral-600'">
+                                            <span x-text="kvCachePercent + '%'"></span>
+                                            <span :class="kvCacheAuto ? 'text-neutral-300' : 'text-neutral-400'">(<span x-text="getKvCacheDisplay()"></span>)</span>
                                         </span>
                                     </div>
                                 </div>
@@ -209,38 +299,6 @@
                                     </div>
                                     <input type="number" x-model.number="globalSettings.scheduler.completion_batch_size"
                                            class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                </div>
-                                <div class="flex items-center justify-between px-6 py-4">
-                                    <div>
-                                        <label class="text-sm text-neutral-700">Max KV Cache Memory</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">
-                                            Memory budget for KV cache (0&ndash;80% of system RAM). Prevents kernel panic from GPU memory exhaustion.
-                                            <br>
-                                            <strong>Auto</strong>: calculated from available memory at model load time.
-                                            <strong>0%</strong>: disabled (no limit).
-                                        </p>
-                                    </div>
-                                    <div class="flex items-center gap-3">
-                                        <label class="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
-                                            <input type="checkbox" x-model="kvCacheAuto"
-                                                   @change="if(kvCacheAuto) { globalSettings.scheduler.max_kv_cache_memory = 'auto' }"
-                                                   class="rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                            <span class="text-xs text-neutral-500">Auto</span>
-                                        </label>
-                                        <input type="range" min="0" max="100" step="5"
-                                               x-model.number="kvCachePercent"
-                                               :disabled="kvCacheAuto"
-                                               @input="updateKvCacheFromSlider()"
-                                               class="w-32 h-1.5 rounded-full appearance-none transition-all duration-200"
-                                               :class="kvCacheAuto
-                                                   ? 'bg-neutral-100 cursor-not-allowed [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-neutral-300 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-not-allowed'
-                                                   : 'bg-neutral-200 cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:shadow-sm'">
-                                        <span class="text-sm w-28 text-right transition-all duration-200"
-                                              :class="kvCacheAuto ? 'text-neutral-300' : 'text-neutral-600'">
-                                            <span x-text="kvCachePercent + '%'"></span>
-                                            <span :class="kvCacheAuto ? 'text-neutral-300' : 'text-neutral-400'">(<span x-text="getKvCacheDisplay()"></span>)</span>
-                                        </span>
-                                    </div>
                                 </div>
                             </div>
                         </div>

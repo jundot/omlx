@@ -10,6 +10,7 @@ import secrets
 from typing import Optional
 
 from fastapi import HTTPException, Request
+from fastapi.responses import RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 # Session configuration
@@ -150,9 +151,18 @@ async def require_admin(request: Request) -> bool:
         ...     return {"settings": "..."}
     """
     if not verify_session(request):
+        # Browser requests (Accept: text/html) get redirected to login page
+        accept = request.headers.get("accept", "")
+        if "text/html" in accept:
+            raise _RedirectToLogin()
         raise HTTPException(
             status_code=401,
             detail="Admin authentication required",
             headers={"WWW-Authenticate": "Cookie"},
         )
     return True
+
+
+class _RedirectToLogin(Exception):
+    """Raised to trigger a redirect to the admin login page."""
+    pass

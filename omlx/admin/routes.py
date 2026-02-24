@@ -72,6 +72,9 @@ class GlobalSettingsRequest(BaseModel):
     model_dir: Optional[str] = None  # Deprecated: kept for backward compatibility
     max_model_memory: Optional[str] = None
 
+    # Memory enforcement
+    max_process_memory: Optional[str] = None  # "auto", "disabled", or "XX%"
+
     # Scheduler settings
     max_num_seqs: Optional[int] = None
     prefill_batch_size: Optional[int] = None
@@ -251,6 +254,72 @@ async def _apply_max_model_memory_runtime(max_memory_bytes: int) -> tuple[bool, 
         msg += f", unloaded: {', '.join(unloaded)}"
 
     return True, msg
+
+
+async def _apply_max_process_memory_runtime(
+    max_process_memory: str,
+) -> tuple[bool, str]:
+    """
+    Apply max process memory change at runtime.
+
+    Starts, stops, or updates the ProcessMemoryEnforcer based on the new value.
+
+    Returns:
+        Tuple of (success, message)
+    """
+    from ..server import _server_state
+    from ..settings import get_system_memory
+
+    if max_process_memory.lower() == "disabled":
+        # Stop enforcer if running
+        if _server_state.process_memory_enforcer is not None:
+            await _server_state.process_memory_enforcer.stop()
+            _server_state.process_memory_enforcer = None
+            if _server_state.engine_pool is not None:
+                _server_state.engine_pool._process_memory_enforcer = None
+        return True, "Process memory enforcement disabled"
+
+    # Calculate max bytes
+    value = max_process_memory.strip().lower()
+    if value == "auto":
+        reserved = 8 * 1024**3
+        total = get_system_memory()
+        max_bytes = max(total - reserved, int(total * 0.1))
+    else:
+        percent_str = value.rstrip("%")
+        try:
+            percent = int(percent_str)
+            max_bytes = int(get_system_memory() * percent / 100)
+        except ValueError:
+            from ..config import parse_size
+            max_bytes = parse_size(max_process_memory)
+
+    if _server_state.process_memory_enforcer is not None:
+        # Update existing enforcer's limit
+        _server_state.process_memory_enforcer.max_bytes = max_bytes
+        # Trigger immediate check
+        await _server_state.process_memory_enforcer._check_and_enforce()
+        return True, (
+            f"Process memory limit updated to "
+            f"{max_bytes / 1024**3:.1f}GB"
+        )
+    else:
+        # Create and start new enforcer
+        if _server_state.engine_pool is None:
+            return False, "Engine pool not initialized"
+        from ..process_memory_enforcer import ProcessMemoryEnforcer
+
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=_server_state.engine_pool,
+            max_bytes=max_bytes,
+        )
+        _server_state.process_memory_enforcer = enforcer
+        _server_state.engine_pool._process_memory_enforcer = enforcer
+        enforcer.start()
+        return True, (
+            f"Process memory enforcement enabled at "
+            f"{max_bytes / 1024**3:.1f}GB"
+        )
 
 
 async def _apply_cache_settings_runtime(
@@ -1084,6 +1153,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "model_dir": str(global_settings.model.get_model_dir(global_settings.base_path)),
             "max_model_memory": global_settings.model.max_model_memory,
         },
+        "memory": {
+            "max_process_memory": global_settings.memory.max_process_memory,
+        },
         "scheduler": {
             "max_num_seqs": global_settings.scheduler.max_num_seqs,
             "prefill_batch_size": global_settings.scheduler.prefill_batch_size,
@@ -1207,6 +1279,21 @@ async def update_global_settings(
                 logger.warning(f"Failed to apply max_model_memory runtime: {msg}")
         except ValueError as e:
             logger.warning(f"Invalid max_model_memory format: {e}")
+
+    # Apply process memory enforcement settings (Live)
+    if request.max_process_memory is not None:
+        global_settings.memory.max_process_memory = request.max_process_memory
+        try:
+            success, msg = await _apply_max_process_memory_runtime(
+                request.max_process_memory
+            )
+            if success:
+                runtime_applied.append("max_process_memory")
+                logger.info(msg)
+            else:
+                logger.warning(f"Failed to apply max_process_memory: {msg}")
+        except Exception as e:
+            logger.warning(f"Error applying max_process_memory: {e}")
 
     # Apply scheduler settings (restart required)
     if request.max_num_seqs is not None:

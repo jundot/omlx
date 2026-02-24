@@ -14,6 +14,7 @@
                 base_path: '',
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info' },
                 model: { model_dirs: [''], max_model_memory: '' },
+                memory: { max_process_memory: 'auto' },
                 scheduler: { max_num_seqs: 8, prefill_batch_size: 8, completion_batch_size: 8, max_kv_cache_memory: 'auto' },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto' },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 40, repetition_penalty: 1.0 },
@@ -23,8 +24,12 @@
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '', ssd_free_bytes: 0, ssd_free: '' },
             },
 
+            // Process memory slider (10-99%)
+            processMemoryPercent: 90,
+            processMemoryAuto: true,
             // Memory slider (0-100%)
             memoryPercent: 80,
+            modelMemoryAuto: true,
             // Cache slider (0-100%)
             cachePercent: 10,
             editingCache: false,
@@ -189,6 +194,7 @@
                             ...data,
                             server: { ...this.globalSettings.server, ...data.server },
                             model: { ...this.globalSettings.model, ...data.model, model_dirs: modelDirs },
+                            memory: { ...this.globalSettings.memory, ...data.memory },
                             scheduler: { ...this.globalSettings.scheduler, ...data.scheduler },
                             cache: { ...this.globalSettings.cache, ...data.cache },
                             sampling: { ...this.globalSettings.sampling, ...data.sampling },
@@ -199,12 +205,26 @@
                         };
 
                         // Calculate memory percent from stored value
-                        this.memoryPercent = this.parseMemoryToPercent(
-                            this.globalSettings.model.max_model_memory,
-                            this.globalSettings.system.total_memory_bytes
-                        );
+                        if (this.globalSettings.model.max_model_memory === 'auto') {
+                            this.modelMemoryAuto = true;
+                            this.memoryPercent = 90;
+                        } else {
+                            this.modelMemoryAuto = false;
+                            this.memoryPercent = this.parseMemoryToPercent(
+                                this.globalSettings.model.max_model_memory,
+                                this.globalSettings.system.total_memory_bytes
+                            );
+                        }
                         // Sync the memory string value from percent
                         this.updateMemoryFromSlider();
+
+                        // Calculate process memory slider state from stored value
+                        const pmState = this.parseProcessMemoryToState(
+                            this.globalSettings.memory.max_process_memory,
+                            this.globalSettings.system.total_memory_bytes
+                        );
+                        this.processMemoryAuto = pmState.auto;
+                        this.processMemoryPercent = pmState.percent;
 
                         // Calculate KV cache slider state from stored value
                         const kvState = this.parseKvCacheToState(
@@ -277,6 +297,7 @@
                             log_level: this.globalSettings.server.log_level,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             max_model_memory: this.globalSettings.model.max_model_memory,
+                            max_process_memory: this.globalSettings.memory.max_process_memory,
                             max_num_seqs: this.globalSettings.scheduler.max_num_seqs,
                             prefill_batch_size: this.globalSettings.scheduler.prefill_batch_size,
                             completion_batch_size: this.globalSettings.scheduler.completion_batch_size,
@@ -888,6 +909,50 @@
                 }
             },
 
+            // Parse process memory setting to slider state
+            parseProcessMemoryToState(value, totalBytes) {
+                if (!value || value === 'disabled') {
+                    return { auto: false, percent: 0 };
+                }
+                if (value === 'auto') {
+                    // auto = (total - 8GB) / total * 100
+                    if (!totalBytes || totalBytes === 0) return { auto: true, percent: 90 };
+                    const reserved = 8 * 1024 * 1024 * 1024;
+                    const autoBytes = Math.max(totalBytes - reserved, totalBytes * 0.1);
+                    const percent = Math.round((autoBytes / totalBytes) * 100);
+                    return { auto: true, percent: Math.min(99, Math.max(10, percent)) };
+                }
+                const percent = parseInt(value.replace('%', ''));
+                if (isNaN(percent)) return { auto: false, percent: 90 };
+                return { auto: false, percent: Math.min(99, Math.max(0, percent)) };
+            },
+
+            // Update process memory setting from slider
+            updateProcessMemoryFromSlider() {
+                if (this.processMemoryPercent === 0) {
+                    this.globalSettings.memory.max_process_memory = 'disabled';
+                } else {
+                    this.globalSettings.memory.max_process_memory =
+                        this.processMemoryPercent + '%';
+                }
+            },
+
+            // Get formatted process memory for display
+            getProcessMemoryDisplay() {
+                const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
+                if (!totalBytes) return '-';
+                if (this.processMemoryPercent === 0 && !this.processMemoryAuto) return '-';
+                if (this.processMemoryAuto) {
+                    const reserved = 8 * 1024 * 1024 * 1024;
+                    const autoBytes = Math.max(totalBytes - reserved, totalBytes * 0.1);
+                    const gb = Math.round(autoBytes / (1024 * 1024 * 1024));
+                    return `${gb}GB`;
+                }
+                const bytes = Math.floor((this.processMemoryPercent / 100) * totalBytes);
+                const gb = Math.round(bytes / (1024 * 1024 * 1024));
+                return `${gb}GB`;
+            },
+
             // Parse stored memory value (e.g., "102GB") to percent of usable memory
             parseMemoryToPercent(memoryStr, totalBytes) {
                 const usableBytes = Math.max(0, totalBytes - 8 * 1024 * 1024 * 1024);
@@ -941,8 +1006,12 @@
 
             // Update memory value when slider changes
             updateMemoryFromSlider() {
-                const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
-                this.globalSettings.model.max_model_memory = this.percentToMemoryString(this.memoryPercent, totalBytes);
+                if (this.modelMemoryAuto) {
+                    this.globalSettings.model.max_model_memory = 'auto';
+                } else {
+                    const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
+                    this.globalSettings.model.max_model_memory = this.percentToMemoryString(this.memoryPercent, totalBytes);
+                }
             },
 
             // Parse cache size string (e.g., "10GB") to percent of SSD free space

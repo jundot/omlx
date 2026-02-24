@@ -49,6 +49,7 @@ class EngineEntry:
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
     is_pinned: bool = False  # Never evict if True
+    abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
 
 
 class EnginePool:
@@ -79,6 +80,7 @@ class EnginePool:
         self._max_model_memory = max_model_memory
         self._current_model_memory = 0
         self._scheduler_config = scheduler_config or SchedulerConfig()
+        self._process_memory_enforcer: object | None = None  # Set by server
 
     @property
     def max_model_memory(self) -> int:
@@ -238,6 +240,39 @@ class EnginePool:
                 else:
                     await self._ensure_memory_available(entry.estimated_size)
 
+            # Check process memory limit before loading.
+            # Try evicting LRU models first to free actual Metal memory.
+            if self._process_memory_enforcer is not None:
+                enforcer = self._process_memory_enforcer
+                while True:
+                    current_active = mx.get_active_memory()
+                    projected = current_active + entry.estimated_size
+                    if projected <= enforcer.max_bytes:
+                        break
+                    # Try to evict an LRU model to free memory
+                    victim = self._find_lru_victim()
+                    if victim is not None:
+                        logger.info(
+                            f"Evicting '{victim}' to fit '{model_id}' "
+                            f"within process memory limit "
+                            f"({format_size(projected)} > "
+                            f"{format_size(enforcer.max_bytes)})"
+                        )
+                        await self._unload_engine(victim)
+                        continue
+                    # No more victims — cannot fit
+                    raise InsufficientMemoryError(
+                        required=entry.estimated_size,
+                        current=current_active,
+                        message=(
+                            f"Cannot load {model_id}: projected memory "
+                            f"{format_size(projected)} would exceed process "
+                            f"limit {format_size(enforcer.max_bytes)} "
+                            f"(current: {format_size(current_active)}, "
+                            f"model: {format_size(entry.estimated_size)})"
+                        ),
+                    )
+
             # Now load the model
             await self._load_engine(model_id)
 
@@ -336,6 +371,7 @@ class EnginePool:
             raise ModelLoadingError(model_id)
 
         entry.is_loading = True
+        entry.abort_loading = False
         try:
             logger.info(f"Loading model: {model_id}")
 
@@ -370,6 +406,24 @@ class EnginePool:
 
             await engine.start()
 
+            # Check if memory enforcer requested abort during loading
+            if entry.abort_loading:
+                logger.warning(
+                    f"Model load aborted by memory enforcer: {model_id}"
+                )
+                try:
+                    await engine.stop()
+                except Exception as e:
+                    logger.warning(
+                        f"Error stopping aborted engine for {model_id}: {e}"
+                    )
+                gc.collect()
+                mx.clear_cache()
+                raise ModelLoadingError(
+                    f"Model {model_id} load aborted: "
+                    f"process memory limit exceeded"
+                )
+
             entry.engine = engine
             entry.last_access = time.time()
             self._current_model_memory += entry.estimated_size
@@ -381,6 +435,7 @@ class EnginePool:
             )
         finally:
             entry.is_loading = False
+            entry.abort_loading = False
 
     async def preload_pinned_models(self) -> None:
         """

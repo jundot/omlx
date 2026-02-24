@@ -17,6 +17,7 @@ from omlx.settings import (
     GlobalSettings,
     LoggingSettings,
     MCPSettings,
+    MemorySettings,
     ModelSettings,
     SamplingSettings,
     SchedulerSettings,
@@ -107,16 +108,19 @@ class TestModelSettings:
         assert settings.max_model_memory == "auto"
 
     def test_get_max_model_memory_bytes_auto(self):
-        """Test auto memory calculation."""
+        """Test auto memory calculation (90% of usable RAM)."""
         settings = ModelSettings(max_model_memory="auto")
-        # Should return 80% of system memory
-        expected = int(get_system_memory() * 0.8)
+        total = get_system_memory()
+        usable = max(0, total - 8 * 1024**3)
+        expected = int(usable * 0.9)
         assert settings.get_max_model_memory_bytes() == expected
 
     def test_get_max_model_memory_bytes_auto_uppercase(self):
         """Test auto memory calculation with uppercase AUTO."""
         settings = ModelSettings(max_model_memory="AUTO")
-        expected = int(get_system_memory() * 0.8)
+        total = get_system_memory()
+        usable = max(0, total - 8 * 1024**3)
+        expected = int(usable * 0.9)
         assert settings.get_max_model_memory_bytes() == expected
 
     def test_get_max_model_memory_bytes_explicit(self):
@@ -403,6 +407,74 @@ class TestLoggingSettings:
         settings = LoggingSettings.from_dict(data)
         assert settings.log_dir == "/custom"
         assert settings.retention_days == 7  # default
+
+
+class TestMemorySettings:
+    """Tests for MemorySettings dataclass."""
+
+    def test_defaults(self):
+        """Test default value is auto."""
+        settings = MemorySettings()
+        assert settings.max_process_memory == "auto"
+
+    def test_disabled_returns_none(self):
+        """Test disabled returns None bytes."""
+        settings = MemorySettings(max_process_memory="disabled")
+        assert settings.get_max_process_memory_bytes() is None
+
+    @patch("omlx.settings.get_system_memory", return_value=64 * 1024**3)
+    def test_auto_returns_total_minus_8gb(self, mock_mem):
+        """Test auto calculates total - 8GB."""
+        settings = MemorySettings(max_process_memory="auto")
+        result = settings.get_max_process_memory_bytes()
+        expected = (64 - 8) * 1024**3
+        assert result == expected
+
+    @patch("omlx.settings.get_system_memory", return_value=64 * 1024**3)
+    def test_percent_parsing(self, mock_mem):
+        """Test percentage parsing (e.g., '80%')."""
+        settings = MemorySettings(max_process_memory="80%")
+        result = settings.get_max_process_memory_bytes()
+        expected = int(64 * 1024**3 * 0.80)
+        assert result == expected
+
+    @patch("omlx.settings.get_system_memory", return_value=64 * 1024**3)
+    def test_percent_range_low(self, mock_mem):
+        """Test percentage below 10% raises ValueError."""
+        settings = MemorySettings(max_process_memory="5%")
+        with pytest.raises(ValueError, match="10-99%"):
+            settings.get_max_process_memory_bytes()
+
+    @patch("omlx.settings.get_system_memory", return_value=64 * 1024**3)
+    def test_percent_range_high(self, mock_mem):
+        """Test percentage above 99% raises ValueError."""
+        settings = MemorySettings(max_process_memory="100%")
+        with pytest.raises(ValueError, match="10-99%"):
+            settings.get_max_process_memory_bytes()
+
+    @patch("omlx.settings.get_system_memory", return_value=12 * 1024**3)
+    def test_auto_with_small_memory(self, mock_mem):
+        """Test auto with small system memory (< 8GB usable) uses 10% floor."""
+        settings = MemorySettings(max_process_memory="auto")
+        result = settings.get_max_process_memory_bytes()
+        # 12GB - 8GB = 4GB, which is > 10% of 12GB (1.2GB), so should be 4GB
+        assert result == 4 * 1024**3
+
+    def test_to_dict(self):
+        """Test serialization."""
+        settings = MemorySettings(max_process_memory="75%")
+        d = settings.to_dict()
+        assert d == {"max_process_memory": "75%"}
+
+    def test_from_dict(self):
+        """Test deserialization."""
+        settings = MemorySettings.from_dict({"max_process_memory": "90%"})
+        assert settings.max_process_memory == "90%"
+
+    def test_from_dict_defaults(self):
+        """Test deserialization with empty dict uses defaults."""
+        settings = MemorySettings.from_dict({})
+        assert settings.max_process_memory == "auto"
 
 
 class TestGlobalSettings:

@@ -163,10 +163,12 @@ class ModelSettings:
         Get max model memory in bytes.
 
         Returns:
-            Max model memory in bytes (80% of RAM if "auto").
+            Max model memory in bytes (90% of usable RAM if "auto").
         """
         if self.max_model_memory.lower() == "auto":
-            return int(get_system_memory() * 0.8)
+            total = get_system_memory()
+            usable = max(0, total - 8 * 1024**3)
+            return int(usable * 0.9)
         return parse_size(self.max_model_memory)
 
     def to_dict(self) -> dict[str, Any]:
@@ -272,6 +274,55 @@ class CacheSettings:
             enabled=data.get("enabled", True),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
+        )
+
+
+@dataclass
+class MemorySettings:
+    """Process-level memory enforcement settings."""
+
+    max_process_memory: str = "auto"  # "auto" (RAM - 8GB), "disabled", or "XX%"
+
+    def get_max_process_memory_bytes(self) -> int | None:
+        """
+        Get max process memory in bytes, or None if disabled.
+
+        - "auto": system RAM minus 8GB
+        - "disabled": None (no enforcement)
+        - "XX%": percentage of system RAM (10-99%)
+
+        Returns:
+            Max process memory in bytes, or None if disabled.
+        """
+        value = self.max_process_memory.strip().lower()
+        if value == "disabled":
+            return None
+        if value == "auto":
+            reserved = 8 * 1024**3  # 8GB reserved for system
+            total = get_system_memory()
+            return max(total - reserved, int(total * 0.1))
+        # Parse percentage like "80%"
+        percent_str = value.rstrip("%")
+        try:
+            percent = int(percent_str)
+        except ValueError:
+            # Try parsing as absolute size (e.g., "32GB")
+            return parse_size(self.max_process_memory)
+        if not 10 <= percent <= 99:
+            raise ValueError(
+                f"max_process_memory must be 10-99%, got {percent}%"
+            )
+        return int(get_system_memory() * percent / 100)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {"max_process_memory": self.max_process_memory}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MemorySettings:
+        """Create from dictionary."""
+        return cls(
+            max_process_memory=data.get("max_process_memory", "auto"),
         )
 
 
@@ -417,6 +468,7 @@ class GlobalSettings:
     base_path: Path = field(default_factory=lambda: DEFAULT_BASE_PATH)
     server: ServerSettings = field(default_factory=ServerSettings)
     model: ModelSettings = field(default_factory=ModelSettings)
+    memory: MemorySettings = field(default_factory=MemorySettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
     cache: CacheSettings = field(default_factory=CacheSettings)
     auth: AuthSettings = field(default_factory=AuthSettings)
@@ -489,6 +541,8 @@ class GlobalSettings:
                 self.server = ServerSettings.from_dict(data["server"])
             if "model" in data:
                 self.model = ModelSettings.from_dict(data["model"])
+            if "memory" in data:
+                self.memory = MemorySettings.from_dict(data["memory"])
             if "scheduler" in data:
                 self.scheduler = SchedulerSettings.from_dict(data["scheduler"])
             if "cache" in data:
@@ -529,6 +583,10 @@ class GlobalSettings:
             self.model.model_dir = dirs[0] if dirs else None
         if max_model_memory := os.getenv("OMLX_MAX_MODEL_MEMORY"):
             self.model.max_model_memory = max_model_memory
+
+        # Memory enforcement settings
+        if max_process_memory := os.getenv("OMLX_MAX_PROCESS_MEMORY"):
+            self.memory.max_process_memory = max_process_memory
 
         # Scheduler settings
         if max_num_seqs := os.getenv("OMLX_MAX_NUM_SEQS"):
@@ -599,6 +657,13 @@ class GlobalSettings:
         if hasattr(args, "max_model_memory") and args.max_model_memory is not None:
             self.model.max_model_memory = args.max_model_memory
 
+        # Memory enforcement settings
+        if (
+            hasattr(args, "max_process_memory")
+            and args.max_process_memory is not None
+        ):
+            self.memory.max_process_memory = args.max_process_memory
+
         # Scheduler settings
         if hasattr(args, "max_num_seqs") and args.max_num_seqs is not None:
             self.scheduler.max_num_seqs = args.max_num_seqs
@@ -640,6 +705,7 @@ class GlobalSettings:
             "version": SETTINGS_VERSION,
             "server": self.server.to_dict(),
             "model": self.model.to_dict(),
+            "memory": self.memory.to_dict(),
             "scheduler": self.scheduler.to_dict(),
             "cache": self.cache.to_dict(),
             "auth": self.auth.to_dict(),
@@ -705,6 +771,25 @@ class GlobalSettings:
                     errors.append("max_model_memory must be positive")
             except ValueError as e:
                 errors.append(f"Invalid max_model_memory: {e}")
+
+        # Memory enforcement validation
+        mem_val = self.memory.max_process_memory.strip().lower()
+        if mem_val not in ("auto", "disabled"):
+            percent_str = mem_val.rstrip("%")
+            try:
+                percent = int(percent_str)
+                if not 10 <= percent <= 99:
+                    errors.append(
+                        f"max_process_memory must be 10-99%, got {percent}%"
+                    )
+            except ValueError:
+                # Could be absolute size, try parsing
+                try:
+                    size = parse_size(self.memory.max_process_memory)
+                    if size <= 0:
+                        errors.append("max_process_memory must be positive")
+                except ValueError as e:
+                    errors.append(f"Invalid max_process_memory: {e}")
 
         # Scheduler validation
         if self.scheduler.max_num_seqs <= 0:
@@ -782,6 +867,7 @@ class GlobalSettings:
             "base_path": str(self.base_path),
             "server": self.server.to_dict(),
             "model": self.model.to_dict(),
+            "memory": self.memory.to_dict(),
             "scheduler": self.scheduler.to_dict(),
             "cache": self.cache.to_dict(),
             "auth": self.auth.to_dict(),

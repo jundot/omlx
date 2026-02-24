@@ -54,7 +54,7 @@ import secrets
 
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse as _BaseStreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse as _BaseStreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from omlx._version import __version__
@@ -232,6 +232,7 @@ class ServerState:
     settings_manager: Optional[object] = None  # ModelSettingsManager
     global_settings: Optional[object] = None  # GlobalSettings
     hf_downloader: Optional[object] = None  # HFDownloader
+    process_memory_enforcer: Optional[object] = None  # ProcessMemoryEnforcer
 
 
 # Global server state instance
@@ -281,6 +282,23 @@ async def lifespan(app: FastAPI):
     if _server_state.engine_pool is not None:
         await _server_state.engine_pool.preload_pinned_models()
 
+    # Start process memory enforcer if configured
+    if (
+        _server_state.global_settings is not None
+        and _server_state.engine_pool is not None
+    ):
+        max_bytes = _server_state.global_settings.memory.get_max_process_memory_bytes()
+        if max_bytes is not None:
+            from .process_memory_enforcer import ProcessMemoryEnforcer
+
+            enforcer = ProcessMemoryEnforcer(
+                engine_pool=_server_state.engine_pool,
+                max_bytes=max_bytes,
+            )
+            _server_state.process_memory_enforcer = enforcer
+            _server_state.engine_pool._process_memory_enforcer = enforcer
+            enforcer.start()
+
     # Initialize MCP if config provided
     mcp_config = os.environ.get("OMLX_MCP_CONFIG")
     if mcp_config:
@@ -288,7 +306,12 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: Stop HF downloader, MCP connections, and engines
+    # Shutdown: Stop process memory enforcer, HF downloader, MCP, engines
+    if _server_state.process_memory_enforcer is not None:
+        await _server_state.process_memory_enforcer.stop()
+        if _server_state.engine_pool is not None:
+            _server_state.engine_pool._process_memory_enforcer = None
+        logger.info("Process memory enforcer stopped")
     if _server_state.hf_downloader is not None:
         await _server_state.hf_downloader.shutdown()
         logger.info("HF Downloader stopped")
@@ -314,6 +337,7 @@ app.include_router(mcp_router)
 
 # Include admin routes
 from .admin.routes import router as admin_router, set_admin_getters
+from .admin.auth import _RedirectToLogin
 set_admin_getters(
     get_server_state,
     get_engine_pool,
@@ -321,6 +345,12 @@ set_admin_getters(
     lambda: _server_state.global_settings,
 )
 app.include_router(admin_router)
+
+
+@app.exception_handler(_RedirectToLogin)
+async def redirect_to_login_handler(request, exc):
+    """Redirect unauthenticated browser requests to the admin login page."""
+    return RedirectResponse(url="/admin", status_code=302)
 
 
 @app.middleware("http")
