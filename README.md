@@ -38,6 +38,13 @@
 
 Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), drag to Applications, done.
 
+### Homebrew
+
+```bash
+brew tap jundot/omlx https://github.com/jundot/omlx
+brew install omlx
+```
+
 ### From Source
 
 ```bash
