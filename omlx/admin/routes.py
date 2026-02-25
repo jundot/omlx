@@ -14,7 +14,7 @@ import os
 import shutil
 from collections import deque
 from pathlib import Path
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
@@ -55,6 +55,7 @@ class ModelSettingsRequest(BaseModel):
     repetition_penalty: Optional[float] = None
     force_sampling: Optional[bool] = None
     max_tool_result_tokens: Optional[int] = None
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
 
@@ -908,6 +909,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "repetition_penalty": settings.repetition_penalty,
                 "force_sampling": settings.force_sampling,
                 "max_tool_result_tokens": settings.max_tool_result_tokens,
+                "chat_template_kwargs": settings.chat_template_kwargs,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
@@ -1000,6 +1002,8 @@ async def update_model_settings(
         current_settings.max_tool_result_tokens = (
             request.max_tool_result_tokens if request.max_tool_result_tokens and request.max_tool_result_tokens > 0 else None
         )
+    if "chat_template_kwargs" in sent:
+        current_settings.chat_template_kwargs = request.chat_template_kwargs
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry

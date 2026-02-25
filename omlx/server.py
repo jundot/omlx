@@ -1268,11 +1268,17 @@ async def create_chat_completion(
 
     engine = await get_engine_for_model(request.model)
 
-    # Get max_tool_result_tokens from model settings
+    # Get per-model settings
     max_tool_result_tokens = None
+    merged_ct_kwargs = {}
     if _server_state.settings_manager:
         ms = _server_state.settings_manager.get_settings(request.model)
         max_tool_result_tokens = ms.max_tool_result_tokens
+        if ms.chat_template_kwargs:
+            merged_ct_kwargs.update(ms.chat_template_kwargs)
+    # Per-request kwargs override model settings
+    if request.chat_template_kwargs:
+        merged_ct_kwargs.update(request.chat_template_kwargs)
 
     # Extract messages - Harmony models need special handling to preserve tool format
     if engine.model_type == "gpt_oss":
@@ -1294,7 +1300,10 @@ async def create_chat_completion(
 
     # Validate context window before sending to model
     tools_for_template = convert_tools_for_template(request.tools) if request.tools else None
-    num_prompt_tokens = engine.count_chat_tokens(messages, tools_for_template)
+    num_prompt_tokens = engine.count_chat_tokens(
+        messages, tools_for_template,
+        chat_template_kwargs=merged_ct_kwargs or None,
+    )
     validate_context_window(num_prompt_tokens, request.model)
 
     # Prepare kwargs
@@ -1312,6 +1321,10 @@ async def create_chat_completion(
     # Add tools if provided
     if request.tools:
         chat_kwargs["tools"] = tools_for_template
+
+    # Add chat template kwargs
+    if merged_ct_kwargs:
+        chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
 
     if request.stream:
         return StreamingResponse(
@@ -1684,6 +1697,8 @@ async def stream_anthropic_messages(
             template_kwargs = {"tokenize": False, "add_generation_prompt": True}
             if kwargs.get("tools"):
                 template_kwargs["tools"] = kwargs["tools"]
+            if kwargs.get("chat_template_kwargs"):
+                template_kwargs.update(kwargs["chat_template_kwargs"])
             prompt = engine.tokenizer.apply_chat_template(messages, **template_kwargs)
             # Tokenize to count
             tokens = engine.tokenizer.encode(prompt)
@@ -1859,11 +1874,17 @@ async def create_anthropic_message(
 
     engine = await get_engine_for_model(request.model)
 
-    # Get max_tool_result_tokens from model settings
+    # Get per-model settings
     max_tool_result_tokens = None
+    merged_ct_kwargs = {}
     if _server_state.settings_manager:
         ms = _server_state.settings_manager.get_settings(request.model)
         max_tool_result_tokens = ms.max_tool_result_tokens
+        if ms.chat_template_kwargs:
+            merged_ct_kwargs.update(ms.chat_template_kwargs)
+    # Per-request kwargs override model settings
+    if request.chat_template_kwargs:
+        merged_ct_kwargs.update(request.chat_template_kwargs)
 
     logger.debug(
         f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
@@ -1907,8 +1928,15 @@ async def create_anthropic_message(
     if internal_tools:
         chat_kwargs["tools"] = internal_tools
 
+    # Add chat template kwargs
+    if merged_ct_kwargs:
+        chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+
     # Validate context window before sending to model
-    num_prompt_tokens = engine.count_chat_tokens(messages, internal_tools)
+    num_prompt_tokens = engine.count_chat_tokens(
+        messages, internal_tools,
+        chat_template_kwargs=merged_ct_kwargs or None,
+    )
     validate_context_window(num_prompt_tokens, request.model)
 
     # Add stop sequences

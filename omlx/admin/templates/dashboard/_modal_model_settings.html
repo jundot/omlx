@@ -115,6 +115,79 @@
                         </button>
                     </div>
 
+                    <!-- Chat Template Kwargs -->
+                    <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <span class="text-sm font-medium text-neutral-700">Chat Template Kwargs</span>
+                                <p class="text-xs text-neutral-500 mt-0.5">Parameters passed to chat template</p>
+                            </div>
+                            <!-- Add dropdown -->
+                            <div class="relative" x-data="{ addOpen: false }">
+                                <button type="button" @click="addOpen = !addOpen"
+                                        class="text-xs text-neutral-500 hover:text-neutral-700 font-medium transition-colors">+ Add</button>
+                                <div x-show="addOpen" @click.away="addOpen = false" x-transition
+                                     class="absolute right-0 mt-1 w-44 bg-white border border-neutral-200 rounded-lg shadow-lg z-10 py-1">
+                                    <button type="button"
+                                            @click="modelSettings.ctKwargEntries.push({type: 'enable_thinking', value: 'true'}); addOpen = false; $nextTick(() => lucide.createIcons())"
+                                            class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">enable_thinking</button>
+                                    <button type="button"
+                                            @click="modelSettings.ctKwargEntries.push({type: 'reasoning_effort', value: 'low'}); addOpen = false; $nextTick(() => lucide.createIcons())"
+                                            class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">reasoning_effort</button>
+                                    <button type="button"
+                                            @click="modelSettings.ctKwargEntries.push({type: 'custom', key: '', value: ''}); addOpen = false; $nextTick(() => lucide.createIcons())"
+                                            class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">Custom</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Dynamic entries -->
+                        <template x-for="(entry, idx) in modelSettings.ctKwargEntries" :key="idx">
+                            <div class="flex gap-2 items-center min-w-0">
+                                <!-- enable_thinking -->
+                                <template x-if="entry.type === 'enable_thinking'">
+                                    <div class="flex gap-2 items-center min-w-0 flex-1">
+                                        <span class="text-xs font-bold uppercase tracking-wider text-neutral-500 whitespace-nowrap">enable_thinking</span>
+                                        <select x-model="entry.value"
+                                                class="w-24 flex-shrink-0 px-3 py-1.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                            <option value="true">true</option>
+                                            <option value="false">false</option>
+                                        </select>
+                                    </div>
+                                </template>
+                                <!-- reasoning_effort -->
+                                <template x-if="entry.type === 'reasoning_effort'">
+                                    <div class="flex gap-2 items-center min-w-0 flex-1">
+                                        <span class="text-xs font-bold uppercase tracking-wider text-neutral-500 whitespace-nowrap">reasoning_effort</span>
+                                        <select x-model="entry.value"
+                                                class="w-28 flex-shrink-0 px-3 py-1.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                            <option value="low">low</option>
+                                            <option value="medium">medium</option>
+                                            <option value="high">high</option>
+                                        </select>
+                                    </div>
+                                </template>
+                                <!-- custom -->
+                                <template x-if="entry.type === 'custom'">
+                                    <div class="grid grid-cols-2 gap-2 min-w-0 flex-1">
+                                        <input type="text" x-model="entry.key" placeholder="key"
+                                               class="px-3 py-1.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all min-w-0">
+                                        <input type="text" x-model="entry.value" placeholder="value"
+                                               class="px-3 py-1.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all min-w-0">
+                                    </div>
+                                </template>
+                                <!-- Remove button -->
+                                <button type="button" @click="modelSettings.ctKwargEntries.splice(idx, 1)"
+                                        class="p-1 text-neutral-400 hover:text-red-500 transition-colors flex-shrink-0">
+                                    <i data-lucide="x" class="w-4 h-4"></i>
+                                </button>
+                            </div>
+                        </template>
+
+                        <!-- Empty state -->
+                        <p x-show="modelSettings.ctKwargEntries.length === 0" class="text-xs text-neutral-400 text-center py-1">No kwargs configured</p>
+                    </div>
+
                     <p class="text-xs text-neutral-400 text-center">Leave empty to use global defaults</p>
                 </div>
 

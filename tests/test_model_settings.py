@@ -84,6 +84,46 @@ class TestModelSettings:
         restored = ModelSettings.from_dict(d)
         assert restored.repetition_penalty == 1.5
 
+    def test_chat_template_kwargs_default(self):
+        """Test chat_template_kwargs defaults to None."""
+        settings = ModelSettings()
+        assert settings.chat_template_kwargs is None
+
+    def test_chat_template_kwargs_to_dict(self):
+        """Test chat_template_kwargs included in to_dict when set."""
+        settings = ModelSettings(
+            chat_template_kwargs={"enable_thinking": False, "reasoning_effort": "low"}
+        )
+        d = settings.to_dict()
+        assert "chat_template_kwargs" in d
+        assert d["chat_template_kwargs"]["enable_thinking"] is False
+        assert d["chat_template_kwargs"]["reasoning_effort"] == "low"
+
+    def test_chat_template_kwargs_excluded_when_none(self):
+        """Test chat_template_kwargs excluded from to_dict when None."""
+        settings = ModelSettings()
+        d = settings.to_dict()
+        assert "chat_template_kwargs" not in d
+
+    def test_chat_template_kwargs_roundtrip(self):
+        """Test chat_template_kwargs survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(
+            chat_template_kwargs={"enable_thinking": True, "custom_key": 42}
+        )
+        d = original.to_dict()
+        restored = ModelSettings.from_dict(d)
+        assert restored.chat_template_kwargs == {"enable_thinking": True, "custom_key": 42}
+
+    def test_chat_template_kwargs_from_dict(self):
+        """Test chat_template_kwargs created from dict."""
+        data = {
+            "temperature": 0.8,
+            "chat_template_kwargs": {"reasoning_effort": "high"},
+        }
+        settings = ModelSettings.from_dict(data)
+        assert settings.temperature == 0.8
+        assert settings.chat_template_kwargs == {"reasoning_effort": "high"}
+
 
 class TestModelSettingsManager:
     """Tests for ModelSettingsManager class."""
@@ -208,6 +248,42 @@ class TestModelSettingsManager:
             assert len(all_settings) == 2
             assert "model-1" in all_settings
             assert "model-2" in all_settings
+
+    def test_chat_template_kwargs_persist(self):
+        """Test chat_template_kwargs survives save/load cycle."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            settings = ModelSettings(
+                chat_template_kwargs={"enable_thinking": False, "reasoning_effort": "medium"}
+            )
+            manager.set_settings("test-model", settings)
+
+            # Reload from file
+            manager2 = ModelSettingsManager(Path(tmpdir))
+            loaded = manager2.get_settings("test-model")
+            assert loaded.chat_template_kwargs == {
+                "enable_thinking": False,
+                "reasoning_effort": "medium",
+            }
+
+    def test_chat_template_kwargs_clear(self):
+        """Test clearing chat_template_kwargs by setting to None."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            # Set kwargs
+            settings = ModelSettings(
+                chat_template_kwargs={"enable_thinking": True}
+            )
+            manager.set_settings("test-model", settings)
+            assert manager.get_settings("test-model").chat_template_kwargs is not None
+
+            # Clear kwargs
+            settings = ModelSettings(chat_template_kwargs=None)
+            manager.set_settings("test-model", settings)
+            loaded = manager.get_settings("test-model")
+            assert loaded.chat_template_kwargs is None
 
     def test_thread_safety(self):
         """Test thread-safe access."""

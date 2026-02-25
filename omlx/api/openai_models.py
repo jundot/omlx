@@ -10,7 +10,7 @@ These models define the request and response schemas for:
 - MCP (Model Context Protocol) integration
 """
 
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -128,6 +128,8 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Optional[Union[str, dict]] = None  # "auto", "none", or specific tool
     # Structured output
     response_format: Optional[Union[ResponseFormat, dict]] = None
+    # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
 
 
 class AssistantMessage(BaseModel):

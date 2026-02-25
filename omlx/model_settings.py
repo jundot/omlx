@@ -45,6 +45,7 @@ class ModelSettings:
     repetition_penalty: Optional[float] = None
     force_sampling: bool = False
     max_tool_result_tokens: Optional[int] = None
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
 
     # Model management flags
     is_pinned: bool = False

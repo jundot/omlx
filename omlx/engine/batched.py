@@ -179,8 +179,16 @@ class BatchedEngine(BaseEngine):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> str:
-        """Apply chat template to messages."""
+        """Apply chat template to messages.
+
+        Args:
+            messages: List of chat messages
+            tools: Optional tool definitions
+            chat_template_kwargs: Optional kwargs passed to tokenizer.apply_chat_template
+                (e.g. enable_thinking, reasoning_effort). Overrides global _enable_thinking.
+        """
         if hasattr(self._tokenizer, 'apply_chat_template'):
             template_kwargs = {
                 "tokenize": False,
@@ -188,13 +196,20 @@ class BatchedEngine(BaseEngine):
             }
             if tools:
                 template_kwargs["tools"] = tools
+            # Global fallback
             if self._enable_thinking is not None:
                 template_kwargs["enable_thinking"] = self._enable_thinking
+            # Per-model/request kwargs override global
+            if chat_template_kwargs:
+                template_kwargs.update(chat_template_kwargs)
 
             try:
                 return self._tokenizer.apply_chat_template(messages, **template_kwargs)
             except TypeError:
-                # Tokenizer doesn't support some parameter, try without tools and enable_thinking
+                # Tokenizer doesn't support some kwargs, remove them and retry
+                if chat_template_kwargs:
+                    for key in chat_template_kwargs:
+                        template_kwargs.pop(key, None)
                 template_kwargs.pop("tools", None)
                 template_kwargs.pop("enable_thinking", None)
                 return self._tokenizer.apply_chat_template(messages, **template_kwargs)
@@ -206,6 +221,7 @@ class BatchedEngine(BaseEngine):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """
         Count prompt tokens for chat messages after applying chat template.
@@ -213,13 +229,16 @@ class BatchedEngine(BaseEngine):
         Args:
             messages: List of chat messages
             tools: Optional tool definitions
+            chat_template_kwargs: Optional kwargs for chat template
 
         Returns:
             Number of prompt tokens
         """
         messages = self._preprocess_messages(messages)
         template_tools = convert_tools_for_template(tools) if tools else None
-        prompt = self._apply_chat_template(messages, template_tools)
+        prompt = self._apply_chat_template(
+            messages, template_tools, chat_template_kwargs=chat_template_kwargs
+        )
         return len(self._tokenizer.encode(prompt))
 
     async def generate(
@@ -395,7 +414,10 @@ class BatchedEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
 
         # Apply chat template
-        prompt = self._apply_chat_template(messages, template_tools)
+        ct_kwargs = kwargs.pop("chat_template_kwargs", None)
+        prompt = self._apply_chat_template(
+            messages, template_tools, chat_template_kwargs=ct_kwargs
+        )
 
         return await self.generate(
             prompt=prompt,
@@ -444,7 +466,10 @@ class BatchedEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
 
         # Apply chat template
-        prompt = self._apply_chat_template(messages, template_tools)
+        ct_kwargs = kwargs.pop("chat_template_kwargs", None)
+        prompt = self._apply_chat_template(
+            messages, template_tools, chat_template_kwargs=ct_kwargs
+        )
 
         async for output in self.stream_generate(
             prompt=prompt,

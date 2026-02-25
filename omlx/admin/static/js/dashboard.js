@@ -62,6 +62,7 @@
                 force_sampling: false,
                 enableToolResultLimit: false,
                 max_tool_result_tokens: null,
+                ctKwargEntries: [],
             },
             savingModelSettings: false,
             loadingGenDefaults: false,
@@ -384,6 +385,18 @@
                 this.selectedModel = model;
                 // Load existing settings if available
                 const settings = model.settings || {};
+                // Parse chat_template_kwargs into ctKwargEntries
+                const ctk = settings.chat_template_kwargs || {};
+                const ctKwargEntries = [];
+                for (const [key, value] of Object.entries(ctk)) {
+                    if (key === 'enable_thinking') {
+                        ctKwargEntries.push({type: 'enable_thinking', value: String(value)});
+                    } else if (key === 'reasoning_effort') {
+                        ctKwargEntries.push({type: 'reasoning_effort', value: String(value)});
+                    } else {
+                        ctKwargEntries.push({type: 'custom', key, value: String(value)});
+                    }
+                }
                 this.modelSettings = {
                     max_context_window: settings.max_context_window || null,
                     max_tokens: settings.max_tokens || null,
@@ -394,6 +407,7 @@
                     force_sampling: settings.force_sampling || false,
                     enableToolResultLimit: !!(settings.max_tool_result_tokens),
                     max_tool_result_tokens: settings.max_tool_result_tokens || null,
+                    ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
                 this.$nextTick(() => lucide.createIcons());
@@ -407,18 +421,37 @@
                     const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`, {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            max_context_window: this.modelSettings.max_context_window || null,
-                            max_tokens: this.modelSettings.max_tokens || null,
-                            temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
-                            top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,
-                            top_k: Number.isFinite(this.modelSettings.top_k) ? this.modelSettings.top_k : null,
-                            repetition_penalty: Number.isFinite(this.modelSettings.repetition_penalty) ? this.modelSettings.repetition_penalty : null,
-                            force_sampling: this.modelSettings.force_sampling,
-                            max_tool_result_tokens: this.modelSettings.enableToolResultLimit
-                                ? (this.modelSettings.max_tool_result_tokens || null)
-                                : 0,
-                        }),
+                        body: JSON.stringify((() => {
+                            // Build chat_template_kwargs from ctKwargEntries
+                            const chatTemplateKwargs = {};
+                            for (const entry of this.modelSettings.ctKwargEntries) {
+                                if (entry.type === 'enable_thinking') {
+                                    chatTemplateKwargs.enable_thinking = entry.value === 'true';
+                                } else if (entry.type === 'reasoning_effort') {
+                                    chatTemplateKwargs.reasoning_effort = entry.value;
+                                } else if (entry.type === 'custom' && entry.key && entry.key.trim()) {
+                                    let val = entry.value;
+                                    if (val === 'true') val = true;
+                                    else if (val === 'false') val = false;
+                                    else if (!isNaN(Number(val)) && val.trim() !== '') val = Number(val);
+                                    chatTemplateKwargs[entry.key.trim()] = val;
+                                }
+                            }
+                            return {
+                                max_context_window: this.modelSettings.max_context_window || null,
+                                max_tokens: this.modelSettings.max_tokens || null,
+                                temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
+                                top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,
+                                top_k: Number.isFinite(this.modelSettings.top_k) ? this.modelSettings.top_k : null,
+                                repetition_penalty: Number.isFinite(this.modelSettings.repetition_penalty) ? this.modelSettings.repetition_penalty : null,
+                                force_sampling: this.modelSettings.force_sampling,
+                                max_tool_result_tokens: this.modelSettings.enableToolResultLimit
+                                    ? (this.modelSettings.max_tool_result_tokens || null)
+                                    : 0,
+                                chat_template_kwargs: Object.keys(chatTemplateKwargs).length > 0
+                                    ? chatTemplateKwargs : null,
+                            };
+                        })()),
                     });
 
                     if (response.ok) {
