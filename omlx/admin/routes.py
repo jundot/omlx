@@ -1268,7 +1268,10 @@ async def update_global_settings(
         global_settings.model.max_model_memory = request.max_model_memory
         # Apply at runtime
         try:
-            max_bytes = parse_size(request.max_model_memory)
+            if request.max_model_memory.lower() == "auto":
+                max_bytes = global_settings.model.get_max_model_memory_bytes()
+            else:
+                max_bytes = parse_size(request.max_model_memory)
             success, msg = await _apply_max_model_memory_runtime(max_bytes)
             if success:
                 runtime_applied.append("max_model_memory")
