@@ -656,6 +656,13 @@
                                                     force_sampling
                                                 </span>
                                             </template>
+                                            <template x-if="model.settings?.chat_template_kwargs">
+                                                <template x-for="[k, v] in Object.entries(model.settings.chat_template_kwargs)" :key="k">
+                                                    <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
+                                                        <span x-text="k"></span>: <span class="ml-1" x-text="v"></span>
+                                                    </span>
+                                                </template>
+                                            </template>
                                         </div>
                                     </div>
                                 </div>
