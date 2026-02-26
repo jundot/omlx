@@ -1,6 +1,4 @@
 class Omlx < Formula
-  include Language::Python::Virtualenv
-
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
   url "https://github.com/jundot/omlx/archive/refs/tags/v0.1.8.tar.gz"
@@ -12,8 +10,15 @@ class Omlx < Formula
   depends_on arch: :arm64
 
   def install
-    venv = virtualenv_create(libexec, "python3.11")
-    venv.pip_install buildpath
+    # Create venv with pip so dependency resolution works properly
+    system "python3.11", "-m", "venv", libexec
+
+    # Upgrade pip to ensure modern resolver (handles git deps, etc.)
+    system libexec/"bin/pip", "install", "--upgrade", "pip"
+
+    # Install package - pip resolves ALL deps from pyproject.toml
+    system libexec/"bin/pip", "install", buildpath
+
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end
 
