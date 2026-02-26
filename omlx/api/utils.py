@@ -82,6 +82,10 @@ def extract_text_content(
         role = msg.role
         content = msg.content
 
+        # Normalize "developer" role to "system" (OpenAI API compatibility)
+        if role == "developer":
+            role = "system"
+
         # Handle tool response messages (role="tool")
         if role == "tool":
             tool_call_id = getattr(msg, 'tool_call_id', None) or ''
@@ -284,6 +288,10 @@ def extract_harmony_messages(
     for msg in messages:
         role = msg.role
         content = msg.content
+
+        # Normalize "developer" role to "system" (OpenAI API compatibility)
+        if role == "developer":
+            role = "system"
 
         # Tool response messages - preserve role and tool_call_id
         # Parse content as JSON if possible (chat_template applies |tojson)
