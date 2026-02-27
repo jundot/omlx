@@ -538,6 +538,9 @@ class _BoundarySnapshotProvider:
             return self._store.load(self._request_id, tc)
         return None
 
+    def __len__(self) -> int:
+        return len(self._valid_tcs)
+
     def __bool__(self) -> bool:
         return bool(self._valid_tcs)
 
