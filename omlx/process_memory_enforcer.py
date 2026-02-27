@@ -67,6 +67,8 @@ class ProcessMemoryEnforcer:
     def max_bytes(self, value: int) -> None:
         old = self._max_bytes
         self._max_bytes = value
+        if self._running:
+            self._propagate_memory_limit()
         logger.info(
             f"Process memory limit changed: "
             f"{_format_gb(old)} -> {_format_gb(value)}"
@@ -82,12 +84,24 @@ class ProcessMemoryEnforcer:
         if self._running:
             return
         self._running = True
+        self._propagate_memory_limit()
         self._task = asyncio.create_task(self._enforcement_loop())
         logger.info(
             f"Process memory enforcer started "
             f"(limit: {_format_gb(self._max_bytes)}, "
             f"interval: {self._poll_interval}s)"
         )
+
+    def _propagate_memory_limit(self) -> None:
+        """Propagate memory limit to all schedulers for inline prefill checking."""
+        for entry in self._engine_pool._entries.values():
+            if entry.engine is not None:
+                scheduler = getattr(entry.engine, "scheduler", None)
+                if scheduler is not None:
+                    scheduler._memory_limit_bytes = self._max_bytes
+                    bg = getattr(scheduler, "batch_generator", None)
+                    if bg is not None and hasattr(bg, "_memory_limit_bytes"):
+                        bg._memory_limit_bytes = self._max_bytes
 
     async def stop(self) -> None:
         """Stop the background enforcement loop."""
@@ -125,7 +139,9 @@ class ProcessMemoryEnforcer:
             f"(over by {_format_gb(overage)})"
         )
 
-        # Acquire EnginePool lock and unload LRU models until under limit
+        # Acquire EnginePool lock and unload LRU models until under limit.
+        # Note: prefill loops self-check via _memory_limit_bytes (same thread,
+        # no GIL issue), so they will abort independently of this enforcer.
         async with self._engine_pool._lock:
             while mx.get_active_memory() > self._max_bytes:
                 victim = self._engine_pool._find_lru_victim()

@@ -96,6 +96,9 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         super().__init__(*args, **kwargs)
         self._boundary_block_size = max(0, int(boundary_block_size))
         self._prefill_boundary_callback = prefill_boundary_callback
+        # Memory limit for inline prefill checking (set by Scheduler).
+        # mx.get_active_memory() is ~20ns, negligible vs ~5s prefill chunks.
+        self._memory_limit_bytes: int = 0  # 0 = disabled
 
     # Cache class names known to be sliceable (no boundary snapshots needed).
     _KNOWN_SLICEABLE = frozenset({"KVCache", "BatchKVCache", "QuantizedKVCache"})
@@ -352,6 +355,19 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                 )
                 mx.clear_cache()
 
+                if (
+                    self._memory_limit_bytes > 0
+                    and mx.get_active_memory() > self._memory_limit_bytes
+                ):
+                    logger.warning(
+                        f"Prefill force-stopped at {processed_tokens} "
+                        f"tokens: memory {mx.get_active_memory() / 1024**3:.1f} "
+                        f"exceeds limit {self._memory_limit_bytes / 1024**3:.1f}"
+                    )
+                    raise RuntimeError(
+                        "Memory limit exceeded during prefill"
+                    )
+
         # Further prompt processing so we need to
         #   1. Merge the KV caches and prepare for right padded prompts
         #   2. Right pad the inputs
@@ -406,6 +422,19 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     processed_tokens=processed_tokens,
                 )
                 mx.clear_cache()
+
+                if (
+                    self._memory_limit_bytes > 0
+                    and mx.get_active_memory() > self._memory_limit_bytes
+                ):
+                    logger.warning(
+                        f"Prefill force-stopped at {processed_tokens} "
+                        f"tokens: memory {mx.get_active_memory() / 1024**3:.1f} "
+                        f"exceeds limit {self._memory_limit_bytes / 1024**3:.1f}"
+                    )
+                    raise RuntimeError(
+                        "Memory limit exceeded during prefill"
+                    )
 
             mx.eval([c.state for c in prompt_cache])
             inputs = last_inputs
@@ -594,6 +623,10 @@ class Scheduler:
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
         self._pending_abort_ids: Set[str] = set()
+
+        # Memory limit for inline prefill checking.
+        # Set by ProcessMemoryEnforcer; propagated to BatchGenerator.
+        self._memory_limit_bytes: int = 0
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: Dict[str, int] = {}
@@ -998,7 +1031,7 @@ class Scheduler:
         if sampling_params.stop_token_ids:
             stop_tokens.update(sampling_params.stop_token_ids)
 
-        return _BoundarySnapshotBatchGenerator(
+        bg = _BoundarySnapshotBatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
             stop_tokens=stop_tokens,
@@ -1014,6 +1047,8 @@ class Scheduler:
                 else None
             ),
         )
+        bg._memory_limit_bytes = self._memory_limit_bytes
+        return bg
 
     def _build_sampler_and_processors(
         self, sampling_params: SamplingParams

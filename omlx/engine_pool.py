@@ -413,6 +413,10 @@ class EnginePool:
             entry.last_access = time.time()
             self._current_model_memory += entry.estimated_size
 
+            # Propagate memory limit to new engine's scheduler
+            if self._process_memory_enforcer is not None:
+                self._process_memory_enforcer._propagate_memory_limit()
+
             logger.info(
                 f"Loaded model: {model_id} "
                 f"(estimated: {format_size(entry.estimated_size)}, "

@@ -164,6 +164,77 @@ class TestCheckAndEnforce:
         # Should not raise, just log warning
 
 
+class TestMemoryLimitPropagation:
+    """Tests for _memory_limit_bytes propagation to schedulers."""
+
+    def test_propagate_memory_limit(self, enforcer):
+        """Propagates memory limit to scheduler and batch_generator."""
+        bg = MagicMock(spec=[])
+        bg._memory_limit_bytes = 0
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_limit_bytes = 0
+        scheduler.batch_generator = bg
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        enforcer._engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_limit_bytes == 10 * 1024**3
+        assert bg._memory_limit_bytes == 10 * 1024**3
+
+    def test_propagates_on_max_bytes_change(self, enforcer):
+        """Propagates updated limit when max_bytes is changed at runtime."""
+        bg = MagicMock(spec=[])
+        bg._memory_limit_bytes = 0
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_limit_bytes = 0
+        scheduler.batch_generator = bg
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        enforcer._engine_pool._entries = {"model-a": entry}
+
+        enforcer._running = True
+        enforcer.max_bytes = 20 * 1024**3
+
+        assert scheduler._memory_limit_bytes == 20 * 1024**3
+        assert bg._memory_limit_bytes == 20 * 1024**3
+
+    def test_skips_engine_without_scheduler(self, enforcer):
+        """Gracefully skips engines without scheduler attribute."""
+        engine = MagicMock(spec=[])
+        # No scheduler attribute (spec=[] prevents auto-creation)
+        entry = _make_entry("model-a", engine=engine)
+        enforcer._engine_pool._entries = {"model-a": entry}
+
+        # Should not raise
+        enforcer._propagate_memory_limit()
+
+    def test_propagates_to_multiple_engines(self, enforcer):
+        """Propagates to all engines."""
+        schedulers = []
+        entries = {}
+        for i in range(3):
+            bg = MagicMock(spec=[])
+            bg._memory_limit_bytes = 0
+            scheduler = MagicMock(spec=[])
+            scheduler._memory_limit_bytes = 0
+            scheduler.batch_generator = bg
+            schedulers.append(scheduler)
+            engine = MagicMock(spec=[])
+            engine.scheduler = scheduler
+            entry = _make_entry(f"model-{i}", engine=engine)
+            entries[f"model-{i}"] = entry
+        enforcer._engine_pool._entries = entries
+
+        enforcer._propagate_memory_limit()
+
+        for scheduler in schedulers:
+            assert scheduler._memory_limit_bytes == 10 * 1024**3
+
+
 class TestProperties:
     """Tests for enforcer properties."""
 
