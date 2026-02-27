@@ -671,7 +671,11 @@ class BlockAwarePrefixCache(CacheManager):
 
                 if handler.supports_block_slicing:
                     # Standard 4D KV cache slicing
-                    keys, values = layer_state['state']
+                    state = layer_state['state']
+                    if not isinstance(state, (list, tuple)) or len(state) < 2:
+                        # Placeholder from boundary snapshot (skipped sliceable layer).
+                        continue
+                    keys, values = state
 
                     # KV cache shape: (batch, n_kv_heads, seq_len, head_dim)
                     # Slice along seq_len dimension (axis 2)

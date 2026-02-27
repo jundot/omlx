@@ -683,8 +683,13 @@ class TestSchedulerBoundarySnapshots:
 
         mock_batch = MagicMock()
         mock_batch.uids = [123]
-        snapshot_cache = [MagicMock()]
-        mock_batch.extract_cache.return_value = snapshot_cache
+        # Create a non-sliceable batch cache layer (e.g. ArraysCache)
+        # so the snapshot capture extracts it instead of replacing with None.
+        mock_layer_cache = MagicMock()
+        type(mock_layer_cache).__name__ = "BatchArraysCache"
+        extracted_cache = MagicMock()
+        mock_layer_cache.extract.return_value = extracted_cache
+        mock_batch.cache = [mock_layer_cache]
 
         scheduler.batch_generator = MagicMock()
         scheduler.batch_generator.active_batch = mock_batch
@@ -701,8 +706,9 @@ class TestSchedulerBoundarySnapshots:
         scheduler._maybe_capture_boundary_snapshot(request, 123)
 
         assert 4 in scheduler._boundary_cache_snapshots["req-boundary"]
-        assert scheduler._boundary_cache_snapshots["req-boundary"][4] == snapshot_cache
-        mock_batch.extract_cache.assert_called_once_with(0)
+        snapshot = scheduler._boundary_cache_snapshots["req-boundary"][4]
+        assert snapshot == [extracted_cache]
+        mock_layer_cache.extract.assert_called_once_with(0)
 
     def test_cleanup_finished_uses_boundary_snapshot_for_partial_trailing_tokens(
         self, mock_model, mock_tokenizer

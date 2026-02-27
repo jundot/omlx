@@ -41,11 +41,13 @@ from .exceptions import is_cache_corruption_error
 # Import tiered cache components
 try:
     from .cache.paged_ssd_cache import PagedSSDCacheManager
+    from .cache.boundary_snapshot_store import BoundarySnapshotSSDStore
     from .memory_monitor import MemoryMonitor
 
     HAS_TIERED_CACHE = True
 except ImportError:
     PagedSSDCacheManager = None
+    BoundarySnapshotSSDStore = None
     MemoryMonitor = None
     HAS_TIERED_CACHE = False
 
@@ -241,7 +243,17 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                 continue
 
             try:
-                snapshot_cache = [c.extract(idx) for c in prompt_cache]
+                # Only extract non-sliceable layers (e.g. ArraysCache).
+                # Sliceable layers (KVCache) can be reconstructed from the
+                # final cache via block slicing, so we skip their costly
+                # mx.contiguous() deep-copy to avoid O(n^2) memory growth
+                # during long prefills.
+                snapshot_cache = [
+                    c.extract(idx)
+                    if type(c).__name__ not in self._KNOWN_SLICEABLE
+                    else None
+                    for c in prompt_cache
+                ]
                 self._prefill_boundary_callback(uid, snapshot_cache, total_tokens)
                 emitted[uid] = total_tokens
             except Exception as e:
@@ -490,6 +502,46 @@ class SchedulerOutput:
     has_work: bool = False
 
 
+class _BoundarySnapshotProvider:
+    """Dict-like lazy loader for boundary snapshots.
+
+    Used by ``store_cache()`` to load snapshots from SSD one block at a time
+    instead of extracting all intermediate snapshots into memory at once.
+    Implements ``__bool__``, ``__contains__``, and ``__getitem__`` to be a
+    drop-in replacement for ``Dict[int, List[Dict[str, Any]]]``.
+    """
+
+    def __init__(
+        self,
+        store: Any,  # Optional[BoundarySnapshotSSDStore]
+        request_id: str,
+        valid_tcs: List[int],
+        in_memory_snapshots: Dict[int, Any],
+        extract_fn: Any,  # Callable — Scheduler._extract_cache_states
+    ) -> None:
+        self._store = store
+        self._request_id = request_id
+        self._valid_tcs = set(valid_tcs)
+        self._in_memory = in_memory_snapshots
+        self._extract_fn = extract_fn
+
+    def __contains__(self, tc: int) -> bool:
+        return tc in self._valid_tcs
+
+    def __getitem__(self, tc: int) -> Any:
+        snap = self._in_memory.get(tc)
+        if snap is not None:
+            # In-memory fallback (SSD write failed).
+            extracted, _ = self._extract_fn(snap)
+            return extracted
+        if self._store is not None:
+            return self._store.load(self._request_id, tc)
+        return None
+
+    def __bool__(self) -> bool:
+        return bool(self._valid_tcs)
+
+
 class Scheduler:
     """
     Scheduler for continuous batching using mlx-lm BatchGenerator.
@@ -547,11 +599,14 @@ class Scheduler:
         self.batch_generator: Optional[BatchGenerator] = None
         self._current_sampler_params: Optional[Tuple] = None
         # Boundary cache snapshots for stateful non-sliceable caches (e.g., ArraysCache).
-        # request_id -> {token_count -> snapshot_cache}
+        # request_id -> {token_count -> snapshot_cache_or_None}
         # Multiple snapshots per request to support per-block ArraysCache state storage.
-        self._boundary_cache_snapshots: Dict[str, Dict[int, List[Any]]] = {}
+        # Values are None when offloaded to SSD via _boundary_snapshot_store.
+        self._boundary_cache_snapshots: Dict[str, Dict[int, Any]] = {}
         # Lazy detection flag: True/False once determined, None before first check.
         self._boundary_snapshot_required: Optional[bool] = None
+        # SSD store for offloading boundary snapshots (initialized in _init_tiered_cache).
+        self._boundary_snapshot_store: Optional["BoundarySnapshotSSDStore"] = None
 
         # paged SSD cache for KV state persistence (oMLX only supports paged SSD-based caching)
         self.paged_cache_manager: Optional[PagedCacheManager] = None
@@ -1066,7 +1121,21 @@ class Scheduler:
         if token_count in self._boundary_cache_snapshots[request_id]:
             return
 
-        self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
+        # Offload snapshot to SSD if store is available, keeping only a
+        # None marker in the dict.  Falls back to in-memory storage when
+        # the SSD store is unavailable or the write fails.
+        if self._boundary_snapshot_store is not None:
+            saved = self._boundary_snapshot_store.save(
+                request_id, token_count, snapshot_cache,
+                self._extract_cache_states,
+            )
+            if saved:
+                self._boundary_cache_snapshots[request_id][token_count] = None
+            else:
+                self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
+        else:
+            self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
+
         self._boundary_snapshot_required = True
         logger.debug(
             "Captured prefill boundary cache snapshot for %s at %s tokens",
@@ -1136,7 +1205,15 @@ class Scheduler:
             # and later evaluating those views on a different stream can still
             # trigger Metal command buffer races.
             with mx.stream(generation_stream):
-                return batch.extract_cache(idx)
+                # Only extract non-sliceable layers to avoid costly
+                # deep-copy accumulation (same rationale as prefill path).
+                known = _BoundarySnapshotBatchGenerator._KNOWN_SLICEABLE
+                return [
+                    c.extract(idx)
+                    if type(c).__name__ not in known
+                    else None
+                    for c in batch.cache
+                ]
         except Exception as e:
             logger.debug(f"Failed to extract boundary cache snapshot for uid={uid}: {e}")
             return None
@@ -1163,7 +1240,20 @@ class Scheduler:
 
         if request.request_id not in self._boundary_cache_snapshots:
             self._boundary_cache_snapshots[request.request_id] = {}
-        self._boundary_cache_snapshots[request.request_id][total_tokens] = snapshot_cache
+
+        # Offload to SSD with in-memory fallback.
+        if self._boundary_snapshot_store is not None:
+            saved = self._boundary_snapshot_store.save(
+                request.request_id, total_tokens, snapshot_cache,
+                self._extract_cache_states,
+            )
+            if saved:
+                self._boundary_cache_snapshots[request.request_id][total_tokens] = None
+            else:
+                self._boundary_cache_snapshots[request.request_id][total_tokens] = snapshot_cache
+        else:
+            self._boundary_cache_snapshots[request.request_id][total_tokens] = snapshot_cache
+
         logger.debug(
             f"Captured boundary cache snapshot for {request.request_id} at "
             f"{total_tokens} tokens"
@@ -1210,20 +1300,40 @@ class Scheduler:
         else:
             return None
 
+        # Load latest snapshot — may be on SSD (None marker) or in memory.
         latest_snapshot = snapshots[latest_tc]
-        extracted_cache, model_cache_config = self._extract_cache_states(latest_snapshot)
-        if not extracted_cache:
+        if latest_snapshot is None and self._boundary_snapshot_store is not None:
+            # Offloaded to SSD — load back.
+            extracted_cache = self._boundary_snapshot_store.load(
+                request_id, latest_tc
+            )
+            if not extracted_cache:
+                return None
+            # Build model_cache_config from the main request cache config
+            # since the SSD snapshot doesn't carry it.
+            model_cache_config = getattr(
+                self.requests.get(request_id), "_model_cache_config", None
+            )
+        elif latest_snapshot is not None:
+            extracted_cache, model_cache_config = self._extract_cache_states(
+                latest_snapshot
+            )
+            if not extracted_cache:
+                return None
+        else:
             return None
 
-        # Extract intermediate snapshots for per-block ArraysCache state
-        intermediate_snapshots: Dict[int, List[Dict[str, Any]]] = {}
-        for tc in valid_counts:
-            if tc == latest_tc:
-                continue  # Skip the latest (it's already in extracted_cache)
-            snap_cache = snapshots[tc]
-            snap_extracted, _ = self._extract_cache_states(snap_cache)
-            if snap_extracted:
-                intermediate_snapshots[tc] = snap_extracted
+        # Build lazy-loading provider for intermediate snapshots.
+        # Each snapshot is loaded from SSD one-at-a-time during
+        # store_cache() instead of extracting all at once.
+        intermediate_tcs = [tc for tc in valid_counts if tc != latest_tc]
+        intermediate_snapshots = _BoundarySnapshotProvider(
+            store=self._boundary_snapshot_store,
+            request_id=request_id,
+            valid_tcs=intermediate_tcs,
+            in_memory_snapshots=snapshots,
+            extract_fn=self._extract_cache_states,
+        )
 
         token_sequence = full_token_sequence[:latest_tc] if latest_tc < total_tokens else full_token_sequence
 
@@ -1233,6 +1343,32 @@ class Scheduler:
             model_cache_config,
             intermediate_snapshots,
         )
+
+    @staticmethod
+    def _merge_boundary_with_full_cache(
+        boundary_cache: List[Dict[str, Any]],
+        full_cache: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Fill placeholder layers in boundary cache from full extracted cache.
+
+        Boundary snapshots skip sliceable (KVCache) layers to save memory,
+        leaving them as ``{'state': (), ...}`` placeholders.  For block
+        storage the KV tensors are needed, so we copy them from the full
+        extracted cache (which contains the complete sequence).
+        """
+        if not full_cache or len(boundary_cache) != len(full_cache):
+            return boundary_cache
+
+        merged = []
+        for bc, fc in zip(boundary_cache, full_cache):
+            state = bc.get("state", ())
+            # Placeholder layers have state == () (empty tuple).
+            if isinstance(state, tuple) and len(state) == 0:
+                # Take full cache layer instead.
+                merged.append(fc)
+            else:
+                merged.append(bc)
+        return merged
 
     def _validate_cache(self, cache: Any) -> bool:
         """
@@ -1409,9 +1545,13 @@ class Scheduler:
         if not raw_cache:
             return [], None
 
-        # Build ModelCacheConfig for type information
+        # Build ModelCacheConfig for type information.
+        # Skip if raw_cache contains None entries (boundary snapshots with
+        # sliceable layers replaced by None) — from_cache_list expects real
+        # cache objects and would log noisy NoneType warnings.
         model_cache_config = None
-        if HAS_CACHE_TYPE_HANDLERS and ModelCacheConfig is not None:
+        has_none_layers = any(c is None for c in raw_cache)
+        if HAS_CACHE_TYPE_HANDLERS and ModelCacheConfig is not None and not has_none_layers:
             try:
                 model_cache_config = ModelCacheConfig.from_cache_list(
                     raw_cache, model_name=self.model_name if hasattr(self, 'model_name') else ""
@@ -1421,6 +1561,17 @@ class Scheduler:
 
         extracted = []
         for layer_idx, layer_cache in enumerate(raw_cache):
+            # Boundary snapshots may contain None for sliceable layers
+            # (KVCache) that were skipped during capture to save memory.
+            # Insert a placeholder to preserve layer index alignment.
+            if layer_cache is None:
+                extracted.append({
+                    'state': (),
+                    'meta_state': (),
+                    'class_name': 'KVCache',
+                    'cache_type': 'KVCache',
+                })
+                continue
             try:
                 class_name = type(layer_cache).__name__
 
@@ -1802,6 +1953,8 @@ class Scheduler:
 
         # Drop any boundary snapshot for this request.
         self._boundary_cache_snapshots.pop(request_id, None)
+        if self._boundary_snapshot_store is not None:
+            self._boundary_snapshot_store.cleanup_request(request_id)
 
         # Mark as aborted
         request.set_finished(RequestStatus.FINISHED_ABORTED)
@@ -2206,10 +2359,20 @@ class Scheduler:
                                 if boundary_override is not None:
                                     (
                                         token_sequence_to_store,
-                                        cache_to_store,
+                                        boundary_cache,
                                         boundary_model_config,
                                         intermediate_snapshots,
                                     ) = boundary_override
+
+                                    # Merge boundary snapshot with full extracted cache:
+                                    # KVCache layers in the snapshot are placeholders
+                                    # (empty state) when snapshots skip sliceable layers.
+                                    # Fill them from the full extracted cache so that
+                                    # _extract_block_tensor_slice can slice KV data.
+                                    cache_to_store = self._merge_boundary_with_full_cache(
+                                        boundary_cache, request._extracted_cache
+                                    )
+
                                     if boundary_model_config is not None:
                                         model_cache_config = boundary_model_config
                                     logger.info(
@@ -2282,6 +2445,8 @@ class Scheduler:
 
             # Drop any boundary snapshot for this request.
             self._boundary_cache_snapshots.pop(request_id, None)
+            if self._boundary_snapshot_store is not None:
+                self._boundary_snapshot_store.cleanup_request(request_id)
 
             # Track as finished
             self.finished_req_ids.add(request_id)
@@ -2307,6 +2472,8 @@ class Scheduler:
         self.batch_generator = None
         self._current_sampler_params = None
         self._boundary_cache_snapshots.clear()
+        if self._boundary_snapshot_store is not None:
+            self._boundary_snapshot_store.cleanup_all()
         self._boundary_snapshot_required = None
 
         # Clear caches
@@ -2480,6 +2647,8 @@ class Scheduler:
         self.batch_generator = None
         self._current_sampler_params = None
         self._boundary_cache_snapshots.clear()
+        if self._boundary_snapshot_store is not None:
+            self._boundary_snapshot_store.cleanup_all()
         self._boundary_snapshot_required = None
 
         # Clear caches
@@ -2628,6 +2797,18 @@ class Scheduler:
             # Connect paged SSD cache manager to BlockAwarePrefixCache for paged SSD-only mode
             if self.block_aware_cache is not None:
                 self.block_aware_cache.set_paged_ssd_cache_manager(self.paged_ssd_cache_manager)
+
+            # Initialize boundary snapshot SSD store for offloading
+            # non-sliceable cache snapshots during prefill.
+            if BoundarySnapshotSSDStore is not None:
+                try:
+                    self._boundary_snapshot_store = BoundarySnapshotSSDStore(
+                        base_dir=Path(self.config.paged_ssd_cache_dir)
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "Failed to initialize boundary snapshot SSD store: %s", e
+                    )
 
             logger.info(
                 f"paged SSD cache enabled: "
