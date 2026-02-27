@@ -700,8 +700,8 @@ class TestSchedulerBoundarySnapshots:
 
         scheduler._maybe_capture_boundary_snapshot(request, 123)
 
-        assert scheduler._boundary_cache_snapshots["req-boundary"][0] == snapshot_cache
-        assert scheduler._boundary_cache_snapshots["req-boundary"][1] == 4
+        assert 4 in scheduler._boundary_cache_snapshots["req-boundary"]
+        assert scheduler._boundary_cache_snapshots["req-boundary"][4] == snapshot_cache
         mock_batch.extract_cache.assert_called_once_with(0)
 
     def test_cleanup_finished_uses_boundary_snapshot_for_partial_trailing_tokens(
@@ -726,7 +726,7 @@ class TestSchedulerBoundarySnapshots:
 
         scheduler.running["req-partial"] = request
         scheduler.requests["req-partial"] = request
-        scheduler._boundary_cache_snapshots["req-partial"] = ([MagicMock()], 4)
+        scheduler._boundary_cache_snapshots["req-partial"] = {4: [MagicMock()]}
 
         snapshot_extracted = [{"state": "boundary-cache"}]
         with patch.object(
@@ -835,8 +835,8 @@ class TestSchedulerBoundarySnapshots:
 
         scheduler._on_prefill_boundary_snapshot(uid, snapshot_cache, 4)
 
-        assert scheduler._boundary_cache_snapshots[request.request_id][0] == snapshot_cache
-        assert scheduler._boundary_cache_snapshots[request.request_id][1] == 4
+        assert 4 in scheduler._boundary_cache_snapshots[request.request_id]
+        assert scheduler._boundary_cache_snapshots[request.request_id][4] == snapshot_cache
         assert scheduler._boundary_snapshot_required is True
 
     def test_prefill_boundary_snapshot_ignores_non_boundary_token_count(

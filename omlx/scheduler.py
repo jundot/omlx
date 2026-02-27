@@ -167,12 +167,14 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         base_sizes: List[int],
         max_allowed: int,
         target_boundaries: List[Optional[int]],
+        all_boundaries: bool = False,
     ) -> int:
         n_to_process = min(self.prefill_step_size, max_allowed)
         if n_to_process <= 1:
             return max(1, n_to_process)
 
         next_delta: Optional[int] = None
+        block_size = self._boundary_block_size
 
         for length, base, target_boundary in zip(lengths, base_sizes, target_boundaries):
             if target_boundary is None:
@@ -187,8 +189,17 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             if current_total >= target_boundary:
                 continue
 
-            target_prefill = target_boundary - base
-            delta = target_prefill - processed_tokens
+            if all_boundaries and block_size > 0:
+                # Stop at the NEXT block boundary (not just the final target).
+                # This ensures boundary snapshots are captured at every block
+                # boundary for hybrid models (ArraysCache + KVCache).
+                next_boundary = ((current_total // block_size) + 1) * block_size
+                next_boundary = min(next_boundary, target_boundary)
+                delta = (next_boundary - base) - processed_tokens
+            else:
+                target_prefill = target_boundary - base
+                delta = target_prefill - processed_tokens
+
             if delta <= 0:
                 continue
 
@@ -252,18 +263,28 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         boundary_enabled = self._boundary_capture_enabled()
         base_sizes = self._cache_base_sizes(caches) if boundary_enabled else []
         target_boundaries: List[Optional[int]] = []
+        # all_boundaries mode: stop at EVERY block boundary (not just last)
+        # for hybrid models with non-sliceable caches (ArraysCache).
+        # Determined after cache is created and checked.
+        all_boundaries = False
         if boundary_enabled:
             block_size = self._boundary_block_size
             for length, base in zip(lengths, base_sizes):
                 full_total = base + max(length, 0)
-                if full_total <= 0 or full_total % block_size == 0:
+                if full_total <= 0:
                     target_boundaries.append(None)
                     continue
 
-                # Capture only the last full boundary below the full prompt
-                # length. This avoids splitting prefill at every boundary.
+                # Compute the last full boundary below the full prompt length.
                 target_boundary = (full_total // block_size) * block_size
-                target_boundaries.append(target_boundary if target_boundary > base else None)
+                if target_boundary <= base:
+                    target_boundaries.append(None)
+                elif full_total % block_size == 0:
+                    # Prompt lands exactly on boundary. Still need a target
+                    # for all_boundaries mode to stop at intermediate ones.
+                    target_boundaries.append(target_boundary)
+                else:
+                    target_boundaries.append(target_boundary)
 
         emitted_boundaries: Dict[int, int] = {uid: -1 for uid in uids}
 
@@ -279,6 +300,10 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             # step-size limiting and expensive cache extraction.
             if boundary_enabled and not self._prompt_cache_needs_snapshots(prompt_cache):
                 boundary_enabled = False
+            elif boundary_enabled:
+                # Hybrid model: stop at every block boundary to capture
+                # per-block ArraysCache snapshots.
+                all_boundaries = True
 
             while inputs.shape[1] > 1:
                 max_allowed = inputs.shape[1] - 1
@@ -289,6 +314,7 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                         base_sizes,
                         max_allowed,
                         target_boundaries,
+                        all_boundaries=all_boundaries,
                     )
                 else:
                     n_to_process = min(self.prefill_step_size, max_allowed)
@@ -326,6 +352,9 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             # Disable boundary capture for sliceable-only caches.
             if boundary_enabled and not self._prompt_cache_needs_snapshots(prompt_cache):
                 boundary_enabled = False
+            elif boundary_enabled:
+                # Hybrid model: stop at every block boundary.
+                all_boundaries = True
 
             for c in prompt_cache:
                 # subtract one from lengths since we don't process the last token during prefill
@@ -340,6 +369,7 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                         base_sizes,
                         max_allowed,
                         target_boundaries,
+                        all_boundaries=all_boundaries,
                     )
                 else:
                     n_to_process = min(self.prefill_step_size, max_allowed)
@@ -495,6 +525,9 @@ class Scheduler:
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
         self._align_block_size_with_rotating_window()
+        # For ArraysCache-only models (no RotatingKVCache), use a larger block
+        # size to reduce boundary snapshot overhead during prefill.
+        self._enlarge_block_size_for_arrays_cache()
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -514,8 +547,9 @@ class Scheduler:
         self.batch_generator: Optional[BatchGenerator] = None
         self._current_sampler_params: Optional[Tuple] = None
         # Boundary cache snapshots for stateful non-sliceable caches (e.g., ArraysCache).
-        # request_id -> (snapshot_cache, token_count_at_snapshot)
-        self._boundary_cache_snapshots: Dict[str, Tuple[List[Any], int]] = {}
+        # request_id -> {token_count -> snapshot_cache}
+        # Multiple snapshots per request to support per-block ArraysCache state storage.
+        self._boundary_cache_snapshots: Dict[str, Dict[int, List[Any]]] = {}
         # Lazy detection flag: True/False once determined, None before first check.
         self._boundary_snapshot_required: Optional[bool] = None
 
@@ -704,6 +738,67 @@ class Scheduler:
                 target_block_size,
             )
             self.config.paged_cache_block_size = target_block_size
+
+    # Default block size for ArraysCache-only hybrid models.
+    _ARRAYS_CACHE_BLOCK_SIZE = 1024
+
+    def _enlarge_block_size_for_arrays_cache(self) -> None:
+        """Enlarge block size for ArraysCache-only hybrid models.
+
+        When a model uses ArraysCache (GatedDeltaNet) but not RotatingKVCache,
+        a larger block size reduces the number of boundary snapshot stops during
+        prefill while still storing valid per-block recurrent state.
+
+        This is skipped if RotatingKVCache was already detected (block size was
+        aligned to its window size) or if the user explicitly set a block size
+        larger than the default.
+        """
+        if not self.config.paged_ssd_cache_dir:
+            return
+
+        # Skip if RotatingKVCache already adjusted block size.
+        rotating_sizes = self._detect_rotating_window_sizes()
+        if rotating_sizes:
+            return
+
+        # Detect ArraysCache from model.make_cache()
+        if not hasattr(self.model, "make_cache"):
+            return
+
+        try:
+            cache_list = self.model.make_cache()
+        except Exception:
+            return
+
+        has_arrays_cache = any(
+            self._cache_tree_has_arrays_cache(cache_obj)
+            for cache_obj in cache_list
+        )
+        if not has_arrays_cache:
+            return
+
+        target = self._ARRAYS_CACHE_BLOCK_SIZE
+        if self.config.paged_cache_block_size >= target:
+            return
+
+        logger.info(
+            "Enlarging paged cache block_size=%s to %s for "
+            "ArraysCache hybrid model (reduces boundary snapshot overhead)",
+            self.config.paged_cache_block_size,
+            target,
+        )
+        self.config.paged_cache_block_size = target
+
+    @staticmethod
+    def _cache_tree_has_arrays_cache(cache_obj: Any) -> bool:
+        """Return True if cache_obj contains ArraysCache (recursively)."""
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)):
+            return any(
+                Scheduler._cache_tree_has_arrays_cache(sub)
+                for sub in sub_caches
+            )
+        return type(cache_obj).__name__ in ("ArraysCache", "SizedArraysCache")
 
     def _get_stop_tokens(self) -> Set[int]:
         """Get stop token IDs from tokenizer."""
@@ -964,11 +1059,14 @@ class Scheduler:
         if not self._cache_list_needs_boundary_snapshot(snapshot_cache):
             return
 
-        prev_snapshot = self._boundary_cache_snapshots.get(request_id)
-        if prev_snapshot is not None and prev_snapshot[1] >= token_count:
+        if request_id not in self._boundary_cache_snapshots:
+            self._boundary_cache_snapshots[request_id] = {}
+
+        # Skip if we already have a snapshot at this token count
+        if token_count in self._boundary_cache_snapshots[request_id]:
             return
 
-        self._boundary_cache_snapshots[request_id] = (snapshot_cache, token_count)
+        self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
         self._boundary_snapshot_required = True
         logger.debug(
             "Captured prefill boundary cache snapshot for %s at %s tokens",
@@ -1063,10 +1161,9 @@ class Scheduler:
         if not snapshot_cache:
             return
 
-        self._boundary_cache_snapshots[request.request_id] = (
-            snapshot_cache,
-            total_tokens,
-        )
+        if request.request_id not in self._boundary_cache_snapshots:
+            self._boundary_cache_snapshots[request.request_id] = {}
+        self._boundary_cache_snapshots[request.request_id][total_tokens] = snapshot_cache
         logger.debug(
             f"Captured boundary cache snapshot for {request.request_id} at "
             f"{total_tokens} tokens"
@@ -1076,32 +1173,65 @@ class Scheduler:
         self,
         request_id: str,
         full_token_sequence: List[int],
-    ) -> Optional[Tuple[List[int], List[Dict[str, Any]], Optional["ModelCacheConfig"]]]:
+    ) -> Optional[Tuple[List[int], List[Dict[str, Any]], Optional["ModelCacheConfig"], Dict[int, List[Dict[str, Any]]]]]:
         """
         Return boundary-aligned cache payload when final request ends on partial block.
+
+        Returns:
+            Tuple of (truncated_tokens, extracted_cache, model_cache_config,
+            intermediate_snapshots) where intermediate_snapshots maps
+            token_count -> extracted cache states for per-block storage.
         """
-        snapshot = self._boundary_cache_snapshots.get(request_id)
-        if not snapshot:
+        snapshots = self._boundary_cache_snapshots.get(request_id)
+        if not snapshots:
             return None
 
-        snapshot_cache, snapshot_token_count = snapshot
         total_tokens = len(full_token_sequence)
         block_size = self.config.paged_cache_block_size
 
-        # Only apply when final sequence has trailing partial tokens.
-        if snapshot_token_count <= 0 or snapshot_token_count >= total_tokens:
-            return None
-        if snapshot_token_count % block_size != 0:
+        # Find all valid boundary-aligned snapshot token counts
+        valid_counts = sorted(
+            tc for tc in snapshots.keys()
+            if 0 < tc <= total_tokens and tc % block_size == 0
+        )
+        if not valid_counts:
             return None
 
-        extracted_cache, model_cache_config = self._extract_cache_states(snapshot_cache)
+        # Find the latest snapshot that leaves trailing partial tokens
+        # (or equals total if it's block-aligned).
+        latest_tc = valid_counts[-1]
+        if latest_tc < total_tokens:
+            # Trailing partial tokens exist — use this snapshot for truncation
+            pass
+        elif latest_tc == total_tokens and total_tokens % block_size == 0:
+            # Exactly block-aligned — no truncation needed but we still
+            # provide intermediate snapshots for per-block storage.
+            latest_tc = total_tokens
+        else:
+            return None
+
+        latest_snapshot = snapshots[latest_tc]
+        extracted_cache, model_cache_config = self._extract_cache_states(latest_snapshot)
         if not extracted_cache:
             return None
 
+        # Extract intermediate snapshots for per-block ArraysCache state
+        intermediate_snapshots: Dict[int, List[Dict[str, Any]]] = {}
+        for tc in valid_counts:
+            if tc == latest_tc:
+                continue  # Skip the latest (it's already in extracted_cache)
+            snap_cache = snapshots[tc]
+            snap_extracted, _ = self._extract_cache_states(snap_cache)
+            if snap_extracted:
+                intermediate_snapshots[tc] = snap_extracted
+
+        token_sequence = full_token_sequence[:latest_tc] if latest_tc < total_tokens else full_token_sequence
+
         return (
-            full_token_sequence[:snapshot_token_count],
+            token_sequence,
             extracted_cache,
             model_cache_config,
+            intermediate_snapshots,
         )
 
     def _validate_cache(self, cache: Any) -> bool:
@@ -2072,11 +2202,13 @@ class Scheduler:
                                     request_id,
                                     full_token_sequence,
                                 )
+                                intermediate_snapshots = None
                                 if boundary_override is not None:
                                     (
                                         token_sequence_to_store,
                                         cache_to_store,
                                         boundary_model_config,
+                                        intermediate_snapshots,
                                     ) = boundary_override
                                     if boundary_model_config is not None:
                                         model_cache_config = boundary_model_config
@@ -2084,7 +2216,9 @@ class Scheduler:
                                         f"Using boundary cache snapshot for {request_id}: "
                                         f"storing {len(token_sequence_to_store)}/"
                                         f"{len(full_token_sequence)} tokens "
-                                        f"(skipping trailing partial block)"
+                                        f"(skipping trailing partial block, "
+                                        f"{len(intermediate_snapshots) if intermediate_snapshots else 0} "
+                                        f"intermediate snapshots)"
                                     )
 
                                 block_table = self.block_aware_cache.store_cache(
@@ -2092,6 +2226,7 @@ class Scheduler:
                                     token_sequence_to_store,
                                     cache_to_store,
                                     model_cache_config=model_cache_config,
+                                    boundary_snapshots=intermediate_snapshots,
                                 )
                             logger.debug(
                                 f"Stored paged cache for request {request_id} "

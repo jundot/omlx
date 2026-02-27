@@ -286,6 +286,7 @@ class BlockAwarePrefixCache(CacheManager):
         tokens: List[int],
         cache_data: List[Any],
         model_cache_config: Optional[ModelCacheConfig] = None,
+        boundary_snapshots: Optional[Dict[int, List[Any]]] = None,
     ) -> Optional[BlockTable]:
         """
         Store computed cache for future reuse.
@@ -303,6 +304,9 @@ class BlockAwarePrefixCache(CacheManager):
                 - List of dicts with 'state': (keys, values) tensors (preferred)
             model_cache_config: Optional cache configuration with per-layer type
                 information. If None, assumes all layers use KVCache.
+            boundary_snapshots: Optional mapping of token_count -> extracted cache
+                states for intermediate block boundaries. Used to store per-block
+                ArraysCache state instead of placeholders in hybrid models.
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -450,9 +454,19 @@ class BlockAwarePrefixCache(CacheManager):
                     break
 
                 is_last_block = (i == num_new_blocks - 1)
+
+                # Look up intermediate snapshot for this block's boundary.
+                # The snapshot provides per-block ArraysCache state captured
+                # at exactly this boundary during prefill.
+                block_boundary_tc = existing_tokens + end_idx
+                snapshot_cache_data = None
+                if boundary_snapshots and block_boundary_tc in boundary_snapshots:
+                    snapshot_cache_data = boundary_snapshots[block_boundary_tc]
+
                 block_kv_data = self._extract_block_tensor_slice(
                     cache_data, cache_start, cache_end, model_cache_config,
                     is_last_block=is_last_block,
+                    snapshot_cache_data=snapshot_cache_data,
                 )
 
                 if block_kv_data and block.block_hash:
@@ -603,6 +617,7 @@ class BlockAwarePrefixCache(CacheManager):
         end_idx: int,
         model_cache_config: Optional[ModelCacheConfig] = None,
         is_last_block: bool = False,
+        snapshot_cache_data: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[List[Tuple[Any, Any]]]:
         """
         Extract tensor slices for a single block from cache data.
@@ -615,6 +630,8 @@ class BlockAwarePrefixCache(CacheManager):
         - Last block: stores the full RotatingKVCache state (keys, values)
         - Non-last blocks: stores a placeholder (mx.zeros((1,)), mx.zeros((1,)))
           to preserve layer count while minimizing storage
+        - Boundary snapshot: if a snapshot was captured at this block's boundary,
+          the snapshot state is used instead of a placeholder
 
         During restore, a partial prefix match that ends on a placeholder block
         first attempts walk-back truncation to the latest block with valid
@@ -629,6 +646,9 @@ class BlockAwarePrefixCache(CacheManager):
                 type information
             is_last_block: If True, this is the last block being stored. For
                 RotatingKVCache layers, only the last block stores full state.
+            snapshot_cache_data: Optional boundary snapshot cache data for this
+                block. When provided, non-sliceable layers use the snapshot state
+                instead of a placeholder.
 
         Returns:
             List of (keys_slice, values_slice) for each layer, or None on failure
@@ -689,10 +709,21 @@ class BlockAwarePrefixCache(CacheManager):
                         (self._clone_tensor(keys_slice), self._clone_tensor(values_slice))
                     )
                 elif cache_type_name == 'RotatingKVCache':
-                    # RotatingKVCache: last-block-only storage strategy
-                    if is_last_block:
-                        # Last block: store full RotatingKVCache state
-                        state = layer_state['state']
+                    # RotatingKVCache: last-block-only or boundary-snapshot strategy
+                    has_valid_state = is_last_block or (
+                        snapshot_cache_data is not None
+                        and layer_idx < len(snapshot_cache_data)
+                    )
+                    if has_valid_state:
+                        # Use snapshot state if available, otherwise use main state
+                        if (
+                            snapshot_cache_data is not None
+                            and layer_idx < len(snapshot_cache_data)
+                            and 'state' in snapshot_cache_data[layer_idx]
+                        ):
+                            state = snapshot_cache_data[layer_idx]['state']
+                        else:
+                            state = layer_state['state']
                         if isinstance(state, (list, tuple)) and len(state) >= 2:
                             keys = state[0]
                             values = state[1]
@@ -705,7 +736,7 @@ class BlockAwarePrefixCache(CacheManager):
                             )
                             block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                     else:
-                        # Non-last block: store placeholder to preserve layer count
+                        # Non-last block without snapshot: store placeholder
                         block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                 elif cache_type_name == 'CacheList':
                     state = layer_state['state']  # List[sub_state]
@@ -739,30 +770,55 @@ class BlockAwarePrefixCache(CacheManager):
                                 ))
                         block_slices.append(('__cache_list__', sub_tensors))
                     else:
-                        # Non-sliceable sub-caches: last-block-only storage
-                        if is_last_block:
-                            sub_tensors = []
-                            for sub_state in state:
-                                if isinstance(sub_state, (list, tuple)) and len(sub_state) >= 2:
-                                    sub_tensors.append((
-                                        self._clone_tensor(sub_state[0]),
-                                        self._clone_tensor(sub_state[1]),
-                                    ))
-                            block_slices.append(('__cache_list__', sub_tensors))
+                        # Non-sliceable sub-caches: last-block-only or snapshot
+                        has_valid_state = is_last_block or (
+                            snapshot_cache_data is not None
+                            and layer_idx < len(snapshot_cache_data)
+                        )
+                        if has_valid_state:
+                            # Use snapshot if available
+                            if (
+                                snapshot_cache_data is not None
+                                and layer_idx < len(snapshot_cache_data)
+                                and 'state' in snapshot_cache_data[layer_idx]
+                            ):
+                                source_state = snapshot_cache_data[layer_idx]['state']
+                            else:
+                                source_state = state
+                            if isinstance(source_state, list):
+                                sub_tensors = []
+                                for sub_state in source_state:
+                                    if isinstance(sub_state, (list, tuple)) and len(sub_state) >= 2:
+                                        sub_tensors.append((
+                                            self._clone_tensor(sub_state[0]),
+                                            self._clone_tensor(sub_state[1]),
+                                        ))
+                                block_slices.append(('__cache_list__', sub_tensors))
+                            else:
+                                block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                         else:
                             block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                 else:
                     # Other non-sliceable cache (ArraysCache/MambaCache)
-                    # Last-block-only storage strategy (same as RotatingKVCache).
                     # GDN recurrent state summarizes the ENTIRE sequence in a
-                    # fixed-size matrix. Storing the same final state in every
-                    # block is both wasteful and dangerous: a partial prefix
-                    # match would restore stale state containing future token
-                    # information. Only the last block carries the valid state;
+                    # fixed-size matrix. Each block boundary snapshot captures
+                    # the state at that point in the sequence. Without a snapshot,
                     # non-last blocks get a placeholder so partial matches are
                     # detected and rejected during reconstruction.
-                    if is_last_block:
-                        state = layer_state['state']
+                    has_valid_state = is_last_block or (
+                        snapshot_cache_data is not None
+                        and layer_idx < len(snapshot_cache_data)
+                    )
+                    if has_valid_state:
+                        # Use snapshot state if available, otherwise main state
+                        if (
+                            snapshot_cache_data is not None
+                            and layer_idx < len(snapshot_cache_data)
+                            and 'state' in snapshot_cache_data[layer_idx]
+                        ):
+                            state = snapshot_cache_data[layer_idx]['state']
+                        else:
+                            state = layer_state['state']
                         if isinstance(state, (list, tuple)) and len(state) >= 2:
                             conv_state = state[0] if state[0] is not None else mx.array([])
                             ssm_state = state[1] if state[1] is not None else mx.array([])
@@ -775,7 +831,7 @@ class BlockAwarePrefixCache(CacheManager):
                             )
                             block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                     else:
-                        # Non-last block: store placeholder to preserve layer count
+                        # Non-last block without snapshot: store placeholder
                         block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
 
             return block_slices if block_slices else None
