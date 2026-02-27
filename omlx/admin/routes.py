@@ -958,6 +958,53 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     return {"models": models}
 
 
+@router.post("/api/models/rescan")
+async def rescan_models(is_admin: bool = Depends(require_admin)):
+    """Re-scan model directory and add any newly discovered models.
+
+    Unlike changing the model directory, this preserves loaded models
+    and only adds new entries for models not already known.
+    """
+    from ..settings import get_settings
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    global_settings = get_settings()
+    model_dir = (
+        global_settings.model.model_dir
+        or global_settings.model.get_model_dir(global_settings.base_path)
+    )
+
+    from ..server import _server_state
+
+    pinned_models = []
+    if _server_state.settings_manager is not None:
+        pinned_models = _server_state.settings_manager.get_pinned_model_ids()
+
+    old_count = engine_pool.model_count
+    existing_ids = set(engine_pool.get_model_ids())
+
+    engine_pool.discover_models(str(model_dir), pinned_models)
+
+    new_count = engine_pool.model_count
+    added = new_count - old_count
+    new_ids = set(engine_pool.get_model_ids()) - existing_ids
+
+    if added > 0:
+        logger.info(f"Rescan found {added} new model(s): {', '.join(sorted(new_ids))}")
+    else:
+        logger.info("Rescan complete, no new models found")
+
+    return {
+        "status": "ok",
+        "total": new_count,
+        "added": added,
+        "new_models": sorted(new_ids),
+    }
+
+
 @router.post("/api/models/{model_id}/unload")
 async def unload_model(
     model_id: str,

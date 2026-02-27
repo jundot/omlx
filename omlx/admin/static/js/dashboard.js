@@ -43,8 +43,10 @@
             // Models
             models: [],
             loadingModels: false,
-            sortBy: 'id',
-            sortOrder: 'asc',
+            rescanning: false,
+            modelSearch: '',
+            sortBy: 'last_used',
+            sortOrder: 'desc',
 
             // Auth UI state
             showApiKey: false,
@@ -388,6 +390,25 @@
                     console.error('Failed to load models:', err);
                 } finally {
                     this.loadingModels = false;
+                }
+            },
+
+            async rescanModels() {
+                this.rescanning = true;
+                try {
+                    const response = await fetch('/admin/api/models/rescan', { method: 'POST' });
+                    if (response.ok) {
+                        const data = await response.json();
+                        if (data.added > 0) {
+                            await this.loadModels();
+                        }
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (err) {
+                    console.error('Failed to rescan models:', err);
+                } finally {
+                    this.rescanning = false;
                 }
             },
 
@@ -1371,7 +1392,12 @@
 
             // Sort models
             get sortedModels() {
-                return [...this.models].sort((a, b) => {
+                let filtered = this.models;
+                if (this.modelSearch) {
+                    const q = this.modelSearch.toLowerCase();
+                    filtered = filtered.filter(m => (m.id || '').toLowerCase().includes(q));
+                }
+                return [...filtered].sort((a, b) => {
                     let aVal, bVal;
 
                     switch (this.sortBy) {
@@ -1398,6 +1424,10 @@
                         case 'is_default':
                             aVal = a.is_default ? 1 : 0;
                             bVal = b.is_default ? 1 : 0;
+                            break;
+                        case 'last_used':
+                            aVal = a.last_access || 0;
+                            bVal = b.last_access || 0;
                             break;
                         default:
                             return 0;

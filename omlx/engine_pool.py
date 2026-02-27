@@ -134,6 +134,11 @@ class EnginePool:
         pinned_set = set(pinned_models or [])
 
         for model_id, info in discovered.items():
+            if model_id in self._entries:
+                # Update pinned status but preserve engine state
+                self._entries[model_id].is_pinned = model_id in pinned_set
+                continue
+
             self._entries[model_id] = EngineEntry(
                 model_id=model_id,
                 model_path=info.model_path,
