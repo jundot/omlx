@@ -539,41 +539,6 @@ class TestPagedSSDCacheManager:
         assert manager.size == 0
         assert manager.max_size == 1024**3
 
-    def test_prefix_index_save_and_load(self, tmp_path: Path):
-        """Test saving and loading prefix index."""
-        manager = PagedSSDCacheManager(
-            cache_dir=tmp_path / "ssd_cache",
-            max_size_bytes=1024**3,
-        )
-
-        # Save prefix index
-        entries = [
-            {"block_hash": "abc123", "token_count": 64},
-            {"block_hash": "def456", "token_count": 128},
-        ]
-        result = manager.save_prefix_index(entries, model_name="test-model")
-        assert result is True
-
-        # Load prefix index
-        loaded = manager.load_prefix_index(model_name="test-model")
-        assert len(loaded) == 2
-        assert loaded[0]["block_hash"] == "abc123"
-
-    def test_prefix_index_model_mismatch(self, tmp_path: Path):
-        """Test loading prefix index with model mismatch."""
-        manager = PagedSSDCacheManager(
-            cache_dir=tmp_path / "ssd_cache",
-            max_size_bytes=1024**3,
-        )
-
-        # Save with one model
-        entries = [{"block_hash": "abc123", "token_count": 64}]
-        manager.save_prefix_index(entries, model_name="model-a")
-
-        # Load with different model
-        loaded = manager.load_prefix_index(model_name="model-b")
-        assert len(loaded) == 0  # Should be empty due to mismatch
-
     def test_close(self, tmp_path: Path):
         """Test closing the manager."""
         manager = PagedSSDCacheManager(

@@ -947,6 +947,21 @@ class PagedCacheManager(CacheManager):
 
                 # Look up in cache
                 cached_block = self.cached_block_hash_to_block.get_block(block_hash)
+
+                # Lazy restore: if not in memory but exists on SSD, register it
+                if cached_block is None and self._paged_ssd_cache_manager is not None:
+                    if self._paged_ssd_cache_manager.has_block(block_hash):
+                        block = self.free_block_queue.popleft()
+                        if block is not None:
+                            block.block_hash = block_hash
+                            block.token_count = self.block_size
+                            block.ref_count = 0
+                            self.cached_block_hash_to_block.insert(
+                                block_hash, block
+                            )
+                            self.allocated_blocks[block.block_id] = block
+                            cached_block = block
+
                 if cached_block is None:
                     self.stats.misses += 1
                     break  # Cache miss, stop here
@@ -1278,120 +1293,6 @@ class PagedCacheManager(CacheManager):
 
             logger.info("Prefix cache reset successfully")
             return True
-
-    def flush_to_paged_ssd_cache(self) -> int:
-        """
-        Flush prefix index to paged SSD cache (SSD).
-
-        In paged SSD-only mode, all cache data is already stored on paged SSD via
-        PagedSSDCacheManager. This method only saves the prefix index for
-        cache restoration on restart.
-
-        Returns:
-            Number of blocks with saved prefix index entries.
-        """
-        if self._paged_ssd_cache_manager is None:
-            logger.warning("Cannot flush: paged SSD cache manager not configured")
-            return 0
-
-        with self._lock:
-            # Save prefix index for cache restoration
-            self._save_prefix_index()
-
-            # Count blocks with block_hash (indexed blocks)
-            indexed_count = sum(
-                1 for block in self.blocks
-                if block.block_hash is not None and not block.is_null
-            )
-
-            logger.info(f"Flushed prefix index ({indexed_count} indexed blocks)")
-            return indexed_count
-
-    def _save_prefix_index(self) -> bool:
-        """
-        Save prefix index to paged SSD cache for restoration on restart.
-
-        Saves all blocks with block_hash set to paged SSD cache.
-        """
-        if self._paged_ssd_cache_manager is None:
-            return False
-
-        entries = []
-
-        # Build index from all allocated blocks with block_hash
-        for block_id, block in self.allocated_blocks.items():
-            if block.block_hash is not None and not block.is_null:
-                entries.append({
-                    "block_hash": block.block_hash.hex(),
-                    "token_count": block.token_count,
-                })
-
-        if not entries:
-            logger.debug("No prefix entries to save")
-            return True
-
-        return self._paged_ssd_cache_manager.save_prefix_index(
-            entries=entries,
-            model_name=self.model_name,
-        )
-
-    def load_cold_prefix_index(self) -> int:
-        """
-        Load prefix index from paged SSD cache and register blocks.
-
-        This enables cache hits for tokens that were saved in a previous
-        server session. Block data is loaded from paged SSD when needed for
-        inference.
-
-        Returns:
-            Number of prefix entries loaded.
-        """
-        if self._paged_ssd_cache_manager is None:
-            return 0
-
-        entries = self._paged_ssd_cache_manager.load_prefix_index(
-            model_name=self.model_name,
-        )
-
-        if not entries:
-            return 0
-
-        loaded = 0
-        with self._lock:
-            for entry in entries:
-                block_hash_hex = entry.get("block_hash")
-                token_count = entry.get("token_count", 0)
-
-                if not block_hash_hex:
-                    continue
-
-                # Check if this block exists in cold storage
-                block_hash = bytes.fromhex(block_hash_hex)
-                if not self._paged_ssd_cache_manager.has_block(block_hash):
-                    logger.debug(f"Block {block_hash_hex[:16]} not found in cold storage")
-                    continue
-
-                # Allocate a block for this entry
-                block = self.free_block_queue.popleft()
-                if block is None:
-                    logger.warning("No free blocks for paged SSD cache restoration")
-                    break
-
-                # Set block metadata (data is on paged SSD)
-                block.block_hash = block_hash
-                block.token_count = token_count
-                block.ref_count = 0  # Evictable
-
-                # Register in hash cache
-                self.cached_block_hash_to_block.insert(block_hash, block)
-                self.allocated_blocks[block.block_id] = block
-
-                loaded += 1
-
-        if loaded > 0:
-            logger.info(f"Loaded {loaded} prefix entries from paged SSD cache index")
-
-        return loaded
 
     def clear(self) -> int:
         """
