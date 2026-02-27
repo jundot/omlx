@@ -318,8 +318,12 @@ class OMLXAppDelegate(NSObject):
         elif status == ServerStatus.STARTING:
             status_text = "● oMLX Server is starting..."
             status_color = NSColor.systemOrangeColor()
+        elif status == ServerStatus.UNRESPONSIVE:
+            status_text = "● oMLX Server is not responding"
+            status_color = NSColor.systemOrangeColor()
         elif status == ServerStatus.ERROR:
-            status_text = "● oMLX Server error"
+            error_detail = self.server_manager.error_message or "Unknown error"
+            status_text = f"● {error_detail}"
             status_color = NSColor.systemRedColor()
         else:
             status_text = "● oMLX Server is stopped"
@@ -348,7 +352,7 @@ class OMLXAppDelegate(NSObject):
 
         self.menu.addItem_(NSMenuItem.separatorItem())
 
-        # --- Start/Stop Server ---
+        # --- Start/Stop/Force Restart Server ---
         if status in (ServerStatus.RUNNING, ServerStatus.STARTING):
             stop_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 "Stop Server", "stopServer:", ""
@@ -358,6 +362,27 @@ class OMLXAppDelegate(NSObject):
             if stop_icon:
                 stop_item.setImage_(stop_icon)
             self.menu.addItem_(stop_item)
+        elif status in (ServerStatus.UNRESPONSIVE, ServerStatus.ERROR):
+            # Force Restart for unresponsive/errored servers
+            restart_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Force Restart", "forceRestart:", ""
+            )
+            restart_item.setTarget_(self)
+            restart_icon = self._create_menu_icon("arrow.clockwise.circle")
+            if restart_icon:
+                restart_item.setImage_(restart_icon)
+            self.menu.addItem_(restart_item)
+
+            # Also show Stop for UNRESPONSIVE (process is still alive)
+            if status == ServerStatus.UNRESPONSIVE:
+                stop_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    "Stop Server", "stopServer:", ""
+                )
+                stop_item.setTarget_(self)
+                stop_icon = self._create_menu_icon("stop.circle")
+                if stop_icon:
+                    stop_item.setImage_(stop_icon)
+                self.menu.addItem_(stop_item)
         else:
             start_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 "Start Server", "startServer:", ""
@@ -518,31 +543,29 @@ class OMLXAppDelegate(NSObject):
     # --- Timer callback ---
 
     def healthCheck_(self, timer):
-        """Periodic health check, stats refresh, and icon update."""
+        """Periodic icon/menu update and stats refresh.
+
+        Crash detection and auto-restart are handled by
+        ServerManager._health_check_loop in a background thread.
+        This timer only refreshes the UI.
+        """
         prev_status = self.server_manager.status
 
         if self.server_manager.status == ServerStatus.RUNNING:
-            if not self.server_manager.check_health():
-                if not self.server_manager.is_running():
-                    self.server_manager._update_status(
-                        ServerStatus.ERROR, "Server process terminated"
-                    )
-                    self._cached_stats = None
-                    self._update_status_display()
-            else:
-                # Refresh stats
-                now = time.time()
-                if now - self._last_stats_fetch >= 5:
-                    self._fetch_stats()
-                    self._last_stats_fetch = now
-                    self._build_menu()
+            # Refresh stats periodically
+            now = time.time()
+            if now - self._last_stats_fetch >= 5:
+                self._fetch_stats()
+                self._last_stats_fetch = now
+                self._build_menu()
 
-        elif self.server_manager.status == ServerStatus.STARTING:
-            if self.server_manager.check_health():
-                self.server_manager._update_status(ServerStatus.RUNNING)
-                self._update_status_display()
+        elif self.server_manager.status in (
+            ServerStatus.ERROR,
+            ServerStatus.UNRESPONSIVE,
+        ):
+            self._cached_stats = None
 
-        # Update icon if status changed
+        # Update icon/menu if status changed
         if self.server_manager.status != prev_status:
             self._update_status_display()
 
@@ -618,6 +641,15 @@ class OMLXAppDelegate(NSObject):
         """Stop the server."""
         self.server_manager.stop()
         self._cached_stats = None
+        self._update_status_display()
+
+    @objc.IBAction
+    def forceRestart_(self, sender):
+        """Force restart the server (kill + start fresh)."""
+        result = self.server_manager.force_restart()
+        if isinstance(result, PortConflict):
+            self._handle_port_conflict(result)
+            return
         self._update_status_display()
 
     @objc.IBAction

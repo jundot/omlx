@@ -338,6 +338,7 @@ class TestServerStatus:
         assert ServerStatus.RUNNING.value == "running"
         assert ServerStatus.STOPPING.value == "stopping"
         assert ServerStatus.ERROR.value == "error"
+        assert ServerStatus.UNRESPONSIVE.value == "unresponsive"
 
     def test_status_comparison(self):
         """Test status enum comparison."""
@@ -636,6 +637,155 @@ class TestServerManager:
         mock_stop.assert_called_once()
         mock_start.assert_called_once()
         assert result is True
+
+
+    def test_initial_auto_restart_state(self, manager: ServerManager):
+        """Test initial auto-restart related state."""
+        assert manager._consecutive_health_failures == 0
+        assert manager._max_health_failures == 3
+        assert manager._max_auto_restarts == 3
+        assert manager._auto_restart_count == 0
+        assert manager._last_healthy_time == 0.0
+        assert manager._stable_threshold == 60.0
+
+    def test_cleanup_dead_process(self, manager: ServerManager):
+        """Test _cleanup_dead_process cleans up process and log handle."""
+        mock_process = Mock()
+        mock_process.pid = 12345
+        mock_log = Mock()
+
+        manager._process = mock_process
+        manager._log_file_handle = mock_log
+
+        with patch("omlx_app.server_manager.os.killpg"), \
+             patch("omlx_app.server_manager.os.getpgid", return_value=12345):
+            manager._cleanup_dead_process()
+
+        assert manager._process is None
+        assert manager._log_file_handle is None
+        mock_log.close.assert_called_once()
+
+    def test_cleanup_dead_process_no_process(self, manager: ServerManager):
+        """Test _cleanup_dead_process when no process exists."""
+        manager._process = None
+        manager._log_file_handle = None
+        # Should not raise
+        manager._cleanup_dead_process()
+
+    @patch.object(ServerManager, "_do_start", return_value=True)
+    def test_try_auto_restart_success(self, mock_do_start, manager: ServerManager):
+        """Test auto-restart succeeds on first attempt."""
+        mock_process = Mock()
+        mock_process.pid = 12345
+        manager._process = mock_process
+        manager._status = ServerStatus.RUNNING
+        manager._last_healthy_time = time.time()  # Just became unhealthy
+
+        with patch("omlx_app.server_manager.os.killpg"), \
+             patch("omlx_app.server_manager.os.getpgid", return_value=12345):
+            manager._try_auto_restart("Server exited with code -9")
+
+        assert manager._auto_restart_count == 1
+        assert manager.status == ServerStatus.STARTING
+        mock_do_start.assert_called_once()
+
+    @patch.object(ServerManager, "_do_start", return_value=True)
+    def test_try_auto_restart_resets_after_stable(self, mock_do_start, manager: ServerManager):
+        """Test auto-restart counter resets after stable running period."""
+        manager._process = Mock(pid=123)
+        manager._auto_restart_count = 2  # Already failed twice
+        manager._last_healthy_time = time.time() - 120  # Stable for 2 minutes
+
+        with patch("omlx_app.server_manager.os.killpg"), \
+             patch("omlx_app.server_manager.os.getpgid", return_value=123):
+            manager._try_auto_restart("Server exited with code -9")
+
+        # Counter should have been reset then incremented to 1
+        assert manager._auto_restart_count == 1
+
+    def test_try_auto_restart_gives_up(self, manager: ServerManager):
+        """Test auto-restart gives up after max attempts."""
+        manager._process = Mock(pid=123)
+        manager._auto_restart_count = 3  # Already at max
+        manager._last_healthy_time = time.time()  # Recent crash (no reset)
+
+        with patch("omlx_app.server_manager.os.killpg"), \
+             patch("omlx_app.server_manager.os.getpgid", return_value=123):
+            manager._try_auto_restart("Server exited with code -9")
+
+        assert manager.status == ServerStatus.ERROR
+        assert "Auto-restart failed after 3 attempts" in manager.error_message
+
+    @patch.object(ServerManager, "check_health", return_value=False)
+    def test_health_check_loop_detects_unresponsive(self, mock_health, manager: ServerManager):
+        """Test health check loop transitions to UNRESPONSIVE after consecutive failures."""
+        mock_process = Mock()
+        mock_process.poll.return_value = None  # Process alive
+        manager._process = mock_process
+        manager._status = ServerStatus.RUNNING
+
+        # Simulate 3 health check failures
+        callback = Mock()
+        manager.set_status_callback(callback)
+
+        # Run _health_check_loop logic manually (not the full loop)
+        for _ in range(3):
+            # Inline the relevant logic from _health_check_loop
+            if not manager.check_health():
+                manager._consecutive_health_failures += 1
+                if manager._process and manager._process.poll() is not None:
+                    pass
+                elif manager._consecutive_health_failures >= manager._max_health_failures:
+                    if manager._status != ServerStatus.UNRESPONSIVE:
+                        manager._update_status(
+                            ServerStatus.UNRESPONSIVE,
+                            "Server not responding to health checks",
+                        )
+
+        assert manager.status == ServerStatus.UNRESPONSIVE
+        assert manager.error_message == "Server not responding to health checks"
+
+    def test_health_check_loop_recovers_from_unresponsive(self, manager: ServerManager):
+        """Test server recovers from UNRESPONSIVE when health check succeeds."""
+        manager._status = ServerStatus.UNRESPONSIVE
+        manager._consecutive_health_failures = 5
+
+        with patch.object(manager, "check_health", return_value=True):
+            # Simulate one iteration of health check
+            if manager.check_health():
+                manager._consecutive_health_failures = 0
+                manager._last_healthy_time = time.time()
+                if manager._status == ServerStatus.UNRESPONSIVE:
+                    manager._update_status(ServerStatus.RUNNING)
+
+        assert manager.status == ServerStatus.RUNNING
+        assert manager._consecutive_health_failures == 0
+
+    @patch.object(ServerManager, "_cleanup_dead_process")
+    @patch.object(ServerManager, "start", return_value=True)
+    def test_force_restart(self, mock_start, mock_cleanup, manager: ServerManager):
+        """Test force_restart cleans up and starts fresh."""
+        manager._auto_restart_count = 3
+        manager._consecutive_health_failures = 10
+        manager._status = ServerStatus.UNRESPONSIVE
+
+        result = manager.force_restart()
+
+        assert result is True
+        assert manager._auto_restart_count == 0
+        assert manager._consecutive_health_failures == 0
+        mock_cleanup.assert_called_once()
+        mock_start.assert_called_once()
+
+    def test_stop_from_unresponsive(self, manager: ServerManager):
+        """Test stop works when server is UNRESPONSIVE."""
+        manager._status = ServerStatus.UNRESPONSIVE
+        manager._process = None
+
+        result = manager.stop()
+
+        assert result is True
+        assert manager.status == ServerStatus.STOPPED
 
 
 class TestPortConflict:

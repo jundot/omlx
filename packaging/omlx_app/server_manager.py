@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -25,6 +26,7 @@ class ServerStatus(Enum):
     RUNNING = "running"
     STOPPING = "stopping"
     ERROR = "error"
+    UNRESPONSIVE = "unresponsive"
 
 
 @dataclass
@@ -65,6 +67,16 @@ class ServerManager:
         self._stop_health_check = threading.Event()
         self._adopted = False
 
+        # Health check failure tracking
+        self._consecutive_health_failures: int = 0
+        self._max_health_failures: int = 3  # 3 consecutive failures → UNRESPONSIVE
+
+        # Auto-restart (only when process actually exits)
+        self._max_auto_restarts: int = 3
+        self._auto_restart_count: int = 0
+        self._last_healthy_time: float = 0.0
+        self._stable_threshold: float = 60.0  # Reset counter after 60s of stable running
+
     @property
     def status(self) -> ServerStatus:
         return self._status
@@ -100,25 +112,106 @@ class ServerManager:
 
     def _health_check_loop(self) -> None:
         while not self._stop_health_check.is_set():
-            if self._status == ServerStatus.RUNNING:
-                if not self.check_health():
+            if self._status in (ServerStatus.RUNNING, ServerStatus.UNRESPONSIVE):
+                if self.check_health():
+                    self._consecutive_health_failures = 0
+                    self._last_healthy_time = time.time()
+                    # Recover from UNRESPONSIVE → RUNNING
+                    if self._status == ServerStatus.UNRESPONSIVE:
+                        logger.info("Server recovered from unresponsive state")
+                        self._update_status(ServerStatus.RUNNING)
+                else:
+                    self._consecutive_health_failures += 1
+
                     if self._adopted:
+                        # Adopted server: just report error
                         self._adopted = False
                         self._update_status(
                             ServerStatus.ERROR,
                             "External server stopped",
                         )
                     elif self._process and self._process.poll() is not None:
+                        # Case 1: Process exited → auto-restart
                         exit_code = self._process.returncode
-                        self._update_status(
-                            ServerStatus.ERROR,
-                            f"Server exited with code {exit_code}",
+                        self._try_auto_restart(
+                            f"Server exited with code {exit_code}"
                         )
-                        self._process = None
+                    elif self._consecutive_health_failures >= self._max_health_failures:
+                        # Case 2: Process alive but unresponsive → warn only
+                        if self._status != ServerStatus.UNRESPONSIVE:
+                            logger.warning(
+                                "Server unresponsive after %d health check failures",
+                                self._consecutive_health_failures,
+                            )
+                            self._update_status(
+                                ServerStatus.UNRESPONSIVE,
+                                "Server not responding to health checks",
+                            )
             elif self._status == ServerStatus.STARTING:
                 if self.check_health():
+                    self._consecutive_health_failures = 0
+                    self._last_healthy_time = time.time()
                     self._update_status(ServerStatus.RUNNING)
             self._stop_health_check.wait(5)
+
+    def _try_auto_restart(self, reason: str) -> None:
+        """Attempt to auto-restart the server after a crash.
+
+        Only called when the server process has actually exited.
+        Uses exponential backoff (5s, 10s, 20s) and gives up after
+        _max_auto_restarts consecutive failures.
+        """
+        # If server ran stably for _stable_threshold seconds, treat as new crash
+        if self._last_healthy_time > 0 and (
+            time.time() - self._last_healthy_time >= self._stable_threshold
+        ):
+            self._auto_restart_count = 0
+
+        if self._auto_restart_count >= self._max_auto_restarts:
+            self._cleanup_dead_process()
+            self._update_status(
+                ServerStatus.ERROR,
+                f"{reason}. Auto-restart failed after {self._max_auto_restarts} attempts",
+            )
+            return
+
+        self._auto_restart_count += 1
+        self._consecutive_health_failures = 0
+        logger.warning(
+            "Auto-restart %d/%d: %s",
+            self._auto_restart_count,
+            self._max_auto_restarts,
+            reason,
+        )
+
+        self._cleanup_dead_process()
+
+        # Exponential backoff: 5s, 10s, 20s
+        backoff = 5 * (2 ** (self._auto_restart_count - 1))
+        self._stop_health_check.wait(backoff)
+        if self._stop_health_check.is_set():
+            return  # stop() was called during backoff
+
+        self._update_status(ServerStatus.STARTING)
+        result = self._do_start()
+        if not result or isinstance(result, PortConflict):
+            self._update_status(
+                ServerStatus.ERROR,
+                f"Auto-restart failed: could not start server",
+            )
+
+    def _cleanup_dead_process(self) -> None:
+        """Kill and clean up a dead or hung server process."""
+        if self._process:
+            try:
+                pid = self._process.pid
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            self._process = None
+        if self._log_file_handle:
+            self._log_file_handle.close()
+            self._log_file_handle = None
 
     def _is_port_in_use(self) -> bool:
         """Check if the configured port is already in use."""
@@ -191,10 +284,11 @@ class ServerManager:
         logger.info(f"Adopted external oMLX server on port {self.config.port}")
         return True
 
-    def start(self) -> Union[bool, PortConflict]:
-        if self._status in (ServerStatus.RUNNING, ServerStatus.STARTING):
-            return False
+    def _do_start(self) -> Union[bool, PortConflict]:
+        """Core start logic shared by start() and auto-restart.
 
+        Does NOT check current status or start the health check thread.
+        """
         # Check for port conflict before launching
         if self._is_port_in_use():
             is_omlx = self._is_omlx_server()
@@ -202,8 +296,8 @@ class ServerManager:
             return PortConflict(pid=pid, is_omlx=is_omlx)
 
         self._adopted = False
+        self._consecutive_health_failures = 0
         args = self.config.build_serve_args()
-        self._update_status(ServerStatus.STARTING)
 
         try:
             # Ensure base directory exists
@@ -223,13 +317,6 @@ class ServerManager:
                 start_new_session=True,
             )
 
-            self._stop_health_check.clear()
-            self._health_check_thread = threading.Thread(
-                target=self._health_check_loop,
-                daemon=True,
-            )
-            self._health_check_thread.start()
-
             logger.info(f"Started server (PID: {self._process.pid})")
             return True
 
@@ -238,8 +325,43 @@ class ServerManager:
             logger.error(f"Failed to start server: {e}")
             return False
 
+    def start(self) -> Union[bool, PortConflict]:
+        if self._status in (ServerStatus.RUNNING, ServerStatus.STARTING):
+            return False
+
+        self._update_status(ServerStatus.STARTING)
+        result = self._do_start()
+
+        if isinstance(result, PortConflict):
+            self._update_status(ServerStatus.STOPPED)
+            return result
+
+        if result:
+            self._stop_health_check.clear()
+            self._health_check_thread = threading.Thread(
+                target=self._health_check_loop,
+                daemon=True,
+            )
+            self._health_check_thread.start()
+
+        return result
+
+    def force_restart(self) -> Union[bool, PortConflict]:
+        """Force restart: kill process, reset counters, and start fresh."""
+        self._cleanup_dead_process()
+        self._auto_restart_count = 0
+        self._consecutive_health_failures = 0
+        self._stop_health_check.set()
+        if self._health_check_thread:
+            self._health_check_thread.join(timeout=2)
+        return self.start()
+
     def stop(self, timeout: float = 10.0) -> bool:
-        if self._status not in (ServerStatus.RUNNING, ServerStatus.STARTING):
+        if self._status not in (
+            ServerStatus.RUNNING,
+            ServerStatus.STARTING,
+            ServerStatus.UNRESPONSIVE,
+        ):
             return False
 
         # Adopted server: just stop monitoring, don't kill anything
