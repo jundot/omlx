@@ -54,6 +54,25 @@ def clean_output_text(text: str) -> str:
 # Text Content Extraction
 # =============================================================================
 
+
+def _extract_text_from_content_list(content: list) -> str:
+    """Extract text parts from a content array, dropping non-text items.
+
+    Handles content arrays from both OpenAI and Anthropic formats.
+    Only items with type="text" are extracted; all others (tool_use,
+    image, image_url, thinking, refusal, etc.) are silently dropped.
+    """
+    text_parts = []
+    for item in content:
+        if hasattr(item, 'model_dump'):
+            item = item.model_dump()
+        elif hasattr(item, 'dict'):
+            item = item.dict()
+        if isinstance(item, dict) and item.get("type") == "text":
+            text_parts.append(item.get("text", ""))
+    return "\n".join(text_parts) if text_parts else ""
+
+
 def extract_text_content(
     messages: List[Message],
     max_tool_result_tokens: int | None = None,
@@ -113,6 +132,8 @@ def extract_text_content(
 
         # Handle assistant messages with tool_calls
         if role == "assistant" and hasattr(msg, 'tool_calls') and msg.tool_calls:
+            if isinstance(content, list):
+                content = _extract_text_from_content_list(content)
             msg_dict = {"role": role, "content": content if content else ""}
 
             # Preserve structured tool_calls for models with native tool calling
@@ -176,20 +197,7 @@ def extract_text_content(
             processed_messages.append({"role": role, "content": content})
         elif isinstance(content, list):
             # Content array - extract text parts only
-            text_parts = []
-            for item in content:
-                # Handle both Pydantic models and dicts
-                if hasattr(item, 'model_dump'):
-                    item = item.model_dump()
-                elif hasattr(item, 'dict'):
-                    item = item.dict()
-
-                item_type = item.get("type", "")
-                if item_type == "text":
-                    text_parts.append(item.get("text", ""))
-
-            # Combine text parts
-            combined_text = "\n".join(text_parts) if text_parts else ""
+            combined_text = _extract_text_from_content_list(content)
             processed_messages.append({"role": role, "content": combined_text})
         else:
             # Unknown format, try to convert

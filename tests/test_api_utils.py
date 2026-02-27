@@ -307,6 +307,28 @@ class TestExtractTextContent:
         assert result[0]["content"] == "You are a coding assistant."
         assert result[1]["role"] == "user"
 
+    def test_assistant_tool_calls_with_content_array(self):
+        """Content array in assistant+tool_calls should be converted to string."""
+        from unittest.mock import MagicMock
+        mock_tokenizer = MagicMock(spec=[])
+        mock_tokenizer.has_tool_calling = True
+
+        messages = [
+            Message(
+                role="assistant",
+                content=[
+                    {"type": "text", "text": "Let me check."},
+                    {"type": "tool_use", "id": "x", "name": "f", "input": {}},
+                ],
+                tool_calls=[{"function": {"name": "f", "arguments": "{}"}}],
+            )
+        ]
+
+        result = extract_text_content(messages, tokenizer=mock_tokenizer)
+
+        assert result[0]["content"] == "Let me check."
+        assert "tool_use" not in str(result[0]["content"])
+
     def test_developer_role_in_harmony(self):
         """Test that 'developer' role is normalized in extract_harmony_messages."""
         messages = [
