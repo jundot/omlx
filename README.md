@@ -43,6 +43,9 @@ Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), dr
 ```bash
 brew tap jundot/omlx https://github.com/jundot/omlx
 brew install omlx
+
+# Run as a background service (auto-restarts on crash)
+brew services start omlx
 ```
 
 ### From Source
@@ -73,6 +76,23 @@ omlx serve --model-dir ~/models
 ```
 
 The server discovers models from subdirectories automatically. Any OpenAI-compatible client can connect to `http://localhost:8000/v1`. A built-in chat UI is also available at `http://localhost:8000/admin/chat`.
+
+### Homebrew Service
+
+If you installed via Homebrew, you can run oMLX as a managed background service:
+
+```bash
+brew services start omlx    # Start (auto-restarts on crash)
+brew services stop omlx     # Stop
+brew services restart omlx  # Restart
+brew services info omlx     # Check status
+```
+
+The service runs `omlx serve` with zero-config defaults (`~/.omlx/models`, port 8000). To customize, either set environment variables (`OMLX_MODEL_DIR`, `OMLX_PORT`, etc.) or run `omlx serve --model-dir /your/path` once to persist settings to `~/.omlx/settings.json`.
+
+Logs are written to two locations:
+- **Service log**: `$(brew --prefix)/var/log/omlx.log` (stdout/stderr)
+- **Server log**: `~/.omlx/logs/server.log` (structured application log)
 
 ## Features
 

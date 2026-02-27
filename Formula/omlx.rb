@@ -9,6 +9,15 @@ class Omlx < Formula
   depends_on :macos
   depends_on arch: :arm64
 
+  service do
+    run [opt_bin/"omlx", "serve"]
+    keep_alive true
+    working_dir var
+    log_path var/"log/omlx.log"
+    error_log_path var/"log/omlx.log"
+    environment_variables PATH: std_service_path_env
+  end
+
   def install
     # Create venv with pip so dependency resolution works properly
     system "python3.11", "-m", "venv", libexec
