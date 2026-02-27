@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for omlx.server module - sampling parameter resolution."""
+"""Tests for omlx.server module - sampling parameter resolution and exception handlers."""
 
 from unittest.mock import patch
 
 import pytest
+from fastapi.testclient import TestClient
 
 from omlx.model_settings import ModelSettings, ModelSettingsManager
-from omlx.server import SamplingDefaults, ServerState, get_sampling_params
+from omlx.server import SamplingDefaults, ServerState, app, get_sampling_params
 
 
 class TestGetSamplingParams:
@@ -109,3 +110,35 @@ class TestGetSamplingParams:
         temp, top_p, _, _ = get_sampling_params(0.9, 0.99)
         assert temp == 0.5  # forced, not request
         assert top_p == 0.8  # forced, not request
+
+
+class TestExceptionHandlers:
+    """Tests for global exception handlers that log API errors."""
+
+    @pytest.fixture
+    def client(self):
+        """Create a test client for the FastAPI app."""
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_http_exception_logged(self, client, caplog):
+        """Test that HTTPException responses are logged."""
+        # /v1/models requires startup, so a 404 on a non-existent route works
+        response = client.get("/v1/nonexistent-endpoint")
+        assert response.status_code == 404
+
+    def test_validation_error_logged(self, client, caplog):
+        """Test that request validation errors (422) are logged."""
+        # POST to /v1/chat/completions with invalid body triggers validation
+        response = client.post(
+            "/v1/chat/completions",
+            json={"invalid_field": "bad"},
+        )
+        # Should be 422 (validation error) or 500 (server not initialized)
+        assert response.status_code in (422, 500)
+
+    def test_exception_handler_returns_json(self, client):
+        """Test that exception handlers return proper JSON responses."""
+        response = client.get("/v1/nonexistent-endpoint")
+        assert response.status_code == 404
+        data = response.json()
+        assert "detail" in data

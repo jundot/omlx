@@ -54,7 +54,8 @@ import secrets
 
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, StreamingResponse as _BaseStreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse as _BaseStreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from omlx._version import __version__
@@ -351,6 +352,54 @@ app.include_router(admin_router)
 async def redirect_to_login_handler(request, exc):
     """Redirect unauthenticated browser requests to the admin login page."""
     return RedirectResponse(url="/admin", status_code=302)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
+    """Log all HTTP errors (4xx/5xx) before returning the response."""
+    logger.warning(
+        "%s %s → %d: %s",
+        request.method,
+        request.url.path,
+        exc.status_code,
+        exc.detail,
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: FastAPIRequest, exc: RequestValidationError
+):
+    """Log request validation errors (422) before returning the response."""
+    logger.warning(
+        "%s %s → 422: %s",
+        request.method,
+        request.url.path,
+        exc.errors(),
+    )
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
+    """Log unhandled exceptions as 500 errors."""
+    logger.error(
+        "%s %s → 500 (unhandled): %s",
+        request.method,
+        request.url.path,
+        exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
 
 
 @app.middleware("http")
