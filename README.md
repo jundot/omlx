@@ -44,6 +44,9 @@ Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), dr
 brew tap jundot/omlx https://github.com/jundot/omlx
 brew install omlx
 
+# Upgrade to the latest version
+brew update && brew upgrade omlx
+
 # Run as a background service (auto-restarts on crash)
 brew services start omlx
 ```
