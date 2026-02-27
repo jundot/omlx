@@ -69,6 +69,7 @@ class InternalResponse:
     # Generated content
     text: str
     finish_reason: Optional[str] = None
+    reasoning_content: Optional[str] = None
 
     # Token counts
     prompt_tokens: int = 0
@@ -87,6 +88,7 @@ class StreamChunk:
     """A single chunk in a streaming response."""
 
     text: str = ""
+    reasoning_content: Optional[str] = None
     finish_reason: Optional[str] = None
     tool_call_delta: Optional[Dict[str, Any]] = None
     is_first: bool = False

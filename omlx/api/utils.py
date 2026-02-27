@@ -22,16 +22,24 @@ SPECIAL_TOKENS_PATTERN = re.compile(
     r'</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]'
 )
 
-# Pattern to strip <think>...</think> reasoning blocks from output
-THINKING_PATTERN = re.compile(r'<think>.*?</think>', re.DOTALL)
-# Also handle case where <think> tag is missing but </think> is present
-# (some models emit thinking content before </think> without explicit <think> tag)
-THINKING_TAIL_PATTERN = re.compile(r'^.*?</think>\s*', re.DOTALL)
+def clean_special_tokens(text: str) -> str:
+    """Clean model output by removing only special tokens.
+
+    Preserves <think>...</think> blocks for downstream processing.
+
+    Args:
+        text: Raw model output
+
+    Returns:
+        Text with special tokens removed but think tags preserved
+    """
+    if not text:
+        return text
+    return SPECIAL_TOKENS_PATTERN.sub('', text).strip()
 
 
 def clean_output_text(text: str) -> str:
-    """
-    Clean model output by removing special tokens and thinking blocks.
+    """Clean model output by removing special tokens and thinking blocks.
 
     Args:
         text: Raw model output
@@ -42,12 +50,9 @@ def clean_output_text(text: str) -> str:
     if not text:
         return text
     text = SPECIAL_TOKENS_PATTERN.sub('', text)
-    # Remove <think>...</think> blocks (reasoning content)
-    text = THINKING_PATTERN.sub('', text)
-    # Handle partial thinking: content before </think> with no <think> tag
-    if '</think>' in text and '<think>' not in text:
-        text = THINKING_TAIL_PATTERN.sub('', text)
-    return text.strip()
+    from .thinking import extract_thinking
+    _, content = extract_thinking(text)
+    return content.strip()
 
 
 # =============================================================================

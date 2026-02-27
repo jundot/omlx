@@ -898,8 +898,23 @@
                             if (line.startsWith('data: ')) {
                                 try {
                                     const data = JSON.parse(line.slice(6));
-                                    if (data.choices?.[0]?.delta?.content) {
-                                        this.streamingContent += data.choices[0].delta.content;
+                                    const delta = data.choices?.[0]?.delta;
+                                    if (delta?.reasoning_content) {
+                                        // Wrap reasoning in <think> tags for UI rendering
+                                        if (!this.thinkingState.isInThinking) {
+                                            this.streamingContent += '<think>';
+                                            this.thinkingState.isInThinking = true;
+                                        }
+                                        this.streamingContent += delta.reasoning_content;
+                                        this.scrollToBottom();
+                                    }
+                                    if (delta?.content) {
+                                        // Close thinking block if transitioning
+                                        if (this.thinkingState.isInThinking) {
+                                            this.streamingContent += '</think>';
+                                            this.thinkingState.isInThinking = false;
+                                        }
+                                        this.streamingContent += delta.content;
                                         this.scrollToBottom();
                                     }
                                 } catch (e) {
@@ -907,6 +922,12 @@
                                 }
                             }
                         }
+                    }
+
+                    // Close unclosed thinking block
+                    if (this.thinkingState.isInThinking) {
+                        this.streamingContent += '</think>';
+                        this.thinkingState.isInThinking = false;
                     }
 
                     // Add completed message
@@ -923,6 +944,11 @@
                     console.log('[streamResponse] catch error:', error.name, error.message);
                     if (error.name === 'AbortError') {
                         console.log('[streamResponse] AbortError caught - stream stopped by user');
+                        // Close unclosed thinking block
+                        if (this.thinkingState.isInThinking) {
+                            this.streamingContent += '</think>';
+                            this.thinkingState.isInThinking = false;
+                        }
                         // Stream was stopped by user
                         if (this.streamingContent) {
                             this.messages.push({

@@ -136,6 +136,7 @@ class AssistantMessage(BaseModel):
     """Response message from the assistant."""
     role: str = "assistant"
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = None
 
 
@@ -269,6 +270,7 @@ class ChatCompletionChunkDelta(BaseModel):
     """Delta content in a streaming chunk."""
     role: Optional[str] = None
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     tool_calls: Optional[List[dict]] = None
 
 

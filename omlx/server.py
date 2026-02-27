@@ -80,6 +80,7 @@ from .api.anthropic_utils import (
     create_message_start_event,
     create_message_stop_event,
     create_text_delta_event,
+    create_thinking_delta_event,
     map_finish_reason_to_stop_reason,
 )
 
@@ -122,7 +123,8 @@ from .api.tool_calling import (
     parse_json_output,
     parse_tool_calls,
 )
-from .api.utils import clean_output_text, extract_harmony_messages, extract_text_content
+from .api.thinking import ThinkingParser, extract_thinking
+from .api.utils import clean_output_text, clean_special_tokens, extract_harmony_messages, extract_text_content
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -1426,6 +1428,10 @@ async def create_chat_completion(
         model_id=request.model,
     )
 
+    # Separate thinking from content
+    raw_text = clean_special_tokens(output.text) if output.text else ""
+    thinking_content, regular_content = extract_thinking(raw_text)
+
     # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
     # For other models, parse from text output
     if engine.model_type == "gpt_oss" and output.tool_calls:
@@ -1442,11 +1448,11 @@ async def create_chat_completion(
             )
             for tc in output.tool_calls
         ]
-        cleaned_text = clean_output_text(output.text) if output.text else ""
+        cleaned_text = regular_content
     else:
-        # Parse tool calls from output using mlx-lm's tool parser
+        # Parse tool calls from regular content (not thinking)
         cleaned_text, tool_calls = parse_tool_calls(
-            output.text,
+            regular_content,
             tokenizer=engine.tokenizer,
             tools=convert_tools_for_template(request.tools),
         )
@@ -1454,7 +1460,7 @@ async def create_chat_completion(
     # Process response_format if specified
     if response_format and not tool_calls:
         cleaned_text, parsed_json, is_valid, error = parse_json_output(
-            cleaned_text or output.text,
+            cleaned_text or regular_content,
             response_format
         )
         if parsed_json is not None:
@@ -1470,7 +1476,8 @@ async def create_chat_completion(
         model=request.model,
         choices=[ChatCompletionChoice(
             message=AssistantMessage(
-                content=clean_output_text(cleaned_text) if cleaned_text else None,
+                content=cleaned_text.strip() if cleaned_text else None,
+                reasoning_content=thinking_content if thinking_content else None,
                 tool_calls=tool_calls,
             ),
             finish_reason=finish_reason,
@@ -1582,15 +1589,16 @@ async def stream_chat_completion(
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
 
-    Streams content tokens, then at completion parses tool calls from
-    accumulated text and emits them as structured tool_calls chunks
-    (OpenAI streaming format).
+    Streams content tokens with reasoning/thinking separation, then at
+    completion parses tool calls from accumulated text and emits them
+    as structured tool_calls chunks (OpenAI streaming format).
     """
     start_time = time.perf_counter()
     first_token_time = None
     last_output = None
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
+    thinking_parser = ThinkingParser()
 
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
@@ -1602,7 +1610,7 @@ async def stream_chat_completion(
             delta=ChatCompletionChunkDelta(role="assistant"),
         )],
     )
-    yield f"data: {first_chunk.model_dump_json()}\n\n"
+    yield f"data: {first_chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Stream content — buffer when tools are present so we can strip
     # tool call markup before emitting (prevents clients from seeing
@@ -1614,16 +1622,56 @@ async def stream_chat_completion(
         if output.new_text:
             accumulated_text += output.new_text
 
-        if not has_tools:
+        if not has_tools and output.new_text:
+            thinking_delta, content_delta = thinking_parser.feed(output.new_text)
+
+            # Emit reasoning_content delta
+            if thinking_delta:
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(reasoning_content=thinking_delta),
+                        finish_reason=None,
+                    )],
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
+            # Emit content delta
+            if content_delta:
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(content=content_delta),
+                        finish_reason=None,
+                    )],
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
+    # Flush remaining buffered content from thinking parser
+    if not has_tools:
+        thinking_delta, content_delta = thinking_parser.finish()
+        if thinking_delta:
             chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
                 choices=[ChatCompletionChunkChoice(
-                    delta=ChatCompletionChunkDelta(content=output.new_text if output.new_text else None),
+                    delta=ChatCompletionChunkDelta(reasoning_content=thinking_delta),
                     finish_reason=None,
                 )],
             )
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+        if content_delta:
+            chunk = ChatCompletionChunk(
+                id=response_id,
+                model=request.model,
+                choices=[ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(content=content_delta),
+                    finish_reason=None,
+                )],
+            )
+            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Parse tool calls from accumulated text
     tool_calls = None
@@ -1644,12 +1692,25 @@ async def stream_chat_completion(
         ]
         cleaned_text = ""
     elif has_tools and accumulated_text:
-        # Parse from accumulated text using mlx-lm's tool parser
+        # Separate thinking from content, then parse tool calls from content
+        thinking_content, regular_content = extract_thinking(accumulated_text)
         cleaned_text, tool_calls = parse_tool_calls(
-            accumulated_text,
+            regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
         )
+
+        # Emit reasoning_content if present (buffered mode)
+        if thinking_content:
+            rc_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=request.model,
+                choices=[ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(reasoning_content=thinking_content),
+                    finish_reason=None,
+                )],
+            )
+            yield f"data: {rc_chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # When tools were requested, emit buffered content now (cleaned of markup)
     if has_tools and cleaned_text:
@@ -1661,7 +1722,7 @@ async def stream_chat_completion(
                 finish_reason=None,
             )],
         )
-        yield f"data: {content_chunk.model_dump_json()}\n\n"
+        yield f"data: {content_chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Emit tool call chunks if found
     if tool_calls:
@@ -1683,7 +1744,7 @@ async def stream_chat_completion(
                     ),
                 )],
             )
-            yield f"data: {tc_chunk.model_dump_json()}\n\n"
+            yield f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Final chunk with finish_reason
     finish_reason = "tool_calls" if tool_calls else (
@@ -1697,7 +1758,7 @@ async def stream_chat_completion(
             finish_reason=finish_reason,
         )],
     )
-    yield f"data: {final_chunk.model_dump_json()}\n\n"
+    yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Record metrics
     if last_output and last_output.finished:
@@ -1751,9 +1812,11 @@ async def stream_anthropic_messages(
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     accumulated_text = ""
 
-    # Track content blocks - skip <think> content entirely for Harmony
-    in_thinking_block = False
+    # Track content blocks with thinking separation
+    thinking_parser = ThinkingParser()
+    thinking_block_started = False
     text_block_started = False
+    block_index = 0
     last_output = None  # Track last output for tool_calls and token counts
 
     # Calculate input tokens before streaming starts
@@ -1781,7 +1844,7 @@ async def stream_anthropic_messages(
         input_tokens=scale_anthropic_tokens(estimated_input_tokens, request.model),
     )
 
-    # 3. Stream content - for Harmony, skip <think> content entirely
+    # 3. Stream content with thinking/content separation
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
             last_output = output  # Keep reference for tool_calls and token counts
@@ -1790,32 +1853,32 @@ async def stream_anthropic_messages(
                 first_token_time = time.perf_counter()
 
             if output.new_text:
-                chunk = output.new_text
+                accumulated_text += output.new_text
+                thinking_delta, content_delta = thinking_parser.feed(output.new_text)
 
-                # Check if entering thinking mode - skip <think> content
-                if '<think>' in chunk:
-                    in_thinking_block = True
-                    # Don't accumulate or send thinking content
-                    continue
+                # Emit thinking content as thinking block
+                if thinking_delta:
+                    if not thinking_block_started:
+                        yield create_content_block_start_event(
+                            index=block_index, block_type="thinking"
+                        )
+                        thinking_block_started = True
+                    yield create_thinking_delta_event(
+                        index=block_index, thinking=thinking_delta
+                    )
 
-                # Check if exiting thinking mode
-                if '</think>' in chunk:
-                    in_thinking_block = False
-                    # Don't send the </think> tag either
-                    continue
-
-                # Skip all thinking content
-                if in_thinking_block:
-                    continue
-
-                # Regular text (outside thinking) - accumulate and send
-                accumulated_text += chunk
-
-                # Start text block if not started
-                if not text_block_started:
-                    yield create_content_block_start_event(index=0, block_type="text")
-                    text_block_started = True
-                yield create_text_delta_event(index=0, text=chunk)
+                # Emit regular content as text block
+                if content_delta:
+                    # Close thinking block if transitioning to text
+                    if thinking_block_started and not text_block_started:
+                        yield create_content_block_stop_event(index=block_index)
+                        block_index += 1
+                    if not text_block_started:
+                        yield create_content_block_start_event(
+                            index=block_index, block_type="text"
+                        )
+                        text_block_started = True
+                    yield create_text_delta_event(index=block_index, text=content_delta)
 
             if output.finished:
                 break
@@ -1825,13 +1888,37 @@ async def stream_anthropic_messages(
         yield create_message_stop_event()
         return
 
-    # 4. Close text block if started, or create empty block
+    # Flush remaining buffered content from thinking parser
+    thinking_delta, content_delta = thinking_parser.finish()
+    if thinking_delta:
+        if not thinking_block_started:
+            yield create_content_block_start_event(
+                index=block_index, block_type="thinking"
+            )
+            thinking_block_started = True
+        yield create_thinking_delta_event(index=block_index, thinking=thinking_delta)
+    if content_delta:
+        if thinking_block_started and not text_block_started:
+            yield create_content_block_stop_event(index=block_index)
+            block_index += 1
+        if not text_block_started:
+            yield create_content_block_start_event(
+                index=block_index, block_type="text"
+            )
+            text_block_started = True
+        yield create_text_delta_event(index=block_index, text=content_delta)
+
+    # 4. Close open blocks
+    if thinking_block_started and not text_block_started:
+        # Only thinking was emitted, close it
+        yield create_content_block_stop_event(index=block_index)
+        block_index += 1
     if text_block_started:
-        yield create_content_block_stop_event(index=0)
-    else:
-        # No text was sent - start and close an empty text block
-        yield create_content_block_start_event(index=0, block_type="text")
-        yield create_content_block_stop_event(index=0)
+        yield create_content_block_stop_event(index=block_index)
+    elif not thinking_block_started:
+        # No content at all - create empty text block
+        yield create_content_block_start_event(index=block_index, block_type="text")
+        yield create_content_block_stop_event(index=block_index)
 
     # 5. Handle tool calls
     # For Harmony models, use tool_calls from output (parsed by HarmonyStreamingParser)
@@ -1852,16 +1939,18 @@ async def stream_anthropic_messages(
             for tc in last_output.tool_calls
         ]
     elif kwargs.get("tools"):
-        # Non-Harmony: parse from accumulated text
+        # Non-Harmony: separate thinking, then parse tool calls from content
+        _, regular_content = extract_thinking(accumulated_text)
         cleaned_text, tool_calls = parse_tool_calls(
-            accumulated_text,
+            regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
         )
 
     # Emit tool_use blocks if present
+    tool_block_start = block_index + 1
     if tool_calls:
-        for i, tc in enumerate(tool_calls, start=1):
+        for i, tc in enumerate(tool_calls, start=tool_block_start):
             # Start tool_use block
             yield create_content_block_start_event(
                 index=i,
@@ -1953,6 +2042,14 @@ async def create_anthropic_message(
     # Per-request kwargs override model settings
     if request.chat_template_kwargs:
         merged_ct_kwargs.update(request.chat_template_kwargs)
+
+    # Pass Anthropic thinking config to chat template
+    if hasattr(request, 'thinking') and request.thinking:
+        thinking_type = getattr(request.thinking, 'type', None)
+        if thinking_type == "enabled":
+            merged_ct_kwargs["enable_thinking"] = True
+        elif thinking_type == "disabled":
+            merged_ct_kwargs["enable_thinking"] = False
 
     logger.debug(
         f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
@@ -2051,6 +2148,10 @@ async def create_anthropic_message(
         model_id=request.model,
     )
 
+    # Separate thinking from content
+    raw_text = clean_special_tokens(output.text) if output.text else ""
+    thinking_content, regular_content = extract_thinking(raw_text)
+
     # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
     # For other models, parse from text output
     if engine.model_type == "gpt_oss" and output.tool_calls:
@@ -2067,25 +2168,24 @@ async def create_anthropic_message(
             )
             for tc in output.tool_calls
         ]
-        cleaned_text = clean_output_text(output.text) if output.text else ""
+        cleaned_text = regular_content
     else:
-        # Parse tool calls from output text (non-Harmony models)
+        # Parse tool calls from regular content (not thinking)
         cleaned_text, tool_calls = parse_tool_calls(
-            output.text,
+            regular_content,
             tokenizer=engine.tokenizer,
             tools=internal_tools,
         )
-        # Clean output text
-        cleaned_text = clean_output_text(cleaned_text) if cleaned_text else output.text
 
     # Convert to Anthropic response format
     response = convert_internal_to_anthropic_response(
-        text=cleaned_text,
+        text=cleaned_text.strip() if cleaned_text else regular_content,
         model=request.model,
         prompt_tokens=scale_anthropic_tokens(output.prompt_tokens, request.model),
         completion_tokens=scale_anthropic_tokens(output.completion_tokens, request.model),
         finish_reason=output.finish_reason,
         tool_calls=tool_calls,
+        thinking=thinking_content if thinking_content else None,
     )
 
     return response

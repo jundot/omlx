@@ -28,7 +28,8 @@ from ..openai_models import (
     ChatCompletionResponse,
     Usage,
 )
-from ..utils import clean_output_text, extract_text_content
+from ..thinking import extract_thinking
+from ..utils import clean_special_tokens, extract_text_content
 from ..tool_calling import convert_tools_for_template
 
 
@@ -102,8 +103,10 @@ class OpenAIAdapter(BaseAdapter):
         Returns:
             ChatCompletionResponse in OpenAI format.
         """
-        # Clean output text
-        content = clean_output_text(response.text) if response.text else None
+        # Separate thinking from content
+        raw_text = clean_special_tokens(response.text) if response.text else ""
+        thinking_content, regular_content = extract_thinking(raw_text)
+        content = regular_content.strip() if regular_content else None
 
         # Determine finish reason
         finish_reason = (
@@ -117,6 +120,7 @@ class OpenAIAdapter(BaseAdapter):
                 ChatCompletionChoice(
                     message=AssistantMessage(
                         content=content,
+                        reasoning_content=thinking_content if thinking_content else None,
                         tool_calls=response.tool_calls,
                     ),
                     finish_reason=finish_reason,
@@ -148,6 +152,7 @@ class OpenAIAdapter(BaseAdapter):
 
         delta = ChatCompletionChunkDelta(
             content=chunk.text if chunk.text else None,
+            reasoning_content=chunk.reasoning_content if chunk.reasoning_content else None,
             tool_calls=chunk.tool_call_delta,
         )
 
@@ -174,7 +179,7 @@ class OpenAIAdapter(BaseAdapter):
                 total_tokens=chunk.prompt_tokens + chunk.completion_tokens,
             )
 
-        return f"data: {response.model_dump_json()}\n\n"
+        return f"data: {response.model_dump_json(exclude_none=True)}\n\n"
 
     def format_stream_end(self, request: ChatCompletionRequest) -> str:
         """

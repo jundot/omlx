@@ -44,8 +44,14 @@ from .openai_models import (
 
 from .utils import (
     clean_output_text,
+    clean_special_tokens,
     extract_text_content,
     SPECIAL_TOKENS_PATTERN,
+)
+
+from .thinking import (
+    ThinkingParser,
+    extract_thinking,
 )
 
 from .tool_calling import (
@@ -154,8 +160,12 @@ __all__ = [
     "MCPExecuteResponse",
     # Utils
     "clean_output_text",
+    "clean_special_tokens",
     "extract_text_content",
     "SPECIAL_TOKENS_PATTERN",
+    # Thinking
+    "ThinkingParser",
+    "extract_thinking",
     # Tool calling
     "parse_tool_calls",
     "convert_tools_for_template",

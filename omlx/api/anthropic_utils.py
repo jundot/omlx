@@ -16,6 +16,7 @@ from .anthropic_models import (
     AnthropicTool,
     AnthropicUsage,
     ContentBlockText,
+    ContentBlockThinking,
     ContentBlockToolUse,
     MessagesRequest,
     MessagesResponse,
@@ -482,6 +483,7 @@ def convert_internal_to_anthropic_response(
     completion_tokens: int,
     finish_reason: str | None,
     tool_calls: list[ToolCall] | None = None,
+    thinking: str | None = None,
 ) -> MessagesResponse:
     """
     Convert internal output to Anthropic MessagesResponse.
@@ -493,11 +495,20 @@ def convert_internal_to_anthropic_response(
         completion_tokens: Number of output tokens
         finish_reason: Internal finish reason ("stop", "length", "tool_calls")
         tool_calls: List of internal ToolCall objects
+        thinking: Reasoning/thinking content from <think> blocks
 
     Returns:
         Anthropic MessagesResponse
     """
-    content: list[ContentBlockText | ContentBlockToolUse] = []
+    content: list[ContentBlockText | ContentBlockToolUse | ContentBlockThinking] = []
+
+    # Add thinking content block before text if present
+    if thinking and thinking.strip():
+        content.append(ContentBlockThinking(
+            type="thinking",
+            thinking=thinking,
+            signature="",
+        ))
 
     # Add text content block if present and not empty
     if text and text.strip():
@@ -628,6 +639,8 @@ def create_content_block_start_event(index: int, block_type: str, **kwargs) -> s
             "name": kwargs.get("name", ""),
             "input": {},
         }
+    elif block_type == "thinking":
+        content_block = {"type": "thinking", "thinking": ""}
     else:
         content_block = {"type": block_type}
 
@@ -637,6 +650,18 @@ def create_content_block_start_event(index: int, block_type: str, **kwargs) -> s
             "type": "content_block_start",
             "index": index,
             "content_block": content_block,
+        },
+    )
+
+
+def create_thinking_delta_event(index: int, thinking: str) -> str:
+    """Create content_block_delta SSE event for thinking content."""
+    return format_sse_event(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "thinking_delta", "thinking": thinking},
         },
     )
 

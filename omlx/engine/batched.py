@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
-from ..api.utils import clean_output_text
+from ..api.utils import clean_special_tokens
 from ..utils.tokenizer import get_tokenizer_config
 from .base import BaseEngine, GenerationOutput
 
@@ -293,7 +293,7 @@ class BatchedEngine(BaseEngine):
             sampling_params=sampling_params,
         )
 
-        text = clean_output_text(output.output_text)
+        text = clean_special_tokens(output.output_text)
 
         return GenerationOutput(
             text=text,
@@ -353,7 +353,7 @@ class BatchedEngine(BaseEngine):
         finished_normally = False
         try:
             async for output in self._engine.stream_outputs(request_id):
-                text = clean_output_text(output.output_text)
+                text = clean_special_tokens(output.output_text)
 
                 # Set finished_normally BEFORE yield, because the consumer
                 # may stop iterating after receiving the final output,
