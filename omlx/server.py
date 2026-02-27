@@ -1300,10 +1300,17 @@ async def create_chat_completion(
 
     # Validate context window before sending to model
     tools_for_template = convert_tools_for_template(request.tools) if request.tools else None
-    num_prompt_tokens = engine.count_chat_tokens(
-        messages, tools_for_template,
-        chat_template_kwargs=merged_ct_kwargs or None,
-    )
+    try:
+        num_prompt_tokens = engine.count_chat_tokens(
+            messages, tools_for_template,
+            chat_template_kwargs=merged_ct_kwargs or None,
+        )
+    except Exception as e:
+        # Catch Jinja2 TemplateError and similar template rendering failures
+        # (e.g. unsupported message roles, invalid content format)
+        if "template" in type(e).__name__.lower() or "template" in str(e).lower():
+            raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
+        raise
     validate_context_window(num_prompt_tokens, request.model)
 
     # Prepare kwargs
@@ -1933,10 +1940,15 @@ async def create_anthropic_message(
         chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
 
     # Validate context window before sending to model
-    num_prompt_tokens = engine.count_chat_tokens(
-        messages, internal_tools,
-        chat_template_kwargs=merged_ct_kwargs or None,
-    )
+    try:
+        num_prompt_tokens = engine.count_chat_tokens(
+            messages, internal_tools,
+            chat_template_kwargs=merged_ct_kwargs or None,
+        )
+    except Exception as e:
+        if "template" in type(e).__name__.lower() or "template" in str(e).lower():
+            raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
+        raise
     validate_context_window(num_prompt_tokens, request.model)
 
     # Add stop sequences

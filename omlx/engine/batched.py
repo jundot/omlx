@@ -213,6 +213,11 @@ class BatchedEngine(BaseEngine):
                 template_kwargs.pop("tools", None)
                 template_kwargs.pop("enable_thinking", None)
                 return self._tokenizer.apply_chat_template(messages, **template_kwargs)
+            except Exception as e:
+                # Template rendering failed (e.g. Jinja2 TemplateError from
+                # unsupported roles, invalid message format, etc.)
+                logger.error(f"Chat template rendering failed: {e}")
+                raise
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"

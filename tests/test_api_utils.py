@@ -293,6 +293,33 @@ class TestExtractTextContent:
         assert "Let me check." in result[0]["content"]
         assert "get_weather" in result[0]["content"]
 
+    def test_developer_role_normalized_to_system(self):
+        """Test that 'developer' role is normalized to 'system'."""
+        messages = [
+            Message(role="developer", content="You are a coding assistant."),
+            Message(role="user", content="Hello"),
+        ]
+
+        result = extract_text_content(messages)
+
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == "You are a coding assistant."
+        assert result[1]["role"] == "user"
+
+    def test_developer_role_in_harmony(self):
+        """Test that 'developer' role is normalized in extract_harmony_messages."""
+        messages = [
+            Message(role="developer", content="You are a coding assistant."),
+            Message(role="user", content="Hello"),
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == "You are a coding assistant."
+
 
 class TestConvertAnthropicToInternal:
     """Tests for convert_anthropic_to_internal function."""
