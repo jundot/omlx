@@ -28,6 +28,8 @@
     [data-theme="dark"] button.bg-neutral-900 svg { color: #18181b !important; }
     [data-theme="dark"] .shadow-xl { box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.4) !important; }
     [data-theme="dark"] ::selection { background-color: #3f3f46; color: #efefef; }
+    [data-theme="dark"] input[type="checkbox"] { background-color: #252529 !important; border-color: #3f3f46 !important; }
+    [data-theme="dark"] input[type="checkbox"]:checked { background-color: #e5e5e5 !important; border-color: #e5e5e5 !important; }
 </style>
 {% endblock %}
 
@@ -156,6 +158,21 @@
                         >
                     </div>
 
+                    <!-- Remember Me -->
+                    <div class="mb-6 flex items-center justify-center gap-2">
+                        <input
+                            type="checkbox"
+                            id="remember"
+                            x-model="remember"
+                            class="h-4 w-4 rounded border-neutral-300 text-neutral-900
+                                   focus:ring-neutral-900 focus:ring-offset-0 cursor-pointer"
+                            :disabled="loading"
+                        >
+                        <label for="remember" class="text-xs text-neutral-500 cursor-pointer select-none">
+                            Stay signed in for 30 days
+                        </label>
+                    </div>
+
                     <!-- Submit Button -->
                     <button
                         type="submit"
@@ -194,6 +211,7 @@
             apiKeyConfigured: apiKeyConfigured,
             apiKey: '',
             apiKeyConfirm: '',
+            remember: false,
             error: '',
             loading: false,
 
@@ -207,7 +225,7 @@
                         headers: {
                             'Content-Type': 'application/json',
                         },
-                        body: JSON.stringify({ api_key: this.apiKey }),
+                        body: JSON.stringify({ api_key: this.apiKey, remember: this.remember }),
                     });
 
                     const data = await response.json();

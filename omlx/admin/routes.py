@@ -21,7 +21,14 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from .auth import verify_api_key, validate_api_key, create_session_token, require_admin
+from .auth import (
+    REMEMBER_ME_MAX_AGE,
+    SESSION_MAX_AGE,
+    create_session_token,
+    require_admin,
+    validate_api_key,
+    verify_api_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +42,7 @@ class LoginRequest(BaseModel):
     """Request model for admin login."""
 
     api_key: str
+    remember: bool = False
 
 
 class SetupApiKeyRequest(BaseModel):
@@ -611,6 +619,12 @@ async def login_page(request: Request):
     Returns:
         HTML login/setup page.
     """
+    # Redirect to dashboard if already authenticated
+    from .auth import verify_session
+
+    if verify_session(request):
+        return RedirectResponse(url="/admin/dashboard", status_code=302)
+
     global_settings = _get_global_settings()
     api_key_configured = bool(global_settings and global_settings.auth.api_key)
     return templates.TemplateResponse(
@@ -717,13 +731,14 @@ async def login(request: LoginRequest, response: Response):
         )
 
     # Create session token and set cookie
-    token = create_session_token()
+    token = create_session_token(remember=request.remember)
+    cookie_max_age = REMEMBER_ME_MAX_AGE if request.remember else SESSION_MAX_AGE
     response.set_cookie(
         key="omlx_admin_session",
         value=token,
         httponly=True,
         samesite="lax",
-        max_age=86400,  # 24 hours
+        max_age=cookie_max_age,
     )
 
     return {"success": True}

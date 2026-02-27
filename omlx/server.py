@@ -725,6 +725,18 @@ def init_server(
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
 
+    # Initialize auth with persistent secret key
+    if global_settings:
+        if not global_settings.auth.secret_key:
+            import secrets as _secrets
+
+            global_settings.auth.secret_key = _secrets.token_hex(32)
+            global_settings.save()
+            logger.info("Generated and saved new auth secret key")
+        from .admin.auth import init_auth
+
+        init_auth(global_settings.auth.secret_key)
+
     # Configure CORS middleware from settings
     cors_origins = global_settings.server.cors_origins if global_settings else ["*"]
     app.add_middleware(

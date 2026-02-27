@@ -308,23 +308,33 @@ class TestAuthSettings:
         """Test default values."""
         settings = AuthSettings()
         assert settings.api_key is None
+        assert settings.secret_key is None
 
     def test_custom_values(self):
         """Test custom values."""
-        settings = AuthSettings(api_key="test-secret-key")
+        settings = AuthSettings(api_key="test-secret-key", secret_key="my-secret")
         assert settings.api_key == "test-secret-key"
+        assert settings.secret_key == "my-secret"
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
         settings = AuthSettings(api_key="my-key")
         result = settings.to_dict()
-        assert result == {"api_key": "my-key"}
+        assert result == {"api_key": "my-key", "secret_key": None}
 
     def test_from_dict(self):
         """Test creation from dictionary."""
+        data = {"api_key": "loaded-key", "secret_key": "loaded-secret"}
+        settings = AuthSettings.from_dict(data)
+        assert settings.api_key == "loaded-key"
+        assert settings.secret_key == "loaded-secret"
+
+    def test_from_dict_backward_compat(self):
+        """Test creation from dictionary without secret_key (backward compat)."""
         data = {"api_key": "loaded-key"}
         settings = AuthSettings.from_dict(data)
         assert settings.api_key == "loaded-key"
+        assert settings.secret_key is None
 
 
 class TestMCPSettings:

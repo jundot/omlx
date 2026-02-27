@@ -16,18 +16,40 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 # Session configuration
 SESSION_COOKIE_NAME = "omlx_admin_session"
 SESSION_MAX_AGE = 86400  # 24 hours in seconds
+REMEMBER_ME_MAX_AGE = 2592000  # 30 days in seconds
 
 # Secret key for signing session tokens
 # Use environment variable if set, otherwise generate a random key
 # Note: Random key means sessions won't persist across server restarts
+# This is a fallback; init_auth() should be called with a persistent key
 SECRET_KEY = os.environ.get("OMLX_SECRET_KEY") or secrets.token_hex(32)
 
 # Initialize the serializer for creating and verifying session tokens
 _serializer = URLSafeTimedSerializer(SECRET_KEY)
 
 
-def create_session_token() -> str:
+def init_auth(secret_key: str) -> None:
+    """Initialize authentication with a persistent secret key.
+
+    Should be called during server startup with the secret key from settings.
+    Environment variable OMLX_SECRET_KEY takes priority if set.
+
+    Args:
+        secret_key: The secret key from settings.json for signing tokens.
+    """
+    global _serializer, SECRET_KEY
+    # Environment variable takes priority over settings
+    key = os.environ.get("OMLX_SECRET_KEY") or secret_key
+    SECRET_KEY = key
+    _serializer = URLSafeTimedSerializer(key)
+
+
+def create_session_token(remember: bool = False) -> str:
     """Create a signed session token for admin authentication.
+
+    Args:
+        remember: If True, the token payload includes a remember flag
+                  for extended session duration (30 days).
 
     Returns:
         A URL-safe signed token string containing admin session data.
@@ -37,16 +59,21 @@ def create_session_token() -> str:
         >>> verify_session_token(token)
         True
     """
-    payload = {"admin": True}
+    payload = {"admin": True, "remember": remember}
     return _serializer.dumps(payload)
 
 
 def verify_session_token(token: str, max_age: int = SESSION_MAX_AGE) -> bool:
     """Verify and decode a session token.
 
+    The max_age is determined by the token's remember flag:
+    - remember=True: 30 days
+    - remember=False (default): 24 hours
+
     Args:
         token: The signed session token to verify.
         max_age: Maximum age of the token in seconds. Defaults to 24 hours.
+                 This is overridden by the token's remember flag.
 
     Returns:
         True if the token is valid and not expired, False otherwise.
@@ -59,7 +86,18 @@ def verify_session_token(token: str, max_age: int = SESSION_MAX_AGE) -> bool:
         False
     """
     try:
-        data = _serializer.loads(token, max_age=max_age)
+        # First load without max_age check to read the remember flag
+        data = _serializer.loads(token, max_age=None)
+        if data.get("admin", False) is not True:
+            return False
+
+        # Determine the appropriate max_age based on remember flag
+        effective_max_age = (
+            REMEMBER_ME_MAX_AGE if data.get("remember", False) else max_age
+        )
+
+        # Re-validate with the correct max_age
+        data = _serializer.loads(token, max_age=effective_max_age)
         return data.get("admin", False) is True
     except (BadSignature, SignatureExpired):
         return False

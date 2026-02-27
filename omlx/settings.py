@@ -324,15 +324,19 @@ class AuthSettings:
     """Authentication configuration settings."""
 
     api_key: str | None = None
+    secret_key: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"api_key": self.api_key}
+        return {"api_key": self.api_key, "secret_key": self.secret_key}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AuthSettings:
         """Create from dictionary."""
-        return cls(api_key=data.get("api_key"))
+        return cls(
+            api_key=data.get("api_key"),
+            secret_key=data.get("secret_key"),
+        )
 
 
 @dataclass

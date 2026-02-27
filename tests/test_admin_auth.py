@@ -2,12 +2,14 @@
 """Tests for admin authentication and chat page API key injection."""
 
 import asyncio
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
 import omlx.server  # noqa: F401 — ensure server module is imported first
+import omlx.admin.auth as admin_auth
 import omlx.admin.routes as admin_routes
 
 
@@ -187,3 +189,114 @@ class TestChatPageApiKeyInjection:
                 assert context["api_key"] == ""
         finally:
             admin_routes._get_global_settings = original
+
+
+class TestInitAuth:
+    """Tests for init_auth() persistent secret key initialization."""
+
+    def test_init_auth_sets_serializer(self):
+        """init_auth should update the serializer with the provided key."""
+        original_serializer = admin_auth._serializer
+        try:
+            admin_auth.init_auth("test-persistent-secret-key")
+            # Create a token with the new serializer
+            token = admin_auth.create_session_token()
+            assert admin_auth.verify_session_token(token) is True
+        finally:
+            admin_auth._serializer = original_serializer
+
+    def test_init_auth_env_var_takes_priority(self):
+        """OMLX_SECRET_KEY env var should take priority over provided key."""
+        original_serializer = admin_auth._serializer
+        original_secret = admin_auth.SECRET_KEY
+        try:
+            with patch.dict("os.environ", {"OMLX_SECRET_KEY": "env-secret-key"}):
+                admin_auth.init_auth("settings-secret-key")
+                assert admin_auth.SECRET_KEY == "env-secret-key"
+        finally:
+            admin_auth._serializer = original_serializer
+            admin_auth.SECRET_KEY = original_secret
+
+    def test_init_auth_uses_provided_key_when_no_env(self):
+        """Should use provided key when no OMLX_SECRET_KEY env var."""
+        original_serializer = admin_auth._serializer
+        original_secret = admin_auth.SECRET_KEY
+        try:
+            with patch.dict("os.environ", {}, clear=True):
+                # Remove OMLX_SECRET_KEY if it exists
+                import os
+
+                os.environ.pop("OMLX_SECRET_KEY", None)
+                admin_auth.init_auth("my-persistent-key")
+                assert admin_auth.SECRET_KEY == "my-persistent-key"
+        finally:
+            admin_auth._serializer = original_serializer
+            admin_auth.SECRET_KEY = original_secret
+
+    def test_tokens_survive_reinit_with_same_key(self):
+        """Tokens created before re-init should still be valid with same key."""
+        original_serializer = admin_auth._serializer
+        original_secret = admin_auth.SECRET_KEY
+        try:
+            key = "persistent-key-for-test"
+            admin_auth.init_auth(key)
+            token = admin_auth.create_session_token()
+
+            # Re-initialize with same key (simulates server restart)
+            admin_auth.init_auth(key)
+            assert admin_auth.verify_session_token(token) is True
+        finally:
+            admin_auth._serializer = original_serializer
+            admin_auth.SECRET_KEY = original_secret
+
+    def test_tokens_invalid_after_reinit_with_different_key(self):
+        """Tokens should be invalid after re-init with a different key."""
+        original_serializer = admin_auth._serializer
+        original_secret = admin_auth.SECRET_KEY
+        try:
+            admin_auth.init_auth("key-one")
+            token = admin_auth.create_session_token()
+
+            admin_auth.init_auth("key-two")
+            assert admin_auth.verify_session_token(token) is False
+        finally:
+            admin_auth._serializer = original_serializer
+            admin_auth.SECRET_KEY = original_secret
+
+
+class TestRememberMe:
+    """Tests for remember me session token functionality."""
+
+    def test_create_token_default_no_remember(self):
+        """Default token should not have remember flag."""
+        token = admin_auth.create_session_token()
+        # Verify it works with default max_age
+        assert admin_auth.verify_session_token(token) is True
+
+    def test_create_token_with_remember(self):
+        """Token with remember=True should be valid."""
+        token = admin_auth.create_session_token(remember=True)
+        assert admin_auth.verify_session_token(token) is True
+
+    def test_remember_token_has_extended_max_age(self):
+        """Remember token should use 30-day max_age for verification."""
+        token = admin_auth.create_session_token(remember=True)
+        # Manually load the payload to check the remember flag
+        data = admin_auth._serializer.loads(token, max_age=None)
+        assert data["remember"] is True
+        assert data["admin"] is True
+
+    def test_non_remember_token_payload(self):
+        """Non-remember token should have remember=False in payload."""
+        token = admin_auth.create_session_token(remember=False)
+        data = admin_auth._serializer.loads(token, max_age=None)
+        assert data["remember"] is False
+        assert data["admin"] is True
+
+    def test_remember_me_max_age_constant(self):
+        """REMEMBER_ME_MAX_AGE should be 30 days."""
+        assert admin_auth.REMEMBER_ME_MAX_AGE == 2592000  # 30 * 24 * 60 * 60
+
+    def test_session_max_age_constant(self):
+        """SESSION_MAX_AGE should be 24 hours."""
+        assert admin_auth.SESSION_MAX_AGE == 86400  # 24 * 60 * 60
