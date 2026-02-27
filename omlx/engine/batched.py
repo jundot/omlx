@@ -6,6 +6,7 @@ This engine wraps AsyncEngineCore to provide continuous batching
 for better throughput when serving multiple concurrent requests.
 """
 
+import copy
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -144,8 +145,8 @@ class BatchedEngine(BaseEngine):
 
         self._model, self._tokenizer = await asyncio.to_thread(_load_model_sync)
 
-        # Create engine config
-        scheduler_config = self._scheduler_config or SchedulerConfig()
+        # Create engine config (copy to avoid mutating the shared instance)
+        scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()
         scheduler_config.model_name = self._model_name  # Ensure cache isolation per model
         engine_config = EngineConfig(
             model_name=self._model_name,

@@ -11,6 +11,7 @@ The scheduler follows vLLM's design with:
 - Continuous batching via BatchGenerator
 """
 
+import copy
 import gc
 import logging
 import time
@@ -575,7 +576,7 @@ class Scheduler:
         """
         self.model = model
         self.tokenizer = tokenizer
-        self.config = config or SchedulerConfig()
+        self.config = copy.copy(config) if config else SchedulerConfig()
 
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
@@ -1048,6 +1049,10 @@ class Scheduler:
 
     def _cache_tree_has_stateful_non_sliceable(self, cache_obj: Any) -> bool:
         """Detect non-sliceable recurrent cache layers requiring snapshots."""
+        # None placeholders from boundary snapshots (sliceable layers replaced).
+        if cache_obj is None:
+            return False
+
         # CacheList nests multiple cache objects.
         sub_caches = getattr(cache_obj, "caches", None)
         if isinstance(sub_caches, (list, tuple)):
