@@ -195,7 +195,7 @@ class MessagesResponse(BaseModel):
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
     model: str
-    content: list[ContentBlockText | ContentBlockToolUse]
+    content: list[ContentBlockText | ContentBlockToolUse | ContentBlockThinking]
     stop_reason: Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None = None
     stop_sequence: str | None = None
     usage: AnthropicUsage = Field(default_factory=AnthropicUsage)
