@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import (
     EntryNotFoundError,
     GatedRepoError,
@@ -99,6 +99,36 @@ def _format_model_size(size_bytes: int) -> str:
         return f"{size_bytes / 1024**3:.1f} GB"
 
 
+def _format_param_count(total_params: int) -> str:
+    """Format parameter count to a human-readable string (e.g., 7.0B, 13.0B)."""
+    if total_params >= 1e12:
+        return f"{total_params / 1e12:.1f}T"
+    if total_params >= 1e9:
+        return f"{total_params / 1e9:.1f}B"
+    if total_params >= 1e6:
+        return f"{total_params / 1e6:.1f}M"
+    return str(total_params)
+
+
+def _get_param_count(safetensors: dict) -> int:
+    """Get total parameter count from safetensors metadata."""
+    params = safetensors.get("parameters", {})
+    if not params:
+        return 0
+    return sum(params.values())
+
+
+# HF API sort field mapping for search.
+_SORT_MAP = {
+    "trending": ("trendingScore", -1),
+    "downloads": ("downloads", -1),
+    "created": ("createdAt", -1),
+    "updated": ("lastModified", -1),
+    "most_params": ("downloads", -1),  # fetch by downloads, re-sort in Python
+    "least_params": ("downloads", -1),  # fetch by downloads, re-sort in Python
+}
+
+
 class HFDownloader:
     """Manages HuggingFace model downloads with progress tracking.
 
@@ -113,7 +143,8 @@ class HFDownloader:
     @staticmethod
     async def get_recommended_models(
         max_memory_bytes: int,
-        limit: int = 30,
+        limit: int = 60,
+        result_limit: int = 50,
     ) -> dict:
         """Fetch trending and popular mlx-community models that fit in memory.
 
@@ -123,9 +154,10 @@ class HFDownloader:
         Args:
             max_memory_bytes: Maximum model size in bytes (typically system memory).
             limit: Number of models to fetch per category from HF API.
+            result_limit: Maximum number of models to return per category.
 
         Returns:
-            Dict with 'trending' and 'popular' lists (up to 10 each).
+            Dict with 'trending' and 'popular' lists.
         """
         api = HfApi()
 
@@ -135,7 +167,6 @@ class HFDownloader:
                 author="mlx-community",
                 sort=sort,
                 limit=limit,
-                pipeline_tag="text-generation",
                 expand=["safetensors", "downloads", "likes", "trendingScore"],
             )
             results = []
@@ -148,6 +179,7 @@ class HFDownloader:
                 size = _calc_safetensors_disk_size(m.safetensors)
                 if size <= 0 or size > max_memory_bytes:
                     continue
+                params = _get_param_count(m.safetensors)
                 results.append(
                     {
                         "repo_id": m.id,
@@ -157,6 +189,10 @@ class HFDownloader:
                         "trending_score": m.trending_score or 0,
                         "size": size,
                         "size_formatted": _format_model_size(size),
+                        "params": params if params > 0 else None,
+                        "params_formatted": (
+                            _format_param_count(params) if params > 0 else None
+                        ),
                     }
                 )
             return results
@@ -167,8 +203,155 @@ class HFDownloader:
         )
 
         return {
-            "trending": trending[:10],
-            "popular": popular[:10],
+            "trending": trending[:result_limit],
+            "popular": popular[:result_limit],
+        }
+
+    @staticmethod
+    async def search_models(
+        query: str,
+        sort: str = "trending",
+        limit: int = 100,
+    ) -> dict:
+        """Search HuggingFace models by query string.
+
+        Args:
+            query: Search query string.
+            sort: Sort order (trending/downloads/created/updated/most_params/least_params).
+            limit: Maximum number of results to return.
+
+        Returns:
+            Dict with 'models' list and 'total' count.
+        """
+        api = HfApi()
+        sort_key, direction = _SORT_MAP.get(sort, ("trendingScore", -1))
+
+        models = await asyncio.to_thread(
+            api.list_models,
+            search=query,
+            sort=sort_key,
+            direction=direction,
+            limit=limit,
+            expand=["safetensors", "downloads", "likes", "trendingScore"],
+        )
+
+        results = []
+        for m in models:
+            params = None
+            params_formatted = None
+            size = 0
+            if m.safetensors and m.safetensors.get("parameters"):
+                params = _get_param_count(m.safetensors)
+                params_formatted = _format_param_count(params) if params > 0 else None
+                size = _calc_safetensors_disk_size(m.safetensors)
+                if params and params <= 0:
+                    params = None
+
+            results.append(
+                {
+                    "repo_id": m.id,
+                    "name": m.id,
+                    "downloads": m.downloads or 0,
+                    "likes": m.likes or 0,
+                    "trending_score": m.trending_score or 0,
+                    "size": size,
+                    "size_formatted": _format_model_size(size) if size > 0 else "",
+                    "params": params,
+                    "params_formatted": params_formatted,
+                }
+            )
+
+        # Re-sort in Python for parameter-based sorting
+        if sort == "most_params":
+            results.sort(key=lambda x: x["params"] or 0, reverse=True)
+        elif sort == "least_params":
+            results.sort(key=lambda x: x["params"] or 0)
+
+        return {
+            "models": results[:limit],
+            "total": len(results),
+        }
+
+    @staticmethod
+    async def get_model_info(repo_id: str) -> dict:
+        """Fetch detailed model information from HuggingFace.
+
+        Args:
+            repo_id: HuggingFace repository ID (e.g., "mlx-community/Llama-3-8B-4bit").
+
+        Returns:
+            Dict with model details including description, files, tags, etc.
+        """
+        api = HfApi()
+        info = await asyncio.to_thread(
+            api.model_info,
+            repo_id,
+            files_metadata=True,
+        )
+
+        # Extract file list with sizes
+        files = []
+        if info.siblings:
+            for s in info.siblings:
+                files.append(
+                    {
+                        "name": s.rfilename,
+                        "size": s.size or 0,
+                        "size_formatted": (
+                            _format_model_size(s.size) if s.size else ""
+                        ),
+                    }
+                )
+
+        # Extract params and size from safetensors
+        params = None
+        params_formatted = None
+        size = 0
+        safetensors = getattr(info, "safetensors", None)
+        if safetensors:
+            st_dict = dict(safetensors) if not isinstance(safetensors, dict) else safetensors
+            if st_dict.get("parameters"):
+                params = _get_param_count(st_dict)
+                params_formatted = _format_param_count(params) if params > 0 else None
+                size = _calc_safetensors_disk_size(st_dict)
+
+        # Fetch model card (README.md) content
+        model_card = ""
+        try:
+            card_path = await asyncio.to_thread(
+                hf_hub_download,
+                repo_id=repo_id,
+                filename="README.md",
+            )
+            if card_path:
+                card_text = Path(card_path).read_text(encoding="utf-8")
+                # Strip YAML front matter (between --- markers)
+                if card_text.startswith("---"):
+                    end = card_text.find("---", 3)
+                    if end != -1:
+                        card_text = card_text[end + 3:].strip()
+                model_card = card_text
+        except Exception:
+            pass  # README not available
+
+        return {
+            "repo_id": info.id,
+            "name": info.id,
+            "model_card": model_card,
+            "description": "",  # kept for backward compat
+            "files": files,
+            "tags": list(info.tags) if info.tags else [],
+            "pipeline_tag": info.pipeline_tag or "",
+            "params": params,
+            "params_formatted": params_formatted,
+            "size": size,
+            "size_formatted": _format_model_size(size) if size > 0 else "",
+            "downloads": info.downloads or 0,
+            "likes": info.likes or 0,
+            "created_at": info.created_at.isoformat() if info.created_at else "",
+            "updated_at": (
+                info.last_modified.isoformat() if info.last_modified else ""
+            ),
         }
 
     def __init__(

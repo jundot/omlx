@@ -20,16 +20,56 @@
                     <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
                     Status
                 </button>
-                <button
-                    @click="mainTab = 'models'; if (!hfModelsLoaded) { loadHFModels(); loadHFTasks(); }"
-                    :class="mainTab === 'models'
-                        ? 'bg-white text-neutral-900 shadow-sm'
-                        : 'text-neutral-600 hover:text-neutral-900'"
-                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
-                >
-                    <i data-lucide="hard-drive-download" class="w-4 h-4"></i>
-                    Models
-                </button>
+                <div class="relative" @mouseenter="modelsDropdown = true" @mouseleave="modelsDropdown = false">
+                    <button
+                        @click="mainTab = 'models'"
+                        :class="mainTab === 'models'
+                            ? 'bg-white text-neutral-900 shadow-sm'
+                            : 'text-neutral-600 hover:text-neutral-900'"
+                        class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                    >
+                        <i data-lucide="hard-drive-download" class="w-4 h-4"></i>
+                        Models
+                    </button>
+                    <!-- Download count badge -->
+                    <span x-show="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length > 0"
+                          x-text="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length"
+                          class="absolute -top-1 -right-1 w-4 h-4 bg-blue-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center pointer-events-none"
+                          x-cloak></span>
+                    <!-- Dropdown menu -->
+                    <div
+                        x-show="modelsDropdown"
+                        x-transition:enter="transition ease-out duration-150"
+                        x-transition:enter-start="opacity-0 translate-y-1"
+                        x-transition:enter-end="opacity-100 translate-y-0"
+                        x-transition:leave="transition ease-in duration-100"
+                        x-transition:leave-start="opacity-100 translate-y-0"
+                        x-transition:leave-end="opacity-0 translate-y-1"
+                        class="absolute left-1/2 -translate-x-1/2 mt-1.5 w-44 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
+                        x-cloak
+                    >
+                        <button
+                            @click="mainTab = 'models'; modelsTab = 'manager'; modelsDropdown = false; loadHFModels();"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'models' && modelsTab === 'manager'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="hard-drive" class="w-3.5 h-3.5"></i>
+                            Manager
+                        </button>
+                        <button
+                            @click="mainTab = 'models'; modelsTab = 'downloader'; modelsDropdown = false; loadHFModels(); loadHFTasks(); if (!hfRecommendedLoaded) loadRecommendedModels();"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'models' && modelsTab === 'downloader'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="cloud-download" class="w-3.5 h-3.5"></i>
+                            Downloader
+                        </button>
+                    </div>
+                </div>
                 <div class="relative" @mouseenter="settingsDropdown = true" @mouseleave="settingsDropdown = false">
                     <button
                         @click="mainTab = 'settings'"

@@ -97,6 +97,10 @@
             logLastUpdated: '',
             _logRefreshTimer: null,
 
+            // Models sub-tab state
+            modelsTab: 'manager',
+            modelsDropdown: false,
+
             // HF Downloader state
             hfRepoId: '',
             hfToken: '',
@@ -114,6 +118,26 @@
             hfRecommendedLoaded: false,
             hfRecommendedLoading: false,
             hfRecommendedTab: 'trending',
+
+            // Pagination state
+            hfPage: { trending: 1, popular: 1, search: 1 },
+            hfPageSize: 10,
+
+            // Search state
+            hfSearchQuery: '',
+            hfSearchSort: 'downloads',
+            hfSearchResults: [],
+            hfSearchLoading: false,
+            hfSearchLoaded: false,
+            hfSearchDebounceTimer: null,
+
+            // Search history
+            hfSearchHistory: JSON.parse(localStorage.getItem('hfSearchHistory') || '[]'),
+            hfSearchHistoryOpen: false,
+
+            // Model detail modal
+            hfModelDetail: null,
+            hfModelDetailLoading: false,
 
             // Benchmark state
             benchModelId: '',
@@ -166,7 +190,9 @@
                     if (value === 'models') {
                         this.loadHFModels();
                         this.loadHFTasks();
-                        if (!this.hfRecommendedLoaded) this.loadRecommendedModels();
+                        if (this.modelsTab === 'downloader') {
+                            if (!this.hfRecommendedLoaded) this.loadRecommendedModels();
+                        }
                         const hasActive = this.hfTasks.some(t =>
                             t.status === 'pending' || t.status === 'downloading');
                         if (hasActive) this.startHFRefresh();
@@ -1318,6 +1344,8 @@
                     if (response.ok) {
                         this.hfRecommended = await response.json();
                         this.hfRecommendedLoaded = true;
+                        this.hfPage.trending = 1;
+                        this.hfPage.popular = 1;
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -1347,6 +1375,134 @@
                 if (count >= 1000000) return (count / 1000000).toFixed(1) + 'M';
                 if (count >= 1000) return (count / 1000).toFixed(1) + 'K';
                 return count.toString();
+            },
+
+            // Pagination helpers
+            getPagedModels(tab) {
+                const page = this.hfPage[tab] || 1;
+                const size = this.hfPageSize;
+                let list;
+                if (tab === 'trending') list = this.hfRecommended.trending || [];
+                else if (tab === 'popular') list = this.hfRecommended.popular || [];
+                else list = this.hfSearchResults || [];
+                return list.slice((page - 1) * size, page * size);
+            },
+
+            getTotalPages(tab) {
+                let total;
+                if (tab === 'trending') total = (this.hfRecommended.trending || []).length;
+                else if (tab === 'popular') total = (this.hfRecommended.popular || []).length;
+                else total = (this.hfSearchResults || []).length;
+                const maxPages = tab === 'search' ? 10 : 5;
+                return Math.min(Math.ceil(total / this.hfPageSize), maxPages);
+            },
+
+            setPage(tab, page) {
+                this.hfPage[tab] = page;
+                this.$nextTick(() => lucide.createIcons());
+            },
+
+            // Search
+            async searchHFModels() {
+                if (!this.hfSearchQuery.trim()) return;
+                this.hfSearchLoading = true;
+                this.hfRecommendedTab = 'search';
+                this.hfPage.search = 1;
+                try {
+                    const params = new URLSearchParams({
+                        q: this.hfSearchQuery,
+                        sort: this.hfSearchSort,
+                        limit: '100',
+                    });
+                    const response = await fetch(`/admin/api/hf/search?${params}`);
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.hfSearchResults = data.models || [];
+                        this.hfSearchLoaded = true;
+                        // Save to search history
+                        this.addSearchHistory(this.hfSearchQuery.trim());
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (err) {
+                    console.error('Search failed:', err);
+                } finally {
+                    this.hfSearchLoading = false;
+                    this.$nextTick(() => lucide.createIcons());
+                }
+            },
+
+            debounceSearch() {
+                clearTimeout(this.hfSearchDebounceTimer);
+                if (!this.hfSearchQuery.trim()) return;
+                this.hfSearchDebounceTimer = setTimeout(() => this.searchHFModels(), 500);
+            },
+
+            immediateSearch() {
+                clearTimeout(this.hfSearchDebounceTimer);
+                this.searchHFModels();
+            },
+
+            formatParamCount(params) {
+                if (!params) return null;
+                if (params >= 1e12) return (params / 1e12).toFixed(1) + 'T';
+                if (params >= 1e9) return (params / 1e9).toFixed(1) + 'B';
+                if (params >= 1e6) return (params / 1e6).toFixed(1) + 'M';
+                return params.toString();
+            },
+
+            // Search history
+            addSearchHistory(query) {
+                let history = this.hfSearchHistory.filter(h => h !== query);
+                history.unshift(query);
+                history = history.slice(0, 5);
+                this.hfSearchHistory = history;
+                localStorage.setItem('hfSearchHistory', JSON.stringify(history));
+            },
+
+            selectSearchHistory(query) {
+                this.hfSearchQuery = query;
+                this.hfSearchHistoryOpen = false;
+                this.searchHFModels();
+            },
+
+            closeSearchHistory() {
+                setTimeout(() => { this.hfSearchHistoryOpen = false; }, 150);
+            },
+
+            // Model detail modal
+            async openModelDetail(repoId) {
+                this.hfModelDetailLoading = true;
+                this.hfModelDetail = null;
+                try {
+                    const params = new URLSearchParams({ repo_id: repoId });
+                    const response = await fetch(`/admin/api/hf/model-info?${params}`);
+                    if (response.ok) {
+                        this.hfModelDetail = await response.json();
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        console.error('Failed to fetch model info');
+                    }
+                } catch (err) {
+                    console.error('Failed to fetch model info:', err);
+                } finally {
+                    this.hfModelDetailLoading = false;
+                    this.$nextTick(() => lucide.createIcons());
+                }
+            },
+
+            closeModelDetail() {
+                this.hfModelDetail = null;
+                this.hfModelDetailLoading = false;
+            },
+
+            formatFileSize(bytes) {
+                if (!bytes) return '';
+                if (bytes < 1024) return bytes + ' B';
+                if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+                if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+                return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
             },
         }
     }

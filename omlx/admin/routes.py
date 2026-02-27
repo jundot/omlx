@@ -1814,8 +1814,51 @@ async def get_recommended_models(is_admin: bool = Depends(require_admin)):
 
     from .hf_downloader import HFDownloader
 
-    result = await HFDownloader.get_recommended_models(max_memory_bytes=max_memory)
+    result = await HFDownloader.get_recommended_models(
+        max_memory_bytes=max_memory, result_limit=50
+    )
     return result
+
+
+@router.get("/api/hf/search")
+async def search_hf_models(
+    q: str = "",
+    sort: str = "trending",
+    limit: int = 100,
+    is_admin: bool = Depends(require_admin),
+):
+    """Search HuggingFace models by query."""
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
+
+    from .hf_downloader import HFDownloader
+
+    result = await HFDownloader.search_models(
+        query=q.strip(),
+        sort=sort,
+        limit=min(limit, 100),
+    )
+    return result
+
+
+@router.get("/api/hf/model-info")
+async def get_hf_model_info(
+    repo_id: str = "",
+    is_admin: bool = Depends(require_admin),
+):
+    """Get detailed model information from HuggingFace."""
+    if not repo_id.strip():
+        raise HTTPException(
+            status_code=400, detail="Query parameter 'repo_id' is required"
+        )
+
+    from .hf_downloader import HFDownloader
+
+    try:
+        result = await HFDownloader.get_model_info(repo_id=repo_id.strip())
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/api/hf/models")

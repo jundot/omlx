@@ -821,8 +821,34 @@ class TestGetRecommendedModels:
         assert "GB" in item["size_formatted"]
 
     @pytest.mark.asyncio
-    async def test_limits_to_10_per_category(self):
-        """Each category should return at most 10 models."""
+    async def test_respects_result_limit(self):
+        """Each category should respect the result_limit parameter."""
+        models = [
+            _make_mock_model(
+                f"mlx-community/model-{i}",
+                disk_size_bytes=1_000_000_000,
+                downloads=200 + i,
+                trending_score=i,
+            )
+            for i in range(60)
+        ]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = models
+            mock_api_cls.return_value = mock_api
+
+            # Default result_limit is 50
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=64 * 1024**3
+            )
+
+        assert len(result["trending"]) == 50
+        assert len(result["popular"]) == 50
+
+    @pytest.mark.asyncio
+    async def test_custom_result_limit(self):
+        """Test custom result_limit parameter."""
         models = [
             _make_mock_model(
                 f"mlx-community/model-{i}",
@@ -839,11 +865,296 @@ class TestGetRecommendedModels:
             mock_api_cls.return_value = mock_api
 
             result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=64 * 1024**3,
+                result_limit=5,
+            )
+
+        assert len(result["trending"]) == 5
+        assert len(result["popular"]) == 5
+
+    @pytest.mark.asyncio
+    async def test_model_dict_includes_params(self):
+        """Verify returned dicts include params and params_formatted."""
+        model = _make_mock_model(
+            "mlx-community/test-model",
+            disk_size_bytes=14_000_000_000,  # BF16: 7B params
+            downloads=200,
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
                 max_memory_bytes=64 * 1024**3
             )
 
-        assert len(result["trending"]) == 10
-        assert len(result["popular"]) == 10
+        item = result["trending"][0]
+        assert item["params"] == 7_000_000_000
+        assert item["params_formatted"] == "7.0B"
+
+
+# =============================================================================
+# Search Models Tests
+# =============================================================================
+
+
+class TestSearchModels:
+    """Test HFDownloader.search_models static method."""
+
+    @pytest.mark.asyncio
+    async def test_returns_models_and_total(self):
+        """Verify search returns models list and total count."""
+        mock_models = [
+            _make_mock_model(
+                "org/model-a",
+                disk_size_bytes=4_000_000_000,
+                downloads=500,
+            ),
+            _make_mock_model(
+                "org/model-b",
+                disk_size_bytes=8_000_000_000,
+                downloads=200,
+            ),
+        ]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = mock_models
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(query="model")
+
+        assert "models" in result
+        assert "total" in result
+        assert len(result["models"]) == 2
+        assert result["total"] == 2
+
+    @pytest.mark.asyncio
+    async def test_search_result_format(self):
+        """Verify search results have full repo_id as name."""
+        model = _make_mock_model(
+            "some-org/cool-model-4bit",
+            disk_size_bytes=6_000_000_000,
+            downloads=1000,
+            likes=42,
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(query="cool")
+
+        item = result["models"][0]
+        assert item["repo_id"] == "some-org/cool-model-4bit"
+        assert item["name"] == "some-org/cool-model-4bit"  # Full name for search
+        assert item["downloads"] == 1000
+        assert item["likes"] == 42
+        assert item["params"] == 3_000_000_000  # 6GB BF16 = 3B params
+        assert item["params_formatted"] == "3.0B"
+
+    @pytest.mark.asyncio
+    async def test_search_handles_no_safetensors(self):
+        """Models without safetensors should still appear with size=0."""
+        model = _make_mock_model("org/model", disk_size_bytes=None, downloads=100)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(query="model")
+
+        item = result["models"][0]
+        assert item["size"] == 0
+        assert item["params"] is None
+
+    @pytest.mark.asyncio
+    async def test_search_most_params_sort(self):
+        """Test most_params sorting works correctly."""
+        small = _make_mock_model("org/small", disk_size_bytes=2_000_000_000, downloads=100)
+        large = _make_mock_model("org/large", disk_size_bytes=20_000_000_000, downloads=100)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [small, large]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="model", sort="most_params"
+            )
+
+        # Large should come first
+        assert result["models"][0]["repo_id"] == "org/large"
+        assert result["models"][1]["repo_id"] == "org/small"
+
+    @pytest.mark.asyncio
+    async def test_search_least_params_sort(self):
+        """Test least_params sorting works correctly."""
+        small = _make_mock_model("org/small", disk_size_bytes=2_000_000_000, downloads=100)
+        large = _make_mock_model("org/large", disk_size_bytes=20_000_000_000, downloads=100)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [small, large]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="model", sort="least_params"
+            )
+
+        # Small should come first
+        assert result["models"][0]["repo_id"] == "org/small"
+        assert result["models"][1]["repo_id"] == "org/large"
+
+    @pytest.mark.asyncio
+    async def test_search_respects_limit(self):
+        """Test limit parameter is respected."""
+        models = [
+            _make_mock_model(
+                f"org/model-{i}", disk_size_bytes=1_000_000_000, downloads=100
+            )
+            for i in range(20)
+        ]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = models
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(query="model", limit=5)
+
+        assert len(result["models"]) == 5
+
+
+# =============================================================================
+# Get Model Info Tests
+# =============================================================================
+
+
+class TestGetModelInfo:
+    """Test HFDownloader.get_model_info static method."""
+
+    @pytest.mark.asyncio
+    async def test_returns_model_info(self):
+        """Verify model info returns expected fields."""
+        mock_info = MagicMock()
+        mock_info.id = "org/test-model"
+        mock_info.downloads = 5000
+        mock_info.likes = 100
+        mock_info.tags = ["text-generation", "mlx"]
+        mock_info.pipeline_tag = "text-generation"
+        mock_info.created_at = None
+        mock_info.last_modified = None
+        mock_info.safetensors = {"parameters": {"BF16": 7_000_000_000}, "total": 7_000_000_000}
+        mock_info.card_data = None
+
+        mock_sibling = MagicMock()
+        mock_sibling.rfilename = "model.safetensors"
+        mock_sibling.size = 14_000_000_000
+        mock_info.siblings = [mock_sibling]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls, \
+             patch("omlx.admin.hf_downloader.hf_hub_download", side_effect=Exception("no readme")):
+            mock_api = MagicMock()
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_model_info("org/test-model")
+
+        assert result["repo_id"] == "org/test-model"
+        assert result["downloads"] == 5000
+        assert result["likes"] == 100
+        assert result["params"] == 7_000_000_000
+        assert result["params_formatted"] == "7.0B"
+        assert len(result["files"]) == 1
+        assert result["files"][0]["name"] == "model.safetensors"
+        assert "text-generation" in result["tags"]
+        assert result["model_card"] == ""  # No README available
+
+    @pytest.mark.asyncio
+    async def test_returns_model_card(self, tmp_path):
+        """Verify model card content is fetched and front matter stripped."""
+        mock_info = MagicMock()
+        mock_info.id = "org/test-model"
+        mock_info.downloads = 100
+        mock_info.likes = 10
+        mock_info.tags = []
+        mock_info.pipeline_tag = "text-generation"
+        mock_info.created_at = None
+        mock_info.last_modified = None
+        mock_info.safetensors = None
+        mock_info.card_data = None
+        mock_info.siblings = []
+
+        # Create a fake README file with YAML front matter
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text("---\nlicense: mit\n---\n# My Model\n\nThis is a great model.")
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls, \
+             patch("omlx.admin.hf_downloader.hf_hub_download", return_value=str(readme_path)):
+            mock_api = MagicMock()
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_model_info("org/test-model")
+
+        assert "# My Model" in result["model_card"]
+        assert "This is a great model." in result["model_card"]
+        assert "license: mit" not in result["model_card"]
+
+
+# =============================================================================
+# Helper Function Tests
+# =============================================================================
+
+
+class TestFormatParamCount:
+    """Test _format_param_count helper."""
+
+    def test_billions(self):
+        from omlx.admin.hf_downloader import _format_param_count
+
+        assert _format_param_count(7_000_000_000) == "7.0B"
+        assert _format_param_count(13_500_000_000) == "13.5B"
+
+    def test_millions(self):
+        from omlx.admin.hf_downloader import _format_param_count
+
+        assert _format_param_count(125_000_000) == "125.0M"
+
+    def test_trillions(self):
+        from omlx.admin.hf_downloader import _format_param_count
+
+        assert _format_param_count(1_500_000_000_000) == "1.5T"
+
+    def test_small(self):
+        from omlx.admin.hf_downloader import _format_param_count
+
+        assert _format_param_count(500) == "500"
+
+
+class TestGetParamCount:
+    """Test _get_param_count helper."""
+
+    def test_single_dtype(self):
+        from omlx.admin.hf_downloader import _get_param_count
+
+        assert _get_param_count({"parameters": {"BF16": 7_000_000_000}}) == 7_000_000_000
+
+    def test_mixed_dtypes(self):
+        from omlx.admin.hf_downloader import _get_param_count
+
+        assert _get_param_count({"parameters": {"BF16": 100, "F32": 200}}) == 300
+
+    def test_empty(self):
+        from omlx.admin.hf_downloader import _get_param_count
+
+        assert _get_param_count({"parameters": {}}) == 0
+        assert _get_param_count({}) == 0
 
 
 class TestCalcSafetensorsDiskSize:
