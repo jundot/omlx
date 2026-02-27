@@ -579,7 +579,10 @@ class HFDownloader:
             self._cleanup_partial(task)
         except RepositoryNotFoundError:
             task.status = DownloadStatus.FAILED
-            task.error = f"Repository not found: {task.repo_id}"
+            task.error = (
+                f"Repository not found: {task.repo_id}. "
+                "This may be a gated model that requires HuggingFace authentication."
+            )
             logger.error(f"Repository not found: {task.repo_id}")
         except GatedRepoError:
             task.status = DownloadStatus.FAILED
