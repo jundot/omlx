@@ -22,7 +22,6 @@ from AppKit import (
     NSImageView,
     NSMakeRect,
     NSOpenPanel,
-    NSSecureTextField,
     NSTextField,
     NSView,
     NSVisualEffectBlendingModeBehindWindow,
@@ -35,6 +34,7 @@ from AppKit import (
 from Foundation import NSData, NSObject
 
 from .server_manager import PortConflict
+from .widgets import PastableSecureTextField
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +285,7 @@ class WelcomeWindowController(NSObject):
 
         current_key = self.config.get_server_api_key() or ""
 
-        self.api_key_secure = NSSecureTextField.alloc().initWithFrame_(
+        self.api_key_secure = PastableSecureTextField.alloc().initWithFrame_(
             NSMakeRect(130, cy - 2, 200, 22)
         )
         self.api_key_secure.setStringValue_(current_key)

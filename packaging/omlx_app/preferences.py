@@ -27,7 +27,6 @@ from AppKit import (
     NSImage,
     NSMakeRect,
     NSOpenPanel,
-    NSSecureTextField,
     NSTextField,
     NSView,
     NSVisualEffectBlendingModeBehindWindow,
@@ -38,6 +37,8 @@ from AppKit import (
     NSWindowStyleMaskTitled,
 )
 from Foundation import NSObject
+
+from .widgets import PastableSecureTextField
 
 logger = logging.getLogger(__name__)
 
@@ -245,7 +246,7 @@ class PreferencesWindowController(NSObject):
 
         current_key = self.config.get_server_api_key() or ""
 
-        self.api_key_secure = NSSecureTextField.alloc().initWithFrame_(
+        self.api_key_secure = PastableSecureTextField.alloc().initWithFrame_(
             NSMakeRect(140, cy - 2, 200, 22)
         )
         self.api_key_secure.setStringValue_(current_key)
