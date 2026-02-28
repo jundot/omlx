@@ -1259,6 +1259,10 @@ class TestCORSMiddleware:
 
         from omlx.server import app, init_server
 
+        # Reset middleware stack so add_middleware works even if app was
+        # already started by another test in the same process.
+        app.middleware_stack = None
+
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = GlobalSettings(base_path=Path(tmpdir))
             init_server(
