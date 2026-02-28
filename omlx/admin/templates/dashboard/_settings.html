@@ -185,7 +185,7 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="gauge" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Memory Management</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Resource Management</span>
                                 </div>
                                 <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">
                                     Live
@@ -252,6 +252,62 @@
                                         </span>
                                     </div>
                                 </div>
+                                <!-- Memory Limit (In-Memory Hot Cache) -->
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Hot Cache Limit (In-Memory Cache)</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">
+                                            In-memory cache for frequently accessed KV cache blocks.
+                                            <br>
+                                            Reduces SSD I/O latency for repeated prompts. <strong>0</strong> = disabled.
+                                        </p>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <input type="range" min="0" max="50" step="1"
+                                               x-model.number="hotCachePercent"
+                                               @input="updateHotCacheFromSlider()"
+                                               class="w-32 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer
+                                                      [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
+                                                      [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
+                                                      [&::-webkit-slider-thumb]:shadow-sm">
+                                        <span class="text-sm text-neutral-600 w-28 text-right">
+                                            <span x-text="hotCachePercent === 0 ? 'Off' : hotCachePercent + '%'"></span>
+                                            <span class="text-neutral-400">(<span x-text="getHotCacheDisplay()"></span>)</span>
+                                        </span>
+                                    </div>
+                                </div>
+                                <!-- SSD Cache Limit (Cold Cache) -->
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Cold Cache Limit (SSD Cache)</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">
+                                            Persistent SSD storage for evicted KV cache blocks.
+                                        </p>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <input type="range" min="0" max="100" step="5"
+                                               x-model.number="cachePercent"
+                                               @input="updateCacheFromSlider()"
+                                               class="w-32 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer
+                                                      [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
+                                                      [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
+                                                      [&::-webkit-slider-thumb]:shadow-sm">
+                                        <span class="text-sm text-neutral-600 w-28 text-right inline-flex items-center justify-end gap-0">
+                                            <span x-text="cachePercent + '%'"></span>
+                                            <span class="text-neutral-400 ml-1">(</span><span x-show="!editingCache" @click="editingCache = true" class="cursor-pointer hover:text-neutral-900" x-text="cacheSizeGB"></span><input x-show="editingCache"
+                                                   type="number"
+                                                   :value="cacheSizeGB"
+                                                   @change="updateCacheFromInput($event.target.value); editingCache = false"
+                                                   @blur="editingCache = false"
+                                                   @keydown.enter="updateCacheFromInput($event.target.value); editingCache = false"
+                                                   @keydown.escape="editingCache = false"
+                                                   x-init="if (editingCache) { $nextTick(() => $el.focus()) }"
+                                                   class="w-12 px-1 text-sm text-right border border-neutral-900 rounded focus:outline-none"
+                                                   min="0"
+                                                   step="1"><span class="text-neutral-400">GB)</span>
+                                        </span>
+                                    </div>
+                                </div>
                             </div>
                         </div>
 
@@ -281,34 +337,6 @@
                                     </div>
                                     <input type="text" x-model="globalSettings.cache.ssd_cache_dir"
                                            class="w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
-                                </div>
-                                <div class="flex items-center justify-between px-6 py-4">
-                                    <div class="flex items-center gap-2">
-                                        <label class="text-sm text-neutral-700">Max Cache Size</label>
-                                    </div>
-                                    <div class="flex items-center gap-3">
-                                        <input type="range" min="0" max="100" step="5"
-                                               x-model.number="cachePercent"
-                                               @input="updateCacheFromSlider()"
-                                               class="w-32 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer
-                                                      [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
-                                                      [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
-                                                      [&::-webkit-slider-thumb]:shadow-sm">
-                                        <span class="text-sm text-neutral-600 w-28 text-right inline-flex items-center justify-end gap-0">
-                                            <span x-text="cachePercent + '%'"></span>
-                                            <span class="text-neutral-400 ml-1">(</span><span x-show="!editingCache" @click="editingCache = true" class="cursor-pointer hover:text-neutral-900" x-text="cacheSizeGB"></span><input x-show="editingCache"
-                                                   type="number"
-                                                   :value="cacheSizeGB"
-                                                   @change="updateCacheFromInput($event.target.value); editingCache = false"
-                                                   @blur="editingCache = false"
-                                                   @keydown.enter="updateCacheFromInput($event.target.value); editingCache = false"
-                                                   @keydown.escape="editingCache = false"
-                                                   x-init="if (editingCache) { $nextTick(() => $el.focus()) }"
-                                                   class="w-12 px-1 text-sm text-right border border-neutral-900 rounded focus:outline-none"
-                                                   min="0"
-                                                   step="1"><span class="text-neutral-400">GB)</span>
-                                        </span>
-                                    </div>
                                 </div>
                             </div>
                         </div>

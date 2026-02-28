@@ -222,6 +222,7 @@ class CacheSettings:
     enabled: bool = True
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
+    hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
 
     def get_ssd_cache_dir(self, base_path: Path) -> Path:
         """
@@ -252,12 +253,17 @@ class CacheSettings:
             return int(get_ssd_capacity(cache_dir) * 0.1)
         return parse_size(self.ssd_cache_max_size)
 
+    def get_hot_cache_max_size_bytes(self) -> int:
+        """Get hot cache max size in bytes. 0 means disabled."""
+        return parse_size(self.hot_cache_max_size)
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
             "enabled": self.enabled,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
+            "hot_cache_max_size": self.hot_cache_max_size,
         }
 
     @classmethod
@@ -267,6 +273,7 @@ class CacheSettings:
             enabled=data.get("enabled", True),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
+            hot_cache_max_size=data.get("hot_cache_max_size", "0"),
         )
 
 

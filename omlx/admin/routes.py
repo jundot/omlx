@@ -94,6 +94,7 @@ class GlobalSettingsRequest(BaseModel):
     cache_enabled: Optional[bool] = None
     ssd_cache_dir: Optional[str] = None
     ssd_cache_max_size: Optional[str] = None
+    hot_cache_max_size: Optional[str] = None  # "0" = disabled, "8GB", etc.
 
     # MCP settings
     mcp_config: Optional[str] = None
@@ -336,6 +337,7 @@ async def _apply_cache_settings_runtime(
     ssd_cache_dir: Optional[str],
     ssd_cache_max_size: Optional[str],
     global_settings,
+    hot_cache_max_size: Optional[str] = None,
 ) -> tuple[bool, str]:
     """
     Apply cache settings at runtime.
@@ -387,6 +389,21 @@ async def _apply_cache_settings_runtime(
             pool._scheduler_config.paged_ssd_cache_max_size = parse_size(
                 global_settings.cache.ssd_cache_max_size
             )
+
+    # Apply hot cache max size
+    if hot_cache_max_size is not None:
+        hot_bytes = 0 if hot_cache_max_size == "0" else parse_size(hot_cache_max_size)
+        old_hot = pool._scheduler_config.hot_cache_max_size
+        pool._scheduler_config.hot_cache_max_size = hot_bytes
+        if hot_bytes != old_hot:
+            from ..utils.formatting import format_bytes
+            old_str = "Off" if old_hot == 0 else format_bytes(old_hot)
+            new_str = "Off" if hot_bytes == 0 else format_bytes(hot_bytes)
+            logger.info(f"Hot cache max size changed: {old_str} -> {new_str}")
+    elif global_settings.cache.hot_cache_max_size:
+        pool._scheduler_config.hot_cache_max_size = (
+            global_settings.cache.get_hot_cache_max_size_bytes()
+        )
 
     # Unload all loaded models so they use new config when reloaded
     loaded_models = pool.get_loaded_model_ids()
@@ -1190,6 +1207,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "ssd_cache_max_size": _format_cache_size(
                 global_settings.cache.get_ssd_cache_max_size_bytes(global_settings.base_path)
             ),
+            "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
         },
         "mcp": {
             "config_path": global_settings.mcp.config_path,
@@ -1338,6 +1356,9 @@ async def update_global_settings(
     if request.ssd_cache_max_size is not None:
         global_settings.cache.ssd_cache_max_size = request.ssd_cache_max_size
         cache_changed = True
+    if request.hot_cache_max_size is not None:
+        global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
+        cache_changed = True
 
     if cache_changed:
         success, msg = await _apply_cache_settings_runtime(
@@ -1345,6 +1366,7 @@ async def update_global_settings(
             request.ssd_cache_dir,
             request.ssd_cache_max_size,
             global_settings,
+            hot_cache_max_size=request.hot_cache_max_size,
         )
         if success:
             runtime_applied.append("cache")

@@ -1035,10 +1035,13 @@ class TestAsyncWriteAndTimeoutLoad:
         )
         import time as time_mod
         for _ in range(50):
-            with ssd_cache._pending_writes_lock:
-                if block_hash not in ssd_cache._pending_writes:
+            with ssd_cache._pending_write_hashes_lock:
+                if block_hash not in ssd_cache._pending_write_hashes:
                     break
             time_mod.sleep(0.1)
+
+        # Remove from hot cache buffer so load goes to disk
+        ssd_cache._hot_cache_remove(block_hash)
 
         # Mock mx.load to simulate a corrupted file
         with patch("mlx.core.load", side_effect=OSError("corrupted file")):
@@ -1073,8 +1076,8 @@ class TestAsyncWriteAndTimeoutLoad:
 
         # Wait for all pending writes to flush
         for _ in range(100):
-            with ssd_cache._pending_writes_lock:
-                if not ssd_cache._pending_writes:
+            with ssd_cache._pending_write_hashes_lock:
+                if not ssd_cache._pending_write_hashes:
                     break
             time_mod.sleep(0.1)
 
@@ -1122,9 +1125,9 @@ class TestAsyncWriteAndTimeoutLoad:
 
         # Background writer should have removed the block from index on error
         assert not ssd_cache.has_block(block_hash)
-        # And from pending writes
-        with ssd_cache._pending_writes_lock:
-            assert block_hash not in ssd_cache._pending_writes
+        # And from pending write hashes
+        with ssd_cache._pending_write_hashes_lock:
+            assert block_hash not in ssd_cache._pending_write_hashes
 
     def test_graceful_shutdown(self, tmp_path, mx):
         """Verify close() stops the writer thread."""
@@ -1176,10 +1179,13 @@ class TestAsyncWriteAndTimeoutLoad:
 
         # Wait for background write to complete
         for _ in range(50):
-            with ssd_cache._pending_writes_lock:
-                if block_hash not in ssd_cache._pending_writes:
+            with ssd_cache._pending_write_hashes_lock:
+                if block_hash not in ssd_cache._pending_write_hashes:
                     break
             time_mod.sleep(0.1)
+
+        # Remove from hot cache buffer so load goes to disk
+        ssd_cache._hot_cache_remove(block_hash)
 
         # Now load should come from disk, not pending writes
         loaded = ssd_cache.load_block(block_hash)
@@ -1319,9 +1325,9 @@ class TestAsyncBackgroundWrite:
             # mx.save_safetensors should NOT be called (we use _write_safetensors_no_mx)
             mock_save.assert_not_called()
 
-        # pending_writes should store tensors_raw (bytes), not arrays (mx.array)
-        with manager._pending_writes_lock:
-            pending = manager._pending_writes.get(block_hash)
+        # Hot cache buffer should store tensors_raw (bytes), not arrays (mx.array)
+        with manager._hot_cache_lock:
+            pending = manager._hot_cache.get(block_hash)
         assert pending is not None
         assert 'tensors_raw' in pending
         assert 'arrays' not in pending  # Old key should not exist

@@ -482,12 +482,12 @@ class BlockAwarePrefixCache(CacheManager):
                     if saved:
                         blocks_saved_to_ssd += 1
                         logger.debug(
-                            f"Saved block {block.block_id} to paged SSD: "
+                            f"Saved block {block.block_id} to tiered cache: "
                             f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
                         )
                     else:
                         logger.warning(
-                            f"Failed to save block {block.block_id} to paged SSD"
+                            f"Failed to save block {block.block_id} to tiered cache"
                         )
                 else:
                     # Failed to extract tensor data - free block and stop
@@ -511,7 +511,7 @@ class BlockAwarePrefixCache(CacheManager):
 
         logger.debug(
             f"Stored cache for {request_id}: "
-            f"{len(block_table.block_ids)} blocks ({blocks_saved_to_ssd} saved to paged SSD), "
+            f"{len(block_table.block_ids)} blocks ({blocks_saved_to_ssd} saved to tiered cache), "
             f"{block_table.num_tokens} tokens"
         )
 
@@ -1152,7 +1152,7 @@ class BlockAwarePrefixCache(CacheManager):
                 )
                 if block_data is None:
                     logger.debug(
-                        f"Failed to load block {block_id} from paged SSD, "
+                        f"Failed to load block {block_id} from tiered cache, "
                         f"using {valid_block_count} valid blocks"
                     )
                     # Remove failed block from hash cache to prevent future false hits
@@ -1214,7 +1214,7 @@ class BlockAwarePrefixCache(CacheManager):
                 # Validate loaded data (pass cache types for hybrid models)
                 if not self._validate_block_cache_data(block_data, layer_cache_types):
                     logger.debug(
-                        f"Block {block_id} has invalid layer data from paged SSD, "
+                        f"Block {block_id} has invalid layer data from tiered cache, "
                         f"using {valid_block_count} valid blocks"
                     )
                     break  # Stop here, use valid prefix
@@ -1516,7 +1516,7 @@ class BlockAwarePrefixCache(CacheManager):
                 return None
 
             logger.debug(
-                f"Reconstructed cache from paged SSD: {len(reconstructed_caches)} layers, "
+                f"Reconstructed cache from tiered cache: {len(reconstructed_caches)} layers, "
                 f"{block_table.num_tokens} tokens from {len(block_table.block_ids)} blocks"
             )
 

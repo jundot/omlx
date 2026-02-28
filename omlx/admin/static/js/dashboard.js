@@ -16,7 +16,7 @@
                 model: { model_dirs: [''], max_model_memory: '' },
                 memory: { max_process_memory: 'auto' },
                 scheduler: { max_num_seqs: 8, prefill_batch_size: 8, completion_batch_size: 8 },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto' },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0' },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
                 auth: { api_key_set: false, api_key: '' },
@@ -33,6 +33,8 @@
             // Cache slider (0-100%)
             cachePercent: 10,
             editingCache: false,
+            // Hot cache slider (0-50%)
+            hotCachePercent: 0,
 
             // Models
             models: [],
@@ -258,6 +260,12 @@
                         );
                         // Sync the cache string value from percent
                         this.updateCacheFromSlider();
+
+                        // Calculate hot cache percent from stored value
+                        this.hotCachePercent = this.parseHotCacheToPercent(
+                            this.globalSettings.cache.hot_cache_max_size,
+                            this.globalSettings.system.total_memory_bytes
+                        );
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -321,6 +329,7 @@
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
+                            hot_cache_max_size: this.globalSettings.cache.hot_cache_max_size,
                             sampling_max_context_window: this.globalSettings.sampling.max_context_window,
                             sampling_max_tokens: this.globalSettings.sampling.max_tokens,
                             sampling_temperature: this.globalSettings.sampling.temperature,
@@ -1123,6 +1132,45 @@
                     const bytes = gb * 1024 * 1024 * 1024;
                     this.cachePercent = Math.round((bytes / freeBytes) * 100);
                 }
+            },
+
+            // Parse hot cache size string to percent of total memory
+            parseHotCacheToPercent(hotCacheStr, totalBytes) {
+                if (!hotCacheStr || hotCacheStr === '0' || !totalBytes || totalBytes === 0) {
+                    return 0;
+                }
+                const match = hotCacheStr.match(/^(\d+(?:\.\d+)?)\s*(GB|MB|TB)?$/i);
+                if (!match) return 0;
+
+                let bytes = parseFloat(match[1]);
+                const unit = (match[2] || 'GB').toUpperCase();
+                if (unit === 'TB') bytes *= 1024 * 1024 * 1024 * 1024;
+                else if (unit === 'GB') bytes *= 1024 * 1024 * 1024;
+                else if (unit === 'MB') bytes *= 1024 * 1024;
+
+                const percent = Math.round((bytes / totalBytes) * 100);
+                return Math.min(50, Math.max(0, percent));
+            },
+
+            // Update hot cache setting from slider
+            updateHotCacheFromSlider() {
+                if (this.hotCachePercent === 0) {
+                    this.globalSettings.cache.hot_cache_max_size = '0';
+                } else {
+                    const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
+                    const bytes = Math.floor((this.hotCachePercent / 100) * totalBytes);
+                    const gb = Math.floor(bytes / (1024 * 1024 * 1024));
+                    this.globalSettings.cache.hot_cache_max_size = gb > 0 ? `${gb}GB` : '0';
+                }
+            },
+
+            // Get formatted hot cache size for display
+            getHotCacheDisplay() {
+                if (this.hotCachePercent === 0) return '0GB';
+                const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
+                const bytes = Math.floor((this.hotCachePercent / 100) * totalBytes);
+                const gb = Math.floor(bytes / (1024 * 1024 * 1024));
+                return `${gb}GB`;
             },
 
             // Sort models
