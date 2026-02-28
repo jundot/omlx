@@ -11,6 +11,7 @@ import pytest
 
 from omlx.api.utils import (
     SPECIAL_TOKENS_PATTERN,
+    _merge_consecutive_roles,
     clean_output_text,
     extract_harmony_messages,
     extract_text_content,
@@ -837,3 +838,151 @@ class TestExtractHarmonyMessages:
         content = result[0]["content"]
         assert isinstance(content, dict)
         assert content["result"] == "success"
+
+
+class TestMergeConsecutiveRoles:
+    """Tests for consecutive same-role message merging."""
+
+    # --- Unit tests for _merge_consecutive_roles ---
+
+    def test_empty_list(self):
+        """Empty list should be returned as-is."""
+        assert _merge_consecutive_roles([]) == []
+
+    def test_single_message(self):
+        """Single message should be returned unchanged."""
+        msgs = [{"role": "user", "content": "Hello"}]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        assert result[0]["content"] == "Hello"
+
+    def test_consecutive_user_merged(self):
+        """Two consecutive user messages should be merged."""
+        msgs = [
+            {"role": "user", "content": "First"},
+            {"role": "user", "content": "Second"},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert result[0]["content"] == "First\n\nSecond"
+
+    def test_three_consecutive_user_merged(self):
+        """Three consecutive user messages should all merge into one."""
+        msgs = [
+            {"role": "user", "content": "First"},
+            {"role": "user", "content": "Second"},
+            {"role": "user", "content": "Third"},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        assert result[0]["content"] == "First\n\nSecond\n\nThird"
+
+    def test_consecutive_assistant_merged(self):
+        """Two consecutive assistant messages should be merged."""
+        msgs = [
+            {"role": "assistant", "content": "Part 1"},
+            {"role": "assistant", "content": "Part 2"},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        assert result[0]["content"] == "Part 1\n\nPart 2"
+
+    def test_system_messages_not_merged(self):
+        """Consecutive system messages should NOT be merged."""
+        msgs = [
+            {"role": "system", "content": "Instruction 1"},
+            {"role": "system", "content": "Instruction 2"},
+            {"role": "user", "content": "Hello"},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 3
+
+    def test_tool_messages_not_merged(self):
+        """Consecutive tool messages should NOT be merged."""
+        msgs = [
+            {"role": "tool", "content": "Result 1", "tool_call_id": "a"},
+            {"role": "tool", "content": "Result 2", "tool_call_id": "b"},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 2
+
+    def test_alternating_roles_unchanged(self):
+        """Properly alternating messages should not be affected."""
+        msgs = [
+            {"role": "system", "content": "Be helpful"},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+            {"role": "user", "content": "How are you?"},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 4
+
+    def test_empty_content_merge(self):
+        """Merging with empty content should not add separators."""
+        msgs = [
+            {"role": "user", "content": "Hello"},
+            {"role": "user", "content": ""},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        assert result[0]["content"] == "Hello"
+
+    def test_both_empty_content(self):
+        """Merging two empty-content messages."""
+        msgs = [
+            {"role": "user", "content": ""},
+            {"role": "user", "content": ""},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        assert result[0]["content"] == ""
+
+    def test_does_not_mutate_input(self):
+        """Merging should not mutate the input list."""
+        msgs = [
+            {"role": "user", "content": "First"},
+            {"role": "user", "content": "Second"},
+        ]
+        original_first = msgs[0]["content"]
+        _merge_consecutive_roles(msgs)
+        assert msgs[0]["content"] == original_first
+        assert len(msgs) == 2
+
+    # --- Integration tests through extract_text_content ---
+
+    def test_extract_text_content_merges_consecutive_user(self):
+        """extract_text_content should merge consecutive user messages."""
+        messages = [
+            Message(role="user", content="Page content here"),
+            Message(role="user", content="What is this about?"),
+        ]
+        result = extract_text_content(messages)
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert "Page content here" in result[0]["content"]
+        assert "What is this about?" in result[0]["content"]
+
+    def test_brave_leo_pattern(self):
+        """Simulate Brave Leo BYOM: system + two consecutive user messages."""
+        messages = [
+            Message(role="system", content="You are a helpful assistant."),
+            Message(role="user", content="Here is some context: blah blah"),
+            Message(role="user", content="What does this mean?"),
+        ]
+        result = extract_text_content(messages)
+        assert len(result) == 2  # system + merged user
+        assert result[0]["role"] == "system"
+        assert result[1]["role"] == "user"
+        assert "blah blah" in result[1]["content"]
+        assert "What does this mean?" in result[1]["content"]
+
+    def test_extract_harmony_merges_consecutive_user(self):
+        """extract_harmony_messages should merge consecutive user messages."""
+        messages = [
+            Message(role="user", content="First"),
+            Message(role="user", content="Second"),
+        ]
+        result = extract_harmony_messages(messages)
+        assert len(result) == 1
+        assert result[0]["content"] == "First\n\nSecond"

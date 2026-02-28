@@ -1373,10 +1373,18 @@ async def create_chat_completion(
             chat_template_kwargs=merged_ct_kwargs or None,
         )
     except Exception as e:
-        # Catch Jinja2 TemplateError and similar template rendering failures
-        # (e.g. unsupported message roles, invalid content format)
-        if "template" in type(e).__name__.lower() or "template" in str(e).lower():
-            raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
+        # Catch chat template rendering failures: Jinja2 TemplateError,
+        # AssertionError from strict role validation, ValueError, etc.
+        err_name = type(e).__name__.lower()
+        err_msg = str(e).lower()
+        if (
+            "template" in err_name
+            or "template" in err_msg
+            or isinstance(e, (AssertionError, ValueError))
+        ):
+            raise HTTPException(
+                status_code=400, detail=f"Chat template error: {e}"
+            )
         raise
     validate_context_window(num_prompt_tokens, request.model)
 
@@ -2136,8 +2144,16 @@ async def create_anthropic_message(
             chat_template_kwargs=merged_ct_kwargs or None,
         )
     except Exception as e:
-        if "template" in type(e).__name__.lower() or "template" in str(e).lower():
-            raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
+        err_name = type(e).__name__.lower()
+        err_msg = str(e).lower()
+        if (
+            "template" in err_name
+            or "template" in err_msg
+            or isinstance(e, (AssertionError, ValueError))
+        ):
+            raise HTTPException(
+                status_code=400, detail=f"Chat template error: {e}"
+            )
         raise
     validate_context_window(num_prompt_tokens, request.model)
 

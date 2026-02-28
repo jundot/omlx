@@ -78,6 +78,45 @@ def _extract_text_from_content_list(content: list) -> str:
     return "\n".join(text_parts) if text_parts else ""
 
 
+# Roles eligible for merging when consecutive.
+# System and tool messages are excluded: system messages have distinct semantics
+# (e.g., JSON schema instructions), and tool messages carry tool_call_id.
+_MERGEABLE_ROLES = {"user", "assistant"}
+
+
+def _merge_consecutive_roles(messages: list[dict]) -> list[dict]:
+    """Merge consecutive messages with the same mergeable role.
+
+    Models with strict chat templates (e.g., Gemma-3) enforce alternating
+    user/assistant roles and reject consecutive same-role messages.
+    OpenAI's API accepts these, so we merge them for compatibility.
+
+    Args:
+        messages: List of processed message dicts with 'role' and 'content'.
+
+    Returns:
+        New list with consecutive same-role messages merged using "\\n\\n".
+    """
+    if not messages:
+        return messages
+
+    merged: list[dict] = [messages[0].copy()]
+
+    for msg in messages[1:]:
+        prev = merged[-1]
+        if msg["role"] == prev["role"] and msg["role"] in _MERGEABLE_ROLES:
+            prev_content = prev.get("content", "")
+            new_content = msg.get("content", "")
+            if prev_content and new_content:
+                prev["content"] = prev_content + "\n\n" + new_content
+            elif new_content:
+                prev["content"] = new_content
+        else:
+            merged.append(msg.copy())
+
+    return merged
+
+
 def extract_text_content(
     messages: List[Message],
     max_tool_result_tokens: int | None = None,
@@ -208,7 +247,7 @@ def extract_text_content(
             # Unknown format, try to convert
             processed_messages.append({"role": role, "content": str(content)})
 
-    return processed_messages
+    return _merge_consecutive_roles(processed_messages)
 
 
 # =============================================================================
@@ -417,4 +456,4 @@ def extract_harmony_messages(
         else:
             processed_messages.append({"role": role, "content": str(content)})
 
-    return processed_messages
+    return _merge_consecutive_roles(processed_messages)

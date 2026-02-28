@@ -111,7 +111,9 @@ def convert_anthropic_to_internal(
             # Unknown format
             processed_messages.append({"role": role, "content": str(content)})
 
-    return processed_messages
+    from .utils import _merge_consecutive_roles
+
+    return _merge_consecutive_roles(processed_messages)
 
 
 def convert_anthropic_to_internal_harmony(
@@ -294,7 +296,9 @@ def convert_anthropic_to_internal_harmony(
             # Unknown format
             processed_messages.append({"role": role, "content": str(content)})
 
-    return processed_messages
+    from .utils import _merge_consecutive_roles
+
+    return _merge_consecutive_roles(processed_messages)
 
 
 # Prefix to filter out from system blocks (billing metadata that
