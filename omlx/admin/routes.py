@@ -64,6 +64,7 @@ class ModelSettingsRequest(BaseModel):
     force_sampling: Optional[bool] = None
     max_tool_result_tokens: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    forced_ct_kwargs: Optional[list[str]] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
 
@@ -1019,6 +1020,8 @@ async def update_model_settings(
         )
     if "chat_template_kwargs" in sent:
         current_settings.chat_template_kwargs = request.chat_template_kwargs
+    if "forced_ct_kwargs" in sent:
+        current_settings.forced_ct_kwargs = request.forced_ct_kwargs
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry

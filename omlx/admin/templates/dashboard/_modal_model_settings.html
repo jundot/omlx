@@ -129,13 +129,13 @@
                                 <div x-show="addOpen" @click.away="addOpen = false" x-transition
                                      class="absolute right-0 mt-1 w-44 bg-white border border-neutral-200 rounded-lg shadow-lg z-10 py-1">
                                     <button type="button"
-                                            @click="modelSettings.ctKwargEntries.push({type: 'enable_thinking', value: 'true'}); addOpen = false; $nextTick(() => lucide.createIcons())"
+                                            @click="modelSettings.ctKwargEntries.push({type: 'enable_thinking', value: 'true', force: false}); addOpen = false; $nextTick(() => lucide.createIcons())"
                                             class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">enable_thinking</button>
                                     <button type="button"
-                                            @click="modelSettings.ctKwargEntries.push({type: 'reasoning_effort', value: 'low'}); addOpen = false; $nextTick(() => lucide.createIcons())"
+                                            @click="modelSettings.ctKwargEntries.push({type: 'reasoning_effort', value: 'low', force: false}); addOpen = false; $nextTick(() => lucide.createIcons())"
                                             class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">reasoning_effort</button>
                                     <button type="button"
-                                            @click="modelSettings.ctKwargEntries.push({type: 'custom', key: '', value: ''}); addOpen = false; $nextTick(() => lucide.createIcons())"
+                                            @click="modelSettings.ctKwargEntries.push({type: 'custom', key: '', value: '', force: false}); addOpen = false; $nextTick(() => lucide.createIcons())"
                                             class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">Custom</button>
                                 </div>
                             </div>
@@ -176,6 +176,12 @@
                                                class="px-3 py-1.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all min-w-0">
                                     </div>
                                 </template>
+                                <!-- Force checkbox -->
+                                <label class="flex items-center gap-1 flex-shrink-0" title="Force: API requests cannot override this value">
+                                    <input type="checkbox" x-model="entry.force"
+                                           class="w-3.5 h-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                    <span class="text-xs text-neutral-400">Force</span>
+                                </label>
                                 <!-- Remove button -->
                                 <button type="button" @click="modelSettings.ctKwargEntries.splice(idx, 1)"
                                         class="p-1 text-neutral-400 hover:text-red-500 transition-colors flex-shrink-0">

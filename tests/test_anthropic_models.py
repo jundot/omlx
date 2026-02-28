@@ -294,6 +294,12 @@ class TestThinkingConfig:
 
         assert config.type == "disabled"
 
+    def test_thinking_adaptive(self):
+        """Test adaptive thinking config."""
+        config = ThinkingConfig(type="adaptive")
+
+        assert config.type == "adaptive"
+
     def test_thinking_default_type(self):
         """Test thinking config defaults to enabled."""
         config = ThinkingConfig()

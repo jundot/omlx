@@ -1334,14 +1334,18 @@ async def create_chat_completion(
     # Get per-model settings
     max_tool_result_tokens = None
     merged_ct_kwargs = {}
+    forced_keys: set[str] = set()
     if _server_state.settings_manager:
         ms = _server_state.settings_manager.get_settings(request.model)
         max_tool_result_tokens = ms.max_tool_result_tokens
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
-    # Per-request kwargs override model settings
+        forced_keys = set(ms.forced_ct_kwargs or [])
+    # Per-request kwargs override model settings (except forced keys)
     if request.chat_template_kwargs:
-        merged_ct_kwargs.update(request.chat_template_kwargs)
+        for k, v in request.chat_template_kwargs.items():
+            if k not in forced_keys:
+                merged_ct_kwargs[k] = v
 
     # Extract messages - Harmony models need special handling to preserve tool format
     if engine.model_type == "gpt_oss":
@@ -2057,22 +2061,27 @@ async def create_anthropic_message(
     # Get per-model settings
     max_tool_result_tokens = None
     merged_ct_kwargs = {}
+    forced_keys: set[str] = set()
     if _server_state.settings_manager:
         ms = _server_state.settings_manager.get_settings(request.model)
         max_tool_result_tokens = ms.max_tool_result_tokens
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
-    # Per-request kwargs override model settings
+        forced_keys = set(ms.forced_ct_kwargs or [])
+    # Per-request kwargs override model settings (except forced keys)
     if request.chat_template_kwargs:
-        merged_ct_kwargs.update(request.chat_template_kwargs)
+        for k, v in request.chat_template_kwargs.items():
+            if k not in forced_keys:
+                merged_ct_kwargs[k] = v
 
-    # Pass Anthropic thinking config to chat template
+    # Pass Anthropic thinking config to chat template (except forced keys)
     if hasattr(request, 'thinking') and request.thinking:
-        thinking_type = getattr(request.thinking, 'type', None)
-        if thinking_type == "enabled":
-            merged_ct_kwargs["enable_thinking"] = True
-        elif thinking_type == "disabled":
-            merged_ct_kwargs["enable_thinking"] = False
+        if "enable_thinking" not in forced_keys:
+            thinking_type = getattr(request.thinking, 'type', None)
+            if thinking_type in ("enabled", "adaptive"):
+                merged_ct_kwargs["enable_thinking"] = True
+            elif thinking_type == "disabled":
+                merged_ct_kwargs["enable_thinking"] = False
 
     logger.debug(
         f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "

@@ -285,6 +285,40 @@ class TestModelSettingsManager:
             loaded = manager.get_settings("test-model")
             assert loaded.chat_template_kwargs is None
 
+    def test_forced_ct_kwargs_persist(self):
+        """Test forced_ct_kwargs survives save/load cycle."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            settings = ModelSettings(
+                chat_template_kwargs={"enable_thinking": False},
+                forced_ct_kwargs=["enable_thinking"],
+            )
+            manager.set_settings("test-model", settings)
+
+            # Reload from file
+            manager2 = ModelSettingsManager(Path(tmpdir))
+            loaded = manager2.get_settings("test-model")
+            assert loaded.forced_ct_kwargs == ["enable_thinking"]
+            assert loaded.chat_template_kwargs == {"enable_thinking": False}
+
+    def test_forced_ct_kwargs_default_none(self):
+        """Test forced_ct_kwargs defaults to None."""
+        settings = ModelSettings()
+        assert settings.forced_ct_kwargs is None
+        d = settings.to_dict()
+        assert "forced_ct_kwargs" not in d
+
+    def test_forced_ct_kwargs_roundtrip(self):
+        """Test forced_ct_kwargs survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(
+            chat_template_kwargs={"enable_thinking": True, "reasoning_effort": "low"},
+            forced_ct_kwargs=["enable_thinking", "reasoning_effort"],
+        )
+        d = original.to_dict()
+        restored = ModelSettings.from_dict(d)
+        assert restored.forced_ct_kwargs == ["enable_thinking", "reasoning_effort"]
+
     def test_thread_safety(self):
         """Test thread-safe access."""
         import threading

@@ -413,14 +413,15 @@
                 const settings = model.settings || {};
                 // Parse chat_template_kwargs into ctKwargEntries
                 const ctk = settings.chat_template_kwargs || {};
+                const forcedKeys = new Set(settings.forced_ct_kwargs || []);
                 const ctKwargEntries = [];
                 for (const [key, value] of Object.entries(ctk)) {
                     if (key === 'enable_thinking') {
-                        ctKwargEntries.push({type: 'enable_thinking', value: String(value)});
+                        ctKwargEntries.push({type: 'enable_thinking', value: String(value), force: forcedKeys.has('enable_thinking')});
                     } else if (key === 'reasoning_effort') {
-                        ctKwargEntries.push({type: 'reasoning_effort', value: String(value)});
+                        ctKwargEntries.push({type: 'reasoning_effort', value: String(value), force: forcedKeys.has('reasoning_effort')});
                     } else {
-                        ctKwargEntries.push({type: 'custom', key, value: String(value)});
+                        ctKwargEntries.push({type: 'custom', key, value: String(value), force: forcedKeys.has(key)});
                     }
                 }
                 this.modelSettings = {
@@ -448,19 +449,24 @@
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify((() => {
-                            // Build chat_template_kwargs from ctKwargEntries
+                            // Build chat_template_kwargs and forced_ct_kwargs from ctKwargEntries
                             const chatTemplateKwargs = {};
+                            const forcedCtKwargs = [];
                             for (const entry of this.modelSettings.ctKwargEntries) {
                                 if (entry.type === 'enable_thinking') {
                                     chatTemplateKwargs.enable_thinking = entry.value === 'true';
+                                    if (entry.force) forcedCtKwargs.push('enable_thinking');
                                 } else if (entry.type === 'reasoning_effort') {
                                     chatTemplateKwargs.reasoning_effort = entry.value;
+                                    if (entry.force) forcedCtKwargs.push('reasoning_effort');
                                 } else if (entry.type === 'custom' && entry.key && entry.key.trim()) {
                                     let val = entry.value;
                                     if (val === 'true') val = true;
                                     else if (val === 'false') val = false;
                                     else if (!isNaN(Number(val)) && val.trim() !== '') val = Number(val);
-                                    chatTemplateKwargs[entry.key.trim()] = val;
+                                    const key = entry.key.trim();
+                                    chatTemplateKwargs[key] = val;
+                                    if (entry.force) forcedCtKwargs.push(key);
                                 }
                             }
                             return {
@@ -476,6 +482,8 @@
                                     : 0,
                                 chat_template_kwargs: Object.keys(chatTemplateKwargs).length > 0
                                     ? chatTemplateKwargs : null,
+                                forced_ct_kwargs: forcedCtKwargs.length > 0
+                                    ? forcedCtKwargs : null,
                             };
                         })()),
                     });
