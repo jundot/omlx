@@ -926,6 +926,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "force_sampling": settings.force_sampling,
                 "max_tool_result_tokens": settings.max_tool_result_tokens,
                 "chat_template_kwargs": settings.chat_template_kwargs,
+                "forced_ct_kwargs": settings.forced_ct_kwargs,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
