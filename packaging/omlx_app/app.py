@@ -59,6 +59,8 @@ class OMLXAppDelegate(NSObject):
         self._icon_filled: Optional[NSImage] = None
         self._update_info: Optional[dict] = None
         self._last_update_check: float = 0
+        self._updater = None  # AppUpdater instance during download
+        self._update_ready = False  # True when staged app is ready to swap
 
         return self
 
@@ -115,6 +117,11 @@ class OMLXAppDelegate(NSObject):
         NSApp.activateIgnoringOtherApps_(True)
 
         logger.info("oMLX menubar app launched successfully")
+
+        # Clean up leftover staged update from previous attempt
+        from .updater import AppUpdater
+
+        AppUpdater.cleanup_staged_app()
 
         # Check for updates (non-blocking, cached for 24h)
         self._check_for_updates()
@@ -244,9 +251,17 @@ class OMLXAppDelegate(NSObject):
                 current = __version__
 
                 if self._is_newer_version(latest, current):
+                    # Find DMG asset URL for auto-update
+                    dmg_url = None
+                    for asset in data.get("assets", []):
+                        if asset.get("name", "").endswith(".dmg"):
+                            dmg_url = asset["browser_download_url"]
+                            break
+
                     self._update_info = {
                         "version": latest,
                         "url": data["html_url"],
+                        "dmg_url": dmg_url,
                         "notes": data.get("body", ""),
                     }
                     logger.info(f"Update available: {latest}")
@@ -270,13 +285,168 @@ class OMLXAppDelegate(NSObject):
             return False
 
     def openUpdate_(self, sender):
-        """Open GitHub releases page when update menu item is clicked."""
+        """Show confirmation dialog and start auto-update."""
+        if not self._update_info:
+            return
+
+        # If no DMG URL available, fall back to browser
+        if not self._update_info.get("dmg_url"):
+            self._open_update_browser()
+            return
+
+        from AppKit import NSAlert, NSAlertFirstButtonReturn
+
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(
+            f"Update to oMLX {self._update_info['version']}?"
+        )
+
+        notes = self._update_info.get("notes", "")
+        if len(notes) > 500:
+            notes = notes[:500] + "..."
+        alert.setInformativeText_(
+            f"{notes}\n\n"
+            "The update will be downloaded and installed automatically. "
+            "The app will restart when ready."
+        )
+        alert.addButtonWithTitle_("Update")
+        alert.addButtonWithTitle_("Cancel")
+
+        if alert.runModal() != NSAlertFirstButtonReturn:
+            return
+
+        self._start_auto_update()
+
+    def _open_update_browser(self):
+        """Fallback: open GitHub releases page in browser."""
         url = (
             self._update_info.get("url")
             if self._update_info
             else "https://github.com/jundot/omlx/releases"
         )
         webbrowser.open(url)
+
+    def _start_auto_update(self):
+        """Begin the background download + staging process."""
+        from .updater import AppUpdater
+
+        # Check write permissions first
+        app_path = AppUpdater.get_app_bundle_path()
+        if not AppUpdater.is_writable(app_path):
+            from AppKit import NSAlert, NSAlertFirstButtonReturn
+
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Cannot Auto-Update")
+            alert.setInformativeText_(
+                f"oMLX does not have write permission to {app_path.parent}.\n\n"
+                "Please download the update manually from GitHub."
+            )
+            alert.addButtonWithTitle_("Open GitHub")
+            alert.addButtonWithTitle_("Cancel")
+            if alert.runModal() == NSAlertFirstButtonReturn:
+                self._open_update_browser()
+            return
+
+        self._updater = AppUpdater(
+            dmg_url=self._update_info["dmg_url"],
+            version=self._update_info["version"],
+            on_progress=self._on_update_progress,
+            on_error=self._on_update_error,
+            on_ready=self._on_update_ready,
+        )
+        self._updater.start()
+        self._build_menu()
+
+    def _on_update_progress(self, message: str):
+        """Called from background thread with progress updates."""
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "updateProgressOnMain:", message, False
+        )
+
+    def updateProgressOnMain_(self, message):
+        """Main thread: rebuild menu to show download progress."""
+        self._build_menu()
+
+    def _on_update_error(self, message: str):
+        """Called from background thread on failure."""
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "updateErrorOnMain:", message, False
+        )
+
+    def updateErrorOnMain_(self, message):
+        """Main thread: show error and offer browser fallback."""
+        self._updater = None
+        self._build_menu()
+
+        from AppKit import NSAlert, NSAlertFirstButtonReturn
+
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Update Failed")
+        alert.setInformativeText_(
+            f"{message}\n\n"
+            "Would you like to download the update manually?"
+        )
+        alert.addButtonWithTitle_("Open GitHub")
+        alert.addButtonWithTitle_("Cancel")
+        if alert.runModal() == NSAlertFirstButtonReturn:
+            self._open_update_browser()
+
+    def _on_update_ready(self):
+        """Called from background thread when staged app is ready."""
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "updateReadyOnMain:", None, False
+        )
+
+    def updateReadyOnMain_(self, _):
+        """Main thread: show 'Restart to Update' in menu."""
+        self._update_ready = True
+        self._updater = None
+        self._build_menu()
+
+    @objc.IBAction
+    def installUpdate_(self, sender):
+        """User clicked 'Restart to Update' - perform the swap."""
+        from AppKit import NSAlert, NSAlertFirstButtonReturn
+
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Ready to Update")
+        alert.setInformativeText_(
+            "oMLX will quit, install the update, and relaunch.\n"
+            "The server will be stopped during the update."
+        )
+        alert.addButtonWithTitle_("Restart Now")
+        alert.addButtonWithTitle_("Later")
+
+        if alert.runModal() != NSAlertFirstButtonReturn:
+            return
+
+        self._perform_update_and_relaunch()
+
+    def _perform_update_and_relaunch(self):
+        """Stop server, spawn swap script, terminate app."""
+        from .updater import AppUpdater
+
+        # Stop server gracefully
+        if self.server_manager.is_running():
+            self.server_manager.stop()
+
+        # Stop health timer
+        if self.health_timer:
+            self.health_timer.invalidate()
+
+        # Spawn detached swap script and terminate
+        if AppUpdater.perform_swap_and_relaunch():
+            NSApp.terminate_(None)
+        else:
+            from AppKit import NSAlert
+
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Update Failed")
+            alert.setInformativeText_(
+                "Could not find the staged update. Please try again."
+            )
+            alert.addButtonWithTitle_("OK")
+            alert.runModal()
 
     # --- Menu building ---
 
@@ -340,14 +510,34 @@ class OMLXAppDelegate(NSObject):
         # --- Update Available (if newer version found) ---
         if self._update_info:
             self.menu.addItem_(NSMenuItem.separatorItem())
-            update_text = f"🔔 Update Available ({self._update_info['version']})"
-            attributed_update = NSAttributedString.alloc().initWithString_attributes_(
-                update_text, {NSForegroundColorAttributeName: NSColor.systemGreenColor()}
+
+            if self._update_ready:
+                update_text = (
+                    f"✅ Restart to Update ({self._update_info['version']})"
+                )
+                update_action = "installUpdate:"
+            elif self._updater is not None:
+                update_text = "⬇️ Downloading Update..."
+                update_action = None
+            else:
+                update_text = (
+                    f"🔔 Update Available ({self._update_info['version']})"
+                )
+                update_action = "openUpdate:"
+
+            attributed_update = (
+                NSAttributedString.alloc().initWithString_attributes_(
+                    update_text,
+                    {NSForegroundColorAttributeName: NSColor.systemGreenColor()},
+                )
             )
             update_item = NSMenuItem.alloc().init()
             update_item.setAttributedTitle_(attributed_update)
-            update_item.setTarget_(self)
-            update_item.setAction_("openUpdate:")
+            if update_action:
+                update_item.setTarget_(self)
+                update_item.setAction_(update_action)
+            else:
+                update_item.setEnabled_(False)
             self.menu.addItem_(update_item)
 
         self.menu.addItem_(NSMenuItem.separatorItem())
