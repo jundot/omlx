@@ -2738,10 +2738,12 @@ class Scheduler:
         """
         Graceful shutdown.
 
-        paged SSD cache is NOT cleared here to allow reuse when the same model
-        is reloaded. paged SSD cache cleanup happens on server startup instead.
+        Flushes hot cache to SSD and closes the background writer.
+        paged SSD cache files are NOT cleared to allow reuse on reload.
         """
         logger.info("Scheduler shutdown initiated...")
+        if self.paged_ssd_cache_manager is not None:
+            self.paged_ssd_cache_manager.close()
         logger.info("Scheduler shutdown completed")
 
     # =========================================================================
