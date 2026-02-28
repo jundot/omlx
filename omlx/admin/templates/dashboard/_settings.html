@@ -86,13 +86,37 @@
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex items-center justify-between px-6 py-4"
+                                     x-data="{
+                                         _mode: (globalSettings.server.host === '127.0.0.1' || globalSettings.server.host === '0.0.0.0') ? null : 'custom',
+                                         get hostMode() {
+                                             if (this._mode === 'custom') return 'custom';
+                                             if (globalSettings.server.host === '127.0.0.1') return 'localhost';
+                                             if (globalSettings.server.host === '0.0.0.0') return 'public';
+                                             return 'custom';
+                                         },
+                                         setHostMode(mode) {
+                                             if (mode === 'localhost') { this._mode = null; globalSettings.server.host = '127.0.0.1'; }
+                                             else if (mode === 'public') { this._mode = null; globalSettings.server.host = '0.0.0.0'; }
+                                             else { this._mode = 'custom'; globalSettings.server.host = ''; }
+                                         }
+                                     }">
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">Host</label>
                                         <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">Restart</span>
                                     </div>
-                                    <input type="text" x-model="globalSettings.server.host"
-                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                    <div class="flex items-center gap-2">
+                                        <select :value="hostMode"
+                                                @change="setHostMode($event.target.value)"
+                                                class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                            <option value="localhost">Localhost only (127.0.0.1)</option>
+                                            <option value="public">Open to all (0.0.0.0)</option>
+                                            <option value="custom">Custom (caution)</option>
+                                        </select>
+                                        <input x-show="hostMode === 'custom'" x-cloak
+                                               type="text" x-model="globalSettings.server.host" placeholder="e.g. 192.168.1.100"
+                                               class="w-40 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                    </div>
                                 </div>
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div class="flex items-center gap-2">
@@ -227,45 +251,6 @@
                                             <span :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'">(<span x-text="getMemoryDisplay()"></span>)</span>
                                         </span>
                                     </div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Batching Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                                <div class="flex items-center gap-3">
-                                    <i data-lucide="layers" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Batching</span>
-                                </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
-                                    Restart needed
-                                </span>
-                            </div>
-                            <div class="divide-y divide-neutral-100">
-                                <div class="flex items-center justify-between px-6 py-4">
-                                    <div>
-                                        <label class="text-sm text-neutral-700">Max Sequences</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Maximum concurrent requests processed in parallel</p>
-                                    </div>
-                                    <input type="number" x-model.number="globalSettings.scheduler.max_num_seqs"
-                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                </div>
-                                <div class="flex items-center justify-between px-6 py-4">
-                                    <div>
-                                        <label class="text-sm text-neutral-700">Prefill Batch Size</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Batch size for prompt encoding phase</p>
-                                    </div>
-                                    <input type="number" x-model.number="globalSettings.scheduler.prefill_batch_size"
-                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                </div>
-                                <div class="flex items-center justify-between px-6 py-4">
-                                    <div>
-                                        <label class="text-sm text-neutral-700">Completion Batch Size</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Batch size for token generation phase</p>
-                                    </div>
-                                    <input type="number" x-model.number="globalSettings.scheduler.completion_batch_size"
-                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                             </div>
                         </div>
@@ -415,6 +400,61 @@
                                     <label class="text-sm text-neutral-700">Config Path</label>
                                     <input type="text" x-model="globalSettings.mcp.config_path" placeholder="Path to MCP config"
                                            class="w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Advanced Settings (collapsible, collapsed by default) -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden"
+                             x-data="{ advancedOpen: false }">
+                            <button @click="advancedOpen = !advancedOpen"
+                                    class="w-full flex items-center justify-between px-6 py-4 bg-neutral-50 hover:bg-neutral-100 transition-colors cursor-pointer">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="settings-2" class="w-4 h-4 text-neutral-400"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">Advanced</span>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                    <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+                                        Restart needed
+                                    </span>
+                                    <i data-lucide="chevron-down" class="w-4 h-4 text-neutral-400 transition-transform duration-200"
+                                       :class="advancedOpen && 'rotate-180'"></i>
+                                </div>
+                            </button>
+                            <div x-show="advancedOpen" x-collapse x-cloak>
+                                <div class="border-t border-neutral-200">
+                                    <div class="px-6 py-3 bg-neutral-50">
+                                        <div class="flex items-center gap-2">
+                                            <i data-lucide="layers" class="w-3.5 h-3.5 text-neutral-400"></i>
+                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Batching</span>
+                                        </div>
+                                    </div>
+                                    <div class="divide-y divide-neutral-100">
+                                        <div class="flex items-center justify-between px-6 py-4">
+                                            <div>
+                                                <label class="text-sm text-neutral-700">Max Sequences</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">Maximum concurrent requests processed in parallel</p>
+                                            </div>
+                                            <input type="number" x-model.number="globalSettings.scheduler.max_num_seqs"
+                                                   class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                        <div class="flex items-center justify-between px-6 py-4">
+                                            <div>
+                                                <label class="text-sm text-neutral-700">Prefill Batch Size</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">Batch size for prompt encoding phase</p>
+                                            </div>
+                                            <input type="number" x-model.number="globalSettings.scheduler.prefill_batch_size"
+                                                   class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                        <div class="flex items-center justify-between px-6 py-4">
+                                            <div>
+                                                <label class="text-sm text-neutral-700">Completion Batch Size</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">Batch size for token generation phase</p>
+                                            </div>
+                                            <input type="number" x-model.number="globalSettings.scheduler.completion_batch_size"
+                                                   class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
                         </div>
