@@ -149,6 +149,16 @@ def serve_command(args):
         scheduler_config.paged_ssd_cache_max_size = 0
         cache_max_size_bytes = 0
 
+    # Hot cache: CLI arg > settings
+    if paged_ssd_cache_dir:
+        if args.hot_cache_max_size:
+            hot_cache_max_bytes = parse_size(args.hot_cache_max_size)
+        else:
+            hot_cache_max_bytes = settings.cache.get_hot_cache_max_size_bytes()
+        scheduler_config.hot_cache_max_size = hot_cache_max_bytes
+    else:
+        scheduler_config.hot_cache_max_size = 0
+
     if args.no_cache:
         print("Mode: Multi-model serving (no oMLX cache, mlx-lm BatchGenerator only)")
     elif paged_ssd_cache_dir:
@@ -156,6 +166,9 @@ def serve_command(args):
         # Format cache size for display
         cache_max_size_display = f"{cache_max_size_bytes / (1024**3):.1f}GB"
         print(f"paged SSD cache: {paged_ssd_cache_dir} (max: {cache_max_size_display})")
+        if scheduler_config.hot_cache_max_size > 0:
+            hot_display = f"{scheduler_config.hot_cache_max_size / (1024**3):.1f}GB"
+            print(f"Hot cache: {hot_display} (in-memory)")
     else:
         print("Mode: Multi-model serving (continuous batching, no cache)")
 
@@ -281,6 +294,12 @@ Example directory structure:
         type=str,
         default=None,
         help="Maximum paged SSD cache size (e.g., '100GB', '50GB'). Default: 100GB",
+    )
+    serve_parser.add_argument(
+        "--hot-cache-max-size",
+        type=str,
+        default=None,
+        help="Maximum in-memory hot cache size (e.g., '8GB', '4GB'). Default: 0 (disabled)",
     )
     serve_parser.add_argument(
         "--no-cache",

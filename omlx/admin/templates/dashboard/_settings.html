@@ -252,6 +252,30 @@
                                         </span>
                                     </div>
                                 </div>
+                                <!-- Memory Limit (In-Memory Hot Cache) -->
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">Memory Limit (In-Memory Hot Cache)</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">
+                                            In-memory cache for frequently accessed KV cache blocks.
+                                            <br>
+                                            Reduces SSD I/O latency for repeated prompts. <strong>0</strong> = disabled.
+                                        </p>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <input type="range" min="0" max="50" step="1"
+                                               x-model.number="hotCachePercent"
+                                               @input="updateHotCacheFromSlider()"
+                                               class="w-32 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer
+                                                      [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
+                                                      [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
+                                                      [&::-webkit-slider-thumb]:shadow-sm">
+                                        <span class="text-sm text-neutral-600 w-28 text-right">
+                                            <span x-text="hotCachePercent === 0 ? 'Off' : hotCachePercent + '%'"></span>
+                                            <span class="text-neutral-400">(<span x-text="getHotCacheDisplay()"></span>)</span>
+                                        </span>
+                                    </div>
+                                </div>
                             </div>
                         </div>
 

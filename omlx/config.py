@@ -106,11 +106,17 @@ class PagedSSDCacheConfig:
     enabled: bool = False
     cache_dir: Optional[Path] = None
     max_size: str = "100GB"
+    hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
 
     @property
     def max_size_bytes(self) -> int:
         """Get max size in bytes."""
         return parse_size(self.max_size)
+
+    @property
+    def hot_cache_max_size_bytes(self) -> int:
+        """Get hot cache max size in bytes. 0 means disabled."""
+        return parse_size(self.hot_cache_max_size)
 
 
 @dataclass

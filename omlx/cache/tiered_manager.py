@@ -71,6 +71,7 @@ class TieredCacheManager:
         paged_ssd_cache_max_size: int,
         block_size: int,
         model: Any = None,
+        hot_cache_max_bytes: int = 0,
     ) -> Optional["TieredCacheManager"]:
         """
         Create a TieredCacheManager from configuration.
@@ -82,6 +83,7 @@ class TieredCacheManager:
             paged_ssd_cache_max_size: Maximum paged SSD cache size in bytes.
             block_size: Tokens per block.
             model: The model (for extracting KV cache dimensions).
+            hot_cache_max_bytes: Maximum in-memory hot cache size (0 = disabled).
 
         Returns:
             TieredCacheManager instance or None if tiered caching is disabled.
@@ -114,6 +116,7 @@ class TieredCacheManager:
             paged_ssd_cache_manager = PagedSSDCacheManager(
                 cache_dir=Path(paged_ssd_cache_dir),
                 max_size_bytes=paged_ssd_cache_max_size,
+                hot_cache_max_bytes=hot_cache_max_bytes,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager

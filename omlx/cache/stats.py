@@ -170,7 +170,7 @@ class PagedSSDCacheStats(BaseCacheStats):
     """
     Statistics for paged SSD cache performance.
 
-    Extends base stats with storage-specific metrics.
+    Extends base stats with storage-specific and hot cache metrics.
     """
 
     saves: int = 0
@@ -178,6 +178,14 @@ class PagedSSDCacheStats(BaseCacheStats):
     errors: int = 0
     total_size_bytes: int = 0
     num_files: int = 0
+
+    # Hot cache (in-memory tier) metrics
+    hot_cache_entries: int = 0
+    hot_cache_size_bytes: int = 0
+    hot_cache_max_bytes: int = 0
+    hot_cache_hits: int = 0
+    hot_cache_evictions: int = 0
+    hot_cache_promotions: int = 0
 
     @property
     def save_rate(self) -> float:
