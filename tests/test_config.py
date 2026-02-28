@@ -136,7 +136,7 @@ class TestGenerationConfig:
         assert config.max_tokens == 32768
         assert config.temperature == 1.0
         assert config.top_p == 0.95
-        assert config.top_k == 40
+        assert config.top_k == 0
         assert config.force_sampling is False
 
     def test_custom_values(self):

@@ -363,7 +363,7 @@ class SamplingSettings:
     max_tokens: int = 32768
     temperature: float = 1.0
     top_p: float = 0.95
-    top_k: int = 40
+    top_k: int = 0
     repetition_penalty: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -385,7 +385,7 @@ class SamplingSettings:
             max_tokens=data.get("max_tokens", 32768),
             temperature=data.get("temperature", 1.0),
             top_p=data.get("top_p", 0.95),
-            top_k=data.get("top_k", 40),
+            top_k=data.get("top_k", 0),
             repetition_penalty=data.get("repetition_penalty", 1.0),
         )
 

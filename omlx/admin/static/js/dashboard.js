@@ -17,7 +17,7 @@
                 memory: { max_process_memory: 'auto' },
                 scheduler: { max_num_seqs: 8, prefill_batch_size: 8, completion_batch_size: 8 },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto' },
-                sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 40, repetition_penalty: 1.0 },
+                sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
                 auth: { api_key_set: false, api_key: '' },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000 },

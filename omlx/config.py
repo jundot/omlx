@@ -76,7 +76,7 @@ class GenerationConfig:
     max_tokens: int = 32768
     temperature: float = 1.0
     top_p: float = 0.95
-    top_k: int = 40
+    top_k: int = 0
     force_sampling: bool = False
 
 

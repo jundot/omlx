@@ -32,7 +32,7 @@ class TestGetSamplingParams:
         temp, top_p, top_k, rep_penalty = get_sampling_params(None, None)
         assert temp == 1.0
         assert top_p == 0.95
-        assert top_k == 40
+        assert top_k == 0
         assert rep_penalty == 1.0
 
     def test_request_overrides(self):
@@ -40,7 +40,7 @@ class TestGetSamplingParams:
         temp, top_p, top_k, rep_penalty = get_sampling_params(0.5, 0.8)
         assert temp == 0.5
         assert top_p == 0.8
-        assert top_k == 40  # not overridable via request
+        assert top_k == 0  # not overridable via request
         assert rep_penalty == 1.0
 
     def test_model_settings_override(self):

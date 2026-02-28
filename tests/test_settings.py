@@ -1182,7 +1182,7 @@ class TestSamplingSettings:
         assert settings.max_tokens == 32768
         assert settings.temperature == 1.0
         assert settings.top_p == 0.95
-        assert settings.top_k == 40
+        assert settings.top_k == 0
         assert settings.repetition_penalty == 1.0
 
     def test_to_dict(self):
