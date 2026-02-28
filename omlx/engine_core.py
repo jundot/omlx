@@ -216,6 +216,21 @@ class EngineCore:
                 break
             except Exception as e:
                 logger.error(f"Engine loop error: {e}")
+                # Propagate error to all running requests so they don't hang
+                for rid in list(self.scheduler.running.keys()):
+                    collector = self._output_collectors.get(rid)
+                    if collector is not None:
+                        collector.put(
+                            RequestOutput(
+                                request_id=rid,
+                                finished=True,
+                                finish_reason="error",
+                                error=str(e),
+                            )
+                        )
+                    event = self._finished_events.get(rid)
+                    if event:
+                        event.set()
                 await asyncio.sleep(0.1)
 
     async def add_request(
@@ -339,6 +354,9 @@ class EngineCore:
 
                     yield output
 
+                    if output.error:
+                        raise RuntimeError(output.error)
+
                     if output.finished:
                         break
 
@@ -411,6 +429,9 @@ class EngineCore:
 
         if final_output is None:
             raise RuntimeError(f"No output for request {request_id}")
+
+        if final_output.error:
+            raise RuntimeError(final_output.error)
 
         return final_output
 

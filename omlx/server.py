@@ -1539,31 +1539,40 @@ async def stream_completion(
     temperature, top_p, top_k, repetition_penalty = get_sampling_params(
         request.temperature, request.top_p, request.model
     )
-    async for output in engine.stream_generate(
-        prompt=prompt,
-        max_tokens=request.max_tokens or _server_state.sampling.max_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        repetition_penalty=repetition_penalty,
-        stop=request.stop,
-    ):
-        if first_token_time is None and output.new_text:
-            first_token_time = time.perf_counter()
-        last_output = output
+    try:
+        async for output in engine.stream_generate(
+            prompt=prompt,
+            max_tokens=request.max_tokens or _server_state.sampling.max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            stop=request.stop,
+        ):
+            if first_token_time is None and output.new_text:
+                first_token_time = time.perf_counter()
+            last_output = output
 
-        data = {
-            "id": f"cmpl-{uuid.uuid4().hex[:8]}",
-            "object": "text_completion",
-            "created": int(time.time()),
-            "model": request.model,
-            "choices": [{
-                "index": 0,
-                "text": output.new_text,
-                "finish_reason": output.finish_reason if output.finished else None,
-            }],
+            data = {
+                "id": f"cmpl-{uuid.uuid4().hex[:8]}",
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [{
+                    "index": 0,
+                    "text": output.new_text,
+                    "finish_reason": output.finish_reason if output.finished else None,
+                }],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+    except Exception as e:
+        logger.error(f"Error during completion streaming: {e}")
+        error_data = {
+            "error": {"message": str(e), "type": "server_error"}
         }
-        yield f"data: {json.dumps(data)}\n\n"
+        yield f"data: {json.dumps(error_data)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
     # Record metrics
     if last_output and last_output.finished:
@@ -1615,39 +1624,53 @@ async def stream_chat_completion(
     # Stream content — buffer when tools are present so we can strip
     # tool call markup before emitting (prevents clients from seeing
     # tool calls in both content and structured tool_calls chunks).
-    async for output in engine.stream_chat(messages=messages, **kwargs):
-        if first_token_time is None and output.new_text:
-            first_token_time = time.perf_counter()
-        last_output = output
-        if output.new_text:
-            accumulated_text += output.new_text
+    try:
+        async for output in engine.stream_chat(messages=messages, **kwargs):
+            if first_token_time is None and output.new_text:
+                first_token_time = time.perf_counter()
+            last_output = output
+            if output.new_text:
+                accumulated_text += output.new_text
 
-        if not has_tools and output.new_text:
-            thinking_delta, content_delta = thinking_parser.feed(output.new_text)
+            if not has_tools and output.new_text:
+                thinking_delta, content_delta = thinking_parser.feed(output.new_text)
 
-            # Emit reasoning_content delta
-            if thinking_delta:
-                chunk = ChatCompletionChunk(
-                    id=response_id,
-                    model=request.model,
-                    choices=[ChatCompletionChunkChoice(
-                        delta=ChatCompletionChunkDelta(reasoning_content=thinking_delta),
-                        finish_reason=None,
-                    )],
-                )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                # Emit reasoning_content delta
+                if thinking_delta:
+                    chunk = ChatCompletionChunk(
+                        id=response_id,
+                        model=request.model,
+                        choices=[ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(reasoning_content=thinking_delta),
+                            finish_reason=None,
+                        )],
+                    )
+                    yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
-            # Emit content delta
-            if content_delta:
-                chunk = ChatCompletionChunk(
-                    id=response_id,
-                    model=request.model,
-                    choices=[ChatCompletionChunkChoice(
-                        delta=ChatCompletionChunkDelta(content=content_delta),
-                        finish_reason=None,
-                    )],
-                )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                # Emit content delta
+                if content_delta:
+                    chunk = ChatCompletionChunk(
+                        id=response_id,
+                        model=request.model,
+                        choices=[ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(content=content_delta),
+                            finish_reason=None,
+                        )],
+                    )
+                    yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+    except Exception as e:
+        logger.error(f"Error during chat streaming: {e}")
+        error_chunk = ChatCompletionChunk(
+            id=response_id,
+            model=request.model,
+            choices=[ChatCompletionChunkChoice(
+                delta=ChatCompletionChunkDelta(),
+                finish_reason="stop",
+            )],
+        )
+        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
     # Flush remaining buffered content from thinking parser
     if not has_tools:

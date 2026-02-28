@@ -211,6 +211,8 @@ class RequestOutput:
     tool_calls: Optional[List[Dict[str, str]]] = None
     # Prefix cache stats
     cached_tokens: int = 0
+    # Error message (set when engine encounters an unrecoverable error)
+    error: Optional[str] = None
 
     @property
     def usage(self) -> Dict[str, int]:

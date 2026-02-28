@@ -524,3 +524,64 @@ class TestRequestOutputCollectorEdgeCases:
 
         assert result.new_token_ids == [100]
         assert result.new_text == "Hello"
+
+    def test_merge_preserves_error_from_new(self):
+        """Test _merge_outputs preserves error field from new output."""
+        collector = RequestOutputCollector()
+
+        existing = RequestOutput(
+            request_id="test-001",
+            new_token_ids=[100],
+            new_text="Hello",
+        )
+        new = RequestOutput(
+            request_id="test-001",
+            new_token_ids=[101],
+            new_text=" world",
+            finished=True,
+            error="Memory limit exceeded during prefill",
+        )
+
+        result = collector._merge_outputs(existing, new)
+
+        assert result.error == "Memory limit exceeded during prefill"
+        assert result.finished is True
+
+    def test_merge_preserves_error_from_existing(self):
+        """Test _merge_outputs preserves error field from existing output."""
+        collector = RequestOutputCollector()
+
+        existing = RequestOutput(
+            request_id="test-001",
+            new_token_ids=[100],
+            new_text="Hello",
+            error="Some earlier error",
+        )
+        new = RequestOutput(
+            request_id="test-001",
+            new_token_ids=[101],
+            new_text=" world",
+            finished=True,
+        )
+
+        result = collector._merge_outputs(existing, new)
+
+        assert result.error == "Some earlier error"
+
+    def test_error_output_put_and_get(self):
+        """Test putting and getting an error output."""
+        collector = RequestOutputCollector()
+
+        error_output = RequestOutput(
+            request_id="test-001",
+            finished=True,
+            finish_reason="error",
+            error="Memory limit exceeded during prefill",
+        )
+        collector.put(error_output)
+
+        result = collector.get_nowait()
+        assert result is not None
+        assert result.error == "Memory limit exceeded during prefill"
+        assert result.finished is True
+        assert result.finish_reason == "error"
