@@ -1249,6 +1249,99 @@ class TestClaudeCodeSettings:
         assert settings.context_scaling_enabled is False
         assert settings.target_context_size == 200000
 
+    def test_new_fields_defaults(self):
+        """Test that the four new fields have correct defaults."""
+        settings = ClaudeCodeSettings()
+        assert settings.mode == "cloud"
+        assert settings.opus_model is None
+        assert settings.sonnet_model is None
+        assert settings.haiku_model is None
+
+    def test_new_fields_to_dict(self):
+        """Test that to_dict includes all four new fields."""
+        settings = ClaudeCodeSettings(
+            mode="local",
+            opus_model="mlx-community/Qwen3-30B-A3B-4bit",
+            sonnet_model="mlx-community/Qwen3-14B-4bit",
+            haiku_model="mlx-community/Qwen3-4B-4bit",
+        )
+        result = settings.to_dict()
+        assert result["mode"] == "local"
+        assert result["opus_model"] == "mlx-community/Qwen3-30B-A3B-4bit"
+        assert result["sonnet_model"] == "mlx-community/Qwen3-14B-4bit"
+        assert result["haiku_model"] == "mlx-community/Qwen3-4B-4bit"
+
+    def test_new_fields_from_dict_full(self):
+        """Test from_dict with all four new fields present."""
+        data = {
+            "mode": "local",
+            "opus_model": "mlx-community/Qwen3-30B-A3B-4bit",
+            "sonnet_model": "mlx-community/Qwen3-14B-4bit",
+            "haiku_model": "mlx-community/Qwen3-4B-4bit",
+        }
+        settings = ClaudeCodeSettings.from_dict(data)
+        assert settings.mode == "local"
+        assert settings.opus_model == "mlx-community/Qwen3-30B-A3B-4bit"
+        assert settings.sonnet_model == "mlx-community/Qwen3-14B-4bit"
+        assert settings.haiku_model == "mlx-community/Qwen3-4B-4bit"
+
+    def test_new_fields_from_dict_backward_compat(self):
+        """Test from_dict({}) gives correct defaults — simulates old settings.json."""
+        settings = ClaudeCodeSettings.from_dict({})
+        assert settings.mode == "cloud"
+        assert settings.opus_model is None
+        assert settings.sonnet_model is None
+        assert settings.haiku_model is None
+
+    def test_new_fields_from_dict_null_model(self):
+        """Test from_dict with explicit null model values."""
+        data = {"mode": "cloud", "opus_model": None}
+        settings = ClaudeCodeSettings.from_dict(data)
+        assert settings.mode == "cloud"
+        assert settings.opus_model is None
+
+
+class TestClaudeCodeValidation:
+    """Tests for mode validation in GlobalSettings.validate()."""
+
+    def _make_global_settings(self, mode: str) -> GlobalSettings:
+        """Create a GlobalSettings with a specific claude_code.mode for testing."""
+        gs = GlobalSettings.__new__(GlobalSettings)
+        # Copy defaults from a real instance then override claude_code
+        real = GlobalSettings()
+        gs.__dict__.update(real.__dict__)
+        gs.claude_code = ClaudeCodeSettings(mode=mode)
+        return gs
+
+    def test_validate_mode_cloud_valid(self):
+        """Mode 'cloud' passes validation."""
+        gs = self._make_global_settings("cloud")
+        errors = gs.validate()
+        mode_errors = [e for e in errors if "claude_code mode" in e]
+        assert mode_errors == []
+
+    def test_validate_mode_local_valid(self):
+        """Mode 'local' passes validation."""
+        gs = self._make_global_settings("local")
+        errors = gs.validate()
+        mode_errors = [e for e in errors if "claude_code mode" in e]
+        assert mode_errors == []
+
+    def test_validate_mode_invalid(self):
+        """Invalid mode produces a validation error."""
+        gs = self._make_global_settings("auto")
+        errors = gs.validate()
+        mode_errors = [e for e in errors if "claude_code mode" in e]
+        assert len(mode_errors) == 1
+        assert "auto" in mode_errors[0]
+
+    def test_validate_mode_empty_string_invalid(self):
+        """Empty string mode is invalid."""
+        gs = self._make_global_settings("")
+        errors = gs.validate()
+        mode_errors = [e for e in errors if "claude_code mode" in e]
+        assert len(mode_errors) == 1
+
 
 class TestCORSMiddleware:
     """Test that CORS middleware is correctly applied to the server."""
