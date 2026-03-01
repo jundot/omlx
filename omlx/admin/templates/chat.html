@@ -996,12 +996,37 @@
                 await this.streamResponse();
             },
 
-            copyMessage(content) {
-                navigator.clipboard.writeText(content).then(() => {
-                    // Visual feedback could be added here
-                }).catch(err => {
+            _copyFallback(text) {
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                textarea.style.position = 'fixed';
+                textarea.style.opacity = '0';
+                document.body.appendChild(textarea);
+                textarea.select();
+                try {
+                    document.execCommand('copy');
+                } catch (err) {
                     console.error('Failed to copy:', err);
+                }
+                document.body.removeChild(textarea);
+            },
+
+            _copyText(text) {
+                return new Promise((resolve) => {
+                    if (navigator.clipboard && window.isSecureContext) {
+                        navigator.clipboard.writeText(text).then(resolve).catch(() => {
+                            this._copyFallback(text);
+                            resolve();
+                        });
+                    } else {
+                        this._copyFallback(text);
+                        resolve();
+                    }
                 });
+            },
+
+            copyMessage(content) {
+                this._copyText(content);
             },
 
             // Edit functions
@@ -1275,7 +1300,7 @@
                     copyBtn.onclick = (e) => {
                         e.preventDefault();
                         e.stopPropagation();
-                        navigator.clipboard.writeText(codeBlock.textContent).then(() => {
+                        this._copyText(codeBlock.textContent).then(() => {
                             copyBtn.textContent = 'Copied!';
                             setTimeout(() => copyBtn.textContent = 'Copy', 2000);
                         });

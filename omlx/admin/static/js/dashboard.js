@@ -652,11 +652,28 @@
             },
 
             copyToClipboard(text) {
-                navigator.clipboard.writeText(text).then(() => {
-                    // Could add visual feedback here
-                }).catch(err => {
+                if (navigator.clipboard && window.isSecureContext) {
+                    navigator.clipboard.writeText(text).catch(() => {
+                        this._copyFallback(text);
+                    });
+                } else {
+                    this._copyFallback(text);
+                }
+            },
+
+            _copyFallback(text) {
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                textarea.style.position = 'fixed';
+                textarea.style.opacity = '0';
+                document.body.appendChild(textarea);
+                textarea.select();
+                try {
+                    document.execCommand('copy');
+                } catch (err) {
                     console.error('Failed to copy:', err);
-                });
+                }
+                document.body.removeChild(textarea);
             },
 
             async logout() {
@@ -900,12 +917,19 @@
 
             benchCopyText() {
                 const text = this.benchBuildText();
-                navigator.clipboard.writeText(text).then(() => {
+                const onSuccess = () => {
                     this.benchCopied = true;
                     setTimeout(() => { this.benchCopied = false; }, 2000);
-                }).catch(err => {
-                    console.error('Failed to copy:', err);
-                });
+                };
+                if (navigator.clipboard && window.isSecureContext) {
+                    navigator.clipboard.writeText(text).then(onSuccess).catch(() => {
+                        this._copyFallback(text);
+                        onSuccess();
+                    });
+                } else {
+                    this._copyFallback(text);
+                    onSuccess();
+                }
             },
 
             // Log viewer functions
