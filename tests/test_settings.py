@@ -1345,6 +1345,81 @@ class TestClaudeCodeValidation:
         assert len(mode_errors) == 1
 
 
+class TestClaudeCodeRouteIntegration:
+    """Integration tests for the settings chain: dataclass <-> dict <-> routes."""
+
+    def test_claude_code_to_dict_has_six_keys(self):
+        """to_dict must include all six keys so GlobalSettings.save() persists them."""
+        s = ClaudeCodeSettings(
+            context_scaling_enabled=True,
+            target_context_size=100000,
+            mode="local",
+            opus_model="mlx-community/Qwen3-30B-A3B-4bit",
+            sonnet_model="mlx-community/Qwen3-14B-4bit",
+            haiku_model="mlx-community/Qwen3-4B-4bit",
+        )
+        d = s.to_dict()
+        expected_keys = {
+            "context_scaling_enabled",
+            "target_context_size",
+            "mode",
+            "opus_model",
+            "sonnet_model",
+            "haiku_model",
+        }
+        assert set(d.keys()) == expected_keys
+
+    def test_claude_code_new_fields_round_trip(self):
+        """Full round-trip: set values -> to_dict -> from_dict -> values match."""
+        original = ClaudeCodeSettings(
+            mode="local",
+            opus_model="mlx-community/Qwen3-30B-A3B-4bit",
+            sonnet_model="mlx-community/Qwen3-14B-4bit",
+            haiku_model="mlx-community/Qwen3-4B-4bit",
+        )
+        reloaded = ClaudeCodeSettings.from_dict(original.to_dict())
+        assert reloaded.mode == "local"
+        assert reloaded.opus_model == "mlx-community/Qwen3-30B-A3B-4bit"
+        assert reloaded.sonnet_model == "mlx-community/Qwen3-14B-4bit"
+        assert reloaded.haiku_model == "mlx-community/Qwen3-4B-4bit"
+
+    def test_claude_code_round_trip_null_models(self):
+        """Null model fields survive the round-trip."""
+        original = ClaudeCodeSettings(mode="cloud", opus_model=None)
+        reloaded = ClaudeCodeSettings.from_dict(original.to_dict())
+        assert reloaded.mode == "cloud"
+        assert reloaded.opus_model is None
+
+    def test_post_handler_model_fields_set_explicit_null(self):
+        """
+        GlobalSettingsRequest.model_validate with explicit null must include
+        the field in model_fields_set so the POST handler can clear it.
+        """
+        from omlx.admin.routes import GlobalSettingsRequest
+        r = GlobalSettingsRequest.model_validate({"claude_code_opus_model": None})
+        assert "claude_code_opus_model" in r.model_fields_set
+        assert r.claude_code_opus_model is None
+
+    def test_post_handler_model_fields_set_absent_field(self):
+        """
+        GlobalSettingsRequest() with no claude_code_opus_model must NOT include it
+        in model_fields_set — POST handler must not apply it (leave server value alone).
+        """
+        from omlx.admin.routes import GlobalSettingsRequest
+        r = GlobalSettingsRequest()
+        assert "claude_code_opus_model" not in r.model_fields_set
+
+    def test_post_handler_model_fields_set_explicit_value(self):
+        """
+        GlobalSettingsRequest with an explicit model ID must include the field
+        in model_fields_set and carry the value.
+        """
+        from omlx.admin.routes import GlobalSettingsRequest
+        r = GlobalSettingsRequest(claude_code_opus_model="mlx-community/Qwen3-30B-A3B-4bit")
+        assert "claude_code_opus_model" in r.model_fields_set
+        assert r.claude_code_opus_model == "mlx-community/Qwen3-30B-A3B-4bit"
+
+
 class TestCORSMiddleware:
     """Test that CORS middleware is correctly applied to the server."""
 
