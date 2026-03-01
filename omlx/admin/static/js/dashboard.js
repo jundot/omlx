@@ -604,17 +604,23 @@
             },
 
             get claudeCodeCommand() {
-                const model = this.selectedClaudeModel || 'select-a-model';
+                const mode = this.globalSettings.claude_code.mode;
+                if (mode === 'cloud') {
+                    return 'env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u API_TIMEOUT_MS -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC claude';
+                }
+                // Local mode
                 const port = this.stats.port || 8000;
+                const opusModel = this.globalSettings.claude_code.opus_model || 'select-a-model';
+                const sonnetModel = this.globalSettings.claude_code.sonnet_model || 'select-a-model';
+                const haikuModel = this.globalSettings.claude_code.haiku_model || 'select-a-model';
                 const parts = [];
                 parts.push(`ANTHROPIC_BASE_URL=http://localhost:${port}`);
                 if (this.stats.api_key) {
                     parts.push(`ANTHROPIC_AUTH_TOKEN=${this.stats.api_key}`);
                 }
-                parts.push(`ANTHROPIC_MODEL=${model}`);
-                parts.push(`ANTHROPIC_DEFAULT_SONNET_MODEL=${model}`);
-                parts.push(`ANTHROPIC_DEFAULT_OPUS_MODEL=${model}`);
-                parts.push(`ANTHROPIC_DEFAULT_HAIKU_MODEL=${model}`);
+                parts.push(`ANTHROPIC_DEFAULT_OPUS_MODEL=${opusModel}`);
+                parts.push(`ANTHROPIC_DEFAULT_SONNET_MODEL=${sonnetModel}`);
+                parts.push(`ANTHROPIC_DEFAULT_HAIKU_MODEL=${haikuModel}`);
                 parts.push('API_TIMEOUT_MS=3000000');
                 parts.push('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1');
                 parts.push('claude');
