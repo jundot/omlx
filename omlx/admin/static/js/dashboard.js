@@ -635,6 +635,10 @@
                         body: JSON.stringify({
                             claude_code_context_scaling_enabled: this.globalSettings.claude_code.context_scaling_enabled,
                             claude_code_target_context_size: this.globalSettings.claude_code.target_context_size,
+                            claude_code_mode: this.globalSettings.claude_code.mode,
+                            claude_code_opus_model: this.globalSettings.claude_code.opus_model,
+                            claude_code_sonnet_model: this.globalSettings.claude_code.sonnet_model,
+                            claude_code_haiku_model: this.globalSettings.claude_code.haiku_model,
                         }),
                     });
                     if (!response.ok) {
