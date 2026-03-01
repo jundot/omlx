@@ -64,8 +64,12 @@ class TestCheckAndEnforce:
     async def test_evicts_when_over_limit(self, enforcer):
         """Evicts LRU model when over limit (multiple models loaded)."""
         # Need at least 2 loaded non-pinned models for eviction path
-        entry_a = _make_entry("model-a", engine=MagicMock())
-        entry_b = _make_entry("model-b", engine=MagicMock())
+        engine_a = MagicMock()
+        engine_a.abort_all_requests = AsyncMock(return_value=0)
+        engine_b = MagicMock()
+        engine_b.abort_all_requests = AsyncMock(return_value=0)
+        entry_a = _make_entry("model-a", engine=engine_a)
+        entry_b = _make_entry("model-b", engine=engine_b)
         enforcer._engine_pool._entries = {
             "model-a": entry_a,
             "model-b": entry_b,
@@ -105,9 +109,15 @@ class TestCheckAndEnforce:
     async def test_evicts_multiple_models(self, enforcer):
         """Evicts multiple models in sequence until under limit."""
         # Need 3 loaded non-pinned models for sequential eviction
-        entry_a = _make_entry("model-a", engine=MagicMock())
-        entry_b = _make_entry("model-b", engine=MagicMock())
-        entry_c = _make_entry("model-c", engine=MagicMock())
+        engine_a = MagicMock()
+        engine_a.abort_all_requests = AsyncMock(return_value=0)
+        engine_b = MagicMock()
+        engine_b.abort_all_requests = AsyncMock(return_value=0)
+        engine_c = MagicMock()
+        engine_c.abort_all_requests = AsyncMock(return_value=0)
+        entry_a = _make_entry("model-a", engine=engine_a)
+        entry_b = _make_entry("model-b", engine=engine_b)
+        entry_c = _make_entry("model-c", engine=engine_c)
         enforcer._engine_pool._entries = {
             "model-a": entry_a,
             "model-b": entry_b,
@@ -156,8 +166,12 @@ class TestCheckAndEnforce:
     async def test_evicts_lru_before_aborting_loading(self, enforcer):
         """Evicts LRU models first, then aborts loading model."""
         # Need 2 loaded non-pinned so model-a gets evicted (not abort path)
-        entry_a = _make_entry("model-a", engine=MagicMock())
-        entry_b = _make_entry("model-b", engine=MagicMock())
+        engine_a = MagicMock()
+        engine_a.abort_all_requests = AsyncMock(return_value=0)
+        engine_b = MagicMock()
+        engine_b.abort_all_requests = AsyncMock(return_value=0)
+        entry_a = _make_entry("model-a", engine=engine_a)
+        entry_b = _make_entry("model-b", engine=engine_b)
         loading_entry = _make_entry(
             "loading-model", engine=None, is_loading=True
         )
@@ -291,6 +305,9 @@ class TestSingleModelMemoryPressure:
         enforcer._engine_pool._unload_engine.assert_awaited_once_with(
             "idle-model"
         )
+        # Idle model's requests aborted before eviction (0 requests)
+        engine_idle.abort_all_requests.assert_awaited_once()
+        # Active model's requests NOT aborted
         engine_active.abort_all_requests.assert_not_awaited()
         assert entry_active.engine is not None
 
@@ -324,16 +341,16 @@ class TestSingleModelMemoryPressure:
             mock_mx.get_active_memory.return_value = 15 * 1024**3
             await enforcer._check_and_enforce()
 
-        # model-b evicted (requests aborted via stop() in _unload_engine)
+        # model-b evicted (requests aborted before eviction)
         enforcer._engine_pool._unload_engine.assert_awaited_once_with(
             "model-b"
         )
-        # model-a's requests aborted (single-model path)
+        # model-b's requests aborted before eviction
+        engine_b.abort_all_requests.assert_awaited_once()
+        # model-a's requests aborted (single-model path, second iteration)
         engine_a.abort_all_requests.assert_awaited_once()
         # model-a still loaded
         assert entry_a.engine is not None
-        # model-b's abort_all_requests NOT called (handled by _unload_engine)
-        engine_b.abort_all_requests.assert_not_awaited()
 
 
 class TestMemoryLimitPropagation:

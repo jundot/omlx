@@ -164,8 +164,18 @@ class ProcessMemoryEnforcer:
                     ]
                     if len(loaded_non_pinned) > 1:
                         # Multiple models: evict LRU victim.
-                        # _unload_engine calls stop() which aborts
-                        # victim's requests.
+                        # First abort active requests so clients receive
+                        # error messages — EngineCore.stop() only cancels
+                        # the engine loop silently without notifying collectors.
+                        entry = self._engine_pool._entries.get(victim)
+                        if entry and entry.engine is not None:
+                            if hasattr(entry.engine, "abort_all_requests"):
+                                aborted = await entry.engine.abort_all_requests()
+                                if aborted > 0:
+                                    logger.warning(
+                                        f"Aborted {aborted} requests on "
+                                        f"'{victim}' before eviction"
+                                    )
                         logger.warning(
                             f"Evicting model '{victim}' to enforce "
                             f"process memory limit"
