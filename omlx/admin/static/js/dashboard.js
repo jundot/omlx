@@ -35,6 +35,10 @@
             editingCache: false,
             // Hot cache slider (0-50%)
             hotCachePercent: 0,
+            // Editing states for direct GB input
+            editingProcessMemory: false,
+            editingModelMemory: false,
+            editingHotCache: false,
 
             // Models
             models: [],
@@ -987,6 +991,18 @@
                     const percent = Math.round((autoBytes / totalBytes) * 100);
                     return { auto: true, percent: Math.min(99, Math.max(10, percent)) };
                 }
+                // Handle GB/TB/MB format (e.g., "69GB")
+                const sizeMatch = value.match(/^(\d+(?:\.\d+)?)\s*(GB|MB|TB)$/i);
+                if (sizeMatch && totalBytes > 0) {
+                    let bytes = parseFloat(sizeMatch[1]);
+                    const unit = sizeMatch[2].toUpperCase();
+                    if (unit === 'TB') bytes *= 1024 * 1024 * 1024 * 1024;
+                    else if (unit === 'GB') bytes *= 1024 * 1024 * 1024;
+                    else if (unit === 'MB') bytes *= 1024 * 1024;
+                    const percent = Math.round((bytes / totalBytes) * 100);
+                    return { auto: false, percent: Math.min(99, Math.max(1, percent)) };
+                }
+                // Handle percent format (e.g., "69%")
                 const percent = parseInt(value.replace('%', ''));
                 if (isNaN(percent)) return { auto: false, percent: 90 };
                 return { auto: false, percent: Math.min(99, Math.max(0, percent)) };
@@ -1107,8 +1123,117 @@
                 return `${gb}GB`;
             },
 
+            // Helper: parse GB from a settings string like "68GB", "1TB", "512MB"
+            _parseSettingsGB(val) {
+                if (!val) return null;
+                const match = val.match(/^(\d+(?:\.\d+)?)\s*(GB|MB|TB)?$/i);
+                if (!match) return null;
+                let num = parseFloat(match[1]);
+                const unit = (match[2] || 'GB').toUpperCase();
+                if (unit === 'TB') return Math.round(num * 1024);
+                if (unit === 'MB') return Math.round(num / 1024);
+                return Math.round(num);
+            },
+
+            // Computed process memory size in GB (for manual input)
+            // Reads from settings value directly to avoid percent round-trip precision loss
+            get processMemorySizeGB() {
+                const val = this.globalSettings.memory?.max_process_memory;
+                // If stored as GB/TB/MB, parse directly
+                const parsed = this._parseSettingsGB(val);
+                if (parsed !== null) return parsed;
+                // Otherwise derive from percent (for "XX%" format or auto)
+                const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
+                if (!totalBytes) return 0;
+                if (this.processMemoryAuto) {
+                    const reserved = 8 * 1024 * 1024 * 1024;
+                    const autoBytes = Math.max(totalBytes - reserved, totalBytes * 0.1);
+                    return Math.round(autoBytes / (1024 * 1024 * 1024));
+                }
+                if (this.processMemoryPercent === 0) return 0;
+                const bytes = Math.floor((this.processMemoryPercent / 100) * totalBytes);
+                return Math.round(bytes / (1024 * 1024 * 1024));
+            },
+
+            // Update process memory from manual GB input
+            updateProcessMemoryFromInput(gbValue) {
+                const gb = parseInt(gbValue) || 0;
+                const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
+                if (gb === 0) {
+                    this.processMemoryPercent = 0;
+                    this.globalSettings.memory.max_process_memory = 'disabled';
+                } else {
+                    // Store as GB string (backend supports parse_size fallback)
+                    this.globalSettings.memory.max_process_memory = `${gb}GB`;
+                    // Sync slider position
+                    if (totalBytes > 0) {
+                        const bytes = gb * 1024 * 1024 * 1024;
+                        this.processMemoryPercent = Math.min(99, Math.max(1, Math.round((bytes / totalBytes) * 100)));
+                    }
+                }
+            },
+
+            // Computed model memory size in GB (for manual input)
+            get modelMemorySizeGB() {
+                const val = this.globalSettings.model?.max_model_memory;
+                const parsed = this._parseSettingsGB(val);
+                if (parsed !== null) return parsed;
+                // Fallback: derive from percent
+                const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
+                if (!totalBytes) return 0;
+                const usableBytes = Math.max(0, totalBytes - 8 * 1024 * 1024 * 1024);
+                const bytes = Math.floor((this.memoryPercent / 100) * usableBytes);
+                return Math.round(bytes / (1024 * 1024 * 1024));
+            },
+
+            // Update model memory from manual GB input
+            updateModelMemoryFromInput(gbValue) {
+                const gb = parseInt(gbValue) || 0;
+                const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
+                const usableBytes = Math.max(0, totalBytes - 8 * 1024 * 1024 * 1024);
+                if (usableBytes > 0) {
+                    const bytes = gb * 1024 * 1024 * 1024;
+                    this.memoryPercent = Math.min(100, Math.max(0, Math.round((bytes / usableBytes) * 100)));
+                }
+                this.globalSettings.model.max_model_memory = `${gb}GB`;
+            },
+
+            // Computed hot cache size in GB (for manual input)
+            get hotCacheSizeGB() {
+                const val = this.globalSettings.cache?.hot_cache_max_size;
+                if (val && val !== '0') {
+                    const parsed = this._parseSettingsGB(val);
+                    if (parsed !== null) return parsed;
+                }
+                if (this.hotCachePercent === 0) return 0;
+                const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
+                const bytes = Math.floor((this.hotCachePercent / 100) * totalBytes);
+                return Math.floor(bytes / (1024 * 1024 * 1024));
+            },
+
+            // Update hot cache from manual GB input
+            updateHotCacheFromInput(gbValue) {
+                const gb = parseInt(gbValue) || 0;
+                if (gb === 0) {
+                    this.hotCachePercent = 0;
+                    this.globalSettings.cache.hot_cache_max_size = '0';
+                } else {
+                    const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
+                    if (totalBytes > 0) {
+                        const bytes = gb * 1024 * 1024 * 1024;
+                        this.hotCachePercent = Math.min(50, Math.max(1, Math.round((bytes / totalBytes) * 100)));
+                    }
+                    this.globalSettings.cache.hot_cache_max_size = `${gb}GB`;
+                }
+            },
+
             // Computed cache size in GB (for manual input)
             get cacheSizeGB() {
+                const val = this.globalSettings.cache?.ssd_cache_max_size;
+                if (val && val !== 'auto') {
+                    const parsed = this._parseSettingsGB(val);
+                    if (parsed !== null) return parsed;
+                }
                 const freeBytes = this.globalSettings.system?.ssd_free_bytes || 0;
                 if (!freeBytes) return 0;
                 const bytes = Math.floor((this.cachePercent / 100) * freeBytes);
