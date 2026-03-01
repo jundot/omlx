@@ -747,6 +747,10 @@ class TestEngineCoreAbortAllRequests:
                         assert output.finished is True
                         assert output.finish_reason == "error"
                         assert "memory" in output.error.lower()
+                        # new_text should contain error message for SSE delivery
+                        assert output.new_text is not None
+                        assert "[Error:" in output.new_text
+                        assert "memory" in output.new_text.lower()
 
                     # Finished events should be set
                     event = engine._finished_events.get(rid)

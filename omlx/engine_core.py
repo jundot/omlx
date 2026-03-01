@@ -304,15 +304,17 @@ class EngineCore:
             self.scheduler.abort_request(rid)
             collector = self._output_collectors.get(rid)
             if collector is not None:
+                error_msg = (
+                    "Request aborted: process memory limit exceeded. "
+                    "Increase --max-process-memory or reduce context size."
+                )
                 collector.put(
                     RequestOutput(
                         request_id=rid,
                         finished=True,
                         finish_reason="error",
-                        error=(
-                            "Request aborted: process memory limit exceeded. "
-                            "Increase --max-process-memory or reduce context size."
-                        ),
+                        new_text=f"\n\n[Error: {error_msg}]",
+                        error=error_msg,
                     )
                 )
             event = self._finished_events.get(rid)
