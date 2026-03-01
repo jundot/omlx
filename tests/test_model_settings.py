@@ -125,6 +125,26 @@ class TestModelSettings:
         assert settings.chat_template_kwargs == {"reasoning_effort": "high"}
 
 
+    def test_ttl_seconds_default(self):
+        """Test ttl_seconds defaults to None."""
+        settings = ModelSettings()
+        assert settings.ttl_seconds is None
+
+    def test_ttl_seconds_roundtrip(self):
+        """Test ttl_seconds survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(ttl_seconds=300)
+        d = original.to_dict()
+        assert d["ttl_seconds"] == 300
+        restored = ModelSettings.from_dict(d)
+        assert restored.ttl_seconds == 300
+
+    def test_ttl_seconds_excluded_when_none(self):
+        """Test ttl_seconds excluded from to_dict when None."""
+        settings = ModelSettings()
+        d = settings.to_dict()
+        assert "ttl_seconds" not in d
+
+
 class TestModelSettingsManager:
     """Tests for ModelSettingsManager class."""
 

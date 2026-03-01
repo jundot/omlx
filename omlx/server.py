@@ -297,10 +297,30 @@ async def lifespan(app: FastAPI):
             enforcer = ProcessMemoryEnforcer(
                 engine_pool=_server_state.engine_pool,
                 max_bytes=max_bytes,
+                settings_manager=_server_state.settings_manager,
             )
             _server_state.process_memory_enforcer = enforcer
             _server_state.engine_pool._process_memory_enforcer = enforcer
             enforcer.start()
+
+    # Start TTL-only checker if process memory enforcer is not running
+    # (enforcer already includes TTL checks in its polling loop)
+    ttl_task = None
+    if _server_state.process_memory_enforcer is None and _server_state.engine_pool is not None:
+        async def _ttl_check_loop():
+            while True:
+                try:
+                    if _server_state.settings_manager is not None:
+                        await _server_state.engine_pool.check_ttl_expirations(
+                            _server_state.settings_manager
+                        )
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"TTL check error: {e}")
+                await asyncio.sleep(1.0)
+
+        ttl_task = asyncio.create_task(_ttl_check_loop())
 
     # Initialize MCP if config provided
     mcp_config = os.environ.get("OMLX_MCP_CONFIG")
@@ -309,7 +329,13 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: Stop process memory enforcer, HF downloader, MCP, engines
+    # Shutdown: Stop TTL task, process memory enforcer, HF downloader, MCP, engines
+    if ttl_task is not None:
+        ttl_task.cancel()
+        try:
+            await ttl_task
+        except asyncio.CancelledError:
+            pass
     if _server_state.process_memory_enforcer is not None:
         await _server_state.process_memory_enforcer.stop()
         if _server_state.engine_pool is not None:

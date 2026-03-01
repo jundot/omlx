@@ -11,12 +11,17 @@ when memory limits are exceeded. It supports:
 - BatchedEngine for all LLM models (continuous batching)
 """
 
+from __future__ import annotations
+
 import asyncio
 import gc
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from .model_settings import ModelSettingsManager
 
 import mlx.core as mx
 
@@ -472,6 +477,7 @@ class EnginePool:
                 {
                     "id": mid,
                     "loaded": e.engine is not None,
+                    "is_loading": e.is_loading,
                     "estimated_size": e.estimated_size,
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
@@ -481,3 +487,57 @@ class EnginePool:
                 for mid, e in sorted(self._entries.items())
             ],
         }
+
+    async def check_ttl_expirations(
+        self, settings_manager: ModelSettingsManager
+    ) -> list[str]:
+        """Check and unload models that have exceeded their TTL.
+
+        Pinned models are skipped (TTL is ignored for pinned models).
+        Models with active requests are skipped and their last_access is refreshed.
+
+        Args:
+            settings_manager: The settings manager to read TTL values from.
+
+        Returns:
+            List of model IDs that were unloaded.
+        """
+        now = time.time()
+        expired: list[str] = []
+
+        async with self._lock:
+            for model_id, entry in self._entries.items():
+                if entry.engine is None or entry.is_loading or entry.is_pinned:
+                    continue
+
+                settings = settings_manager.get_settings(model_id)
+                if settings.ttl_seconds is None:
+                    continue
+
+                idle_time = now - entry.last_access
+                if idle_time < settings.ttl_seconds:
+                    continue
+
+                # Check if model has active requests
+                has_active = False
+                if isinstance(entry.engine, BatchedEngine):
+                    engine_core = getattr(entry.engine, "_engine", None)
+                    if engine_core is not None:
+                        inner = getattr(engine_core, "engine", None)
+                        if inner is not None:
+                            collectors = getattr(inner, "_output_collectors", {})
+                            if len(collectors) > 0:
+                                has_active = True
+
+                if has_active:
+                    entry.last_access = now
+                    continue
+
+                logger.info(
+                    f"TTL expired for model '{model_id}' "
+                    f"(idle {idle_time:.0f}s > ttl {settings.ttl_seconds}s)"
+                )
+                await self._unload_engine(model_id)
+                expired.append(model_id)
+
+        return expired

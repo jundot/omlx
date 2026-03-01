@@ -420,6 +420,51 @@
                 }
             },
 
+            async loadModel(modelId) {
+                const model = this.models.find(m => m.id === modelId);
+                if (model) model.is_loading = true;
+                try {
+                    const response = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/load`, {
+                        method: 'POST',
+                    });
+                    if (response.ok) {
+                        await this.loadModels();
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await response.json();
+                        alert(data.detail || 'Failed to load model');
+                        await this.loadModels();
+                    }
+                } catch (err) {
+                    console.error('Failed to load model:', err);
+                    alert('Failed to load model');
+                    await this.loadModels();
+                }
+            },
+
+            async unloadModel(modelId) {
+                try {
+                    const response = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/unload`, {
+                        method: 'POST',
+                    });
+                    if (response.ok) {
+                        const model = this.models.find(m => m.id === modelId);
+                        if (model) model.loaded = false;
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await response.json();
+                        alert(data.detail || 'Failed to unload model');
+                    }
+                    await this.loadModels();
+                } catch (err) {
+                    console.error('Failed to unload model:', err);
+                    alert('Failed to unload model');
+                    await this.loadModels();
+                }
+            },
+
             openModelSettings(model) {
                 this.selectedModel = model;
                 // Load existing settings if available
@@ -447,6 +492,7 @@
                     force_sampling: settings.force_sampling || false,
                     enableToolResultLimit: !!(settings.max_tool_result_tokens),
                     max_tool_result_tokens: settings.max_tool_result_tokens || null,
+                    ttl_seconds: settings.ttl_seconds ?? null,
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
@@ -490,6 +536,7 @@
                                 top_k: Number.isFinite(this.modelSettings.top_k) ? this.modelSettings.top_k : null,
                                 repetition_penalty: Number.isFinite(this.modelSettings.repetition_penalty) ? this.modelSettings.repetition_penalty : null,
                                 force_sampling: this.modelSettings.force_sampling,
+                                ttl_seconds: this.modelSettings.ttl_seconds || null,
                                 max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                     ? (this.modelSettings.max_tool_result_tokens || null)
                                     : 0,

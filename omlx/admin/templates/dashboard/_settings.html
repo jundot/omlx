@@ -654,15 +654,41 @@
                                         </div>
 
                                         <!-- Status -->
-                                        <div class="w-20 text-center flex-shrink-0">
-                                            <span :class="model.loaded
-                                                      ? 'bg-neutral-900 text-white'
-                                                      : 'bg-white text-neutral-500 border border-neutral-200'"
-                                                  class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1">
-                                                <span :class="model.loaded ? 'bg-white' : 'bg-neutral-400'"
-                                                      class="w-1.5 h-1.5 rounded-full"></span>
-                                                <span x-text="model.loaded ? 'Loaded' : 'Ready'"></span>
-                                            </span>
+                                        <div class="w-20 text-center flex-shrink-0"
+                                             x-data="{ hover: false }"
+                                             @mouseenter="hover = true" @mouseleave="hover = false">
+                                            <!-- Loading state -->
+                                            <template x-if="model.is_loading">
+                                                <span class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 bg-amber-100 text-amber-700">
+                                                    <svg class="w-3 h-3 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                                                    </svg>
+                                                    <span>Loading</span>
+                                                </span>
+                                            </template>
+                                            <!-- Loaded state -->
+                                            <template x-if="!model.is_loading && model.loaded">
+                                                <button @click="unloadModel(model.id)"
+                                                        :class="hover
+                                                            ? 'bg-red-100 text-red-700 cursor-pointer'
+                                                            : 'bg-neutral-900 text-white'"
+                                                        class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 transition-all">
+                                                    <span :class="hover ? 'bg-red-500' : 'bg-white'" class="w-1.5 h-1.5 rounded-full"></span>
+                                                    <span x-text="hover ? 'Unload' : 'Loaded'"></span>
+                                                </button>
+                                            </template>
+                                            <!-- Ready state -->
+                                            <template x-if="!model.is_loading && !model.loaded">
+                                                <button @click="loadModel(model.id)"
+                                                        :class="hover
+                                                            ? 'bg-green-100 text-green-700 border-green-200 cursor-pointer'
+                                                            : 'bg-white text-neutral-500 border-neutral-200'"
+                                                        class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 border transition-all">
+                                                    <span :class="hover ? 'bg-green-500' : 'bg-neutral-400'" class="w-1.5 h-1.5 rounded-full"></span>
+                                                    <span x-text="hover ? 'Load' : 'Ready'"></span>
+                                                </button>
+                                            </template>
                                         </div>
 
                                         <!-- Pin Toggle -->

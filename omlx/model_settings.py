@@ -47,6 +47,7 @@ class ModelSettings:
     max_tool_result_tokens: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     forced_ct_kwargs: Optional[list[str]] = None  # Keys that cannot be overridden by API requests
+    ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
 
     # Model management flags
     is_pinned: bool = False

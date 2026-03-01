@@ -65,6 +65,7 @@ class ModelSettingsRequest(BaseModel):
     max_tool_result_tokens: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     forced_ct_kwargs: Optional[list[str]] = None
+    ttl_seconds: Optional[int] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
 
@@ -922,6 +923,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         model_data = {
             "id": model_id,
             "loaded": model_info.get("loaded", False),
+            "is_loading": model_info.get("is_loading", False),
             "estimated_size": model_info.get("estimated_size", 0),
             "estimated_size_formatted": format_size(model_info.get("estimated_size", 0)),
             "pinned": model_info.get("pinned", False),
@@ -944,6 +946,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "max_tool_result_tokens": settings.max_tool_result_tokens,
                 "chat_template_kwargs": settings.chat_template_kwargs,
                 "forced_ct_kwargs": settings.forced_ct_kwargs,
+                "ttl_seconds": settings.ttl_seconds,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
@@ -974,6 +977,33 @@ async def unload_model(
     await engine_pool._unload_engine(model_id)
     logger.info(f"Manually unloaded model: {model_id}")
     return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
+
+
+@router.post("/api/models/{model_id}/load")
+async def load_model(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Manually load a model into memory."""
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    if entry.engine is not None:
+        return {"status": "ok", "model_id": model_id, "message": f"Already loaded: {model_id}"}
+    if entry.is_loading:
+        raise HTTPException(status_code=409, detail=f"Model is already loading: {model_id}")
+
+    try:
+        await engine_pool.get_engine(model_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    logger.info(f"Manually loaded model: {model_id}")
+    return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
 
 
 @router.put("/api/models/{model_id}/settings")
@@ -1040,6 +1070,8 @@ async def update_model_settings(
         current_settings.chat_template_kwargs = request.chat_template_kwargs
     if "forced_ct_kwargs" in sent:
         current_settings.forced_ct_kwargs = request.forced_ct_kwargs
+    if "ttl_seconds" in sent:
+        current_settings.ttl_seconds = request.ttl_seconds
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry

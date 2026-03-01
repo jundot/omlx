@@ -410,3 +410,127 @@ class TestEnginePoolEviction:
             # Try to load model-b - should fail (can't evict pinned model-a)
             with pytest.raises(InsufficientMemoryError):
                 await pool.get_engine("model-b")
+
+
+class TestEnginePoolStatus:
+    """Tests for get_status is_loading field."""
+
+    def test_get_status_includes_is_loading(self, small_mock_model_dir):
+        """Test get_status includes is_loading field."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        status = pool.get_status()
+        for model in status["models"]:
+            assert "is_loading" in model
+            assert model["is_loading"] is False
+
+
+class TestEnginePoolTTL:
+    """Tests for TTL expiration checking."""
+
+    @pytest.fixture
+    def pool_with_loaded_model(self, small_mock_model_dir):
+        """Create pool with a mock-loaded model."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Mock-load model-a
+        entry = pool._entries["model-a"]
+        entry.engine = MagicMock(spec=[])
+        entry.engine.stop = AsyncMock()
+        entry.last_access = 100.0  # Old access time
+        pool._current_model_memory = entry.estimated_size
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_ttl_expires_idle_model(self, pool_with_loaded_model):
+        """Test that TTL unloads idle model."""
+        pool = pool_with_loaded_model
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = 60
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=200.0):  # 100s idle > 60s TTL
+            expired = await pool.check_ttl_expirations(settings_manager)
+
+        assert "model-a" in expired
+        assert pool._entries["model-a"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_ttl_skips_model_within_ttl(self, pool_with_loaded_model):
+        """Test that TTL does not unload model within TTL."""
+        pool = pool_with_loaded_model
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = 300
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=200.0):  # 100s idle < 300s TTL
+            expired = await pool.check_ttl_expirations(settings_manager)
+
+        assert expired == []
+        assert pool._entries["model-a"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_ttl_skips_no_ttl_model(self, pool_with_loaded_model):
+        """Test that models without TTL are not unloaded."""
+        pool = pool_with_loaded_model
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = None
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=99999.0):
+            expired = await pool.check_ttl_expirations(settings_manager)
+
+        assert expired == []
+        assert pool._entries["model-a"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_ttl_skips_pinned_model(self, pool_with_loaded_model):
+        """Test that pinned models are not unloaded by TTL."""
+        pool = pool_with_loaded_model
+        pool._entries["model-a"].is_pinned = True
+
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = 60
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=200.0):
+            expired = await pool.check_ttl_expirations(settings_manager)
+
+        assert expired == []
+        assert pool._entries["model-a"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_ttl_skips_model_with_active_requests(self, pool_with_loaded_model):
+        """Test that TTL does not unload model with active requests."""
+        pool = pool_with_loaded_model
+
+        # Mock a BatchedEngine with active requests
+        mock_engine = MagicMock()
+        mock_engine_core = MagicMock()
+        mock_inner = MagicMock()
+        mock_inner._output_collectors = {"req1": MagicMock()}
+        mock_engine_core.engine = mock_inner
+        mock_engine._engine = mock_engine_core
+
+        from omlx.engine import BatchedEngine
+        mock_engine.__class__ = BatchedEngine
+
+        pool._entries["model-a"].engine = mock_engine
+
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = 60
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=200.0):
+            expired = await pool.check_ttl_expirations(settings_manager)
+
+        assert expired == []
+        # last_access should be refreshed
+        assert pool._entries["model-a"].last_access == 200.0
