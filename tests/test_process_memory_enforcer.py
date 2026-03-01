@@ -62,7 +62,21 @@ class TestCheckAndEnforce:
 
     @pytest.mark.asyncio
     async def test_evicts_when_over_limit(self, enforcer):
-        """Evicts LRU model when over limit."""
+        """Evicts LRU model when over limit (multiple models loaded)."""
+        # Need at least 2 loaded non-pinned models for eviction path
+        entry_a = _make_entry("model-a", engine=MagicMock())
+        entry_b = _make_entry("model-b", engine=MagicMock())
+        enforcer._engine_pool._entries = {
+            "model-a": entry_a,
+            "model-b": entry_b,
+        }
+        enforcer._engine_pool._find_lru_victim.return_value = "model-a"
+
+        async def fake_unload(model_id):
+            enforcer._engine_pool._entries[model_id].engine = None
+
+        enforcer._engine_pool._unload_engine.side_effect = fake_unload
+
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.side_effect = [
                 15 * 1024**3,  # Initial check (over limit)
@@ -90,10 +104,25 @@ class TestCheckAndEnforce:
     @pytest.mark.asyncio
     async def test_evicts_multiple_models(self, enforcer):
         """Evicts multiple models in sequence until under limit."""
+        # Need 3 loaded non-pinned models for sequential eviction
+        entry_a = _make_entry("model-a", engine=MagicMock())
+        entry_b = _make_entry("model-b", engine=MagicMock())
+        entry_c = _make_entry("model-c", engine=MagicMock())
+        enforcer._engine_pool._entries = {
+            "model-a": entry_a,
+            "model-b": entry_b,
+            "model-c": entry_c,
+        }
         enforcer._engine_pool._find_lru_victim.side_effect = [
             "model-a",
             "model-b",
         ]
+
+        async def fake_unload(model_id):
+            enforcer._engine_pool._entries[model_id].engine = None
+
+        enforcer._engine_pool._unload_engine.side_effect = fake_unload
+
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.side_effect = [
                 20 * 1024**3,  # Initial check
@@ -126,15 +155,28 @@ class TestCheckAndEnforce:
     @pytest.mark.asyncio
     async def test_evicts_lru_before_aborting_loading(self, enforcer):
         """Evicts LRU models first, then aborts loading model."""
+        # Need 2 loaded non-pinned so model-a gets evicted (not abort path)
+        entry_a = _make_entry("model-a", engine=MagicMock())
+        entry_b = _make_entry("model-b", engine=MagicMock())
+        loading_entry = _make_entry(
+            "loading-model", engine=None, is_loading=True
+        )
+        enforcer._engine_pool._entries = {
+            "model-a": entry_a,
+            "model-b": entry_b,
+            "loading-model": loading_entry,
+        }
+
+        async def fake_unload(model_id):
+            enforcer._engine_pool._entries[model_id].engine = None
+
+        enforcer._engine_pool._unload_engine.side_effect = fake_unload
+
         # First call returns victim, second call returns None
         enforcer._engine_pool._find_lru_victim.side_effect = [
             "model-a",
             None,
         ]
-        loading_entry = _make_entry(
-            "loading-model", engine=None, is_loading=True
-        )
-        enforcer._engine_pool._entries = {"loading-model": loading_entry}
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.side_effect = [
@@ -162,6 +204,136 @@ class TestCheckAndEnforce:
             ]
             await enforcer._check_and_enforce()
         # Should not raise, just log warning
+
+
+class TestSingleModelMemoryPressure:
+    """Tests for single-model memory pressure handling (Issue #62).
+
+    Verifies three scenarios:
+    1. Two models, one inferring: evict idle LRU, inference continues
+    2. Single model: abort requests, keep model loaded
+    3. Two models both inferring: evict LRU, then abort remaining
+    """
+
+    @pytest.mark.asyncio
+    async def test_single_model_aborts_not_evicts(self, enforcer):
+        """Scenario 2: Single model aborts requests instead of evicting."""
+        engine = MagicMock()
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("big-model", engine=engine)
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = "big-model"
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = [
+                15 * 1024**3,  # Initial check
+                15 * 1024**3,  # While loop check
+            ]
+            await enforcer._check_and_enforce()
+
+        engine.abort_all_requests.assert_awaited_once()
+        enforcer._engine_pool._unload_engine.assert_not_awaited()
+        assert entry.engine is not None
+
+    @pytest.mark.asyncio
+    async def test_single_model_no_active_requests(self, enforcer):
+        """Scenario 2 variant: No requests to abort, model still kept."""
+        engine = MagicMock()
+        engine.abort_all_requests = AsyncMock(return_value=0)
+        entry = _make_entry("big-model", engine=engine)
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = "big-model"
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = [
+                15 * 1024**3,
+                15 * 1024**3,
+            ]
+            await enforcer._check_and_enforce()
+
+        engine.abort_all_requests.assert_awaited_once()
+        enforcer._engine_pool._unload_engine.assert_not_awaited()
+        assert entry.engine is not None
+
+    @pytest.mark.asyncio
+    async def test_two_models_one_inferring_evicts_idle(self, enforcer):
+        """Scenario 1: Two models, only one inferring. Evict idle LRU."""
+        engine_active = MagicMock()
+        engine_active.abort_all_requests = AsyncMock(return_value=0)
+        engine_idle = MagicMock()
+        engine_idle.abort_all_requests = AsyncMock(return_value=0)
+
+        entry_active = _make_entry(
+            "active-model", engine=engine_active
+        )
+        entry_idle = _make_entry(
+            "idle-model", engine=engine_idle
+        )
+        enforcer._engine_pool._entries = {
+            "active-model": entry_active,
+            "idle-model": entry_idle,
+        }
+        enforcer._engine_pool._find_lru_victim.return_value = "idle-model"
+
+        async def fake_unload(model_id):
+            enforcer._engine_pool._entries[model_id].engine = None
+
+        enforcer._engine_pool._unload_engine.side_effect = fake_unload
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = [
+                15 * 1024**3,  # Initial check
+                15 * 1024**3,  # While loop check
+                8 * 1024**3,  # After eviction (under limit)
+            ]
+            await enforcer._check_and_enforce()
+
+        enforcer._engine_pool._unload_engine.assert_awaited_once_with(
+            "idle-model"
+        )
+        engine_active.abort_all_requests.assert_not_awaited()
+        assert entry_active.engine is not None
+
+    @pytest.mark.asyncio
+    async def test_two_models_both_inferring_evict_then_abort(self, enforcer):
+        """Scenario 3: Both models inferring. Evict LRU, abort remaining."""
+        engine_a = MagicMock()
+        engine_a.abort_all_requests = AsyncMock(return_value=2)
+        engine_b = MagicMock()
+        engine_b.abort_all_requests = AsyncMock(return_value=1)
+
+        entry_a = _make_entry("model-a", engine=engine_a)
+        entry_b = _make_entry("model-b", engine=engine_b)
+        enforcer._engine_pool._entries = {
+            "model-a": entry_a,
+            "model-b": entry_b,
+        }
+        # First iteration: model-b is LRU. After eviction: model-a is sole.
+        enforcer._engine_pool._find_lru_victim.side_effect = [
+            "model-b",
+            "model-a",
+        ]
+
+        async def fake_unload(model_id):
+            enforcer._engine_pool._entries[model_id].engine = None
+
+        enforcer._engine_pool._unload_engine.side_effect = fake_unload
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            # Memory stays over limit throughout
+            mock_mx.get_active_memory.return_value = 15 * 1024**3
+            await enforcer._check_and_enforce()
+
+        # model-b evicted (requests aborted via stop() in _unload_engine)
+        enforcer._engine_pool._unload_engine.assert_awaited_once_with(
+            "model-b"
+        )
+        # model-a's requests aborted (single-model path)
+        engine_a.abort_all_requests.assert_awaited_once()
+        # model-a still loaded
+        assert entry_a.engine is not None
+        # model-b's abort_all_requests NOT called (handled by _unload_engine)
+        engine_b.abort_all_requests.assert_not_awaited()
 
 
 class TestMemoryLimitPropagation:

@@ -505,3 +505,9 @@ class BatchedEngine(BaseEngine):
         if self._engine:
             return self._engine.get_cache_stats()
         return None
+
+    async def abort_all_requests(self) -> int:
+        """Abort all active requests without stopping the engine."""
+        if self._engine and self._engine.engine:
+            return await self._engine.engine.abort_all_requests()
+        return 0

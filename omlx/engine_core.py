@@ -292,6 +292,38 @@ class EngineCore:
         self._cleanup_request(request_id)
         return result
 
+    async def abort_all_requests(self) -> int:
+        """Abort all active requests without stopping the engine.
+
+        Sends error output to all active collectors and marks requests
+        for deferred abort in the scheduler. Cleanup is handled by
+        the consumer (stream_outputs/generate).
+        """
+        request_ids = list(self._output_collectors.keys())
+        for rid in request_ids:
+            self.scheduler.abort_request(rid)
+            collector = self._output_collectors.get(rid)
+            if collector is not None:
+                collector.put(
+                    RequestOutput(
+                        request_id=rid,
+                        finished=True,
+                        finish_reason="error",
+                        error=(
+                            "Request aborted: process memory limit exceeded. "
+                            "Increase --max-process-memory or reduce context size."
+                        ),
+                    )
+                )
+            event = self._finished_events.get(rid)
+            if event is not None:
+                event.set()
+        if request_ids:
+            logger.warning(
+                f"Aborted {len(request_ids)} requests due to memory pressure"
+            )
+        return len(request_ids)
+
     def _cleanup_request(self, request_id: str) -> None:
         """Clean up request tracking."""
         collector = self._output_collectors.pop(request_id, None)
@@ -614,6 +646,10 @@ class AsyncEngineCore:
     async def abort_request(self, request_id: str) -> bool:
         """Abort a request."""
         return await self.engine.abort_request(request_id)
+
+    async def abort_all_requests(self) -> int:
+        """Abort all active requests without stopping the engine."""
+        return await self.engine.abort_all_requests()
 
     async def stream_outputs(
         self,

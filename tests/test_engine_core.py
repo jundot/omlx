@@ -714,3 +714,86 @@ class TestAsyncEngineCore:
                 stats = engine.get_cache_stats()
 
                 assert stats is None  # No SSD cache configured
+
+
+class TestEngineCoreAbortAllRequests:
+    """Tests for EngineCore.abort_all_requests()."""
+
+    @pytest.mark.asyncio
+    async def test_abort_all_requests(self, mock_model, mock_tokenizer):
+        """Test abort_all_requests() sends errors to all collectors."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+
+                # Add multiple requests
+                rid1 = await engine.add_request(prompt="Hello")
+                rid2 = await engine.add_request(prompt="World")
+
+                # Abort all
+                count = await engine.abort_all_requests()
+                assert count == 2
+
+                # Collectors should have error outputs
+                for rid in [rid1, rid2]:
+                    collector = engine._output_collectors.get(rid)
+                    if collector is not None:
+                        output = collector.get_nowait()
+                        assert output is not None
+                        assert output.finished is True
+                        assert output.finish_reason == "error"
+                        assert "memory" in output.error.lower()
+
+                    # Finished events should be set
+                    event = engine._finished_events.get(rid)
+                    if event is not None:
+                        assert event.is_set()
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_abort_all_requests_empty(self, mock_model, mock_tokenizer):
+        """Test abort_all_requests() with no active requests returns 0."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+                count = await engine.abort_all_requests()
+                assert count == 0
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_abort_all_requests_engine_keeps_running(
+        self, mock_model, mock_tokenizer
+    ):
+        """Test engine loop continues after abort_all_requests()."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+
+                rid = await engine.add_request(prompt="Hello")
+                await engine.abort_all_requests()
+
+                # Engine should still be running
+                assert engine.is_running() is True
+
+                # Can add new requests after abort
+                new_rid = await engine.add_request(prompt="New request")
+                assert new_rid in engine._output_collectors
+            finally:
+                await engine.stop()
+                engine.close()

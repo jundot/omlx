@@ -127,7 +127,17 @@ class ProcessMemoryEnforcer:
             await asyncio.sleep(self._poll_interval)
 
     async def _check_and_enforce(self) -> None:
-        """Check current memory and enforce limit if exceeded."""
+        """Check current memory and enforce limit if exceeded.
+
+        Handles three scenarios via the while loop:
+        1. Multiple models, one inferring: evict LRU (idle) model,
+           inference on the other continues.
+        2. Single model: abort all requests, keep model loaded.
+           Short-context requests can be served afterward.
+        3. Multiple models, both inferring: first iteration evicts LRU
+           (aborting its requests), second iteration aborts remaining
+           single model's requests.
+        """
         current = mx.get_active_memory()
         if current <= self._max_bytes:
             return
@@ -146,12 +156,38 @@ class ProcessMemoryEnforcer:
             while mx.get_active_memory() > self._max_bytes:
                 victim = self._engine_pool._find_lru_victim()
                 if victim is not None:
-                    logger.warning(
-                        f"Evicting model '{victim}' to enforce "
-                        f"process memory limit"
-                    )
-                    await self._engine_pool._unload_engine(victim)
-                    continue
+                    # Count loaded non-pinned models
+                    loaded_non_pinned = [
+                        mid
+                        for mid, e in self._engine_pool._entries.items()
+                        if e.engine is not None and not e.is_pinned
+                    ]
+                    if len(loaded_non_pinned) > 1:
+                        # Multiple models: evict LRU victim.
+                        # _unload_engine calls stop() which aborts
+                        # victim's requests.
+                        logger.warning(
+                            f"Evicting model '{victim}' to enforce "
+                            f"process memory limit"
+                        )
+                        await self._engine_pool._unload_engine(victim)
+                        continue
+                    else:
+                        # Single model: abort all requests, keep model
+                        # loaded. This frees KV cache blocks internally
+                        # so short-context requests can be served without
+                        # new Metal allocation.
+                        entry = self._engine_pool._entries.get(victim)
+                        if entry and entry.engine is not None:
+                            if hasattr(entry.engine, "abort_all_requests"):
+                                aborted = await entry.engine.abort_all_requests()
+                                if aborted > 0:
+                                    logger.warning(
+                                        f"Aborted {aborted} requests on "
+                                        f"'{victim}' due to memory pressure "
+                                        f"(model kept loaded)"
+                                    )
+                        break
 
                 # No loaded non-pinned model to evict.
                 # Check if any model is currently loading — request abort.
