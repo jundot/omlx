@@ -61,6 +61,7 @@ class OMLXAppDelegate(NSObject):
         self._last_update_check: float = 0
         self._updater = None  # AppUpdater instance during download
         self._update_ready = False  # True when staged app is ready to swap
+        self._update_progress_text = ""  # Current download progress text
 
         return self
 
@@ -365,6 +366,7 @@ class OMLXAppDelegate(NSObject):
 
     def updateProgressOnMain_(self, message):
         """Main thread: rebuild menu to show download progress."""
+        self._update_progress_text = message
         self._build_menu()
 
     def _on_update_error(self, message: str):
@@ -376,6 +378,7 @@ class OMLXAppDelegate(NSObject):
     def updateErrorOnMain_(self, message):
         """Main thread: show error and offer browser fallback."""
         self._updater = None
+        self._update_progress_text = ""
         self._build_menu()
 
         from AppKit import NSAlert, NSAlertFirstButtonReturn
@@ -401,6 +404,7 @@ class OMLXAppDelegate(NSObject):
         """Main thread: show 'Restart to Update' in menu."""
         self._update_ready = True
         self._updater = None
+        self._update_progress_text = ""
         self._build_menu()
 
     @objc.IBAction
@@ -517,7 +521,8 @@ class OMLXAppDelegate(NSObject):
                 )
                 update_action = "installUpdate:"
             elif self._updater is not None:
-                update_text = "⬇️ Downloading Update..."
+                progress = self._update_progress_text or "Downloading..."
+                update_text = f"⬇️ {progress}"
                 update_action = None
             else:
                 update_text = (

@@ -100,9 +100,15 @@ class TestAppUpdater:
     @patch("omlx_app.updater.subprocess.run")
     def test_mount_dmg_success(self, mock_run):
         """Test successful DMG mounting."""
+        # Realistic hdiutil output: first lines have empty mount point,
+        # only the last line has the actual mount path
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="/dev/disk5\t\t\t/tmp/dmg-XXXX\n",
+            stdout=(
+                "/dev/disk5\tApple_partition_scheme\t\n"
+                "/dev/disk5s1\tApple_partition_map\t\n"
+                "/dev/disk5s2\tApple_HFS\t/tmp/dmg-XXXX\n"
+            ),
         )
 
         updater = AppUpdater(dmg_url="https://x.com/a.dmg", version="1.0")
@@ -111,6 +117,27 @@ class TestAppUpdater:
             result = updater._mount_dmg(Path("/tmp/test.dmg"))
 
         assert result == Path("/tmp/dmg-XXXX")
+
+    @patch("omlx_app.updater.subprocess.run")
+    def test_mount_dmg_skips_empty_mount_points(self, mock_run):
+        """Test that empty mount point strings (from partition lines) are skipped."""
+        # Lines with empty last column should NOT match as mount points
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=(
+                "/dev/disk5\tApple_partition_scheme\t\n"
+                "/dev/disk5s1\tApple_partition_map\t\n"
+                "/dev/disk5s2\tApple_HFS\t/tmp/dmg-REAL\n"
+            ),
+        )
+
+        updater = AppUpdater(dmg_url="https://x.com/a.dmg", version="1.0")
+
+        with patch.object(Path, "is_dir", return_value=True):
+            result = updater._mount_dmg(Path("/tmp/test.dmg"))
+
+        # Should return the actual mount point, not empty string from first lines
+        assert str(result) == "/tmp/dmg-REAL"
         mock_run.assert_called_once()
         args = mock_run.call_args[0][0]
         assert "hdiutil" in args

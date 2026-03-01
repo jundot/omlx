@@ -183,7 +183,7 @@ class AppUpdater:
             ],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=120,
         )
         if result.returncode != 0:
             raise UpdateError(f"Failed to mount DMG: {result.stderr}")
@@ -193,7 +193,7 @@ class AppUpdater:
             parts = line.split("\t")
             if len(parts) >= 3:
                 mount_point = parts[-1].strip()
-                if Path(mount_point).is_dir():
+                if mount_point and Path(mount_point).is_dir():
                     return Path(mount_point)
 
         raise UpdateError("Could not determine DMG mount point")
