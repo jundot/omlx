@@ -114,6 +114,11 @@ class ResponseFormat(BaseModel):
 # Chat Completion
 # =============================================================================
 
+class StreamOptions(BaseModel):
+    """Options for streaming responses."""
+    include_usage: bool = False
+
+
 class ChatCompletionRequest(BaseModel):
     """Request for chat completion."""
     model: str
@@ -122,6 +127,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float | None = None
     max_tokens: Optional[int] = None
     stream: bool = False
+    stream_options: Optional[StreamOptions] = None
     stop: Optional[List[str]] = None
     # Tool calling
     tools: Optional[List[ToolDefinition]] = None
@@ -148,9 +154,21 @@ class ChatCompletionChoice(BaseModel):
 
 
 class Usage(BaseUsage):
-    """Token usage statistics for OpenAI API."""
+    """Token usage statistics for OpenAI API.
 
-    pass
+    Extends BaseUsage with optional timing metrics (oMLX extension).
+    When present, timing values are in seconds.
+    """
+
+    cached_tokens: Optional[int] = None
+    # Timing metrics (oMLX extension, seconds)
+    model_load_duration: Optional[float] = None
+    time_to_first_token: Optional[float] = None
+    total_time: Optional[float] = None
+    prompt_eval_duration: Optional[float] = None
+    generation_duration: Optional[float] = None
+    prompt_tokens_per_second: Optional[float] = None
+    generation_tokens_per_second: Optional[float] = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -176,6 +194,7 @@ class CompletionRequest(BaseModel):
     top_p: float | None = None
     max_tokens: Optional[int] = None
     stream: bool = False
+    stream_options: Optional[StreamOptions] = None
     stop: Optional[List[str]] = None
 
 

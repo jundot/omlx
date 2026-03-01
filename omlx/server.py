@@ -1217,7 +1217,9 @@ async def create_completion(
     _: bool = Depends(verify_api_key),
 ):
     """Create a text completion."""
+    load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
+    model_load_duration = time.perf_counter() - load_start
 
     # Handle single prompt or list of prompts
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
@@ -1230,7 +1232,7 @@ async def create_completion(
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
-                stream_completion(engine, prompts[0], request),
+                stream_completion(engine, prompts[0], request, model_load_duration=model_load_duration),
                 http_request=http_request,
             ),
             media_type="text/event-stream",
@@ -1329,7 +1331,9 @@ async def create_chat_completion(
             content_preview = str(msg.content)[:200] if msg.content else "(empty)"
             logger.log(5, "  Message[%d]: role=%s, content=%s...", i, msg.role, content_preview)
 
+    load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
+    model_load_duration = time.perf_counter() - load_start
 
     # Get per-model settings
     max_tool_result_tokens = None
@@ -1411,7 +1415,7 @@ async def create_chat_completion(
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
-                stream_chat_completion(engine, messages, request, **chat_kwargs),
+                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, **chat_kwargs),
                 http_request=http_request,
             ),
             media_type="text/event-stream",
@@ -1542,6 +1546,7 @@ async def stream_completion(
     engine: BaseEngine,
     prompt: str,
     request: CompletionRequest,
+    model_load_duration: float = 0.0,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     start_time = time.perf_counter()
@@ -1590,14 +1595,42 @@ async def stream_completion(
     if last_output and last_output.finished:
         end_time = time.perf_counter()
         ttft = (first_token_time - start_time) if first_token_time else (end_time - start_time)
+        gen_duration = end_time - (first_token_time or start_time)
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
-            generation_duration=end_time - (first_token_time or start_time),
+            generation_duration=gen_duration,
             model_id=request.model,
         )
+
+        # Emit usage chunk if requested
+        if request.stream_options and request.stream_options.include_usage:
+            total_time = end_time - start_time
+            pt = last_output.prompt_tokens
+            ct = last_output.completion_tokens
+            usage_data = {
+                "id": f"cmpl-{uuid.uuid4().hex[:8]}",
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [],
+                "usage": Usage(
+                    prompt_tokens=pt,
+                    completion_tokens=ct,
+                    total_tokens=pt + ct,
+                    cached_tokens=last_output.cached_tokens or None,
+                    model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
+                    time_to_first_token=round(ttft, 2),
+                    total_time=round(total_time, 2),
+                    prompt_eval_duration=round(ttft, 2),
+                    generation_duration=round(gen_duration, 2),
+                    prompt_tokens_per_second=round(pt / ttft, 2) if ttft > 0 else None,
+                    generation_tokens_per_second=round(ct / gen_duration, 2) if gen_duration > 0 else None,
+                ).model_dump(exclude_none=True),
+            }
+            yield f"data: {json.dumps(usage_data)}\n\n"
 
     yield "data: [DONE]\n\n"
 
@@ -1606,6 +1639,7 @@ async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
     request: ChatCompletionRequest,
+    model_load_duration: float = 0.0,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
@@ -1795,18 +1829,44 @@ async def stream_chat_completion(
     )
     yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
 
-    # Record metrics
+    # Record metrics and emit usage chunk
     if last_output and last_output.finished:
         end_time = time.perf_counter()
         ttft = (first_token_time - start_time) if first_token_time else (end_time - start_time)
+        gen_duration = end_time - (first_token_time or start_time)
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
-            generation_duration=end_time - (first_token_time or start_time),
+            generation_duration=gen_duration,
             model_id=request.model,
         )
+
+        # Emit usage chunk if requested
+        if request.stream_options and request.stream_options.include_usage:
+            total_time = end_time - start_time
+            pt = last_output.prompt_tokens
+            ct = last_output.completion_tokens
+            usage_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=request.model,
+                choices=[],
+                usage=Usage(
+                    prompt_tokens=pt,
+                    completion_tokens=ct,
+                    total_tokens=pt + ct,
+                    cached_tokens=last_output.cached_tokens or None,
+                    model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
+                    time_to_first_token=round(ttft, 2),
+                    total_time=round(total_time, 2),
+                    prompt_eval_duration=round(ttft, 2),
+                    generation_duration=round(gen_duration, 2),
+                    prompt_tokens_per_second=round(pt / ttft, 2) if ttft > 0 else None,
+                    generation_tokens_per_second=round(ct / gen_duration, 2) if gen_duration > 0 else None,
+                ),
+            )
+            yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
 
     yield "data: [DONE]\n\n"
 
