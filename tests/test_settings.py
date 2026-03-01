@@ -1231,10 +1231,12 @@ class TestClaudeCodeSettings:
             context_scaling_enabled=True, target_context_size=100000
         )
         result = settings.to_dict()
-        assert result == {
-            "context_scaling_enabled": True,
-            "target_context_size": 100000,
-        }
+        assert result["context_scaling_enabled"] is True
+        assert result["target_context_size"] == 100000
+        assert result["mode"] == "cloud"
+        assert result["opus_model"] is None
+        assert result["sonnet_model"] is None
+        assert result["haiku_model"] is None
 
     def test_from_dict(self):
         """Test creation from dictionary."""
