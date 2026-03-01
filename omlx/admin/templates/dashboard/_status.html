@@ -140,6 +140,12 @@
 
                                     <!-- Per-tier model selectors (Local mode only) -->
                                     <div x-show="globalSettings.claude_code.mode === 'local'" x-cloak class="space-y-3">
+                                        <!-- No models loaded warning -->
+                                        <div x-show="globalSettings.claude_code.mode === 'local' && llmModels.length === 0" x-cloak
+                                             class="flex items-center gap-2 px-3 py-2.5 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">
+                                            <i data-lucide="alert-triangle" class="w-3.5 h-3.5 flex-shrink-0"></i>
+                                            <span>No models loaded — start omlx with a model to enable Local mode</span>
+                                        </div>
                                         <!-- Opus tier -->
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">Opus Tier</label>
