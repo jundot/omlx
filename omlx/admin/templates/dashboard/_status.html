@@ -157,6 +157,12 @@
                                                     <option :value="m.id" x-text="m.id"></option>
                                                 </template>
                                             </select>
+                                            <div x-show="globalSettings.claude_code.opus_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.claude_code.opus_model)"
+                                                 x-cloak
+                                                 class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                                                <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+                                                <span>Saved model no longer available</span>
+                                            </div>
                                         </div>
                                         <!-- Sonnet tier -->
                                         <div>
@@ -169,6 +175,12 @@
                                                     <option :value="m.id" x-text="m.id"></option>
                                                 </template>
                                             </select>
+                                            <div x-show="globalSettings.claude_code.sonnet_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.claude_code.sonnet_model)"
+                                                 x-cloak
+                                                 class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                                                <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+                                                <span>Saved model no longer available</span>
+                                            </div>
                                         </div>
                                         <!-- Haiku tier -->
                                         <div>
@@ -181,6 +193,12 @@
                                                     <option :value="m.id" x-text="m.id"></option>
                                                 </template>
                                             </select>
+                                            <div x-show="globalSettings.claude_code.haiku_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.claude_code.haiku_model)"
+                                                 x-cloak
+                                                 class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                                                <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+                                                <span>Saved model no longer available</span>
+                                            </div>
                                             <p class="mt-1 text-xs text-neutral-400">Background tasks &amp; fast ops — choose smallest available</p>
                                         </div>
                                     </div>
