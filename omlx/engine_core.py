@@ -584,6 +584,11 @@ class EngineCore:
         self._stream_states.clear()
         self._finished_events.clear()
 
+        # Release model and tokenizer references for GC
+        self.model = None
+        self.tokenizer = None
+        self.scheduler = None
+
         logger.debug(f"Engine {self._engine_id} closed")
 
     def __del__(self):

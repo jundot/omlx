@@ -2764,6 +2764,16 @@ class Scheduler:
                 if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'cache'):
                     layer.self_attn.cache = None
 
+        # Release model and tokenizer references for GC
+        self.model = None
+        self.tokenizer = None
+
+        # Release all cache-related references for GC
+        self.paged_cache_manager = None
+        self.block_aware_cache = None
+        self.memory_monitor = None
+        self._boundary_snapshot_store = None
+
         # Force garbage collection of any lingering cache objects
         import gc
         gc.collect()
@@ -2780,6 +2790,7 @@ class Scheduler:
         logger.info("Scheduler shutdown initiated...")
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
+            self.paged_ssd_cache_manager = None
         logger.info("Scheduler shutdown completed")
 
     # =========================================================================
