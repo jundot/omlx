@@ -247,36 +247,38 @@ class EnginePool:
 
             # Check process memory limit before loading.
             # Try evicting LRU models first to free actual Metal memory.
+            # max_bytes <= 0 means enforcement is disabled (no limit).
             if self._process_memory_enforcer is not None:
                 enforcer = self._process_memory_enforcer
-                while True:
-                    current_active = mx.get_active_memory()
-                    projected = current_active + entry.estimated_size
-                    if projected <= enforcer.max_bytes:
-                        break
-                    # Try to evict an LRU model to free memory
-                    victim = self._find_lru_victim()
-                    if victim is not None:
-                        logger.info(
-                            f"Evicting '{victim}' to fit '{model_id}' "
-                            f"within process memory limit "
-                            f"({format_size(projected)} > "
-                            f"{format_size(enforcer.max_bytes)})"
+                if enforcer.max_bytes > 0:
+                    while True:
+                        current_active = mx.get_active_memory()
+                        projected = current_active + entry.estimated_size
+                        if projected <= enforcer.max_bytes:
+                            break
+                        # Try to evict an LRU model to free memory
+                        victim = self._find_lru_victim()
+                        if victim is not None:
+                            logger.info(
+                                f"Evicting '{victim}' to fit '{model_id}' "
+                                f"within process memory limit "
+                                f"({format_size(projected)} > "
+                                f"{format_size(enforcer.max_bytes)})"
+                            )
+                            await self._unload_engine(victim)
+                            continue
+                        # No more victims — cannot fit
+                        raise InsufficientMemoryError(
+                            required=entry.estimated_size,
+                            current=current_active,
+                            message=(
+                                f"Cannot load {model_id}: projected memory "
+                                f"{format_size(projected)} would exceed process "
+                                f"limit {format_size(enforcer.max_bytes)} "
+                                f"(current: {format_size(current_active)}, "
+                                f"model: {format_size(entry.estimated_size)})"
+                            ),
                         )
-                        await self._unload_engine(victim)
-                        continue
-                    # No more victims — cannot fit
-                    raise InsufficientMemoryError(
-                        required=entry.estimated_size,
-                        current=current_active,
-                        message=(
-                            f"Cannot load {model_id}: projected memory "
-                            f"{format_size(projected)} would exceed process "
-                            f"limit {format_size(enforcer.max_bytes)} "
-                            f"(current: {format_size(current_active)}, "
-                            f"model: {format_size(entry.estimated_size)})"
-                        ),
-                    )
 
             # Now load the model
             await self._load_engine(model_id)

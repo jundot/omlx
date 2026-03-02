@@ -220,6 +220,63 @@ class TestCheckAndEnforce:
         # Should not raise, just log warning
 
 
+class TestDisabledWhenMaxBytesZero:
+    """Tests for enforcement disabled when max_bytes <= 0."""
+
+    @pytest.mark.asyncio
+    async def test_no_enforce_when_max_bytes_zero(self, mock_engine_pool):
+        """No enforcement when max_bytes is 0 (disabled)."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, max_bytes=0
+        )
+        engine = MagicMock()
+        engine.abort_all_requests = AsyncMock(return_value=0)
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.return_value = 50 * 1024**3
+            await enforcer._check_and_enforce()
+
+        engine.abort_all_requests.assert_not_awaited()
+        mock_engine_pool._unload_engine.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_enforce_when_max_bytes_negative(self, mock_engine_pool):
+        """No enforcement when max_bytes is negative."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, max_bytes=-1
+        )
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.return_value = 50 * 1024**3
+            await enforcer._check_and_enforce()
+
+        mock_engine_pool._unload_engine.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_propagate_zero_disables_inline_prefill_check(
+        self, mock_engine_pool
+    ):
+        """Propagating max_bytes=0 sets scheduler limit to 0 (disabled)."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, max_bytes=0
+        )
+        bg = MagicMock(spec=[])
+        bg._memory_limit_bytes = 999
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_limit_bytes = 999
+        scheduler.batch_generator = bg
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_limit_bytes == 0
+        assert bg._memory_limit_bytes == 0
+
+
 class TestSingleModelMemoryPressure:
     """Tests for single-model memory pressure handling (Issue #62).
 

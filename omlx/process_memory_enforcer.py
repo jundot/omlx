@@ -149,6 +149,9 @@ class ProcessMemoryEnforcer:
            (aborting its requests), second iteration aborts remaining
            single model's requests.
         """
+        if self._max_bytes <= 0:
+            return
+
         current = mx.get_active_memory()
         if current <= self._max_bytes:
             return
