@@ -593,7 +593,7 @@
 
             async saveLanguage(lang) {
                 try {
-                    await fetch('/admin/api/settings', {
+                    await fetch('/admin/api/global-settings', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ ui_language: lang })
