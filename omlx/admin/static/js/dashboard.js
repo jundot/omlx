@@ -350,8 +350,9 @@
                         this.saveSuccess = true;
                         this.saveMessage = data.message || 'Settings saved successfully';
                         this.$nextTick(() => lucide.createIcons());
-                        // Refresh stats so Claude Code command reflects new API key
+                        // Refresh stats and model list (cache changes unload models)
                         await this.loadStats();
+                        await this.loadModels();
                         setTimeout(() => { this.saveSuccess = false; }, 5000);
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
