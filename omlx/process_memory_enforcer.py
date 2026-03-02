@@ -96,16 +96,31 @@ class ProcessMemoryEnforcer:
             f"interval: {self._poll_interval}s)"
         )
 
+    def _get_hard_limit_bytes(self) -> int:
+        """Hard limit for inline prefill check: system_ram - 4GB.
+
+        Returns 0 if enforcement is disabled (max_bytes <= 0).
+        Always >= max_bytes so prefill gets headroom above the soft limit.
+        """
+        if self._max_bytes <= 0:
+            return 0
+        from .settings import get_system_memory
+
+        return max(get_system_memory() - 4 * 1024**3, self._max_bytes)
+
     def _propagate_memory_limit(self) -> None:
-        """Propagate memory limit to all schedulers for inline prefill checking."""
+        """Propagate soft/hard memory limits to schedulers for inline prefill checking."""
+        hard_limit = self._get_hard_limit_bytes()
         for entry in self._engine_pool._entries.values():
             if entry.engine is not None:
                 scheduler = getattr(entry.engine, "scheduler", None)
                 if scheduler is not None:
                     scheduler._memory_limit_bytes = self._max_bytes
+                    scheduler._memory_hard_limit_bytes = hard_limit
                     bg = getattr(scheduler, "batch_generator", None)
                     if bg is not None and hasattr(bg, "_memory_limit_bytes"):
                         bg._memory_limit_bytes = self._max_bytes
+                        bg._memory_hard_limit_bytes = hard_limit
 
     async def stop(self) -> None:
         """Stop the background enforcement loop."""

@@ -263,8 +263,10 @@ class TestDisabledWhenMaxBytesZero:
         )
         bg = MagicMock(spec=[])
         bg._memory_limit_bytes = 999
+        bg._memory_hard_limit_bytes = 999
         scheduler = MagicMock(spec=[])
         scheduler._memory_limit_bytes = 999
+        scheduler._memory_hard_limit_bytes = 999
         scheduler.batch_generator = bg
         engine = MagicMock(spec=[])
         engine.scheduler = scheduler
@@ -274,7 +276,38 @@ class TestDisabledWhenMaxBytesZero:
         enforcer._propagate_memory_limit()
 
         assert scheduler._memory_limit_bytes == 0
+        assert scheduler._memory_hard_limit_bytes == 0
         assert bg._memory_limit_bytes == 0
+        assert bg._memory_hard_limit_bytes == 0
+
+
+class TestHardLimitCalculation:
+    """Tests for _get_hard_limit_bytes calculation."""
+
+    def test_hard_limit_is_system_ram_minus_4gb(self, enforcer):
+        """Hard limit = system_ram - 4GB."""
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 96 * 1024**3
+            result = enforcer._get_hard_limit_bytes()
+        assert result == 92 * 1024**3
+
+    def test_hard_limit_at_least_max_bytes(self, mock_engine_pool):
+        """Hard limit is at least max_bytes (for small systems)."""
+        # 16GB system, 14GB soft limit -> system-4GB = 12GB < 14GB
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, max_bytes=14 * 1024**3
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 16 * 1024**3
+            result = enforcer._get_hard_limit_bytes()
+        assert result == 14 * 1024**3
+
+    def test_hard_limit_zero_when_disabled(self, mock_engine_pool):
+        """Hard limit is 0 when max_bytes <= 0 (disabled)."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, max_bytes=0
+        )
+        assert enforcer._get_hard_limit_bytes() == 0
 
 
 class TestSingleModelMemoryPressure:
@@ -411,31 +444,40 @@ class TestSingleModelMemoryPressure:
 
 
 class TestMemoryLimitPropagation:
-    """Tests for _memory_limit_bytes propagation to schedulers."""
+    """Tests for soft/hard memory limit propagation to schedulers."""
 
     def test_propagate_memory_limit(self, enforcer):
-        """Propagates memory limit to scheduler and batch_generator."""
+        """Propagates soft and hard limits to scheduler and batch_generator."""
         bg = MagicMock(spec=[])
         bg._memory_limit_bytes = 0
+        bg._memory_hard_limit_bytes = 0
         scheduler = MagicMock(spec=[])
         scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
         scheduler.batch_generator = bg
         engine = MagicMock(spec=[])
         engine.scheduler = scheduler
         entry = _make_entry("model-a", engine=engine)
         enforcer._engine_pool._entries = {"model-a": entry}
 
-        enforcer._propagate_memory_limit()
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 96 * 1024**3
+            enforcer._propagate_memory_limit()
 
         assert scheduler._memory_limit_bytes == 10 * 1024**3
         assert bg._memory_limit_bytes == 10 * 1024**3
+        # hard limit = 96GB - 4GB = 92GB
+        assert scheduler._memory_hard_limit_bytes == 92 * 1024**3
+        assert bg._memory_hard_limit_bytes == 92 * 1024**3
 
     def test_propagates_on_max_bytes_change(self, enforcer):
-        """Propagates updated limit when max_bytes is changed at runtime."""
+        """Propagates updated limits when max_bytes is changed at runtime."""
         bg = MagicMock(spec=[])
         bg._memory_limit_bytes = 0
+        bg._memory_hard_limit_bytes = 0
         scheduler = MagicMock(spec=[])
         scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
         scheduler.batch_generator = bg
         engine = MagicMock(spec=[])
         engine.scheduler = scheduler
@@ -443,7 +485,9 @@ class TestMemoryLimitPropagation:
         enforcer._engine_pool._entries = {"model-a": entry}
 
         enforcer._running = True
-        enforcer.max_bytes = 20 * 1024**3
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 96 * 1024**3
+            enforcer.max_bytes = 20 * 1024**3
 
         assert scheduler._memory_limit_bytes == 20 * 1024**3
         assert bg._memory_limit_bytes == 20 * 1024**3
