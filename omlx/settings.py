@@ -435,6 +435,22 @@ class LoggingSettings:
 
 
 @dataclass
+class UISettings:
+    """Admin UI settings."""
+
+    language: str = "en"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {"language": self.language}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "UISettings":
+        """Create from dictionary."""
+        return cls(language=data.get("language", "en"))
+
+
+@dataclass
 class ClaudeCodeSettings:
     """Claude Code integration settings."""
 
@@ -480,6 +496,7 @@ class GlobalSettings:
     sampling: SamplingSettings = field(default_factory=SamplingSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
+    ui: UISettings = field(default_factory=UISettings)
 
     @classmethod
     def load(
@@ -561,6 +578,8 @@ class GlobalSettings:
                 self.logging = LoggingSettings.from_dict(data["logging"])
             if "claude_code" in data:
                 self.claude_code = ClaudeCodeSettings.from_dict(data["claude_code"])
+            if "ui" in data:
+                self.ui = UISettings.from_dict(data["ui"])
 
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse settings file {path}: {e}")
@@ -710,6 +729,7 @@ class GlobalSettings:
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
+            "ui": self.ui.to_dict(),
         }
 
         try:
@@ -871,6 +891,7 @@ class GlobalSettings:
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
+            "ui": self.ui.to_dict(),
         }
 
 

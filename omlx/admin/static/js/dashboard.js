@@ -22,6 +22,7 @@
                 auth: { api_key_set: false, api_key: '' },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000 },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '', ssd_free_bytes: 0, ssd_free: '' },
+                ui: { language: 'en' },
             },
 
             // Process memory slider (10-99%)
@@ -229,6 +230,7 @@
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
+                        this.globalSettings.ui = data.ui || { language: 'en' };
 
                         // Calculate memory percent from stored value
                         if (this.globalSettings.model.max_model_memory === 'auto') {
@@ -293,7 +295,7 @@
                 if (!s.sampling.max_tokens) errors.push('Max Tokens');
 
                 if (errors.length > 0) {
-                    this.saveError = `Required fields cannot be empty: ${errors.join(', ')}`;
+                    this.saveError = window.t('js.error.required_fields').replace('{fields}', errors.join(', '));
                     this.saving = false;
                     return;
                 }
@@ -301,12 +303,12 @@
                 // Validate API key if provided
                 if (s.auth.api_key) {
                     if (s.auth.api_key.length < 4) {
-                        this.saveError = 'API key must be at least 4 characters';
+                        this.saveError = window.t('js.error.api_key_too_short');
                         this.saving = false;
                         return;
                     }
                     if (/\s/.test(s.auth.api_key)) {
-                        this.saveError = 'API key must not contain whitespace';
+                        this.saveError = window.t('js.error.api_key_whitespace');
                         this.saving = false;
                         return;
                     }
@@ -353,14 +355,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.saveError = Array.isArray(data.detail) ? data.detail.join(', ') : (data.detail || 'Failed to save settings');
+                        this.saveError = Array.isArray(data.detail) ? data.detail.join(', ') : (data.detail || window.t('js.error.save_settings'));
                         // Reload settings to revert to server values
                         await this.loadGlobalSettings();
                         this.$nextTick(() => lucide.createIcons());
                     }
                 } catch (err) {
                     console.error('Failed to save global settings:', err);
-                    this.saveError = 'Failed to save settings';
+                    this.saveError = window.t('js.error.failed_save_settings');
                     // Reload settings to revert to server values
                     await this.loadGlobalSettings();
                     this.$nextTick(() => lucide.createIcons());
@@ -406,12 +408,12 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || 'Failed to update model setting');
+                        alert(data.detail || window.t('js.error.fail_model_setting'));
                         await this.loadModels();
                     }
                 } catch (err) {
                     console.error('Failed to update model setting:', err);
-                    alert('Failed to update model setting');
+                    alert(window.t('js.error.fail_model_setting'));
                     await this.loadModels();
                 }
             },
@@ -509,11 +511,11 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || 'Failed to save model settings');
+                        alert(data.detail || window.t('js.error.fail_save_model'));
                     }
                 } catch (err) {
                     console.error('Failed to save model settings:', err);
-                    alert('Failed to save model settings');
+                    alert(window.t('js.error.fail_save_model'));
                 } finally {
                     this.savingModelSettings = false;
                 }
@@ -533,16 +535,16 @@
                         this.modelSettings.top_k = data.top_k ?? null;
                         this.modelSettings.repetition_penalty = data.repetition_penalty ?? null;
                     } else if (response.status === 404) {
-                        alert('No config defaults found for this model');
+                        alert(window.t('js.error.no_config_defaults'));
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || 'Failed to load generation config');
+                        alert(data.detail || window.t('js.error.load_gen_config'));
                     }
                 } catch (err) {
                     console.error('Failed to load generation config:', err);
-                    alert('Failed to load generation config');
+                    alert(window.t('js.error.load_gen_config'));
                 } finally {
                     this.loadingGenDefaults = false;
                 }
@@ -586,6 +588,20 @@
                     }
                 } catch (err) {
                     console.error('Failed to save Claude Code settings:', err);
+                }
+            },
+
+            async saveLanguage(lang) {
+                try {
+                    await fetch('/admin/api/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ui_language: lang })
+                    });
+                    // Reload to apply new locale
+                    location.reload();
+                } catch (e) {
+                    console.error('Failed to save language:', e);
                 }
             },
 
@@ -675,7 +691,7 @@
                     .map(([k, _]) => parseInt(k));
 
                 if (promptLengths.length === 0) {
-                    this.benchError = 'Select at least one prompt length';
+                    this.benchError = window.t('js.error.bench_no_prompt');
                     return;
                 }
 
@@ -712,7 +728,7 @@
 
                     if (!response.ok) {
                         const data = await response.json();
-                        this.benchError = data.detail || 'Failed to start benchmark';
+                        this.benchError = data.detail || window.t('js.error.bench_start');
                         this.benchRunning = false;
                         return;
                     }
@@ -722,7 +738,7 @@
                     this.connectBenchSSE(data.bench_id);
                 } catch (err) {
                     console.error('Failed to start benchmark:', err);
-                    this.benchError = 'Failed to start benchmark: ' + err.message;
+                    this.benchError = window.t('js.error.bench_start_prefix').replace('{message}', err.message);
                     this.benchRunning = false;
                 }
             },
@@ -778,7 +794,7 @@
 
                 es.onerror = () => {
                     if (this.benchRunning) {
-                        this.benchError = 'Connection to benchmark lost';
+                        this.benchError = window.t('js.error.bench_connection');
                         this.benchRunning = false;
                         this.benchProgress = null;
                     }
@@ -1257,7 +1273,7 @@
                     });
 
                     if (response.ok) {
-                        this.hfSuccess = `Download started: ${repoId}`;
+                        this.hfSuccess = window.t('js.download.started').replace('{repo_id}', repoId);
                         this.hfRepoId = '';
                         await this.loadHFTasks();
                         this.startHFRefresh();
@@ -1270,7 +1286,7 @@
                     }
                 } catch (err) {
                     console.error('Failed to start download:', err);
-                    this.hfError = 'Failed to start download. Check server connection.';
+                    this.hfError = window.t('js.error.download_start');
                 } finally {
                     this.hfDownloading = false;
                     this.$nextTick(() => lucide.createIcons());
@@ -1363,7 +1379,7 @@
                     }
                 } catch (err) {
                     console.error('Failed to delete model:', err);
-                    this.hfError = 'Failed to delete model. Check server connection.';
+                    this.hfError = window.t('js.error.delete_model');
                     setTimeout(() => { this.hfError = ''; }, 5000);
                 }
             },

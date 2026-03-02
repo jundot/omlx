@@ -9,6 +9,7 @@ This module provides HTTP routes for the admin panel including:
 """
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -110,6 +111,9 @@ class GlobalSettingsRequest(BaseModel):
     # Claude Code settings
     claude_code_context_scaling_enabled: Optional[bool] = None
     claude_code_target_context_size: Optional[int] = None
+
+    # UI settings
+    ui_language: Optional[str] = None
 
     # Auth settings
     api_key: Optional[str] = None
@@ -484,6 +488,49 @@ def _static_version(path: str) -> str:
 
 
 templates.env.globals["static"] = _static_version
+# i18n defaults (English) — overridden once set_admin_getters is called
+_en_locale: dict = {}
+try:
+    _en_locale = json.loads((Path(__file__).parent / "i18n" / "en.json").read_text(encoding="utf-8"))
+except Exception:
+    pass
+templates.env.globals["t"] = lambda key: _en_locale.get(key, key)
+templates.env.globals["locale_json"] = json.dumps(_en_locale, ensure_ascii=False)
+
+_i18n_dir = Path(__file__).parent / "i18n"
+
+
+def _load_locale(language: str) -> dict:
+    """Load locale dict for a given language code. Falls back to en on error."""
+    path = _i18n_dir / f"{language}.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        try:
+            return json.loads((_i18n_dir / "en.json").read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+
+def _make_t(locale: dict):
+    """Return a Jinja2-compatible t() function for the given locale dict."""
+    def t(key: str) -> str:
+        return locale.get(key, key)
+    return t
+
+
+def _refresh_i18n_globals() -> None:
+    """Reload i18n globals from current settings. Called on startup and language change."""
+    lang = "en"
+    try:
+        settings = _get_global_settings() if _get_global_settings else None
+        if settings:
+            lang = settings.ui.language
+    except Exception:
+        pass
+    locale = _load_locale(lang)
+    templates.env.globals["t"] = _make_t(locale)
+    templates.env.globals["locale_json"] = json.dumps(locale, ensure_ascii=False)
 
 
 # =============================================================================
@@ -520,6 +567,7 @@ def set_admin_getters(
     _get_engine_pool = pool_getter
     _get_settings_manager = settings_manager_getter
     _get_global_settings = global_settings_getter
+    _refresh_i18n_globals()
 
 
 def set_hf_downloader(downloader):
@@ -1432,6 +1480,13 @@ async def update_global_settings(
             f"scaling={'enabled' if global_settings.claude_code.context_scaling_enabled else 'disabled'}, "
             f"target={global_settings.claude_code.target_context_size}"
         )
+
+    # Apply UI settings
+    if request.ui_language is not None:
+        global_settings.ui.language = request.ui_language
+        runtime_applied.append("ui_language")
+        _refresh_i18n_globals()
+        logger.info(f"UI language changed to: {request.ui_language}")
 
     # Apply auth settings (API key change)
     if request.api_key is not None:

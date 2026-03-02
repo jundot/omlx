@@ -83,7 +83,7 @@ where = ["."]
 include = ["omlx*"]
 
 [tool.setuptools.package-data]
-"omlx.admin" = ["templates/**/*.html", "static/**/*"]
+"omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 
 [tool.black]
 line-length = 88
