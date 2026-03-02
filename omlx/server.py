@@ -893,7 +893,7 @@ async def _safe_anext(ait):
 async def _with_sse_keepalive(
     generator: AsyncIterator[str],
     http_request: Optional["FastAPIRequest"] = None,
-    interval: float = 30.0,
+    interval: float = 10.0,
     disconnect_poll: float = 2.0,
 ) -> AsyncIterator[str]:
     """Wrap an SSE generator to send periodic keep-alive comments.
@@ -911,6 +911,11 @@ async def _with_sse_keepalive(
     ait = generator.__aiter__()
     task = None
     keepalive_elapsed = 0.0
+
+    # Send initial keepalive immediately so clients with short read
+    # timeouts (e.g. openclaw ~15s) don't disconnect during prefill.
+    yield ": keep-alive\n\n"
+
     try:
         while True:
             task = asyncio.ensure_future(_safe_anext(ait))

@@ -506,6 +506,67 @@ class TestSchedulerAbortRequest:
         assert uid not in scheduler.uid_to_request_id
 
 
+class TestPrefillAbortInterrupt:
+    """Tests for prefill abort interrupt via _check_pending_aborts_for_uids."""
+
+    def test_check_pending_aborts_returns_aborted_uids(
+        self, mock_model, mock_tokenizer
+    ):
+        """_check_pending_aborts_for_uids returns UIDs with pending aborts."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        # Set up UID mapping
+        scheduler.uid_to_request_id[0] = "req-a"
+        scheduler.uid_to_request_id[1] = "req-b"
+        scheduler._pending_abort_ids.add("req-a")
+
+        result = scheduler._check_pending_aborts_for_uids([0, 1])
+        assert result == [0]
+
+    def test_check_pending_aborts_empty_when_no_aborts(
+        self, mock_model, mock_tokenizer
+    ):
+        """Returns empty list when no pending aborts."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.uid_to_request_id[0] = "req-a"
+
+        result = scheduler._check_pending_aborts_for_uids([0])
+        assert result == []
+
+    def test_prefill_aborted_error_resets_batch_generator(
+        self, mock_model, mock_tokenizer
+    ):
+        """_PrefillAbortedError in step() resets batch_generator to None."""
+        from omlx.scheduler import _PrefillAbortedError
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.batch_generator = MagicMock()
+
+        # Make batch_generator.next() raise _PrefillAbortedError
+        scheduler.batch_generator.next.side_effect = _PrefillAbortedError(
+            [0], 1024
+        )
+        # Need running requests for next() to be called
+        request = Request(
+            request_id="req-prefill",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1]
+        request.num_prompt_tokens = 1
+        request.status = RequestStatus.RUNNING
+        scheduler.running["req-prefill"] = request
+        scheduler.requests["req-prefill"] = request
+
+        output = scheduler.step()
+
+        # batch_generator should be reset
+        assert scheduler.batch_generator is None
+        # Request should be moved back to waiting
+        assert "req-prefill" not in scheduler.running
+        assert len(scheduler.waiting) > 0
+
+
 class TestSchedulerQueryMethods:
     """Tests for Scheduler query methods."""
 

@@ -83,6 +83,18 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+class _PrefillAbortedError(Exception):
+    """Raised when prefill is interrupted by a pending abort."""
+
+    def __init__(self, aborted_uids: List[int], processed_tokens: int):
+        self.aborted_uids = aborted_uids
+        self.processed_tokens = processed_tokens
+        super().__init__(
+            f"Prefill aborted for UIDs {aborted_uids} "
+            f"at {processed_tokens} tokens"
+        )
+
+
 class _BoundarySnapshotBatchGenerator(BatchGenerator):
     """BatchGenerator with boundary-aligned prefill snapshot callbacks."""
 
@@ -91,11 +103,13 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         *args: Any,
         boundary_block_size: int = 0,
         prefill_boundary_callback: Optional[Callable[[int, List[Any], int], None]] = None,
+        abort_check_callback: Optional[Callable[[List[int]], List[int]]] = None,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
         self._boundary_block_size = max(0, int(boundary_block_size))
         self._prefill_boundary_callback = prefill_boundary_callback
+        self._abort_check_callback = abort_check_callback
         # Memory limits for inline prefill checking (set by Scheduler).
         # mx.get_active_memory() is ~20ns, negligible vs ~5s prefill chunks.
         self._memory_limit_bytes: int = 0  # soft limit, 0 = disabled
@@ -381,6 +395,21 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                             f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
                         )
 
+                # Check for pending aborts between prefill chunks.
+                # GIL guarantees _pending_abort_ids.add() is atomic,
+                # so reading from the executor thread is safe.
+                if self._abort_check_callback is not None:
+                    abort_uids = self._abort_check_callback(list(uids))
+                    if abort_uids:
+                        logger.info(
+                            f"Prefill interrupted at {processed_tokens}/"
+                            f"{max(lengths)} tokens: "
+                            f"{len(abort_uids)} request(s) aborted"
+                        )
+                        raise _PrefillAbortedError(
+                            abort_uids, processed_tokens
+                        )
+
         # Further prompt processing so we need to
         #   1. Merge the KV caches and prepare for right padded prompts
         #   2. Right pad the inputs
@@ -459,6 +488,19 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                             f"{self._memory_limit_bytes / 1024**3:.1f}GB "
                             f"(hard limit: "
                             f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
+                        )
+
+                # Check for pending aborts between prefill chunks.
+                if self._abort_check_callback is not None:
+                    abort_uids = self._abort_check_callback(list(uids))
+                    if abort_uids:
+                        logger.info(
+                            f"Prefill interrupted at {processed_tokens}/"
+                            f"{max(lengths)} tokens: "
+                            f"{len(abort_uids)} request(s) aborted"
+                        )
+                        raise _PrefillAbortedError(
+                            abort_uids, processed_tokens
                         )
 
             mx.eval([c.state for c in prompt_cache])
@@ -1073,6 +1115,7 @@ class Scheduler:
                 if self.block_aware_cache is not None
                 else None
             ),
+            abort_check_callback=self._check_pending_aborts_for_uids,
         )
         bg._memory_limit_bytes = self._memory_limit_bytes
         bg._memory_hard_limit_bytes = self._memory_hard_limit_bytes
@@ -1938,6 +1981,22 @@ class Scheduler:
 
         self.batch_generator.remove([uid])
 
+    def _check_pending_aborts_for_uids(self, uids: List[int]) -> List[int]:
+        """Return UIDs that have pending aborts.
+
+        Called from _process_prompts() during prefill to detect aborted
+        requests between chunks. GIL guarantees thread-safe reads of
+        _pending_abort_ids from the executor thread.
+        """
+        if not self._pending_abort_ids:
+            return []
+        aborted = []
+        for uid in uids:
+            request_id = self.uid_to_request_id.get(uid)
+            if request_id and request_id in self._pending_abort_ids:
+                aborted.append(uid)
+        return aborted
+
     def abort_request(self, request_id: str) -> bool:
         """
         Enqueue a request for deferred abort.
@@ -2634,6 +2693,22 @@ class Scheduler:
                         self._cleanup_finished(finished_ids)
 
                 # Success - break out of retry loop
+                break
+
+            except _PrefillAbortedError:
+                # Prefill was interrupted by a pending abort.
+                # BatchGenerator is in an inconsistent state (partial
+                # prefill), so reset it entirely. Pending aborts will
+                # be processed at the start of the next step().
+                self.batch_generator = None
+                self._current_sampler_params = None
+                self._boundary_cache_snapshots.clear()
+                if self._boundary_snapshot_store is not None:
+                    self._boundary_snapshot_store.cleanup_all()
+                self._boundary_snapshot_required = None
+                # Move any running requests back to waiting so they
+                # can be rescheduled with a fresh BatchGenerator.
+                self._reschedule_running_requests()
                 break
 
             except TypeError as e:
