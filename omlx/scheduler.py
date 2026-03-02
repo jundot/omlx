@@ -2031,10 +2031,14 @@ class Scheduler:
         request.set_finished(RequestStatus.FINISHED_ABORTED)
         self.finished_req_ids.add(request_id)
 
-        # Remove from requests dict to prevent memory leak.
+        # Remove from requests dict and clear cache references to release
+        # MLX arrays promptly (mirrors _cleanup_finished behavior).
         # _cleanup_request (engine_core) no longer calls remove_finished_request,
         # so this is the single cleanup point for aborted requests.
-        self.requests.pop(request_id, None)
+        req_to_remove = self.requests.pop(request_id, None)
+        if req_to_remove is not None:
+            req_to_remove._extracted_cache = None
+            req_to_remove.prompt_cache = None
 
         logger.debug(f"Aborted request {request_id}")
         return True
