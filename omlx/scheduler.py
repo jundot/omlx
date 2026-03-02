@@ -2031,6 +2031,11 @@ class Scheduler:
         request.set_finished(RequestStatus.FINISHED_ABORTED)
         self.finished_req_ids.add(request_id)
 
+        # Remove from requests dict to prevent memory leak.
+        # _cleanup_request (engine_core) no longer calls remove_finished_request,
+        # so this is the single cleanup point for aborted requests.
+        self.requests.pop(request_id, None)
+
         logger.debug(f"Aborted request {request_id}")
         return True
 

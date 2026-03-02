@@ -327,13 +327,17 @@ class EngineCore:
         return len(request_ids)
 
     def _cleanup_request(self, request_id: str) -> None:
-        """Clean up request tracking."""
+        """Clean up request tracking.
+
+        Only cleans engine-core level state (collectors, events).
+        Scheduler state is cleaned by _do_abort_request (deferred abort)
+        or _cleanup_finished (normal completion).
+        """
         collector = self._output_collectors.pop(request_id, None)
         if collector:
             collector.clear()
         self._stream_states.pop(request_id, None)
         self._finished_events.pop(request_id, None)
-        self.scheduler.remove_finished_request(request_id)
 
     async def _delayed_cleanup(self, request_id: str, delay: float = 5.0) -> None:
         """

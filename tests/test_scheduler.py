@@ -468,6 +468,43 @@ class TestSchedulerAbortRequest:
 
         scheduler.batch_generator.remove.assert_not_called()
 
+    def test_abort_cleans_all_scheduler_state(self, mock_model, mock_tokenizer):
+        """Abort must clean running, uid mappings, and requests dict.
+
+        Regression test: previously _cleanup_request (engine_core) removed
+        the request from self.requests before the deferred abort ran,
+        causing _do_abort_request to early-return and leave ghost state
+        in running/uid mappings/active batch.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="req-ghost",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1]
+        request.num_prompt_tokens = 1
+        request.status = RequestStatus.RUNNING
+
+        uid = 10
+        scheduler.requests["req-ghost"] = request
+        scheduler.running["req-ghost"] = request
+        scheduler.request_id_to_uid["req-ghost"] = uid
+        scheduler.uid_to_request_id[uid] = "req-ghost"
+
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.active_batch = MagicMock(uids=[uid])
+
+        scheduler.abort_request("req-ghost")
+        scheduler._process_pending_aborts()
+
+        # All scheduler state must be cleaned
+        assert "req-ghost" not in scheduler.running
+        assert "req-ghost" not in scheduler.requests
+        assert "req-ghost" not in scheduler.request_id_to_uid
+        assert uid not in scheduler.uid_to_request_id
+
 
 class TestSchedulerQueryMethods:
     """Tests for Scheduler query methods."""

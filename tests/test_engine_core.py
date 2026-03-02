@@ -331,6 +331,46 @@ class TestEngineCoreAbortRequest:
                 await engine.stop()
                 engine.close()
 
+    @pytest.mark.asyncio
+    async def test_abort_request_no_ghost_in_scheduler(
+        self, mock_model, mock_tokenizer
+    ):
+        """Deferred abort must clean scheduler state (no ghost request).
+
+        Regression: _cleanup_request used to call remove_finished_request()
+        which deleted from scheduler.requests before the deferred abort ran,
+        causing _do_abort_request to skip cleanup and leave ghost state in
+        scheduler.running / uid mappings / active batch.
+        """
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+
+                request_id = await engine.add_request(prompt="Hello")
+
+                # Request should be in scheduler waiting
+                assert request_id in engine.scheduler.requests
+
+                await engine.abort_request(request_id)
+
+                # Engine-core state cleaned immediately
+                assert request_id not in engine._output_collectors
+
+                # Process the deferred abort (normally happens in step())
+                engine.scheduler._process_pending_aborts()
+
+                # Scheduler state must be fully cleaned
+                assert request_id not in engine.scheduler.requests
+                assert request_id not in engine.scheduler.running
+                assert request_id not in engine.scheduler.request_id_to_uid
+            finally:
+                await engine.stop()
+                engine.close()
+
 
 class TestEngineCoreGetStats:
     """Tests for EngineCore.get_stats()."""
