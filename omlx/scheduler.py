@@ -2359,7 +2359,8 @@ class Scheduler:
         if request.request_id in self.request_id_to_uid:
             uid = self.request_id_to_uid[request.request_id]
             # Clean up pending VLM embeddings not yet consumed by prefill.
-            self.batch_generator._vlm_pending.pop(uid, None)
+            if self.batch_generator is not None:
+                self.batch_generator._vlm_pending.pop(uid, None)
             self._remove_uid_from_active_batch(uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
