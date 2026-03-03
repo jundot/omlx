@@ -1850,13 +1850,19 @@ def _parse_commits_from_pyproject(
 @router.get("/api/stats")
 async def get_server_stats(
     model: str = "",
+    scope: str = "session",
     is_admin: bool = Depends(require_admin),
 ):
-    """Get server serving stats for the Status dashboard."""
+    """Get server serving stats for the Status dashboard.
+
+    Args:
+        model: Filter by model ID. Empty string returns global aggregate.
+        scope: "session" for current session, "alltime" for persisted totals.
+    """
     from ..server_metrics import get_server_metrics
 
     metrics = get_server_metrics()
-    snapshot = metrics.get_snapshot(model_id=model)
+    snapshot = metrics.get_snapshot(model_id=model, scope=scope)
 
     global_settings = _get_global_settings()
     port = global_settings.server.port if global_settings else 8000
@@ -1882,10 +1888,19 @@ async def get_server_stats(
 
 @router.post("/api/stats/clear")
 async def clear_server_stats(is_admin: bool = Depends(require_admin)):
-    """Clear all server metrics."""
+    """Clear session server metrics."""
     from ..server_metrics import get_server_metrics
 
     get_server_metrics().clear_metrics()
+    return {"status": "ok"}
+
+
+@router.post("/api/stats/clear-alltime")
+async def clear_alltime_stats(is_admin: bool = Depends(require_admin)):
+    """Clear all-time server metrics and delete persisted stats file."""
+    from ..server_metrics import get_server_metrics
+
+    get_server_metrics().clear_alltime_metrics()
     return {"status": "ok"}
 
 

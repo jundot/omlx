@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for server_metrics module."""
 
+import json
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -286,6 +288,194 @@ class TestServerMetrics:
         snapshot_a = metrics.get_snapshot(model_id="model-a")
         # Falls back to global (empty) since per-model was cleared
         assert snapshot_a["total_prompt_tokens"] == 0
+
+    def test_clear_metrics_does_not_affect_alltime(self):
+        """Test that clear_metrics only resets session, not all-time."""
+        metrics = ServerMetrics()
+        metrics.record_request_complete(
+            prompt_tokens=100, completion_tokens=50, model_id="model-a"
+        )
+
+        metrics.clear_metrics()
+
+        # Session should be zero
+        session = metrics.get_snapshot(scope="session")
+        assert session["total_prompt_tokens"] == 0
+
+        # All-time should still have the data
+        alltime = metrics.get_snapshot(scope="alltime")
+        assert alltime["total_prompt_tokens"] == 100
+        assert alltime["total_completion_tokens"] == 50
+
+
+class TestAlltimePersistence:
+    """Tests for all-time stats persistence."""
+
+    def test_alltime_snapshot(self):
+        """Test that alltime scope returns cumulative data."""
+        metrics = ServerMetrics()
+        metrics.record_request_complete(prompt_tokens=100, completion_tokens=50)
+
+        alltime = metrics.get_snapshot(scope="alltime")
+        assert alltime["total_prompt_tokens"] == 100
+        assert alltime["total_completion_tokens"] == 50
+        assert alltime["total_requests"] == 1
+
+    def test_alltime_per_model(self):
+        """Test alltime per-model tracking."""
+        metrics = ServerMetrics()
+        metrics.record_request_complete(
+            prompt_tokens=100, completion_tokens=50, model_id="model-a"
+        )
+        metrics.record_request_complete(
+            prompt_tokens=200, completion_tokens=80, model_id="model-b"
+        )
+
+        alltime_a = metrics.get_snapshot(model_id="model-a", scope="alltime")
+        assert alltime_a["total_prompt_tokens"] == 100
+
+        alltime_b = metrics.get_snapshot(model_id="model-b", scope="alltime")
+        assert alltime_b["total_prompt_tokens"] == 200
+
+    def test_alltime_persistence_save_load(self, tmp_path):
+        """Test save/load round-trip for all-time stats."""
+        stats_path = tmp_path / "stats.json"
+
+        # Create and populate metrics
+        m1 = ServerMetrics(stats_path=stats_path)
+        m1.record_request_complete(
+            prompt_tokens=500,
+            completion_tokens=100,
+            cached_tokens=50,
+            prefill_duration=1.0,
+            generation_duration=2.0,
+            model_id="test-model",
+        )
+        m1.save_alltime()
+
+        # Verify file exists
+        assert stats_path.exists()
+        data = json.loads(stats_path.read_text())
+        assert data["total_prompt_tokens"] == 500
+        assert data["total_completion_tokens"] == 100
+        assert data["total_cached_tokens"] == 50
+        assert "test-model" in data["per_model"]
+
+        # Load into new instance
+        m2 = ServerMetrics(stats_path=stats_path)
+        alltime = m2.get_snapshot(scope="alltime")
+        assert alltime["total_prompt_tokens"] == 500
+        assert alltime["total_completion_tokens"] == 100
+        assert alltime["total_cached_tokens"] == 50
+        assert alltime["total_requests"] == 1
+
+        # Per-model should also be restored
+        alltime_model = m2.get_snapshot(model_id="test-model", scope="alltime")
+        assert alltime_model["total_prompt_tokens"] == 500
+
+    def test_alltime_accumulates_across_resets(self, tmp_path):
+        """Test that all-time stats accumulate across reset cycles."""
+        stats_path = tmp_path / "stats.json"
+
+        # Session 1
+        m1 = ServerMetrics(stats_path=stats_path)
+        m1.record_request_complete(prompt_tokens=100, completion_tokens=50)
+        m1.save_alltime()
+
+        # Session 2
+        m2 = ServerMetrics(stats_path=stats_path)
+        m2.record_request_complete(prompt_tokens=200, completion_tokens=80)
+        m2.save_alltime()
+
+        # Session 3: verify accumulation
+        m3 = ServerMetrics(stats_path=stats_path)
+        alltime = m3.get_snapshot(scope="alltime")
+        assert alltime["total_prompt_tokens"] == 300  # 100 + 200
+        assert alltime["total_completion_tokens"] == 130  # 50 + 80
+        assert alltime["total_requests"] == 2
+
+        # Session metrics should start fresh
+        session = m3.get_snapshot(scope="session")
+        assert session["total_prompt_tokens"] == 0
+        assert session["total_requests"] == 0
+
+    def test_clear_alltime_metrics(self, tmp_path):
+        """Test that clear_alltime_metrics resets and deletes file."""
+        stats_path = tmp_path / "stats.json"
+
+        metrics = ServerMetrics(stats_path=stats_path)
+        metrics.record_request_complete(prompt_tokens=100, completion_tokens=50)
+        metrics.save_alltime()
+        assert stats_path.exists()
+
+        metrics.clear_alltime_metrics()
+
+        alltime = metrics.get_snapshot(scope="alltime")
+        assert alltime["total_prompt_tokens"] == 0
+        assert alltime["total_requests"] == 0
+        assert not stats_path.exists()
+
+    def test_corrupted_stats_file(self, tmp_path):
+        """Test graceful handling of corrupted stats file."""
+        stats_path = tmp_path / "stats.json"
+        stats_path.write_text("not valid json {{{")
+
+        # Should not raise, should start with zeros
+        metrics = ServerMetrics(stats_path=stats_path)
+        alltime = metrics.get_snapshot(scope="alltime")
+        assert alltime["total_prompt_tokens"] == 0
+        assert alltime["total_requests"] == 0
+
+    def test_missing_stats_file(self, tmp_path):
+        """Test that missing stats file starts with zeros."""
+        stats_path = tmp_path / "nonexistent" / "stats.json"
+
+        metrics = ServerMetrics(stats_path=stats_path)
+        alltime = metrics.get_snapshot(scope="alltime")
+        assert alltime["total_prompt_tokens"] == 0
+
+    def test_periodic_save_timing(self, tmp_path):
+        """Test that periodic save respects the interval."""
+        stats_path = tmp_path / "stats.json"
+        metrics = ServerMetrics(stats_path=stats_path)
+
+        # Record request - should not trigger save (interval not elapsed)
+        metrics.record_request_complete(prompt_tokens=100, completion_tokens=50)
+        assert not stats_path.exists()
+
+        # Force save time to be in the past
+        metrics._last_save_time = 0
+
+        # Record again - should now trigger periodic save
+        metrics.record_request_complete(prompt_tokens=100, completion_tokens=50)
+        assert stats_path.exists()
+
+    def test_reset_server_metrics_saves_alltime(self, tmp_path):
+        """Test that reset_server_metrics saves before resetting."""
+        stats_path = tmp_path / "stats.json"
+        reset_server_metrics(stats_path=stats_path)
+        m1 = get_server_metrics()
+        m1.record_request_complete(prompt_tokens=100, completion_tokens=50)
+
+        # Reset should save the all-time data
+        reset_server_metrics(stats_path=stats_path)
+        assert stats_path.exists()
+
+        m2 = get_server_metrics()
+        alltime = m2.get_snapshot(scope="alltime")
+        assert alltime["total_prompt_tokens"] == 100
+
+    def test_save_uses_atomic_write(self, tmp_path):
+        """Test that save writes atomically via tmp file."""
+        stats_path = tmp_path / "stats.json"
+        metrics = ServerMetrics(stats_path=stats_path)
+        metrics.record_request_complete(prompt_tokens=100, completion_tokens=50)
+        metrics.save_alltime()
+
+        # Verify no leftover tmp file
+        tmp_file = stats_path.with_suffix(".json.tmp")
+        assert not tmp_file.exists()
+        assert stats_path.exists()
 
 
 class TestServerMetricsSingleton:

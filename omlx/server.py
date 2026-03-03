@@ -329,7 +329,8 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: Stop TTL task, process memory enforcer, HF downloader, MCP, engines
+    # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
+    get_server_metrics().save_alltime()
     if ttl_task is not None:
         ttl_task.cancel()
         try:
@@ -843,8 +844,9 @@ def init_server(
     else:
         _server_state.default_model = None
 
-    # Reset server metrics for fresh start
-    reset_server_metrics()
+    # Reset server metrics for fresh start (with all-time persistence)
+    stats_path = base_path / "stats.json"
+    reset_server_metrics(stats_path=stats_path)
 
     logger.info(f"Server initialized with {_server_state.engine_pool.model_count} models")
     if _server_state.default_model:

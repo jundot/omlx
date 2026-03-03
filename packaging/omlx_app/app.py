@@ -54,6 +54,7 @@ class OMLXAppDelegate(NSObject):
         self.welcome_controller = None
         self.preferences_controller = None
         self._cached_stats: Optional[dict] = None
+        self._cached_alltime_stats: Optional[dict] = None
         self._last_stats_fetch: float = 0
         self._icon_outline: Optional[NSImage] = None
         self._icon_filled: Optional[NSImage] = None
@@ -602,14 +603,45 @@ class OMLXAppDelegate(NSObject):
 
         if is_running and self._cached_stats:
             s = self._cached_stats
-            entries = [
+
+            # Session stats
+            session_header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "── Session ──", None, ""
+            )
+            session_header.setEnabled_(False)
+            stats_submenu.addItem_(session_header)
+
+            session_entries = [
                 ("Total Tokens Processed", f"{s.get('total_prompt_tokens', 0):,}"),
                 ("Cached Tokens", f"{s.get('total_cached_tokens', 0):,}"),
                 ("Cache Efficiency", f"{s.get('cache_efficiency', 0):.1f}%"),
                 ("Avg PP Speed", f"{s.get('avg_prefill_tps', 0):.1f} tok/s"),
                 ("Avg TG Speed", f"{s.get('avg_generation_tps', 0):.1f} tok/s"),
             ]
-            for label, value in entries:
+            for label, value in session_entries:
+                text = f"{label}: {value}"
+                mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    text, "noOp:", ""
+                )
+                mi.setTarget_(self)
+                stats_submenu.addItem_(mi)
+
+            # All-time stats
+            stats_submenu.addItem_(NSMenuItem.separatorItem())
+            alltime_header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "── All-Time ──", None, ""
+            )
+            alltime_header.setEnabled_(False)
+            stats_submenu.addItem_(alltime_header)
+
+            a = self._cached_alltime_stats or {}
+            alltime_entries = [
+                ("Total Tokens Processed", f"{a.get('total_prompt_tokens', 0):,}"),
+                ("Cached Tokens", f"{a.get('total_cached_tokens', 0):,}"),
+                ("Cache Efficiency", f"{a.get('cache_efficiency', 0):.1f}%"),
+                ("Total Requests", f"{a.get('total_requests', 0):,}"),
+            ]
+            for label, value in alltime_entries:
                 text = f"{label}: {value}"
                 mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                     text, "noOp:", ""
@@ -711,6 +743,7 @@ class OMLXAppDelegate(NSObject):
 
             if not api_key:
                 self._cached_stats = None
+            self._cached_alltime_stats = None
                 return
 
             session = requests.Session()
@@ -721,6 +754,7 @@ class OMLXAppDelegate(NSObject):
             )
             if login_resp.status_code != 200:
                 self._cached_stats = None
+            self._cached_alltime_stats = None
                 return
 
             stats_resp = session.get(
@@ -731,9 +765,22 @@ class OMLXAppDelegate(NSObject):
                 self._cached_stats = stats_resp.json()
             else:
                 self._cached_stats = None
+            self._cached_alltime_stats = None
+
+            alltime_resp = session.get(
+                f"{base_url}/admin/api/stats",
+                params={"scope": "alltime"},
+                timeout=2,
+            )
+            if alltime_resp.status_code == 200:
+                self._cached_alltime_stats = alltime_resp.json()
+            else:
+                self._cached_alltime_stats = None
 
         except requests.RequestException:
             self._cached_stats = None
+            self._cached_alltime_stats = None
+            self._cached_alltime_stats = None
 
     # --- Timer callback ---
 
@@ -759,6 +806,7 @@ class OMLXAppDelegate(NSObject):
             ServerStatus.UNRESPONSIVE,
         ):
             self._cached_stats = None
+            self._cached_alltime_stats = None
 
         # Update icon/menu if status changed
         if self.server_manager.status != prev_status:
@@ -836,6 +884,7 @@ class OMLXAppDelegate(NSObject):
         """Stop the server."""
         self.server_manager.stop()
         self._cached_stats = None
+        self._cached_alltime_stats = None
         self._update_status_display()
 
     @objc.IBAction

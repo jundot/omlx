@@ -7,12 +7,41 @@
                             <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('status.heading') }}</h3>
                         </div>
                         <div class="flex items-center gap-2">
-                            <button @click="clearStats()"
-                                    class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5"
-                                    :title="window.t('status.clear_tooltip')">
-                                <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
-                                {{ t('status.clear') }}
-                            </button>
+                            <!-- Scope toggle -->
+                            <div class="flex rounded-lg border border-neutral-200 overflow-hidden">
+                                <button @click="statsScope = 'session'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
+                                        :class="statsScope === 'session' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
+                                        class="px-3 py-1.5 text-xs font-medium transition-all">
+                                    {{ t('status.scope_session') }}
+                                </button>
+                                <button @click="statsScope = 'alltime'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
+                                        :class="statsScope === 'alltime' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
+                                        class="px-3 py-1.5 text-xs font-medium transition-all border-l border-neutral-200">
+                                    {{ t('status.scope_alltime') }}
+                                </button>
+                            </div>
+                            <!-- Clear button -->
+                            <div class="flex items-center gap-1.5">
+                                <button x-show="(statsScope === 'session' && !showClearStatsConfirm) || (statsScope === 'alltime' && !showClearAlltimeConfirm)"
+                                        @click="statsScope === 'session' ? showClearStatsConfirm = true : showClearAlltimeConfirm = true"
+                                        class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5"
+                                        :title="statsScope === 'session' ? window.t('status.clear_tooltip') : window.t('status.clear_alltime_tooltip')">
+                                    <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
+                                    {{ t('status.clear') }}
+                                </button>
+                                <div x-show="(statsScope === 'session' && showClearStatsConfirm) || (statsScope === 'alltime' && showClearAlltimeConfirm)"
+                                     x-cloak class="flex items-center gap-1.5">
+                                    <span class="text-xs text-red-600">{{ t('status.clear_confirm') }}</span>
+                                    <button @click="statsScope === 'session' ? clearStats() : clearAlltimeStats()"
+                                            class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                        {{ t('status.clear_yes') }}
+                                    </button>
+                                    <button @click="showClearStatsConfirm = false; showClearAlltimeConfirm = false"
+                                            class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                        {{ t('status.clear_cancel') }}
+                                    </button>
+                                </div>
+                            </div>
                             <select x-model="selectedStatsModel"
                                     @change="loadStats()"
                                     class="px-3 py-1.5 text-xs font-medium border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
@@ -30,24 +59,24 @@
                         <div class="bg-white rounded-2xl border border-neutral-200 p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.total_tokens') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
-                               :class="getStatFontClass(stats.total_prompt_tokens)"
-                               x-text="formatNumber(stats.total_prompt_tokens)"></p>
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"
+                               x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"></p>
                         </div>
 
                         <!-- Cached Tokens Served -->
                         <div class="bg-white rounded-2xl border border-neutral-200 p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cached_tokens') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
-                               :class="getStatFontClass(stats.total_cached_tokens)"
-                               x-text="formatNumber(stats.total_cached_tokens)"></p>
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"
+                               x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"></p>
                         </div>
 
                         <!-- Cache Efficiency -->
                         <div class="bg-white rounded-2xl border border-neutral-200 p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cache_efficiency') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
-                               :class="getStatFontClass(stats.cache_efficiency)"
-                               x-text="stats.cache_efficiency.toFixed(1) + '%'"></p>
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency)"
+                               x-text="(statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency.toFixed(1) + '%'"></p>
                         </div>
                     </div>
 
@@ -62,11 +91,11 @@
                         <div class="grid grid-cols-2 divide-x divide-neutral-100">
                             <div class="p-6">
                                 <p class="text-xs text-neutral-500 mb-1">{{ t('status.speed.prompt_processing') }} <span class="text-neutral-400">{{ t('status.speed.prompt_processing_note') }}</span></p>
-                                <p class="text-2xl font-bold text-neutral-900" x-text="stats.avg_prefill_tps.toFixed(1) + ' tok/s'"></p>
+                                <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_prefill_tps.toFixed(1) + ' tok/s'"></p>
                             </div>
                             <div class="p-6">
                                 <p class="text-xs text-neutral-500 mb-1">{{ t('status.speed.token_generation') }}</p>
-                                <p class="text-2xl font-bold text-neutral-900" x-text="stats.avg_generation_tps.toFixed(1) + ' tok/s'"></p>
+                                <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_generation_tps.toFixed(1) + ' tok/s'"></p>
                             </div>
                         </div>
                     </div>

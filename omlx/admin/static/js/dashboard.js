@@ -86,7 +86,18 @@
                 api_key: '',
                 engines: {},
             },
+            alltimeStats: {
+                total_prompt_tokens: 0,
+                total_cached_tokens: 0,
+                cache_efficiency: 0.0,
+                avg_prefill_tps: 0.0,
+                avg_generation_tps: 0.0,
+                total_requests: 0,
+            },
+            statsScope: 'session',
             selectedStatsModel: '',
+            showClearStatsConfirm: false,
+            showClearAlltimeConfirm: false,
             _statsRefreshTimer: null,
 
             // Log viewer state
@@ -684,6 +695,18 @@
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
+
+                    // Load all-time stats
+                    const alltimeParams = new URLSearchParams({ scope: 'alltime' });
+                    if (this.selectedStatsModel) {
+                        alltimeParams.set('model', this.selectedStatsModel);
+                    }
+                    const alltimeUrl = '/admin/api/stats?' + alltimeParams;
+                    const alltimeResponse = await fetch(alltimeUrl);
+                    if (alltimeResponse.ok) {
+                        const alltimeData = await alltimeResponse.json();
+                        this.alltimeStats = { ...this.alltimeStats, ...alltimeData };
+                    }
                 } catch (err) {
                     console.error('Failed to load stats:', err);
                 }
@@ -692,9 +715,22 @@
             async clearStats() {
                 try {
                     await fetch('/admin/api/stats/clear', { method: 'POST' });
+                    this.showClearStatsConfirm = false;
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear stats:', err);
+                    this.showClearStatsConfirm = false;
+                }
+            },
+
+            async clearAlltimeStats() {
+                try {
+                    await fetch('/admin/api/stats/clear-alltime', { method: 'POST' });
+                    this.showClearAlltimeConfirm = false;
+                    await this.loadStats();
+                } catch (err) {
+                    console.error('Failed to clear all-time stats:', err);
+                    this.showClearAlltimeConfirm = false;
                 }
             },
 
