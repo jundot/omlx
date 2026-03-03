@@ -123,11 +123,10 @@
                         </div>
                         <div class="px-6 py-5">
                             <div class="flex gap-4 items-start">
-                                <!-- Left: Mode Toggle + Per-Tier Selectors -->
-                                <div class="w-64 flex-shrink-0">
-                                    <!-- Mode toggle -->
+                                <!-- Left: Mode Toggle -->
+                                <div class="w-48 flex-shrink-0">
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('status.claude_code.mode') }}</label>
-                                    <div class="flex items-center gap-3 mb-4">
+                                    <div class="flex items-center gap-3">
                                         <button type="button"
                                                 @click="globalSettings.claude_code.mode = (globalSettings.claude_code.mode === 'cloud' ? 'local' : 'cloud'); saveClaudeCodeSettings()"
                                                 :class="globalSettings.claude_code.mode === 'local' ? 'bg-neutral-900' : 'bg-neutral-200'"
@@ -136,71 +135,6 @@
                                                   class="inline-block h-5 w-5 transform rounded-full bg-white shadow mt-0.5 ml-0.5 transition duration-200"></span>
                                         </button>
                                         <span class="text-sm font-medium text-neutral-700" x-text="globalSettings.claude_code.mode === 'cloud' ? window.t('status.claude_code.mode_cloud') : window.t('status.claude_code.mode_local')"></span>
-                                    </div>
-
-                                    <!-- Per-tier model selectors (Local mode only) -->
-                                    <div x-show="globalSettings.claude_code.mode === 'local'" x-cloak class="space-y-3">
-                                        <!-- No models loaded warning -->
-                                        <div x-show="globalSettings.claude_code.mode === 'local' && llmModels.length === 0" x-cloak
-                                             class="flex items-center gap-2 px-3 py-2.5 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">
-                                            <i data-lucide="alert-triangle" class="w-3.5 h-3.5 flex-shrink-0"></i>
-                                            <span>{{ t('status.claude_code.no_models_warning') }}</span>
-                                        </div>
-                                        <!-- Opus tier -->
-                                        <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.claude_code.opus_tier') }}</label>
-                                            <select x-model="globalSettings.claude_code.opus_model"
-                                                    @change="globalSettings.claude_code.opus_model = globalSettings.claude_code.opus_model || null; saveClaudeCodeSettings()"
-                                                    class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
-                                                <option value="">{{ t('status.claude_code.select_model') }}</option>
-                                                <template x-for="m in llmModels" :key="m.id">
-                                                    <option :value="m.id" x-text="m.id"></option>
-                                                </template>
-                                            </select>
-                                            <div x-show="globalSettings.claude_code.opus_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.claude_code.opus_model)"
-                                                 x-cloak
-                                                 class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
-                                                <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
-                                                <span>{{ t('status.claude_code.model_unavailable') }}</span>
-                                            </div>
-                                        </div>
-                                        <!-- Sonnet tier -->
-                                        <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.claude_code.sonnet_tier') }}</label>
-                                            <select x-model="globalSettings.claude_code.sonnet_model"
-                                                    @change="globalSettings.claude_code.sonnet_model = globalSettings.claude_code.sonnet_model || null; saveClaudeCodeSettings()"
-                                                    class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
-                                                <option value="">{{ t('status.claude_code.select_model') }}</option>
-                                                <template x-for="m in llmModels" :key="m.id">
-                                                    <option :value="m.id" x-text="m.id"></option>
-                                                </template>
-                                            </select>
-                                            <div x-show="globalSettings.claude_code.sonnet_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.claude_code.sonnet_model)"
-                                                 x-cloak
-                                                 class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
-                                                <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
-                                                <span>{{ t('status.claude_code.model_unavailable') }}</span>
-                                            </div>
-                                        </div>
-                                        <!-- Haiku tier -->
-                                        <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.claude_code.haiku_tier') }}</label>
-                                            <select x-model="globalSettings.claude_code.haiku_model"
-                                                    @change="globalSettings.claude_code.haiku_model = globalSettings.claude_code.haiku_model || null; saveClaudeCodeSettings()"
-                                                    class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
-                                                <option value="">{{ t('status.claude_code.select_model') }}</option>
-                                                <template x-for="m in llmModels" :key="m.id">
-                                                    <option :value="m.id" x-text="m.id"></option>
-                                                </template>
-                                            </select>
-                                            <div x-show="globalSettings.claude_code.haiku_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.claude_code.haiku_model)"
-                                                 x-cloak
-                                                 class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
-                                                <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
-                                                <span>{{ t('status.claude_code.model_unavailable') }}</span>
-                                            </div>
-                                            <p class="mt-1 text-xs text-neutral-400">{{ t('status.claude_code.haiku_hint') }}</p>
-                                        </div>
                                     </div>
                                 </div>
 
@@ -218,6 +152,73 @@
                                             <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
                                             <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
                                         </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Per-tier model selectors (Local mode only) — 3 columns -->
+                            <div x-show="globalSettings.claude_code.mode === 'local'" x-cloak class="mt-4 pt-4 border-t border-neutral-100">
+                                <!-- No models loaded warning -->
+                                <div x-show="llmModels.length === 0" x-cloak
+                                     class="flex items-center gap-2 px-3 py-2.5 mb-4 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">
+                                    <i data-lucide="alert-triangle" class="w-3.5 h-3.5 flex-shrink-0"></i>
+                                    <span>{{ t('status.claude_code.no_models_warning') }}</span>
+                                </div>
+                                <div class="grid grid-cols-3 gap-4">
+                                    <!-- Opus tier -->
+                                    <div>
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.claude_code.opus_tier') }}</label>
+                                        <select x-model="globalSettings.claude_code.opus_model"
+                                                @change="globalSettings.claude_code.opus_model = globalSettings.claude_code.opus_model || null; saveClaudeCodeSettings()"
+                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                            <option value="">{{ t('status.claude_code.select_model') }}</option>
+                                            <template x-for="m in llmModels" :key="m.id">
+                                                <option :value="m.id" x-text="m.id"></option>
+                                            </template>
+                                        </select>
+                                        <div x-show="globalSettings.claude_code.opus_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.claude_code.opus_model)"
+                                             x-cloak
+                                             class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                                            <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+                                            <span>{{ t('status.claude_code.model_unavailable') }}</span>
+                                        </div>
+                                    </div>
+                                    <!-- Sonnet tier -->
+                                    <div>
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.claude_code.sonnet_tier') }}</label>
+                                        <select x-model="globalSettings.claude_code.sonnet_model"
+                                                @change="globalSettings.claude_code.sonnet_model = globalSettings.claude_code.sonnet_model || null; saveClaudeCodeSettings()"
+                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                            <option value="">{{ t('status.claude_code.select_model') }}</option>
+                                            <template x-for="m in llmModels" :key="m.id">
+                                                <option :value="m.id" x-text="m.id"></option>
+                                            </template>
+                                        </select>
+                                        <div x-show="globalSettings.claude_code.sonnet_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.claude_code.sonnet_model)"
+                                             x-cloak
+                                             class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                                            <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+                                            <span>{{ t('status.claude_code.model_unavailable') }}</span>
+                                        </div>
+                                    </div>
+                                    <!-- Haiku tier -->
+                                    <div>
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.claude_code.haiku_tier') }}</label>
+                                        <select x-model="globalSettings.claude_code.haiku_model"
+                                                @change="globalSettings.claude_code.haiku_model = globalSettings.claude_code.haiku_model || null; saveClaudeCodeSettings()"
+                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                            <option value="">{{ t('status.claude_code.select_model') }}</option>
+                                            <template x-for="m in llmModels" :key="m.id">
+                                                <option :value="m.id" x-text="m.id"></option>
+                                            </template>
+                                        </select>
+                                        <div x-show="globalSettings.claude_code.haiku_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.claude_code.haiku_model)"
+                                             x-cloak
+                                             class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                                            <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+                                            <span>{{ t('status.claude_code.model_unavailable') }}</span>
+                                        </div>
+                                        <p class="mt-1 text-xs text-neutral-400">{{ t('status.claude_code.haiku_hint') }}</p>
                                     </div>
                                 </div>
                             </div>
