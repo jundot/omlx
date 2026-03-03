@@ -225,6 +225,63 @@ class TestVLMModelAdapter:
         assert result is expected
 
 
+    def test_forward_with_inputs_embeds_kwarg(self):
+        """Test batched VLM path: inputs_embeds kwarg passed to language_model."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+
+        input_ids = MockMXArray(shape=(2, 10))
+        cache = [MagicMock()]
+        embeds = MockMXArray(shape=(2, 10, 128))
+        extra = {"position_ids": MockMXArray(shape=(2, 10))}
+
+        adapter(input_ids, cache=cache, inputs_embeds=embeds, vlm_extra_kwargs=extra)
+
+        # Should call language_model with inputs_embeds and extra kwargs
+        call_args = vlm.language_model.call_args
+        assert call_args.kwargs.get("inputs_embeds") is embeds
+        assert call_args.kwargs.get("position_ids") is extra["position_ids"]
+        # _pending_embeds should NOT be set (batched path doesn't use it)
+        assert adapter._pending_embeds is None
+
+    def test_inputs_embeds_kwarg_takes_priority_over_pending(self):
+        """Test that inputs_embeds kwarg takes priority over _pending_embeds."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+
+        # Set pending embeddings (legacy path)
+        pending = MockMXArray(shape=(1, 20, 128))
+        adapter.set_pending_embeddings(pending)
+
+        # Call with explicit inputs_embeds kwarg (batched path)
+        batched = MockMXArray(shape=(2, 10, 128))
+        input_ids = MockMXArray(shape=(2, 10))
+        adapter(input_ids, cache=[MagicMock()], inputs_embeds=batched)
+
+        # Batched path should be used, not legacy path
+        call_args = vlm.language_model.call_args
+        assert call_args.kwargs.get("inputs_embeds") is batched
+
+    def test_logits_extraction_from_language_model_output(self):
+        """Test that LanguageModelOutput.logits is extracted for BatchGenerator."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+
+        # Simulate LanguageModelOutput with .logits attribute
+        lm_output = MagicMock()
+        lm_output.logits = MockMXArray(shape=(2, 10, 32000))
+        vlm.language_model.return_value = lm_output
+
+        result = adapter(MockMXArray(shape=(2, 10)), cache=[MagicMock()])
+        assert result is lm_output.logits
+
+
 class TestVLMModelAdapterModelProperty:
     """Tests for VLMModelAdapter.model property (for nested access)."""
 

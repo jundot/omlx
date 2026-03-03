@@ -1,3 +1,8 @@
+    // OCR model types that require temperature=0.0 (deterministic output)
+    const OCR_CONFIG_MODEL_TYPES = new Set([
+        'deepseekocr', 'deepseekocr_2', 'dots_ocr', 'glm_ocr',
+    ]);
+
     function dashboard() {
         return {
             // Theme
@@ -496,10 +501,11 @@
                         ctKwargEntries.push({type: 'custom', key, value: String(value), force: forcedKeys.has(key)});
                     }
                 }
+                const isOcr = OCR_CONFIG_MODEL_TYPES.has(model.config_model_type || '');
                 this.modelSettings = {
                     max_context_window: settings.max_context_window || null,
                     max_tokens: settings.max_tokens || null,
-                    temperature: settings.temperature ?? null,
+                    temperature: isOcr ? 0.0 : (settings.temperature ?? null),
                     top_p: settings.top_p ?? null,
                     top_k: settings.top_k ?? null,
                     repetition_penalty: settings.repetition_penalty ?? null,

@@ -144,20 +144,19 @@ class VLMModelAdapter(nn.Module):
             return self._language_model.args
         return self.config
 
-    def make_cache(self) -> Optional[List[Any]]:
+    def make_cache(self) -> List[Any]:
         """
         Create KV cache using the language model's make_cache().
 
         Returns the same cache types (KVCache, RotatingKVCache, ArraysCache, etc.)
-        as if the language model were used directly. This ensures full compatibility
-        with oMLX's tiered cache and boundary snapshot mechanisms.
-
-        Returns:
-            List of cache objects, or None if language model doesn't define make_cache
+        as if the language model were used directly. Falls back to default KVCache
+        per layer if the language model doesn't define make_cache().
         """
         if hasattr(self._language_model, "make_cache"):
             return self._language_model.make_cache()
-        return None
+        # Fallback: default KVCache for each layer (matches mlx-lm's make_prompt_cache)
+        from mlx_lm.models.cache import KVCache
+        return [KVCache() for _ in range(len(self.layers))]
 
     def set_pending_embeddings(
         self,
@@ -218,21 +217,36 @@ class VLMModelAdapter(nn.Module):
         """
         Forward pass, dispatching between VLM prefill and standard decode.
 
-        Wraps batch caches with int-offset proxies because mlx-lm's
-        BatchKVCache stores offset as mx.array, but mlx-vlm models use
-        cache.offset for Python slicing which requires int.
+        Supports three paths:
+        1. Batched VLM: ``inputs_embeds`` kwarg from _process_prompts()
+        2. Legacy single VLM: ``_pending_embeds`` set via set_pending_embeddings()
+        3. Standard decode: token IDs only
 
         Args:
             input_ids: Token IDs, shape (batch, seq_len)
             cache: KV cache list
-            **kwargs: Additional kwargs from BatchGenerator
+            **kwargs: Additional kwargs from BatchGenerator.
+                inputs_embeds: Pre-computed embeddings for batched VLM prefill
+                vlm_extra_kwargs: Model-specific kwargs (e.g., position_ids)
 
         Returns:
             Model output (logits as mx.array)
         """
         wrapped_cache = _wrap_caches(cache)
+        inputs_embeds = kwargs.pop("inputs_embeds", None)
+        vlm_extra = kwargs.pop("vlm_extra_kwargs", None) or {}
 
-        if self._pending_embeds is not None:
+        if inputs_embeds is not None:
+            # Batched VLM path: embeddings from _process_prompts
+            result = self._language_model(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                cache=wrapped_cache,
+                **vlm_extra,
+                **kwargs,
+            )
+        elif self._pending_embeds is not None:
+            # Legacy single-request path
             result = self._forward_with_embeddings(input_ids, wrapped_cache, **kwargs)
         else:
             # Standard decode path: token IDs only

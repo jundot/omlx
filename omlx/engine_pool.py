@@ -51,6 +51,7 @@ class EngineEntry:
     model_type: Literal["llm", "vlm", "embedding", "reranker"]  # Model type
     engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
+    config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
@@ -141,6 +142,7 @@ class EnginePool:
                 model_type=info.model_type,
                 engine_type=info.engine_type,
                 estimated_size=info.estimated_size,
+                config_model_type=getattr(info, "config_model_type", ""),
                 is_pinned=model_id in pinned_set,
             )
 
@@ -491,6 +493,7 @@ class EnginePool:
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
+                    "config_model_type": e.config_model_type,
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
                 for mid, e in sorted(self._entries.items())

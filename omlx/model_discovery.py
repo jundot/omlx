@@ -45,6 +45,10 @@ VLM_MODEL_TYPES = {
     "bunny_llama",
     "multi_modality",
     "florence2",
+    "deepseekocr",
+    "deepseekocr_2",
+    "dots_ocr",
+    "glm_ocr",
 }
 
 # Known VLM architectures
@@ -115,9 +119,10 @@ class DiscoveredModel:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: ModelType  # Always "llm"
-    engine_type: EngineType  # "batched" or "simple"
+    model_type: ModelType  # "llm", "vlm", "embedding", or "reranker"
+    engine_type: EngineType  # "batched", "vlm", "embedding", or "reranker"
     estimated_size: int  # Estimated memory usage in bytes
+    config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
 
 
 def detect_model_type(model_path: Path) -> ModelType:
@@ -174,8 +179,9 @@ def detect_model_type(model_path: Path) -> ModelType:
     if normalized_type in VLM_MODEL_TYPES:
         return "vlm"
 
-    # Check for VLM: presence of vision_config + text_config (fallback heuristic)
-    if "vision_config" in config and "text_config" in config:
+    # Check for VLM: presence of vision_config (fallback heuristic)
+    # Some VLMs have both vision_config + text_config, others only vision_config.
+    if "vision_config" in config:
         return "vlm"
 
     return "llm"
@@ -246,12 +252,22 @@ def _register_model(
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)
 
+        # Read raw config model_type for sub-type detection (e.g., OCR models)
+        config_model_type = ""
+        try:
+            import json
+            with open(model_dir / "config.json") as f:
+                config_model_type = json.load(f).get("model_type", "")
+        except Exception:
+            pass
+
         models[model_id] = DiscoveredModel(
             model_id=model_id,
             model_path=str(model_dir),
             model_type=model_type,
             engine_type=engine_type,
             estimated_size=estimated_size,
+            config_model_type=config_model_type,
         )
 
         size_gb = estimated_size / (1024**3)

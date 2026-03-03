@@ -43,6 +43,33 @@ from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
 
+# OCR model types that require special handling.
+OCR_MODEL_TYPES = {"deepseekocr", "deepseekocr_2", "dots_ocr", "glm_ocr"}
+
+# OCR model types and their default markdown conversion prompts.
+# When an OCR model receives a generic user prompt with an image,
+# the prompt is automatically adjusted for markdown output.
+OCR_MODEL_PROMPTS: Dict[str, str] = {
+    "deepseekocr": "Convert the document to markdown.",
+    "deepseekocr_2": "Convert the document to markdown.",
+    "dots_ocr": (
+        "Convert this document image to markdown. "
+        "Preserve the reading order, use LaTeX for formulas, "
+        "and HTML for tables."
+    ),
+    "glm_ocr": "Text Recognition:",
+}
+
+# Extra stop sequences for OCR models to prevent degeneration.
+# Many OCR models lack proper EOS handling and generate chat-turn
+# tokens (<|user|>, <|im_start|>, etc.) indefinitely after the OCR output.
+OCR_EXTRA_STOP_SEQUENCES: List[str] = [
+    "<|user|>",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|endoftext|>",
+]
+
 _video_processor_patched = False
 
 
@@ -129,6 +156,36 @@ class VLMBatchedEngine(BaseEngine):
             if hasattr(config, "model_type"):
                 return config.model_type
         return None
+
+    @property
+    def is_ocr_model(self) -> bool:
+        return (self.model_type or "") in OCR_MODEL_TYPES
+
+    def _resolve_ocr_stop_token_ids(self) -> list[int]:
+        """Convert OCR stop sequences to token IDs via the tokenizer.
+
+        Caches the result after first call since the tokenizer doesn't change.
+        """
+        if hasattr(self, "_ocr_stop_ids_cache"):
+            return self._ocr_stop_ids_cache
+
+        ids: list[int] = []
+        if self._tokenizer is None:
+            return ids
+
+        unk_id = getattr(self._tokenizer, "unk_token_id", None)
+        for seq in OCR_EXTRA_STOP_SEQUENCES:
+            try:
+                token_id = self._tokenizer.convert_tokens_to_ids(seq)
+                if token_id is not None and token_id != unk_id:
+                    ids.append(token_id)
+            except (AttributeError, KeyError, TypeError):
+                pass
+
+        self._ocr_stop_ids_cache = ids
+        if ids:
+            logger.debug(f"OCR stop token IDs resolved: {ids}")
+        return ids
 
     async def start(self) -> None:
         """Load VLM model and processor via mlx-vlm, create engine with VLMModelAdapter."""
@@ -372,6 +429,13 @@ class VLMBatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # OCR models: force temperature=0.0 and add extra stop token IDs
+        # to prevent degeneration (repeated <|user|>, <|im_start|>, etc.).
+        extra_stop_ids: list[int] = []
+        if self.is_ocr_model:
+            temperature = 0.0
+            extra_stop_ids = self._resolve_ocr_stop_token_ids()
+
         from ..request import SamplingParams
 
         sampling_params = SamplingParams(
@@ -381,6 +445,7 @@ class VLMBatchedEngine(BaseEngine):
             top_k=top_k,
             repetition_penalty=repetition_penalty,
             stop=stop or [],
+            stop_token_ids=extra_stop_ids or None,
         )
 
         output = await self._engine.generate(
@@ -420,6 +485,12 @@ class VLMBatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # OCR models: force temperature=0.0 and add extra stop token IDs.
+        extra_stop_ids: list[int] = []
+        if self.is_ocr_model:
+            temperature = 0.0
+            extra_stop_ids = self._resolve_ocr_stop_token_ids()
+
         from ..request import SamplingParams
 
         sampling_params = SamplingParams(
@@ -429,6 +500,7 @@ class VLMBatchedEngine(BaseEngine):
             top_k=top_k,
             repetition_penalty=repetition_penalty,
             stop=stop or [],
+            stop_token_ids=extra_stop_ids or None,
         )
 
         request_id = await self._engine.add_request(
@@ -529,6 +601,60 @@ class VLMBatchedEngine(BaseEngine):
         ):
             yield output
 
+    def _apply_ocr_prompt(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Replace the last user text with an OCR-specific prompt if applicable.
+
+        OCR models (DeepSeek-OCR, GLM-OCR, DOTS-OCR) require specific prompt
+        formats for markdown output. When the model is an OCR type and the user
+        sends a generic message with images, substitute the user text with the
+        model's default OCR prompt.
+
+        Only activates when:
+        - The model_type is in OCR_MODEL_PROMPTS
+        - The last user message contains image content
+        """
+        model_type = self.model_type or ""
+        if model_type not in OCR_MODEL_PROMPTS:
+            return messages
+
+        ocr_prompt = OCR_MODEL_PROMPTS[model_type]
+        messages = copy.deepcopy(messages)
+
+        # Find last user message and replace text content
+        for msg in reversed(messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                # Multi-part content: check if it has images
+                has_image = any(
+                    isinstance(p, dict) and p.get("type") == "image_url"
+                    for p in content
+                )
+                if not has_image:
+                    break
+                # Replace text parts with OCR prompt
+                new_content = []
+                text_replaced = False
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        if not text_replaced:
+                            new_content.append({"type": "text", "text": ocr_prompt})
+                            text_replaced = True
+                        # Drop extra text parts
+                    else:
+                        new_content.append(part)
+                if not text_replaced:
+                    # No text part found, prepend OCR prompt
+                    new_content.insert(0, {"type": "text", "text": ocr_prompt})
+                msg["content"] = new_content
+            elif isinstance(content, str):
+                # Plain string — replace directly (shouldn't have images here)
+                msg["content"] = ocr_prompt
+            break
+
+        return messages
+
     def _process_chat_messages(
         self,
         messages: list[dict[str, Any]],
@@ -547,9 +673,12 @@ class VLMBatchedEngine(BaseEngine):
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
 
         if images:
+            # Apply OCR-specific prompt if applicable
+            ocr_messages = self._apply_ocr_prompt(messages)
+
             # VLM path: prepare vision inputs
             token_ids, vlm_embeds, vlm_kwargs, image_hash = self._prepare_vision_inputs(
-                messages, images, chat_template_kwargs=ct_kwargs
+                ocr_messages, images, chat_template_kwargs=ct_kwargs
             )
             return token_ids, vlm_embeds, vlm_kwargs, image_hash
         else:

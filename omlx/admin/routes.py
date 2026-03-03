@@ -987,6 +987,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "is_default": server_state.default_model == model_id if server_state else False,
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
+            "config_model_type": model_info.get("config_model_type", ""),
             "last_access": model_info.get("last_access"),
         }
 
