@@ -239,6 +239,8 @@
     "settings.language.label": "Interface Language",
     "settings.language.en": "English",
     "settings.language.zh": "中文",
+    "settings.language.ko": "한국어",
+    "settings.language.ja": "日本語",
 
     "settings.save.button": "Save Settings",
     "settings.save.saving": "Saving...",
