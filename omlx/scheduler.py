@@ -921,6 +921,11 @@ class Scheduler:
         self.tokenizer = tokenizer
         self.config = copy.copy(config) if config else SchedulerConfig()
 
+        # Load additional EOS tokens from generation_config.json.
+        # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
+        # that are not in tokenizer.eos_token_id.
+        self._generation_config_eos: Optional[Set[int]] = self._load_generation_config_eos()
+
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
         self._align_block_size_with_rotating_window()
@@ -1213,8 +1218,44 @@ class Scheduler:
             )
         return type(cache_obj).__name__ in ("ArraysCache", "SizedArraysCache")
 
+    def _load_generation_config_eos(self) -> Optional[Set[int]]:
+        """Load EOS token IDs from generation_config.json if available."""
+        try:
+            model_path = getattr(self.tokenizer, "name_or_path", None)
+            if not model_path:
+                return None
+            import json
+            import os
+            gc_path = os.path.join(model_path, "generation_config.json")
+            if not os.path.exists(gc_path):
+                return None
+            with open(gc_path) as f:
+                gc = json.load(f)
+            eos = gc.get("eos_token_id")
+            if eos is None:
+                return None
+            if isinstance(eos, list):
+                result = set(eos)
+            else:
+                result = {eos}
+            # Only return if there are tokens beyond what tokenizer already provides
+            tokenizer_eos = getattr(self.tokenizer, "eos_token_id", None)
+            if tokenizer_eos is not None:
+                existing = {tokenizer_eos} if isinstance(tokenizer_eos, int) else set(tokenizer_eos)
+                extra = result - existing
+                if extra:
+                    logger.info(
+                        f"Loaded {len(extra)} additional EOS token(s) from "
+                        f"generation_config.json: {extra}"
+                    )
+                    return result
+            return result
+        except Exception as e:
+            logger.debug(f"Could not load generation_config.json: {e}")
+            return None
+
     def _get_stop_tokens(self) -> Set[int]:
-        """Get stop token IDs from tokenizer."""
+        """Get stop token IDs from tokenizer and generation_config."""
         stop_tokens = set()
         if hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
             if isinstance(self.tokenizer.eos_token_id, list):
@@ -1227,6 +1268,12 @@ class Scheduler:
                 stop_tokens.add(eos_ids)
             else:
                 stop_tokens.update(eos_ids)
+
+        # Read additional EOS tokens from generation_config.json.
+        # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
+        # that are not reflected in tokenizer.eos_token_id.
+        if self._generation_config_eos is not None:
+            stop_tokens.update(self._generation_config_eos)
 
         # Add Harmony stop tokens for gpt-oss models (use cached tokens)
         if self._is_harmony_model and self._harmony_stop_tokens:

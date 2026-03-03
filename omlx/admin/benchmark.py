@@ -187,7 +187,7 @@ async def _run_single_test(
 
     # Reset peak memory tracking
     try:
-        mx.metal.reset_peak_memory()
+        mx.reset_peak_memory()
     except Exception:
         pass
 
@@ -217,7 +217,7 @@ async def _run_single_test(
 
     # Get peak memory
     try:
-        peak_memory = mx.metal.get_peak_memory()
+        peak_memory = mx.get_peak_memory()
     except Exception:
         peak_memory = 0
 
