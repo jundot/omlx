@@ -52,11 +52,7 @@ OCR_MODEL_TYPES = {"deepseekocr", "deepseekocr_2", "dots_ocr", "glm_ocr"}
 OCR_MODEL_PROMPTS: Dict[str, str] = {
     "deepseekocr": "Convert the document to markdown.",
     "deepseekocr_2": "Convert the document to markdown.",
-    "dots_ocr": (
-        "Convert this document image to markdown. "
-        "Preserve the reading order, use LaTeX for formulas, "
-        "and HTML for tables."
-    ),
+    "dots_ocr": "Convert this page to clean Markdown while preserving reading order.",
     "glm_ocr": "Text Recognition:",
 }
 
@@ -68,6 +64,7 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
     "<|im_start|>",
     "<|im_end|>",
     "<|endoftext|>",
+    "<|endofassistant|>",
 ]
 
 _video_processor_patched = False

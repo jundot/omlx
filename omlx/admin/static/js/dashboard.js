@@ -176,6 +176,7 @@
             benchShowMetrics: false,
             benchShowText: false,
             benchCopied: false,
+            benchIncludeImage: false,
 
             async init() {
                 // Apply theme
@@ -838,6 +839,7 @@
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
+                            include_image: this.benchIncludeImage,
                         }),
                     });
 
@@ -1016,14 +1018,15 @@
                     }
                 };
 
+                const imgSuffix = this.benchIncludeImage ? ' + image tokens' : '';
                 buildBatchText(
                     'Continuous Batching — Same Prompt',
-                    'pp1024 / tg128 · partial prefix cache hit',
+                    `pp1024${imgSuffix} / tg128 · partial prefix cache hit`,
                     this.benchBatchSameResults
                 );
                 buildBatchText(
                     'Continuous Batching — Different Prompts',
-                    'pp1024 / tg128 · no cache reuse',
+                    `pp1024${imgSuffix} / tg128 · no cache reuse`,
                     this.benchBatchDiffResults
                 );
 

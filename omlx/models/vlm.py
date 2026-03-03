@@ -49,9 +49,9 @@ class _IntOffsetCacheProxy:
         if isinstance(raw, mx.array):
             if raw.ndim == 0:
                 return int(raw.item())
-            # Batch size 1: take the single element
-            if raw.shape[0] == 1:
-                return int(raw[0].item())
+            # Batched offset: all elements should be identical during prefill.
+            # Take the first element to return a scalar int.
+            return int(raw.reshape(-1)[0].item())
         return raw
 
     def __getattr__(self, name: str):
