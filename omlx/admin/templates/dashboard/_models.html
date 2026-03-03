@@ -8,7 +8,7 @@
                                 ? 'bg-neutral-900 text-white'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
                             class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
-                            Manager
+                            {{ t('models.tab.manager') }}
                         </button>
                         <button
                             @click="modelsTab = 'downloader'; if (!hfRecommendedLoaded) loadRecommendedModels(); loadHFTasks();"
@@ -16,7 +16,7 @@
                                 ? 'bg-neutral-900 text-white'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
                             class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
-                            Downloader
+                            {{ t('models.tab.downloader') }}
                         </button>
                     </div>
 
@@ -24,9 +24,9 @@
                     <div x-show="modelsTab === 'manager'" x-cloak>
                         <!-- Header -->
                         <div class="mb-8">
-                            <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">Models</h2>
-                            <h3 class="text-2xl font-bold tracking-tight text-neutral-900">Model Manager</h3>
-                            <p class="text-sm text-neutral-500 mt-2">Manage your local models.</p>
+                            <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('models.manager.section_label') }}</h2>
+                            <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('models.manager.heading') }}</h3>
+                            <p class="text-sm text-neutral-500 mt-2">{{ t('models.manager.description') }}</p>
                         </div>
 
                         <!-- Local Models Section -->
@@ -34,21 +34,21 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="hard-drive" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Local Models</span>
-                                    <span class="text-xs text-neutral-400" x-text="hfModels.length + ' models'"></span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.manager.local_models') }}</span>
+                                    <span class="text-xs text-neutral-400" x-text="window.t('models.manager.models_count').replace('{count}', hfModels.length)"></span>
                                 </div>
                                 <button @click="loadHFModels()"
                                         class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700
                                                hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5">
                                     <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>
-                                    Refresh
+                                    {{ t('models.manager.refresh') }}
                                 </button>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <template x-if="hfModels.length === 0">
                                     <div class="px-6 py-12 text-center">
                                         <i data-lucide="inbox" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
-                                        <p class="text-sm text-neutral-500">No models found in model directory.</p>
+                                        <p class="text-sm text-neutral-500">{{ t('models.manager.no_models') }}</p>
                                     </div>
                                 </template>
                                 <template x-for="model in hfModels" :key="model.name">
@@ -60,7 +60,7 @@
                                                     @click.stop="copyToClipboard(model.name); copied = true; setTimeout(() => copied = false, 2000)"
                                                     class="p-1 rounded-md transition-all flex-shrink-0"
                                                     :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
-                                                    title="Copy model name">
+                                                    :title="window.t('models.manager.copy_model_name_tooltip')">
                                                 <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
                                                 <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
                                             </button>
@@ -69,20 +69,20 @@
                                             <template x-if="hfDeleteConfirm !== model.name">
                                                 <button @click="hfDeleteConfirm = model.name"
                                                         class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
-                                                        title="Delete model">
+                                                        :title="window.t('models.manager.delete_tooltip')">
                                                     <i data-lucide="trash-2" class="w-4 h-4"></i>
                                                 </button>
                                             </template>
                                             <template x-if="hfDeleteConfirm === model.name">
                                                 <div class="flex items-center gap-2">
-                                                    <span class="text-xs text-red-600">Delete?</span>
+                                                    <span class="text-xs text-red-600">{{ t('models.manager.delete_confirm') }}</span>
                                                     <button @click="deleteHFModel(model.name)"
                                                             class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
-                                                        Yes
+                                                        {{ t('models.manager.delete_yes') }}
                                                     </button>
                                                     <button @click="hfDeleteConfirm = null"
                                                             class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
-                                                        No
+                                                        {{ t('models.manager.delete_no') }}
                                                     </button>
                                                 </div>
                                             </template>
@@ -97,9 +97,9 @@
                     <div x-show="modelsTab === 'downloader'" x-cloak>
                         <!-- Header -->
                         <div class="mb-8">
-                            <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">Models</h2>
-                            <h3 class="text-2xl font-bold tracking-tight text-neutral-900">Model Downloader</h3>
-                            <p class="text-sm text-neutral-500 mt-2">Download models from HuggingFace and browse available models.</p>
+                            <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('models.downloader.section_label') }}</h2>
+                            <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('models.downloader.heading') }}</h3>
+                            <p class="text-sm text-neutral-500 mt-2">{{ t('models.downloader.description') }}</p>
                         </div>
 
                         <!-- Download Form Section -->
@@ -107,13 +107,13 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="cloud-download" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Download from HuggingFace</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.downloader.download_section') }}</span>
                                 </div>
                             </div>
                             <div class="px-6 py-5">
                                 <div class="flex items-end gap-4">
                                     <div class="flex-1">
-                                        <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">Repository ID</label>
+                                        <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.downloader.repo_id') }}</label>
                                         <input type="text" x-model="hfRepoId"
                                                @keydown.enter="startHFDownload()"
                                                placeholder="mlx-community/Llama-3-8B-4bit"
@@ -124,7 +124,7 @@
                                     </div>
                                     <div class="w-48">
                                         <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">
-                                            HF Token <span class="text-neutral-400 normal-case">(optional)</span>
+                                            {{ t('models.downloader.hf_token') }} <span class="text-neutral-400 normal-case">{{ t('models.downloader.hf_token_optional') }}</span>
                                         </label>
                                         <input type="password" x-model="hfToken"
                                                @keydown.enter="startHFDownload()"
@@ -140,7 +140,7 @@
                                                    hover:bg-neutral-800 transition-all disabled:opacity-50 disabled:cursor-not-allowed
                                                    flex items-center gap-2 whitespace-nowrap">
                                         <i data-lucide="download" class="w-4 h-4"></i>
-                                        Download
+                                        {{ t('models.downloader.download_button') }}
                                     </button>
                                 </div>
                                 <div x-show="hfError" x-cloak
@@ -160,7 +160,7 @@
                         <div class="bg-white rounded-2xl border border-neutral-200 mb-6">
                             <div class="flex items-center gap-3 px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <i data-lucide="search" class="w-4 h-4 text-neutral-500"></i>
-                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Search HuggingFace</span>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.search.section_label') }}</span>
                             </div>
                             <div class="px-6 py-5">
                                 <div class="flex items-center gap-3">
@@ -171,14 +171,14 @@
                                                @keydown.enter="immediateSearch()"
                                                @focus="hfSearchHistoryOpen = true"
                                                @blur="closeSearchHistory()"
-                                               placeholder="Search models on HuggingFace..."
+                                               placeholder="{{ t('models.search.placeholder') }}"
                                                class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm
                                                       focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                         <!-- Search history dropdown -->
                                         <div x-show="hfSearchHistoryOpen && hfSearchHistory.length > 0 && !hfSearchQuery.trim()"
                                              x-cloak
                                              class="absolute top-full left-0 right-0 mt-1 bg-white rounded-xl shadow-lg border border-neutral-200 py-1 z-50">
-                                            <div class="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-neutral-400">Recent searches</div>
+                                            <div class="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('models.search.recent_searches') }}</div>
                                             <template x-for="(item, idx) in hfSearchHistory" :key="idx">
                                                 <button @mousedown.prevent="selectSearchHistory(item)"
                                                         class="w-full px-3 py-2 text-left text-sm text-neutral-700 hover:bg-neutral-50 flex items-center gap-2 transition-colors">
@@ -195,12 +195,12 @@
                                                 class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm
                                                        focus:ring-2 focus:ring-neutral-900 focus:border-transparent
                                                        transition-all bg-white appearance-none cursor-pointer">
-                                            <option value="trending">Trending</option>
-                                            <option value="downloads">Most Downloads</option>
-                                            <option value="created">Recently Created</option>
-                                            <option value="updated">Recently Updated</option>
-                                            <option value="most_params">Most Parameters</option>
-                                            <option value="least_params">Least Parameters</option>
+                                            <option value="trending">{{ t('models.search.sort.trending') }}</option>
+                                            <option value="downloads">{{ t('models.search.sort.downloads') }}</option>
+                                            <option value="created">{{ t('models.search.sort.created') }}</option>
+                                            <option value="updated">{{ t('models.search.sort.updated') }}</option>
+                                            <option value="most_params">{{ t('models.search.sort.most_params') }}</option>
+                                            <option value="least_params">{{ t('models.search.sort.least_params') }}</option>
                                         </select>
                                     </div>
                                     <!-- Search button -->
@@ -210,7 +210,7 @@
                                                    hover:bg-neutral-800 transition-all disabled:opacity-50 disabled:cursor-not-allowed
                                                    flex items-center gap-2 whitespace-nowrap">
                                         <i data-lucide="search" class="w-4 h-4"></i>
-                                        Search
+                                        {{ t('models.search.button') }}
                                     </button>
                                 </div>
                             </div>
@@ -221,9 +221,9 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="star" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Browse Models</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.browse.section_label') }}</span>
                                     <span x-show="globalSettings.system.total_memory" x-cloak
-                                          class="text-xs text-neutral-400" x-text="'for ' + globalSettings.system.total_memory + ' system'"></span>
+                                          class="text-xs text-neutral-400" x-text="window.t('models.browse.system_suffix').replace('{memory}', globalSettings.system.total_memory)"></span>
                                 </div>
                                 <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5">
                                     <button @click="hfRecommendedTab = 'trending'"
@@ -231,21 +231,21 @@
                                                 ? 'bg-white text-neutral-900 shadow-sm'
                                                 : 'text-neutral-500 hover:text-neutral-700'"
                                             class="px-3 py-1 text-xs font-medium rounded-md transition-all">
-                                        Trending
+                                        {{ t('models.browse.tab.trending') }}
                                     </button>
                                     <button @click="hfRecommendedTab = 'popular'"
                                             :class="hfRecommendedTab === 'popular'
                                                 ? 'bg-white text-neutral-900 shadow-sm'
                                                 : 'text-neutral-500 hover:text-neutral-700'"
                                             class="px-3 py-1 text-xs font-medium rounded-md transition-all">
-                                        Popular
+                                        {{ t('models.browse.tab.popular') }}
                                     </button>
                                     <button @click="hfRecommendedTab = 'search'"
                                             :class="hfRecommendedTab === 'search'
                                                 ? 'bg-white text-neutral-900 shadow-sm'
                                                 : 'text-neutral-500 hover:text-neutral-700'"
                                             class="px-3 py-1 text-xs font-medium rounded-md transition-all">
-                                        Search Results
+                                        {{ t('models.browse.tab.search_results') }}
                                         <span x-show="hfSearchResults.length > 0" x-cloak
                                               class="ml-1 text-[10px] text-neutral-400"
                                               x-text="'(' + hfSearchResults.length + ')'"></span>
@@ -256,17 +256,17 @@
                             <!-- Loading state for recommended -->
                             <div x-show="hfRecommendedLoading && (hfRecommendedTab === 'trending' || hfRecommendedTab === 'popular')" x-cloak class="px-6 py-12 text-center">
                                 <div class="inline-block w-5 h-5 border-2 border-neutral-300 border-t-neutral-600 rounded-full animate-spin mb-3"></div>
-                                <p class="text-sm text-neutral-500">Loading recommendations...</p>
+                                <p class="text-sm text-neutral-500">{{ t('models.browse.loading') }}</p>
                             </div>
 
                             <!-- Not loaded state for recommended -->
                             <div x-show="!hfRecommendedLoading && !hfRecommendedLoaded && (hfRecommendedTab === 'trending' || hfRecommendedTab === 'popular')" x-cloak class="px-6 py-12 text-center">
                                 <i data-lucide="star" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
-                                <p class="text-sm text-neutral-500">Click to load recommended models.</p>
+                                <p class="text-sm text-neutral-500">{{ t('models.browse.load_prompt') }}</p>
                                 <button @click="loadRecommendedModels()"
                                         class="mt-3 px-4 py-2 text-xs font-medium text-neutral-600 hover:text-neutral-800
                                                bg-neutral-100 hover:bg-neutral-200 rounded-lg transition-all">
-                                    Load Recommendations
+                                    {{ t('models.browse.load_button') }}
                                 </button>
                             </div>
 
@@ -276,7 +276,7 @@
                                     <div class="divide-y divide-neutral-100">
                                         <template x-if="(hfRecommended.trending || []).length === 0">
                                             <div class="px-6 py-8 text-center">
-                                                <p class="text-sm text-neutral-500">No trending models found for your system.</p>
+                                                <p class="text-sm text-neutral-500">{{ t('models.browse.no_trending') }}</p>
                                             </div>
                                         </template>
                                         <template x-for="model in getPagedModels('trending')" :key="model.repo_id">
@@ -288,17 +288,17 @@
                                                         <span class="text-xs text-neutral-400" x-text="model.size_formatted"></span>
                                                         <span class="text-xs text-neutral-400" x-text="'&#11015; ' + formatDownloads(model.downloads)"></span>
                                                         <span class="text-xs text-neutral-400" x-text="'&#9829; ' + model.likes"></span>
-                                                        <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' params'"></span>
+                                                        <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
                                                     </div>
                                                 </div>
                                                 <div class="flex items-center gap-2 shrink-0 ml-4">
                                                     <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
                                                           class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">
-                                                        Tight fit
+                                                        {{ t('models.browse.tight_fit') }}
                                                     </span>
                                                     <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
                                                           class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200">
-                                                        High OOM risk
+                                                        {{ t('models.browse.high_oom_risk') }}
                                                     </span>
                                                     <button @click="downloadRecommended(model.repo_id)"
                                                             :disabled="hfDownloading"
@@ -306,7 +306,7 @@
                                                                    hover:bg-neutral-900 hover:text-white rounded-lg transition-all
                                                                    disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
                                                         <i data-lucide="download" class="w-3.5 h-3.5"></i>
-                                                        Download
+                                                        {{ t('models.downloader.download_button') }}
                                                     </button>
                                                 </div>
                                             </div>
@@ -334,7 +334,7 @@
                                     <div class="divide-y divide-neutral-100">
                                         <template x-if="(hfRecommended.popular || []).length === 0">
                                             <div class="px-6 py-8 text-center">
-                                                <p class="text-sm text-neutral-500">No popular models found for your system.</p>
+                                                <p class="text-sm text-neutral-500">{{ t('models.browse.no_popular') }}</p>
                                             </div>
                                         </template>
                                         <template x-for="model in getPagedModels('popular')" :key="model.repo_id">
@@ -346,17 +346,17 @@
                                                         <span class="text-xs text-neutral-400" x-text="model.size_formatted"></span>
                                                         <span class="text-xs text-neutral-400" x-text="'&#11015; ' + formatDownloads(model.downloads)"></span>
                                                         <span class="text-xs text-neutral-400" x-text="'&#9829; ' + model.likes"></span>
-                                                        <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' params'"></span>
+                                                        <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
                                                     </div>
                                                 </div>
                                                 <div class="flex items-center gap-2 shrink-0 ml-4">
                                                     <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
                                                           class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">
-                                                        Tight fit
+                                                        {{ t('models.browse.tight_fit') }}
                                                     </span>
                                                     <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
                                                           class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200">
-                                                        High OOM risk
+                                                        {{ t('models.browse.high_oom_risk') }}
                                                     </span>
                                                     <button @click="downloadRecommended(model.repo_id)"
                                                             :disabled="hfDownloading"
@@ -364,7 +364,7 @@
                                                                    hover:bg-neutral-900 hover:text-white rounded-lg transition-all
                                                                    disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
                                                         <i data-lucide="download" class="w-3.5 h-3.5"></i>
-                                                        Download
+                                                        {{ t('models.downloader.download_button') }}
                                                     </button>
                                                 </div>
                                             </div>
@@ -391,19 +391,19 @@
                                 <!-- Loading state -->
                                 <div x-show="hfSearchLoading" x-cloak class="px-6 py-12 text-center">
                                     <div class="inline-block w-5 h-5 border-2 border-neutral-300 border-t-neutral-600 rounded-full animate-spin mb-3"></div>
-                                    <p class="text-sm text-neutral-500">Searching...</p>
+                                    <p class="text-sm text-neutral-500">{{ t('models.browse.searching') }}</p>
                                 </div>
                                 <!-- Not searched yet -->
                                 <div x-show="!hfSearchLoading && !hfSearchLoaded" x-cloak class="px-6 py-12 text-center">
                                     <i data-lucide="search" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
-                                    <p class="text-sm text-neutral-500">Enter a search query to find models.</p>
+                                    <p class="text-sm text-neutral-500">{{ t('models.browse.search_prompt') }}</p>
                                 </div>
                                 <!-- Results -->
                                 <template x-if="hfSearchLoaded && !hfSearchLoading">
                                     <div>
                                         <template x-if="hfSearchResults.length === 0">
                                             <div class="px-6 py-8 text-center">
-                                                <p class="text-sm text-neutral-500">No results found.</p>
+                                                <p class="text-sm text-neutral-500">{{ t('models.browse.no_results') }}</p>
                                             </div>
                                         </template>
                                         <div class="divide-y divide-neutral-100">
@@ -416,17 +416,17 @@
                                                             <span x-show="model.size > 0" x-cloak class="text-xs text-neutral-400" x-text="model.size_formatted"></span>
                                                             <span class="text-xs text-neutral-400" x-text="'&#11015; ' + formatDownloads(model.downloads)"></span>
                                                             <span class="text-xs text-neutral-400" x-text="'&#9829; ' + model.likes"></span>
-                                                            <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' params'"></span>
+                                                            <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
                                                         </div>
                                                     </div>
                                                     <div class="flex items-center gap-2 shrink-0 ml-4">
                                                         <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
                                                               class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">
-                                                            Tight fit
+                                                            {{ t('models.browse.tight_fit') }}
                                                         </span>
                                                         <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
                                                               class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200">
-                                                            High OOM risk
+                                                            {{ t('models.browse.high_oom_risk') }}
                                                         </span>
                                                         <button @click="downloadRecommended(model.repo_id)"
                                                                 :disabled="hfDownloading"
@@ -434,7 +434,7 @@
                                                                        hover:bg-neutral-900 hover:text-white rounded-lg transition-all
                                                                        disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
                                                             <i data-lucide="download" class="w-3.5 h-3.5"></i>
-                                                            Download
+                                                            {{ t('models.downloader.download_button') }}
                                                         </button>
                                                     </div>
                                                 </div>
@@ -464,7 +464,7 @@
                                 <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                     <div class="flex items-center gap-3">
                                         <i data-lucide="list" class="w-4 h-4 text-neutral-500"></i>
-                                        <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Download Queue</span>
+                                        <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.queue.section_label') }}</span>
                                     </div>
                                 </div>
                                 <div class="divide-y divide-neutral-100">
@@ -497,7 +497,7 @@
                                                                     <span x-text="formatProgress(task)"></span>
                                                                 </template>
                                                                 <template x-if="task.total_size <= 0">
-                                                                    <span>Downloading...</span>
+                                                                    <span>{{ t('models.queue.downloading') }}</span>
                                                                 </template>
                                                             </div>
                                                         </div>
@@ -507,13 +507,13 @@
                                                     <button x-show="task.status === 'downloading' || task.status === 'pending'" x-cloak
                                                             @click="cancelHFDownload(task.task_id)"
                                                             class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
-                                                            title="Cancel download">
+                                                            :title="window.t('models.queue.cancel_tooltip')">
                                                         <i data-lucide="x" class="w-4 h-4"></i>
                                                     </button>
                                                     <button x-show="task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'" x-cloak
                                                             @click="removeHFTask(task.task_id)"
                                                             class="p-1.5 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all"
-                                                            title="Remove from list">
+                                                            :title="window.t('models.queue.remove_tooltip')">
                                                         <i data-lucide="trash-2" class="w-4 h-4"></i>
                                                     </button>
                                                 </div>
@@ -539,7 +539,7 @@
                         <!-- Loading -->
                         <div x-show="hfModelDetailLoading && !hfModelDetail" class="p-12 text-center">
                             <div class="inline-block w-6 h-6 border-2 border-neutral-300 border-t-neutral-600 rounded-full animate-spin mb-3"></div>
-                            <p class="text-sm text-neutral-500">Loading model info...</p>
+                            <p class="text-sm text-neutral-500">{{ t('models.detail.loading') }}</p>
                         </div>
                         <!-- Content -->
                         <template x-if="hfModelDetail">
@@ -553,7 +553,7 @@
                                                 <span x-show="hfModelDetail.size > 0" class="text-xs text-neutral-500" x-text="hfModelDetail.size_formatted"></span>
                                                 <span class="text-xs text-neutral-500" x-text="'&#11015; ' + formatDownloads(hfModelDetail.downloads)"></span>
                                                 <span class="text-xs text-neutral-500" x-text="'&#9829; ' + hfModelDetail.likes"></span>
-                                                <span x-show="hfModelDetail.params" x-cloak class="text-xs text-neutral-500" x-text="hfModelDetail.params_formatted + ' params'"></span>
+                                                <span x-show="hfModelDetail.params" x-cloak class="text-xs text-neutral-500" x-text="hfModelDetail.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
                                                 <span x-show="hfModelDetail.pipeline_tag" x-cloak
                                                       class="px-2 py-0.5 text-[10px] font-medium rounded bg-blue-50 text-blue-700 border border-blue-200"
                                                       x-text="hfModelDetail.pipeline_tag"></span>
@@ -572,12 +572,12 @@
                                             <button @click="detailTab = 'card'"
                                                     :class="detailTab === 'card' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
                                                     class="px-3 py-1 text-xs font-medium rounded-md transition-all">
-                                                Model Card
+                                                {{ t('models.detail.tab.model_card') }}
                                             </button>
                                             <button @click="detailTab = 'files'"
                                                     :class="detailTab === 'files' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
                                                     class="px-3 py-1 text-xs font-medium rounded-md transition-all">
-                                                Files
+                                                {{ t('models.detail.tab.files') }}
                                                 <span x-show="hfModelDetail.files && hfModelDetail.files.length > 0" x-cloak
                                                       class="ml-1 text-[10px] text-neutral-400"
                                                       x-text="'(' + hfModelDetail.files.length + ')'"></span>
@@ -585,7 +585,7 @@
                                             <button @click="detailTab = 'tags'"
                                                     :class="detailTab === 'tags' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
                                                     class="px-3 py-1 text-xs font-medium rounded-md transition-all">
-                                                Tags
+                                                {{ t('models.detail.tab.tags') }}
                                             </button>
                                         </div>
 
@@ -597,7 +597,7 @@
                                             </div>
                                             <div x-show="!hfModelDetail.model_card" x-cloak class="py-8 text-center">
                                                 <i data-lucide="file-text" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
-                                                <p class="text-sm text-neutral-500">No model card available.</p>
+                                                <p class="text-sm text-neutral-500">{{ t('models.detail.no_model_card') }}</p>
                                             </div>
                                         </div>
 
@@ -614,7 +614,7 @@
                                                 </div>
                                             </div>
                                             <div x-show="!hfModelDetail.files || hfModelDetail.files.length === 0" x-cloak class="py-8 text-center">
-                                                <p class="text-sm text-neutral-500">No file information available.</p>
+                                                <p class="text-sm text-neutral-500">{{ t('models.detail.no_files') }}</p>
                                             </div>
                                         </div>
 
@@ -629,7 +629,7 @@
                                                 </div>
                                             </div>
                                             <div x-show="!hfModelDetail.tags || hfModelDetail.tags.length === 0" x-cloak class="py-8 text-center">
-                                                <p class="text-sm text-neutral-500">No tags available.</p>
+                                                <p class="text-sm text-neutral-500">{{ t('models.detail.no_tags') }}</p>
                                             </div>
                                         </div>
                                     </div>
@@ -639,19 +639,19 @@
                                     <a :href="'https://huggingface.co/' + hfModelDetail.repo_id" target="_blank" rel="noopener noreferrer"
                                        class="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1.5 transition-colors">
                                         <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
-                                        View on HuggingFace
+                                        {{ t('models.detail.view_on_hf') }}
                                     </a>
                                     <div class="flex items-center gap-2">
                                         <button @click="closeModelDetail()"
                                                 class="px-4 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
-                                            Close
+                                            {{ t('models.detail.close') }}
                                         </button>
                                         <button @click="downloadRecommended(hfModelDetail.repo_id); closeModelDetail();"
                                                 :disabled="hfDownloading"
                                                 class="px-5 py-2 text-xs font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-all
                                                        disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
                                             <i data-lucide="download" class="w-3.5 h-3.5"></i>
-                                            Download
+                                            {{ t('models.downloader.download_button') }}
                                         </button>
                                     </div>
                                 </div>

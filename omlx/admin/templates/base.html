@@ -25,6 +25,12 @@
         })();
     </script>
 
+    <script>
+        // i18n locale strings
+        window._t = {{ locale_json | safe }};
+        window.t = function(key) { return window._t[key] !== undefined ? window._t[key] : key; };
+    </script>
+
     <style>
         body {
             -webkit-font-smoothing: antialiased;
