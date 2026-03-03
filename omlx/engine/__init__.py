@@ -4,6 +4,7 @@ Engine abstraction for oMLX inference.
 
 Provides multiple engine implementations:
 - BatchedEngine: Continuous batching for multiple concurrent users
+- VLMBatchedEngine: Vision-language model engine with image support
 - EmbeddingEngine: Batch embedding generation using mlx-embeddings
 - RerankerEngine: Document reranking using SequenceClassification models
 
@@ -16,12 +17,14 @@ from .base import BaseEngine, BaseNonStreamingEngine, GenerationOutput
 from .batched import BatchedEngine
 from .embedding import EmbeddingEngine
 from .reranker import RerankerEngine
+from .vlm import VLMBatchedEngine
 
 __all__ = [
     "BaseEngine",
     "BaseNonStreamingEngine",
     "GenerationOutput",
     "BatchedEngine",
+    "VLMBatchedEngine",
     "EmbeddingEngine",
     "RerankerEngine",
     # Core engine components

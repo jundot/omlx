@@ -97,6 +97,53 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text("{}")
         assert detect_model_type(tmp_path) == "llm"
 
+    def test_detect_vlm_by_model_type(self, tmp_path):
+        """Test detection of VLM model by model_type."""
+        config = {
+            "model_type": "qwen2_5_vl",
+            "architectures": ["Qwen2_5_VLForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_vlm_by_architecture(self, tmp_path):
+        """Test detection of VLM model by architecture name."""
+        config = {
+            "model_type": "unknown_vlm",
+            "architectures": ["LlavaForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_vlm_by_vision_config(self, tmp_path):
+        """Test detection of VLM model by vision_config + text_config."""
+        config = {
+            "model_type": "some_new_vlm",
+            "vision_config": {"hidden_size": 1024},
+            "text_config": {"hidden_size": 2048},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_vlm_gemma3(self, tmp_path):
+        """Test detection of Gemma3 as VLM."""
+        config = {
+            "model_type": "gemma3",
+            "architectures": ["Gemma3ForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_vlm_qwen3_5_moe(self, tmp_path):
+        """Test detection of Qwen3.5 MoE as VLM."""
+        config = {
+            "model_type": "qwen3_5_moe",
+            "vision_config": {"depth": 32, "hidden_size": 1280},
+            "text_config": {"hidden_size": 4096},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
 
 class TestEstimateModelSize:
     """Tests for estimate_model_size function."""

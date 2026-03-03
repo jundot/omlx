@@ -42,6 +42,9 @@ requirements = [
     "mcp>=1.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
+    # mlx-vlm from commit (55e87a2) - aligned with pyproject.toml
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@55e87a23a7ee8bbfbd23c2ca6cb574a8f70e81d1",
+    "Pillow>=9.0.0",
 ]
 platforms = [
     "macosx_arm64",

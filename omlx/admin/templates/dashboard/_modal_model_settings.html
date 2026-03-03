@@ -51,8 +51,15 @@
                     <div class="grid grid-cols-2 gap-4">
                         <div>
                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.temperature') }}</label>
-                            <input type="number" x-model.number="modelSettings.temperature" step="0.1" min="0" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                            <template x-if="OCR_CONFIG_MODEL_TYPES.has(selectedModel?.config_model_type || '')">
+                                <input type="number" value="0.0" disabled
+                                       class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm bg-neutral-100 text-neutral-400 cursor-not-allowed"
+                                       title="OCR models require temperature=0.0">
+                            </template>
+                            <template x-if="!OCR_CONFIG_MODEL_TYPES.has(selectedModel?.config_model_type || '')">
+                                <input type="number" x-model.number="modelSettings.temperature" step="0.1" min="0" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
+                                       class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                            </template>
                         </div>
                         <div>
                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.repetition_penalty') }}</label>

@@ -114,6 +114,9 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         # mx.get_active_memory() is ~20ns, negligible vs ~5s prefill chunks.
         self._memory_limit_bytes: int = 0  # soft limit, 0 = disabled
         self._memory_hard_limit_bytes: int = 0  # hard limit (system_ram - 4GB)
+        # Per-UID VLM embeddings for batched prefill.
+        # uid → (inputs_embeds, extra_kwargs, start_offset)
+        self._vlm_pending: Dict[int, Tuple[mx.array, Dict[str, Any], int]] = {}
 
     # Cache class names known to be sliceable (no boundary snapshots needed).
     _KNOWN_SLICEABLE = frozenset({"KVCache", "BatchKVCache", "QuantizedKVCache"})
@@ -280,12 +283,55 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     f"Prefill boundary snapshot callback failed for uid={uid}: {e}"
                 )
 
+    def _step(
+        self,
+        input_tokens: mx.array,
+        prompt_cache: List[Any],
+        samplers: list,
+        logits_processors: list,
+        tokens: List[mx.array],
+        **kwargs: Any,
+    ):
+        """Override to pass VLM kwargs (inputs_embeds etc.) to self.model()."""
+        batch_size = input_tokens.shape[0]
+
+        logits = self.model(input_tokens, cache=prompt_cache, **kwargs)
+        logits = logits[:, -1, :]
+
+        if any(logits_processors):
+            processed_logits = []
+            for e in range(batch_size):
+                sample_logits = logits[e : e + 1]
+                for processor in logits_processors[e]:
+                    sample_logits = processor(tokens[e], sample_logits)
+                processed_logits.append(sample_logits)
+            logits = mx.concatenate(processed_logits, axis=0)
+
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        if any(samplers):
+            all_samples = []
+            for e in range(batch_size):
+                sample_sampler = samplers[e] or self.sampler
+                sampled = sample_sampler(logprobs[e : e + 1])
+                all_samples.append(sampled)
+            sampled = mx.concatenate(all_samples, axis=0)
+        else:
+            sampled = self.sampler(logprobs)
+
+        return sampled, list(logprobs)
+
     def _process_prompts(self, prompts):
         uids, inputs, max_tokens, caches, samplers, logits_processors = zip(*prompts)
 
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
         padding = [max_length - l for l in lengths]
+
+        # Collect per-UID VLM embeddings registered by _schedule_waiting().
+        vlm_embeds_map: Dict[int, Tuple[mx.array, Dict[str, Any], int]] = {}
+        for uid in uids:
+            if uid in self._vlm_pending:
+                vlm_embeds_map[uid] = self._vlm_pending.pop(uid)
 
         self._stats.prompt_tokens += sum(lengths)
 
@@ -319,12 +365,21 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
 
         emitted_boundaries: Dict[int, int] = {uid: -1 for uid in uids}
 
+        # VLM batched embeddings (built per-path, used in _step at the end).
+        batched_embeds: Optional[mx.array] = None
+        batched_extra: Optional[Dict[str, Any]] = None
+
         # New prompts so
         #   1. Left-pad the inputs
         #   2. Process
         if all(c[0].empty() for c in caches):
             inputs = _left_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _make_cache(self.model, padding, self.max_kv_size)
+
+            # Build left-padded VLM embeddings batch (matching token padding).
+            batched_embeds, batched_extra = self._build_left_padded_vlm_batch(
+                vlm_embeds_map, list(uids), lengths, max_length
+            )
 
             # Disable boundary capture if all layers are sliceable (e.g.
             # pure BatchKVCache models).  This avoids unnecessary prefill
@@ -350,9 +405,20 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                 else:
                     n_to_process = min(self.prefill_step_size, max_allowed)
 
-                self.model(inputs[:, :n_to_process], cache=prompt_cache)
+                model_kwargs = {}
+                if batched_embeds is not None:
+                    model_kwargs["inputs_embeds"] = batched_embeds[:, :n_to_process]
+                    if batched_extra:
+                        model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
+                            batched_extra, n_to_process
+                        )
+                self.model(inputs[:, :n_to_process], cache=prompt_cache, **model_kwargs)
                 mx.eval([c.state for c in prompt_cache])
                 inputs = inputs[:, n_to_process:]
+                if batched_embeds is not None:
+                    batched_embeds = batched_embeds[:, n_to_process:]
+                    if batched_extra:
+                        batched_extra = _advance_vlm_extra(batched_extra, n_to_process)
                 processed_tokens += n_to_process
                 self.prompt_progress_callback(
                     [
@@ -420,6 +486,11 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             inputs = _right_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _merge_caches(caches)
 
+            # Build right-padded VLM embeddings batch (matching token padding).
+            batched_embeds, batched_extra = self._build_right_padded_vlm_batch(
+                vlm_embeds_map, list(uids), lengths, max_length
+            )
+
             # Disable boundary capture for sliceable-only caches.
             if boundary_enabled and not self._prompt_cache_needs_snapshots(prompt_cache):
                 boundary_enabled = False
@@ -445,9 +516,20 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                 else:
                     n_to_process = min(self.prefill_step_size, max_allowed)
 
-                self.model(inputs[:, :n_to_process], cache=prompt_cache)
+                model_kwargs = {}
+                if batched_embeds is not None:
+                    model_kwargs["inputs_embeds"] = batched_embeds[:, :n_to_process]
+                    if batched_extra:
+                        model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
+                            batched_extra, n_to_process
+                        )
+                self.model(inputs[:, :n_to_process], cache=prompt_cache, **model_kwargs)
                 mx.eval([c.state for c in prompt_cache])
                 inputs = inputs[:, n_to_process:]
+                if batched_embeds is not None:
+                    batched_embeds = batched_embeds[:, n_to_process:]
+                    if batched_extra:
+                        batched_extra = _advance_vlm_extra(batched_extra, n_to_process)
                 processed_tokens += n_to_process
                 self.prompt_progress_callback(
                     [
@@ -510,8 +592,15 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             c.finalize()
         mx.clear_cache()
 
+        # Pass remaining VLM embeddings (last token) to _step if available.
+        step_kwargs: Dict[str, Any] = {}
+        if batched_embeds is not None and batched_embeds.shape[1] > 0:
+            step_kwargs["inputs_embeds"] = batched_embeds
+            if batched_extra:
+                step_kwargs["vlm_extra_kwargs"] = batched_extra
         y, logprobs = self._step(
-            inputs, prompt_cache, samplers, logits_processors, tokens
+            inputs, prompt_cache, samplers, logits_processors, tokens,
+            **step_kwargs,
         )
 
         self._emit_boundary_snapshots(
@@ -536,6 +625,163 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             list(logits_processors),
             tokens,
         )
+
+    # ------------------------------------------------------------------
+    # VLM batched-prefill helpers
+    # ------------------------------------------------------------------
+
+    def _build_left_padded_vlm_batch(
+        self,
+        vlm_embeds_map: Dict[int, Tuple[mx.array, Dict[str, Any], int]],
+        uids: List[int],
+        lengths: List[int],
+        max_length: int,
+    ) -> Tuple[Optional[mx.array], Optional[Dict[str, Any]]]:
+        """Build left-padded VLM embeddings batch matching token left-padding."""
+        if not vlm_embeds_map:
+            return None, None
+
+        hidden_dim = next(iter(vlm_embeds_map.values()))[0].shape[-1]
+        padded: List[mx.array] = []
+        for uid in uids:
+            if uid not in vlm_embeds_map:
+                # Text-only request in a mixed batch should not happen
+                # (VLM/text batches are separated in _schedule_waiting),
+                # but handle gracefully with zero embeddings.
+                padded.append(mx.zeros((1, max_length, hidden_dim)))
+                continue
+            embeds, _, start_offset = vlm_embeds_map[uid]
+            embeds = embeds[:, start_offset:]  # skip cached portion
+            pad_len = max_length - embeds.shape[1]
+            if pad_len > 0:
+                pad = mx.zeros((1, pad_len, hidden_dim))
+                padded.append(mx.concatenate([pad, embeds], axis=1))
+            else:
+                padded.append(embeds[:, :max_length])
+
+        batched = mx.concatenate(padded, axis=0)
+        batched_extra = self._batch_vlm_extra_kwargs(
+            vlm_embeds_map, uids, max_length, "left"
+        )
+        return batched, batched_extra
+
+    def _build_right_padded_vlm_batch(
+        self,
+        vlm_embeds_map: Dict[int, Tuple[mx.array, Dict[str, Any], int]],
+        uids: List[int],
+        lengths: List[int],
+        max_length: int,
+    ) -> Tuple[Optional[mx.array], Optional[Dict[str, Any]]]:
+        """Build right-padded VLM embeddings batch matching token right-padding."""
+        if not vlm_embeds_map:
+            return None, None
+
+        hidden_dim = next(iter(vlm_embeds_map.values()))[0].shape[-1]
+        padded: List[mx.array] = []
+        for uid in uids:
+            if uid not in vlm_embeds_map:
+                padded.append(mx.zeros((1, max_length, hidden_dim)))
+                continue
+            embeds, _, start_offset = vlm_embeds_map[uid]
+            embeds = embeds[:, start_offset:]  # skip cached portion
+            pad_len = max_length - embeds.shape[1]
+            if pad_len > 0:
+                pad = mx.zeros((1, pad_len, hidden_dim))
+                padded.append(mx.concatenate([embeds, pad], axis=1))
+            else:
+                padded.append(embeds[:, :max_length])
+
+        batched = mx.concatenate(padded, axis=0)
+        batched_extra = self._batch_vlm_extra_kwargs(
+            vlm_embeds_map, uids, max_length, "right"
+        )
+        return batched, batched_extra
+
+    @staticmethod
+    def _batch_vlm_extra_kwargs(
+        vlm_embeds_map: Dict[int, Tuple[mx.array, Dict[str, Any], int]],
+        uids: List[int],
+        max_length: int,
+        pad_side: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Batch model-specific VLM kwargs (position_ids, attention_mask, etc.).
+
+        For tensor kwargs: pad and concatenate along batch dim.
+        For scalar kwargs: use shared value if all identical, else skip.
+        Returns None if no extra kwargs or if heterogeneous (can't batch).
+        """
+        all_keys: set = set()
+        for uid in uids:
+            if uid not in vlm_embeds_map:
+                continue
+            _, extra_kw, _ = vlm_embeds_map[uid]
+            all_keys.update(extra_kw.keys())
+        if not all_keys:
+            return None
+
+        batched: Dict[str, Any] = {}
+        for key in all_keys:
+            values: List[Any] = []
+            for uid in uids:
+                if uid not in vlm_embeds_map:
+                    return None  # mixed VLM/text → can't batch extras
+                _, extra_kw, start_offset = vlm_embeds_map[uid]
+                val = extra_kw.get(key)
+                if val is None:
+                    return None  # heterogeneous → skip batching
+                if isinstance(val, mx.array) and val.ndim >= 2:
+                    val = val[:, start_offset:]
+                    pad_len = max_length - val.shape[1]
+                    if pad_len > 0:
+                        pad = mx.zeros_like(
+                            mx.zeros(
+                                (val.shape[0], pad_len) + val.shape[2:]
+                            )
+                        )
+                        if pad_side == "left":
+                            val = mx.concatenate([pad, val], axis=1)
+                        else:
+                            val = mx.concatenate([val, pad], axis=1)
+                    else:
+                        val = val[:, :max_length]
+                values.append(val)
+
+            if all(isinstance(v, mx.array) for v in values):
+                batched[key] = mx.concatenate(values, axis=0)
+            else:
+                # Scalar values: use if all identical
+                if len(set(str(v) for v in values)) == 1:
+                    batched[key] = values[0]
+                else:
+                    return None  # heterogeneous scalars → can't batch
+
+        return batched if batched else None
+
+
+def _slice_vlm_extra(
+    extra: Dict[str, Any], n: int
+) -> Dict[str, Any]:
+    """Slice VLM extra kwargs to first n tokens along seq dimension."""
+    sliced: Dict[str, Any] = {}
+    for key, val in extra.items():
+        if isinstance(val, mx.array) and val.ndim >= 2:
+            sliced[key] = val[:, :n]
+        else:
+            sliced[key] = val
+    return sliced
+
+
+def _advance_vlm_extra(
+    extra: Dict[str, Any], n: int
+) -> Dict[str, Any]:
+    """Advance VLM extra kwargs past first n tokens along seq dimension."""
+    advanced: Dict[str, Any] = {}
+    for key, val in extra.items():
+        if isinstance(val, mx.array) and val.ndim >= 2:
+            advanced[key] = val[:, n:]
+        else:
+            advanced[key] = val
+    return advanced
 
 
 class SchedulingPolicy(Enum):
@@ -674,6 +920,11 @@ class Scheduler:
         self.model = model
         self.tokenizer = tokenizer
         self.config = copy.copy(config) if config else SchedulerConfig()
+
+        # Load additional EOS tokens from generation_config.json.
+        # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
+        # that are not in tokenizer.eos_token_id.
+        self._generation_config_eos: Optional[Set[int]] = self._load_generation_config_eos()
 
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
@@ -863,6 +1114,9 @@ class Scheduler:
             logger.debug(f"Failed to inspect model rotating window sizes: {e}")
             return set()
 
+        if cache_list is None:
+            return set()
+
         window_sizes: Set[int] = set()
         for cache_obj in cache_list:
             self._collect_rotating_window_sizes(cache_obj, window_sizes)
@@ -931,6 +1185,9 @@ class Scheduler:
         except Exception:
             return
 
+        if cache_list is None:
+            return
+
         has_arrays_cache = any(
             self._cache_tree_has_arrays_cache(cache_obj)
             for cache_obj in cache_list
@@ -961,16 +1218,62 @@ class Scheduler:
             )
         return type(cache_obj).__name__ in ("ArraysCache", "SizedArraysCache")
 
+    def _load_generation_config_eos(self) -> Optional[Set[int]]:
+        """Load EOS token IDs from generation_config.json if available."""
+        try:
+            model_path = getattr(self.tokenizer, "name_or_path", None)
+            if not model_path:
+                return None
+            import json
+            import os
+            gc_path = os.path.join(model_path, "generation_config.json")
+            if not os.path.exists(gc_path):
+                return None
+            with open(gc_path) as f:
+                gc = json.load(f)
+            eos = gc.get("eos_token_id")
+            if eos is None:
+                return None
+            if isinstance(eos, list):
+                result = set(eos)
+            else:
+                result = {eos}
+            # Only return if there are tokens beyond what tokenizer already provides
+            tokenizer_eos = getattr(self.tokenizer, "eos_token_id", None)
+            if tokenizer_eos is not None:
+                existing = {tokenizer_eos} if isinstance(tokenizer_eos, int) else set(tokenizer_eos)
+                extra = result - existing
+                if extra:
+                    logger.info(
+                        f"Loaded {len(extra)} additional EOS token(s) from "
+                        f"generation_config.json: {extra}"
+                    )
+                    return result
+            return result
+        except Exception as e:
+            logger.debug(f"Could not load generation_config.json: {e}")
+            return None
+
     def _get_stop_tokens(self) -> Set[int]:
-        """Get stop token IDs from tokenizer."""
+        """Get stop token IDs from tokenizer and generation_config."""
         stop_tokens = set()
         if hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
             if isinstance(self.tokenizer.eos_token_id, list):
                 stop_tokens.update(self.tokenizer.eos_token_id)
             else:
                 stop_tokens.add(self.tokenizer.eos_token_id)
-        if hasattr(self.tokenizer, 'eos_token_ids'):
-            stop_tokens.update(self.tokenizer.eos_token_ids)
+        if hasattr(self.tokenizer, 'eos_token_ids') and self.tokenizer.eos_token_ids is not None:
+            eos_ids = self.tokenizer.eos_token_ids
+            if isinstance(eos_ids, int):
+                stop_tokens.add(eos_ids)
+            else:
+                stop_tokens.update(eos_ids)
+
+        # Read additional EOS tokens from generation_config.json.
+        # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
+        # that are not reflected in tokenizer.eos_token_id.
+        if self._generation_config_eos is not None:
+            stop_tokens.update(self._generation_config_eos)
 
         # Add Harmony stop tokens for gpt-oss models (use cached tokens)
         if self._is_harmony_model and self._harmony_stop_tokens:
@@ -1840,9 +2143,15 @@ class Scheduler:
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
             # Use paged cache
+            # Build extra_keys for VLM image hash prefix cache isolation
+            extra_keys = None
+            if request.vlm_image_hash:
+                extra_keys = (request.vlm_image_hash,)
+
             block_table, remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
                 request.prompt_token_ids,
+                extra_keys=extra_keys,
             )
             if block_table and block_table.num_tokens > 0:
                 # Reconstruct actual KVCache objects from stored tensor data
@@ -2049,6 +2358,8 @@ class Scheduler:
         # Remove from running (BatchGenerator)
         if request.request_id in self.request_id_to_uid:
             uid = self.request_id_to_uid[request.request_id]
+            # Clean up pending VLM embeddings not yet consumed by prefill.
+            self.batch_generator._vlm_pending.pop(uid, None)
             self._remove_uid_from_active_batch(uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
@@ -2130,6 +2441,9 @@ class Scheduler:
         # Track cache status of first scheduled request to ensure homogeneity
         # None = not determined yet, True = has cache, False = no cache
         batch_cache_status: Optional[bool] = None
+        # Track VLM status: VLM and text-only requests cannot be in the same prefill batch
+        # None = not determined yet, True = VLM request, False = text-only request
+        batch_vlm_status: Optional[bool] = None
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
             request = self.waiting.popleft()
@@ -2167,6 +2481,20 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
+            # Check VLM status homogeneity: VLM and text-only requests use
+            # different prefill paths (embeddings vs token IDs)
+            request_is_vlm = request.vlm_inputs_embeds is not None
+            if batch_vlm_status is None:
+                batch_vlm_status = request_is_vlm
+            elif batch_vlm_status != request_is_vlm:
+                # VLM status mismatch - defer this request to next batch
+                self.waiting.appendleft(request)
+                logger.debug(
+                    f"Deferring request {request.request_id} to next batch "
+                    f"(VLM status mismatch: batch={batch_vlm_status}, request={request_is_vlm})"
+                )
+                break
+
             # Check cache status homogeneity to avoid mlx-lm _merge_caches bug
             request_has_cache = cache_to_use is not None
             if batch_cache_status is None:
@@ -2185,6 +2513,11 @@ class Scheduler:
                 request.sampling_params
             )
 
+            # Clear stale mRoPE position state for text-only requests
+            # to prevent position contamination from prior VLM requests.
+            if not request_is_vlm and hasattr(self.model, "clear_vlm_position_state"):
+                self.model.clear_vlm_position_state()
+
             # Insert into BatchGenerator with optional cache
             uids = self.batch_generator.insert(
                 [tokens_to_process],
@@ -2196,6 +2529,15 @@ class Scheduler:
 
             if uids:
                 uid = uids[0]
+
+                # Store VLM embeddings per-UID for batched prefill.
+                # _process_prompts() will collect these and build a padded batch.
+                if request.vlm_inputs_embeds is not None:
+                    self.batch_generator._vlm_pending[uid] = (
+                        request.vlm_inputs_embeds,
+                        request.vlm_extra_kwargs or {},
+                        request.cached_tokens,
+                    )
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
                 request.batch_uid = uid
@@ -2209,13 +2551,21 @@ class Scheduler:
 
                 # Check if prompt ends with <think> token for reasoning models
                 # The chat template may end with "<think>\n" so check last few tokens
-                if hasattr(self.tokenizer, 'has_thinking') and self.tokenizer.has_thinking:
-                    think_start_id = getattr(self.tokenizer, 'think_start_id', None)
-                    if think_start_id and request.prompt_token_ids:
-                        # Check last 3 tokens (covers "<think>\n" case)
-                        last_tokens = request.prompt_token_ids[-3:]
-                        if think_start_id in last_tokens:
-                            request.needs_think_prefix = True
+                think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+                if think_start_id is None:
+                    # VLM tokenizers loaded via mlx-vlm may not have think_start_id.
+                    # Try to resolve it from the vocabulary directly.
+                    try:
+                        think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
+                        if think_start_id == self.tokenizer.unk_token_id:
+                            think_start_id = None
+                    except (AttributeError, KeyError, TypeError):
+                        pass
+                if think_start_id and request.prompt_token_ids:
+                    # Check last 3 tokens (covers "<think>\n" case)
+                    last_tokens = request.prompt_token_ids[-3:]
+                    if think_start_id in last_tokens:
+                        request.needs_think_prefix = True
 
                 self.total_prompt_tokens += request.num_prompt_tokens
                 cache_info = f", {request.cached_tokens} cached" if request.cached_tokens > 0 else ""
@@ -2255,6 +2605,11 @@ class Scheduler:
             request = self.running.get(request_id)
             if request is None:
                 continue
+
+            # Release VLM embeddings after first decode token (prefill is done)
+            if request.vlm_inputs_embeds is not None:
+                request.vlm_inputs_embeds = None
+                request.vlm_extra_kwargs = None
 
             # Check finish reason first - don't include EOS token in output
             # (following mlx-lm's batch_generate behavior)
@@ -2523,12 +2878,18 @@ class Scheduler:
                                         f"intermediate snapshots)"
                                     )
 
+                                # Build extra_keys for VLM image hash
+                                store_extra_keys = None
+                                if request.vlm_image_hash:
+                                    store_extra_keys = (request.vlm_image_hash,)
+
                                 block_table = self.block_aware_cache.store_cache(
                                     request_id,
                                     token_sequence_to_store,
                                     cache_to_store,
                                     model_cache_config=model_cache_config,
                                     boundary_snapshots=intermediate_snapshots,
+                                    extra_keys=store_extra_keys,
                                 )
                             logger.debug(
                                 f"Stored paged cache for request {request_id} "

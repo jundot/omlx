@@ -124,8 +124,8 @@ from .api.tool_calling import (
     parse_tool_calls,
 )
 from .api.thinking import ThinkingParser, extract_thinking
-from .api.utils import clean_output_text, clean_special_tokens, extract_harmony_messages, extract_text_content
-from .engine import BaseEngine, BatchedEngine
+from .api.utils import clean_output_text, clean_special_tokens, extract_harmony_messages, extract_multimodal_content, extract_text_content
+from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
@@ -1384,9 +1384,15 @@ async def create_chat_completion(
             if k not in forced_keys:
                 merged_ct_kwargs[k] = v
 
-    # Extract messages - Harmony models need special handling to preserve tool format
+    # Extract messages - different engines need different content handling
+    is_vlm = isinstance(engine, VLMBatchedEngine)
     if engine.model_type == "gpt_oss":
         messages = extract_harmony_messages(
+            request.messages, max_tool_result_tokens, engine.tokenizer
+        )
+    elif is_vlm:
+        # VLM: preserve image_url content parts for vision processing
+        messages = extract_multimodal_content(
             request.messages, max_tool_result_tokens, engine.tokenizer
         )
     else:
@@ -2191,13 +2197,15 @@ async def create_anthropic_message(
 
     # Convert Anthropic format to internal format
     # Harmony models need special handling to preserve tool format
+    is_vlm = isinstance(engine, VLMBatchedEngine)
     if engine.model_type == "gpt_oss":
         messages = convert_anthropic_to_internal_harmony(
             request, max_tool_result_tokens, engine.tokenizer
         )
     else:
         messages = convert_anthropic_to_internal(
-            request, max_tool_result_tokens, engine.tokenizer
+            request, max_tool_result_tokens, engine.tokenizer,
+            preserve_images=is_vlm,
         )
 
     # Prepare kwargs

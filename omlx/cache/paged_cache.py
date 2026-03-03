@@ -869,6 +869,7 @@ class PagedCacheManager(CacheManager):
         token_ids: List[int],
         num_cached_blocks: int,
         num_full_blocks: int,
+        extra_keys: Optional[Tuple[Any, ...]] = None,
     ) -> None:
         """
         Cache full blocks for prefix caching (vLLM style).
@@ -880,6 +881,7 @@ class PagedCacheManager(CacheManager):
             token_ids: All token IDs for the request
             num_cached_blocks: Number of blocks already cached
             num_full_blocks: Number of full blocks to cache
+            extra_keys: Additional keys for hash (e.g., VLM image hash)
         """
         if not self.enable_caching:
             return
@@ -905,7 +907,10 @@ class PagedCacheManager(CacheManager):
                 block_tokens = token_ids[start:end]
 
                 # Compute chain hash
-                block_hash = compute_block_hash(parent_hash, block_tokens, model_name=self.model_name)
+                block_hash = compute_block_hash(
+                    parent_hash, block_tokens,
+                    extra_keys=extra_keys, model_name=self.model_name,
+                )
                 block.block_hash = block_hash
                 block.token_count = len(block_tokens)
 
@@ -917,12 +922,14 @@ class PagedCacheManager(CacheManager):
     def get_computed_blocks(
         self,
         token_ids: List[int],
+        extra_keys: Optional[Tuple[Any, ...]] = None,
     ) -> Tuple[List[CacheBlock], int]:
         """
         Find cached blocks for a token prefix (vLLM style).
 
         Args:
             token_ids: Token IDs to look up
+            extra_keys: Additional keys for hash (e.g., VLM image hash)
 
         Returns:
             Tuple of (cached_blocks, num_cached_tokens)
@@ -943,7 +950,10 @@ class PagedCacheManager(CacheManager):
                 block_tokens = token_ids[start:end]
 
                 # Compute expected hash
-                block_hash = compute_block_hash(parent_hash, block_tokens, model_name=self.model_name)
+                block_hash = compute_block_hash(
+                    parent_hash, block_tokens,
+                    extra_keys=extra_keys, model_name=self.model_name,
+                )
 
                 # Look up in cache
                 cached_block = self.cached_block_hash_to_block.get_block(block_hash)
@@ -981,6 +991,7 @@ class PagedCacheManager(CacheManager):
         self,
         tokens: List[int],
         parent_hash: Optional[BlockHash] = None,
+        extra_keys: Optional[Tuple[Any, ...]] = None,
     ) -> Optional[CacheBlock]:
         """
         Find a cached block matching the given tokens using chain hash.
@@ -988,6 +999,7 @@ class PagedCacheManager(CacheManager):
         Args:
             tokens: Token IDs to look up
             parent_hash: Hash of the parent block (for chain), or None for first block
+            extra_keys: Additional keys for hash (e.g., VLM image hash)
 
         Returns:
             Cached block if found, None otherwise
@@ -996,7 +1008,10 @@ class PagedCacheManager(CacheManager):
             return None
 
         with self._lock:
-            block_hash = compute_block_hash(parent_hash, tokens, model_name=self.model_name)
+            block_hash = compute_block_hash(
+                parent_hash, tokens, extra_keys=extra_keys,
+                model_name=self.model_name,
+            )
             block = self.cached_block_hash_to_block.get_block(block_hash)
             if block:
                 block.touch()
@@ -1011,6 +1026,7 @@ class PagedCacheManager(CacheManager):
         block: CacheBlock,
         tokens: List[int],
         parent_hash: Optional[BlockHash] = None,
+        extra_keys: Optional[Tuple[Any, ...]] = None,
     ) -> None:
         """
         Register a block's hash for deduplication using chain hash.
@@ -1019,12 +1035,16 @@ class PagedCacheManager(CacheManager):
             block: Block to register
             tokens: Token IDs in this block
             parent_hash: Hash of the parent block (for chain), or None for first block
+            extra_keys: Additional keys for hash (e.g., VLM image hash)
         """
         if not self.enable_caching:
             return
 
         with self._lock:
-            block_hash = compute_block_hash(parent_hash, tokens, model_name=self.model_name)
+            block_hash = compute_block_hash(
+                parent_hash, tokens, extra_keys=extra_keys,
+                model_name=self.model_name,
+            )
             block.block_hash = block_hash
             self.cached_block_hash_to_block.insert(block_hash, block)
 
@@ -1079,13 +1099,16 @@ class PagedCacheManager(CacheManager):
     def find_shared_prefix(
         self,
         tokens: List[int],
+        extra_keys: Optional[Tuple[Any, ...]] = None,
     ) -> Tuple[List[int], List[int]]:
         """
         Find shared prefix blocks for a token sequence.
 
         Uses get_computed_blocks for consistent chain-hash lookup.
         """
-        cached_blocks, num_cached_tokens = self.get_computed_blocks(tokens)
+        cached_blocks, num_cached_tokens = self.get_computed_blocks(
+            tokens, extra_keys=extra_keys
+        )
 
         shared_block_ids = [b.block_id for b in cached_blocks]
         remaining_tokens = tokens[num_cached_tokens:]

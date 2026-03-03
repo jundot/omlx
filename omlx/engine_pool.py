@@ -28,6 +28,7 @@ import mlx.core as mx
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
+from .engine.vlm import VLMBatchedEngine
 from .exceptions import (
     EnginePoolError,
     InsufficientMemoryError,
@@ -47,9 +48,10 @@ class EngineEntry:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: Literal["llm", "embedding", "reranker"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker"]  # Engine type to use
+    model_type: Literal["llm", "vlm", "embedding", "reranker"]  # Model type
+    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
+    config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
@@ -140,6 +142,7 @@ class EnginePool:
                 model_type=info.model_type,
                 engine_type=info.engine_type,
                 estimated_size=info.estimated_size,
+                config_model_type=getattr(info, "config_model_type", ""),
                 is_pinned=model_id in pinned_set,
             )
 
@@ -389,6 +392,12 @@ class EnginePool:
             elif entry.engine_type == "reranker":
                 # RerankerEngine for reranker models
                 engine = RerankerEngine(model_name=entry.model_path)
+            elif entry.engine_type == "vlm":
+                # VLMBatchedEngine for vision-language models
+                engine = VLMBatchedEngine(
+                    model_name=entry.model_path,
+                    scheduler_config=self._scheduler_config,
+                )
             else:
                 # BatchedEngine with continuous batching (default)
                 engine = BatchedEngine(
@@ -484,6 +493,7 @@ class EnginePool:
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
+                    "config_model_type": e.config_model_type,
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
                 for mid, e in sorted(self._entries.items())

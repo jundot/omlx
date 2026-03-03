@@ -987,6 +987,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "is_default": server_state.default_model == model_id if server_state else False,
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
+            "config_model_type": model_info.get("config_model_type", ""),
             "last_access": model_info.get("last_access"),
         }
 
@@ -2208,10 +2209,10 @@ async def start_benchmark(
         raise HTTPException(
             status_code=404, detail=f"Model not found: {bench_request.model_id}"
         )
-    if entry.model_type not in ("llm", None):
+    if entry.model_type not in ("llm", "vlm", None):
         raise HTTPException(
             status_code=400,
-            detail=f"Model {bench_request.model_id} is not an LLM (type: {entry.model_type})",
+            detail=f"Model {bench_request.model_id} is not a supported model (type: {entry.model_type})",
         )
 
     # Cleanup old runs

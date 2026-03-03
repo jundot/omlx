@@ -1,3 +1,8 @@
+    // OCR model types that require temperature=0.0 (deterministic output)
+    const OCR_CONFIG_MODEL_TYPES = new Set([
+        'deepseekocr', 'deepseekocr_2', 'dots_ocr', 'glm_ocr',
+    ]);
+
     function dashboard() {
         return {
             // Theme
@@ -171,6 +176,7 @@
             benchShowMetrics: false,
             benchShowText: false,
             benchCopied: false,
+            benchIncludeImage: false,
 
             async init() {
                 // Apply theme
@@ -496,10 +502,11 @@
                         ctKwargEntries.push({type: 'custom', key, value: String(value), force: forcedKeys.has(key)});
                     }
                 }
+                const isOcr = OCR_CONFIG_MODEL_TYPES.has(model.config_model_type || '');
                 this.modelSettings = {
                     max_context_window: settings.max_context_window || null,
                     max_tokens: settings.max_tokens || null,
-                    temperature: settings.temperature ?? null,
+                    temperature: isOcr ? 0.0 : (settings.temperature ?? null),
                     top_p: settings.top_p ?? null,
                     top_k: settings.top_k ?? null,
                     repetition_penalty: settings.repetition_penalty ?? null,
@@ -615,7 +622,7 @@
 
             // Status tab functions
             get llmModels() {
-                return this.models.filter(m => m.model_type === 'llm' || !m.model_type);
+                return this.models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type);
             },
 
             get claudeCodeCommand() {
@@ -832,6 +839,7 @@
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
+                            include_image: this.benchIncludeImage,
                         }),
                     });
 
@@ -1010,14 +1018,15 @@
                     }
                 };
 
+                const imgSuffix = this.benchIncludeImage ? ' + image tokens' : '';
                 buildBatchText(
                     'Continuous Batching — Same Prompt',
-                    'pp1024 / tg128 · partial prefix cache hit',
+                    `pp1024${imgSuffix} / tg128 · partial prefix cache hit`,
                     this.benchBatchSameResults
                 );
                 buildBatchText(
                     'Continuous Batching — Different Prompts',
-                    'pp1024 / tg128 · no cache reuse',
+                    `pp1024${imgSuffix} / tg128 · no cache reuse`,
                     this.benchBatchDiffResults
                 );
 

@@ -7,6 +7,7 @@ estimating memory usage for each.
 
 Supports:
 - LLM models: Use BatchedEngine for continuous batching with paged KV cache
+- VLM models: Use VLMBatchedEngine for vision-language model inference
 - Embedding models: Use EmbeddingEngine for batch embedding generation
 - Reranker models: Use RerankerEngine for document reranking
 """
@@ -19,8 +20,53 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "embedding", "reranker"]
-EngineType = Literal["batched", "embedding", "reranker"]
+ModelType = Literal["llm", "vlm", "embedding", "reranker"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker"]
+
+# Known VLM (Vision-Language Model) types from mlx-vlm
+VLM_MODEL_TYPES = {
+    "qwen2_vl",
+    "qwen2_5_vl",
+    "qwen3_vl",
+    "qwen3_vl_moe",
+    "qwen3_5_moe",
+    "gemma3",
+    "llava",
+    "llava_next",
+    "llava-qwen2",
+    "mllama",
+    "idefics3",
+    "internvl_chat",
+    "phi3_v",
+    "paligemma",
+    "mistral3",
+    "pixtral",
+    "molmo",
+    "bunny_llama",
+    "multi_modality",
+    "florence2",
+    "deepseekocr",
+    "deepseekocr_2",
+    "dots_ocr",
+    "glm_ocr",
+}
+
+# Known VLM architectures
+VLM_ARCHITECTURES = {
+    "LlavaForConditionalGeneration",
+    "LlavaNextForConditionalGeneration",
+    "Qwen2VLForConditionalGeneration",
+    "Qwen2_5_VLForConditionalGeneration",
+    "MllamaForConditionalGeneration",
+    "Gemma3ForConditionalGeneration",
+    "InternVLChatModel",
+    "Idefics3ForConditionalGeneration",
+    "PaliGemmaForConditionalGeneration",
+    "Phi3VForCausalLM",
+    "Pixtral",
+    "MolmoForCausalLM",
+    "Florence2ForConditionalGeneration",
+}
 
 # Known embedding model types from mlx-embeddings
 EMBEDDING_MODEL_TYPES = {
@@ -73,9 +119,10 @@ class DiscoveredModel:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: ModelType  # Always "llm"
-    engine_type: EngineType  # "batched" or "simple"
+    model_type: ModelType  # "llm", "vlm", "embedding", or "reranker"
+    engine_type: EngineType  # "batched", "vlm", "embedding", or "reranker"
     estimated_size: int  # Estimated memory usage in bytes
+    config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
 
 
 def detect_model_type(model_path: Path) -> ModelType:
@@ -86,12 +133,13 @@ def detect_model_type(model_path: Path) -> ModelType:
     1. architectures field for reranker-specific classes (SequenceClassification)
     2. model_type field against known embedding types
     3. architectures field for embedding-specific classes
+    4. VLM detection via architectures, model_type, or vision_config presence
 
     Args:
         model_path: Path to model directory
 
     Returns:
-        Model type: "llm", "embedding", or "reranker"
+        Model type: "llm", "vlm", "embedding", or "reranker"
     """
     config_path = model_path / "config.json"
     if not config_path.exists():
@@ -121,6 +169,20 @@ def detect_model_type(model_path: Path) -> ModelType:
     for arch in architectures:
         if arch in EMBEDDING_ARCHITECTURES:
             return "embedding"
+
+    # Check for VLM: architectures field
+    for arch in architectures:
+        if arch in VLM_ARCHITECTURES:
+            return "vlm"
+
+    # Check for VLM: model_type field
+    if normalized_type in VLM_MODEL_TYPES:
+        return "vlm"
+
+    # Check for VLM: presence of vision_config (fallback heuristic)
+    # Some VLMs have both vision_config + text_config, others only vision_config.
+    if "vision_config" in config:
+        return "vlm"
 
     return "llm"
 
@@ -184,9 +246,20 @@ def _register_model(
             engine_type: EngineType = "embedding"
         elif model_type == "reranker":
             engine_type = "reranker"
+        elif model_type == "vlm":
+            engine_type = "vlm"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)
+
+        # Read raw config model_type for sub-type detection (e.g., OCR models)
+        config_model_type = ""
+        try:
+            import json
+            with open(model_dir / "config.json") as f:
+                config_model_type = json.load(f).get("model_type", "")
+        except Exception:
+            pass
 
         models[model_id] = DiscoveredModel(
             model_id=model_id,
@@ -194,6 +267,7 @@ def _register_model(
             model_type=model_type,
             engine_type=engine_type,
             estimated_size=estimated_size,
+            config_model_type=config_model_type,
         )
 
         size_gb = estimated_size / (1024**3)

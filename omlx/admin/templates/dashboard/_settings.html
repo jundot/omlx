@@ -748,7 +748,7 @@
 
                                         <!-- Default Radio (only for LLM models) -->
                                         <div class="w-14 flex justify-center flex-shrink-0">
-                                            <template x-if="model.model_type === 'llm' || !model.model_type">
+                                            <template x-if="model.model_type === 'llm' || model.model_type === 'vlm' || !model.model_type">
                                                 <button
                                                     @click="updateModelSetting(model.id, 'is_default', true)"
                                                     :class="model.is_default
@@ -759,7 +759,7 @@
                                                     <span x-show="model.is_default" class="w-1.5 h-1.5 bg-white rounded-full"></span>
                                                 </button>
                                             </template>
-                                            <template x-if="model.model_type && model.model_type !== 'llm'">
+                                            <template x-if="model.model_type && model.model_type !== 'llm' && model.model_type !== 'vlm'">
                                                 <span class="text-xs text-neutral-300">—</span>
                                             </template>
                                         </div>
@@ -767,7 +767,7 @@
                                         <!-- Actions (icon only) - hidden for embedding/reranker models -->
                                         <div class="w-10 flex justify-center flex-shrink-0">
                                             <button
-                                                x-show="!model.model_type || model.model_type === 'llm'"
+                                                x-show="!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm'"
                                                 @click="openModelSettings(model)"
                                                 class="p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all"
                                                 :title="window.t('settings.models.table.sampling_settings_tooltip')"
@@ -778,7 +778,7 @@
                                     </div>
 
                                     <!-- Sampling Settings Row (if any settings configured) - hidden for embedding/reranker models -->
-                                    <div x-show="(!model.model_type || model.model_type === 'llm') && model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.repetition_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens)"
+                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.repetition_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens)"
                                          class="px-6 pb-4 -mt-2">
                                         <div class="ml-11 flex flex-wrap gap-2">
                                             <template x-if="model.settings?.max_context_window">

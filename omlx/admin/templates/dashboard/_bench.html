@@ -24,7 +24,7 @@
                                         :disabled="benchRunning"
                                         class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                     <option value="">{{ t('bench.config.model_placeholder') }}</option>
-                                    <template x-for="m in models.filter(m => m.model_type === 'llm' || !m.model_type)" :key="m.id">
+                                    <template x-for="m in models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type)" :key="m.id">
                                         <option :value="m.id" x-text="m.id + ' (' + (m.estimated_size ? (m.estimated_size / 1073741824).toFixed(1) + ' GB' : 'unknown') + ')'"></option>
                                     </template>
                                 </select>
@@ -62,6 +62,19 @@
                                     </template>
                                 </div>
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('bench.config.batch_hint') }}</p>
+                            </div>
+
+                            <!-- VLM Image Option -->
+                            <div x-show="models.find(m => m.id === benchModelId)?.model_type === 'vlm'"
+                                 x-transition>
+                                <label class="flex items-center gap-2 cursor-pointer">
+                                    <input type="checkbox"
+                                           x-model="benchIncludeImage"
+                                           :disabled="benchRunning"
+                                           class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                    <span class="text-sm text-neutral-600">{{ t('bench.config.include_image') }}</span>
+                                </label>
+                                <p class="text-xs text-neutral-400 mt-1">{{ t('bench.config.include_image_hint') }}</p>
                             </div>
 
                             <!-- Run / Cancel Button -->
@@ -161,7 +174,8 @@
                                 <i data-lucide="layers" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('bench.results.batch_same.section_label') }}</span>
                             </div>
-                            <span class="text-xs text-neutral-400">{{ t('bench.results.batch_same.subtitle') }}</span>
+                            <span class="text-xs text-neutral-400"
+                                  x-text="benchIncludeImage ? '{{ t('bench.results.batch_same.subtitle_image') }}' : '{{ t('bench.results.batch_same.subtitle') }}'"></span>
                         </div>
                         <div class="overflow-x-auto">
                             <table class="w-full text-sm">
@@ -210,7 +224,8 @@
                                 <i data-lucide="layers" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('bench.results.batch_diff.section_label') }}</span>
                             </div>
-                            <span class="text-xs text-neutral-400">{{ t('bench.results.batch_diff.subtitle') }}</span>
+                            <span class="text-xs text-neutral-400"
+                                  x-text="benchIncludeImage ? '{{ t('bench.results.batch_diff.subtitle_image') }}' : '{{ t('bench.results.batch_diff.subtitle') }}'"></span>
                         </div>
                         <div class="overflow-x-auto">
                             <table class="w-full text-sm">

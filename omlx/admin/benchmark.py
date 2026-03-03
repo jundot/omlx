@@ -8,6 +8,7 @@ real-time progress reporting via SSE events.
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ class BenchmarkRequest(BaseModel):
     prompt_lengths: list[int]
     generation_length: int = 128
     batch_sizes: list[int] = []
+    include_image: bool = False
 
     @field_validator("prompt_lengths")
     @classmethod
@@ -94,6 +96,19 @@ def cleanup_old_runs(max_runs: int = 10) -> None:
     if len(completed) > max_runs:
         for bid, _ in completed[:-max_runs]:
             del _benchmark_runs[bid]
+
+
+# Path to bundled sample image (relative to this file)
+_SAMPLE_IMAGE_PATH = os.path.join(
+    os.path.dirname(__file__), "static", "img", "bench_sample.jpg"
+)
+
+
+def _get_sample_image_path() -> str:
+    """Return the path to the bundled sample image for VLM benchmarking."""
+    if not os.path.exists(_SAMPLE_IMAGE_PATH):
+        raise FileNotFoundError(f"Sample image not found: {_SAMPLE_IMAGE_PATH}")
+    return _SAMPLE_IMAGE_PATH
 
 
 def _generate_prompt(tokenizer: Any, target_tokens: int) -> str:
@@ -172,7 +187,7 @@ async def _run_single_test(
 
     # Reset peak memory tracking
     try:
-        mx.metal.reset_peak_memory()
+        mx.reset_peak_memory()
     except Exception:
         pass
 
@@ -202,7 +217,7 @@ async def _run_single_test(
 
     # Get peak memory
     try:
-        peak_memory = mx.metal.get_peak_memory()
+        peak_memory = mx.get_peak_memory()
     except Exception:
         peak_memory = 0
 
@@ -233,6 +248,7 @@ async def _run_batch_test(
     prompt_tokens: int,
     max_tokens: int,
     batch_size: int,
+    image: Any = None,
 ) -> dict:
     """Run a continuous batching benchmark test.
 
@@ -244,6 +260,7 @@ async def _run_batch_test(
                  all entries are identical. For different-prompt tests, each
                  has a unique UUID prefix.
         prompt_tokens: Number of prompt tokens per request (for pp TPS calc).
+        image: Optional PIL Image to include in each request (VLM benchmark).
     """
     from ..request import SamplingParams
 
@@ -257,22 +274,47 @@ async def _run_batch_test(
 
     async def _single_request(prompt: str) -> dict:
         """Run a single request within the batch."""
-        request_id = await engine_core.add_request(
-            prompt=prompt,
-            sampling_params=sampling_params,
-        )
-
         start = time.perf_counter()
         first_token = None
         tokens = 0
         prev_tokens = 0
+        actual_prompt_tokens = 0
 
-        async for output in engine_core.stream_outputs(request_id):
-            if first_token is None and output.completion_tokens > prev_tokens:
-                first_token = time.perf_counter()
-            prev_tokens = output.completion_tokens
-            if output.finished:
+        if image is not None:
+            # VLM path: use stream_chat with image
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": image}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            async for output in engine.stream_chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.0,
+                top_p=1.0,
+            ):
+                if first_token is None and output.completion_tokens > prev_tokens:
+                    first_token = time.perf_counter()
+                prev_tokens = output.completion_tokens
                 tokens = output.completion_tokens
+                actual_prompt_tokens = output.prompt_tokens
+        else:
+            # Text-only path: use engine_core directly
+            request_id = await engine_core.add_request(
+                prompt=prompt,
+                sampling_params=sampling_params,
+            )
+
+            async for output in engine_core.stream_outputs(request_id):
+                if first_token is None and output.completion_tokens > prev_tokens:
+                    first_token = time.perf_counter()
+                prev_tokens = output.completion_tokens
+                if output.finished:
+                    tokens = output.completion_tokens
 
         end = time.perf_counter()
         if first_token is None:
@@ -283,6 +325,7 @@ async def _run_batch_test(
             "first_token_abs": first_token,
             "end_abs": end,
             "completion_tokens": tokens,
+            "prompt_tokens": actual_prompt_tokens,
         }
 
     # Submit all requests concurrently
@@ -294,7 +337,11 @@ async def _run_batch_test(
 
     # Aggregate metrics
     total_gen_tokens = sum(r["completion_tokens"] for r in results)
-    total_prompt_tokens = prompt_tokens * batch_size
+    # For VLM image requests, use actual prompt tokens (includes vision tokens)
+    if image is not None:
+        total_prompt_tokens = sum(r["prompt_tokens"] for r in results)
+    else:
+        total_prompt_tokens = prompt_tokens * batch_size
     wall_time = wall_end - wall_start
     avg_ttft_ms = (sum(r["ttft_s"] for r in results) / batch_size) * 1000
 
@@ -426,6 +473,15 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 single_pp1024_gen_tps = metrics["gen_tps"]
 
         # Phase 4: Batch tests
+        # Load sample image for VLM benchmarking if requested
+        bench_image = None
+        if request.include_image:
+            try:
+                bench_image = _get_sample_image_path()
+                logger.info("Benchmark: sample image ready for VLM testing")
+            except Exception as e:
+                logger.warning(f"Benchmark: failed to find sample image: {e}")
+
         # Prepare prompts: one shared prompt for same-prompt tests,
         # unique prompts for different-prompt tests.
         max_batch = max(request.batch_sizes) if request.batch_sizes else 0
@@ -462,6 +518,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 prompt_tokens=1024,
                 max_tokens=request.generation_length,
                 batch_size=batch_size,
+                image=bench_image,
             )
 
             result_same = {
@@ -489,6 +546,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 prompt_tokens=1024,
                 max_tokens=request.generation_length,
                 batch_size=batch_size,
+                image=bench_image,
             )
 
             result_diff = {

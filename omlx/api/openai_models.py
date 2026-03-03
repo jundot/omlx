@@ -26,15 +26,23 @@ from omlx.api.shared_models import (
 # Content Types
 # =============================================================================
 
+class ImageURL(BaseModel):
+    """Image URL or base64 data URI for vision model input."""
+    url: str  # "https://..." or "data:image/jpeg;base64,..."
+    detail: Optional[str] = "auto"  # "low", "high", "auto"
+
+
 class ContentPart(BaseModel):
     """
     A part of a message content array.
 
     Supports:
     - text: Plain text content
+    - image_url: Image input for vision models
     """
-    type: str  # "text"
+    type: str  # "text" or "image_url"
     text: Optional[str] = None
+    image_url: Optional[ImageURL] = None
 
 
 # =============================================================================
