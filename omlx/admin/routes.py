@@ -111,6 +111,10 @@ class GlobalSettingsRequest(BaseModel):
     # Claude Code settings
     claude_code_context_scaling_enabled: Optional[bool] = None
     claude_code_target_context_size: Optional[int] = None
+    claude_code_mode: Optional[str] = None
+    claude_code_opus_model: Optional[str] = None
+    claude_code_sonnet_model: Optional[str] = None
+    claude_code_haiku_model: Optional[str] = None
 
     # Auth settings
     api_key: Optional[str] = None
@@ -1259,6 +1263,10 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "claude_code": {
             "context_scaling_enabled": global_settings.claude_code.context_scaling_enabled,
             "target_context_size": global_settings.claude_code.target_context_size,
+            "mode": global_settings.claude_code.mode,
+            "opus_model": global_settings.claude_code.opus_model,
+            "sonnet_model": global_settings.claude_code.sonnet_model,
+            "haiku_model": global_settings.claude_code.haiku_model,
         },
         "system": {
             "total_memory_bytes": memory_info["total_bytes"],
@@ -1456,13 +1464,31 @@ async def update_global_settings(
             request.claude_code_target_context_size
         )
         claude_code_changed = True
+    # mode: standard is-not-None check is correct — mode must never be null
+    if request.claude_code_mode is not None:
+        global_settings.claude_code.mode = request.claude_code_mode
+        claude_code_changed = True
+    # model fields: use model_fields_set to distinguish "field absent from POST body"
+    # from "field explicitly sent as null" — null must clear the field to None.
+    # DO NOT use `is not None` here: that would prevent clearing a model field to null.
+    if "claude_code_opus_model" in request.model_fields_set:
+        global_settings.claude_code.opus_model = request.claude_code_opus_model
+        claude_code_changed = True
+    if "claude_code_sonnet_model" in request.model_fields_set:
+        global_settings.claude_code.sonnet_model = request.claude_code_sonnet_model
+        claude_code_changed = True
+    if "claude_code_haiku_model" in request.model_fields_set:
+        global_settings.claude_code.haiku_model = request.claude_code_haiku_model
+        claude_code_changed = True
 
     if claude_code_changed:
         runtime_applied.append("claude_code")
         logger.info(
             f"Claude Code settings updated: "
-            f"scaling={'enabled' if global_settings.claude_code.context_scaling_enabled else 'disabled'}, "
-            f"target={global_settings.claude_code.target_context_size}"
+            f"mode={global_settings.claude_code.mode}, "
+            f"opus={global_settings.claude_code.opus_model}, "
+            f"sonnet={global_settings.claude_code.sonnet_model}, "
+            f"haiku={global_settings.claude_code.haiku_model}"
         )
 
     # Apply auth settings (API key change)
@@ -1781,6 +1807,26 @@ async def get_server_stats(
             global_settings.claude_code.target_context_size
             if global_settings
             else 200000
+        ),
+        "claude_code_mode": (
+            global_settings.claude_code.mode
+            if global_settings
+            else "cloud"
+        ),
+        "claude_code_opus_model": (
+            global_settings.claude_code.opus_model
+            if global_settings
+            else None
+        ),
+        "claude_code_sonnet_model": (
+            global_settings.claude_code.sonnet_model
+            if global_settings
+            else None
+        ),
+        "claude_code_haiku_model": (
+            global_settings.claude_code.haiku_model
+            if global_settings
+            else None
         ),
         "engines": _get_engine_info(),
     }

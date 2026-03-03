@@ -1231,10 +1231,12 @@ class TestClaudeCodeSettings:
             context_scaling_enabled=True, target_context_size=100000
         )
         result = settings.to_dict()
-        assert result == {
-            "context_scaling_enabled": True,
-            "target_context_size": 100000,
-        }
+        assert result["context_scaling_enabled"] is True
+        assert result["target_context_size"] == 100000
+        assert result["mode"] == "cloud"
+        assert result["opus_model"] is None
+        assert result["sonnet_model"] is None
+        assert result["haiku_model"] is None
 
     def test_from_dict(self):
         """Test creation from dictionary."""
@@ -1248,6 +1250,174 @@ class TestClaudeCodeSettings:
         settings = ClaudeCodeSettings.from_dict({})
         assert settings.context_scaling_enabled is False
         assert settings.target_context_size == 200000
+
+    def test_new_fields_defaults(self):
+        """Test that the four new fields have correct defaults."""
+        settings = ClaudeCodeSettings()
+        assert settings.mode == "cloud"
+        assert settings.opus_model is None
+        assert settings.sonnet_model is None
+        assert settings.haiku_model is None
+
+    def test_new_fields_to_dict(self):
+        """Test that to_dict includes all four new fields."""
+        settings = ClaudeCodeSettings(
+            mode="local",
+            opus_model="mlx-community/Qwen3-30B-A3B-4bit",
+            sonnet_model="mlx-community/Qwen3-14B-4bit",
+            haiku_model="mlx-community/Qwen3-4B-4bit",
+        )
+        result = settings.to_dict()
+        assert result["mode"] == "local"
+        assert result["opus_model"] == "mlx-community/Qwen3-30B-A3B-4bit"
+        assert result["sonnet_model"] == "mlx-community/Qwen3-14B-4bit"
+        assert result["haiku_model"] == "mlx-community/Qwen3-4B-4bit"
+
+    def test_new_fields_from_dict_full(self):
+        """Test from_dict with all four new fields present."""
+        data = {
+            "mode": "local",
+            "opus_model": "mlx-community/Qwen3-30B-A3B-4bit",
+            "sonnet_model": "mlx-community/Qwen3-14B-4bit",
+            "haiku_model": "mlx-community/Qwen3-4B-4bit",
+        }
+        settings = ClaudeCodeSettings.from_dict(data)
+        assert settings.mode == "local"
+        assert settings.opus_model == "mlx-community/Qwen3-30B-A3B-4bit"
+        assert settings.sonnet_model == "mlx-community/Qwen3-14B-4bit"
+        assert settings.haiku_model == "mlx-community/Qwen3-4B-4bit"
+
+    def test_new_fields_from_dict_backward_compat(self):
+        """Test from_dict({}) gives correct defaults — simulates old settings.json."""
+        settings = ClaudeCodeSettings.from_dict({})
+        assert settings.mode == "cloud"
+        assert settings.opus_model is None
+        assert settings.sonnet_model is None
+        assert settings.haiku_model is None
+
+    def test_new_fields_from_dict_null_model(self):
+        """Test from_dict with explicit null model values."""
+        data = {"mode": "cloud", "opus_model": None}
+        settings = ClaudeCodeSettings.from_dict(data)
+        assert settings.mode == "cloud"
+        assert settings.opus_model is None
+
+
+class TestClaudeCodeValidation:
+    """Tests for mode validation in GlobalSettings.validate()."""
+
+    def _make_global_settings(self, mode: str) -> GlobalSettings:
+        """Create a GlobalSettings with a specific claude_code.mode for testing."""
+        gs = GlobalSettings.__new__(GlobalSettings)
+        # Copy defaults from a real instance then override claude_code
+        real = GlobalSettings()
+        gs.__dict__.update(real.__dict__)
+        gs.claude_code = ClaudeCodeSettings(mode=mode)
+        return gs
+
+    def test_validate_mode_cloud_valid(self):
+        """Mode 'cloud' passes validation."""
+        gs = self._make_global_settings("cloud")
+        errors = gs.validate()
+        mode_errors = [e for e in errors if "claude_code mode" in e]
+        assert mode_errors == []
+
+    def test_validate_mode_local_valid(self):
+        """Mode 'local' passes validation."""
+        gs = self._make_global_settings("local")
+        errors = gs.validate()
+        mode_errors = [e for e in errors if "claude_code mode" in e]
+        assert mode_errors == []
+
+    def test_validate_mode_invalid(self):
+        """Invalid mode produces a validation error."""
+        gs = self._make_global_settings("auto")
+        errors = gs.validate()
+        mode_errors = [e for e in errors if "claude_code mode" in e]
+        assert len(mode_errors) == 1
+        assert "auto" in mode_errors[0]
+
+    def test_validate_mode_empty_string_invalid(self):
+        """Empty string mode is invalid."""
+        gs = self._make_global_settings("")
+        errors = gs.validate()
+        mode_errors = [e for e in errors if "claude_code mode" in e]
+        assert len(mode_errors) == 1
+
+
+class TestClaudeCodeRouteIntegration:
+    """Integration tests for the settings chain: dataclass <-> dict <-> routes."""
+
+    def test_claude_code_to_dict_has_six_keys(self):
+        """to_dict must include all six keys so GlobalSettings.save() persists them."""
+        s = ClaudeCodeSettings(
+            context_scaling_enabled=True,
+            target_context_size=100000,
+            mode="local",
+            opus_model="mlx-community/Qwen3-30B-A3B-4bit",
+            sonnet_model="mlx-community/Qwen3-14B-4bit",
+            haiku_model="mlx-community/Qwen3-4B-4bit",
+        )
+        d = s.to_dict()
+        expected_keys = {
+            "context_scaling_enabled",
+            "target_context_size",
+            "mode",
+            "opus_model",
+            "sonnet_model",
+            "haiku_model",
+        }
+        assert set(d.keys()) == expected_keys
+
+    def test_claude_code_new_fields_round_trip(self):
+        """Full round-trip: set values -> to_dict -> from_dict -> values match."""
+        original = ClaudeCodeSettings(
+            mode="local",
+            opus_model="mlx-community/Qwen3-30B-A3B-4bit",
+            sonnet_model="mlx-community/Qwen3-14B-4bit",
+            haiku_model="mlx-community/Qwen3-4B-4bit",
+        )
+        reloaded = ClaudeCodeSettings.from_dict(original.to_dict())
+        assert reloaded.mode == "local"
+        assert reloaded.opus_model == "mlx-community/Qwen3-30B-A3B-4bit"
+        assert reloaded.sonnet_model == "mlx-community/Qwen3-14B-4bit"
+        assert reloaded.haiku_model == "mlx-community/Qwen3-4B-4bit"
+
+    def test_claude_code_round_trip_null_models(self):
+        """Null model fields survive the round-trip."""
+        original = ClaudeCodeSettings(mode="cloud", opus_model=None)
+        reloaded = ClaudeCodeSettings.from_dict(original.to_dict())
+        assert reloaded.mode == "cloud"
+        assert reloaded.opus_model is None
+
+    def test_post_handler_model_fields_set_explicit_null(self):
+        """
+        GlobalSettingsRequest.model_validate with explicit null must include
+        the field in model_fields_set so the POST handler can clear it.
+        """
+        from omlx.admin.routes import GlobalSettingsRequest
+        r = GlobalSettingsRequest.model_validate({"claude_code_opus_model": None})
+        assert "claude_code_opus_model" in r.model_fields_set
+        assert r.claude_code_opus_model is None
+
+    def test_post_handler_model_fields_set_absent_field(self):
+        """
+        GlobalSettingsRequest() with no claude_code_opus_model must NOT include it
+        in model_fields_set — POST handler must not apply it (leave server value alone).
+        """
+        from omlx.admin.routes import GlobalSettingsRequest
+        r = GlobalSettingsRequest()
+        assert "claude_code_opus_model" not in r.model_fields_set
+
+    def test_post_handler_model_fields_set_explicit_value(self):
+        """
+        GlobalSettingsRequest with an explicit model ID must include the field
+        in model_fields_set and carry the value.
+        """
+        from omlx.admin.routes import GlobalSettingsRequest
+        r = GlobalSettingsRequest(claude_code_opus_model="mlx-community/Qwen3-30B-A3B-4bit")
+        assert "claude_code_opus_model" in r.model_fields_set
+        assert r.claude_code_opus_model == "mlx-community/Qwen3-30B-A3B-4bit"
 
 
 class TestCORSMiddleware:

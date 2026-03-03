@@ -20,7 +20,7 @@
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
                 auth: { api_key_set: false, api_key: '' },
-                claude_code: { context_scaling_enabled: false, target_context_size: 200000 },
+                claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '', ssd_free_bytes: 0, ssd_free: '' },
             },
 
@@ -85,7 +85,6 @@
                 api_key: '',
                 engines: {},
             },
-            selectedClaudeModel: '',
             selectedStatsModel: '',
             _statsRefreshTimer: null,
 
@@ -606,17 +605,23 @@
             },
 
             get claudeCodeCommand() {
-                const model = this.selectedClaudeModel || 'select-a-model';
+                const mode = this.globalSettings.claude_code.mode;
+                if (mode === 'cloud') {
+                    return 'env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u API_TIMEOUT_MS -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC claude';
+                }
+                // Local mode
                 const port = this.stats.port || 8000;
+                const opusModel = this.globalSettings.claude_code.opus_model || 'select-a-model';
+                const sonnetModel = this.globalSettings.claude_code.sonnet_model || 'select-a-model';
+                const haikuModel = this.globalSettings.claude_code.haiku_model || 'select-a-model';
                 const parts = [];
                 parts.push(`ANTHROPIC_BASE_URL=http://localhost:${port}`);
                 if (this.stats.api_key) {
                     parts.push(`ANTHROPIC_AUTH_TOKEN=${this.stats.api_key}`);
                 }
-                parts.push(`ANTHROPIC_MODEL=${model}`);
-                parts.push(`ANTHROPIC_DEFAULT_SONNET_MODEL=${model}`);
-                parts.push(`ANTHROPIC_DEFAULT_OPUS_MODEL=${model}`);
-                parts.push(`ANTHROPIC_DEFAULT_HAIKU_MODEL=${model}`);
+                parts.push(`ANTHROPIC_DEFAULT_OPUS_MODEL=${opusModel}`);
+                parts.push(`ANTHROPIC_DEFAULT_SONNET_MODEL=${sonnetModel}`);
+                parts.push(`ANTHROPIC_DEFAULT_HAIKU_MODEL=${haikuModel}`);
                 parts.push('API_TIMEOUT_MS=3000000');
                 parts.push('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1');
                 parts.push('claude');
@@ -631,6 +636,10 @@
                         body: JSON.stringify({
                             claude_code_context_scaling_enabled: this.globalSettings.claude_code.context_scaling_enabled,
                             claude_code_target_context_size: this.globalSettings.claude_code.target_context_size,
+                            claude_code_mode: this.globalSettings.claude_code.mode,
+                            claude_code_opus_model: this.globalSettings.claude_code.opus_model,
+                            claude_code_sonnet_model: this.globalSettings.claude_code.sonnet_model,
+                            claude_code_haiku_model: this.globalSettings.claude_code.haiku_model,
                         }),
                     });
                     if (!response.ok) {
@@ -652,10 +661,6 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.stats = { ...this.stats, ...data };
-                        // Set default selected model if not set
-                        if (!this.selectedClaudeModel && this.llmModels.length > 0) {
-                            this.selectedClaudeModel = this.llmModels[0].id;
-                        }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
