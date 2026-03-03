@@ -503,6 +503,7 @@ except Exception:
     pass
 templates.env.globals["t"] = lambda key: _en_locale.get(key, key)
 templates.env.globals["locale_json"] = json.dumps(_en_locale, ensure_ascii=False)
+templates.env.globals["current_lang"] = "en"
 
 
 def _load_locale(language: str) -> dict:
@@ -538,6 +539,7 @@ def _refresh_i18n_globals() -> None:
     locale = _load_locale(lang)
     templates.env.globals["t"] = _make_t(locale)
     templates.env.globals["locale_json"] = json.dumps(locale, ensure_ascii=False)
+    templates.env.globals["current_lang"] = lang
 
 
 # =============================================================================
