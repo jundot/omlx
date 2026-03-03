@@ -308,6 +308,82 @@ class VLMBatchedEngine(BaseEngine):
 
         logger.info(f"VLM tool calling enabled: parser={tool_parser_type}")
 
+    @staticmethod
+    def _count_content_parts(content: Any, part_types: set[str]) -> int:
+        """Count multimodal parts in list content by type."""
+        if not isinstance(content, list):
+            return 0
+
+        count = 0
+        for item in content:
+            if isinstance(item, dict):
+                item_type = item.get("type", "")
+            else:
+                item_type = getattr(item, "type", "")
+            if item_type in part_types:
+                count += 1
+        return count
+
+    def _format_messages_for_vlm_template(
+        self,
+        messages: list[dict[str, Any]],
+        num_images: int,
+    ) -> list[dict[str, Any]]:
+        """Format VLM messages with image tokens on image-bearing user turns."""
+        from mlx_vlm.prompt_utils import extract_text_from_content, get_message_json
+
+        model_type = self.model_type or getattr(self._vlm_model.config, "model_type", "")
+        if not model_type:
+            raise ValueError("Missing VLM model_type for chat template formatting")
+
+        image_part_types = {"image", "image_url", "input_image"}
+        has_explicit_images = any(
+            isinstance(msg, dict)
+            and self._count_content_parts(msg.get("content"), image_part_types) > 0
+            for msg in messages
+        )
+
+        remaining_images = num_images
+        assigned_fallback_images = False
+        formatted_messages: list[dict[str, Any]] = []
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                msg = {"role": "user", "content": str(msg)}
+
+            role = msg.get("role", "user")
+            raw_content = msg.get("content")
+            content = extract_text_from_content(raw_content)
+
+            msg_num_images = 0
+            if role == "user":
+                explicit_images = self._count_content_parts(raw_content, image_part_types)
+                if explicit_images > 0 and remaining_images > 0:
+                    msg_num_images = min(explicit_images, remaining_images)
+                    remaining_images -= msg_num_images
+                elif (
+                    not has_explicit_images
+                    and remaining_images > 0
+                    and not assigned_fallback_images
+                ):
+                    msg_num_images = remaining_images
+                    remaining_images = 0
+                    assigned_fallback_images = True
+
+            formatted_messages.append(
+                get_message_json(
+                    model_type,
+                    content,
+                    role,
+                    skip_image_token=role != "user" or msg_num_images == 0,
+                    skip_audio_token=True,
+                    num_images=msg_num_images,
+                    num_audios=0,
+                )
+            )
+
+        return formatted_messages
+
     def _prepare_vision_inputs(
         self,
         messages: list[dict[str, Any]],
@@ -347,17 +423,25 @@ class VLMBatchedEngine(BaseEngine):
             )
 
         # Apply VLM-specific chat template with image placeholders.
-        # Use return_messages=True to get the formatted messages list,
-        # then apply the processor's chat template directly so we can
-        # pass enable_thinking (mlx-vlm's apply_chat_template doesn't
-        # forward **kwargs to get_chat_template).
-        formatted_messages = apply_chat_template(
-            self._processor,
-            self._vlm_model.config,
-            messages,
-            num_images=num_images,
-            return_messages=True,
-        )
+        # Build per-message placeholders in oMLX so image-bearing turns always
+        # receive image tokens, regardless of conversation history shape.
+        try:
+            formatted_messages = self._format_messages_for_vlm_template(
+                messages, num_images=num_images
+            )
+        except Exception as e:
+            logger.debug(
+                "Falling back to mlx-vlm apply_chat_template for VLM formatting: %s",
+                e,
+            )
+            # Fallback to upstream formatter for unknown model/format edge cases.
+            formatted_messages = apply_chat_template(
+                self._processor,
+                self._vlm_model.config,
+                messages,
+                num_images=num_images,
+                return_messages=True,
+            )
 
         template_kwargs = {
             "tokenize": False,

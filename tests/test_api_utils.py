@@ -14,6 +14,7 @@ from omlx.api.utils import (
     _merge_consecutive_roles,
     clean_output_text,
     extract_harmony_messages,
+    extract_multimodal_content,
     extract_text_content,
 )
 from omlx.api.anthropic_utils import (
@@ -986,3 +987,47 @@ class TestMergeConsecutiveRoles:
         result = extract_harmony_messages(messages)
         assert len(result) == 1
         assert result[0]["content"] == "First\n\nSecond"
+
+
+class TestExtractMultimodalContent:
+    """Tests for extract_multimodal_content normalization."""
+
+    def test_converts_input_text_and_input_image(self):
+        """Responses-style input_text/input_image should normalize for VLM."""
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "input_text", "text": "Describe this image"},
+                    {"type": "input_image", "image_url": "/tmp/example.png"},
+                ],
+            )
+        ]
+
+        result = extract_multimodal_content(messages)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        assert content[0]["type"] == "text"
+        assert content[0]["text"] == "Describe this image"
+        assert content[1]["type"] == "image_url"
+        assert content[1]["image_url"]["url"] == "/tmp/example.png"
+
+    def test_converts_input_image_dict_shape(self):
+        """input_image with image_url object should normalize to image_url."""
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "Analyze"},
+                    {"type": "input_image", "image_url": {"url": "https://example.com/a.png"}},
+                ],
+            )
+        ]
+
+        result = extract_multimodal_content(messages)
+
+        content = result[0]["content"]
+        assert content[1]["type"] == "image_url"
+        assert content[1]["image_url"]["url"] == "https://example.com/a.png"

@@ -92,10 +92,23 @@ def _extract_multimodal_content_list(content: list) -> list:
             item = item.dict()
         if isinstance(item, dict):
             item_type = item.get("type")
-            if item_type == "text":
-                parts.append(item)
+            if item_type in ("text", "input_text"):
+                text = item.get("text") or item.get("content") or ""
+                parts.append({"type": "text", "text": text})
             elif item_type == "image_url":
                 parts.append(item)
+            elif item_type == "input_image":
+                image_url_value = item.get("image_url", item.get("input_image"))
+                url = None
+                if isinstance(image_url_value, str):
+                    url = image_url_value
+                elif isinstance(image_url_value, dict):
+                    url = image_url_value.get("url")
+                if url:
+                    parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": url},
+                    })
             elif item_type == "image":
                 # Anthropic format: convert to OpenAI image_url format
                 source = item.get("source", {})

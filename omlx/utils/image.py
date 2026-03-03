@@ -104,22 +104,30 @@ def extract_images_from_messages(
                 if text:
                     text_parts.append(text)
 
-            elif part_type == "image_url":
+            elif part_type in ("image_url", "input_image"):
+                # OpenAI chat format: {"type":"image_url","image_url":{"url":"..."}}
+                # Responses-style format: {"type":"input_image","image_url":"..."}
                 image_url_obj = (
                     part.get("image_url") if isinstance(part, dict)
                     else getattr(part, "image_url", None)
                 )
-                if image_url_obj:
-                    url = (
-                        image_url_obj.get("url") if isinstance(image_url_obj, dict)
-                        else getattr(image_url_obj, "url", None)
-                    )
-                    if url:
-                        try:
-                            img = load_image(url)
-                            images.append(img)
-                        except Exception as e:
-                            logger.warning(f"Failed to load image: {e}")
+                if image_url_obj is None and isinstance(part, dict):
+                    image_url_obj = part.get("input_image")
+
+                url = None
+                if isinstance(image_url_obj, str):
+                    url = image_url_obj
+                elif isinstance(image_url_obj, dict):
+                    url = image_url_obj.get("url")
+                elif image_url_obj is not None:
+                    url = getattr(image_url_obj, "url", None)
+
+                if url:
+                    try:
+                        img = load_image(url)
+                        images.append(img)
+                    except Exception as e:
+                        logger.warning(f"Failed to load image: {e}")
 
         new_msg = {"role": role, "content": "\n".join(text_parts) if text_parts else ""}
         # Preserve extra fields

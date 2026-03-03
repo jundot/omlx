@@ -580,6 +580,76 @@ class TestPrepareVisionInputs:
             engine._prepare_vision_inputs(messages, images)
 
 
+class TestFormatMessagesForVLMTemplate:
+    """Tests for VLMBatchedEngine._format_messages_for_vlm_template()."""
+
+    @staticmethod
+    def _count_image_placeholders(formatted_messages):
+        count = 0
+        for msg in formatted_messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in {
+                        "image",
+                        "image_url",
+                        "input_image",
+                    }:
+                        count += 1
+            elif isinstance(content, str):
+                count += content.count("<image>")
+                count += content.count("<start_of_image>")
+                count += content.count("<|image_1|>")
+        return count
+
+    def test_assigns_placeholder_to_late_user_image_turn(self):
+        """system→assistant→user(image) still places image token on user turn."""
+        engine = _make_loaded_engine(model_type="qwen3_5")
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "assistant", "content": "Hello"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is this image?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                ],
+            },
+        ]
+
+        formatted = engine._format_messages_for_vlm_template(messages, num_images=1)
+
+        assert self._count_image_placeholders(formatted) == 1
+        assert self._count_image_placeholders([formatted[-1]]) == 1
+
+    def test_caps_placeholders_by_loaded_image_count(self):
+        """Do not add more placeholders than successfully loaded images."""
+        engine = _make_loaded_engine(model_type="qwen3_5")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,a"}},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,b"}},
+                    {"type": "text", "text": "Compare"},
+                ],
+            },
+        ]
+
+        formatted = engine._format_messages_for_vlm_template(messages, num_images=1)
+
+        assert self._count_image_placeholders(formatted) == 1
+
+    def test_fallback_inserts_first_user_when_no_explicit_parts(self):
+        """Legacy path: num_images without explicit image parts still injects once."""
+        engine = _make_loaded_engine(model_type="qwen3_5")
+        messages = [{"role": "user", "content": "Describe this"}]
+
+        formatted = engine._format_messages_for_vlm_template(messages, num_images=1)
+
+        assert self._count_image_placeholders(formatted) == 1
+
+
 # ---------------------------------------------------------------------------
 # TestCountChatTokens
 # ---------------------------------------------------------------------------

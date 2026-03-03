@@ -131,6 +131,26 @@ class TestExtractImagesFromMessages:
         # Text-only message should contain only text part
         assert text_msgs[0]["role"] == "user"
 
+    def test_message_with_input_image(self):
+        """Messages with input_image content parts extract images."""
+        img = _make_test_image(4, 4)
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": uri},
+                    {"type": "input_text", "text": "What is this?"},
+                ],
+            },
+        ]
+        text_msgs, images = extract_images_from_messages(messages)
+        assert len(images) == 1
+        assert isinstance(images[0], Image.Image)
+        assert text_msgs[0]["role"] == "user"
+
     def test_multiple_images_in_one_message(self):
         """Multiple images in a single message are all extracted."""
         img1 = _make_test_image(4, 4, "red")
