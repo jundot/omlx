@@ -1485,6 +1485,8 @@ async def update_global_settings(
         runtime_applied.append("claude_code")
         logger.info(
             f"Claude Code settings updated: "
+            f"scaling={'enabled' if global_settings.claude_code.context_scaling_enabled else 'disabled'}, "
+            f"target={global_settings.claude_code.target_context_size}, "
             f"mode={global_settings.claude_code.mode}, "
             f"opus={global_settings.claude_code.opus_model}, "
             f"sonnet={global_settings.claude_code.sonnet_model}, "
@@ -1807,26 +1809,6 @@ async def get_server_stats(
             global_settings.claude_code.target_context_size
             if global_settings
             else 200000
-        ),
-        "claude_code_mode": (
-            global_settings.claude_code.mode
-            if global_settings
-            else "cloud"
-        ),
-        "claude_code_opus_model": (
-            global_settings.claude_code.opus_model
-            if global_settings
-            else None
-        ),
-        "claude_code_sonnet_model": (
-            global_settings.claude_code.sonnet_model
-            if global_settings
-            else None
-        ),
-        "claude_code_haiku_model": (
-            global_settings.claude_code.haiku_model
-            if global_settings
-            else None
         ),
         "engines": _get_engine_info(),
     }
