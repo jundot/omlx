@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}{% if api_key_configured %}Login{% else %}Setup{% endif %} - oMLX Admin{% endblock %}
+{% block title %}{% if api_key_configured %}{{ t('login.title_login') }}{% else %}{{ t('login.title_setup') }}{% endif %}{% endblock %}
 
 {% block head %}
 <style>
@@ -53,8 +53,8 @@
         <template x-if="!apiKeyConfigured">
             <div class="bg-white rounded-3xl shadow-xl border border-neutral-200 p-8 card-hover animate-fade-in-up" style="animation-delay: 0.1s;">
                 <div class="mb-6 text-center">
-                    <h2 class="text-lg font-bold text-neutral-900 mb-1">Set Up API Key</h2>
-                    <p class="text-xs text-neutral-500">Create an API key to secure your server</p>
+                    <h2 class="text-lg font-bold text-neutral-900 mb-1">{{ t('login.setup.heading') }}</h2>
+                    <p class="text-xs text-neutral-500">{{ t('login.setup.description') }}</p>
                 </div>
 
                 <form @submit.prevent="setup">
@@ -69,13 +69,13 @@
                     <!-- API Key Input -->
                     <div class="mb-4">
                         <label for="setup_api_key" class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-3">
-                            API Key
+                            {{ t('login.setup.label_api_key') }}
                         </label>
                         <input
                             type="password"
                             id="setup_api_key"
                             x-model="apiKey"
-                            placeholder="Enter new API key"
+                            placeholder="{{ t('login.setup.placeholder_new') }}"
                             class="w-full px-4 py-3 border border-neutral-200 rounded-xl text-sm
                                    placeholder-neutral-400 focus:ring-2 focus:ring-neutral-900
                                    focus:border-transparent transition-all duration-200"
@@ -87,13 +87,13 @@
                     <!-- Confirm API Key Input -->
                     <div class="mb-2">
                         <label for="setup_api_key_confirm" class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-3">
-                            Confirm API Key
+                            {{ t('login.setup.label_confirm') }}
                         </label>
                         <input
                             type="password"
                             id="setup_api_key_confirm"
                             x-model="apiKeyConfirm"
-                            placeholder="Enter API key again"
+                            placeholder="{{ t('login.setup.placeholder_confirm') }}"
                             class="w-full px-4 py-3 border border-neutral-200 rounded-xl text-sm
                                    placeholder-neutral-400 focus:ring-2 focus:ring-neutral-900
                                    focus:border-transparent transition-all duration-200"
@@ -103,7 +103,7 @@
                     </div>
 
                     <!-- Validation Hints -->
-                    <p class="text-[11px] text-neutral-400 mb-6">Min 4 characters, no spaces</p>
+                    <p class="text-[11px] text-neutral-400 mb-6">{{ t('login.setup.validation_hint') }}</p>
 
                     <!-- Submit Button -->
                     <button
@@ -115,13 +115,13 @@
                                disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
                         :disabled="loading"
                     >
-                        <span x-show="!loading">Set API Key</span>
+                        <span x-show="!loading">{{ t('login.setup.button_set') }}</span>
                         <span x-show="loading" class="flex items-center justify-center">
                             <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                                 <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                                 <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                             </svg>
-                            Setting up...
+                            {{ t('login.setup.button_setting_up') }}
                         </span>
                     </button>
                 </form>
@@ -143,13 +143,13 @@
                     <!-- API Key Input -->
                     <div class="mb-6">
                         <label for="api_key" class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-3">
-                            API Key
+                            {{ t('login.login.label_api_key') }}
                         </label>
                         <input
                             type="password"
                             id="api_key"
                             x-model="apiKey"
-                            placeholder="Enter your API key"
+                            placeholder="{{ t('login.login.placeholder') }}"
                             class="w-full px-4 py-3 border border-neutral-200 rounded-xl text-sm
                                    placeholder-neutral-400 focus:ring-2 focus:ring-neutral-900
                                    focus:border-transparent transition-all duration-200"
@@ -169,7 +169,7 @@
                             :disabled="loading"
                         >
                         <label for="remember" class="text-xs text-neutral-500 cursor-pointer select-none">
-                            Stay signed in for 30 days
+                            {{ t('login.login.remember') }}
                         </label>
                     </div>
 
@@ -183,13 +183,13 @@
                                disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
                         :disabled="loading"
                     >
-                        <span x-show="!loading">Sign in</span>
+                        <span x-show="!loading">{{ t('login.login.button_sign_in') }}</span>
                         <span x-show="loading" class="flex items-center justify-center">
                             <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                                 <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                                 <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                             </svg>
-                            Signing in...
+                            {{ t('login.login.button_signing_in') }}
                         </span>
                     </button>
                 </form>
@@ -198,7 +198,7 @@
 
         <!-- Footer -->
         <p class="mt-8 text-center text-xs text-neutral-400 animate-fade-in-up" style="animation-delay: 0.2s;">
-            LLM inference, optimized for your Mac
+            {{ t('app.tagline') }}
         </p>
     </div>
 </div>
@@ -233,10 +233,10 @@
                     if (response.ok && data.success) {
                         window.location.href = '/admin/dashboard';
                     } else {
-                        this.error = data.detail || data.message || 'Invalid API key';
+                        this.error = data.detail || data.message || window.t('login.error.invalid_api_key');
                     }
                 } catch (err) {
-                    this.error = 'Failed to connect to server';
+                    this.error = window.t('login.error.connect_failed');
                     console.error('Login error:', err);
                 } finally {
                     this.loading = false;
@@ -248,15 +248,15 @@
 
                 // Client-side validation
                 if (this.apiKey.length < 4) {
-                    this.error = 'API key must be at least 4 characters';
+                    this.error = window.t('login.error.min_length');
                     return;
                 }
                 if (/\s/.test(this.apiKey)) {
-                    this.error = 'API key must not contain whitespace';
+                    this.error = window.t('login.error.no_whitespace');
                     return;
                 }
                 if (this.apiKey !== this.apiKeyConfirm) {
-                    this.error = 'API keys do not match';
+                    this.error = window.t('login.error.mismatch');
                     return;
                 }
 
@@ -279,10 +279,10 @@
                     if (response.ok && data.success) {
                         window.location.href = '/admin/dashboard';
                     } else {
-                        this.error = data.detail || data.message || 'Failed to set up API key';
+                        this.error = data.detail || data.message || window.t('login.error.setup_failed');
                     }
                 } catch (err) {
-                    this.error = 'Failed to connect to server';
+                    this.error = window.t('login.error.connect_failed');
                     console.error('Setup error:', err);
                 } finally {
                     this.loading = false;

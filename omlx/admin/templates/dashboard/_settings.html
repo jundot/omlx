@@ -8,7 +8,7 @@
                         : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
                     class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200"
                 >
-                    Global Settings
+                    {{ t('settings.tab.global') }}
                 </button>
                 <button
                     @click="activeTab = 'models'"
@@ -17,7 +17,7 @@
                         : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
                     class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200"
                 >
-                    Model Settings
+                    {{ t('settings.tab.models') }}
                 </button>
             </div>
 
@@ -26,10 +26,10 @@
                 <div class="animate-fade-in-up">
                     <!-- Header -->
                     <div class="mb-8">
-                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">Global Settings</h2>
-                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">Server Configuration</h3>
+                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('settings.global.section_label') }}</h2>
+                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('settings.global.heading') }}</h3>
                         <p class="text-sm text-neutral-500 mt-2">
-                            Settings marked with <span class="px-1 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">Restart</span> require server restart.
+                            {{ t('settings.global.restart_notice') }} <span class="px-1 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.global.restart_badge') }}</span> {{ t('settings.global.restart_suffix') }}
                         </p>
                     </div>
 
@@ -41,30 +41,30 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="shield" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Auth & Info</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.auth.section_label') }}</span>
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">Base Path</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Read-only</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.auth.base_path') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.auth.base_path_hint') }}</p>
                                     </div>
                                     <span class="text-sm text-neutral-700 font-mono" x-text="globalSettings.base_path || '~/.omlx'"></span>
                                 </div>
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">API Key</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Min 4 chars, no whitespace</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.auth.api_key') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.auth.api_key_hint') }}</p>
                                     </div>
                                     <div class="flex items-center gap-2">
                                         <input :type="showApiKey ? 'text' : 'password'"
                                                x-model="globalSettings.auth.api_key"
-                                               placeholder="Enter API key"
+                                               placeholder="{{ t('settings.auth.api_key_placeholder') }}"
                                                class="w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                         <button type="button" @click="showApiKey = !showApiKey; $nextTick(() => lucide.createIcons())"
                                                 class="p-2 rounded-lg hover:bg-neutral-100 transition-colors text-neutral-400 hover:text-neutral-600"
-                                                title="Toggle visibility">
+                                                title="{{ t('settings.auth.toggle_visibility_tooltip') }}">
                                             <template x-if="!showApiKey">
                                                 <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>
                                             </template>
@@ -82,7 +82,7 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="server" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Server</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.server.section_label') }}</span>
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
@@ -102,41 +102,41 @@
                                          }
                                      }">
                                     <div class="flex items-center gap-2">
-                                        <label class="text-sm text-neutral-700">Host</label>
-                                        <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">Restart</span>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.server.host') }}</label>
+                                        <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.global.restart_badge') }}</span>
                                     </div>
                                     <div class="flex items-center gap-2">
                                         <select :value="hostMode"
                                                 @change="setHostMode($event.target.value)"
                                                 class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                            <option value="localhost">Localhost only (127.0.0.1)</option>
-                                            <option value="public">Open to all (0.0.0.0)</option>
-                                            <option value="custom">Custom (caution)</option>
+                                            <option value="localhost">{{ t('settings.server.host_localhost') }}</option>
+                                            <option value="public">{{ t('settings.server.host_public') }}</option>
+                                            <option value="custom">{{ t('settings.server.host_custom') }}</option>
                                         </select>
                                         <input x-show="hostMode === 'custom'" x-cloak
-                                               type="text" x-model="globalSettings.server.host" placeholder="e.g. 192.168.1.100"
+                                               type="text" x-model="globalSettings.server.host" placeholder="{{ t('settings.server.host_placeholder') }}"
                                                class="w-40 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                     </div>
                                 </div>
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div class="flex items-center gap-2">
-                                        <label class="text-sm text-neutral-700">Port</label>
-                                        <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">Restart</span>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.server.port') }}</label>
+                                        <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.global.restart_badge') }}</span>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.server.port"
                                            class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div class="flex items-center gap-2">
-                                        <label class="text-sm text-neutral-700">Log Level</label>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.server.log_level') }}</label>
                                     </div>
                                     <select x-model="globalSettings.server.log_level"
                                             class="w-48 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                        <option value="error">error</option>
-                                        <option value="warning">warning</option>
-                                        <option value="info">info (default)</option>
-                                        <option value="debug">debug</option>
-                                        <option value="trace">trace - includes full content</option>
+                                        <option value="error">{{ t('settings.server.log_level_error') }}</option>
+                                        <option value="warning">{{ t('settings.server.log_level_warning') }}</option>
+                                        <option value="info">{{ t('settings.server.log_level_info') }}</option>
+                                        <option value="debug">{{ t('settings.server.log_level_debug') }}</option>
+                                        <option value="trace">{{ t('settings.server.log_level_trace') }}</option>
                                     </select>
                                 </div>
                             </div>
@@ -147,19 +147,19 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Model</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.model.section_label') }}</span>
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="px-6 py-4">
                                     <div class="flex items-center justify-between mb-3">
                                         <div class="flex items-center gap-2">
-                                            <label class="text-sm text-neutral-700">Model Directories</label>
+                                            <label class="text-sm text-neutral-700">{{ t('settings.model.model_directories') }}</label>
                                         </div>
                                         <button @click="globalSettings.model.model_dirs.push(''); $nextTick(() => lucide.createIcons())"
                                                 class="flex items-center gap-1 text-xs px-2 py-1 text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-colors">
                                             <i data-lucide="plus" class="w-3.5 h-3.5"></i>
-                                            <span>Add</span>
+                                            <span>{{ t('settings.model.add') }}</span>
                                         </button>
                                     </div>
                                     <div class="flex flex-col gap-2">
@@ -167,7 +167,7 @@
                                             <div class="flex items-center gap-2">
                                                 <input type="text" x-model="globalSettings.model.model_dirs[index]"
                                                        class="flex-1 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs"
-                                                       :placeholder="index === 0 ? 'Primary model directory' : 'Additional model directory'">
+                                                       :placeholder="index === 0 ? '{{ t('settings.model.placeholder_primary') }}' : '{{ t('settings.model.placeholder_additional') }}'">
                                                 <button @click="if (globalSettings.model.model_dirs.length > 1) globalSettings.model.model_dirs.splice(index, 1)"
                                                         class="flex-shrink-0 p-1.5 rounded-lg transition-colors"
                                                         :class="globalSettings.model.model_dirs.length > 1 ? 'text-neutral-400 hover:text-red-500 hover:bg-red-50' : 'text-neutral-200 cursor-not-allowed'">
@@ -185,22 +185,22 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="gauge" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Resource Management</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.resource.section_label') }}</span>
                                 </div>
                                 <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">
-                                    Live
+                                    {{ t('settings.resource.live_badge') }}
                                 </span>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <!-- Memory Limit (Total) -->
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">Memory Limit (Total)</label>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.memory_limit_total') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">
-                                            Total memory limit for oMLX process (models + KV cache + overhead).
+                                            {{ t('settings.resource.memory_limit_total_description') }}
                                             <br>
-                                            Exceeding this triggers immediate LRU model eviction.
-                                            <strong>Auto</strong>: system RAM &minus; 8GB.
+                                            {{ t('settings.resource.memory_limit_total_eviction') }}
+                                            <strong>{{ t('settings.resource.memory_limit_total_auto') }}</strong>{{ t('settings.resource.memory_limit_total_auto_desc') }}
                                         </p>
                                     </div>
                                     <div class="flex items-center gap-3">
@@ -208,7 +208,7 @@
                                             <input type="checkbox" x-model="processMemoryAuto"
                                                    @change="if(processMemoryAuto) { globalSettings.memory.max_process_memory = 'auto'; } else { updateProcessMemoryFromSlider(); }"
                                                    class="rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                            <span class="text-xs text-neutral-500">Auto</span>
+                                            <span class="text-xs text-neutral-500">{{ t('settings.resource.auto') }}</span>
                                         </label>
                                         <input type="range" min="0" max="99" step="1"
                                                x-model.number="processMemoryPercent"
@@ -220,7 +220,7 @@
                                                    : 'bg-neutral-200 cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:shadow-sm'">
                                         <span class="text-sm w-28 text-right transition-all duration-200 inline-flex items-center justify-end gap-0"
                                               :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-600'">
-                                            <span x-text="processMemoryAuto ? 'Auto' : (processMemoryPercent === 0 ? 'Off' : processMemoryPercent + '%')"></span>
+                                            <span x-text="processMemoryAuto ? window.t('settings.resource.auto') : (processMemoryPercent === 0 ? window.t('settings.resource.off') : processMemoryPercent + '%')"></span>
                                             <span :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'" class="ml-1">(</span><span x-show="!editingProcessMemory" @click="if(!processMemoryAuto) { editingProcessMemory = true }" class="cursor-pointer hover:text-neutral-900" :class="processMemoryAuto ? 'cursor-default text-neutral-300' : ''" x-text="processMemorySizeGB"></span><input x-show="editingProcessMemory"
                                                    type="number"
                                                    :value="processMemorySizeGB"
@@ -238,14 +238,14 @@
                                 <!-- Memory Limit (Models Only) -->
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div class="flex items-center gap-2">
-                                        <label class="text-sm text-neutral-700">Memory Limit (Models Only)</label>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.memory_limit_models') }}</label>
                                     </div>
                                     <div class="flex items-center gap-3">
                                         <label class="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
                                             <input type="checkbox" x-model="modelMemoryAuto"
                                                    @change="if(modelMemoryAuto) { memoryPercent = 90; updateMemoryFromSlider(); }"
                                                    class="rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                            <span class="text-xs text-neutral-500">Auto</span>
+                                            <span class="text-xs text-neutral-500">{{ t('settings.resource.auto') }}</span>
                                         </label>
                                         <input type="range" min="0" max="100" step="5"
                                                x-model.number="memoryPercent"
@@ -257,7 +257,7 @@
                                                    : 'bg-neutral-200 cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:shadow-sm'">
                                         <span class="text-sm w-28 text-right transition-all duration-200 inline-flex items-center justify-end gap-0"
                                               :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-600'">
-                                            <span x-text="modelMemoryAuto ? 'Auto' : memoryPercent + '%'"></span>
+                                            <span x-text="modelMemoryAuto ? window.t('settings.resource.auto') : memoryPercent + '%'"></span>
                                             <span :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'" class="ml-1">(</span><span x-show="!editingModelMemory" @click="if(!modelMemoryAuto) { editingModelMemory = true }" class="cursor-pointer hover:text-neutral-900" :class="modelMemoryAuto ? 'cursor-default text-neutral-300' : ''" x-text="modelMemorySizeGB"></span><input x-show="editingModelMemory"
                                                    type="number"
                                                    :value="modelMemorySizeGB"
@@ -275,11 +275,11 @@
                                 <!-- Memory Limit (In-Memory Hot Cache) -->
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">Hot Cache Limit (In-Memory Cache)</label>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.hot_cache_limit') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">
-                                            In-memory cache for frequently accessed KV cache blocks.
+                                            {{ t('settings.resource.hot_cache_description') }}
                                             <br>
-                                            Reduces SSD I/O latency for repeated prompts. <strong>0</strong> = disabled.
+                                            {{ t('settings.resource.hot_cache_zero_note') }} <strong>{{ t('settings.resource.hot_cache_disabled') }}</strong> {{ t('settings.resource.hot_cache_disabled_label') }}
                                         </p>
                                     </div>
                                     <div class="flex items-center gap-3">
@@ -291,7 +291,7 @@
                                                       [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
                                                       [&::-webkit-slider-thumb]:shadow-sm">
                                         <span class="text-sm text-neutral-600 w-28 text-right inline-flex items-center justify-end gap-0">
-                                            <span x-text="hotCachePercent === 0 ? 'Off' : hotCachePercent + '%'"></span>
+                                            <span x-text="hotCachePercent === 0 ? window.t('settings.resource.off') : hotCachePercent + '%'"></span>
                                             <span class="text-neutral-400 ml-1">(</span><span x-show="!editingHotCache" @click="editingHotCache = true" class="cursor-pointer hover:text-neutral-900" x-text="hotCacheSizeGB"></span><input x-show="editingHotCache"
                                                    type="number"
                                                    :value="hotCacheSizeGB"
@@ -309,9 +309,9 @@
                                 <!-- SSD Cache Limit (Cold Cache) -->
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">Cold Cache Limit (SSD Cache)</label>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.cold_cache_limit') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">
-                                            Persistent SSD storage for evicted KV cache blocks.
+                                            {{ t('settings.resource.cold_cache_description') }}
                                         </p>
                                     </div>
                                     <div class="flex items-center gap-3">
@@ -346,13 +346,13 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="hard-drive" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Cache</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.cache.section_label') }}</span>
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div class="flex items-center gap-2">
-                                        <label class="text-sm text-neutral-700">Cache Enabled</label>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.cache.enabled') }}</label>
                                     </div>
                                     <button type="button" @click="globalSettings.cache.enabled = !globalSettings.cache.enabled"
                                             :class="globalSettings.cache.enabled ? 'bg-black' : 'bg-neutral-200'"
@@ -363,7 +363,7 @@
                                 </div>
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div class="flex items-center gap-2">
-                                        <label class="text-sm text-neutral-700">SSD Cache Directory</label>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.cache.ssd_directory') }}</label>
                                     </div>
                                     <input type="text" x-model="globalSettings.cache.ssd_cache_dir"
                                            class="w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
@@ -376,27 +376,27 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="sliders" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Generation Defaults</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.generation.section_label') }}</span>
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">Max Context Window</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Reject prompts exceeding this token limit</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.max_context_window') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.max_context_window_hint') }}</p>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.sampling.max_context_window" min="1" max="2097152"
                                            class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                                 <div class="flex items-center justify-between px-6 py-4">
-                                    <label class="text-sm text-neutral-700">Max Tokens</label>
+                                    <label class="text-sm text-neutral-700">{{ t('settings.generation.max_tokens') }}</label>
                                     <input type="number" x-model.number="globalSettings.sampling.max_tokens" min="1" max="131072"
                                            class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">Temperature</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">0.0 = deterministic, 2.0 = max randomness</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.temperature') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.temperature_hint') }}</p>
                                     </div>
                                     <div class="flex items-center gap-3">
                                         <input type="range" min="0" max="2" step="0.1"
@@ -410,8 +410,8 @@
                                 </div>
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">Top P</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Nucleus sampling threshold</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.top_p') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.top_p_hint') }}</p>
                                     </div>
                                     <div class="flex items-center gap-3">
                                         <input type="range" min="0" max="1" step="0.05"
@@ -425,16 +425,16 @@
                                 </div>
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">Top K</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">0 = disabled</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.top_k') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.top_k_hint') }}</p>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.sampling.top_k" min="0"
                                            class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                                 <div class="flex items-center justify-between px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">Repetition Penalty</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">1.0 = disabled</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.repetition_penalty') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.repetition_penalty_hint') }}</p>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.sampling.repetition_penalty" step="0.05" min="1"
                                            class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
@@ -447,16 +447,16 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="plug" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">MCP</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.mcp.section_label') }}</span>
                                 </div>
                                 <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
-                                    Restart needed
+                                    {{ t('settings.mcp.restart_badge') }}
                                 </span>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex items-center justify-between px-6 py-4">
-                                    <label class="text-sm text-neutral-700">Config Path</label>
-                                    <input type="text" x-model="globalSettings.mcp.config_path" placeholder="Path to MCP config"
+                                    <label class="text-sm text-neutral-700">{{ t('settings.mcp.config_path') }}</label>
+                                    <input type="text" x-model="globalSettings.mcp.config_path" placeholder="{{ t('settings.mcp.config_placeholder') }}"
                                            class="w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                             </div>
@@ -469,11 +469,11 @@
                                     class="w-full flex items-center justify-between px-6 py-4 bg-neutral-50 hover:bg-neutral-100 transition-colors cursor-pointer">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="settings-2" class="w-4 h-4 text-neutral-400"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">Advanced</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.section_label') }}</span>
                                 </div>
                                 <div class="flex items-center gap-2">
                                     <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
-                                        Restart needed
+                                        {{ t('settings.advanced.restart_badge') }}
                                     </span>
                                     <i data-lucide="chevron-down" class="w-4 h-4 text-neutral-400 transition-transform duration-200"
                                        :class="advancedOpen && 'rotate-180'"></i>
@@ -484,36 +484,55 @@
                                     <div class="px-6 py-3 bg-neutral-50">
                                         <div class="flex items-center gap-2">
                                             <i data-lucide="layers" class="w-3.5 h-3.5 text-neutral-400"></i>
-                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Batching</span>
+                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.batching') }}</span>
                                         </div>
                                     </div>
                                     <div class="divide-y divide-neutral-100">
                                         <div class="flex items-center justify-between px-6 py-4">
                                             <div>
-                                                <label class="text-sm text-neutral-700">Max Sequences</label>
-                                                <p class="text-xs text-neutral-400 mt-0.5">Maximum concurrent requests processed in parallel</p>
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.max_sequences') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.max_sequences_hint') }}</p>
                                             </div>
                                             <input type="number" x-model.number="globalSettings.scheduler.max_num_seqs"
                                                    class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                         <div class="flex items-center justify-between px-6 py-4">
                                             <div>
-                                                <label class="text-sm text-neutral-700">Prefill Batch Size</label>
-                                                <p class="text-xs text-neutral-400 mt-0.5">Batch size for prompt encoding phase</p>
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.prefill_batch_size') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.prefill_batch_size_hint') }}</p>
                                             </div>
                                             <input type="number" x-model.number="globalSettings.scheduler.prefill_batch_size"
                                                    class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                         <div class="flex items-center justify-between px-6 py-4">
                                             <div>
-                                                <label class="text-sm text-neutral-700">Completion Batch Size</label>
-                                                <p class="text-xs text-neutral-400 mt-0.5">Batch size for token generation phase</p>
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.completion_batch_size') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.completion_batch_size_hint') }}</p>
                                             </div>
                                             <input type="number" x-model.number="globalSettings.scheduler.completion_batch_size"
                                                    class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                     </div>
                                 </div>
+                            </div>
+                        </div>
+
+                        <!-- Language -->
+                        <div class="space-y-4">
+                            <h4 class="text-sm font-semibold text-neutral-800 flex items-center gap-2">
+                                <i data-lucide="globe" class="w-4 h-4"></i>
+                                {{ t('settings.language.section_label') }}
+                            </h4>
+                            <div>
+                                <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">{{ t('settings.language.label') }}</label>
+                                <select x-model="globalSettings.ui.language"
+                                        @change="saveLanguage(globalSettings.ui.language)"
+                                        class="w-full max-w-xs px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white">
+                                    <option value="en">{{ t('settings.language.en') }}</option>
+                                    <option value="zh">{{ t('settings.language.zh') }}</option>
+                                    <option value="ko">{{ t('settings.language.ko') }}</option>
+                                    <option value="ja">{{ t('settings.language.ja') }}</option>
+                                </select>
                             </div>
                         </div>
 
@@ -548,13 +567,13 @@
                                    transform hover:scale-105 active:scale-95
                                    disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
                         >
-                            <span x-show="!saving">Save Settings</span>
+                            <span x-show="!saving">{{ t('settings.save.button') }}</span>
                             <span x-show="saving" class="flex items-center">
                                 <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                                     <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                                     <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                                 </svg>
-                                Saving...
+                                {{ t('settings.save.saving') }}
                             </span>
                         </button>
                     </div>
@@ -566,9 +585,9 @@
                 <div class="animate-fade-in-up">
                     <!-- Header -->
                     <div class="mb-8">
-                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">Model Settings</h2>
-                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">Available Models</h3>
-                        <p class="text-sm text-neutral-500 mt-2">Configure per-model settings including sampling parameters.</p>
+                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('settings.models.section_label') }}</h2>
+                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('settings.models.heading') }}</h3>
+                        <p class="text-sm text-neutral-500 mt-2">{{ t('settings.models.description') }}</p>
                     </div>
 
                     <!-- Loading State -->
@@ -577,7 +596,7 @@
                             <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                             <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                         </svg>
-                        <p class="mt-3 text-sm text-neutral-500">Loading models...</p>
+                        <p class="mt-3 text-sm text-neutral-500">{{ t('settings.models.loading') }}</p>
                     </div>
 
                     <!-- Empty State -->
@@ -585,8 +604,8 @@
                         <div class="w-16 h-16 bg-neutral-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
                             <i data-lucide="package-x" class="w-8 h-8 text-neutral-400"></i>
                         </div>
-                        <h4 class="text-lg font-semibold text-neutral-900 mb-2">No models found</h4>
-                        <p class="text-sm text-neutral-500">Add models to your model directory to get started.</p>
+                        <h4 class="text-lg font-semibold text-neutral-900 mb-2">{{ t('settings.models.no_models_heading') }}</h4>
+                        <p class="text-sm text-neutral-500">{{ t('settings.models.no_models_description') }}</p>
                     </div>
 
                     <!-- Model Table -->
@@ -594,27 +613,27 @@
                         <!-- Table Header -->
                         <div class="flex items-center gap-4 px-6 py-3 bg-neutral-50 border-b border-neutral-200 text-xs font-bold uppercase tracking-wider text-neutral-500">
                             <div class="flex-1 min-w-0 flex items-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('id')">
-                                Model
+                                {{ t('settings.models.table.model') }}
                                 <span x-show="sortBy === 'id'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
                             <div class="w-20 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('type')">
-                                Type
+                                {{ t('settings.models.table.type') }}
                                 <span x-show="sortBy === 'type'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
                             <div class="w-20 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('size')">
-                                Size
+                                {{ t('settings.models.table.size') }}
                                 <span x-show="sortBy === 'size'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
                             <div class="w-20 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('loaded')">
-                                Status
+                                {{ t('settings.models.table.status') }}
                                 <span x-show="sortBy === 'loaded'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
                             <div class="w-12 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('pinned')">
-                                Pin
+                                {{ t('settings.models.table.pin') }}
                                 <span x-show="sortBy === 'pinned'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
                             <div class="w-14 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_default')">
-                                Default
+                                {{ t('settings.models.table.default') }}
                                 <span x-show="sortBy === 'is_default'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
                             <div class="w-10 text-center"></div>
@@ -636,7 +655,7 @@
                                                     @click.stop="copyToClipboard(model.id); copied = true; setTimeout(() => copied = false, 2000)"
                                                     class="p-1 rounded-md transition-all flex-shrink-0"
                                                     :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
-                                                    title="Copy model name">
+                                                    :title="window.t('settings.models.table.copy_model_name_tooltip')"
                                                 <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
                                                 <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
                                             </button>
@@ -664,7 +683,7 @@
                                                         <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                                                         <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
                                                     </svg>
-                                                    <span>Loading</span>
+                                                    <span x-text="window.t('settings.models.table.status_loading')"></span>
                                                 </span>
                                             </template>
                                             <!-- Loaded state -->
@@ -675,7 +694,7 @@
                                                             : 'bg-neutral-900 text-white'"
                                                         class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 transition-all">
                                                     <span :class="hover ? 'bg-red-500' : 'bg-white'" class="w-1.5 h-1.5 rounded-full"></span>
-                                                    <span x-text="hover ? 'Unload' : 'Loaded'"></span>
+                                                    <span x-text="hover ? window.t('settings.models.table.status_unload') : window.t('settings.models.table.status_loaded')"></span>
                                                 </button>
                                             </template>
                                             <!-- Ready state -->
@@ -686,7 +705,7 @@
                                                             : 'bg-white text-neutral-500 border-neutral-200'"
                                                         class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 border transition-all">
                                                     <span :class="hover ? 'bg-green-500' : 'bg-neutral-400'" class="w-1.5 h-1.5 rounded-full"></span>
-                                                    <span x-text="hover ? 'Load' : 'Ready'"></span>
+                                                    <span x-text="hover ? window.t('settings.models.table.status_load') : window.t('settings.models.table.status_ready')"></span>
                                                 </button>
                                             </template>
                                         </div>
@@ -729,7 +748,7 @@
                                                 x-show="!model.model_type || model.model_type === 'llm'"
                                                 @click="openModelSettings(model)"
                                                 class="p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all"
-                                                title="Sampling Settings"
+                                                :title="window.t('settings.models.table.sampling_settings_tooltip')"
                                             >
                                                 <i data-lucide="settings" class="w-4 h-4"></i>
                                             </button>

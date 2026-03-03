@@ -5,7 +5,7 @@
                 <img x-show="theme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX" class="w-8 h-8">
                 <img x-show="theme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX" class="w-8 h-8" x-cloak>
                 <span class="font-bold tracking-tight text-lg">oMLX</span>
-                <span class="text-sm text-neutral-400 ml-1">Admin</span>
+                <span class="text-sm text-neutral-400 ml-1">{{ t('navbar.admin') }}</span>
             </div>
 
             <!-- Center Navigation -->
@@ -18,7 +18,7 @@
                     class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
                 >
                     <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
-                    Status
+                    {{ t('navbar.tab.status') }}
                 </button>
                 <div class="relative" @mouseenter="modelsDropdown = true" @mouseleave="modelsDropdown = false">
                     <button
@@ -29,7 +29,7 @@
                         class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
                     >
                         <i data-lucide="hard-drive-download" class="w-4 h-4"></i>
-                        Models
+                        {{ t('navbar.tab.models') }}
                     </button>
                     <!-- Download count badge -->
                     <span x-show="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length > 0"
@@ -56,7 +56,7 @@
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
                         >
                             <i data-lucide="hard-drive" class="w-3.5 h-3.5"></i>
-                            Manager
+                            {{ t('navbar.dropdown.manager') }}
                         </button>
                         <button
                             @click="mainTab = 'models'; modelsTab = 'downloader'; modelsDropdown = false; loadHFModels(); loadHFTasks(); if (!hfRecommendedLoaded) loadRecommendedModels();"
@@ -66,7 +66,7 @@
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
                         >
                             <i data-lucide="cloud-download" class="w-3.5 h-3.5"></i>
-                            Downloader
+                            {{ t('navbar.dropdown.downloader') }}
                         </button>
                     </div>
                 </div>
@@ -79,7 +79,7 @@
                         class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
                     >
                         <i data-lucide="settings" class="w-4 h-4"></i>
-                        Settings
+                        {{ t('navbar.tab.settings') }}
                         <i data-lucide="chevron-down" class="w-3 h-3 ml-0.5 opacity-50 hidden"></i>
                     </button>
                     <div
@@ -101,7 +101,7 @@
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
                         >
                             <i data-lucide="globe" class="w-3.5 h-3.5"></i>
-                            Global Settings
+                            {{ t('navbar.dropdown.global_settings') }}
                         </button>
                         <button
                             @click="mainTab = 'settings'; activeTab = 'models'; settingsDropdown = false"
@@ -111,7 +111,7 @@
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
                         >
                             <i data-lucide="cpu" class="w-3.5 h-3.5"></i>
-                            Model Settings
+                            {{ t('navbar.dropdown.model_settings') }}
                         </button>
                     </div>
                 </div>
@@ -123,7 +123,7 @@
                     class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
                 >
                     <i data-lucide="scroll-text" class="w-4 h-4"></i>
-                    Logs
+                    {{ t('navbar.tab.logs') }}
                 </button>
                 <button
                     @click="mainTab = 'bench'"
@@ -133,14 +133,14 @@
                     class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
                 >
                     <i data-lucide="gauge" class="w-4 h-4"></i>
-                    Bench
+                    {{ t('navbar.tab.bench') }}
                 </button>
                 <a
                     href="/admin/chat"
                     class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5 text-neutral-600 hover:text-neutral-900"
                 >
                     <i data-lucide="message-circle" class="w-4 h-4"></i>
-                    Chat
+                    {{ t('navbar.tab.chat') }}
                 </a>
             </div>
 
@@ -153,7 +153,7 @@
                     :class="theme === 'dark'
                         ? 'text-amber-400 hover:bg-neutral-700'
                         : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
-                    :title="theme === 'light' ? 'Dark Mode' : 'Light Mode'"
+                    :title="theme === 'light' ? window.t('navbar.theme.dark_mode') : window.t('navbar.theme.light_mode')"
                 >
                     <i x-show="theme === 'light'" data-lucide="sun" class="w-4 h-4"></i>
                     <i x-show="theme === 'dark'" data-lucide="moon" class="w-4 h-4" x-cloak></i>
@@ -166,7 +166,7 @@
                            hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all duration-200"
                 >
                     <i data-lucide="log-out" class="w-4 h-4 mr-2"></i>
-                    Logout
+                    {{ t('navbar.logout') }}
                 </button>
             </div>
         </div>

@@ -1,12 +1,21 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{ current_lang }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}oMLX Admin{% endblock %}</title>
 
-    <!-- Inter Font (self-hosted) -->
+    <!-- Inter Font (self-hosted, Latin) -->
     <link rel="stylesheet" href="/admin/static/fonts/inter/inter.css">
+
+    <!-- CJK Font (conditional, self-hosted) -->
+    {% if current_lang == 'zh' %}
+    <link rel="stylesheet" href="/admin/static/fonts/noto-sans-sc/noto-sans-sc.css">
+    {% elif current_lang == 'ko' %}
+    <link rel="stylesheet" href="/admin/static/fonts/noto-sans-kr/noto-sans-kr.css">
+    {% elif current_lang == 'ja' %}
+    <link rel="stylesheet" href="/admin/static/fonts/noto-sans-jp/noto-sans-jp.css">
+    {% endif %}
 
     <!-- Tailwind CSS (pre-compiled) -->
     <link rel="stylesheet" href="/admin/static/css/tailwind.css">
@@ -25,8 +34,28 @@
         })();
     </script>
 
+    <script>
+        // i18n locale strings
+        window._t = {{ locale_json | safe }};
+        window.t = function(key) { return window._t[key] !== undefined ? window._t[key] : key; };
+    </script>
+
     <style>
+        /* Language-specific font stack */
+        :root {
+            {% if current_lang == 'ko' %}
+            --font-sans: 'Noto Sans KR', 'Inter', system-ui, sans-serif;
+            {% elif current_lang == 'zh' %}
+            --font-sans: 'Noto Sans SC', 'Inter', system-ui, sans-serif;
+            {% elif current_lang == 'ja' %}
+            --font-sans: 'Noto Sans JP', 'Inter', system-ui, sans-serif;
+            {% else %}
+            --font-sans: 'Inter', system-ui, sans-serif;
+            {% endif %}
+        }
+
         body {
+            font-family: var(--font-sans) !important;
             -webkit-font-smoothing: antialiased;
             -moz-osx-font-smoothing: grayscale;
         }
