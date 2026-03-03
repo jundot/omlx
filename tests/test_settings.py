@@ -249,6 +249,7 @@ class TestCacheSettings:
         assert settings.enabled is True
         assert settings.ssd_cache_dir is None
         assert settings.ssd_cache_max_size == "auto"
+        assert settings.initial_cache_blocks == 256
 
     def test_get_ssd_cache_dir_default(self):
         """Test default SSD cache directory."""
@@ -287,6 +288,7 @@ class TestCacheSettings:
             "ssd_cache_dir": "/cache",
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",
+            "initial_cache_blocks": 256,
         }
 
     def test_from_dict(self):
@@ -300,6 +302,23 @@ class TestCacheSettings:
         assert settings.enabled is False
         assert settings.ssd_cache_dir == "/cache"
         assert settings.ssd_cache_max_size == "200GB"
+        assert settings.initial_cache_blocks == 256  # default
+
+    def test_from_dict_with_initial_cache_blocks(self):
+        """Test creation from dictionary with initial_cache_blocks."""
+        data = {
+            "enabled": True,
+            "initial_cache_blocks": 16384,
+        }
+        settings = CacheSettings.from_dict(data)
+        assert settings.initial_cache_blocks == 16384
+
+    def test_initial_cache_blocks_custom(self):
+        """Test custom initial_cache_blocks value."""
+        settings = CacheSettings(initial_cache_blocks=8192)
+        assert settings.initial_cache_blocks == 8192
+        result = settings.to_dict()
+        assert result["initial_cache_blocks"] == 8192
 
 
 class TestAuthSettings:
@@ -748,6 +767,18 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert any("ssd_cache_max_size" in e.lower() for e in errors)
 
+    def test_validate_invalid_initial_cache_blocks(self):
+        """Test validation catches invalid initial_cache_blocks."""
+        settings = GlobalSettings()
+        settings.cache.initial_cache_blocks = 0
+        errors = settings.validate()
+        assert any("initial_cache_blocks" in e.lower() for e in errors)
+
+        settings = GlobalSettings()
+        settings.cache.initial_cache_blocks = -1
+        errors = settings.validate()
+        assert any("initial_cache_blocks" in e.lower() for e in errors)
+
     def test_validate_multiple_errors(self):
         """Test validation returns multiple errors."""
         settings = GlobalSettings()
@@ -822,6 +853,17 @@ class TestGlobalSettings:
                 assert settings.cache.enabled is False
                 assert settings.cache.ssd_cache_dir == "/env/cache"
                 assert settings.cache.ssd_cache_max_size == "200GB"
+
+    def test_env_override_initial_cache_blocks(self):
+        """Test environment variable override for initial_cache_blocks."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {"OMLX_INITIAL_CACHE_BLOCKS": "16384"},
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.cache.initial_cache_blocks == 16384
 
     def test_env_override_cache_enabled_values(self):
         """Test various values for OMLX_CACHE_ENABLED."""
@@ -932,6 +974,13 @@ class TestGlobalSettings:
             assert settings.cache.ssd_cache_dir == "/cli/cache"
             assert settings.cache.ssd_cache_max_size == "500GB"
 
+    def test_cli_override_initial_cache_blocks(self):
+        """Test CLI override for initial_cache_blocks."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = Namespace(initial_cache_blocks=4096)
+            settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
+            assert settings.cache.initial_cache_blocks == 4096
+
     def test_cli_override_mcp(self):
         """Test CLI override for MCP settings."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -988,6 +1037,15 @@ class TestGlobalSettings:
         assert scheduler_config.max_num_seqs == 128
         assert scheduler_config.prefill_batch_size == 4
         assert scheduler_config.completion_batch_size == 16
+        assert scheduler_config.initial_cache_blocks == 256  # default
+
+    def test_to_scheduler_config_initial_cache_blocks(self):
+        """Test that initial_cache_blocks passes through to SchedulerConfig."""
+        settings = GlobalSettings()
+        settings.cache.initial_cache_blocks = 8192
+
+        scheduler_config = settings.to_scheduler_config()
+        assert scheduler_config.initial_cache_blocks == 8192
 
 
 class TestInitSettings:

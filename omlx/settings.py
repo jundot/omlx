@@ -223,6 +223,7 @@ class CacheSettings:
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
+    initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
 
     def get_ssd_cache_dir(self, base_path: Path) -> Path:
         """
@@ -264,6 +265,7 @@ class CacheSettings:
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
+            "initial_cache_blocks": self.initial_cache_blocks,
         }
 
     @classmethod
@@ -274,6 +276,7 @@ class CacheSettings:
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=data.get("hot_cache_max_size", "0"),
+            initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
 
 
@@ -651,6 +654,13 @@ class GlobalSettings:
             self.cache.ssd_cache_dir = ssd_cache_dir
         if ssd_cache_max := os.getenv("OMLX_SSD_CACHE_MAX_SIZE"):
             self.cache.ssd_cache_max_size = ssd_cache_max
+        if initial_blocks := os.getenv("OMLX_INITIAL_CACHE_BLOCKS"):
+            try:
+                self.cache.initial_cache_blocks = int(initial_blocks)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_INITIAL_CACHE_BLOCKS value: {initial_blocks}"
+                )
 
         # Auth settings
         if api_key := os.getenv("OMLX_API_KEY"):
@@ -717,6 +727,11 @@ class GlobalSettings:
             self.cache.ssd_cache_dir = args.ssd_cache_dir
         if hasattr(args, "ssd_cache_max_size") and args.ssd_cache_max_size is not None:
             self.cache.ssd_cache_max_size = args.ssd_cache_max_size
+        if (
+            hasattr(args, "initial_cache_blocks")
+            and args.initial_cache_blocks is not None
+        ):
+            self.cache.initial_cache_blocks = args.initial_cache_blocks
 
         # Auth settings
         if hasattr(args, "api_key") and args.api_key is not None:
@@ -847,6 +862,12 @@ class GlobalSettings:
             except ValueError as e:
                 errors.append(f"Invalid ssd_cache_max_size: {e}")
 
+        if self.cache.initial_cache_blocks <= 0:
+            errors.append(
+                f"Invalid initial_cache_blocks: "
+                f"{self.cache.initial_cache_blocks} (must be > 0)"
+            )
+
         # Sampling validation
         if self.sampling.max_tokens <= 0:
             errors.append(
@@ -894,6 +915,7 @@ class GlobalSettings:
             max_num_seqs=self.scheduler.max_num_seqs,
             prefill_batch_size=self.scheduler.prefill_batch_size,
             completion_batch_size=self.scheduler.completion_batch_size,
+            initial_cache_blocks=self.cache.initial_cache_blocks,
         )
 
     def to_dict(self) -> dict[str, Any]:

@@ -97,6 +97,7 @@ class GlobalSettingsRequest(BaseModel):
     ssd_cache_dir: Optional[str] = None
     ssd_cache_max_size: Optional[str] = None
     hot_cache_max_size: Optional[str] = None  # "0" = disabled, "8GB", etc.
+    initial_cache_blocks: Optional[int] = None  # Starting blocks (requires restart)
 
     # MCP settings
     mcp_config: Optional[str] = None
@@ -1296,6 +1297,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                 global_settings.cache.get_ssd_cache_max_size_bytes(global_settings.base_path)
             ),
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
+            "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
         },
         "mcp": {
             "config_path": global_settings.mcp.config_path,
@@ -1454,6 +1456,8 @@ async def update_global_settings(
     if request.hot_cache_max_size is not None:
         global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
         cache_changed = True
+    if request.initial_cache_blocks is not None:
+        global_settings.cache.initial_cache_blocks = request.initial_cache_blocks
 
     if cache_changed:
         success, msg = await _apply_cache_settings_runtime(

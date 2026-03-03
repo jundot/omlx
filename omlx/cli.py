@@ -306,6 +306,13 @@ Example directory structure:
         action="store_true",
         help="Disable oMLX paged SSD cache. mlx-lm BatchGenerator still manages KV states internally.",
     )
+    serve_parser.add_argument(
+        "--initial-cache-blocks",
+        type=int,
+        default=None,
+        help="Number of cache blocks to pre-allocate at startup (default: 256). "
+        "Higher values reduce dynamic allocation overhead for large contexts.",
+    )
 
     # MCP options
     serve_parser.add_argument(

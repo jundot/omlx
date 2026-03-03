@@ -234,6 +234,9 @@
     "settings.advanced.prefill_batch_size_hint": "Batch size for prompt encoding phase",
     "settings.advanced.completion_batch_size": "Completion Batch Size",
     "settings.advanced.completion_batch_size_hint": "Batch size for token generation phase",
+    "settings.advanced.cache": "Cache",
+    "settings.advanced.initial_cache_blocks": "Initial Cache Blocks",
+    "settings.advanced.initial_cache_blocks_hint": "Blocks pre-allocated at startup. Higher values reduce dynamic allocation overhead.",
 
     "settings.language.section_label": "Language",
     "settings.language.label": "Interface Language",

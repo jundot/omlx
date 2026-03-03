@@ -234,6 +234,9 @@
   "settings.advanced.prefill_batch_size_hint": "프롬프트 인코딩 단계의 배치 크기",
   "settings.advanced.completion_batch_size": "완성 배치 크기",
   "settings.advanced.completion_batch_size_hint": "토큰 생성 단계의 배치 크기",
+  "settings.advanced.cache": "캐시",
+  "settings.advanced.initial_cache_blocks": "초기 캐시 블록 수",
+  "settings.advanced.initial_cache_blocks_hint": "시작 시 미리 할당할 블록 수. 높을수록 동적 할당 오버헤드 감소.",
 
   "settings.language.section_label": "언어",
   "settings.language.label": "인터페이스 언어",
