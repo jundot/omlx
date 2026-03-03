@@ -286,6 +286,7 @@ class TestCacheSettings:
             "enabled": False,
             "ssd_cache_dir": "/cache",
             "ssd_cache_max_size": "50GB",
+            "hot_cache_max_size": "0",
         }
 
     def test_from_dict(self):
