@@ -235,6 +235,10 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
+
+        # Inject mlx-lm tool calling support into VLM tokenizer
+        self._inject_tool_calling(self._tokenizer)
+
         self._loaded = True
         logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
 
@@ -251,11 +255,65 @@ class VLMBatchedEngine(BaseEngine):
         self._loaded = False
         logger.info("VLMBatchedEngine stopped")
 
+    def _inject_tool_calling(self, tokenizer) -> None:
+        """Inject mlx-lm's tool calling attributes into VLM tokenizer.
+
+        mlx-vlm's TokenizerWrapper lacks tool calling support (has_tool_calling,
+        tool_parser, etc). We reuse mlx-lm's _infer_tool_parser() to detect the
+        parser type from the chat template, then set the attributes directly on
+        the wrapper instance so parse_tool_calls() can use native tool parsing.
+        """
+        try:
+            from mlx_lm.tokenizer_utils import _infer_tool_parser
+        except ImportError:
+            return
+
+        chat_template = getattr(tokenizer, "chat_template", None)
+        if not chat_template:
+            return
+
+        tool_parser_type = _infer_tool_parser(chat_template)
+        if tool_parser_type is None:
+            return
+
+        try:
+            import importlib
+
+            tool_module = importlib.import_module(
+                f"mlx_lm.tool_parsers.{tool_parser_type}"
+            )
+        except ImportError:
+            logger.warning(
+                f"VLM tool parser module not found: {tool_parser_type}"
+            )
+            return
+
+        tool_call_start = tool_module.tool_call_start
+        tool_call_end = tool_module.tool_call_end
+
+        # Validate tokens exist in vocab (same check as mlx-lm)
+        vocab = tokenizer.get_vocab()
+        if (tool_call_start and tool_call_start not in vocab) or (
+            tool_call_end and tool_call_end not in vocab
+        ):
+            return
+
+        # Set instance attributes on the mlx-vlm TokenizerWrapper.
+        # Python's __getattr__ is only called when normal lookup fails,
+        # so instance attributes take precedence over delegation to HF tokenizer.
+        tokenizer.has_tool_calling = True
+        tokenizer.tool_call_start = tool_call_start
+        tokenizer.tool_call_end = tool_call_end
+        tokenizer.tool_parser = tool_module.parse_tool_call
+
+        logger.info(f"VLM tool calling enabled: parser={tool_parser_type}")
+
     def _prepare_vision_inputs(
         self,
         messages: list[dict[str, Any]],
         images: list[Any],
         chat_template_kwargs: dict[str, Any] | None = None,
+        tools: list[dict] | None = None,
     ) -> Tuple[List[int], Optional[mx.array], Optional[Dict[str, Any]], Optional[str]]:
         """
         Run the full VLM preprocessing pipeline:
@@ -309,6 +367,8 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["enable_thinking"] = self._enable_thinking
         # Per-model/request kwargs override global defaults (e.g. enable_thinking,
         # reasoning_effort).  This mirrors the text-only _apply_chat_template().
+        if tools:
+            template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
 
@@ -673,9 +733,14 @@ class VLMBatchedEngine(BaseEngine):
             # Apply OCR-specific prompt if applicable
             ocr_messages = self._apply_ocr_prompt(messages)
 
+            # Convert tools for template format (same as text-only path)
+            template_tools = convert_tools_for_template(tools) if tools else None
+
             # VLM path: prepare vision inputs
             token_ids, vlm_embeds, vlm_kwargs, image_hash = self._prepare_vision_inputs(
-                ocr_messages, images, chat_template_kwargs=ct_kwargs
+                ocr_messages, images,
+                chat_template_kwargs=ct_kwargs,
+                tools=template_tools,
             )
             return token_ids, vlm_embeds, vlm_kwargs, image_hash
         else:
