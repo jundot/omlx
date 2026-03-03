@@ -68,16 +68,17 @@ def clean_all(preserve_venv: bool = False):
         SCRIPT_DIR / "_venvstacks_resolved.toml",
     ]
 
+    def _rm_onerror(func, path, exc_info):
+        """Handle .DS_Store and other permission errors during rmtree."""
+        os.chmod(path, 0o777)
+        func(path)
+
     for d in dirs_to_clean:
         if preserve_venv and d in venv_dirs:
             continue
         if d.exists():
-            shutil.rmtree(d, ignore_errors=True)
-            # Handle stubborn files like .DS_Store
-            if d.exists():
-                shutil.rmtree(d, ignore_errors=True)
-            if not d.exists():
-                print(f"  Removed {d.relative_to(SCRIPT_DIR)}/")
+            shutil.rmtree(d, onerror=_rm_onerror)
+            print(f"  Removed {d.relative_to(SCRIPT_DIR)}/")
 
     for f in files_to_clean:
         if preserve_venv and f.name == "_venvstacks_resolved.toml":
