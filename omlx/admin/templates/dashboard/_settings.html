@@ -36,6 +36,29 @@
                     <!-- Settings Sections -->
                     <div class="space-y-4">
 
+                        <!-- Language Section -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="globe" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.language.section_label') }}</span>
+                                </div>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <label class="text-sm text-neutral-700">{{ t('settings.language.label') }}</label>
+                                    <select x-model="globalSettings.ui.language"
+                                            @change="saveLanguage(globalSettings.ui.language)"
+                                            class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="en">{{ t('settings.language.en') }}</option>
+                                        <option value="zh">{{ t('settings.language.zh') }}</option>
+                                        <option value="ko">{{ t('settings.language.ko') }}</option>
+                                        <option value="ja">{{ t('settings.language.ja') }}</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+
                         <!-- Auth & Info Section -->
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
@@ -514,25 +537,6 @@
                                         </div>
                                     </div>
                                 </div>
-                            </div>
-                        </div>
-
-                        <!-- Language -->
-                        <div class="space-y-4">
-                            <h4 class="text-sm font-semibold text-neutral-800 flex items-center gap-2">
-                                <i data-lucide="globe" class="w-4 h-4"></i>
-                                {{ t('settings.language.section_label') }}
-                            </h4>
-                            <div>
-                                <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">{{ t('settings.language.label') }}</label>
-                                <select x-model="globalSettings.ui.language"
-                                        @change="saveLanguage(globalSettings.ui.language)"
-                                        class="w-full max-w-xs px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white">
-                                    <option value="en">{{ t('settings.language.en') }}</option>
-                                    <option value="zh">{{ t('settings.language.zh') }}</option>
-                                    <option value="ko">{{ t('settings.language.ko') }}</option>
-                                    <option value="ja">{{ t('settings.language.ja') }}</option>
-                                </select>
                             </div>
                         </div>
 
