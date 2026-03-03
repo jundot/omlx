@@ -45,9 +45,16 @@ def _read_version() -> str:
 VERSION = _read_version()
 
 
-def clean_all():
-    """Remove all build artifacts and caches for a clean build."""
-    print("\n[Clean] Removing all build artifacts...")
+def clean_all(preserve_venv: bool = False):
+    """Remove build artifacts and caches for a clean build.
+
+    Args:
+        preserve_venv: When True, keep _build/, _export/, _wheels/ and
+            requirements/ so that --skip-venv can reuse them.
+    """
+    print("\n[Clean] Removing build artifacts...")
+
+    venv_dirs = {BUILD_DIR, EXPORT_DIR, WHEELS_DIR, SCRIPT_DIR / "requirements"}
 
     dirs_to_clean = [
         BUILD_DIR,      # _build/
@@ -62,11 +69,19 @@ def clean_all():
     ]
 
     for d in dirs_to_clean:
+        if preserve_venv and d in venv_dirs:
+            continue
         if d.exists():
-            shutil.rmtree(d)
-            print(f"  Removed {d.relative_to(SCRIPT_DIR)}/")
+            shutil.rmtree(d, ignore_errors=True)
+            # Handle stubborn files like .DS_Store
+            if d.exists():
+                shutil.rmtree(d, ignore_errors=True)
+            if not d.exists():
+                print(f"  Removed {d.relative_to(SCRIPT_DIR)}/")
 
     for f in files_to_clean:
+        if preserve_venv and f.name == "_venvstacks_resolved.toml":
+            continue
         if f.exists():
             f.unlink()
             print(f"  Removed {f.relative_to(SCRIPT_DIR)}")
@@ -781,9 +796,9 @@ def main():
     print(f"Building {APP_NAME} v{VERSION}")
     print("=" * 50)
 
-    # Clean all build artifacts before starting (unless dmg-only)
+    # Clean build artifacts before starting (unless dmg-only)
     if not args.dmg_only:
-        clean_all()
+        clean_all(preserve_venv=args.skip_venv)
 
     DIST_DIR.mkdir(parents=True, exist_ok=True)
 
