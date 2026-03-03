@@ -743,7 +743,7 @@ class OMLXAppDelegate(NSObject):
 
             if not api_key:
                 self._cached_stats = None
-            self._cached_alltime_stats = None
+                self._cached_alltime_stats = None
                 return
 
             session = requests.Session()
@@ -754,7 +754,7 @@ class OMLXAppDelegate(NSObject):
             )
             if login_resp.status_code != 200:
                 self._cached_stats = None
-            self._cached_alltime_stats = None
+                self._cached_alltime_stats = None
                 return
 
             stats_resp = session.get(
@@ -765,7 +765,7 @@ class OMLXAppDelegate(NSObject):
                 self._cached_stats = stats_resp.json()
             else:
                 self._cached_stats = None
-            self._cached_alltime_stats = None
+                self._cached_alltime_stats = None
 
             alltime_resp = session.get(
                 f"{base_url}/admin/api/stats",
@@ -779,7 +779,6 @@ class OMLXAppDelegate(NSObject):
 
         except requests.RequestException:
             self._cached_stats = None
-            self._cached_alltime_stats = None
             self._cached_alltime_stats = None
 
     # --- Timer callback ---
