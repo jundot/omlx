@@ -48,6 +48,15 @@ class TestLoadImage:
         assert isinstance(loaded, Image.Image)
         assert loaded.size == (8, 8)
 
+    def test_rgba_converted_to_rgb(self):
+        """RGBA images (e.g. transparent PNGs) are converted to RGB."""
+        rgba_img = Image.new("RGBA", (8, 8), (255, 0, 0, 128))
+        b64 = _image_to_base64(rgba_img)
+        uri = f"data:image/png;base64,{b64}"
+
+        loaded = load_image(uri)
+        assert loaded.mode == "RGB"
+
     def test_load_base64_jpeg(self):
         """Load image from data URI with base64 JPEG."""
         img = _make_test_image(8, 8, "green")

@@ -43,16 +43,21 @@ def load_image(url_or_base64: str) -> Image.Image:
         except ValueError:
             raise ValueError(f"Invalid data URI format: {url_or_base64[:50]}...")
         img_bytes = base64.b64decode(data_part)
-        return Image.open(io.BytesIO(img_bytes))
+        img = Image.open(io.BytesIO(img_bytes))
     elif url_or_base64.startswith(("http://", "https://")):
         import urllib.request
 
         with urllib.request.urlopen(url_or_base64, timeout=30) as response:
             img_bytes = response.read()
-        return Image.open(io.BytesIO(img_bytes))
+        img = Image.open(io.BytesIO(img_bytes))
     else:
         # Try as local file path
-        return Image.open(url_or_base64)
+        img = Image.open(url_or_base64)
+
+    # Ensure RGB format (RGBA/P/L etc. cause broadcast errors in vision processors)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    return img
 
 
 def extract_images_from_messages(
