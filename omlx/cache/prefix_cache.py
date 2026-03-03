@@ -208,6 +208,7 @@ class BlockAwarePrefixCache(CacheManager):
         self,
         request_id: str,
         tokens: List[int],
+        extra_keys: Optional[Tuple[Any, ...]] = None,
     ) -> Tuple[Optional[BlockTable], List[int]]:
         """
         Find cached prefix blocks for the given tokens.
@@ -215,6 +216,7 @@ class BlockAwarePrefixCache(CacheManager):
         Args:
             request_id: Unique request identifier
             tokens: Input token sequence
+            extra_keys: Additional keys for hash (e.g., VLM image hash)
 
         Returns:
             Tuple of (block_table, remaining_tokens)
@@ -225,7 +227,9 @@ class BlockAwarePrefixCache(CacheManager):
             return None, tokens
 
         # Try to find shared prefix blocks
-        shared_block_ids, remaining = self.paged_cache.find_shared_prefix(tokens)
+        shared_block_ids, remaining = self.paged_cache.find_shared_prefix(
+            tokens, extra_keys=extra_keys
+        )
 
         if shared_block_ids:
             # Create block table for this request with shared blocks
@@ -251,7 +255,7 @@ class BlockAwarePrefixCache(CacheManager):
             return block_table, remaining
 
         # Try prefix index for longer matches
-        best_match = self._find_best_prefix_match(tokens)
+        best_match = self._find_best_prefix_match(tokens, extra_keys=extra_keys)
         if best_match:
             prefix_len, matched_block_ids, num_blocks = best_match
 
@@ -287,6 +291,7 @@ class BlockAwarePrefixCache(CacheManager):
         cache_data: List[Any],
         model_cache_config: Optional[ModelCacheConfig] = None,
         boundary_snapshots: Optional[Dict[int, List[Any]]] = None,
+        extra_keys: Optional[Tuple[Any, ...]] = None,
     ) -> Optional[BlockTable]:
         """
         Store computed cache for future reuse.
@@ -412,12 +417,15 @@ class BlockAwarePrefixCache(CacheManager):
 
             # Compute chain hash for this block
             block.block_hash = compute_block_hash(
-                parent_hash, block_tokens, model_name=self.paged_cache.model_name
+                parent_hash, block_tokens,
+                extra_keys=extra_keys, model_name=self.paged_cache.model_name,
             )
 
             # Register hash for full blocks (for deduplication)
             if len(block_tokens) == self.block_size:
-                self.paged_cache.register_block_hash(block, block_tokens, parent_hash)
+                self.paged_cache.register_block_hash(
+                    block, block_tokens, parent_hash, extra_keys=extra_keys
+                )
 
             # Extract tensor slice and save to paged SSD
             if is_tensor_data and HAS_MLX and self.paged_ssd_cache is not None:
@@ -501,7 +509,7 @@ class BlockAwarePrefixCache(CacheManager):
                     break
 
         # Update prefix index
-        self._update_prefix_index(tokens, block_table.block_ids)
+        self._update_prefix_index(tokens, block_table.block_ids, extra_keys=extra_keys)
 
         # Store entry for request tracking
         self._request_tables[request_id] = BlockCacheEntry(
@@ -1791,6 +1799,7 @@ class BlockAwarePrefixCache(CacheManager):
     def _find_best_prefix_match(
         self,
         tokens: List[int],
+        extra_keys: Optional[Tuple[Any, ...]] = None,
     ) -> Optional[Tuple[int, List[int], int]]:
         """Find best matching prefix in the index."""
         best_match = None
@@ -1809,6 +1818,7 @@ class BlockAwarePrefixCache(CacheManager):
             parent_hash = compute_block_hash(
                 parent_hash,
                 block_tokens,
+                extra_keys=extra_keys,
                 model_name=self.paged_cache.model_name,
             )
             prefix_len += len(block_tokens)
@@ -1825,6 +1835,7 @@ class BlockAwarePrefixCache(CacheManager):
         self,
         tokens: List[int],
         block_ids: List[int],
+        extra_keys: Optional[Tuple[Any, ...]] = None,
     ) -> None:
         """Update prefix index with new token sequence."""
         # Index prefixes using chain hashes (avoid O(n^2) full-prefix hashing).
@@ -1844,6 +1855,7 @@ class BlockAwarePrefixCache(CacheManager):
                 block_hash = compute_block_hash(
                     parent_hash,
                     block_tokens,
+                    extra_keys=extra_keys,
                     model_name=self.paged_cache.model_name,
                 )
                 if block is not None:

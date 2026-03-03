@@ -215,7 +215,8 @@ class EngineCore:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Engine loop error: {e}")
+                import traceback
+                logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
                 # Propagate error to all running requests so they don't hang
                 for rid in list(self.scheduler.running.keys()):
                     collector = self._output_collectors.get(rid)
@@ -240,6 +241,9 @@ class EngineCore:
         request_id: Optional[str] = None,
         images: Optional[List[Any]] = None,
         videos: Optional[List[Any]] = None,
+        vlm_inputs_embeds: Optional[Any] = None,
+        vlm_extra_kwargs: Optional[Dict[str, Any]] = None,
+        vlm_image_hash: Optional[str] = None,
     ) -> str:
         """
         Add a request for processing.
@@ -250,6 +254,9 @@ class EngineCore:
             request_id: Optional custom request ID
             images: Optional images for multimodal
             videos: Optional videos for multimodal
+            vlm_inputs_embeds: Pre-computed vision+text embeddings for VLM
+            vlm_extra_kwargs: Model-specific VLM kwargs (e.g., position_ids)
+            vlm_image_hash: SHA256 hash of images for prefix cache
 
         Returns:
             The request ID
@@ -266,6 +273,9 @@ class EngineCore:
             sampling_params=sampling_params,
             images=images,
             videos=videos,
+            vlm_inputs_embeds=vlm_inputs_embeds,
+            vlm_extra_kwargs=vlm_extra_kwargs,
+            vlm_image_hash=vlm_image_hash,
         )
 
         # Setup output collector with stream_interval from config

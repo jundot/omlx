@@ -969,8 +969,12 @@ class Scheduler:
                 stop_tokens.update(self.tokenizer.eos_token_id)
             else:
                 stop_tokens.add(self.tokenizer.eos_token_id)
-        if hasattr(self.tokenizer, 'eos_token_ids'):
-            stop_tokens.update(self.tokenizer.eos_token_ids)
+        if hasattr(self.tokenizer, 'eos_token_ids') and self.tokenizer.eos_token_ids is not None:
+            eos_ids = self.tokenizer.eos_token_ids
+            if isinstance(eos_ids, int):
+                stop_tokens.add(eos_ids)
+            else:
+                stop_tokens.update(eos_ids)
 
         # Add Harmony stop tokens for gpt-oss models (use cached tokens)
         if self._is_harmony_model and self._harmony_stop_tokens:
@@ -1840,9 +1844,15 @@ class Scheduler:
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
             # Use paged cache
+            # Build extra_keys for VLM image hash prefix cache isolation
+            extra_keys = None
+            if request.vlm_image_hash:
+                extra_keys = (request.vlm_image_hash,)
+
             block_table, remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
                 request.prompt_token_ids,
+                extra_keys=extra_keys,
             )
             if block_table and block_table.num_tokens > 0:
                 # Reconstruct actual KVCache objects from stored tensor data
@@ -2130,6 +2140,9 @@ class Scheduler:
         # Track cache status of first scheduled request to ensure homogeneity
         # None = not determined yet, True = has cache, False = no cache
         batch_cache_status: Optional[bool] = None
+        # Track VLM status: VLM and text-only requests cannot be in the same prefill batch
+        # None = not determined yet, True = VLM request, False = text-only request
+        batch_vlm_status: Optional[bool] = None
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
             request = self.waiting.popleft()
@@ -2167,6 +2180,20 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
+            # Check VLM status homogeneity: VLM and text-only requests use
+            # different prefill paths (embeddings vs token IDs)
+            request_is_vlm = request.vlm_inputs_embeds is not None
+            if batch_vlm_status is None:
+                batch_vlm_status = request_is_vlm
+            elif batch_vlm_status != request_is_vlm:
+                # VLM status mismatch - defer this request to next batch
+                self.waiting.appendleft(request)
+                logger.debug(
+                    f"Deferring request {request.request_id} to next batch "
+                    f"(VLM status mismatch: batch={batch_vlm_status}, request={request_is_vlm})"
+                )
+                break
+
             # Check cache status homogeneity to avoid mlx-lm _merge_caches bug
             request_has_cache = cache_to_use is not None
             if batch_cache_status is None:
@@ -2184,6 +2211,19 @@ class Scheduler:
             sampler, logits_processors = self._build_sampler_and_processors(
                 request.sampling_params
             )
+
+            # Set pending VLM embeddings on the model adapter before insert.
+            # The adapter will inject these during prefill, then auto-clear.
+            if request.vlm_inputs_embeds is not None and hasattr(self.model, "set_pending_embeddings"):
+                self.model.set_pending_embeddings(
+                    request.vlm_inputs_embeds,
+                    request.vlm_extra_kwargs,
+                    start_offset=request.cached_tokens,
+                )
+            elif not request_is_vlm and hasattr(self.model, "clear_vlm_position_state"):
+                # Text-only request: clear stale mRoPE position state from
+                # any prior VLM request to prevent position contamination.
+                self.model.clear_vlm_position_state()
 
             # Insert into BatchGenerator with optional cache
             uids = self.batch_generator.insert(
@@ -2209,13 +2249,21 @@ class Scheduler:
 
                 # Check if prompt ends with <think> token for reasoning models
                 # The chat template may end with "<think>\n" so check last few tokens
-                if hasattr(self.tokenizer, 'has_thinking') and self.tokenizer.has_thinking:
-                    think_start_id = getattr(self.tokenizer, 'think_start_id', None)
-                    if think_start_id and request.prompt_token_ids:
-                        # Check last 3 tokens (covers "<think>\n" case)
-                        last_tokens = request.prompt_token_ids[-3:]
-                        if think_start_id in last_tokens:
-                            request.needs_think_prefix = True
+                think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+                if think_start_id is None:
+                    # VLM tokenizers loaded via mlx-vlm may not have think_start_id.
+                    # Try to resolve it from the vocabulary directly.
+                    try:
+                        think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
+                        if think_start_id == self.tokenizer.unk_token_id:
+                            think_start_id = None
+                    except (AttributeError, KeyError, TypeError):
+                        pass
+                if think_start_id and request.prompt_token_ids:
+                    # Check last 3 tokens (covers "<think>\n" case)
+                    last_tokens = request.prompt_token_ids[-3:]
+                    if think_start_id in last_tokens:
+                        request.needs_think_prefix = True
 
                 self.total_prompt_tokens += request.num_prompt_tokens
                 cache_info = f", {request.cached_tokens} cached" if request.cached_tokens > 0 else ""
@@ -2255,6 +2303,11 @@ class Scheduler:
             request = self.running.get(request_id)
             if request is None:
                 continue
+
+            # Release VLM embeddings after first decode token (prefill is done)
+            if request.vlm_inputs_embeds is not None:
+                request.vlm_inputs_embeds = None
+                request.vlm_extra_kwargs = None
 
             # Check finish reason first - don't include EOS token in output
             # (following mlx-lm's batch_generate behavior)
@@ -2523,12 +2576,18 @@ class Scheduler:
                                         f"intermediate snapshots)"
                                     )
 
+                                # Build extra_keys for VLM image hash
+                                store_extra_keys = None
+                                if request.vlm_image_hash:
+                                    store_extra_keys = (request.vlm_image_hash,)
+
                                 block_table = self.block_aware_cache.store_cache(
                                     request_id,
                                     token_sequence_to_store,
                                     cache_to_store,
                                     model_cache_config=model_cache_config,
                                     boundary_snapshots=intermediate_snapshots,
+                                    extra_keys=store_extra_keys,
                                 )
                             logger.debug(
                                 f"Stored paged cache for request {request_id} "

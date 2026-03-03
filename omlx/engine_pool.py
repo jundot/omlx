@@ -28,6 +28,7 @@ import mlx.core as mx
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
+from .engine.vlm import VLMBatchedEngine
 from .exceptions import (
     EnginePoolError,
     InsufficientMemoryError,
@@ -47,8 +48,8 @@ class EngineEntry:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: Literal["llm", "embedding", "reranker"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker"]  # Engine type to use
+    model_type: Literal["llm", "vlm", "embedding", "reranker"]  # Model type
+    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
@@ -389,6 +390,12 @@ class EnginePool:
             elif entry.engine_type == "reranker":
                 # RerankerEngine for reranker models
                 engine = RerankerEngine(model_name=entry.model_path)
+            elif entry.engine_type == "vlm":
+                # VLMBatchedEngine for vision-language models
+                engine = VLMBatchedEngine(
+                    model_name=entry.model_path,
+                    scheduler_config=self._scheduler_config,
+                )
             else:
                 # BatchedEngine with continuous batching (default)
                 engine = BatchedEngine(

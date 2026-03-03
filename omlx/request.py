@@ -125,6 +125,11 @@ class Request:
     images: Optional[List[Any]] = None
     videos: Optional[List[Any]] = None
 
+    # VLM (Vision-Language Model) fields
+    vlm_inputs_embeds: Optional[Any] = None  # Pre-computed vision+text embeddings (mx.array)
+    vlm_extra_kwargs: Optional[Dict[str, Any]] = None  # Model-specific kwargs (e.g., position_ids)
+    vlm_image_hash: Optional[str] = None  # SHA256 hash of images for prefix cache
+
     # Metadata
     finish_reason: Optional[str] = None
 

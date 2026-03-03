@@ -78,6 +78,39 @@ def _extract_text_from_content_list(content: list) -> str:
     return "\n".join(text_parts) if text_parts else ""
 
 
+def _extract_multimodal_content_list(content: list) -> list:
+    """Extract text and image parts from a content array, preserving images.
+
+    Keeps both text and image_url items for VLM processing.
+    Other content types (tool_use, thinking, refusal, etc.) are dropped.
+    """
+    parts = []
+    for item in content:
+        if hasattr(item, 'model_dump'):
+            item = item.model_dump()
+        elif hasattr(item, 'dict'):
+            item = item.dict()
+        if isinstance(item, dict):
+            item_type = item.get("type")
+            if item_type == "text":
+                parts.append(item)
+            elif item_type == "image_url":
+                parts.append(item)
+            elif item_type == "image":
+                # Anthropic format: convert to OpenAI image_url format
+                source = item.get("source", {})
+                if source.get("type") == "base64":
+                    media_type = source.get("media_type", "image/jpeg")
+                    data = source.get("data", "")
+                    parts.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{media_type};base64,{data}",
+                        },
+                    })
+    return parts
+
+
 # Roles eligible for merging when consecutive.
 # System and tool messages are excluded: system messages have distinct semantics
 # (e.g., JSON schema instructions), and tool messages carry tool_call_id.
@@ -248,6 +281,133 @@ def extract_text_content(
             processed_messages.append({"role": role, "content": str(content)})
 
     return _merge_consecutive_roles(processed_messages)
+
+
+def extract_multimodal_content(
+    messages: List[Message],
+    max_tool_result_tokens: int | None = None,
+    tokenizer: Any | None = None,
+) -> List[dict]:
+    """
+    Extract content from messages, preserving image_url parts for VLM.
+
+    Same as extract_text_content but keeps image_url content parts
+    in their original list format for VLM processing.
+
+    Args:
+        messages: List of Message objects
+        max_tool_result_tokens: Maximum token count for tool results.
+        tokenizer: Tokenizer instance for token counting and truncation.
+
+    Returns:
+        List of message dicts. Messages with images have content as list.
+    """
+    processed_messages = []
+
+    for msg in messages:
+        role = msg.role
+        content = msg.content
+
+        if role == "developer":
+            role = "system"
+
+        # Tool response messages - same as extract_text_content
+        if role == "tool":
+            tool_call_id = getattr(msg, 'tool_call_id', None) or ''
+            tool_content = content if content else ""
+            if max_tool_result_tokens and tokenizer and tool_content:
+                from .anthropic_utils import truncate_tool_result
+                tool_content = truncate_tool_result(
+                    tool_content, max_tool_result_tokens, tokenizer
+                )
+            if getattr(tokenizer, 'has_tool_calling', False):
+                processed_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": tool_content,
+                })
+            else:
+                processed_messages.append({
+                    "role": "user",
+                    "content": f"[Tool Result ({tool_call_id})]: {tool_content}"
+                })
+            continue
+
+        # Assistant with tool_calls - same as extract_text_content
+        if role == "assistant" and hasattr(msg, 'tool_calls') and msg.tool_calls:
+            if isinstance(content, list):
+                content = _extract_text_from_content_list(content)
+            msg_dict = {"role": role, "content": content if content else ""}
+
+            if getattr(tokenizer, 'has_tool_calling', False):
+                tool_calls_list = []
+                for tc in msg.tool_calls:
+                    if isinstance(tc, dict):
+                        func = tc.get("function", {})
+                        tool_calls_list.append({
+                            "id": tc.get("id", ""),
+                            "function": {
+                                "name": func.get("name", ""),
+                                "arguments": _try_parse_json(
+                                    func.get("arguments", "{}")
+                                ),
+                            }
+                        })
+                    else:
+                        args_str = (
+                            getattr(tc.function, 'arguments', '{}')
+                            if hasattr(tc, 'function') else '{}'
+                        )
+                        tool_calls_list.append({
+                            "id": getattr(tc, 'id', ''),
+                            "function": {
+                                "name": (
+                                    getattr(tc.function, 'name', '')
+                                    if hasattr(tc, 'function') else ''
+                                ),
+                                "arguments": _try_parse_json(args_str),
+                            }
+                        })
+                msg_dict["tool_calls"] = tool_calls_list
+            else:
+                tool_calls_text = []
+                for tc in msg.tool_calls:
+                    if isinstance(tc, dict):
+                        func = tc.get("function", {})
+                        name = func.get("name", "unknown")
+                        args = func.get("arguments", "{}")
+                        tool_calls_text.append(f"[Calling tool: {name}({args})]")
+                text = msg_dict["content"]
+                if tool_calls_text:
+                    text = (text + "\n" if text else "") + "\n".join(tool_calls_text)
+                msg_dict["content"] = text
+
+            processed_messages.append(msg_dict)
+            continue
+
+        if content is None:
+            processed_messages.append({"role": role, "content": ""})
+            continue
+
+        if isinstance(content, str):
+            processed_messages.append({"role": role, "content": content})
+        elif isinstance(content, list):
+            # Preserve image_url parts for VLM processing
+            multimodal_parts = _extract_multimodal_content_list(content)
+            has_images = any(
+                p.get("type") == "image_url" for p in multimodal_parts
+            )
+            if has_images:
+                # Keep as content list for VLM engine
+                processed_messages.append({"role": role, "content": multimodal_parts})
+            else:
+                # Text-only, flatten to string
+                combined_text = _extract_text_from_content_list(content)
+                processed_messages.append({"role": role, "content": combined_text})
+        else:
+            processed_messages.append({"role": role, "content": str(content)})
+
+    return processed_messages
 
 
 # =============================================================================

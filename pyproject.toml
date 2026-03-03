@@ -57,6 +57,9 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
+    # VLM (Vision-Language Model) support
+    "mlx-vlm>=0.3.12",
+    "Pillow>=9.0.0",
 ]
 
 [project.optional-dependencies]

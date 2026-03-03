@@ -33,6 +33,7 @@ def convert_anthropic_to_internal(
     request: MessagesRequest,
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
+    preserve_images: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Convert Anthropic Messages API format to internal format.
@@ -41,12 +42,17 @@ def convert_anthropic_to_internal(
     - System message from separate 'system' field
     - Content blocks to text
     - Tool results and tool uses in message history
+    - Image blocks (when preserve_images=True for VLM)
 
     Args:
         request: Anthropic MessagesRequest
+        max_tool_result_tokens: Maximum token count for tool results.
+        tokenizer: Tokenizer instance for token counting and truncation.
+        preserve_images: If True, preserve image blocks as OpenAI image_url
+            format for VLM processing.
 
     Returns:
-        List of {"role": str, "content": str}
+        List of {"role": str, "content": str or list}
     """
     processed_messages: list[dict[str, Any]] = []
 
@@ -67,6 +73,7 @@ def convert_anthropic_to_internal(
         elif isinstance(content, list):
             # Content blocks list
             text_parts: list[str] = []
+            image_parts: list[dict] = []
             for block in content:
                 # Handle both Pydantic models and dicts
                 if hasattr(block, "model_dump"):
@@ -80,6 +87,26 @@ def convert_anthropic_to_internal(
 
                 if block_type == "text":
                     text_parts.append(block_dict.get("text", ""))
+
+                elif block_type == "image" and preserve_images:
+                    # Anthropic image block -> OpenAI image_url format
+                    source = block_dict.get("source", {})
+                    if source.get("type") == "base64":
+                        media_type = source.get("media_type", "image/jpeg")
+                        data = source.get("data", "")
+                        image_parts.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{data}",
+                            },
+                        })
+                    elif source.get("type") == "url":
+                        image_parts.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": source.get("url", ""),
+                            },
+                        })
 
                 elif block_type == "tool_use":
                     # Tool use in assistant message (model called a tool)
@@ -105,8 +132,20 @@ def convert_anthropic_to_internal(
                     # Thinking blocks are ignored (reasoning content is not passed to model)
                     continue
 
-            combined_text = "\n".join(text_parts) if text_parts else ""
-            processed_messages.append({"role": role, "content": combined_text})
+            if image_parts:
+                # Build multimodal content list for VLM
+                content_parts = []
+                for img in image_parts:
+                    content_parts.append(img)
+                if text_parts:
+                    content_parts.append({
+                        "type": "text",
+                        "text": "\n".join(text_parts),
+                    })
+                processed_messages.append({"role": role, "content": content_parts})
+            else:
+                combined_text = "\n".join(text_parts) if text_parts else ""
+                processed_messages.append({"role": role, "content": combined_text})
         else:
             # Unknown format
             processed_messages.append({"role": role, "content": str(content)})
