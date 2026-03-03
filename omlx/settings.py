@@ -802,7 +802,7 @@ class GlobalSettings:
                 f"Invalid port: {self.server.port} (must be 1-65535)"
             )
 
-        valid_log_levels = {"debug", "info", "warning", "error", "critical"}
+        valid_log_levels = {"trace", "debug", "info", "warning", "error", "critical"}
         if self.server.log_level.lower() not in valid_log_levels:
             errors.append(
                 f"Invalid log_level: {self.server.log_level} "

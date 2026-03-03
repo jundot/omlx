@@ -730,7 +730,7 @@ class TestGlobalSettings:
 
     def test_validate_valid_log_levels(self):
         """Test validation accepts all valid log levels."""
-        for level in ["debug", "info", "warning", "error", "critical"]:
+        for level in ["trace", "debug", "info", "warning", "error", "critical"]:
             settings = GlobalSettings()
             settings.server.log_level = level
             errors = settings.validate()
