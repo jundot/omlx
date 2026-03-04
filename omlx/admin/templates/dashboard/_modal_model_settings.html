@@ -76,13 +76,8 @@
                         </div>
                     </div>
 
-                    <!-- Row 3: Repetition Penalty / Top P / Top K -->
+                    <!-- Row 3: Top P / Top K / Repetition Penalty -->
                     <div class="grid grid-cols-3 gap-4">
-                        <div>
-                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.repetition_penalty') }}</label>
-                            <input type="number" x-model.number="modelSettings.repetition_penalty" step="0.05" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                        </div>
                         <div>
                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.top_p') }}</label>
                             <input type="number" x-model.number="modelSettings.top_p" step="0.05" min="0" max="1" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
@@ -91,6 +86,13 @@
                         <div>
                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.top_k') }}</label>
                             <input type="number" x-model.number="modelSettings.top_k" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
+                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                        </div>
+                        <div>
+                            <label class="relative group block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2 cursor-default">{{ t('modal.model_settings.repetition_penalty_short') }}
+                                <span class="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 px-2 py-1 bg-neutral-800 text-white text-xs font-normal normal-case tracking-normal rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">{{ t('modal.model_settings.repetition_penalty') }}</span>
+                            </label>
+                            <input type="number" x-model.number="modelSettings.repetition_penalty" step="0.05" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                         </div>
                     </div>

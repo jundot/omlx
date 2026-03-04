@@ -266,6 +266,7 @@
   "modal.model_settings.max_tokens": "最大 Token 数",
   "modal.model_settings.temperature": "温度",
   "modal.model_settings.repetition_penalty": "重复惩罚",
+  "modal.model_settings.repetition_penalty_short": "Rep. Penalty",
   "modal.model_settings.top_p": "Top P",
   "modal.model_settings.top_k": "Top K",
   "modal.model_settings.ttl_seconds": "TTL（秒）",

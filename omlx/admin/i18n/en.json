@@ -290,6 +290,7 @@
     "modal.model_settings.max_tokens": "Max Tokens",
     "modal.model_settings.temperature": "Temperature",
     "modal.model_settings.repetition_penalty": "Repetition Penalty",
+    "modal.model_settings.repetition_penalty_short": "Rep. Penalty",
     "modal.model_settings.top_p": "Top P",
     "modal.model_settings.top_k": "Top K",
     "modal.model_settings.ttl_seconds": "TTL (Seconds)",
