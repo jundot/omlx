@@ -323,7 +323,10 @@ async def lifespan(app: FastAPI):
         ttl_task = asyncio.create_task(_ttl_check_loop())
 
     # Initialize MCP if config provided
+    # Priority: env var > settings.json
     mcp_config = os.environ.get("OMLX_MCP_CONFIG")
+    if not mcp_config and _server_state.global_settings:
+        mcp_config = _server_state.global_settings.mcp.config_path
     if mcp_config:
         await init_mcp(mcp_config)
 

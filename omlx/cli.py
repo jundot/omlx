@@ -114,9 +114,11 @@ def serve_command(args):
     print(f"Max process memory: {settings.memory.max_process_memory}")
 
     # Store MCP config path for FastAPI startup
-    if args.mcp_config:
-        print(f"MCP config: {args.mcp_config}")
-        os.environ["OMLX_MCP_CONFIG"] = args.mcp_config
+    # Priority: CLI arg > settings.json
+    mcp_config = args.mcp_config or settings.mcp.config_path
+    if mcp_config:
+        print(f"MCP config: {mcp_config}")
+        os.environ["OMLX_MCP_CONFIG"] = mcp_config
 
     # Determine paged SSD cache directory
     # Priority: --no-cache > CLI arg > settings file

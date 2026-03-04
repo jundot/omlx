@@ -114,7 +114,8 @@ def validate_config(data: Dict[str, Any]) -> MCPConfig:
         raise ValueError("MCP config must be a dictionary")
 
     # Validate servers section
-    servers_data = data.get("servers", {})
+    # Support both oMLX ("servers") and Claude Desktop ("mcpServers") format
+    servers_data = data.get("servers") or data.get("mcpServers", {})
     if not isinstance(servers_data, dict):
         raise ValueError("'servers' must be a dictionary")
 
