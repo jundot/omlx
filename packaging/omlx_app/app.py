@@ -972,7 +972,7 @@ class OMLXAppDelegate(NSObject):
         alert.setMessageText_("About oMLX")
         alert.setInformativeText_(
             "oMLX - LLM inference,\noptimized for your Mac\n\n"
-            "Built with MLX and mlx-lm\n"
+            "Built with MLX, mlx-lm, and mlx-vlm\n"
             f"Version: {__version__}"
         )
         alert.addButtonWithTitle_("OK")

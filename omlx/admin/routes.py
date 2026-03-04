@@ -1784,6 +1784,7 @@ def _get_engine_info() -> dict:
     engines = {}
     packages = {
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
+        "mlx-vlm": "https://github.com/Blaizzy/mlx-vlm",
         "mlx-embeddings": "https://github.com/Blaizzy/mlx-embeddings",
     }
 

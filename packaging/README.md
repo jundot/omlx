@@ -59,7 +59,7 @@ oMLX.app/
 | Layer | Contents |
 |-------|----------|
 | Runtime | Python 3.11 |
-| Framework | MLX, mlx-lm, FastAPI, transformers |
+| Framework | MLX, mlx-lm, mlx-vlm, FastAPI, transformers |
 | Application | rumps, PyObjC |
 
 ## Installation
