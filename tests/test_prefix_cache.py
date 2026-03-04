@@ -1021,6 +1021,230 @@ class TestArraysCacheLastBlockOnly:
         failed_hash = compute_block_hash(None, tokens, model_name="test-model")
         assert paged_cache.cached_block_hash_to_block.get_block(failed_hash) is None
 
+    def test_store_cache_keeps_valid_prefix_when_later_ssd_save_fails(self, mx):
+        """A later SSD save failure should roll back only the failed block."""
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.side_effect = [True, False]
+
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        # Seed request with one already-cached prefix block.
+        existing_tokens = [10, 11, 12, 13]
+        existing_block = paged_cache.allocate_block()
+        assert existing_block is not None
+        existing_block.token_count = block_size
+        block_table = paged_cache.create_block_table("req-partial-rollback")
+        block_table.block_ids.append(existing_block.block_id)
+        block_table.num_tokens = block_size
+        paged_cache.register_block_hash(existing_block, existing_tokens, None)
+        assert existing_block.block_hash is not None
+
+        # Add two more blocks; first save succeeds, second save fails.
+        tokens = existing_tokens + [20, 21, 22, 23, 30, 31, 32, 33]
+        keys = mx.arange(12, dtype=mx.float32).reshape(1, 1, 12, 1)
+        values = (mx.arange(12, dtype=mx.float32) + 100).reshape(1, 1, 12, 1)
+        cache_data = [
+            {"state": (keys, values), "cache_type": "KVCache", "class_name": "KVCache"}
+        ]
+
+        result = cache.store_cache("req-partial-rollback", tokens, cache_data)
+
+        assert result is not None
+
+        first_new_hash = compute_block_hash(
+            existing_block.block_hash, tokens[4:8], model_name="test-model"
+        )
+        failed_hash = compute_block_hash(first_new_hash, tokens[8:12], model_name="test-model")
+
+        # Keep existing block + first new block; drop only the failed second new block.
+        assert len(result.block_ids) == 2
+        assert result.num_tokens == 8
+        assert result.block_ids[0] == existing_block.block_id
+
+        first_new_block = paged_cache.cached_block_hash_to_block.get_block(first_new_hash)
+        assert first_new_block is not None
+        assert result.block_ids[1] == first_new_block.block_id
+        assert result.block_ids == [existing_block.block_id, first_new_block.block_id]
+
+        # save_block should attempt exactly two writes in this scenario.
+        calls = mock_ssd.save_block.call_args_list
+        assert len(calls) == 2
+        attempted_hashes = [call.kwargs["block_hash"] for call in calls]
+        assert attempted_hashes == [first_new_hash, failed_hash]
+        assert [call.kwargs["token_count"] for call in calls] == [block_size, block_size]
+
+        # Verify global-index slices were persisted for both attempted new blocks.
+        first_saved_keys, first_saved_values = calls[0].kwargs["cache_data"][0]
+        failed_saved_keys, failed_saved_values = calls[1].kwargs["cache_data"][0]
+        assert first_saved_keys.tolist() == keys[:, :, 4:8, :].tolist()
+        assert first_saved_values.tolist() == values[:, :, 4:8, :].tolist()
+        assert failed_saved_keys.tolist() == keys[:, :, 8:12, :].tolist()
+        assert failed_saved_values.tolist() == values[:, :, 8:12, :].tolist()
+
+        assert paged_cache.cached_block_hash_to_block.get_block(first_new_hash) is not None
+        assert paged_cache.cached_block_hash_to_block.get_block(failed_hash) is None
+        # Failed block should be freed, not just removed from hash index.
+        allocated_non_null_ids = {
+            block.block_id
+            for block in paged_cache.allocated_blocks.values()
+            if not block.is_null
+        }
+        assert allocated_non_null_ids == {existing_block.block_id, first_new_block.block_id}
+        assert all(
+            b.block_hash != failed_hash for b in paged_cache.allocated_blocks.values()
+        )
+
+        # Public contract after partial failure: only valid prefix should be reused.
+        expected_partial_ids = [existing_block.block_id, first_new_block.block_id]
+        fetched_partial, remaining_partial = cache.fetch_cache(
+            "req-partial-rollback-hit", tokens
+        )
+        assert fetched_partial is not None
+        assert fetched_partial.block_ids == expected_partial_ids
+        assert fetched_partial.num_tokens == 8
+        assert remaining_partial == tokens[8:12]
+
+    def test_store_cache_retry_after_partial_failure_saves_only_missing_tail(self, mx):
+        """Retry should preserve valid prefix and only save the missing tail block."""
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.side_effect = [True, False, True]
+
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        existing_tokens = [10, 11, 12, 13]
+        existing_block = paged_cache.allocate_block()
+        assert existing_block is not None
+        existing_block.token_count = block_size
+        block_table = paged_cache.create_block_table("req-retry")
+        block_table.block_ids.append(existing_block.block_id)
+        block_table.num_tokens = block_size
+        paged_cache.register_block_hash(existing_block, existing_tokens, None)
+        assert existing_block.block_hash is not None
+
+        tokens = existing_tokens + [20, 21, 22, 23, 30, 31, 32, 33]
+        keys = mx.arange(12, dtype=mx.float32).reshape(1, 1, 12, 1)
+        values = (mx.arange(12, dtype=mx.float32) + 100).reshape(1, 1, 12, 1)
+        cache_data = [
+            {"state": (keys, values), "cache_type": "KVCache", "class_name": "KVCache"}
+        ]
+
+        first_result = cache.store_cache("req-retry", tokens, cache_data)
+        assert first_result is not None
+
+        first_new_hash = compute_block_hash(
+            existing_block.block_hash, tokens[4:8], model_name="test-model"
+        )
+        tail_hash = compute_block_hash(first_new_hash, tokens[8:12], model_name="test-model")
+        first_new_block = paged_cache.cached_block_hash_to_block.get_block(first_new_hash)
+        assert first_new_block is not None
+        retained_prefix_ids = first_result.block_ids.copy()
+        assert retained_prefix_ids == [existing_block.block_id, first_new_block.block_id]
+
+        retry_result = cache.store_cache("req-retry", tokens, cache_data)
+        assert retry_result is not None
+
+        calls = mock_ssd.save_block.call_args_list
+        assert len(calls) == 3
+        attempted_hashes = [call.kwargs["block_hash"] for call in calls]
+        assert attempted_hashes == [first_new_hash, tail_hash, tail_hash]
+        assert attempted_hashes.count(first_new_hash) == 1
+        assert attempted_hashes.count(tail_hash) == 2
+        assert [call.kwargs["token_count"] for call in calls] == [block_size, block_size, block_size]
+        retry_saved_keys, retry_saved_values = calls[2].kwargs["cache_data"][0]
+        assert retry_saved_keys.tolist() == keys[:, :, 8:12, :].tolist()
+        assert retry_saved_values.tolist() == values[:, :, 8:12, :].tolist()
+
+        assert len(retry_result.block_ids) == 3
+        assert retry_result.num_tokens == 12
+        assert retry_result.block_ids[:2] == retained_prefix_ids
+        assert len(set(retry_result.block_ids)) == 3
+
+        tail_block = paged_cache.cached_block_hash_to_block.get_block(tail_hash)
+        assert tail_block is not None
+        assert retry_result.block_ids[2] == tail_block.block_id
+
+        # Reconstruct full cache and verify tensor content for retry flow.
+        saved_by_hash = {
+            existing_block.block_hash: [
+                (keys[:, :, 0:4, :], values[:, :, 0:4, :]),
+            ],
+        }
+        for call in calls:
+            saved_by_hash[call.kwargs["block_hash"]] = call.kwargs["cache_data"]
+
+        def load_block_with_metadata(block_hash):
+            block_data = saved_by_hash.get(block_hash)
+            if block_data is None:
+                return None, None
+            return (
+                block_data,
+                {
+                    "model_name": "test-model",
+                    "num_layers": 1,
+                    "layer_cache_types": ["KVCache"],
+                    "layer_meta_states": [()],
+                },
+            )
+
+        mock_ssd.load_block_with_metadata.side_effect = load_block_with_metadata
+        reconstructed = cache.reconstruct_cache(retry_result)
+        assert reconstructed is not None
+        assert len(reconstructed) == 1
+        layer_cache = reconstructed[0]
+        if hasattr(layer_cache, "state"):
+            reconstructed_keys, reconstructed_values = layer_cache.state
+        elif isinstance(layer_cache, (list, tuple)) and len(layer_cache) == 2:
+            reconstructed_keys, reconstructed_values = layer_cache
+        else:
+            reconstructed_keys, reconstructed_values = layer_cache.keys, layer_cache.values
+
+        assert reconstructed_keys.tolist() == keys.tolist()
+        assert reconstructed_values.tolist() == values.tolist()
+
+        # Force prefix-index fallback by removing chain-hash index entries.
+        for block_id in retry_result.block_ids:
+            block = paged_cache.allocated_blocks.get(block_id)
+            assert block is not None
+            assert block.block_hash is not None
+            paged_cache.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
+
+        # Explicitly prove shared-hash path cannot succeed in this fixture.
+        assert paged_cache._paged_ssd_cache_manager is None
+        shared_block_ids, _ = paged_cache.find_shared_prefix(tokens)
+        assert shared_block_ids == []
+
+        expected_ids = retry_result.block_ids.copy()
+        # Public contract via prefix-index fallback: full prefix hit, no remaining tokens.
+        fetched_table, remaining = cache.fetch_cache("req-retry-prefix-index-hit", tokens)
+        assert fetched_table is not None
+        assert fetched_table.block_ids == expected_ids
+        assert fetched_table.num_tokens == 12
+        assert remaining == []
+
 
 class TestPrefixCacheCacheList:
     """Tests for CacheList support in BlockAwarePrefixCache."""
