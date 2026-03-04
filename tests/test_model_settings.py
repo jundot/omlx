@@ -144,6 +144,25 @@ class TestModelSettings:
         d = settings.to_dict()
         assert "ttl_seconds" not in d
 
+    def test_model_type_override_default(self):
+        """Test model_type_override defaults to None."""
+        settings = ModelSettings()
+        assert settings.model_type_override is None
+
+    def test_model_type_override_roundtrip(self):
+        """Test model_type_override survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(model_type_override="vlm")
+        d = original.to_dict()
+        assert d["model_type_override"] == "vlm"
+        restored = ModelSettings.from_dict(d)
+        assert restored.model_type_override == "vlm"
+
+    def test_model_type_override_excluded_when_none(self):
+        """Test model_type_override excluded from to_dict when None."""
+        settings = ModelSettings()
+        d = settings.to_dict()
+        assert "model_type_override" not in d
+
 
 class TestModelSettingsManager:
     """Tests for ModelSettingsManager class."""
@@ -321,6 +340,34 @@ class TestModelSettingsManager:
             loaded = manager2.get_settings("test-model")
             assert loaded.forced_ct_kwargs == ["enable_thinking"]
             assert loaded.chat_template_kwargs == {"enable_thinking": False}
+
+    def test_model_type_override_persist(self):
+        """Test model_type_override survives save/load cycle."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            settings = ModelSettings(model_type_override="embedding")
+            manager.set_settings("test-model", settings)
+
+            # Reload from file
+            manager2 = ModelSettingsManager(Path(tmpdir))
+            loaded = manager2.get_settings("test-model")
+            assert loaded.model_type_override == "embedding"
+
+    def test_model_type_override_clear(self):
+        """Test clearing model_type_override by setting to None."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            settings = ModelSettings(model_type_override="vlm")
+            manager.set_settings("test-model", settings)
+            assert manager.get_settings("test-model").model_type_override == "vlm"
+
+            # Clear override
+            settings = ModelSettings(model_type_override=None)
+            manager.set_settings("test-model", settings)
+            loaded = manager.get_settings("test-model")
+            assert loaded.model_type_override is None
 
     def test_forced_ct_kwargs_default_none(self):
         """Test forced_ct_kwargs defaults to None."""

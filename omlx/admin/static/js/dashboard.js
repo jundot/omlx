@@ -65,6 +65,7 @@
             showModelSettingsModal: false,
             selectedModel: null,
             modelSettings: {
+                model_type_override: '',
                 max_context_window: null,
                 max_tokens: null,
                 temperature: null,
@@ -504,6 +505,7 @@
                 }
                 const isOcr = OCR_CONFIG_MODEL_TYPES.has(model.config_model_type || '');
                 this.modelSettings = {
+                    model_type_override: settings.model_type_override || '',
                     max_context_window: settings.max_context_window || null,
                     max_tokens: settings.max_tokens || null,
                     temperature: isOcr ? 0.0 : (settings.temperature ?? null),
@@ -550,6 +552,7 @@
                                 }
                             }
                             return {
+                                model_type_override: this.modelSettings.model_type_override || null,
                                 max_context_window: this.modelSettings.max_context_window || null,
                                 max_tokens: this.modelSettings.max_tokens || null,
                                 temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
@@ -575,8 +578,18 @@
                         const model = this.models.find(m => m.id === this.selectedModel.id);
                         if (model) {
                             model.settings = data.settings || {};
+                            // Update effective model_type/engine_type from server
+                            if (data.model_type) {
+                                model.model_type = data.model_type;
+                            }
+                            if (data.engine_type) {
+                                model.engine_type = data.engine_type;
+                            }
                         }
                         this.showModelSettingsModal = false;
+                        if (data.requires_reload) {
+                            alert(window.t('js.info.model_type_reload_required'));
+                        }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {

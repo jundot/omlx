@@ -160,6 +160,29 @@ class EnginePool:
             f"max memory: {format_size(self._max_model_memory)}"
         )
 
+    _MODEL_TYPE_TO_ENGINE: dict[str, str] = {
+        "llm": "batched",
+        "vlm": "vlm",
+        "embedding": "embedding",
+        "reranker": "reranker",
+    }
+
+    def apply_settings_overrides(
+        self, settings_manager: "ModelSettingsManager"
+    ) -> None:
+        """Apply model_type_override from persisted settings to discovered entries."""
+        for model_id, entry in self._entries.items():
+            settings = settings_manager.get_settings(model_id)
+            if settings.model_type_override:
+                entry.model_type = settings.model_type_override
+                entry.engine_type = self._MODEL_TYPE_TO_ENGINE.get(
+                    settings.model_type_override, "batched"
+                )
+                logger.info(
+                    f"Applied model_type override for {model_id}: "
+                    f"type={entry.model_type}, engine={entry.engine_type}"
+                )
+
     def get_model_ids(self) -> list[str]:
         """Get list of all discovered model IDs."""
         return list(self._entries.keys())
@@ -405,7 +428,36 @@ class EnginePool:
                     scheduler_config=self._scheduler_config,
                 )
 
-            await engine.start()
+            try:
+                await engine.start()
+            except Exception as start_error:
+                if entry.engine_type == "vlm":
+                    # VLM loading failed — fall back to LLM (BatchedEngine)
+                    logger.warning(
+                        f"VLM loading failed for {model_id}, "
+                        f"falling back to LLM: {start_error}"
+                    )
+                    try:
+                        await engine.stop()
+                    except Exception:
+                        pass
+                    gc.collect()
+                    mx.clear_cache()
+
+                    engine = BatchedEngine(
+                        model_name=entry.model_path,
+                        scheduler_config=self._scheduler_config,
+                    )
+                    await engine.start()
+
+                    entry.model_type = "llm"
+                    entry.engine_type = "batched"
+                    logger.info(
+                        f"Successfully loaded {model_id} as LLM "
+                        f"(fallback from VLM)"
+                    )
+                else:
+                    raise
 
             # Check if memory enforcer requested abort during loading
             if entry.abort_loading:

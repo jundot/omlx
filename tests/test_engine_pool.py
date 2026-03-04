@@ -195,6 +195,109 @@ class TestEngineEntry:
         assert entry.is_pinned is True
 
 
+class TestApplySettingsOverrides:
+    """Tests for apply_settings_overrides method."""
+
+    def test_override_changes_model_type(self, small_mock_model_dir):
+        """Test that model_type_override changes entry model_type and engine_type."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Verify auto-detected types
+        assert pool.get_entry("model-a").model_type == "llm"
+        assert pool.get_entry("model-a").engine_type == "batched"
+
+        # Mock settings manager
+        from omlx.model_settings import ModelSettings
+
+        settings_manager = MagicMock()
+        settings_manager.get_settings.side_effect = lambda mid: (
+            ModelSettings(model_type_override="vlm")
+            if mid == "model-a"
+            else ModelSettings()
+        )
+
+        pool.apply_settings_overrides(settings_manager)
+
+        # model-a should be overridden to vlm
+        assert pool.get_entry("model-a").model_type == "vlm"
+        assert pool.get_entry("model-a").engine_type == "vlm"
+
+        # model-b should remain unchanged (no override)
+        assert pool.get_entry("model-b").model_type == "llm"
+        assert pool.get_entry("model-b").engine_type == "batched"
+
+    def test_no_override_leaves_entry_unchanged(self, small_mock_model_dir):
+        """Test that None override doesn't change entry types."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        from omlx.model_settings import ModelSettings
+
+        settings_manager = MagicMock()
+        settings_manager.get_settings.return_value = ModelSettings()
+
+        pool.apply_settings_overrides(settings_manager)
+
+        assert pool.get_entry("model-a").model_type == "llm"
+        assert pool.get_entry("model-a").engine_type == "batched"
+
+
+class TestVLMFallback:
+    """Tests for VLM-to-LLM fallback during engine loading."""
+
+    @pytest.mark.asyncio
+    async def test_vlm_fallback_to_llm_on_start_failure(self, small_mock_model_dir):
+        """Test that VLM loading failure falls back to LLM BatchedEngine."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Force model-a to be VLM type
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+
+        # VLM engine that fails on start
+        mock_vlm_engine = MagicMock()
+        mock_vlm_engine.start = AsyncMock(
+            side_effect=Exception("Missing vision_tower parameters")
+        )
+        mock_vlm_engine.stop = AsyncMock()
+
+        # Batched engine that succeeds
+        mock_batched_engine = MagicMock()
+        mock_batched_engine.start = AsyncMock()
+
+        with patch(
+            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
+        ), patch(
+            "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
+        ):
+            await pool._load_engine("model-a")
+
+        # Should have fallen back to LLM
+        assert entry.model_type == "llm"
+        assert entry.engine_type == "batched"
+        assert entry.engine is mock_batched_engine
+
+    @pytest.mark.asyncio
+    async def test_non_vlm_failure_still_raises(self, small_mock_model_dir):
+        """Test that non-VLM engine failures propagate normally."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool.get_entry("model-a")
+        assert entry.engine_type == "batched"  # LLM, not VLM
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock(side_effect=Exception("Load failed"))
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine", return_value=mock_engine
+        ), pytest.raises(Exception, match="Load failed"):
+            await pool._load_engine("model-a")
+
+
 class TestEnginePoolLRU:
     """Tests for LRU eviction logic."""
 

@@ -284,6 +284,8 @@
     "settings.models.badge.force_sampling": "force_sampling",
 
     "modal.model_settings.section_label": "Model Settings",
+    "modal.model_settings.model_type": "Model Type",
+    "modal.model_settings.model_type_auto": "Auto-detect",
     "modal.model_settings.max_context_window": "Max Context Window",
     "modal.model_settings.max_tokens": "Max Tokens",
     "modal.model_settings.temperature": "Temperature",
@@ -434,6 +436,7 @@
     "js.error.load_model_failed": "Failed to load model",
     "js.error.unload_model_failed": "Failed to unload model",
     "js.error.save_model_settings_failed": "Failed to save model settings",
+    "js.info.model_type_reload_required": "Model type changed. Unload and reload the model for the change to take effect.",
     "js.error.no_config_defaults": "No config defaults found for this model",
     "js.error.load_generation_config_failed": "Failed to load generation config",
     "js.error.select_prompt_length": "Select at least one prompt length",

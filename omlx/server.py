@@ -822,6 +822,7 @@ def init_server(
 
     # Discover models (use pinned models from settings file)
     _server_state.engine_pool.discover_models(dir_list, pinned_models)
+    _server_state.engine_pool.apply_settings_overrides(_server_state.settings_manager)
 
     if _server_state.engine_pool.model_count == 0:
         logger.warning(
@@ -867,6 +868,9 @@ def init_server(
         if _server_state.engine_pool and _server_state.settings_manager:
             pinned = _server_state.settings_manager.get_pinned_model_ids()
             _server_state.engine_pool.discover_models(dir_list, pinned)
+            _server_state.engine_pool.apply_settings_overrides(
+                _server_state.settings_manager
+            )
             logger.info("Model pool refreshed after download completion")
 
     _server_state.hf_downloader = HFDownloader(

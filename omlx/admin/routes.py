@@ -56,6 +56,7 @@ class SetupApiKeyRequest(BaseModel):
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
+    model_type_override: Optional[str] = None
     max_context_window: Optional[int] = None
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
@@ -994,6 +995,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         # Add settings if available
         if settings:
             model_data["settings"] = {
+                "model_type_override": settings.model_type_override,
                 "max_context_window": settings.max_context_window,
                 "max_tokens": settings.max_tokens,
                 "temperature": settings.temperature,
@@ -1105,6 +1107,36 @@ async def update_model_settings(
     # Apply updates — use model_fields_set to distinguish "sent as null"
     # (clear to default) from "not sent" (don't touch).
     sent = request.model_fields_set
+    prev_engine_type = entry.engine_type  # Track for requires_reload check
+    if "model_type_override" in sent:
+        valid_types = {"llm", "vlm", "embedding", "reranker"}
+        # Treat empty string as None (auto-detect)
+        override_value = request.model_type_override or None
+        if override_value is not None and override_value not in valid_types:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid model_type_override: {request.model_type_override}",
+            )
+        current_settings.model_type_override = override_value
+        # Update engine pool entry type immediately
+        type_to_engine = {
+            "llm": "batched",
+            "vlm": "vlm",
+            "embedding": "embedding",
+            "reranker": "reranker",
+        }
+        if override_value:
+            entry.model_type = override_value
+            entry.engine_type = type_to_engine.get(override_value, "batched")
+        else:
+            # Reset to auto-detected type
+            from pathlib import Path
+
+            from ..model_discovery import detect_model_type
+
+            detected_type = detect_model_type(Path(entry.model_path))
+            entry.model_type = detected_type
+            entry.engine_type = type_to_engine.get(detected_type, "batched")
     if "max_context_window" in sent:
         current_settings.max_context_window = request.max_context_window
     if "max_tokens" in sent:
@@ -1143,10 +1175,26 @@ async def update_model_settings(
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
 
+    # Warn if engine type actually changed while model is loaded
+    requires_reload = (
+        "model_type_override" in sent
+        and entry.engine is not None
+        and entry.engine_type != prev_engine_type
+    )
+    if requires_reload:
+        logger.info(
+            f"Model type changed for loaded model {model_id} "
+            f"(now {entry.model_type}/{entry.engine_type}). "
+            f"Reload required to take effect."
+        )
+
     return {
         "success": True,
         "model_id": model_id,
         "settings": current_settings.to_dict(),
+        "model_type": entry.model_type,
+        "engine_type": entry.engine_type,
+        "requires_reload": requires_reload,
     }
 
 

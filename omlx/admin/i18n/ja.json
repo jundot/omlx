@@ -284,6 +284,8 @@
   "settings.models.badge.force_sampling": "force_sampling",
 
   "modal.model_settings.section_label": "モデル設定",
+  "modal.model_settings.model_type": "モデルタイプ",
+  "modal.model_settings.model_type_auto": "自動検出",
   "modal.model_settings.max_context_window": "最大コンテキストウィンドウ",
   "modal.model_settings.max_tokens": "最大トークン数",
   "modal.model_settings.temperature": "温度",
@@ -434,6 +436,7 @@
   "js.error.load_model_failed": "モデルのロードに失敗しました",
   "js.error.unload_model_failed": "モデルのアンロードに失敗しました",
   "js.error.save_model_settings_failed": "モデル設定の保存に失敗しました",
+  "js.info.model_type_reload_required": "モデルタイプが変更されました。変更を適用するにはモデルをアンロードして再ロードしてください。",
   "js.error.no_config_defaults": "このモデルのデフォルト設定が見つかりません",
   "js.error.load_generation_config_failed": "生成設定の読み込みに失敗しました",
   "js.error.select_prompt_length": "プロンプト長を1つ以上選択してください",
