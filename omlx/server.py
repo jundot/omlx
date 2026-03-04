@@ -1411,7 +1411,9 @@ async def create_chat_completion(
     # Merge MCP tools with user-provided tools
     effective_tools = request.tools
     if _server_state.mcp_manager:
-        effective_tools = _server_state.mcp_manager.get_merged_tools(request.tools)
+        # Convert Pydantic ToolDefinition models to dicts for merge_tools
+        user_tools_dicts = [t.model_dump() for t in request.tools] if request.tools else None
+        effective_tools = _server_state.mcp_manager.get_merged_tools(user_tools_dicts)
 
     # Validate context window before sending to model
     tools_for_template = convert_tools_for_template(effective_tools) if effective_tools else None
