@@ -984,6 +984,43 @@ class TestArraysCacheLastBlockOnly:
         assert saved_keys.tolist() == expected_keys.tolist()
         assert saved_values.tolist() == expected_values.tolist()
 
+    def test_store_cache_rolls_back_when_ssd_save_fails(self, mx):
+        """Failed SSD save should not retain block metadata in paged cache."""
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = False
+
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        tokens = [1, 2, 3, 4]  # exactly one full block
+        keys = mx.ones((1, 8, 4, 64))
+        values = mx.ones((1, 8, 4, 64))
+        cache_data = [
+            {"state": (keys, values), "cache_type": "KVCache", "class_name": "KVCache"}
+        ]
+
+        result = cache.store_cache("req-rollback", tokens, cache_data)
+
+        assert result is not None
+        # If persistence fails, block should be rolled back (not indexed/retained).
+        assert len(result.block_ids) == 0
+        assert result.num_tokens == 0
+        assert paged_cache.stats.allocated_blocks == 1  # null block only
+
+        failed_hash = compute_block_hash(None, tokens, model_name="test-model")
+        assert paged_cache.cached_block_hash_to_block.get_block(failed_hash) is None
+
 
 class TestPrefixCacheCacheList:
     """Tests for CacheList support in BlockAwarePrefixCache."""

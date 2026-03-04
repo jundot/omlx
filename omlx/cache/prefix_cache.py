@@ -497,6 +497,12 @@ class BlockAwarePrefixCache(CacheManager):
                         logger.warning(
                             f"Failed to save block {block.block_id} to tiered cache"
                         )
+                        # Persistence failed: roll back metadata so we don't
+                        # retain a block that cannot be reconstructed later.
+                        self.paged_cache.free_block(block.block_id)
+                        block_table.block_ids.pop()
+                        block_table.num_tokens -= len(block_tokens)
+                        break
                 else:
                     # Failed to extract tensor data - free block and stop
                     logger.debug(
