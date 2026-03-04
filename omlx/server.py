@@ -1408,8 +1408,13 @@ async def create_chat_completion(
             # Inject JSON instruction into messages
             messages = _inject_json_instruction(messages, json_instruction)
 
+    # Merge MCP tools with user-provided tools
+    effective_tools = request.tools
+    if _server_state.mcp_manager:
+        effective_tools = _server_state.mcp_manager.get_merged_tools(request.tools)
+
     # Validate context window before sending to model
-    tools_for_template = convert_tools_for_template(request.tools) if request.tools else None
+    tools_for_template = convert_tools_for_template(effective_tools) if effective_tools else None
     try:
         num_prompt_tokens = engine.count_chat_tokens(
             messages, tools_for_template,
@@ -1443,8 +1448,8 @@ async def create_chat_completion(
         "repetition_penalty": repetition_penalty,
     }
 
-    # Add tools if provided
-    if request.tools:
+    # Add tools if provided (includes MCP tools)
+    if tools_for_template:
         chat_kwargs["tools"] = tools_for_template
 
     # Add chat template kwargs
@@ -1509,7 +1514,7 @@ async def create_chat_completion(
         cleaned_text, tool_calls = parse_tool_calls(
             regular_content,
             tokenizer=engine.tokenizer,
-            tools=convert_tools_for_template(request.tools),
+            tools=tools_for_template,
         )
 
     # Process response_format if specified
@@ -2229,8 +2234,22 @@ async def create_anthropic_message(
         "repetition_penalty": repetition_penalty,
     }
 
-    # Add tools if provided
-    internal_tools = convert_anthropic_tools_to_internal(request.tools)
+    # Merge MCP tools with user-provided Anthropic tools
+    user_internal = convert_anthropic_tools_to_internal(request.tools)
+    if _server_state.mcp_manager:
+        mcp_openai_tools = _server_state.mcp_manager.get_all_tools_openai()
+        combined = (mcp_openai_tools or []) + (user_internal or [])
+        # Deduplicate by function name (user tools take precedence)
+        if combined:
+            seen = {}
+            for tool in combined:
+                name = tool.get("function", {}).get("name", "")
+                seen[name] = tool
+            internal_tools = list(seen.values())
+        else:
+            internal_tools = None
+    else:
+        internal_tools = user_internal
     if internal_tools:
         chat_kwargs["tools"] = internal_tools
 
