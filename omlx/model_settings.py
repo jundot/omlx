@@ -30,6 +30,8 @@ class ModelSettings:
         top_k: Top-k sampling parameter (None = use global default).
         repetition_penalty: Repetition penalty (None = use default 1.0, i.e. disabled).
         force_sampling: Force sampling even with temperature=0.
+        kv_cache_bits: KV cache quantization bits (None=fp16, 8, or 4).
+        kv_cache_group_size: KV cache quantization group size.
         is_pinned: Keep model loaded in memory.
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.
@@ -49,6 +51,10 @@ class ModelSettings:
     forced_ct_kwargs: Optional[list[str]] = None  # Keys that cannot be overridden by API requests
     ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
     model_type_override: Optional[str] = None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
+
+    # KV cache quantization settings
+    kv_cache_bits: Optional[int] = None  # KV cache quantization: None=fp16, 8, or 4
+    kv_cache_group_size: int = 64  # Quantization group size
 
     # Model management flags
     is_pinned: bool = False

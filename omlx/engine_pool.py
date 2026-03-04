@@ -74,6 +74,7 @@ class EnginePool:
         self,
         max_model_memory: int,
         scheduler_config: SchedulerConfig | None = None,
+        settings_manager: "ModelSettingsManager | None" = None,
     ):
         """
         Initialize the engine pool.
@@ -81,12 +82,14 @@ class EnginePool:
         Args:
             max_model_memory: Maximum memory for loaded models in bytes
             scheduler_config: Configuration for BatchedEngine schedulers
+            settings_manager: Optional ModelSettingsManager for model-specific KV cache settings
         """
         self._entries: dict[str, EngineEntry] = {}
         self._lock = asyncio.Lock()
         self._max_model_memory = max_model_memory
         self._current_model_memory = 0
         self._scheduler_config = scheduler_config or SchedulerConfig()
+        self._settings_manager = settings_manager
         self._process_memory_enforcer: object | None = None  # Set by server
 
     @property
@@ -399,6 +402,8 @@ class EnginePool:
         Raises:
             ModelLoadingError: If model is already being loaded
         """
+        import copy
+
         entry = self._entries[model_id]
         if entry.is_loading:
             raise ModelLoadingError(model_id)
@@ -407,6 +412,20 @@ class EnginePool:
         entry.abort_loading = False
         try:
             logger.info(f"Loading model: {model_id}")
+
+            # Read model settings for KV cache quantization
+            engine_scheduler_config = self._scheduler_config
+            if self._settings_manager is not None:
+                model_settings = self._settings_manager.get_settings(model_id)
+                if model_settings.kv_cache_bits is not None or model_settings.kv_cache_group_size != 64:
+                    # Create a copy with model-specific KV cache settings
+                    engine_scheduler_config = copy.copy(self._scheduler_config)
+                    engine_scheduler_config.kv_cache_bits = model_settings.kv_cache_bits
+                    engine_scheduler_config.kv_cache_group_size = model_settings.kv_cache_group_size
+                    logger.info(
+                        f"Model {model_id}: KV cache quantization "
+                        f"{model_settings.kv_cache_bits}-bit, group_size={model_settings.kv_cache_group_size}"
+                    )
 
             # Create engine based on engine type
             if entry.engine_type == "embedding":
@@ -419,13 +438,13 @@ class EnginePool:
                 # VLMBatchedEngine for vision-language models
                 engine = VLMBatchedEngine(
                     model_name=entry.model_path,
-                    scheduler_config=self._scheduler_config,
+                    scheduler_config=engine_scheduler_config,
                 )
             else:
                 # BatchedEngine with continuous batching (default)
                 engine = BatchedEngine(
                     model_name=entry.model_path,
-                    scheduler_config=self._scheduler_config,
+                    scheduler_config=engine_scheduler_config,
                 )
 
             try:

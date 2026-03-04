@@ -43,6 +43,8 @@ class TestListModelsSettings:
             is_default=False,
             display_name="Test Model",
             description="A test model",
+            kv_cache_bits=8,
+            kv_cache_group_size=64,
         )
 
         mock_settings_manager = MagicMock()

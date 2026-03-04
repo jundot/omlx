@@ -98,18 +98,25 @@ class _PrefillAbortedError(Exception):
 class _BoundarySnapshotBatchGenerator(BatchGenerator):
     """BatchGenerator with boundary-aligned prefill snapshot callbacks."""
 
+    # KV cache quantization state
+    _kv_quantization_logged: bool = False
+
     def __init__(
         self,
         *args: Any,
         boundary_block_size: int = 0,
         prefill_boundary_callback: Optional[Callable[[int, List[Any], int], None]] = None,
         abort_check_callback: Optional[Callable[[List[int]], List[int]]] = None,
+        kv_cache_bits: Optional[int] = None,
+        kv_cache_group_size: int = 64,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
         self._boundary_block_size = max(0, int(boundary_block_size))
         self._prefill_boundary_callback = prefill_boundary_callback
         self._abort_check_callback = abort_check_callback
+        self.kv_cache_bits: Optional[int] = kv_cache_bits
+        self.kv_cache_group_size: int = kv_cache_group_size
         # Memory limits for inline prefill checking (set by Scheduler).
         # mx.get_active_memory() is ~20ns, negligible vs ~5s prefill chunks.
         self._memory_limit_bytes: int = 0  # soft limit, 0 = disabled
@@ -117,6 +124,27 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         # Per-UID VLM embeddings for batched prefill.
         # uid → (inputs_embeds, extra_kwargs, start_offset)
         self._vlm_pending: Dict[int, Tuple[mx.array, Dict[str, Any], int]] = {}
+
+    def _quantize_cache(self, prompt_cache: List[Any]) -> List[Any]:
+        """Quantize KV cache layers that support it."""
+        if not self._kv_quantization_logged:
+            logger.info(f"KV cache: quantized {self.kv_cache_bits}-bit, group_size={self.kv_cache_group_size}")
+            _BoundarySnapshotBatchGenerator._kv_quantization_logged = True
+
+        quantized = []
+        for i, cache_obj in enumerate(prompt_cache):
+            if hasattr(cache_obj, 'to_quantized'):
+                try:
+                    quantized.append(cache_obj.to_quantized(
+                        group_size=self.kv_cache_group_size,
+                        bits=self.kv_cache_bits
+                    ))
+                except Exception as e:
+                    logger.warning(f"KV cache quantization failed for layer {i}: {e}, using fp16")
+                    quantized.append(cache_obj)
+            else:
+                quantized.append(cache_obj)
+        return quantized
 
     # Cache class names known to be sliceable (no boundary snapshots needed).
     _KNOWN_SLICEABLE = frozenset({"KVCache", "BatchKVCache", "QuantizedKVCache"})
@@ -376,6 +404,10 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             inputs = _left_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _make_cache(self.model, padding, self.max_kv_size)
 
+            # Apply KV cache quantization if enabled
+            if self.kv_cache_bits is not None:
+                prompt_cache = self._quantize_cache(prompt_cache)
+
             # Build left-padded VLM embeddings batch (matching token padding).
             batched_embeds, batched_extra = self._build_left_padded_vlm_batch(
                 vlm_embeds_map, list(uids), lengths, max_length
@@ -485,6 +517,10 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             last_inputs = mx.array([p[-1:] for p in inputs])
             inputs = _right_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _merge_caches(caches)
+
+            # Apply KV cache quantization if enabled
+            if self.kv_cache_bits is not None:
+                prompt_cache = self._quantize_cache(prompt_cache)
 
             # Build right-padded VLM embeddings batch (matching token padding).
             batched_embeds, batched_extra = self._build_right_padded_vlm_batch(
@@ -824,6 +860,10 @@ class SchedulerConfig:
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
     mlx_cache_cleanup_interval: int = 32  # Steps between mx.clear_cache() calls
+
+    # KV cache quantization settings
+    kv_cache_bits: Optional[int] = None  # None=fp16, 8, or 4
+    kv_cache_group_size: int = 64  # Quantization group size
 
 
 @dataclass
@@ -1419,6 +1459,8 @@ class Scheduler:
                 else None
             ),
             abort_check_callback=self._check_pending_aborts_for_uids,
+            kv_cache_bits=self.config.kv_cache_bits,
+            kv_cache_group_size=self.config.kv_cache_group_size,
         )
         bg._memory_limit_bytes = self._memory_limit_bytes
         bg._memory_hard_limit_bytes = self._memory_hard_limit_bytes
