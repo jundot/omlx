@@ -296,3 +296,54 @@ class TestVLMModelAdapterModelProperty:
 
         # BatchGenerator accesses model.layers
         assert adapter.layers is vlm.language_model.model.layers
+
+
+class TestIntOffsetCacheProxy:
+    """Tests for _IntOffsetCacheProxy offset conversion."""
+
+    def test_scalar_offset_passthrough(self):
+        """Scalar int offset is returned as-is."""
+        from omlx.models.vlm import _IntOffsetCacheProxy
+
+        cache = MagicMock(spec=[])
+        cache.offset = 42
+        proxy = _IntOffsetCacheProxy(cache)
+        assert proxy.offset == 42
+
+    def test_0d_mx_array_offset(self):
+        """0-d mx.array offset is converted to int."""
+        import mlx.core as mx
+        from omlx.models.vlm import _IntOffsetCacheProxy
+
+        cache = MagicMock(spec=[])
+        cache.offset = mx.array(7)
+        proxy = _IntOffsetCacheProxy(cache)
+        assert proxy.offset == 7
+
+    def test_batched_offset_returns_idx(self):
+        """BatchKVCache proxy returns _idx, not offset[0].
+
+        When left_padding[0] > 0, offset[0] < _idx.  The proxy must
+        return _idx so the attention mask is not truncated (Issue #79).
+        """
+        import mlx.core as mx
+        from omlx.models.vlm import _IntOffsetCacheProxy
+
+        cache = MagicMock(spec=[])
+        cache.offset = mx.array([500, 625])  # offset[0]=500 (padded element)
+        cache._idx = 625  # buffer write index
+        proxy = _IntOffsetCacheProxy(cache)
+        # Must return _idx (625), NOT offset[0] (500)
+        assert proxy.offset == 625
+
+    def test_batched_offset_without_idx_falls_back(self):
+        """Non-BatchKVCache with mx.array offset uses [0] fallback."""
+        import mlx.core as mx
+        from omlx.models.vlm import _IntOffsetCacheProxy
+
+        cache = MagicMock(spec=[])
+        cache.offset = mx.array([100, 200])
+        # No _idx attribute — delete it from mock
+        del cache._idx
+        proxy = _IntOffsetCacheProxy(cache)
+        assert proxy.offset == 100

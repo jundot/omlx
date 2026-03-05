@@ -352,6 +352,14 @@ class TestIsCacheCorruptionError:
         )
         assert is_cache_corruption_error(error) is True
 
+    def test_value_error_cannot_be_broadcast(self):
+        """Test detection of MLX broadcast_shapes error (Issue #79)."""
+        error = ValueError(
+            "[broadcast_shapes] Shapes (8,1,625,2674) and (8,8,625,3697) "
+            "cannot be broadcast."
+        )
+        assert is_cache_corruption_error(error) is True
+
     def test_value_error_shape_mismatch(self):
         """Test detection of shape mismatch error."""
         error = ValueError("shape mismatch in cache concatenation")
@@ -390,6 +398,7 @@ class TestCacheCorruptionPatterns:
             "cache.values",
             "'NoneType' object has no attribute",
             "not broadcastable",
+            "cannot be broadcast",
             "shape mismatch",
         ]
         for pattern in expected_patterns:

@@ -730,24 +730,42 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                 if val is None:
                     return None  # heterogeneous → skip batching
                 if isinstance(val, mx.array) and val.ndim >= 2:
-                    val = val[:, start_offset:]
-                    pad_len = max_length - val.shape[1]
-                    if pad_len > 0:
-                        pad = mx.zeros_like(
-                            mx.zeros(
-                                (val.shape[0], pad_len) + val.shape[2:]
-                            )
-                        )
-                        if pad_side == "left":
-                            val = mx.concatenate([pad, val], axis=1)
+                    if val.ndim >= 3:
+                        # 3D+ tensors (e.g. mRoPE position_ids (3,1,seq)):
+                        # seq is last axis, batch is axis 1.
+                        val = val[..., start_offset:]
+                        pad_len = max_length - val.shape[-1]
+                        if pad_len > 0:
+                            pad_shape = val.shape[:-1] + (pad_len,)
+                            pad = mx.zeros(pad_shape, dtype=val.dtype)
+                            if pad_side == "left":
+                                val = mx.concatenate([pad, val], axis=-1)
+                            else:
+                                val = mx.concatenate([val, pad], axis=-1)
                         else:
-                            val = mx.concatenate([val, pad], axis=1)
+                            val = val[..., :max_length]
                     else:
-                        val = val[:, :max_length]
+                        # 2D tensors (batch, seq): existing behavior.
+                        val = val[:, start_offset:]
+                        pad_len = max_length - val.shape[1]
+                        if pad_len > 0:
+                            pad = mx.zeros_like(
+                                mx.zeros(
+                                    (val.shape[0], pad_len) + val.shape[2:]
+                                )
+                            )
+                            if pad_side == "left":
+                                val = mx.concatenate([pad, val], axis=1)
+                            else:
+                                val = mx.concatenate([val, pad], axis=1)
+                        else:
+                            val = val[:, :max_length]
                 values.append(val)
 
             if all(isinstance(v, mx.array) for v in values):
-                batched[key] = mx.concatenate(values, axis=0)
+                # For 3D+ tensors, batch dim is axis 1; for 2D, axis 0.
+                concat_axis = 1 if values[0].ndim >= 3 else 0
+                batched[key] = mx.concatenate(values, axis=concat_axis)
             else:
                 # Scalar values: use if all identical
                 if len(set(str(v) for v in values)) == 1:
@@ -764,7 +782,9 @@ def _slice_vlm_extra(
     """Slice VLM extra kwargs to first n tokens along seq dimension."""
     sliced: Dict[str, Any] = {}
     for key, val in extra.items():
-        if isinstance(val, mx.array) and val.ndim >= 2:
+        if isinstance(val, mx.array) and val.ndim >= 3:
+            sliced[key] = val[..., :n]
+        elif isinstance(val, mx.array) and val.ndim == 2:
             sliced[key] = val[:, :n]
         else:
             sliced[key] = val
@@ -777,7 +797,9 @@ def _advance_vlm_extra(
     """Advance VLM extra kwargs past first n tokens along seq dimension."""
     advanced: Dict[str, Any] = {}
     for key, val in extra.items():
-        if isinstance(val, mx.array) and val.ndim >= 2:
+        if isinstance(val, mx.array) and val.ndim >= 3:
+            advanced[key] = val[..., n:]
+        elif isinstance(val, mx.array) and val.ndim == 2:
             advanced[key] = val[:, n:]
         else:
             advanced[key] = val
@@ -2514,9 +2536,9 @@ class Scheduler:
                 request.sampling_params
             )
 
-            # Clear stale mRoPE position state for text-only requests
-            # to prevent position contamination from prior VLM requests.
-            if not request_is_vlm and hasattr(self.model, "clear_vlm_position_state"):
+            # Clear stale mRoPE position state to prevent position
+            # contamination from prior requests (VLM or text-only).
+            if hasattr(self.model, "clear_vlm_position_state"):
                 self.model.clear_vlm_position_state()
 
             # Insert into BatchGenerator with optional cache
@@ -2976,6 +2998,10 @@ class Scheduler:
         if self._boundary_snapshot_store is not None:
             self._boundary_snapshot_store.cleanup_all()
         self._boundary_snapshot_required = None
+
+        # Clear stale VLM position state to prevent re-corruption on retry
+        if hasattr(self.model, "clear_vlm_position_state"):
+            self.model.clear_vlm_position_state()
 
         # Clear caches
         if self.block_aware_cache is not None:

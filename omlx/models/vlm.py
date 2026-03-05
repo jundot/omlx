@@ -47,10 +47,15 @@ class _IntOffsetCacheProxy:
     def offset(self):
         raw = self._cache.offset
         if isinstance(raw, mx.array):
+            # BatchKVCache: return _idx (buffer write index) instead of
+            # per-element offset[0].  _idx matches the value used by
+            # make_mask() to compute the attention mask's kv dimension.
+            # Using offset[0] causes mask truncation when left_padding[0] > 0
+            # because offset[i] = _idx - left_padding[i].
+            if hasattr(self._cache, "_idx"):
+                return self._cache._idx
             if raw.ndim == 0:
                 return int(raw.item())
-            # Batched offset: all elements should be identical during prefill.
-            # Take the first element to return a scalar int.
             return int(raw.reshape(-1)[0].item())
         return raw
 

@@ -406,6 +406,7 @@ CACHE_CORRUPTION_PATTERNS = [
     "cache.values",
     "'NoneType' object has no attribute",
     "not broadcastable",
+    "cannot be broadcast",
     "shape mismatch",
 ]
 
