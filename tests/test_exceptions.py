@@ -340,9 +340,31 @@ class TestIsCacheCorruptionError:
         error = AttributeError("cache.values returned empty")
         assert is_cache_corruption_error(error) is True
 
+    def test_attribute_error_none_attribute(self):
+        """Test detection of NoneType attribute access error."""
+        error = AttributeError("'NoneType' object has no attribute 'shape'")
+        assert is_cache_corruption_error(error) is True
+
+    def test_value_error_not_broadcastable(self):
+        """Test detection of shape broadcast error."""
+        error = ValueError(
+            "Shapes (1,8,256,128) and (1,8,512,128) are not broadcastable"
+        )
+        assert is_cache_corruption_error(error) is True
+
+    def test_value_error_shape_mismatch(self):
+        """Test detection of shape mismatch error."""
+        error = ValueError("shape mismatch in cache concatenation")
+        assert is_cache_corruption_error(error) is True
+
     def test_non_corruption_error(self):
         """Test that non-corruption errors return False."""
         error = ValueError("Invalid temperature value")
+        assert is_cache_corruption_error(error) is False
+
+    def test_attribute_error_non_corruption(self):
+        """Non-corruption AttributeError should not match."""
+        error = AttributeError("'str' object has no attribute 'encode'")
         assert is_cache_corruption_error(error) is False
 
     def test_unrelated_error(self):
@@ -366,6 +388,9 @@ class TestCacheCorruptionPatterns:
             "KVCache",
             "cache.keys",
             "cache.values",
+            "'NoneType' object has no attribute",
+            "not broadcastable",
+            "shape mismatch",
         ]
         for pattern in expected_patterns:
             assert pattern in CACHE_CORRUPTION_PATTERNS

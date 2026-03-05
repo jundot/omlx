@@ -3073,8 +3073,8 @@ class Scheduler:
                 self._reschedule_running_requests()
                 break
 
-            except TypeError as e:
-                # Catch the NoneType error specifically
+            except (TypeError, AttributeError, ValueError) as e:
+                # Catch cache corruption errors (NoneType, shape mismatch, etc.)
                 if self._is_cache_corruption_error(e):
                     if attempt < max_retries:
                         import traceback

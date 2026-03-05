@@ -404,6 +404,9 @@ CACHE_CORRUPTION_PATTERNS = [
     "KVCache",
     "cache.keys",
     "cache.values",
+    "'NoneType' object has no attribute",
+    "not broadcastable",
+    "shape mismatch",
 ]
 
 
