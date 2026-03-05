@@ -224,6 +224,7 @@
                                             <br>
                                             {{ t('settings.resource.memory_limit_total_eviction') }}
                                             <strong>{{ t('settings.resource.memory_limit_total_auto') }}</strong>{{ t('settings.resource.memory_limit_total_auto_desc') }}
+                                            {{ t('settings.resource.memory_limit_total_disabled') }}
                                         </p>
                                     </div>
                                     <div class="flex items-center gap-3">
@@ -244,7 +245,7 @@
                                         <span class="text-sm w-28 text-right transition-all duration-200 inline-flex items-center justify-end gap-0"
                                               :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-600'">
                                             <span x-text="processMemoryAuto ? window.t('settings.resource.auto') : (processMemoryPercent === 0 ? window.t('settings.resource.off') : processMemoryPercent + '%')"></span>
-                                            <span :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'" class="ml-1">(</span><span x-show="!editingProcessMemory" @click="if(!processMemoryAuto) { editingProcessMemory = true }" class="cursor-pointer hover:text-neutral-900" :class="processMemoryAuto ? 'cursor-default text-neutral-300' : ''" x-text="processMemorySizeGB"></span><input x-show="editingProcessMemory"
+                                            <template x-if="processMemoryAuto || processMemoryPercent !== 0"><span><span :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'" class="ml-1">(</span><span x-show="!editingProcessMemory" @click="if(!processMemoryAuto) { editingProcessMemory = true }" class="cursor-pointer hover:text-neutral-900" :class="processMemoryAuto ? 'cursor-default text-neutral-300' : ''" x-text="processMemorySizeGB"></span><input x-show="editingProcessMemory"
                                                    type="number"
                                                    :value="processMemorySizeGB"
                                                    @change="updateProcessMemoryFromInput($event.target.value); editingProcessMemory = false"
@@ -254,14 +255,17 @@
                                                    x-init="if (editingProcessMemory) { $nextTick(() => $el.focus()) }"
                                                    class="w-12 px-1 text-sm text-right border border-neutral-900 rounded focus:outline-none"
                                                    min="0"
-                                                   step="1"><span :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'">GB)</span>
+                                                   step="1"><span :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'">GB)</span></span></template>
                                         </span>
                                     </div>
                                 </div>
                                 <!-- Memory Limit (Models Only) -->
                                 <div class="flex items-center justify-between px-6 py-4">
-                                    <div class="flex items-center gap-2">
+                                    <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.resource.memory_limit_models') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">
+                                            {{ t('settings.resource.memory_limit_models_description') }}
+                                        </p>
                                     </div>
                                     <div class="flex items-center gap-3">
                                         <label class="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
@@ -281,7 +285,7 @@
                                         <span class="text-sm w-28 text-right transition-all duration-200 inline-flex items-center justify-end gap-0"
                                               :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-600'">
                                             <span x-text="modelMemoryAuto ? window.t('settings.resource.auto') : (memoryPercent === 0 ? window.t('settings.resource.off') : memoryPercent + '%')"></span>
-                                            <span :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'" class="ml-1">(</span><span x-show="!editingModelMemory" @click="if(!modelMemoryAuto) { editingModelMemory = true }" class="cursor-pointer hover:text-neutral-900" :class="modelMemoryAuto ? 'cursor-default text-neutral-300' : ''" x-text="modelMemorySizeGB"></span><input x-show="editingModelMemory"
+                                            <template x-if="modelMemoryAuto || memoryPercent !== 0"><span><span :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'" class="ml-1">(</span><span x-show="!editingModelMemory" @click="if(!modelMemoryAuto) { editingModelMemory = true }" class="cursor-pointer hover:text-neutral-900" :class="modelMemoryAuto ? 'cursor-default text-neutral-300' : ''" x-text="modelMemorySizeGB"></span><input x-show="editingModelMemory"
                                                    type="number"
                                                    :value="modelMemorySizeGB"
                                                    @change="updateModelMemoryFromInput($event.target.value); editingModelMemory = false"
@@ -291,7 +295,7 @@
                                                    x-init="if (editingModelMemory) { $nextTick(() => $el.focus()) }"
                                                    class="w-12 px-1 text-sm text-right border border-neutral-900 rounded focus:outline-none"
                                                    min="0"
-                                                   step="1"><span :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'">GB)</span>
+                                                   step="1"><span :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'">GB)</span></span></template>
                                         </span>
                                     </div>
                                 </div>
