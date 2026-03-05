@@ -1425,14 +1425,28 @@ class Scheduler:
         if sampling_params.stop_token_ids:
             stop_tokens.update(sampling_params.stop_token_ids)
 
+        # Ensure continuous batching is possible: prefill_batch_size must be
+        # strictly less than completion_batch_size, otherwise mlx-lm's _next()
+        # condition (num_to_add >= prefill_batch_size) prevents adding new
+        # requests while any request is active.
+        prefill_bs = self.config.prefill_batch_size
+        completion_bs = self.config.completion_batch_size
+        if prefill_bs >= completion_bs:
+            logger.warning(
+                f"prefill_batch_size ({prefill_bs}) >= completion_batch_size "
+                f"({completion_bs}), forcing prefill_batch_size=1 to enable "
+                f"continuous batching"
+            )
+            prefill_bs = 1
+
         bg = _BoundarySnapshotBatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
             stop_tokens=stop_tokens,
             sampler=sampler,
             logits_processors=logits_processors if logits_processors else None,
-            prefill_batch_size=self.config.prefill_batch_size,
-            completion_batch_size=self.config.completion_batch_size,
+            prefill_batch_size=prefill_bs,
+            completion_batch_size=completion_bs,
             prefill_step_size=self.config.prefill_step_size,
             boundary_block_size=self.config.paged_cache_block_size,
             prefill_boundary_callback=(

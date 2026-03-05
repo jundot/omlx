@@ -137,7 +137,6 @@ class VLMBatchedEngine(BaseEngine):
         self._adapter = None
         self._engine = None
         self._loaded = False
-        self._vision_lock = asyncio.Lock()
 
     @property
     def model_name(self) -> str:
@@ -693,10 +692,11 @@ class VLMBatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        async with self._vision_lock:
-            prompt, vlm_embeds, vlm_kwargs, image_hash = await asyncio.to_thread(
-                self._process_chat_messages, messages, tools, kwargs,
-            )
+        loop = asyncio.get_running_loop()
+        prompt, vlm_embeds, vlm_kwargs, image_hash = await loop.run_in_executor(
+            self._engine._mlx_executor,
+            self._process_chat_messages, messages, tools, kwargs,
+        )
 
         return await self.generate(
             prompt=prompt,
@@ -726,16 +726,15 @@ class VLMBatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        # Run vision encoding in a background thread to avoid blocking
+        # Run vision encoding on the MLX executor thread to avoid blocking
         # the event loop.  Blocking here (synchronous mx.eval) prevents
         # uvicorn from managing HTTP keep-alive connections, causing
         # TransferEncodingError on the next request (issue #80).
-        # The asyncio.Lock serializes concurrent VLM vision encoding
-        # to match the original single-threaded event loop behavior.
-        async with self._vision_lock:
-            prompt, vlm_embeds, vlm_kwargs, image_hash = await asyncio.to_thread(
-                self._process_chat_messages, messages, tools, kwargs,
-            )
+        loop = asyncio.get_running_loop()
+        prompt, vlm_embeds, vlm_kwargs, image_hash = await loop.run_in_executor(
+            self._engine._mlx_executor,
+            self._process_chat_messages, messages, tools, kwargs,
+        )
 
         async for output in self.stream_generate(
             prompt=prompt,

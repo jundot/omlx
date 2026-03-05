@@ -202,7 +202,7 @@ class SchedulerSettings:
     """Scheduler configuration settings."""
 
     max_num_seqs: int = 8
-    prefill_batch_size: int = 8
+    prefill_batch_size: int = 1
     completion_batch_size: int = 8
 
     def to_dict(self) -> dict[str, Any]:
@@ -214,7 +214,7 @@ class SchedulerSettings:
         """Create from dictionary."""
         return cls(
             max_num_seqs=data.get("max_num_seqs", 8),
-            prefill_batch_size=data.get("prefill_batch_size", 8),
+            prefill_batch_size=data.get("prefill_batch_size", 1),
             completion_batch_size=data.get("completion_batch_size", 8),
         )
 

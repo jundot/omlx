@@ -215,7 +215,7 @@ class TestSchedulerSettings:
         """Test default values."""
         settings = SchedulerSettings()
         assert settings.max_num_seqs == 8
-        assert settings.prefill_batch_size == 8
+        assert settings.prefill_batch_size == 1
         assert settings.completion_batch_size == 8
 
     def test_custom_values(self):
@@ -233,7 +233,7 @@ class TestSchedulerSettings:
         result = settings.to_dict()
         assert result == {
             "max_num_seqs": 8,
-            "prefill_batch_size": 8,
+            "prefill_batch_size": 1,
             "completion_batch_size": 8,
         }
 

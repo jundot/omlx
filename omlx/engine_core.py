@@ -637,6 +637,11 @@ class AsyncEngineCore:
     ):
         self.engine = EngineCore(model, tokenizer, config)
 
+    @property
+    def _mlx_executor(self):
+        """Expose the MLX executor for VLM vision encoding."""
+        return self.engine._mlx_executor
+
     async def __aenter__(self) -> "AsyncEngineCore":
         await self.engine.start()
         return self

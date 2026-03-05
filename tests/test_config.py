@@ -162,7 +162,7 @@ class TestSchedulerConfig:
         """Test default configuration values."""
         config = SchedulerConfig()
         assert config.max_num_seqs == 8
-        assert config.prefill_batch_size == 8
+        assert config.prefill_batch_size == 1
         assert config.completion_batch_size == 8
         assert config.stream_interval == 1
         assert config.enable_thinking is None
