@@ -51,8 +51,6 @@ dependencies = [
     # Server
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
-    # MCP (Model Context Protocol) support
-    "mcp>=1.0.0",
     # JSON Schema validation for structured output
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
@@ -63,12 +61,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mcp = [
+    "mcp>=1.0.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
+    "mcp>=1.0.0",
 ]
 [project.urls]
 Homepage = "https://github.com/jundot/omlx"

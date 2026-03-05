@@ -52,6 +52,9 @@ brew update && brew upgrade omlx
 
 # Run as a background service (auto-restarts on crash)
 brew services start omlx
+
+# Optional: MCP (Model Context Protocol) support
+/opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
 ### From Source
@@ -59,7 +62,8 @@ brew services start omlx
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e .
+pip install -e .          # Core only
+pip install -e ".[mcp]"   # With MCP (Model Context Protocol) support
 ```
 
 Requires Python 3.10+ and Apple Silicon (M1/M2/M3/M4).
