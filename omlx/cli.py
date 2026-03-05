@@ -244,7 +244,7 @@ Example directory structure:
         "--max-model-memory",
         type=str,
         default=None,
-        help="Maximum memory for loaded models (e.g., 32GB). Default: 80%% of system memory.",
+        help="Maximum memory for loaded models (e.g., 32GB, 'disabled'). Default: 80%% of system memory.",
     )
     serve_parser.add_argument(
         "--max-process-memory",

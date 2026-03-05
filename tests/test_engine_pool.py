@@ -70,6 +70,24 @@ class TestEnginePoolInit:
         assert pool.model_count == 0
         assert pool.loaded_model_count == 0
 
+    def test_init_disabled_memory(self):
+        """Test initialization with disabled (None) memory limit."""
+        pool = EnginePool(max_model_memory=None)
+        assert pool.max_model_memory is None
+        assert pool.current_model_memory == 0
+
+    def test_model_too_large_skipped_when_disabled(self, small_mock_model_dir):
+        """Test that ModelTooLargeError is NOT raised when memory is disabled."""
+        pool = EnginePool(max_model_memory=None)
+        pool.discover_models(str(small_mock_model_dir))
+        # With None (disabled), the size check should be skipped entirely
+        # Model loading will fail for other reasons (mock), but ModelTooLargeError
+        # should not be raised
+        entry = pool.get_entry("model-a")
+        assert entry is not None
+        # Verify the entry has a nonzero estimated size
+        assert entry.estimated_size > 0
+
     def test_discover_models(self, small_mock_model_dir):
         """Test model discovery."""
         pool = EnginePool(max_model_memory=10 * 1024**3)

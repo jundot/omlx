@@ -158,14 +158,18 @@ class ModelSettings:
         """
         return self.get_model_dirs(base_path)[0]
 
-    def get_max_model_memory_bytes(self) -> int:
+    def get_max_model_memory_bytes(self) -> int | None:
         """
-        Get max model memory in bytes.
+        Get max model memory in bytes, or None if disabled.
 
         Returns:
-            Max model memory in bytes (90% of usable RAM if "auto").
+            Max model memory in bytes (90% of usable RAM if "auto"),
+            or None if disabled (no limit).
         """
-        if self.max_model_memory.lower() == "auto":
+        value = self.max_model_memory.strip().lower()
+        if value == "disabled":
+            return None
+        if value == "auto":
             total = get_system_memory()
             usable = max(0, total - 8 * 1024**3)
             return int(usable * 0.9)
@@ -810,7 +814,7 @@ class GlobalSettings:
             )
 
         # Model validation
-        if self.model.max_model_memory.lower() != "auto":
+        if self.model.max_model_memory.lower() not in ("auto", "disabled"):
             try:
                 size = parse_size(self.model.max_model_memory)
                 if size <= 0:

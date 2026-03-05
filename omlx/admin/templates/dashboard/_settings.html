@@ -280,7 +280,7 @@
                                                    : 'bg-neutral-200 cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:shadow-sm'">
                                         <span class="text-sm w-28 text-right transition-all duration-200 inline-flex items-center justify-end gap-0"
                                               :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-600'">
-                                            <span x-text="modelMemoryAuto ? window.t('settings.resource.auto') : memoryPercent + '%'"></span>
+                                            <span x-text="modelMemoryAuto ? window.t('settings.resource.auto') : (memoryPercent === 0 ? window.t('settings.resource.off') : memoryPercent + '%')"></span>
                                             <span :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'" class="ml-1">(</span><span x-show="!editingModelMemory" @click="if(!modelMemoryAuto) { editingModelMemory = true }" class="cursor-pointer hover:text-neutral-900" :class="modelMemoryAuto ? 'cursor-default text-neutral-300' : ''" x-text="modelMemorySizeGB"></span><input x-show="editingModelMemory"
                                                    type="number"
                                                    :value="modelMemorySizeGB"

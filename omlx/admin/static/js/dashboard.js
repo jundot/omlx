@@ -257,6 +257,9 @@
                         if (this.globalSettings.model.max_model_memory === 'auto') {
                             this.modelMemoryAuto = true;
                             this.memoryPercent = 90;
+                        } else if (this.globalSettings.model.max_model_memory === 'disabled') {
+                            this.modelMemoryAuto = false;
+                            this.memoryPercent = 0;
                         } else {
                             this.modelMemoryAuto = false;
                             this.memoryPercent = this.parseMemoryToPercent(
@@ -1191,6 +1194,7 @@
 
             // Parse stored memory value (e.g., "102GB") to percent of usable memory
             parseMemoryToPercent(memoryStr, totalBytes) {
+                if (memoryStr === 'disabled') return 0;
                 const usableBytes = Math.max(0, totalBytes - 8 * 1024 * 1024 * 1024);
                 if (!memoryStr || !usableBytes || usableBytes === 0) {
                     return 80; // Default 80%
@@ -1234,6 +1238,7 @@
             getMemoryDisplay() {
                 const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
                 if (!totalBytes) return '-';
+                if (this.memoryPercent === 0 && !this.modelMemoryAuto) return '-';
                 const usableBytes = Math.max(0, totalBytes - 8 * 1024 * 1024 * 1024);
                 const bytes = Math.floor((this.memoryPercent / 100) * usableBytes);
                 const gb = Math.round(bytes / (1024 * 1024 * 1024));
@@ -1244,6 +1249,8 @@
             updateMemoryFromSlider() {
                 if (this.modelMemoryAuto) {
                     this.globalSettings.model.max_model_memory = 'auto';
+                } else if (this.memoryPercent === 0) {
+                    this.globalSettings.model.max_model_memory = 'disabled';
                 } else {
                     const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
                     this.globalSettings.model.max_model_memory = this.percentToMemoryString(this.memoryPercent, totalBytes);
@@ -1331,6 +1338,7 @@
             // Computed model memory size in GB (for manual input)
             get modelMemorySizeGB() {
                 const val = this.globalSettings.model?.max_model_memory;
+                if (val === 'disabled') return 0;
                 const parsed = this._parseSettingsGB(val);
                 if (parsed !== null) return parsed;
                 // Fallback: derive from percent
@@ -1344,6 +1352,11 @@
             // Update model memory from manual GB input
             updateModelMemoryFromInput(gbValue) {
                 const gb = parseInt(gbValue) || 0;
+                if (gb === 0) {
+                    this.memoryPercent = 0;
+                    this.globalSettings.model.max_model_memory = 'disabled';
+                    return;
+                }
                 const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
                 const usableBytes = Math.max(0, totalBytes - 8 * 1024 * 1024 * 1024);
                 if (usableBytes > 0) {

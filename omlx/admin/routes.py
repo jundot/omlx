@@ -241,11 +241,14 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     )
 
 
-async def _apply_max_model_memory_runtime(max_memory_bytes: int) -> tuple[bool, str]:
+async def _apply_max_model_memory_runtime(
+    max_memory_bytes: int | None,
+) -> tuple[bool, str]:
     """
     Apply max model memory change at runtime.
 
     If current usage exceeds new limit, unloads LRU models until within limit.
+    If None, disables model memory limiting.
 
     Returns:
         Tuple of (success, message)
@@ -260,6 +263,12 @@ async def _apply_max_model_memory_runtime(max_memory_bytes: int) -> tuple[bool, 
     old_limit = pool._max_model_memory
     pool._max_model_memory = max_memory_bytes
 
+    old_display = format_size(old_limit) if old_limit is not None else "disabled"
+
+    if max_memory_bytes is None:
+        msg = f"Max model memory changed: {old_display} -> disabled (no limit)"
+        return True, msg
+
     # If current usage exceeds new limit, unload LRU models
     unloaded = []
     while pool._current_model_memory > max_memory_bytes:
@@ -270,7 +279,7 @@ async def _apply_max_model_memory_runtime(max_memory_bytes: int) -> tuple[bool, 
         await pool._unload_engine(victim)
         unloaded.append(victim)
 
-    msg = f"Max model memory changed: {format_size(old_limit)} -> {format_size(max_memory_bytes)}"
+    msg = f"Max model memory changed: {old_display} -> {format_size(max_memory_bytes)}"
     if unloaded:
         msg += f", unloaded: {', '.join(unloaded)}"
 
@@ -1455,7 +1464,9 @@ async def update_global_settings(
         global_settings.model.max_model_memory = request.max_model_memory
         # Apply at runtime
         try:
-            if request.max_model_memory.lower() == "auto":
+            if request.max_model_memory.lower() == "disabled":
+                max_bytes = None
+            elif request.max_model_memory.lower() == "auto":
                 max_bytes = global_settings.model.get_max_model_memory_bytes()
             else:
                 max_bytes = parse_size(request.max_model_memory)

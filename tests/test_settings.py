@@ -136,6 +136,16 @@ class TestModelSettings:
         settings = ModelSettings(max_model_memory="1TB")
         assert settings.get_max_model_memory_bytes() == 1024**4
 
+    def test_get_max_model_memory_bytes_disabled(self):
+        """Test disabled memory returns None."""
+        settings = ModelSettings(max_model_memory="disabled")
+        assert settings.get_max_model_memory_bytes() is None
+
+    def test_get_max_model_memory_bytes_disabled_case_insensitive(self):
+        """Test disabled is case-insensitive."""
+        settings = ModelSettings(max_model_memory="DISABLED")
+        assert settings.get_max_model_memory_bytes() is None
+
     def test_get_model_dirs_default(self):
         """Test default model directories."""
         settings = ModelSettings()
@@ -735,6 +745,13 @@ class TestGlobalSettings:
             settings.server.log_level = level
             errors = settings.validate()
             assert errors == []
+
+    def test_validate_disabled_max_model_memory(self):
+        """Test validation accepts 'disabled' value."""
+        settings = GlobalSettings()
+        settings.model.max_model_memory = "disabled"
+        errors = settings.validate()
+        assert not any("max_model_memory" in e.lower() for e in errors)
 
     def test_validate_invalid_max_model_memory(self):
         """Test validation catches invalid memory size."""

@@ -72,14 +72,15 @@ class EnginePool:
 
     def __init__(
         self,
-        max_model_memory: int,
+        max_model_memory: int | None,
         scheduler_config: SchedulerConfig | None = None,
     ):
         """
         Initialize the engine pool.
 
         Args:
-            max_model_memory: Maximum memory for loaded models in bytes
+            max_model_memory: Maximum memory for loaded models in bytes,
+                or None for no limit (disabled)
             scheduler_config: Configuration for BatchedEngine schedulers
         """
         self._entries: dict[str, EngineEntry] = {}
@@ -90,8 +91,8 @@ class EnginePool:
         self._process_memory_enforcer: object | None = None  # Set by server
 
     @property
-    def max_model_memory(self) -> int:
-        """Maximum memory for loaded models in bytes."""
+    def max_model_memory(self) -> int | None:
+        """Maximum memory for loaded models in bytes, or None if disabled."""
         return self._max_model_memory
 
     @property
@@ -155,9 +156,10 @@ class EnginePool:
             if model_id not in found_models:
                 logger.warning(f"Pinned model not found: {model_id}")
 
+        mem_display = "disabled" if self._max_model_memory is None else format_size(self._max_model_memory)
         logger.info(
             f"Discovered {len(self._entries)} models, "
-            f"max memory: {format_size(self._max_model_memory)}"
+            f"max memory: {mem_display}"
         )
 
     _MODEL_TYPE_TO_ENGINE: dict[str, str] = {
@@ -246,7 +248,10 @@ class EnginePool:
                 return entry.engine
 
             # Check if model is too large for memory limit
-            if entry.estimated_size > self._max_model_memory:
+            if (
+                self._max_model_memory is not None
+                and entry.estimated_size > self._max_model_memory
+            ):
                 raise ModelTooLargeError(
                     model_id, entry.estimated_size, self._max_model_memory
                 )
@@ -255,21 +260,23 @@ class EnginePool:
             # so other models get evicted earlier, leaving room for context.
             # Always try to evict with headroom first. If all evictable models
             # are gone and the model still fits without headroom, allow it.
-            kv_headroom = int(entry.estimated_size * 0.25)
-            required_with_headroom = entry.estimated_size + kv_headroom
-            try:
-                await self._ensure_memory_available(required_with_headroom)
-            except InsufficientMemoryError:
-                # Can't fit with headroom even after evicting everything possible.
-                # Fall back to weights-only if that fits.
-                if self._current_model_memory + entry.estimated_size <= self._max_model_memory:
-                    logger.info(
-                        f"Loading {model_id} without KV headroom "
-                        f"(need {format_size(required_with_headroom)}, "
-                        f"available {format_size(self._max_model_memory - self._current_model_memory)})"
-                    )
-                else:
-                    await self._ensure_memory_available(entry.estimated_size)
+            # Skip entirely when model memory limit is disabled (None).
+            if self._max_model_memory is not None:
+                kv_headroom = int(entry.estimated_size * 0.25)
+                required_with_headroom = entry.estimated_size + kv_headroom
+                try:
+                    await self._ensure_memory_available(required_with_headroom)
+                except InsufficientMemoryError:
+                    # Can't fit with headroom even after evicting everything possible.
+                    # Fall back to weights-only if that fits.
+                    if self._current_model_memory + entry.estimated_size <= self._max_model_memory:
+                        logger.info(
+                            f"Loading {model_id} without KV headroom "
+                            f"(need {format_size(required_with_headroom)}, "
+                            f"available {format_size(self._max_model_memory - self._current_model_memory)})"
+                        )
+                    else:
+                        await self._ensure_memory_available(entry.estimated_size)
 
             # Check process memory limit before loading.
             # Try evicting LRU models first to free actual Metal memory.
@@ -321,6 +328,8 @@ class EnginePool:
         Raises:
             InsufficientMemoryError: If can't free enough memory
         """
+        if self._max_model_memory is None:
+            return  # No model memory limit
         while self._current_model_memory + required > self._max_model_memory:
             victim = self._find_lru_victim()
             if not victim:
