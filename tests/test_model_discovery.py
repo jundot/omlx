@@ -144,6 +144,25 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_text_only_qwen3_5_moe_as_llm(self, tmp_path):
+        """Text-only quant of qwen3_5_moe (no vision_config) should be LLM."""
+        config = {
+            "model_type": "qwen3_5_moe",
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_vlm_model_type_requires_vision_config(self, tmp_path):
+        """VLM_MODEL_TYPES match without vision_config should fall back to LLM."""
+        config = {
+            "model_type": "gemma3",
+            # No VLM architecture, no vision_config — text-only derivative
+            "architectures": ["SomeTextOnlyArch"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
 
 class TestEstimateModelSize:
     """Tests for estimate_model_size function."""
