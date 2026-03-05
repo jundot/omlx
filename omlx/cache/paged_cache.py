@@ -961,15 +961,18 @@ class PagedCacheManager(CacheManager):
                 # Lazy restore: if not in memory but exists on SSD, register it
                 if cached_block is None and self._paged_ssd_cache_manager is not None:
                     if self._paged_ssd_cache_manager.has_block(block_hash):
-                        block = self.free_block_queue.popleft()
+                        # Use standard allocation path so we handle an empty
+                        # free queue gracefully (grow/evict) and keep stats in sync.
+                        block = self.allocate_block()
                         if block is not None:
                             block.block_hash = block_hash
                             block.token_count = self.block_size
+                            # Cold-registered blocks are metadata-only until a
+                            # request claims them via increment_ref().
                             block.ref_count = 0
                             self.cached_block_hash_to_block.insert(
                                 block_hash, block
                             )
-                            self.allocated_blocks[block.block_id] = block
                             cached_block = block
 
                 if cached_block is None:

@@ -786,6 +786,56 @@ class TestPagedCacheManager:
         assert num_tokens == 4
         assert len(cached_blocks) == 1
 
+    def test_get_computed_blocks_ssd_fallback_no_free_blocks(self):
+        """SSD fallback should not raise when no free blocks are available."""
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=2, model_name="test-model", initial_blocks=2
+        )
+
+        # block 0 is reserved null block; allocate the only remaining free block
+        # so fallback has no free blocks left to register SSD hits.
+        allocated = manager.allocate_block()
+        assert allocated is not None
+        assert manager.free_block_queue.num_free_blocks == 0
+
+        tokens = [1, 2, 3, 4]
+        hash1 = compute_block_hash(None, tokens, model_name="test-model")
+
+        mock_ssd = MagicMock(spec=[])
+        mock_ssd.has_block = MagicMock(side_effect=lambda h: h == hash1)
+        manager._paged_ssd_cache_manager = mock_ssd
+
+        # Robust behavior: graceful miss, not ValueError from popleft().
+        cached_blocks, num_tokens = manager.get_computed_blocks(tokens)
+
+        assert num_tokens == 0
+        assert cached_blocks == []
+        assert manager.stats.misses >= 1
+
+    def test_get_computed_blocks_ssd_fallback_updates_stats(self):
+        """SSD fallback registration should keep cache stats in sync."""
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        hash1 = compute_block_hash(None, [1, 2, 3, 4], model_name="test-model")
+        hash2 = compute_block_hash(hash1, [5, 6, 7, 8], model_name="test-model")
+
+        mock_ssd = MagicMock(spec=[])
+        mock_ssd.has_block = MagicMock(side_effect=lambda h: h in (hash1, hash2))
+        manager._paged_ssd_cache_manager = mock_ssd
+
+        initial_allocated = manager.stats.allocated_blocks
+        initial_free = manager.stats.free_blocks
+
+        cached_blocks, num_tokens = manager.get_computed_blocks(tokens)
+
+        assert len(cached_blocks) == 2
+        assert num_tokens == 8
+        assert manager.stats.allocated_blocks == initial_allocated + 2
+        assert manager.stats.free_blocks == initial_free - 2
+
     def test_get_computed_blocks_no_ssd_no_regression(self):
         """Test that without SSD cache manager, behavior is unchanged."""
         manager = PagedCacheManager(
