@@ -2445,8 +2445,11 @@ async def init_mcp(config_path: str):
         logger.info(f"MCP initialized with {len(_server_state.mcp_manager.get_all_tools())} tools")
 
     except ImportError:
-        logger.error("MCP SDK not installed. Install with: pip install mcp")
-        raise
+        logger.warning(
+            "MCP SDK not installed. MCP features disabled. "
+            "Install with: pip install mcp"
+        )
+        return
     except Exception as e:
         logger.error(f"Failed to initialize MCP: {e}")
         raise
