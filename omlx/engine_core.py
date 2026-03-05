@@ -104,6 +104,13 @@ class EngineCore:
         self._start_time: Optional[float] = None
         self._steps_executed = 0
 
+        # Single-thread executor ensures MLX calls are never concurrent.
+        # Exposed as instance variable so VLMBatchedEngine can run vision
+        # encoding on the same thread, keeping the event loop responsive.
+        self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mlx-step"
+        )
+
         logger.debug(f"Engine {self._engine_id} initialized")
 
     async def start(self) -> None:
@@ -140,10 +147,6 @@ class EngineCore:
         are called directly to avoid ~0.5-2ms context switch overhead,
         giving ~5-10% throughput improvement during sustained generation.
         """
-        # Single-thread executor ensures MLX calls are never concurrent
-        _executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mlx-step"
-        )
         loop = asyncio.get_running_loop()
 
         step_interval = self.config.step_interval
@@ -160,7 +163,7 @@ class EngineCore:
                     has_waiting = self.scheduler.get_num_waiting() > 0
                     if has_waiting:
                         output = await loop.run_in_executor(
-                            _executor, self.scheduler.step
+                            self._mlx_executor, self.scheduler.step
                         )
                     else:
                         output = self.scheduler.step()

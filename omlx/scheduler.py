@@ -2415,6 +2415,12 @@ class Scheduler:
         # Clean up Harmony parser
         self._cleanup_harmony_parser(request_id)
 
+        # Clean up VLM adapter state to prevent contamination
+        if hasattr(self.model, 'clear_vlm_position_state'):
+            self.model.clear_vlm_position_state()
+        if hasattr(self.model, 'clear_pending_embeddings'):
+            self.model.clear_pending_embeddings()
+
         # Drop any boundary snapshot for this request.
         self._boundary_cache_snapshots.pop(request_id, None)
         if self._boundary_snapshot_store is not None:
@@ -2965,6 +2971,10 @@ class Scheduler:
 
             # Clean up Harmony parser
             self._cleanup_harmony_parser(request_id)
+
+            # Clean up VLM adapter state (position_ids, rope_deltas)
+            if hasattr(self.model, 'clear_vlm_position_state'):
+                self.model.clear_vlm_position_state()
 
             # Drop any boundary snapshot for this request.
             self._boundary_cache_snapshots.pop(request_id, None)

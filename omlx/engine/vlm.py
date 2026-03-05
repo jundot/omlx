@@ -692,8 +692,10 @@ class VLMBatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        prompt, vlm_embeds, vlm_kwargs, image_hash = self._process_chat_messages(
-            messages, tools, kwargs
+        loop = asyncio.get_running_loop()
+        prompt, vlm_embeds, vlm_kwargs, image_hash = await loop.run_in_executor(
+            self._engine._mlx_executor,
+            self._process_chat_messages, messages, tools, kwargs,
         )
 
         return await self.generate(
@@ -724,8 +726,14 @@ class VLMBatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        prompt, vlm_embeds, vlm_kwargs, image_hash = self._process_chat_messages(
-            messages, tools, kwargs
+        # Run vision encoding on the MLX executor thread to avoid blocking
+        # the event loop.  Blocking here (synchronous mx.eval) prevents
+        # uvicorn from managing HTTP keep-alive connections, causing
+        # TransferEncodingError on the next request (issue #80).
+        loop = asyncio.get_running_loop()
+        prompt, vlm_embeds, vlm_kwargs, image_hash = await loop.run_in_executor(
+            self._engine._mlx_executor,
+            self._process_chat_messages, messages, tools, kwargs,
         )
 
         async for output in self.stream_generate(
