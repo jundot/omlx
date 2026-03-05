@@ -239,8 +239,6 @@
   "settings.advanced.batching": "バッチング",
   "settings.advanced.max_sequences": "最大シーケンス数",
   "settings.advanced.max_sequences_hint": "並列処理可能な最大同時リクエスト数",
-  "settings.advanced.prefill_batch_size": "プリフィルバッチサイズ",
-  "settings.advanced.prefill_batch_size_hint": "プロンプトエンコード段階のバッチサイズ",
   "settings.advanced.completion_batch_size": "コンプリーションバッチサイズ",
   "settings.advanced.completion_batch_size_hint": "トークン生成段階のバッチサイズ",
   "settings.advanced.cache": "キャッシュ",

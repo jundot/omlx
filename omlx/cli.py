@@ -272,12 +272,6 @@ Example directory structure:
         "--max-num-seqs", type=int, default=None, help="Max concurrent sequences (default: 256)"
     )
     serve_parser.add_argument(
-        "--prefill-batch-size",
-        type=int,
-        default=None,
-        help="Max sequences for mlx-lm BatchGenerator prefill phase (prompt processing). (default: 8)",
-    )
-    serve_parser.add_argument(
         "--completion-batch-size",
         type=int,
         default=None,

@@ -239,8 +239,6 @@
   "settings.advanced.batching": "배칭",
   "settings.advanced.max_sequences": "최대 시퀀스",
   "settings.advanced.max_sequences_hint": "다중 처리 가능한 최대 동시 요청 수",
-  "settings.advanced.prefill_batch_size": "프리필 배치 크기",
-  "settings.advanced.prefill_batch_size_hint": "프롬프트 인코딩 단계의 배치 크기",
   "settings.advanced.completion_batch_size": "완성 배치 크기",
   "settings.advanced.completion_batch_size_hint": "토큰 생성 단계의 배치 크기",
   "settings.advanced.cache": "캐시",

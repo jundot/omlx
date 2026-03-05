@@ -284,7 +284,6 @@ class TestSchedulerWithRealModel:
         config = SchedulerConfig(
             max_num_seqs=4,
             max_num_batched_tokens=1024,
-            prefill_batch_size=2,
             completion_batch_size=4,
         )
 

@@ -159,7 +159,6 @@ class TestServeCommandOptions:
             timeout=10,
         )
         assert "--max-num-seqs" in result.stdout
-        assert "--prefill-batch-size" in result.stdout
         assert "--completion-batch-size" in result.stdout
 
     def test_serve_has_cache_options(self):

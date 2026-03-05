@@ -90,7 +90,6 @@ class GlobalSettingsRequest(BaseModel):
 
     # Scheduler settings
     max_num_seqs: Optional[int] = None
-    prefill_batch_size: Optional[int] = None
     completion_batch_size: Optional[int] = None
 
     # Cache settings
@@ -1344,7 +1343,6 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "scheduler": {
             "max_num_seqs": global_settings.scheduler.max_num_seqs,
-            "prefill_batch_size": global_settings.scheduler.prefill_batch_size,
             "completion_batch_size": global_settings.scheduler.completion_batch_size,
         },
         "cache": {
@@ -1497,8 +1495,6 @@ async def update_global_settings(
     # Apply scheduler settings (restart required)
     if request.max_num_seqs is not None:
         global_settings.scheduler.max_num_seqs = request.max_num_seqs
-    if request.prefill_batch_size is not None:
-        global_settings.scheduler.prefill_batch_size = request.prefill_batch_size
     if request.completion_batch_size is not None:
         global_settings.scheduler.completion_batch_size = request.completion_batch_size
 

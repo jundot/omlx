@@ -202,7 +202,6 @@ class SchedulerSettings:
     """Scheduler configuration settings."""
 
     max_num_seqs: int = 8
-    prefill_batch_size: int = 1
     completion_batch_size: int = 8
 
     def to_dict(self) -> dict[str, Any]:
@@ -214,7 +213,6 @@ class SchedulerSettings:
         """Create from dictionary."""
         return cls(
             max_num_seqs=data.get("max_num_seqs", 8),
-            prefill_batch_size=data.get("prefill_batch_size", 1),
             completion_batch_size=data.get("completion_batch_size", 8),
         )
 
@@ -638,11 +636,6 @@ class GlobalSettings:
                 self.scheduler.max_num_seqs = int(max_num_seqs)
             except ValueError:
                 logger.warning(f"Invalid OMLX_MAX_NUM_SEQS value: {max_num_seqs}")
-        if prefill_batch := os.getenv("OMLX_PREFILL_BATCH_SIZE"):
-            try:
-                self.scheduler.prefill_batch_size = int(prefill_batch)
-            except ValueError:
-                logger.warning(f"Invalid OMLX_PREFILL_BATCH_SIZE: {prefill_batch}")
         if completion_batch := os.getenv("OMLX_COMPLETION_BATCH_SIZE"):
             try:
                 self.scheduler.completion_batch_size = int(completion_batch)
@@ -716,8 +709,6 @@ class GlobalSettings:
         # Scheduler settings
         if hasattr(args, "max_num_seqs") and args.max_num_seqs is not None:
             self.scheduler.max_num_seqs = args.max_num_seqs
-        if hasattr(args, "prefill_batch_size") and args.prefill_batch_size is not None:
-            self.scheduler.prefill_batch_size = args.prefill_batch_size
         if (
             hasattr(args, "completion_batch_size")
             and args.completion_batch_size is not None
@@ -846,11 +837,6 @@ class GlobalSettings:
             errors.append(
                 f"Invalid max_num_seqs: {self.scheduler.max_num_seqs} (must be > 0)"
             )
-        if self.scheduler.prefill_batch_size <= 0:
-            errors.append(
-                f"Invalid prefill_batch_size: {self.scheduler.prefill_batch_size} "
-                "(must be > 0)"
-            )
         if self.scheduler.completion_batch_size <= 0:
             errors.append(
                 f"Invalid completion_batch_size: "
@@ -917,7 +903,6 @@ class GlobalSettings:
 
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_num_seqs,
-            prefill_batch_size=self.scheduler.prefill_batch_size,
             completion_batch_size=self.scheduler.completion_batch_size,
             initial_cache_blocks=self.cache.initial_cache_blocks,
         )

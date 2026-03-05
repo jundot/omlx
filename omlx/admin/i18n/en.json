@@ -239,8 +239,6 @@
     "settings.advanced.batching": "Batching",
     "settings.advanced.max_sequences": "Max Sequences",
     "settings.advanced.max_sequences_hint": "Maximum concurrent requests processed in parallel",
-    "settings.advanced.prefill_batch_size": "Prefill Batch Size",
-    "settings.advanced.prefill_batch_size_hint": "Batch size for prompt encoding phase",
     "settings.advanced.completion_batch_size": "Completion Batch Size",
     "settings.advanced.completion_batch_size_hint": "Batch size for token generation phase",
     "settings.advanced.cache": "Cache",

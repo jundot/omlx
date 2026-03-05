@@ -34,7 +34,6 @@ class TestSchedulerConfig:
         assert config.max_num_seqs == 256
         assert config.max_num_batched_tokens == 8192
         assert config.policy == SchedulingPolicy.FCFS
-        assert config.prefill_batch_size == 8
         assert config.completion_batch_size == 32
         assert config.prefill_step_size == 2048
         assert config.paged_cache_block_size == 256
@@ -52,7 +51,6 @@ class TestSchedulerConfig:
             max_num_seqs=128,
             max_num_batched_tokens=4096,
             policy=SchedulingPolicy.PRIORITY,
-            prefill_batch_size=4,
             completion_batch_size=16,
             prefill_step_size=1024,
             paged_cache_block_size=128,
@@ -68,7 +66,6 @@ class TestSchedulerConfig:
         assert config.max_num_seqs == 128
         assert config.max_num_batched_tokens == 4096
         assert config.policy == SchedulingPolicy.PRIORITY
-        assert config.prefill_batch_size == 4
         assert config.completion_batch_size == 16
         assert config.prefill_step_size == 1024
         assert config.paged_cache_block_size == 128
@@ -154,7 +151,6 @@ class TestSchedulerInitialization:
         """Test Scheduler initializes with custom config."""
         config = SchedulerConfig(
             max_num_seqs=64,
-            prefill_batch_size=2,
         )
         scheduler = Scheduler(
             model=mock_model,
@@ -163,7 +159,6 @@ class TestSchedulerInitialization:
         )
 
         assert scheduler.config.max_num_seqs == 64
-        assert scheduler.config.prefill_batch_size == 2
 
     def test_init_statistics_zero(self, mock_model, mock_tokenizer):
         """Test Scheduler initializes with zero statistics."""

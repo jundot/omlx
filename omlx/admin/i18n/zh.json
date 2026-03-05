@@ -219,8 +219,6 @@
   "settings.advanced.batching": "批处理",
   "settings.advanced.max_sequences": "最大序列数",
   "settings.advanced.max_sequences_hint": "并行处理的最大并发请求数",
-  "settings.advanced.prefill_batch_size": "预填充批大小",
-  "settings.advanced.prefill_batch_size_hint": "提示词编码阶段的批处理大小",
   "settings.advanced.completion_batch_size": "补全批大小",
   "settings.advanced.completion_batch_size_hint": "Token 生成阶段的批处理大小",
   "settings.advanced.cache": "缓存",

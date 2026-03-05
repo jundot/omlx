@@ -20,7 +20,7 @@
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info' },
                 model: { model_dirs: [''], max_model_memory: '' },
                 memory: { max_process_memory: 'auto' },
-                scheduler: { max_num_seqs: 8, prefill_batch_size: 1, completion_batch_size: 8 },
+                scheduler: { max_num_seqs: 8, completion_batch_size: 8 },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256 },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
@@ -312,7 +312,6 @@
                 if (!s.server.port) errors.push('Port');
                 if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
                 if (!s.scheduler.max_num_seqs) errors.push('Max Sequences');
-                if (!s.scheduler.prefill_batch_size) errors.push('Prefill Batch Size');
                 if (!s.scheduler.completion_batch_size) errors.push('Completion Batch Size');
                 if (!s.cache.ssd_cache_max_size) errors.push('Max Cache Size');
                 if (!s.sampling.max_context_window) errors.push('Max Context Window');
@@ -350,7 +349,6 @@
                             max_model_memory: this.globalSettings.model.max_model_memory,
                             max_process_memory: this.globalSettings.memory.max_process_memory,
                             max_num_seqs: this.globalSettings.scheduler.max_num_seqs,
-                            prefill_batch_size: this.globalSettings.scheduler.prefill_batch_size,
                             completion_batch_size: this.globalSettings.scheduler.completion_batch_size,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,

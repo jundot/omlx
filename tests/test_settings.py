@@ -215,16 +215,14 @@ class TestSchedulerSettings:
         """Test default values."""
         settings = SchedulerSettings()
         assert settings.max_num_seqs == 8
-        assert settings.prefill_batch_size == 1
         assert settings.completion_batch_size == 8
 
     def test_custom_values(self):
         """Test custom values."""
         settings = SchedulerSettings(
-            max_num_seqs=128, prefill_batch_size=4, completion_batch_size=16
+            max_num_seqs=128, completion_batch_size=16
         )
         assert settings.max_num_seqs == 128
-        assert settings.prefill_batch_size == 4
         assert settings.completion_batch_size == 16
 
     def test_to_dict(self):
@@ -233,7 +231,6 @@ class TestSchedulerSettings:
         result = settings.to_dict()
         assert result == {
             "max_num_seqs": 8,
-            "prefill_batch_size": 1,
             "completion_batch_size": 8,
         }
 
@@ -241,12 +238,10 @@ class TestSchedulerSettings:
         """Test creation from dictionary."""
         data = {
             "max_num_seqs": 512,
-            "prefill_batch_size": 16,
             "completion_batch_size": 64,
         }
         settings = SchedulerSettings.from_dict(data)
         assert settings.max_num_seqs == 512
-        assert settings.prefill_batch_size == 16
         assert settings.completion_batch_size == 64
 
 
@@ -562,7 +557,6 @@ class TestGlobalSettings:
                         "model": {"model_dir": "/models", "max_model_memory": "64GB"},
                         "scheduler": {
                             "max_num_seqs": 128,
-                            "prefill_batch_size": 4,
                             "completion_batch_size": 16,
                         },
                         "cache": {
@@ -768,11 +762,6 @@ class TestGlobalSettings:
         assert any("max_num_seqs" in e.lower() for e in errors)
 
         settings = GlobalSettings()
-        settings.scheduler.prefill_batch_size = -1
-        errors = settings.validate()
-        assert any("prefill_batch_size" in e.lower() for e in errors)
-
-        settings = GlobalSettings()
         settings.scheduler.completion_batch_size = 0
         errors = settings.validate()
         assert any("completion_batch_size" in e.lower() for e in errors)
@@ -844,14 +833,12 @@ class TestGlobalSettings:
                 os.environ,
                 {
                     "OMLX_MAX_NUM_SEQS": "512",
-                    "OMLX_PREFILL_BATCH_SIZE": "16",
                     "OMLX_COMPLETION_BATCH_SIZE": "64",
                 },
                 clear=False,
             ):
                 settings = GlobalSettings.load(base_path=tmpdir)
                 assert settings.scheduler.max_num_seqs == 512
-                assert settings.scheduler.prefill_batch_size == 16
                 assert settings.scheduler.completion_batch_size == 64
 
     def test_env_override_cache(self):
@@ -970,12 +957,10 @@ class TestGlobalSettings:
         with tempfile.TemporaryDirectory() as tmpdir:
             args = Namespace(
                 max_num_seqs=64,
-                prefill_batch_size=2,
                 completion_batch_size=8,
             )
             settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
             assert settings.scheduler.max_num_seqs == 64
-            assert settings.scheduler.prefill_batch_size == 2
             assert settings.scheduler.completion_batch_size == 8
 
     def test_cli_override_cache(self):
@@ -1047,12 +1032,10 @@ class TestGlobalSettings:
         """Test conversion to SchedulerConfig."""
         settings = GlobalSettings()
         settings.scheduler.max_num_seqs = 128
-        settings.scheduler.prefill_batch_size = 4
         settings.scheduler.completion_batch_size = 16
 
         scheduler_config = settings.to_scheduler_config()
         assert scheduler_config.max_num_seqs == 128
-        assert scheduler_config.prefill_batch_size == 4
         assert scheduler_config.completion_batch_size == 16
         assert scheduler_config.initial_cache_blocks == 256  # default
 
