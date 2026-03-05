@@ -140,12 +140,12 @@ class EngineCore:
         return self._running
 
     async def _engine_loop(self) -> None:
-        """Main engine loop - hybrid executor for prefill vs generation.
+        """Main engine loop - runs scheduler steps on the MLX executor.
 
-        Prefill steps (long prompts) are run in a thread executor to keep
-        the asyncio event loop responsive.  Generation-only steps (~1-3ms)
-        are called directly to avoid ~0.5-2ms context switch overhead,
-        giving ~5-10% throughput improvement during sustained generation.
+        All scheduler steps run on _mlx_executor (single-worker thread) to
+        guarantee that MLX GPU operations are never concurrent.  VLM vision
+        encoding also runs on the same executor, so inline scheduler.step()
+        on the event loop would race with vision mx.eval() and segfault.
         """
         loop = asyncio.get_running_loop()
 
@@ -156,19 +156,9 @@ class EngineCore:
         while self._running:
             try:
                 if self.scheduler.has_requests():
-                    # Hybrid approach: use executor only when prefill is likely.
-                    # Prefill happens when there are waiting requests that need
-                    # to be inserted into the batch (may block for seconds).
-                    # Generation-only steps are fast (<3ms) and can run inline.
-                    has_waiting = self.scheduler.get_num_waiting() > 0
-                    if has_waiting:
-                        output = await loop.run_in_executor(
-                            self._mlx_executor, self.scheduler.step
-                        )
-                    else:
-                        output = self.scheduler.step()
-                        # Yield to event loop after inline step
-                        await asyncio.sleep(0)
+                    output = await loop.run_in_executor(
+                        self._mlx_executor, self.scheduler.step
+                    )
                     self._steps_executed += 1
 
                     # Fast path: distribute outputs to collectors
