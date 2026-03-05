@@ -177,7 +177,7 @@ class MockBaseEngine:
             finish_reason="stop",
         )
 
-    def count_chat_tokens(self, messages: List[Dict], tools=None) -> int:
+    def count_chat_tokens(self, messages: List[Dict], tools=None, chat_template_kwargs=None) -> int:
         prompt = self._tokenizer.apply_chat_template(messages, tokenize=False)
         return len(self._tokenizer.encode(prompt))
 

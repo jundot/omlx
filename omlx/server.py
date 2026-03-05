@@ -55,7 +55,7 @@ import secrets
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse as _BaseStreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from omlx._version import __version__
@@ -141,50 +141,6 @@ from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-class StreamingResponse(_BaseStreamingResponse):
-    """StreamingResponse that aborts generation when client disconnects.
-
-    Monitors the ASGI receive channel for http.disconnect and closes
-    the body iterator, propagating GeneratorExit through the engine's
-    stream_generate which calls abort_request().
-    """
-
-    async def __call__(self, scope, receive, send):
-        disconnected = asyncio.Event()
-
-        async def _monitor_disconnect():
-            while True:
-                message = await receive()
-                if message.get("type") == "http.disconnect":
-                    disconnected.set()
-                    return
-
-        monitor_task = asyncio.create_task(_monitor_disconnect())
-
-        inner = self.body_iterator
-
-        async def _disconnect_aware():
-            try:
-                async for chunk in inner:
-                    if disconnected.is_set():
-                        logger.info("Client disconnected, stopping stream")
-                        return
-                    yield chunk
-            finally:
-                if hasattr(inner, "aclose"):
-                    await inner.aclose()
-
-        self.body_iterator = _disconnect_aware()
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            monitor_task.cancel()
-            try:
-                await monitor_task
-            except asyncio.CancelledError:
-                pass
 
 
 # Security bearer for API key authentication
@@ -434,19 +390,57 @@ async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
     )
 
 
-@app.middleware("http")
-async def debug_request_logging(request: FastAPIRequest, call_next):
-    """Log full request body for POST requests when debug logging is enabled."""
-    if logger.isEnabledFor(5) and request.method == "POST":
-        body = await request.body()
+class DebugRequestLoggingMiddleware:
+    """Pure ASGI middleware for trace-level request body logging.
+
+    Uses raw ASGI protocol instead of BaseHTTPMiddleware to avoid
+    wrapping StreamingResponse in an intermediate pipe layer, which
+    causes connection corruption on HTTP keep-alive connections.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or not logger.isEnabledFor(5)
+            or scope.get("method") != "POST"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        # Read and cache the request body for logging
+        body_parts = []
+        while True:
+            message = await receive()
+            body_parts.append(message)
+            if not message.get("more_body", False):
+                break
+
+        body = b"".join(part.get("body", b"") for part in body_parts)
         logger.log(
             5,
             "Incoming %s %s — body: %s",
-            request.method, request.url.path,
+            scope["method"],
+            scope["path"],
             body.decode("utf-8", errors="replace"),
         )
-    response = await call_next(request)
-    return response
+
+        # Replay cached body for inner app, then forward real receive
+        body_sent = False
+
+        async def cached_receive():
+            nonlocal body_sent
+            if not body_sent:
+                body_sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+
+        await self.app(scope, cached_receive, send)
+
+
+app.add_middleware(DebugRequestLoggingMiddleware)
 
 
 # =============================================================================
