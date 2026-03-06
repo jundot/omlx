@@ -841,3 +841,32 @@ class TestEngineCoreAbortAllRequests:
             finally:
                 await engine.stop()
                 engine.close()
+
+
+class TestGlobalMLXExecutor:
+    """Tests for the global MLX executor singleton (issue #85)."""
+
+    def test_get_mlx_executor_returns_singleton(self):
+        """get_mlx_executor() must always return the same executor instance."""
+        from omlx.engine_core import get_mlx_executor
+
+        executor1 = get_mlx_executor()
+        executor2 = get_mlx_executor()
+        assert executor1 is executor2
+
+    def test_engines_share_mlx_executor(self, mock_model, mock_tokenizer):
+        """Multiple EngineCore instances must share a single MLX executor (#85)."""
+        from omlx.engine_core import get_mlx_executor
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine1 = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            engine2 = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                assert engine1._mlx_executor is engine2._mlx_executor
+                assert engine1._mlx_executor is get_mlx_executor()
+            finally:
+                engine1.close()
+                engine2.close()

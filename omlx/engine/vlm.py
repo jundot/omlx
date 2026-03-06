@@ -194,7 +194,10 @@ class VLMBatchedEngine(BaseEngine):
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
 
-        # Load VLM model and processor in background thread
+        # Load VLM model on the global MLX executor to avoid blocking the event loop
+        # while ensuring no concurrent Metal operations. See issue #85.
+        from ..engine_core import get_mlx_executor
+
         def _load_vlm_sync():
             # Patch transformers bug: video_processor_class_from_name crashes
             # when torchvision is not available (extractors is None, `in` fails).
@@ -202,7 +205,10 @@ class VLMBatchedEngine(BaseEngine):
             _patch_video_processor_bug()
             return vlm_load(self._model_name)
 
-        self._vlm_model, self._processor = await asyncio.to_thread(_load_vlm_sync)
+        loop = asyncio.get_running_loop()
+        self._vlm_model, self._processor = await loop.run_in_executor(
+            get_mlx_executor(), _load_vlm_sync
+        )
 
         # Extract tokenizer from processor
         if hasattr(self._processor, "tokenizer"):

@@ -37,6 +37,7 @@ from .exceptions import (
     ModelTooLargeError,
 )
 from .model_discovery import DiscoveredModel, discover_models, format_size
+from .engine_core import get_mlx_executor
 from .scheduler import SchedulerConfig
 
 logger = logging.getLogger(__name__)
@@ -389,9 +390,12 @@ class EnginePool:
         entry.engine = None
         entry.last_access = 0.0
 
-        # Force garbage collection to release memory
+        # Force garbage collection to release memory.
+        # Run mx.clear_cache on the global MLX executor to avoid concurrent
+        # Metal operations with running engines. See issue #85.
         gc.collect()
-        mx.clear_cache()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
 
         logger.info(
             f"Unloaded model: {model_id}, "
@@ -451,7 +455,8 @@ class EnginePool:
                     except Exception:
                         pass
                     gc.collect()
-                    mx.clear_cache()
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
 
                     engine = BatchedEngine(
                         model_name=entry.model_path,
@@ -480,7 +485,8 @@ class EnginePool:
                         f"Error stopping aborted engine for {model_id}: {e}"
                     )
                 gc.collect()
-                mx.clear_cache()
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
                 raise ModelLoadingError(
                     f"Model {model_id} load aborted: "
                     f"process memory limit exceeded"

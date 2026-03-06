@@ -29,6 +29,24 @@ from .model_registry import get_registry, ModelOwnershipError
 
 logger = logging.getLogger(__name__)
 
+_global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Get or create the global MLX executor (lazy singleton).
+
+    mlx-lm's BatchGenerator uses a module-level Metal stream
+    (generation_stream), so ALL MLX GPU operations across all models
+    MUST be serialized onto one thread to prevent Metal command buffer
+    races that cause segfaults. See issue #85.
+    """
+    global _global_mlx_executor
+    if _global_mlx_executor is None:
+        _global_mlx_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mlx-global"
+        )
+    return _global_mlx_executor
+
 
 @dataclass
 class EngineConfig:
@@ -104,12 +122,10 @@ class EngineCore:
         self._start_time: Optional[float] = None
         self._steps_executed = 0
 
-        # Single-thread executor ensures MLX calls are never concurrent.
-        # Exposed as instance variable so VLMBatchedEngine can run vision
-        # encoding on the same thread, keeping the event loop responsive.
-        self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mlx-step"
-        )
+        # Global single-thread executor shared across ALL engines.
+        # mlx-lm uses a module-level Metal stream, so concurrent MLX calls
+        # from different engine threads cause segfaults. See issue #85.
+        self._mlx_executor = get_mlx_executor()
 
         logger.debug(f"Engine {self._engine_id} initialized")
 

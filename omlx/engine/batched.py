@@ -135,15 +135,20 @@ class BatchedEngine(BaseEngine):
             trust_remote_code=self._trust_remote_code,
         )
 
-        # Load model and tokenizer in a separate thread to avoid blocking the event loop.
-        # This allows /admin and /health endpoints to remain responsive during model loading.
+        # Load model on the global MLX executor to avoid blocking the event loop
+        # while ensuring no concurrent Metal operations. See issue #85.
+        from ..engine_core import get_mlx_executor
+
         def _load_model_sync():
             return load(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
             )
 
-        self._model, self._tokenizer = await asyncio.to_thread(_load_model_sync)
+        loop = asyncio.get_running_loop()
+        self._model, self._tokenizer = await loop.run_in_executor(
+            get_mlx_executor(), _load_model_sync
+        )
 
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()
