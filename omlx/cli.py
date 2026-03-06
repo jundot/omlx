@@ -47,8 +47,15 @@ def serve_command(args):
     import os
     import uvicorn
 
+    from ._version import __version__
     from .settings import init_settings, get_settings
     from .logging_config import configure_file_logging
+
+    # Print version banner
+    print(f"\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
+    print(f"\033[33m├─ https://github.com/jundot/omlx\033[0m")
+    print(f"\033[33m└─ Version: {__version__}\033[0m")
+    print()
 
     # Initialize global settings first (to get log_level from file if not specified)
     settings = init_settings(base_path=args.base_path, cli_args=args)

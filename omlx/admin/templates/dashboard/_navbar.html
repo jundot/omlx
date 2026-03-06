@@ -2,10 +2,19 @@
         <div class="max-w-7xl mx-auto flex justify-between items-center">
             <!-- Logo -->
             <div class="flex items-center gap-2">
-                <img x-show="theme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX" class="w-8 h-8">
-                <img x-show="theme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX" class="w-8 h-8" x-cloak>
-                <span class="font-bold tracking-tight text-lg">oMLX</span>
-                <span class="text-sm text-neutral-400 ml-1">{{ t('navbar.admin') }}</span>
+                <a href="/admin/dashboard" class="flex items-center gap-2">
+                    <img x-show="theme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX" class="w-9 h-9">
+                    <img x-show="theme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX" class="w-9 h-9" x-cloak>
+                </a>
+                <div class="flex flex-col gap-0">
+                    <a href="/admin/dashboard" class="font-bold tracking-tight text-xl leading-none">oMLX</a>
+                    <a href="https://github.com/jundot/omlx" target="_blank"
+                       class="relative text-[10px] text-neutral-500 dark:text-neutral-400 leading-none hover:text-neutral-700"
+                       x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+                        v{{ version }}
+                        <span x-show="show" x-cloak class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-[10px] text-white bg-neutral-800 rounded whitespace-nowrap z-50">Go to GitHub</span>
+                    </a>
+                </div>
             </div>
 
             <!-- Center Navigation -->

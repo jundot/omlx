@@ -504,6 +504,9 @@ def _static_version(path: str) -> str:
 
 templates.env.globals["static"] = _static_version
 
+from omlx._version import __version__ as _omlx_version
+templates.env.globals["version"] = _omlx_version
+
 # i18n defaults (English) — overridden once set_admin_getters is called
 _i18n_dir = Path(__file__).parent / "i18n"
 _en_locale: dict = {}
