@@ -2864,7 +2864,14 @@ class Scheduler:
                     if hasattr(request, '_extracted_cache') and request._extracted_cache is not None:
                         try:
                             full_token_sequence = list(request.prompt_token_ids) + list(request.output_token_ids)
-                            token_sequence_to_store = full_token_sequence
+                            # For reasoning models, only cache prompt tokens.
+                            # Output contains <think> tokens that the API layer
+                            # strips before the next turn, so they never match.
+                            if getattr(request, 'needs_think_prefix', False):
+                                cacheable_sequence = list(request.prompt_token_ids)
+                            else:
+                                cacheable_sequence = full_token_sequence
+                            token_sequence_to_store = cacheable_sequence
                             cache_to_store = request._extracted_cache
                             # Get model cache config if available (for hybrid cache support)
                             model_cache_config = getattr(request, '_model_cache_config', None)
@@ -2875,7 +2882,7 @@ class Scheduler:
                             with mx.stream(generation_stream):
                                 boundary_override = self._get_boundary_store_override(
                                     request_id,
-                                    full_token_sequence,
+                                    cacheable_sequence,
                                 )
                                 intermediate_snapshots = None
                                 if boundary_override is not None:

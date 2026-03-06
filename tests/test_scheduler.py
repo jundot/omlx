@@ -803,6 +803,66 @@ class TestSchedulerBoundarySnapshots:
         assert snapshot == [extracted_cache]
         mock_layer_cache.extract.assert_called_once_with(0)
 
+    def test_cleanup_finished_skips_output_tokens_for_reasoning_model(
+        self, mock_model, mock_tokenizer
+    ):
+        """Reasoning models (needs_think_prefix=True) should store only prompt tokens."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+
+        request = Request(
+            request_id="req-reasoning",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+        request.num_prompt_tokens = 8
+        request.output_token_ids = [9, 10, 11, 12]
+        request.needs_think_prefix = True
+        request._extracted_cache = [{"state": "cache"}]
+        request._model_cache_config = None
+
+        scheduler.running["req-reasoning"] = request
+        scheduler.requests["req-reasoning"] = request
+
+        scheduler._cleanup_finished({"req-reasoning"})
+
+        scheduler.block_aware_cache.store_cache.assert_called_once()
+        args, kwargs = scheduler.block_aware_cache.store_cache.call_args
+        assert args[0] == "req-reasoning"
+        assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8]  # prompt only
+
+    def test_cleanup_finished_stores_output_tokens_for_non_reasoning_model(
+        self, mock_model, mock_tokenizer
+    ):
+        """Non-reasoning models should store prompt + output tokens."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+
+        request = Request(
+            request_id="req-nonreasoning",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request.num_prompt_tokens = 4
+        request.output_token_ids = [5, 6, 7, 8]
+        request._extracted_cache = [{"state": "cache"}]
+        request._model_cache_config = None
+
+        scheduler.running["req-nonreasoning"] = request
+        scheduler.requests["req-nonreasoning"] = request
+
+        scheduler._cleanup_finished({"req-nonreasoning"})
+
+        scheduler.block_aware_cache.store_cache.assert_called_once()
+        args, kwargs = scheduler.block_aware_cache.store_cache.call_args
+        assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8]  # prompt + output
+
     def test_cleanup_finished_uses_boundary_snapshot_for_partial_trailing_tokens(
         self, mock_model, mock_tokenizer
     ):
