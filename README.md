@@ -85,7 +85,7 @@ Launch oMLX from your Applications folder. The Welcome screen guides you through
 omlx serve --model-dir ~/models
 ```
 
-The server discovers models from subdirectories automatically. Any OpenAI-compatible client can connect to `http://localhost:8000/v1`. A built-in chat UI is also available at `http://localhost:8000/admin/chat`.
+The server discovers LLMs, VLMs, embedding models, and rerankers from subdirectories automatically. Any OpenAI-compatible client can connect to `http://localhost:8000/v1`. A built-in chat UI is also available at `http://localhost:8000/admin/chat`.
 
 ### Homebrew Service
 
@@ -106,15 +106,19 @@ Logs are written to two locations:
 
 ## Features
 
-oMLX is built on top of [vllm-mlx](https://github.com/waybarrios/vllm-mlx), extending it with tiered KV caching, multi-model serving, an admin dashboard, Claude Code optimization, and Anthropic API support. Currently supports text-based LLMs - VLM and OCR model support is planned for upcoming milestones.
+Supports text LLMs, vision-language models (VLM), OCR models, embeddings, and rerankers on Apple Silicon.
 
 ### Admin Dashboard
 
-Web UI at `/admin` for real-time monitoring, model management, chat, benchmark, and per-model settings. All CDN dependencies are vendored for fully offline operation.
+Web UI at `/admin` for real-time monitoring, model management, chat, benchmark, and per-model settings. Supports English, Korean, Japanese, and Chinese. All CDN dependencies are vendored for fully offline operation.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX Admin Dashboard" width="720">
 </p>
+
+### Vision-Language Models
+
+Run VLMs with the same continuous batching and tiered KV cache stack as text LLMs. Supports multi-image chat, base64/URL/file image inputs, and tool calling with vision context. OCR models (DeepSeek-OCR, DOTS-OCR, GLM-OCR) are auto-detected with optimized prompts.
 
 ### Tiered KV Cache (Hot + Cold)
 
@@ -137,7 +141,7 @@ Context scaling support for running smaller context models with Claude Code. Sca
 
 ### Multi-Model Serving
 
-Load LLMs, embedding models, and rerankers within the same server. Models are managed through a combination of automatic and manual controls:
+Load LLMs, VLMs, embedding models, and rerankers within the same server. Models are managed through a combination of automatic and manual controls:
 
 - **LRU eviction**: Least-recently-used models are evicted automatically when memory runs low.
 - **Manual load/unload**: Interactive status badges in the admin panel let you load or unload models on demand.
@@ -147,7 +151,10 @@ Load LLMs, embedding models, and rerankers within the same server. Models are ma
 
 ### Per-Model Settings
 
-Configure sampling parameters, chat template kwargs, TTL, and more per model directly from the admin panel. Changes apply immediately without server restart.
+Configure sampling parameters, chat template kwargs, TTL, model alias, model type override, and more per model directly from the admin panel. Changes apply immediately without server restart.
+
+- **Model alias**: set a custom API-visible name. `/v1/models` returns the alias, and requests accept both the alias and directory name.
+- **Model type override**: manually set a model as LLM or VLM regardless of auto-detection.
 
 <p align="center">
   <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX Chat Template Kwargs" width="480">
@@ -179,7 +186,7 @@ One-click benchmarking from the admin panel. Measures prefill (PP) and text gene
 
 ### macOS Menubar App
 
-Native PyObjC menubar app (not Electron). Start, stop, and monitor the server without opening a terminal. Includes real-time serving stats, auto-restart on crash, and in-app auto-update.
+Native PyObjC menubar app (not Electron). Start, stop, and monitor the server without opening a terminal. Includes persistent serving stats (survives restarts), auto-restart on crash, and in-app auto-update.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX Menubar Stats" width="400">
@@ -187,7 +194,7 @@ Native PyObjC menubar app (not Electron). Start, stop, and monitor the server wi
 
 ### API Compatibility
 
-Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stats (`stream_options.include_usage`) and Anthropic adaptive thinking.
+Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stats (`stream_options.include_usage`), Anthropic adaptive thinking, and vision inputs (base64, URL).
 
 | Endpoint | Description |
 |----------|-------------|
@@ -205,7 +212,7 @@ Supports all function calling formats available in mlx-lm, JSON schema validatio
 | Model Family | Format |
 |---|---|
 | Llama, Qwen, DeepSeek, etc. | JSON `<tool_call>` |
-| Qwen3 Coder | XML `<function=...>` |
+| Qwen3.5 Series | XML `<function=...>` |
 | Gemma | `<start_function_call>` |
 | GLM (4.7, 5) | `<arg_key>/<arg_value>` XML |
 | MiniMax | Namespaced `<minimax:tool_call>` |
@@ -224,6 +231,7 @@ Point `--model-dir` at a directory containing MLX-format model subdirectories. T
 ├── Step-3.5-Flash-8bit/
 ├── Qwen3-Coder-Next-8bit/
 ├── gpt-oss-120b-MXFP4-Q8/
+├── Qwen3.5-122B-A10B-4bit/
 └── bge-m3/
 ```
 
@@ -232,6 +240,8 @@ Models are auto-detected by type. You can also download models directly from the
 | Type | Models |
 |------|--------|
 | LLM | Any model supported by [mlx-lm](https://github.com/ml-explore/mlx-lm) |
+| VLM | Qwen3.5 Series, GLM-4V, Pixtral, and other [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) models |
+| OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT |
 | Reranker | ModernBERT, XLM-RoBERTa |
 
@@ -258,6 +268,7 @@ omlx serve --model-dir ~/models --mcp-config mcp.json
 
 # API key authentication
 omlx serve --model-dir ~/models --api-key your-secret-key
+# Localhost-only: skip verification via admin panel global settings
 ```
 
 All settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
@@ -270,6 +281,7 @@ FastAPI Server (OpenAI / Anthropic API)
     │
     ├── EnginePool (multi-model, LRU eviction, TTL, manual load/unload)
     │   ├── BatchedEngine (LLMs, continuous batching)
+    │   ├── VLMEngine (vision-language models)
     │   ├── EmbeddingEngine
     │   └── RerankerEngine
     │
@@ -331,6 +343,7 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 ## Acknowledgments
 
 - [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple
-- [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX originated as a fork of vllm-mlx v0.1.0, since re-architected with multi-model serving, paged SSD caching, an admin panel, and a standalone macOS menu bar app
+- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Vision-language model inference on Apple Silicon
+- [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX started from vllm-mlx v0.1.0 and evolved significantly with multi-model serving, tiered KV caching, VLM with full paged cache support, an admin panel, and a macOS menu bar app
 - [venvstacks](https://venvstacks.lmstudio.ai) - Portable Python environment layering for the macOS app bundle
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
