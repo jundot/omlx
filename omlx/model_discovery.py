@@ -175,12 +175,19 @@ def detect_model_type(model_path: Path) -> ModelType:
         if arch in VLM_ARCHITECTURES:
             return "vlm"
 
-    # Check for VLM: model_type field
+    # Check for VLM: model_type field (only if vision capabilities are present)
+    # Some model families (e.g., qwen3_5_moe) have both VLM and text-only variants.
+    # Text-only quants won't have vision_config in their config.json.
     if normalized_type in VLM_MODEL_TYPES:
-        return "vlm"
+        if "vision_config" in config:
+            return "vlm"
+        logger.info(
+            f"Model type '{model_type}' is in VLM_MODEL_TYPES but no vision_config found — "
+            "treating as LLM (text-only quant)"
+        )
 
     # Check for VLM: presence of vision_config (fallback heuristic)
-    # Some VLMs have both vision_config + text_config, others only vision_config.
+    # Catch-all for VLMs that aren't yet listed in VLM_MODEL_TYPES.
     if "vision_config" in config:
         return "vlm"
 
