@@ -177,6 +177,8 @@ class PagedSSDCacheStats(BaseCacheStats):
     loads: int = 0
     errors: int = 0
     total_size_bytes: int = 0
+    max_size_bytes: int = 0
+    configured_max_size_bytes: int = 0
     num_files: int = 0
 
     # Hot cache (in-memory tier) metrics

@@ -545,6 +545,10 @@ class PagedSSDCacheManager(CacheManager):
         self._index = PagedSSDCacheIndex(max_size_bytes)
         self._lock = threading.RLock()
 
+        # Disk usage cache for dynamic effective max size (30s TTL)
+        self._disk_usage_cache = None  # type: shutil._ntuple_diskusage | None
+        self._disk_usage_cache_time: float = 0.0
+
         # Statistics
         self._stats = {
             "saves": 0,
@@ -1513,14 +1517,43 @@ class PagedSSDCacheManager(CacheManager):
                 logger.error(f"Failed to delete SSD cache file: {e}")
                 return False
 
+    # Use at most 99% of available disk space to avoid filling disk completely
+    _DISK_SAFE_RATIO = 0.99
+
+    def _get_effective_max_size(self) -> int:
+        """Get effective max size considering actual disk free space.
+
+        Returns the minimum of configured max_size and 99% of disk space
+        available for cache (current cache size + disk free). This ensures
+        eviction triggers before the disk fills up even when other processes
+        consume disk space after the server started.
+
+        Uses a 30-second TTL cache for shutil.disk_usage() results.
+        """
+        now = time.monotonic()
+        if (
+            self._disk_usage_cache is None
+            or now - self._disk_usage_cache_time > 30.0
+        ):
+            try:
+                self._disk_usage_cache = shutil.disk_usage(self._cache_dir)
+            except OSError:
+                return self._max_size
+            self._disk_usage_cache_time = now
+
+        disk_available = self._index.total_size + self._disk_usage_cache.free
+        disk_limit = int(disk_available * self._DISK_SAFE_RATIO)
+        return min(self._max_size, disk_limit)
+
     def _enforce_size_limit_for_new_block(self) -> None:
         """Enforce size limit before adding a new block."""
         # Estimate average block size (use 1MB as conservative estimate)
         estimated_new_size = 1 * 1024 * 1024
 
-        target_size = self._max_size - estimated_new_size
+        effective_max = self._get_effective_max_size()
+        target_size = effective_max - estimated_new_size
         if target_size < 0:
-            target_size = int(self._max_size * 0.9)
+            target_size = int(effective_max * 0.9)
 
         if self._index.total_size > target_size:
             evicted = self._index.evict_until_size(target_size)
@@ -1546,11 +1579,12 @@ class PagedSSDCacheManager(CacheManager):
         """
         with self._lock:
             initial_size = self._index.total_size
+            effective_max = self._get_effective_max_size()
 
-            if initial_size <= self._max_size:
+            if initial_size <= effective_max:
                 return 0
 
-            target_size = int(self._max_size * 0.9)  # 90% of max
+            target_size = int(effective_max * 0.9)  # 90% of effective max
             evicted = self._index.evict_until_size(target_size)
 
             for metadata in evicted:
@@ -1604,6 +1638,8 @@ class PagedSSDCacheManager(CacheManager):
                 loads=self._stats["loads"],
                 errors=self._stats["errors"],
                 total_size_bytes=self._index.total_size,
+                max_size_bytes=self._get_effective_max_size(),
+                configured_max_size_bytes=self._max_size,
                 num_files=self._index.count,
                 hot_cache_entries=hot_entries,
                 hot_cache_size_bytes=hot_size,
@@ -1626,15 +1662,18 @@ class PagedSSDCacheManager(CacheManager):
             with self._hot_cache_lock:
                 hot_entries = len(self._hot_cache)
                 hot_size = self._hot_cache_total_bytes
+            effective_max = self._get_effective_max_size()
             return {
                 "cache_dir": str(self._cache_dir),
-                "max_size": self._max_size,
-                "max_size_formatted": format_bytes(self._max_size),
+                "max_size": effective_max,
+                "max_size_formatted": format_bytes(effective_max),
+                "configured_max_size": self._max_size,
+                "configured_max_size_formatted": format_bytes(self._max_size),
                 "total_size": self._index.total_size,
                 "total_size_formatted": format_bytes(self._index.total_size),
                 "utilization": (
-                    self._index.total_size / self._max_size
-                    if self._max_size > 0
+                    self._index.total_size / effective_max
+                    if effective_max > 0
                     else 0.0
                 ),
                 "num_files": self._index.count,
@@ -1773,10 +1812,23 @@ class PagedSSDCacheManager(CacheManager):
     @property
     def max_size(self) -> int:
         """
-        Get the maximum cache size in bytes.
+        Get the effective maximum cache size in bytes.
+
+        This accounts for actual disk free space, returning the minimum of
+        the configured max size and 99% of available disk space for cache.
 
         Returns:
-            Maximum cache size in bytes.
+            Effective maximum cache size in bytes.
+        """
+        return self._get_effective_max_size()
+
+    @property
+    def configured_max_size(self) -> int:
+        """
+        Get the originally configured maximum cache size in bytes.
+
+        Returns:
+            Configured maximum cache size in bytes.
         """
         return self._max_size
 

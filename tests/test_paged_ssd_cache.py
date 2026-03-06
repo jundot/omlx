@@ -7,6 +7,7 @@ enabling larger effective cache sizes than GPU memory allows.
 """
 
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -1400,3 +1401,146 @@ class TestAsyncBackgroundWrite:
         # Non-existent hash should be no-op
         index.update_file_size(b"nonexistent_hash____", 999)
         assert index.total_size == 150
+
+
+class TestEffectiveMaxSize:
+    """Tests for dynamic effective max size based on disk free space."""
+
+    def _make_disk_usage(self, total: int, used: int, free: int):
+        """Create a mock disk_usage result."""
+        return shutil._ntuple_diskusage(total, used, free)
+
+    def test_effective_max_size_disk_sufficient(self, tmp_path: Path):
+        """When disk has plenty of free space, effective = configured max."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=100 * 1024**3,  # 100GB configured
+        )
+
+        # Mock: 500GB free, cache is empty (0 bytes)
+        mock_usage = self._make_disk_usage(
+            total=1000 * 1024**3, used=500 * 1024**3, free=500 * 1024**3
+        )
+        with patch("shutil.disk_usage", return_value=mock_usage):
+            effective = manager._get_effective_max_size()
+
+        # disk_available = 0 + 500GB = 500GB, disk_limit = 495GB
+        # effective = min(100GB, 495GB) = 100GB
+        assert effective == 100 * 1024**3
+
+    def test_effective_max_size_disk_low(self, tmp_path: Path):
+        """When disk is low, effective shrinks below configured max."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=110 * 1024**3,  # 110GB configured
+        )
+
+        # Simulate: cache currently has 10GB, disk free is 90GB
+        # So disk_available = 10GB + 90GB = 100GB
+        manager._index._total_size = 10 * 1024**3
+
+        mock_usage = self._make_disk_usage(
+            total=500 * 1024**3, used=410 * 1024**3, free=90 * 1024**3
+        )
+        with patch("shutil.disk_usage", return_value=mock_usage):
+            effective = manager._get_effective_max_size()
+
+        # disk_limit = int(100GB * 0.99) = 99GB
+        # effective = min(110GB, 99GB) = 99GB
+        expected = int(100 * 1024**3 * 0.99)
+        assert effective == expected
+
+    def test_effective_max_size_oserror_fallback(self, tmp_path: Path):
+        """When disk_usage fails, fall back to configured max."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=50 * 1024**3,
+        )
+
+        with patch("shutil.disk_usage", side_effect=OSError("disk error")):
+            effective = manager._get_effective_max_size()
+
+        assert effective == 50 * 1024**3
+
+    def test_effective_max_size_cache_30s(self, tmp_path: Path):
+        """disk_usage result is cached for 30 seconds."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=100 * 1024**3,
+        )
+
+        mock_usage = self._make_disk_usage(
+            total=1000 * 1024**3, used=500 * 1024**3, free=500 * 1024**3
+        )
+        with patch("shutil.disk_usage", return_value=mock_usage) as mock_du:
+            # First call — should invoke disk_usage
+            manager._get_effective_max_size()
+            assert mock_du.call_count == 1
+
+            # Second call within 30s — should use cache
+            manager._get_effective_max_size()
+            assert mock_du.call_count == 1
+
+            # Expire cache by rewinding timestamp
+            manager._disk_usage_cache_time -= 31.0
+
+            # Third call — should invoke disk_usage again
+            manager._get_effective_max_size()
+            assert mock_du.call_count == 2
+
+    def test_utilization_never_exceeds_1(self, tmp_path: Path):
+        """Utilization should never exceed 1.0 with effective max size."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=100 * 1024**3,
+        )
+
+        # Simulate: cache has 50GB, but disk only has 10GB free
+        # So disk_available = 50GB + 10GB = 60GB, disk_limit = ~59.4GB
+        manager._index._total_size = 50 * 1024**3
+
+        mock_usage = self._make_disk_usage(
+            total=200 * 1024**3, used=190 * 1024**3, free=10 * 1024**3
+        )
+        with patch("shutil.disk_usage", return_value=mock_usage):
+            stats = manager.get_stats_dict()
+
+        assert stats["utilization"] <= 1.0
+        assert stats["max_size"] < stats["configured_max_size"]
+
+    def test_stats_includes_effective_and_configured(self, tmp_path: Path):
+        """Stats should include both effective and configured max sizes."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=100 * 1024**3,
+        )
+
+        mock_usage = self._make_disk_usage(
+            total=500 * 1024**3, used=450 * 1024**3, free=50 * 1024**3
+        )
+        with patch("shutil.disk_usage", return_value=mock_usage):
+            stats_dict = manager.get_stats_dict()
+            stats_obj = manager.get_stats()
+
+        # Dict format
+        assert "configured_max_size" in stats_dict
+        assert stats_dict["configured_max_size"] == 100 * 1024**3
+
+        # Dataclass format
+        assert stats_obj.configured_max_size_bytes == 100 * 1024**3
+        assert stats_obj.max_size_bytes > 0
+
+    def test_max_size_property_returns_effective(self, tmp_path: Path):
+        """max_size property should return effective (not configured) value."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=200 * 1024**3,
+        )
+
+        # disk_available = 0 + 50GB = 50GB, disk_limit = ~49.5GB
+        mock_usage = self._make_disk_usage(
+            total=500 * 1024**3, used=450 * 1024**3, free=50 * 1024**3
+        )
+        with patch("shutil.disk_usage", return_value=mock_usage):
+            assert manager.max_size < 200 * 1024**3
+            assert manager.configured_max_size == 200 * 1024**3
