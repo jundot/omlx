@@ -192,10 +192,6 @@ class EngineCore:
                                 # Note: cleanup is handled by stream_outputs() finally block
                                 # _delayed_cleanup() was causing double cleanup race condition
 
-                        # Free Metal buffers after distributing finished outputs
-                        if output.finished_request_ids:
-                            mx.clear_cache()
-
                         # Always yield to prevent event loop starvation.
                         # Without this, orphaned requests (client disconnected but
                         # request still in scheduler) block the entire event loop,

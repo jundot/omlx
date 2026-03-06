@@ -2849,7 +2849,7 @@ class Scheduler:
         # can conflict with async Metal operations on the generation stream.
         # This is needed even when active_batch is None, because _next() sets
         # active_batch = None after mx.async_eval when all requests finish.
-        if finished_ids and self.block_aware_cache is not None:
+        if finished_ids:
             mx.synchronize(generation_stream)
 
         for request_id in finished_ids:
@@ -2971,9 +2971,11 @@ class Scheduler:
             # Clean up Harmony parser
             self._cleanup_harmony_parser(request_id)
 
-            # Clean up VLM adapter state (position_ids, rope_deltas)
+            # Clean up VLM adapter state (position_ids, rope_deltas, pending embeddings)
             if hasattr(self.model, 'clear_vlm_position_state'):
                 self.model.clear_vlm_position_state()
+            if hasattr(self.model, 'clear_pending_embeddings'):
+                self.model.clear_pending_embeddings()
 
             # Drop any boundary snapshot for this request.
             self._boundary_cache_snapshots.pop(request_id, None)
