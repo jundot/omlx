@@ -870,3 +870,121 @@ class TestGlobalMLXExecutor:
             finally:
                 engine1.close()
                 engine2.close()
+
+    @pytest.mark.asyncio
+    async def test_shared_executor_serializes_concurrent_tasks(self):
+        """Concurrent submissions to shared executor must never overlap (#85).
+
+        Simulates two engines submitting work simultaneously and verifies
+        that tasks run one at a time (no concurrent execution).
+        """
+        import threading
+        import time
+        from omlx.engine_core import get_mlx_executor
+
+        executor = get_mlx_executor()
+        loop = asyncio.get_running_loop()
+
+        active_count = 0
+        max_concurrent = 0
+        lock = threading.Lock()
+
+        def simulated_step(task_id: str, duration: float = 0.05):
+            """Simulate a scheduler.step() that takes some time."""
+            nonlocal active_count, max_concurrent
+            with lock:
+                active_count += 1
+                if active_count > max_concurrent:
+                    max_concurrent = active_count
+            time.sleep(duration)
+            with lock:
+                active_count -= 1
+            return task_id
+
+        # Submit multiple tasks concurrently (simulating two engines)
+        tasks = [
+            loop.run_in_executor(executor, simulated_step, "engine_a_step1"),
+            loop.run_in_executor(executor, simulated_step, "engine_b_step1"),
+            loop.run_in_executor(executor, simulated_step, "engine_a_step2"),
+            loop.run_in_executor(executor, simulated_step, "engine_b_step2"),
+        ]
+        results = await asyncio.gather(*tasks)
+
+        # All tasks completed
+        assert set(results) == {
+            "engine_a_step1", "engine_b_step1",
+            "engine_a_step2", "engine_b_step2",
+        }
+        # Critical: no two tasks ever ran at the same time
+        assert max_concurrent == 1, (
+            f"Expected max 1 concurrent task, got {max_concurrent}. "
+            f"Shared executor failed to serialize MLX operations."
+        )
+
+    @pytest.mark.asyncio
+    async def test_two_engine_loops_serialize_on_shared_executor(
+        self, mock_model, mock_tokenizer
+    ):
+        """Two engines running their loops must serialize step() calls (#85).
+
+        Creates two EngineCore instances with mock schedulers, starts both
+        engine loops, and verifies their scheduler.step() calls never overlap.
+        """
+        import threading
+        import time
+
+        active_count = 0
+        max_concurrent = 0
+        total_steps = 0
+        lock = threading.Lock()
+
+        def make_tracked_step():
+            """Create a step function that tracks concurrency."""
+            from omlx.scheduler import SchedulerOutput
+
+            def tracked_step():
+                nonlocal active_count, max_concurrent, total_steps
+                with lock:
+                    active_count += 1
+                    total_steps += 1
+                    if active_count > max_concurrent:
+                        max_concurrent = active_count
+                time.sleep(0.01)  # Simulate GPU work
+                with lock:
+                    active_count -= 1
+                return SchedulerOutput(outputs=[])
+
+            return tracked_step
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine1 = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            engine2 = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            # Wire up tracked step functions
+            engine1.scheduler.step = make_tracked_step()
+            engine2.scheduler.step = make_tracked_step()
+            engine1.scheduler.has_requests = lambda: True
+            engine2.scheduler.has_requests = lambda: True
+
+            try:
+                await engine1.start()
+                await engine2.start()
+
+                # Let both engines run for a bit
+                await asyncio.sleep(0.3)
+            finally:
+                await engine1.stop()
+                await engine2.stop()
+                engine1.close()
+                engine2.close()
+
+        assert total_steps >= 4, (
+            f"Expected at least 4 steps from two engines, got {total_steps}"
+        )
+        assert max_concurrent == 1, (
+            f"Expected max 1 concurrent step(), got {max_concurrent}. "
+            f"Two engines ran MLX operations in parallel — would cause "
+            f"Metal command buffer races in production."
+        )
