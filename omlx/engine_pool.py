@@ -138,18 +138,34 @@ class EnginePool:
         pinned_set = set(pinned_models or [])
 
         for model_id, info in discovered.items():
-            self._entries[model_id] = EngineEntry(
-                model_id=model_id,
-                model_path=info.model_path,
-                model_type=info.model_type,
-                engine_type=info.engine_type,
-                estimated_size=info.estimated_size,
-                config_model_type=getattr(info, "config_model_type", ""),
-                is_pinned=model_id in pinned_set,
-            )
+            existing = self._entries.get(model_id)
+            if existing is not None and existing.engine is not None:
+                # Loaded model: preserve runtime state, only update pinned flag
+                existing.is_pinned = model_id in pinned_set
+            else:
+                # New or unloaded model: create fresh entry
+                self._entries[model_id] = EngineEntry(
+                    model_id=model_id,
+                    model_path=info.model_path,
+                    model_type=info.model_type,
+                    engine_type=info.engine_type,
+                    estimated_size=info.estimated_size,
+                    config_model_type=getattr(info, "config_model_type", ""),
+                    is_pinned=model_id in pinned_set,
+                )
 
             if model_id in pinned_set:
                 logger.info(f"Pinned model: {model_id}")
+
+        # Remove entries no longer discovered and not loaded
+        discovered_ids = set(discovered.keys())
+        stale = [
+            mid
+            for mid in self._entries
+            if mid not in discovered_ids and self._entries[mid].engine is None
+        ]
+        for mid in stale:
+            del self._entries[mid]
 
         # Warn about pinned models not found
         found_models = set(self._entries.keys())

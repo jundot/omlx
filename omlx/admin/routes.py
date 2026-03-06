@@ -230,6 +230,8 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     # Re-discover models from new directories
     try:
         pool.discover_models(model_dirs, pinned_models)
+        if _server_state.settings_manager is not None:
+            pool.apply_settings_overrides(_server_state.settings_manager)
     except Exception as e:
         return False, f"Failed to discover models: {e}"
 
@@ -2225,6 +2227,8 @@ async def delete_hf_model(
         engine_pool.discover_models(
             [str(d) for d in model_dirs], pinned_models
         )
+        if settings_manager:
+            engine_pool.apply_settings_overrides(settings_manager)
         logger.info("Model pool refreshed after deletion")
 
     return {"success": True, "message": f"Model '{model_name}' deleted"}

@@ -111,6 +111,102 @@ class TestEnginePoolInit:
         assert entry_b.is_pinned is False
 
 
+class TestDiscoverModelsMerge:
+    """Tests for discover_models merge behavior (issue #89)."""
+
+    def test_rediscover_preserves_loaded_engine(self, small_mock_model_dir):
+        """Test that re-discovery preserves loaded engine state."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Simulate loaded model-a
+        entry_a = pool.get_entry("model-a")
+        mock_engine = MagicMock()
+        entry_a.engine = mock_engine
+        entry_a.last_access = 42.0
+        pool._current_model_memory = entry_a.estimated_size
+
+        original_size = entry_a.estimated_size
+
+        # Re-discover (simulates model deletion or download completion)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Loaded model should be preserved
+        entry_a_after = pool.get_entry("model-a")
+        assert entry_a_after is entry_a  # Same object
+        assert entry_a_after.engine is mock_engine
+        assert entry_a_after.last_access == 42.0
+        assert entry_a_after.estimated_size == original_size
+        assert pool._current_model_memory == original_size
+        assert pool.model_count == 2
+
+    def test_rediscover_removes_stale_unloaded(self, small_mock_model_dir):
+        """Test that unloaded models missing from disk are removed."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        assert "model-a" in pool.get_model_ids()
+        assert "model-b" in pool.get_model_ids()
+
+        # Delete model-b from disk
+        import shutil
+
+        shutil.rmtree(small_mock_model_dir / "model-b")
+
+        # Re-discover
+        pool.discover_models(str(small_mock_model_dir))
+
+        assert "model-a" in pool.get_model_ids()
+        assert "model-b" not in pool.get_model_ids()
+        assert pool.model_count == 1
+
+    def test_rediscover_keeps_loaded_model_missing_from_disk(
+        self, small_mock_model_dir
+    ):
+        """Test that loaded models are kept even if missing from disk."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Simulate loaded model-b
+        entry_b = pool.get_entry("model-b")
+        entry_b.engine = MagicMock()
+        entry_b.last_access = 99.0
+
+        # Delete model-b from disk
+        import shutil
+
+        shutil.rmtree(small_mock_model_dir / "model-b")
+
+        # Re-discover
+        pool.discover_models(str(small_mock_model_dir))
+
+        # model-b should still be in entries (loaded in memory)
+        assert "model-b" in pool.get_model_ids()
+        assert pool.get_entry("model-b").engine is not None
+        assert pool.get_entry("model-b").last_access == 99.0
+
+    def test_rediscover_updates_pinned_flag_on_loaded(self, small_mock_model_dir):
+        """Test that pinned flag is updated on loaded models during re-discovery."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Simulate loaded model-a (not pinned)
+        entry_a = pool.get_entry("model-a")
+        entry_a.engine = MagicMock()
+        assert entry_a.is_pinned is False
+
+        # Re-discover with model-a pinned
+        pool.discover_models(str(small_mock_model_dir), pinned_models=["model-a"])
+
+        # Pinned flag should be updated, engine preserved
+        assert pool.get_entry("model-a").is_pinned is True
+        assert pool.get_entry("model-a").engine is not None
+
+        # Re-discover without pinning
+        pool.discover_models(str(small_mock_model_dir), pinned_models=[])
+        assert pool.get_entry("model-a").is_pinned is False
+        assert pool.get_entry("model-a").engine is not None
+
+
 class TestEnginePoolErrors:
     """Tests for EnginePool error handling."""
 
