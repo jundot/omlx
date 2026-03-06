@@ -337,10 +337,15 @@ class AuthSettings:
 
     api_key: str | None = None
     secret_key: str | None = None
+    skip_api_key_verification: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"api_key": self.api_key, "secret_key": self.secret_key}
+        return {
+            "api_key": self.api_key,
+            "secret_key": self.secret_key,
+            "skip_api_key_verification": self.skip_api_key_verification,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AuthSettings:
@@ -348,6 +353,7 @@ class AuthSettings:
         return cls(
             api_key=data.get("api_key"),
             secret_key=data.get("secret_key"),
+            skip_api_key_verification=data.get("skip_api_key_verification", False),
         )
 
 

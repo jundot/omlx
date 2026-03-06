@@ -24,7 +24,7 @@
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256 },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
-                auth: { api_key_set: false, api_key: '' },
+                auth: { api_key_set: false, api_key: '', skip_api_key_verification: false },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
                 ui: { language: 'en' },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '', ssd_free_bytes: 0, ssd_free: '' },
@@ -65,6 +65,7 @@
             showModelSettingsModal: false,
             selectedModel: null,
             modelSettings: {
+                model_alias: '',
                 model_type_override: '',
                 max_context_window: null,
                 max_tokens: null,
@@ -363,6 +364,7 @@
                             sampling_repetition_penalty: this.globalSettings.sampling.repetition_penalty,
                             mcp_config: this.globalSettings.mcp.config_path,
                             ...(this.globalSettings.auth.api_key ? { api_key: this.globalSettings.auth.api_key } : {}),
+                            skip_api_key_verification: this.globalSettings.auth.skip_api_key_verification,
                         }),
                     });
 
@@ -506,6 +508,7 @@
                 }
                 const isOcr = OCR_CONFIG_MODEL_TYPES.has(model.config_model_type || '');
                 this.modelSettings = {
+                    model_alias: settings.model_alias || '',
                     model_type_override: settings.model_type_override || '',
                     max_context_window: settings.max_context_window || null,
                     max_tokens: settings.max_tokens || null,
@@ -553,6 +556,7 @@
                                 }
                             }
                             return {
+                                model_alias: this.modelSettings.model_alias?.trim() || null,
                                 model_type_override: this.modelSettings.model_type_override || null,
                                 max_context_window: this.modelSettings.max_context_window || null,
                                 max_tokens: this.modelSettings.max_tokens || null,

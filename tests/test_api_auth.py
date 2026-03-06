@@ -78,6 +78,65 @@ class TestVerifyApiKey:
             _server_state.api_key = original_key
 
 
+class TestSkipApiKeyVerification:
+    """Tests for skip_api_key_verification feature."""
+
+    def _make_global_settings(self, host="127.0.0.1", skip=True):
+        from omlx.settings import GlobalSettings, ServerSettings, AuthSettings
+        from dataclasses import dataclass
+        gs = GlobalSettings.__new__(GlobalSettings)
+        gs.server = ServerSettings(host=host)
+        gs.auth = AuthSettings(api_key="test-key", skip_api_key_verification=skip)
+        return gs
+
+    def test_skip_verification_when_localhost(self):
+        """Skip API key verification when enabled and host is localhost."""
+        from omlx.server import verify_api_key, _server_state
+        import asyncio
+
+        original_key = _server_state.api_key
+        original_gs = _server_state.global_settings
+        _server_state.api_key = "test-key"
+        _server_state.global_settings = self._make_global_settings(
+            host="127.0.0.1", skip=True
+        )
+
+        try:
+            result = asyncio.run(verify_api_key(credentials=None))
+            assert result is True
+        finally:
+            _server_state.api_key = original_key
+            _server_state.global_settings = original_gs
+
+    def test_skip_verification_ignored_when_not_localhost(self):
+        """Do not skip verification when host is not localhost."""
+        from omlx.server import verify_api_key, _server_state
+        from fastapi import HTTPException
+        import asyncio
+
+        original_key = _server_state.api_key
+        original_gs = _server_state.global_settings
+        _server_state.api_key = "test-key"
+        _server_state.global_settings = self._make_global_settings(
+            host="0.0.0.0", skip=True
+        )
+
+        try:
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(verify_api_key(credentials=None))
+            assert exc_info.value.status_code == 401
+        finally:
+            _server_state.api_key = original_key
+            _server_state.global_settings = original_gs
+
+    def test_skip_verification_disabled_by_default(self):
+        """Default skip_api_key_verification is False."""
+        from omlx.settings import AuthSettings
+
+        auth = AuthSettings()
+        assert auth.skip_api_key_verification is False
+
+
 class TestAdminAuth:
     """Tests for admin authentication functions."""
 

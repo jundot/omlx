@@ -56,6 +56,7 @@ class SetupApiKeyRequest(BaseModel):
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
+    model_alias: Optional[str] = None
     model_type_override: Optional[str] = None
     max_context_window: Optional[int] = None
     max_tokens: Optional[int] = None
@@ -123,6 +124,7 @@ class GlobalSettingsRequest(BaseModel):
 
     # Auth settings
     api_key: Optional[str] = None
+    skip_api_key_verification: Optional[bool] = None
 
 
 class HFDownloadRequest(BaseModel):
@@ -1008,6 +1010,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         # Add settings if available
         if settings:
             model_data["settings"] = {
+                "model_alias": settings.model_alias,
                 "model_type_override": settings.model_type_override,
                 "max_context_window": settings.max_context_window,
                 "max_tokens": settings.max_tokens,
@@ -1121,6 +1124,25 @@ async def update_model_settings(
     # (clear to default) from "not sent" (don't touch).
     sent = request.model_fields_set
     prev_engine_type = entry.engine_type  # Track for requires_reload check
+    if "model_alias" in sent:
+        alias_value = request.model_alias.strip() if request.model_alias else None
+        if alias_value == "":
+            alias_value = None
+        if alias_value is not None:
+            all_settings = settings_manager.get_all_settings()
+            for mid, ms in all_settings.items():
+                if mid != model_id and ms.model_alias == alias_value:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Alias '{alias_value}' is already used by model '{mid}'",
+                    )
+            for mid in engine_pool._entries:
+                if mid != model_id and mid == alias_value:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Alias '{alias_value}' conflicts with model directory name '{mid}'",
+                    )
+        current_settings.model_alias = alias_value
     if "model_type_override" in sent:
         valid_types = {"llm", "vlm", "embedding", "reranker"}
         # Treat empty string as None (auto-detect)
@@ -1374,6 +1396,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "auth": {
             "api_key_set": bool(global_settings.auth.api_key),
             "api_key": global_settings.auth.api_key or "",
+            "skip_api_key_verification": global_settings.auth.skip_api_key_verification,
         },
         "claude_code": {
             "context_scaling_enabled": global_settings.claude_code.context_scaling_enabled,
@@ -1433,6 +1456,9 @@ async def update_global_settings(
     # Apply server settings
     if request.host is not None:
         global_settings.server.host = request.host
+        # Reset skip_api_key_verification when host is not localhost
+        if request.host != "127.0.0.1":
+            global_settings.auth.skip_api_key_verification = False
     if request.port is not None:
         global_settings.server.port = request.port
     if request.log_level is not None:
@@ -1632,6 +1658,14 @@ async def update_global_settings(
         _server_state.api_key = request.api_key
         runtime_applied.append("api_key")
         logger.info("API key updated via admin settings")
+
+    if request.skip_api_key_verification is not None:
+        # Only allow enabling when host is localhost
+        if request.skip_api_key_verification and global_settings.server.host != "127.0.0.1":
+            global_settings.auth.skip_api_key_verification = False
+        else:
+            global_settings.auth.skip_api_key_verification = request.skip_api_key_verification
+        runtime_applied.append("skip_api_key_verification")
 
     # Validate settings
     errors = global_settings.validate()

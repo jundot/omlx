@@ -171,6 +171,8 @@
   "settings.auth.api_key_hint": "4자 이상, 공백 불가",
   "settings.auth.api_key_placeholder": "API 키 입력",
   "settings.auth.toggle_visibility_tooltip": "표시/숨기기 전환",
+  "settings.auth.skip_verification": "API 키 검증 건너뛰기",
+  "settings.auth.skip_verification_hint": "API 엔드포인트에서 인증을 요구하지 않습니다 (localhost 전용)",
 
   "settings.server.section_label": "서버",
   "settings.server.host": "호스트",
@@ -284,9 +286,10 @@
   "settings.models.badge.force_sampling": "force_sampling",
 
   "modal.model_settings.section_label": "모델 설정",
+  "modal.model_settings.model_alias": "모델 별칭",
   "modal.model_settings.model_type": "모델 타입",
   "modal.model_settings.model_type_auto": "자동 감지",
-  "modal.model_settings.max_context_window": "최대 컨텍스트 윈도우",
+  "modal.model_settings.max_context_window": "Ctx Window",
   "modal.model_settings.max_tokens": "최대 토큰 수",
   "modal.model_settings.temperature": "Temperature",
   "modal.model_settings.repetition_penalty": "Repetition Penalty",

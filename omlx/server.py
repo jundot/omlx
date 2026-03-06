@@ -223,6 +223,14 @@ async def verify_api_key(
     if _server_state.api_key is None:
         return True
 
+    # Skip verification if enabled and host is localhost
+    if (
+        _server_state.global_settings is not None
+        and _server_state.global_settings.auth.skip_api_key_verification
+        and _server_state.global_settings.server.host == "127.0.0.1"
+    ):
+        return True
+
     # Check if credentials provided
     if credentials is None:
         raise HTTPException(status_code=401, detail="API key required")
@@ -483,6 +491,9 @@ async def get_engine(
             status_code=400,
             detail="No model specified and no default model set"
         )
+
+    # Resolve alias to real model_id
+    model_id = pool.resolve_model_id(model_id, _server_state.settings_manager)
 
     try:
         engine = await pool.get_engine(model_id)
@@ -1036,10 +1047,17 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
 
     if _server_state.engine_pool is not None:
         status = _server_state.engine_pool.get_status()
+        settings_manager = _server_state.settings_manager
         for m in status["models"]:
+            model_id = m["id"]
+            display_id = model_id
+            if settings_manager:
+                ms = settings_manager.get_settings(model_id)
+                if ms.model_alias:
+                    display_id = ms.model_alias
             models.append(
                 ModelInfo(
-                    id=m["id"],
+                    id=display_id,
                     owned_by="omlx",
                 )
             )

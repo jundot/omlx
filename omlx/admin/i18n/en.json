@@ -171,6 +171,8 @@
     "settings.auth.api_key_hint": "Min 4 chars, no whitespace",
     "settings.auth.api_key_placeholder": "Enter API key",
     "settings.auth.toggle_visibility_tooltip": "Toggle visibility",
+    "settings.auth.skip_verification": "Skip API key verification",
+    "settings.auth.skip_verification_hint": "API endpoints will not require authentication (localhost only)",
 
     "settings.server.section_label": "Server",
     "settings.server.host": "Host",
@@ -284,9 +286,10 @@
     "settings.models.badge.force_sampling": "force_sampling",
 
     "modal.model_settings.section_label": "Model Settings",
+    "modal.model_settings.model_alias": "Model Alias",
     "modal.model_settings.model_type": "Model Type",
     "modal.model_settings.model_type_auto": "Auto-detect",
-    "modal.model_settings.max_context_window": "Max Context Window",
+    "modal.model_settings.max_context_window": "Ctx Window",
     "modal.model_settings.max_tokens": "Max Tokens",
     "modal.model_settings.temperature": "Temperature",
     "modal.model_settings.repetition_penalty": "Repetition Penalty",

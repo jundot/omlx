@@ -231,6 +231,23 @@ class EnginePool:
         entry.is_pinned = pinned
         return True
 
+    def resolve_model_id(self, model_id_or_alias: str, settings_manager) -> str:
+        """Resolve a model alias to its actual model_id (directory name).
+
+        Tries exact match in _entries first, then scans model settings
+        for alias match. Returns the original string if no match found.
+        """
+        if model_id_or_alias in self._entries:
+            return model_id_or_alias
+
+        if settings_manager is not None:
+            all_settings = settings_manager.get_all_settings()
+            for mid, ms in all_settings.items():
+                if ms.model_alias and ms.model_alias == model_id_or_alias:
+                    return mid
+
+        return model_id_or_alias
+
     async def get_engine(self, model_id: str) -> BaseEngine | EmbeddingEngine | RerankerEngine:
         """
         Get or load engine for the specified model.

@@ -751,3 +751,52 @@ class TestEnginePoolTTL:
         assert expired == []
         # last_access should be refreshed
         assert pool._entries["model-a"].last_access == 200.0
+
+
+class TestResolveModelId:
+    """Tests for resolve_model_id method."""
+
+    def test_direct_match(self, small_mock_model_dir):
+        """Test direct model_id match returns immediately."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        result = pool.resolve_model_id("model-a", settings_manager=None)
+        assert result == "model-a"
+
+    def test_alias_match(self, small_mock_model_dir):
+        """Test alias resolution returns real model_id."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        settings_manager = MagicMock()
+        from omlx.model_settings import ModelSettings
+        settings_manager.get_all_settings.return_value = {
+            "model-a": ModelSettings(model_alias="gpt-4"),
+            "model-b": ModelSettings(),
+        }
+
+        result = pool.resolve_model_id("gpt-4", settings_manager)
+        assert result == "model-a"
+
+    def test_no_match_returns_original(self, small_mock_model_dir):
+        """Test unresolved name returns original string."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        settings_manager = MagicMock()
+        from omlx.model_settings import ModelSettings
+        settings_manager.get_all_settings.return_value = {
+            "model-a": ModelSettings(),
+        }
+
+        result = pool.resolve_model_id("nonexistent", settings_manager)
+        assert result == "nonexistent"
+
+    def test_alias_match_no_settings_manager(self, small_mock_model_dir):
+        """Test with None settings_manager falls back to direct match only."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        result = pool.resolve_model_id("some-alias", settings_manager=None)
+        assert result == "some-alias"

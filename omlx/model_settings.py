@@ -49,6 +49,7 @@ class ModelSettings:
     forced_ct_kwargs: Optional[list[str]] = None  # Keys that cannot be overridden by API requests
     ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
     model_type_override: Optional[str] = None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
+    model_alias: Optional[str] = None  # API-visible name (alternative to directory name)
 
     # Model management flags
     is_pinned: bool = False

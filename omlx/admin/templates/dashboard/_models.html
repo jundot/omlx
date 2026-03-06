@@ -55,9 +55,13 @@
                                     <div class="px-6 py-3 flex items-center justify-between hover:bg-neutral-50 transition-colors">
                                         <div class="min-w-0 flex-1 flex items-center gap-2">
                                             <span class="text-sm font-medium text-neutral-900 truncate" x-text="model.name"></span>
+                                            <template x-if="models.find(m => m.id === model.name)?.settings?.model_alias">
+                                                <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
+                                                      x-text="models.find(m => m.id === model.name)?.settings?.model_alias"></span>
+                                            </template>
                                             <span class="text-xs text-neutral-400 flex-shrink-0" x-text="'(' + model.size_formatted + ')'"></span>
                                             <button x-data="{ copied: false }"
-                                                    @click.stop="copyToClipboard(model.name); copied = true; setTimeout(() => copied = false, 2000)"
+                                                    @click.stop="copyToClipboard(models.find(m => m.id === model.name)?.settings?.model_alias || model.name); copied = true; setTimeout(() => copied = false, 2000)"
                                                     class="p-1 rounded-md transition-all flex-shrink-0"
                                                     :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
                                                     :title="window.t('models.manager.copy_model_name_tooltip')">

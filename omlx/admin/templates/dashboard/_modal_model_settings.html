@@ -35,8 +35,14 @@
 
                 <!-- Sampling Parameters -->
                 <div class="space-y-5">
-                    <!-- Row 1: Model Type / Max Context Window -->
+                    <!-- Row 1: Model Alias / Model Type -->
                     <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.model_alias') }}</label>
+                            <input type="text" x-model="modelSettings.model_alias"
+                                   :placeholder="selectedModel?.id"
+                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                        </div>
                         <div>
                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.model_type') }}</label>
                             <select x-model="modelSettings.model_type_override"
@@ -48,15 +54,15 @@
                                 <option value="reranker">Reranker</option>
                             </select>
                         </div>
+                    </div>
+
+                    <!-- Row 2: Ctx Window / Max Tokens / Temperature -->
+                    <div class="grid grid-cols-3 gap-4">
                         <div>
                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_context_window') }}</label>
                             <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                         </div>
-                    </div>
-
-                    <!-- Row 2: Max Tokens / Temperature -->
-                    <div class="grid grid-cols-2 gap-4">
                         <div>
                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_tokens') }}</label>
                             <input type="number" x-model.number="modelSettings.max_tokens" placeholder="{{ t('modal.model_settings.placeholder_default') }}"

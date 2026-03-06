@@ -171,6 +171,8 @@
   "settings.auth.api_key_hint": "4文字以上、スペース不可",
   "settings.auth.api_key_placeholder": "APIキーを入力",
   "settings.auth.toggle_visibility_tooltip": "表示切り替え",
+  "settings.auth.skip_verification": "APIキー検証をスキップ",
+  "settings.auth.skip_verification_hint": "APIエンドポイントで認証を要求しません（localhost専用）",
 
   "settings.server.section_label": "サーバー",
   "settings.server.host": "ホスト",
@@ -284,9 +286,10 @@
   "settings.models.badge.force_sampling": "force_sampling",
 
   "modal.model_settings.section_label": "モデル設定",
+  "modal.model_settings.model_alias": "モデルエイリアス",
   "modal.model_settings.model_type": "モデルタイプ",
   "modal.model_settings.model_type_auto": "自動検出",
-  "modal.model_settings.max_context_window": "最大コンテキストウィンドウ",
+  "modal.model_settings.max_context_window": "Ctx Window",
   "modal.model_settings.max_tokens": "最大トークン数",
   "modal.model_settings.temperature": "温度",
   "modal.model_settings.repetition_penalty": "繰り返しペナルティ",

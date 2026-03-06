@@ -144,6 +144,25 @@ class TestModelSettings:
         d = settings.to_dict()
         assert "ttl_seconds" not in d
 
+    def test_model_alias_default(self):
+        """Test model_alias defaults to None."""
+        settings = ModelSettings()
+        assert settings.model_alias is None
+
+    def test_model_alias_roundtrip(self):
+        """Test model_alias survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(model_alias="gpt-4")
+        d = original.to_dict()
+        assert d["model_alias"] == "gpt-4"
+        restored = ModelSettings.from_dict(d)
+        assert restored.model_alias == "gpt-4"
+
+    def test_model_alias_excluded_when_none(self):
+        """Test model_alias excluded from to_dict when None."""
+        settings = ModelSettings()
+        d = settings.to_dict()
+        assert "model_alias" not in d
+
     def test_model_type_override_default(self):
         """Test model_type_override defaults to None."""
         settings = ModelSettings()
@@ -340,6 +359,32 @@ class TestModelSettingsManager:
             loaded = manager2.get_settings("test-model")
             assert loaded.forced_ct_kwargs == ["enable_thinking"]
             assert loaded.chat_template_kwargs == {"enable_thinking": False}
+
+    def test_model_alias_persist(self):
+        """Test model_alias survives save/load cycle."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            settings = ModelSettings(model_alias="my-model")
+            manager.set_settings("test-model", settings)
+
+            manager2 = ModelSettingsManager(Path(tmpdir))
+            loaded = manager2.get_settings("test-model")
+            assert loaded.model_alias == "my-model"
+
+    def test_model_alias_clear(self):
+        """Test clearing model_alias by setting to None."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            settings = ModelSettings(model_alias="my-model")
+            manager.set_settings("test-model", settings)
+            assert manager.get_settings("test-model").model_alias == "my-model"
+
+            settings = ModelSettings(model_alias=None)
+            manager.set_settings("test-model", settings)
+            loaded = manager.get_settings("test-model")
+            assert loaded.model_alias is None
 
     def test_model_type_override_persist(self):
         """Test model_type_override survives save/load cycle."""
