@@ -290,8 +290,13 @@ class EngineCore:
         )
         self._finished_events[request_id] = asyncio.Event()
 
-        # Add to scheduler
-        self.scheduler.add_request(request)
+        # Add to scheduler — route through the MLX executor so that
+        # prefix cache reconstruction (mx.load, mx.concatenate) never
+        # races with scheduler.step() on the Metal stream.  See #95.
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            self._mlx_executor, self.scheduler.add_request, request
+        )
 
         return request_id
 
