@@ -120,12 +120,12 @@ def _get_param_count(safetensors: dict) -> int:
 
 # HF API sort field mapping for search.
 _SORT_MAP = {
-    "trending": ("trendingScore", -1),
-    "downloads": ("downloads", -1),
-    "created": ("createdAt", -1),
-    "updated": ("lastModified", -1),
-    "most_params": ("downloads", -1),  # fetch by downloads, re-sort in Python
-    "least_params": ("downloads", -1),  # fetch by downloads, re-sort in Python
+    "trending": "trendingScore",
+    "downloads": "downloads",
+    "created": "createdAt",
+    "updated": "lastModified",
+    "most_params": "downloads",  # fetch by downloads, re-sort in Python
+    "least_params": "downloads",  # fetch by downloads, re-sort in Python
 }
 
 
@@ -224,13 +224,12 @@ class HFDownloader:
             Dict with 'models' list and 'total' count.
         """
         api = HfApi()
-        sort_key, direction = _SORT_MAP.get(sort, ("trendingScore", -1))
+        sort_key = _SORT_MAP.get(sort, "trendingScore")
 
         models = await asyncio.to_thread(
             api.list_models,
             search=query,
             sort=sort_key,
-            direction=direction,
             limit=limit,
             expand=["safetensors", "downloads", "likes", "trendingScore"],
         )
