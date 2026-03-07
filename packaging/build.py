@@ -239,9 +239,46 @@ def _create_resolved_toml(version_map: dict[str, str]) -> Path:
     return resolved_path
 
 
+def _check_git_commit_sync():
+    """Verify git commit SHAs match between pyproject.toml and venvstacks.toml.
+
+    Aborts the build if any git-pinned package has different commits
+    in the two files, preventing accidental stale builds.
+    """
+    pyproject_path = SCRIPT_DIR.parent / "pyproject.toml"
+    venvstacks_path = SCRIPT_DIR / "venvstacks.toml"
+
+    pyproject_reqs = {
+        r[0].split("@")[0].strip().lower(): r[1]
+        for r in _parse_git_requirements(pyproject_path)
+    }
+    venvstacks_reqs = {
+        r[0].split("@")[0].strip().lower(): r[1]
+        for r in _parse_git_requirements(venvstacks_path)
+    }
+
+    mismatches = []
+    for pkg in pyproject_reqs:
+        if pkg in venvstacks_reqs and pyproject_reqs[pkg] != venvstacks_reqs[pkg]:
+            mismatches.append(
+                f"  {pkg}:\n"
+                f"    pyproject.toml:    {pyproject_reqs[pkg]}\n"
+                f"    venvstacks.toml:   {venvstacks_reqs[pkg]}"
+            )
+
+    if mismatches:
+        print("\n✗ Git commit mismatch between pyproject.toml and venvstacks.toml:")
+        for m in mismatches:
+            print(m)
+        print("\nUpdate both files to the same commit before building.")
+        sys.exit(1)
+
+
 def build_venvstacks():
     """Build venvstacks layers."""
     print("\n[1/4] Building venvstacks layers...")
+
+    _check_git_commit_sync()
 
     # Step 1: Build wheels from git-pinned packages
     version_map = build_local_wheels()
