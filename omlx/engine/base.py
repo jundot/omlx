@@ -67,7 +67,9 @@ class BaseEngine(ABC):
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
+        min_p: float = 0.0,
         repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
         stop: Optional[List[str]] = None,
         **kwargs,
     ) -> GenerationOutput:
@@ -97,7 +99,9 @@ class BaseEngine(ABC):
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
+        min_p: float = 0.0,
         repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
         stop: Optional[List[str]] = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
@@ -127,7 +131,9 @@ class BaseEngine(ABC):
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
+        min_p: float = 0.0,
         repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
         tools: Optional[List[dict]] = None,
         **kwargs,
     ) -> GenerationOutput:
@@ -157,7 +163,9 @@ class BaseEngine(ABC):
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
+        min_p: float = 0.0,
         repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
         tools: Optional[List[dict]] = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:

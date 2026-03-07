@@ -64,6 +64,8 @@ class ModelSettingsRequest(BaseModel):
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = None
+    min_p: Optional[float] = None
+    presence_penalty: Optional[float] = None
     force_sampling: Optional[bool] = None
     max_tool_result_tokens: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
@@ -1018,6 +1020,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "top_p": settings.top_p,
                 "top_k": settings.top_k,
                 "repetition_penalty": settings.repetition_penalty,
+                "min_p": settings.min_p,
+                "presence_penalty": settings.presence_penalty,
                 "force_sampling": settings.force_sampling,
                 "max_tool_result_tokens": settings.max_tool_result_tokens,
                 "chat_template_kwargs": settings.chat_template_kwargs,
@@ -1184,6 +1188,10 @@ async def update_model_settings(
         current_settings.top_k = request.top_k
     if "repetition_penalty" in sent:
         current_settings.repetition_penalty = request.repetition_penalty
+    if "min_p" in sent:
+        current_settings.min_p = request.min_p
+    if "presence_penalty" in sent:
+        current_settings.presence_penalty = request.presence_penalty
     if "force_sampling" in sent:
         current_settings.force_sampling = request.force_sampling
     if "max_tool_result_tokens" in sent:

@@ -38,6 +38,8 @@ class InternalRequest:
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = 0
+    min_p: float = 0.0
+    presence_penalty: float = 0.0
     stream: bool = False
 
     # Stop conditions

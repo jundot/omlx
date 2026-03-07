@@ -791,7 +791,7 @@
                                     </div>
 
                                     <!-- Sampling Settings Row (if any settings configured) - hidden for embedding/reranker models -->
-                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.repetition_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens)"
+                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens)"
                                          class="px-6 pb-4 -mt-2">
                                         <div class="ml-11 flex flex-wrap gap-2">
                                             <template x-if="model.settings?.max_context_window">
@@ -819,9 +819,19 @@
                                                     top_k: <span class="ml-1" x-text="model.settings.top_k"></span>
                                                 </span>
                                             </template>
+                                            <template x-if="model.settings?.min_p !== null && model.settings?.min_p !== undefined">
+                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
+                                                    min_p: <span class="ml-1" x-text="model.settings.min_p"></span>
+                                                </span>
+                                            </template>
                                             <template x-if="model.settings?.repetition_penalty !== null && model.settings?.repetition_penalty !== undefined">
                                                 <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-pink-50 text-pink-700 border border-pink-200">
                                                     rep_penalty: <span class="ml-1" x-text="model.settings.repetition_penalty"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.presence_penalty !== null && model.settings?.presence_penalty !== undefined">
+                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-rose-50 text-rose-700 border border-rose-200">
+                                                    presence_penalty: <span class="ml-1" x-text="model.settings.presence_penalty"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.max_tool_result_tokens">

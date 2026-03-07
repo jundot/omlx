@@ -259,7 +259,9 @@ class BatchedEngine(BaseEngine):
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
+        min_p: float = 0.0,
         repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
         stop: list[str] | None = None,
         **kwargs,
     ) -> GenerationOutput:
@@ -272,7 +274,9 @@ class BatchedEngine(BaseEngine):
             temperature: Sampling temperature
             top_p: Top-p sampling
             top_k: Top-k sampling (0 = disabled)
+            min_p: Min-p sampling (0.0 = disabled)
             repetition_penalty: Repetition penalty (1.0 = disabled)
+            presence_penalty: Presence penalty (0.0 = disabled)
             stop: Stop sequences
             **kwargs: Additional model-specific parameters
 
@@ -289,7 +293,9 @@ class BatchedEngine(BaseEngine):
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            min_p=min_p,
             repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
             stop=stop or [],
         )
 
@@ -316,7 +322,9 @@ class BatchedEngine(BaseEngine):
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
+        min_p: float = 0.0,
         repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
         stop: list[str] | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
@@ -329,7 +337,9 @@ class BatchedEngine(BaseEngine):
             temperature: Sampling temperature
             top_p: Top-p sampling
             top_k: Top-k sampling (0 = disabled)
+            min_p: Min-p sampling (0.0 = disabled)
             repetition_penalty: Repetition penalty (1.0 = disabled)
+            presence_penalty: Presence penalty (0.0 = disabled)
             stop: Stop sequences
             **kwargs: Additional model-specific parameters
 
@@ -346,7 +356,9 @@ class BatchedEngine(BaseEngine):
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            min_p=min_p,
             repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
             stop=stop or [],
         )
 
@@ -395,7 +407,9 @@ class BatchedEngine(BaseEngine):
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
+        min_p: float = 0.0,
         repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
         tools: list[dict] | None = None,
         **kwargs,
     ) -> GenerationOutput:
@@ -408,7 +422,9 @@ class BatchedEngine(BaseEngine):
             temperature: Sampling temperature
             top_p: Top-p sampling
             top_k: Top-k sampling (0 = disabled)
+            min_p: Min-p sampling (0.0 = disabled)
             repetition_penalty: Repetition penalty (1.0 = disabled)
+            presence_penalty: Presence penalty (0.0 = disabled)
             tools: Optional tool definitions
             **kwargs: Additional model-specific parameters
 
@@ -436,7 +452,9 @@ class BatchedEngine(BaseEngine):
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            min_p=min_p,
             repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
             **kwargs,
         )
 
@@ -447,7 +465,9 @@ class BatchedEngine(BaseEngine):
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
+        min_p: float = 0.0,
         repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
         tools: list[dict] | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
@@ -460,7 +480,9 @@ class BatchedEngine(BaseEngine):
             temperature: Sampling temperature
             top_p: Top-p sampling
             top_k: Top-k sampling (0 = disabled)
+            min_p: Min-p sampling (0.0 = disabled)
             repetition_penalty: Repetition penalty (1.0 = disabled)
+            presence_penalty: Presence penalty (0.0 = disabled)
             tools: Optional tool definitions
             **kwargs: Additional model-specific parameters
 
@@ -488,7 +510,9 @@ class BatchedEngine(BaseEngine):
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            min_p=min_p,
             repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
             **kwargs,
         ):
             yield output

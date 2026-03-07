@@ -281,7 +281,9 @@
   "settings.models.badge.temp": "temp:",
   "settings.models.badge.top_p": "top_p:",
   "settings.models.badge.top_k": "top_k:",
+  "settings.models.badge.min_p": "min_p:",
   "settings.models.badge.rep_penalty": "rep_penalty:",
+  "settings.models.badge.presence_penalty": "presence_penalty:",
   "settings.models.badge.tool_result_tokens": "tool_result_tokens:",
   "settings.models.badge.force_sampling": "force_sampling",
 
@@ -294,6 +296,8 @@
   "modal.model_settings.temperature": "温度",
   "modal.model_settings.repetition_penalty": "繰り返しペナルティ",
   "modal.model_settings.repetition_penalty_short": "Rep. Penalty",
+  "modal.model_settings.min_p": "Min P",
+  "modal.model_settings.presence_penalty": "Presence Penalty",
   "modal.model_settings.top_p": "Top P",
   "modal.model_settings.top_k": "Top K",
   "modal.model_settings.ttl_seconds": "TTL（秒）",

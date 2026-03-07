@@ -319,6 +319,42 @@ class TestOpenAIAdapter:
 
         assert internal.top_p == 0.9
 
+    def test_parse_request_with_min_p(self, adapter):
+        """Test parsing request with min_p."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+            min_p=0.1,
+        )
+
+        internal = adapter.parse_request(request)
+
+        assert internal.min_p == 0.1
+
+    def test_parse_request_with_presence_penalty(self, adapter):
+        """Test parsing request with presence_penalty."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+            presence_penalty=0.5,
+        )
+
+        internal = adapter.parse_request(request)
+
+        assert internal.presence_penalty == 0.5
+
+    def test_parse_request_default_min_p_and_presence_penalty(self, adapter):
+        """Test default min_p and presence_penalty values."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+
+        internal = adapter.parse_request(request)
+
+        assert internal.min_p == 0.0
+        assert internal.presence_penalty == 0.0
+
     def test_parse_request_with_max_tokens(self, adapter):
         """Test parsing request with max_tokens."""
         request = ChatCompletionRequest(

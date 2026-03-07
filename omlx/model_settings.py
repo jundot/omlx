@@ -43,6 +43,8 @@ class ModelSettings:
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = None
+    min_p: Optional[float] = None
+    presence_penalty: Optional[float] = None
     force_sampling: bool = False
     max_tool_result_tokens: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None

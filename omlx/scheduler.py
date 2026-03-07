@@ -806,6 +806,23 @@ def _advance_vlm_extra(
     return advanced
 
 
+def make_presence_penalty(penalty: float):
+    """
+    OpenAI-style presence penalty (additive, binary).
+
+    For each unique token in the history, subtract penalty from its logit.
+    Unlike repetition_penalty (multiplicative, CTRL paper), this is:
+    - Additive: logit -= penalty
+    - Binary: same penalty regardless of occurrence count
+    """
+    def presence_penalty_processor(tokens, logits):
+        if len(tokens) > 0:
+            unique_tokens = mx.array(list(set(tokens.tolist())))
+            logits[:, unique_tokens] -= penalty
+        return logits
+    return presence_penalty_processor
+
+
 class SchedulingPolicy(Enum):
     """Scheduling policy for request ordering."""
 
@@ -1418,6 +1435,10 @@ class Scheduler:
             if sampling_params.repetition_penalty != 1.0
             else None,
         )
+        if sampling_params.presence_penalty != 0.0:
+            logits_processors.append(
+                make_presence_penalty(sampling_params.presence_penalty)
+            )
 
         stop_tokens = self._get_stop_tokens()
         # Add custom stop token IDs
@@ -1460,6 +1481,10 @@ class Scheduler:
             if sampling_params.repetition_penalty != 1.0
             else None,
         )
+        if sampling_params.presence_penalty != 0.0:
+            logits_processors.append(
+                make_presence_penalty(sampling_params.presence_penalty)
+            )
         return sampler, logits_processors
 
     def _ensure_batch_generator(self, sampling_params: SamplingParams) -> None:

@@ -38,6 +38,8 @@ class TestListModelsSettings:
             temperature=0.7,
             top_p=0.9,
             top_k=40,
+            min_p=0.05,
+            presence_penalty=0.3,
             force_sampling=True,
             is_pinned=True,
             is_default=False,

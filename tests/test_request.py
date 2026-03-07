@@ -77,6 +77,7 @@ class TestSamplingParams:
         assert params.top_k == 0
         assert params.min_p == 0.0
         assert params.repetition_penalty == 1.0
+        assert params.presence_penalty == 0.0
         assert params.stop == []
         assert params.stop_token_ids == []
         assert params.logprobs is False
@@ -91,6 +92,7 @@ class TestSamplingParams:
             top_k=40,
             min_p=0.05,
             repetition_penalty=1.1,
+            presence_penalty=0.5,
             stop=["###", "END"],
             stop_token_ids=[2, 100],
             logprobs=True,
@@ -102,6 +104,7 @@ class TestSamplingParams:
         assert params.top_k == 40
         assert params.min_p == 0.05
         assert params.repetition_penalty == 1.1
+        assert params.presence_penalty == 0.5
         assert params.stop == ["###", "END"]
         assert params.stop_token_ids == [2, 100]
         assert params.logprobs is True
