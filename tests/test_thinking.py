@@ -4,6 +4,7 @@
 import pytest
 
 from omlx.api.thinking import ThinkingParser, extract_thinking
+from omlx.server import is_thinking_disabled
 
 
 class TestExtractThinking:
@@ -90,6 +91,27 @@ class TestThinkingParser:
         t, c = parser.feed("<think>reasoning</think>answer")
         assert t == "reasoning"
         assert c == "answer"
+
+    def test_strip_mode_drops_thinking(self):
+        """strip_mode emits only visible content."""
+        parser = ThinkingParser(strip_mode=True)
+        t1, c1 = parser.feed("<think>reasoning</think>answer")
+        t2, c2 = parser.finish()
+        assert t1 == "" and c1 == "answer"
+        assert t2 == "" and c2 == ""
+
+    def test_strip_mode_streaming_chunks(self):
+        """strip_mode works across chunk boundaries."""
+        parser = ThinkingParser(strip_mode=True)
+        t1, c1 = parser.feed("<think>reas")
+        t2, c2 = parser.feed("oning</think>ans")
+        t3, c3 = parser.feed("wer")
+        t4, c4 = parser.finish()
+        # All thinking deltas suppressed
+        assert t1 == "" and t2 == "" and t3 == "" and t4 == ""
+        # No content while inside <think>, content emitted after </think>
+        assert c1 == ""
+        assert "answer" in (c2 + c3)
 
     def test_tag_split_across_chunks(self):
         """<think> tag split across two chunks."""
@@ -239,6 +261,31 @@ class TestThinkingParser:
         assert "**4**" in content
         assert "<think>" not in thinking
         assert "</think>" not in content
+
+
+class TestIsThinkingDisabled:
+    def test_disabled_in_kwargs(self):
+        assert is_thinking_disabled(
+            {"chat_template_kwargs": {"enable_thinking": False}}, None
+        ) is True
+
+    def test_disabled_in_merged(self):
+        assert is_thinking_disabled(None, {"enable_thinking": False}) is True
+
+    def test_not_present(self):
+        assert is_thinking_disabled(None, None) is False
+        assert is_thinking_disabled({}, {}) is False
+
+    def test_enabled_returns_false(self):
+        assert is_thinking_disabled(
+            {"chat_template_kwargs": {"enable_thinking": True}}, None
+        ) is False
+
+    def test_kwargs_overrides_merged(self):
+        assert is_thinking_disabled(
+            {"chat_template_kwargs": {"enable_thinking": False}},
+            {"enable_thinking": True},
+        ) is True
 
 
 class TestCleanSpecialTokens:

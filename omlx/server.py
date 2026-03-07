@@ -215,6 +215,16 @@ def get_mcp_manager():
     return _server_state.mcp_manager
 
 
+def is_thinking_disabled(kwargs: dict | None, merged_ct_kwargs: dict | None) -> bool:
+    """Return True when effective chat template kwargs disable thinking."""
+    effective = {}
+    if merged_ct_kwargs:
+        effective.update(merged_ct_kwargs)
+    if kwargs and kwargs.get("chat_template_kwargs"):
+        effective.update(kwargs["chat_template_kwargs"])
+    return effective.get("enable_thinking") is False
+
+
 async def verify_api_key(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> bool:
@@ -1541,6 +1551,8 @@ async def create_chat_completion(
     # Separate thinking from content
     raw_text = clean_special_tokens(output.text) if output.text else ""
     thinking_content, regular_content = extract_thinking(raw_text)
+    if is_thinking_disabled(chat_kwargs, merged_ct_kwargs):
+        thinking_content = ""
 
     # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
     # For other models, parse from text output
@@ -1751,7 +1763,8 @@ async def stream_chat_completion(
     last_output = None
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
-    thinking_parser = ThinkingParser()
+    _thinking_off = is_thinking_disabled(kwargs, None)
+    thinking_parser = ThinkingParser(strip_mode=_thinking_off)
 
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
@@ -1861,6 +1874,8 @@ async def stream_chat_completion(
     elif has_tools and accumulated_text:
         # Separate thinking from content, then parse tool calls from content
         thinking_content, regular_content = extract_thinking(accumulated_text)
+        if is_thinking_disabled(kwargs, None):
+            thinking_content = ""
         cleaned_text, tool_calls = parse_tool_calls(
             regular_content,
             tokenizer=engine.tokenizer,
@@ -2006,7 +2021,8 @@ async def stream_anthropic_messages(
     accumulated_text = ""
 
     # Track content blocks with thinking separation
-    thinking_parser = ThinkingParser()
+    _thinking_off = is_thinking_disabled(kwargs, None)
+    thinking_parser = ThinkingParser(strip_mode=_thinking_off)
     thinking_block_started = False
     text_block_started = False
     block_index = 0
@@ -2133,7 +2149,9 @@ async def stream_anthropic_messages(
         ]
     elif kwargs.get("tools"):
         # Non-Harmony: separate thinking, then parse tool calls from content
-        _, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(accumulated_text)
+        if is_thinking_disabled(kwargs, None):
+            thinking_content = ""
         cleaned_text, tool_calls = parse_tool_calls(
             regular_content,
             tokenizer=engine.tokenizer,
@@ -2375,6 +2393,8 @@ async def create_anthropic_message(
     # Separate thinking from content
     raw_text = clean_special_tokens(output.text) if output.text else ""
     thinking_content, regular_content = extract_thinking(raw_text)
+    if is_thinking_disabled(chat_kwargs, merged_ct_kwargs):
+        thinking_content = ""
 
     # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
     # For other models, parse from text output

@@ -93,9 +93,10 @@ class ThinkingParser:
         t, c = parser.finish()
     """
 
-    def __init__(self):
+    def __init__(self, strip_mode: bool = False):
         self._in_thinking: bool = False
         self._buffer: str = ""  # Buffer for potential partial tags
+        self._strip_mode: bool = strip_mode
 
     def feed(self, text: str) -> Tuple[str, str]:
         """Feed a text chunk, return (thinking_delta, content_delta).
@@ -153,6 +154,8 @@ class ThinkingParser:
                     content_out.append(text[i])
                 i += 1
 
+        if self._strip_mode:
+            return ("", "".join(content_out))
         return ("".join(thinking_out), "".join(content_out))
 
     def finish(self) -> Tuple[str, str]:
@@ -173,7 +176,7 @@ class ThinkingParser:
         self._buffer = ""
 
         if self._in_thinking:
-            return (buf, "")
+            return ("", "") if self._strip_mode else (buf, "")
         else:
             return ("", buf)
 
