@@ -49,6 +49,9 @@ VLM_MODEL_TYPES = {
     "deepseekocr_2",
     "dots_ocr",
     "glm_ocr",
+    "minicpmv",
+    "phi4_siglip",
+    "phi4mm",
 }
 
 # Known VLM architectures

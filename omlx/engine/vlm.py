@@ -491,11 +491,14 @@ class VLMBatchedEngine(BaseEngine):
         pixel_values = inputs.get("pixel_values")
         attention_mask = inputs.get("attention_mask")
 
-        # Extract additional model-specific inputs
-        extra_model_inputs = {}
-        for key in inputs:
-            if key not in ("input_ids", "attention_mask", "pixel_values"):
-                extra_model_inputs[key] = inputs[key]
+        # Extract additional model-specific inputs (filter None values
+        # since prepare_inputs may include them after mlx-vlm 348466f)
+        extra_model_inputs = {
+            k: v
+            for k, v in inputs.items()
+            if k not in ("input_ids", "attention_mask", "pixel_values")
+            and v is not None
+        }
 
         if pixel_values is not None and num_images > 0:
             # Run vision encoder + embedding merge.
