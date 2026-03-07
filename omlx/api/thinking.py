@@ -26,6 +26,16 @@ _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 _THINKING_TAIL_PATTERN = re.compile(r'^(.*?)</think>', re.DOTALL)
 
 
+def _strip_thinking_blocks(text: str) -> str:
+    """Strip <think> blocks (and partial tail blocks) from text."""
+    if not text:
+        return ""
+    stripped = _THINKING_PATTERN.sub("", text)
+    if '</think>' in stripped and '<think>' not in stripped:
+        stripped = _THINKING_TAIL_PATTERN.sub("", stripped, count=1)
+    return stripped.strip()
+
+
 def extract_thinking(text: str) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 
@@ -45,20 +55,10 @@ def extract_thinking(text: str) -> Tuple[str, str]:
     if not text:
         return ("", "")
 
-    thinking_parts = []
-    remaining = text
-
-    # Extract all <think>...</think> blocks
-    while True:
-        match = _THINKING_PATTERN.search(remaining)
-        if not match:
-            break
-        thinking_parts.append(match.group(1))
-        remaining = remaining[:match.start()] + remaining[match.end():]
-
+    thinking_parts = [m.group(1) for m in _THINKING_PATTERN.finditer(text)]
     if thinking_parts:
         thinking = "\n".join(thinking_parts).strip()
-        return (thinking, remaining.strip())
+        return (thinking, _strip_thinking_blocks(text))
 
     # Handle partial: content before </think> without <think> tag
     if '</think>' in text and '<think>' not in text:

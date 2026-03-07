@@ -3,7 +3,8 @@
 
 import pytest
 
-from omlx.api.thinking import ThinkingParser, extract_thinking
+from omlx.api.thinking import ThinkingParser, extract_thinking, _strip_thinking_blocks
+from omlx.server import maybe_prepend_think_prefix
 
 
 class TestExtractThinking:
@@ -37,6 +38,12 @@ class TestExtractThinking:
         """Only thinking content, no answer."""
         thinking, content = extract_thinking("<think>reasoning</think>")
         assert thinking == "reasoning"
+        assert content == ""
+
+    def test_all_thinking_returns_empty_content(self):
+        """All-thinking output should not leak think tags into answer."""
+        thinking, content = extract_thinking("<think>internal reasoning only</think>")
+        assert thinking == "internal reasoning only"
         assert content == ""
 
     def test_multiline_thinking(self):
@@ -79,6 +86,47 @@ class TestExtractThinking:
         )
         assert "Let me reason..." in thinking
         assert "Final answer." in content
+
+
+class TestStripThinkingBlocks:
+    def test_strip_complete(self):
+        assert _strip_thinking_blocks("<think>a</think>b") == "b"
+
+    def test_strip_partial_tail(self):
+        assert _strip_thinking_blocks("reasoning</think>answer") == "answer"
+
+    def test_strip_all_thinking(self):
+        assert _strip_thinking_blocks("<think>only</think>") == ""
+
+    def test_empty(self):
+        assert _strip_thinking_blocks("") == ""
+
+
+class TestMaybePrependThinkPrefix:
+    def test_noop_already_has_open_tag(self):
+        engine = type("Engine", (), {"tokenizer": None})()
+        raw = "<think>reason</think>answer"
+        assert maybe_prepend_think_prefix(engine, raw) == raw
+
+    def test_noop_no_close_tag(self):
+        engine = type("Engine", (), {"tokenizer": None})()
+        raw = "just answer"
+        assert maybe_prepend_think_prefix(engine, raw) == raw
+
+    def test_noop_empty(self):
+        engine = type("Engine", (), {"tokenizer": None})()
+        assert maybe_prepend_think_prefix(engine, "") == ""
+
+    def test_prepends_when_needed(self):
+        class DummyTokenizer:
+            think_start = "<think>"
+
+            def apply_chat_template(self, *args, **kwargs):
+                return "prompt...<think>"
+
+        engine = type("Engine", (), {"tokenizer": DummyTokenizer()})()
+        raw = "reasoning</think>answer"
+        assert maybe_prepend_think_prefix(engine, raw) == "<think>\n" + raw
 
 
 class TestThinkingParser:

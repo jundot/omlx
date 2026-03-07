@@ -52,6 +52,12 @@ from typing import Optional, Union
 
 import secrets
 
+try:
+    import jinja2
+    _TEMPLATE_ERRORS = (TypeError, ValueError, jinja2.TemplateError)
+except ImportError:
+    _TEMPLATE_ERRORS = (TypeError, ValueError)
+
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
@@ -213,6 +219,41 @@ def get_engine_pool() -> EnginePool:
 def get_mcp_manager():
     """Get the MCP manager instance (may be None)."""
     return _server_state.mcp_manager
+
+
+def maybe_prepend_think_prefix(engine: BaseEngine, raw_text: str) -> str:
+    """Prepend <think> prefix for reasoning templates when output is missing open tag."""
+    if not raw_text or "<think>" in raw_text or "</think>" not in raw_text:
+        return raw_text
+
+    cached = getattr(engine, "_needs_think_prefix_nonstream", None)
+    if cached is None:
+        cached = False
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is None:
+            logger.warning("Cannot detect think-prefix behavior: tokenizer missing")
+        elif not hasattr(tokenizer, "apply_chat_template"):
+            logger.warning("Cannot detect think-prefix behavior: no apply_chat_template")
+        else:
+            try:
+                probe_messages = [{"role": "user", "content": "ping"}]
+                prompt = tokenizer.apply_chat_template(
+                    probe_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    chat_template_kwargs={"enable_thinking": True},
+                )
+                think_tag = getattr(tokenizer, "think_start", "<think>")
+                if isinstance(prompt, str):
+                    cached = prompt.rstrip().endswith(think_tag)
+            except _TEMPLATE_ERRORS as e:
+                logger.warning("Failed reasoning think-prefix detection: %s", e)
+        setattr(engine, "_needs_think_prefix_nonstream", cached)
+
+    if not cached:
+        return raw_text
+    think_tag = getattr(getattr(engine, "tokenizer", None), "think_start", "<think>")
+    return f"{think_tag}\n{raw_text}"
 
 
 async def verify_api_key(
@@ -1540,6 +1581,7 @@ async def create_chat_completion(
 
     # Separate thinking from content
     raw_text = clean_special_tokens(output.text) if output.text else ""
+    raw_text = maybe_prepend_think_prefix(engine, raw_text)
     thinking_content, regular_content = extract_thinking(raw_text)
 
     # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
@@ -1860,6 +1902,7 @@ async def stream_chat_completion(
         cleaned_text = ""
     elif has_tools and accumulated_text:
         # Separate thinking from content, then parse tool calls from content
+        accumulated_text = maybe_prepend_think_prefix(engine, accumulated_text)
         thinking_content, regular_content = extract_thinking(accumulated_text)
         cleaned_text, tool_calls = parse_tool_calls(
             regular_content,
@@ -2133,6 +2176,7 @@ async def stream_anthropic_messages(
         ]
     elif kwargs.get("tools"):
         # Non-Harmony: separate thinking, then parse tool calls from content
+        accumulated_text = maybe_prepend_think_prefix(engine, accumulated_text)
         _, regular_content = extract_thinking(accumulated_text)
         cleaned_text, tool_calls = parse_tool_calls(
             regular_content,
@@ -2374,6 +2418,7 @@ async def create_anthropic_message(
 
     # Separate thinking from content
     raw_text = clean_special_tokens(output.text) if output.text else ""
+    raw_text = maybe_prepend_think_prefix(engine, raw_text)
     thinking_content, regular_content = extract_thinking(raw_text)
 
     # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
