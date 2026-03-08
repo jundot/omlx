@@ -472,21 +472,21 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
 
     # Collect single results and batch results
     single_results = [r for r in run.results if r.get("test_type") == "single"]
-    batch_same_results = [r for r in run.results if r.get("test_type") == "batch_same"]
+    batch_diff_results = [r for r in run.results if r.get("test_type") == "batch_diff"]
 
-    # Build batching_results from batch_same data
+    # Build batching_results from batch_diff (uncached) data
     batching_results = []
     pp1024_single = next(
         (r for r in single_results if r.get("pp") == 1024), None
     )
-    if pp1024_single and batch_same_results:
+    if pp1024_single and batch_diff_results:
         baseline_tps = pp1024_single["gen_tps"]
         batching_results.append({
             "batch_size": 1,
             "tg_tps": baseline_tps,
             "speedup": 1.0,
         })
-        for br in batch_same_results:
+        for br in batch_diff_results:
             speedup = round(br["tg_tps"] / baseline_tps, 2) if baseline_tps > 0 else 1.0
             batching_results.append({
                 "batch_size": br["batch_size"],
