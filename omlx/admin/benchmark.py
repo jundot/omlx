@@ -9,9 +9,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, field_validator
@@ -365,6 +367,242 @@ async def _run_batch_test(
     }
 
 
+OMLX_AI_API_URL = "https://omlx.ai/api/benchmarks"
+
+# Quantization patterns to strip from model directory names
+_QUANT_SUFFIXES = re.compile(
+    r"[-_](2bit|3bit|4bit|6bit|8bit|fp16|bf16|fp32)$", re.IGNORECASE
+)
+_MLX_SUFFIXES = re.compile(r"[-_]?MLX[-_]?", re.IGNORECASE)
+
+
+def _detect_quantization(model_path: str) -> str:
+    """Detect model quantization from config.json or directory name.
+
+    Fallback chain: config.json → directory name → "unknown"
+    """
+    config_path = Path(model_path) / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+            qconfig = config.get("quantization_config", {})
+            bits = qconfig.get("bits")
+            if bits is not None:
+                return f"{bits}bit"
+        except Exception:
+            pass
+
+    # Fallback: extract from directory name
+    dirname = Path(model_path).name
+    match = re.search(
+        r"(2bit|3bit|4bit|6bit|8bit|fp16|bf16)", dirname, re.IGNORECASE
+    )
+    if match:
+        return match.group(1).lower()
+
+    return "unknown"
+
+
+def _clean_model_name(model_id: str, quantization: str) -> str:
+    """Clean model directory name for display as model_name.
+
+    Strips quantization suffixes and MLX markers.
+    e.g. "Qwen3-30B-A3B-4bit" → "Qwen3-30B-A3B"
+    """
+    name = model_id
+    name = _QUANT_SUFFIXES.sub("", name)
+    name = _MLX_SUFFIXES.sub("", name)
+    return name.strip("-_ ")
+
+
+async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
+    """Upload benchmark results to omlx.ai community benchmarks.
+
+    Sends each single-request result as a separate submission,
+    grouped by submission_group. Upload failures don't affect
+    the benchmark run status.
+    """
+    import requests
+
+    from .._version import __version__
+    from ..utils.hardware import (
+        compute_owner_hash,
+        get_chip_name,
+        get_gpu_core_count,
+        get_io_platform_uuid,
+        get_os_version,
+        get_total_memory_gb,
+        parse_chip_info,
+    )
+
+    await _send_event(run, {
+        "type": "progress",
+        "phase": "upload",
+        "message": "Uploading to community benchmarks...",
+        "current": 0,
+        "total": 0,
+    })
+
+    # Collect hardware info
+    chip_string = get_chip_name()
+    chip_name, chip_variant = parse_chip_info(chip_string)
+    memory_gb = round(get_total_memory_gb())
+    gpu_cores = get_gpu_core_count()
+    os_version = get_os_version()
+    omlx_version = __version__
+
+    # Compute owner_hash
+    owner_hash_full = None
+    owner_hash_display = None
+    io_uuid = get_io_platform_uuid()
+    if io_uuid:
+        owner_hash_full = compute_owner_hash(io_uuid, chip_name, gpu_cores, memory_gb)
+        # Display hash is without the verify character
+        owner_hash_display = owner_hash_full[:-1]
+
+    # Get model info
+    entry = engine_pool.get_entry(run.request.model_id)
+    model_path = entry.model_path if entry else ""
+    quantization = _detect_quantization(model_path)
+    model_name = _clean_model_name(run.request.model_id, quantization)
+
+    # Generate submission group
+    submission_group = str(uuid.uuid4())
+
+    # Collect single results and batch results
+    single_results = [r for r in run.results if r.get("test_type") == "single"]
+    batch_same_results = [r for r in run.results if r.get("test_type") == "batch_same"]
+
+    # Build batching_results from batch_same data
+    batching_results = []
+    pp1024_single = next(
+        (r for r in single_results if r.get("pp") == 1024), None
+    )
+    if pp1024_single and batch_same_results:
+        baseline_tps = pp1024_single["gen_tps"]
+        batching_results.append({
+            "batch_size": 1,
+            "tg_tps": baseline_tps,
+            "speedup": 1.0,
+        })
+        for br in batch_same_results:
+            speedup = round(br["tg_tps"] / baseline_tps, 2) if baseline_tps > 0 else 1.0
+            batching_results.append({
+                "batch_size": br["batch_size"],
+                "tg_tps": br["tg_tps"],
+                "speedup": speedup,
+            })
+
+    success_count = 0
+    failed_count = 0
+
+    for result in single_results:
+        context_length = result["pp"]
+        peak_mem_gb = None
+        if result.get("peak_memory_bytes") and result["peak_memory_bytes"] > 0:
+            peak_mem_gb = round(result["peak_memory_bytes"] / (1024**3), 2)
+
+        payload = {
+            "chip_name": chip_name,
+            "chip_variant": chip_variant,
+            "memory_gb": memory_gb,
+            "gpu_cores": gpu_cores,
+            "omlx_version": omlx_version,
+            "os_version": os_version,
+            "model_name": model_name,
+            "quantization": quantization,
+            "context_length": context_length,
+            "pp_tps": result["processing_tps"],
+            "tg_tps": result["gen_tps"],
+            "ttft_ms": result.get("ttft_ms"),
+            "peak_memory_gb": peak_mem_gb,
+            "submission_group": submission_group,
+        }
+
+        if owner_hash_full:
+            payload["owner_hash"] = owner_hash_full
+
+        # Attach batching_results only to the first submission (lowest context_length)
+        if context_length == single_results[0]["pp"] and batching_results:
+            payload["batching_results"] = batching_results
+
+        try:
+            resp = await asyncio.to_thread(
+                requests.post,
+                OMLX_AI_API_URL,
+                json=payload,
+                timeout=15,
+            )
+
+            if resp.status_code == 201:
+                data = resp.json()
+                success_count += 1
+                await _send_event(run, {
+                    "type": "upload",
+                    "data": {
+                        "context_length": context_length,
+                        "id": data.get("id"),
+                        "url": data.get("url"),
+                    },
+                })
+            elif resp.status_code == 409:
+                data = resp.json()
+                success_count += 1  # Duplicate is still ok
+                await _send_event(run, {
+                    "type": "upload",
+                    "data": {
+                        "context_length": context_length,
+                        "id": data.get("existing_id"),
+                        "url": data.get("existing_url"),
+                        "duplicate": True,
+                    },
+                })
+            else:
+                failed_count += 1
+                error_msg = ""
+                try:
+                    error_msg = resp.json().get("error", resp.text)
+                except Exception:
+                    error_msg = resp.text
+                await _send_event(run, {
+                    "type": "upload",
+                    "data": {
+                        "context_length": context_length,
+                        "error": error_msg,
+                    },
+                })
+                logger.warning(
+                    f"Benchmark upload failed for pp{context_length}: "
+                    f"{resp.status_code} {error_msg}"
+                )
+
+        except Exception as e:
+            failed_count += 1
+            await _send_event(run, {
+                "type": "upload",
+                "data": {
+                    "context_length": context_length,
+                    "error": str(e),
+                },
+            })
+            logger.warning(f"Benchmark upload error for pp{context_length}: {e}")
+
+    await _send_event(run, {
+        "type": "upload_done",
+        "data": {
+            "owner_hash": owner_hash_display,
+            "total": len(single_results),
+            "success": success_count,
+            "failed": failed_count,
+        },
+    })
+
+    logger.info(
+        f"Benchmark upload complete: {success_count}/{len(single_results)} succeeded"
+    )
+
+
 async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     """Execute a complete benchmark run.
 
@@ -583,6 +821,22 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 "total_tests": total_tests,
             },
         })
+
+        # Upload results to omlx.ai (failures don't affect benchmark status)
+        try:
+            await _upload_to_omlx_ai(run, engine_pool)
+        except Exception as e:
+            logger.warning(f"Benchmark upload to omlx.ai failed: {e}")
+            await _send_event(run, {
+                "type": "upload_done",
+                "data": {
+                    "owner_hash": None,
+                    "total": 0,
+                    "success": 0,
+                    "failed": 0,
+                    "error": str(e),
+                },
+            })
 
     except asyncio.CancelledError:
         run.status = "cancelled"

@@ -181,6 +181,10 @@
             benchShowText: false,
             benchCopied: false,
             benchIncludeImage: false,
+            benchDeviceInfo: null,
+            benchUploadResults: [],
+            benchUploadDone: null,
+            benchUploading: false,
 
             async init() {
                 // Apply theme
@@ -225,6 +229,9 @@
                         if (hasActive) this.startHFRefresh();
                     } else {
                         this.stopHFRefresh();
+                    }
+                    if (value === 'bench') {
+                        if (!this.benchDeviceInfo) this.loadBenchDeviceInfo();
                     }
                     this.$nextTick(() => lucide.createIcons());
                 });
@@ -845,6 +852,11 @@
                     .filter(([_, v]) => v)
                     .map(([k, _]) => parseInt(k));
 
+                // Load device info if not loaded yet
+                if (!this.benchDeviceInfo) {
+                    this.loadBenchDeviceInfo();
+                }
+
                 // Reset state
                 this.benchRunning = true;
                 this.benchProgress = null;
@@ -853,6 +865,9 @@
                 this.benchBatchDiffResults = [];
                 this.benchError = '';
                 this.benchBenchId = null;
+                this.benchUploadResults = [];
+                this.benchUploadDone = null;
+                this.benchUploading = false;
 
                 try {
                     const response = await fetch('/admin/api/bench/start', {
@@ -917,12 +932,24 @@
                                 this.benchBatchDiffResults = [...this.benchBatchDiffResults, data.data];
                             }
                         } else if (data.type === 'done') {
+                            // Benchmark tests done, uploading starts
+                            this.benchUploading = true;
+                            this.benchProgress = {
+                                phase: 'upload',
+                                message: 'Uploading to community benchmarks...',
+                                current: 0,
+                                total: 0,
+                            };
+                            this.loadModels();
+                        } else if (data.type === 'upload') {
+                            this.benchUploadResults = [...this.benchUploadResults, data.data];
+                        } else if (data.type === 'upload_done') {
+                            this.benchUploadDone = data.data;
+                            this.benchUploading = false;
                             this.benchRunning = false;
                             this.benchProgress = null;
                             es.close();
                             this.benchEventSource = null;
-                            // Refresh model list to show updated load states
-                            this.loadModels();
                         } else if (data.type === 'error') {
                             this.benchError = data.message;
                             this.benchRunning = false;
@@ -1071,6 +1098,17 @@
                 } else {
                     this._copyFallback(text);
                     onSuccess();
+                }
+            },
+
+            async loadBenchDeviceInfo() {
+                try {
+                    const resp = await fetch('/admin/api/device-info');
+                    if (resp.ok) {
+                        this.benchDeviceInfo = await resp.json();
+                    }
+                } catch (err) {
+                    console.error('Failed to load device info:', err);
                 }
             },
 

@@ -11,8 +11,10 @@ Single source of truth for:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import platform
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -229,6 +231,97 @@ def get_mlx_vlm_version() -> str:
         return getattr(mlx_vlm, "__version__", "Unknown")
     except Exception:
         return "Unknown"
+
+
+# =============================================================================
+# Benchmark / omlx.ai Integration
+# =============================================================================
+
+_OWNER_HASH_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def get_gpu_core_count() -> Optional[int]:
+    """Get GPU core count via system_profiler."""
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        for line in result.stdout.splitlines():
+            if "Total Number of Cores" in line:
+                match = re.search(r"(\d+)", line)
+                if match:
+                    return int(match.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def get_io_platform_uuid() -> Optional[str]:
+    """Get IOPlatformUUID from ioreg (unique per device)."""
+    try:
+        result = subprocess.run(
+            ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        for line in result.stdout.splitlines():
+            if "IOPlatformUUID" in line:
+                match = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', line)
+                if match:
+                    return match.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def parse_chip_info(chip_string: str) -> tuple[str, str]:
+    """Parse chip name and variant from sysctl brand string.
+
+    Args:
+        chip_string: e.g. "Apple M4 Pro", "Apple M3 Max", "Apple M2"
+
+    Returns:
+        (chip_name, chip_variant) e.g. ("M4", "Pro"), ("M3", "Max"), ("M2", "")
+    """
+    match = re.search(r"M(\d+)\s*(Pro|Max|Ultra)?", chip_string)
+    if not match:
+        return ("M1", "")
+    chip_name = f"M{match.group(1)}"
+    chip_variant = match.group(2) or ""
+    return (chip_name, chip_variant)
+
+
+def compute_owner_hash(
+    uuid: str, chip_name: str, gpu_cores: Optional[int], memory_gb: int
+) -> str:
+    """Compute owner_hash for omlx.ai benchmark submissions.
+
+    Format: SHA-256(uuid + chip_name + gpu_cores + memory_gb) + verify_char
+    The verify_char is ALPHABET[sum(charCodes of hash) % 36].
+
+    Returns:
+        Full owner_hash including verify character.
+    """
+    raw = f"{uuid}{chip_name}{gpu_cores}{memory_gb}"
+    hash_hex = hashlib.sha256(raw.encode()).hexdigest()
+    verify_sum = sum(ord(c) for c in hash_hex)
+    verify_char = _OWNER_HASH_ALPHABET[verify_sum % 36]
+    return hash_hex + verify_char
+
+
+def get_os_version() -> str:
+    """Get macOS version string (e.g. 'macOS 15.2')."""
+    try:
+        mac_ver = platform.mac_ver()[0]
+        if mac_ver:
+            return f"macOS {mac_ver}"
+    except Exception:
+        pass
+    return "macOS"
 
 
 # =============================================================================

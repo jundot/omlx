@@ -11,7 +11,9 @@ from omlx.admin.benchmark import (
     VALID_PROMPT_LENGTHS,
     BenchmarkRequest,
     BenchmarkRun,
+    _clean_model_name,
     _compute_single_metrics,
+    _detect_quantization,
     _generate_prompt,
     cleanup_old_runs,
     create_run,
@@ -287,3 +289,198 @@ class TestSSEEventFormat:
         assert event["type"] == "result"
         assert event["data"]["test_type"] == "single"
         assert event["data"]["pp"] == 1024
+
+
+# =============================================================================
+# Quantization detection tests
+# =============================================================================
+
+
+class TestDetectQuantization:
+    def test_from_config_json(self, tmp_path):
+        config = {"quantization_config": {"quant_method": "awq", "bits": 4}}
+        (tmp_path / "config.json").write_text(
+            __import__("json").dumps(config)
+        )
+        assert _detect_quantization(str(tmp_path)) == "4bit"
+
+    def test_from_config_json_8bit(self, tmp_path):
+        config = {"quantization_config": {"bits": 8}}
+        (tmp_path / "config.json").write_text(
+            __import__("json").dumps(config)
+        )
+        assert _detect_quantization(str(tmp_path)) == "8bit"
+
+    def test_from_dirname_4bit(self, tmp_path):
+        model_dir = tmp_path / "Qwen3-30B-A3B-4bit"
+        model_dir.mkdir()
+        assert _detect_quantization(str(model_dir)) == "4bit"
+
+    def test_from_dirname_fp16(self, tmp_path):
+        model_dir = tmp_path / "Llama-3-8B-fp16"
+        model_dir.mkdir()
+        assert _detect_quantization(str(model_dir)) == "fp16"
+
+    def test_from_dirname_bf16(self, tmp_path):
+        model_dir = tmp_path / "Model-bf16"
+        model_dir.mkdir()
+        assert _detect_quantization(str(model_dir)) == "bf16"
+
+    def test_unknown_fallback(self, tmp_path):
+        model_dir = tmp_path / "SomeModel"
+        model_dir.mkdir()
+        assert _detect_quantization(str(model_dir)) == "unknown"
+
+    def test_config_takes_priority_over_dirname(self, tmp_path):
+        model_dir = tmp_path / "Model-4bit"
+        model_dir.mkdir()
+        config = {"quantization_config": {"bits": 8}}
+        (model_dir / "config.json").write_text(
+            __import__("json").dumps(config)
+        )
+        assert _detect_quantization(str(model_dir)) == "8bit"
+
+
+# =============================================================================
+# Model name cleaning tests
+# =============================================================================
+
+
+class TestCleanModelName:
+    def test_strip_4bit(self):
+        assert _clean_model_name("Qwen3-30B-A3B-4bit", "4bit") == "Qwen3-30B-A3B"
+
+    def test_strip_8bit(self):
+        assert _clean_model_name("Llama-3-8B-8bit", "8bit") == "Llama-3-8B"
+
+    def test_strip_fp16(self):
+        assert _clean_model_name("Model-fp16", "fp16") == "Model"
+
+    def test_strip_mlx_marker(self):
+        assert _clean_model_name("Qwen3-30B-MLX-4bit", "4bit") == "Qwen3-30B"
+
+    def test_no_quant_suffix(self):
+        assert _clean_model_name("Qwen3-30B-A3B", "unknown") == "Qwen3-30B-A3B"
+
+    def test_preserves_model_size(self):
+        assert _clean_model_name("DeepSeek-R1-0528-Qwen3-8B-4bit", "4bit") == "DeepSeek-R1-0528-Qwen3-8B"
+
+
+# =============================================================================
+# Upload integration tests (mocked HTTP)
+# =============================================================================
+
+
+class TestUploadToOmlxAi:
+    @pytest.mark.asyncio
+    async def test_upload_success(self):
+        """Test successful upload sends correct SSE events."""
+        from omlx.admin.benchmark import _upload_to_omlx_ai
+
+        run = BenchmarkRun(
+            bench_id="test-bench",
+            request=BenchmarkRequest(
+                model_id="Qwen3-30B-4bit",
+                prompt_lengths=[1024],
+            ),
+        )
+        run.results = [
+            {
+                "test_type": "single",
+                "pp": 1024,
+                "tg": 128,
+                "processing_tps": 500.0,
+                "gen_tps": 50.0,
+                "ttft_ms": 100.0,
+                "peak_memory_bytes": 8 * 1024**3,
+            },
+        ]
+
+        mock_entry = MagicMock()
+        mock_entry.model_path = "/models/Qwen3-30B-4bit"
+        mock_pool = MagicMock()
+        mock_pool.get_entry.return_value = mock_entry
+
+        mock_response = MagicMock()
+        mock_response.status_code = 201
+        mock_response.json.return_value = {
+            "id": "abc12345",
+            "url": "https://omlx.ai/benchmarks/abc12345",
+        }
+
+        mock_to_thread = AsyncMock(return_value=mock_response)
+
+        with patch("asyncio.to_thread", mock_to_thread):
+            await _upload_to_omlx_ai(run, mock_pool)
+
+        # Collect all events
+        events = []
+        while not run.queue.empty():
+            events.append(run.queue.get_nowait())
+
+        # Should have: progress, upload, upload_done
+        event_types = [e["type"] for e in events]
+        assert "progress" in event_types
+        assert "upload" in event_types
+        assert "upload_done" in event_types
+
+        upload_event = next(e for e in events if e["type"] == "upload")
+        assert upload_event["data"]["context_length"] == 1024
+        assert upload_event["data"]["id"] == "abc12345"
+
+        done_event = next(e for e in events if e["type"] == "upload_done")
+        assert done_event["data"]["success"] == 1
+        assert done_event["data"]["failed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_upload_duplicate(self):
+        """Test 409 duplicate response is handled as success."""
+        from omlx.admin.benchmark import _upload_to_omlx_ai
+
+        run = BenchmarkRun(
+            bench_id="test-bench",
+            request=BenchmarkRequest(
+                model_id="Qwen3-30B-4bit",
+                prompt_lengths=[1024],
+            ),
+        )
+        run.results = [
+            {
+                "test_type": "single",
+                "pp": 1024,
+                "tg": 128,
+                "processing_tps": 500.0,
+                "gen_tps": 50.0,
+                "ttft_ms": 100.0,
+                "peak_memory_bytes": 0,
+            },
+        ]
+
+        mock_entry = MagicMock()
+        mock_entry.model_path = "/models/Qwen3-30B-4bit"
+        mock_pool = MagicMock()
+        mock_pool.get_entry.return_value = mock_entry
+
+        mock_response = MagicMock()
+        mock_response.status_code = 409
+        mock_response.json.return_value = {
+            "error": "Duplicate",
+            "existing_id": "xyz789",
+            "existing_url": "https://omlx.ai/benchmarks/xyz789",
+        }
+
+        mock_to_thread = AsyncMock(return_value=mock_response)
+
+        with patch("asyncio.to_thread", mock_to_thread):
+            await _upload_to_omlx_ai(run, mock_pool)
+
+        events = []
+        while not run.queue.empty():
+            events.append(run.queue.get_nowait())
+
+        upload_event = next(e for e in events if e["type"] == "upload")
+        assert upload_event["data"]["duplicate"] is True
+        assert upload_event["data"]["id"] == "xyz789"
+
+        done_event = next(e for e in events if e["type"] == "upload_done")
+        assert done_event["data"]["success"] == 1

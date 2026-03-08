@@ -22,7 +22,7 @@
   <a href="#features">Features</a> ·
   <a href="#models">Models</a> ·
   <a href="#cli-configuration">CLI Configuration</a> ·
-  <a href="https://github.com/jundot/omlx">GitHub</a>
+  <a href="https://omlx.ai">oMLX.ai</a>
 </p>
 
 ---

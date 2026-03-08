@@ -2370,7 +2370,7 @@ async def stream_benchmark(
                 yield f"data: {json.dumps(event)}\n\n"
 
                 # Stop streaming on terminal events
-                if event.get("type") in ("done", "error"):
+                if event.get("type") in ("upload_done", "error"):
                     break
         except asyncio.CancelledError:
             pass
@@ -2427,4 +2427,38 @@ async def get_benchmark_results(
         "status": run.status,
         "results": run.results,
         "error": run.error_message if run.error_message else None,
+    }
+
+
+@router.get("/api/device-info")
+async def get_device_info(
+    is_admin: bool = Depends(require_admin),
+):
+    """Get device hardware info and owner_hash for omlx.ai integration."""
+    from ..utils.hardware import (
+        compute_owner_hash,
+        get_chip_name,
+        get_gpu_core_count,
+        get_io_platform_uuid,
+        get_total_memory_gb,
+        parse_chip_info,
+    )
+
+    chip_string = get_chip_name()
+    chip_name, chip_variant = parse_chip_info(chip_string)
+    memory_gb = round(get_total_memory_gb())
+    gpu_cores = get_gpu_core_count()
+
+    owner_hash = None
+    io_uuid = get_io_platform_uuid()
+    if io_uuid:
+        full_hash = compute_owner_hash(io_uuid, chip_name, gpu_cores, memory_gb)
+        owner_hash = full_hash[:-1]  # Strip verify character for URL
+
+    return {
+        "chip_name": chip_name,
+        "chip_variant": chip_variant,
+        "memory_gb": memory_gb,
+        "gpu_cores": gpu_cores,
+        "owner_hash": owner_hash,
     }
