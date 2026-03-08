@@ -1969,11 +1969,13 @@ async def get_server_stats(
     snapshot = metrics.get_snapshot(model_id=model, scope=scope)
 
     global_settings = _get_global_settings()
+    host = global_settings.server.host if global_settings else "127.0.0.1"
     port = global_settings.server.port if global_settings else 8000
     api_key = global_settings.auth.api_key if global_settings else ""
 
     return {
         **snapshot,
+        "host": host,
         "port": port,
         "api_key": api_key or "",
         "claude_code_context_scaling_enabled": (

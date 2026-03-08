@@ -113,9 +113,9 @@
                                 <label class="text-sm text-neutral-700 font-medium">{{ t('status.api.openai') }}</label>
                                 <div class="flex items-center gap-2">
                                     <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
-                                          x-text="'http://localhost:' + stats.port + '/v1'"></code>
+                                          x-text="'http://' + displayHost + ':' + stats.port + '/v1'"></code>
                                     <button x-data="{ copied: false }"
-                                            @click="copyToClipboard('http://localhost:' + stats.port + '/v1'); copied = true; setTimeout(() => copied = false, 2000)"
+                                            @click="copyToClipboard('http://' + displayHost + ':' + stats.port + '/v1'); copied = true; setTimeout(() => copied = false, 2000)"
                                             class="p-1.5 rounded-lg transition-all"
                                             :class="copied ? 'text-green-500' : 'text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100'"
                                             :title="window.t('status.api.copy_tooltip')">
@@ -128,9 +128,9 @@
                                 <label class="text-sm text-neutral-700 font-medium">{{ t('status.api.claude') }}</label>
                                 <div class="flex items-center gap-2">
                                     <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
-                                          x-text="'http://localhost:' + stats.port"></code>
+                                          x-text="'http://' + displayHost + ':' + stats.port"></code>
                                     <button x-data="{ copied: false }"
-                                            @click="copyToClipboard('http://localhost:' + stats.port); copied = true; setTimeout(() => copied = false, 2000)"
+                                            @click="copyToClipboard('http://' + displayHost + ':' + stats.port); copied = true; setTimeout(() => copied = false, 2000)"
                                             class="p-1.5 rounded-lg transition-all"
                                             :class="copied ? 'text-green-500' : 'text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100'"
                                             :title="window.t('status.api.copy_tooltip')">

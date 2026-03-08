@@ -91,6 +91,7 @@
                 avg_prefill_tps: 0.0,
                 avg_generation_tps: 0.0,
                 total_requests: 0,
+                host: '127.0.0.1',
                 port: 8000,
                 api_key: '',
                 engines: {},
@@ -652,6 +653,13 @@
             },
 
             // Status tab functions
+            get displayHost() {
+                const host = this.stats.host || '127.0.0.1';
+                if (host === '0.0.0.0') return 'your-ip-address';
+                if (host === 'localhost') return '127.0.0.1';
+                return host;
+            },
+
             get llmModels() {
                 return this.models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type);
             },
@@ -667,7 +675,7 @@
                 const sonnetModel = this.globalSettings.claude_code.sonnet_model || 'select-a-model';
                 const haikuModel = this.globalSettings.claude_code.haiku_model || 'select-a-model';
                 const parts = [];
-                parts.push(`ANTHROPIC_BASE_URL=http://localhost:${port}`);
+                parts.push(`ANTHROPIC_BASE_URL=http://${this.displayHost}:${port}`);
                 if (this.stats.api_key) {
                     parts.push(`ANTHROPIC_AUTH_TOKEN=${this.stats.api_key}`);
                 }
