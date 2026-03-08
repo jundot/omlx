@@ -371,7 +371,7 @@ OMLX_AI_API_URL = "https://omlx.ai/api/benchmarks"
 
 # Quantization patterns to strip from model directory names
 _QUANT_SUFFIXES = re.compile(
-    r"[-_](2bit|3bit|4bit|6bit|8bit|fp16|bf16|fp32)$", re.IGNORECASE
+    r"[-_](2bit|3bit|4bit|6bit|8bit|fp16|bf16|fp32|MXFP4|NVFP4)$", re.IGNORECASE
 )
 _MLX_SUFFIXES = re.compile(r"[-_]?MLX[-_]?", re.IGNORECASE)
 
@@ -396,7 +396,7 @@ def _detect_quantization(model_path: str) -> str:
     # Fallback: extract from directory name
     dirname = Path(model_path).name
     match = re.search(
-        r"(2bit|3bit|4bit|6bit|8bit|fp16|bf16)", dirname, re.IGNORECASE
+        r"(2bit|3bit|4bit|6bit|8bit|fp16|bf16|MXFP4|NVFP4)", dirname, re.IGNORECASE
     )
     if match:
         return match.group(1).lower()

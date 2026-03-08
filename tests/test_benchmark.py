@@ -326,6 +326,16 @@ class TestDetectQuantization:
         model_dir.mkdir()
         assert _detect_quantization(str(model_dir)) == "bf16"
 
+    def test_from_dirname_mxfp4(self, tmp_path):
+        model_dir = tmp_path / "gpt-oss-120b-MXFP4"
+        model_dir.mkdir()
+        assert _detect_quantization(str(model_dir)) == "mxfp4"
+
+    def test_from_dirname_nvfp4(self, tmp_path):
+        model_dir = tmp_path / "Model-NVFP4"
+        model_dir.mkdir()
+        assert _detect_quantization(str(model_dir)) == "nvfp4"
+
     def test_unknown_fallback(self, tmp_path):
         model_dir = tmp_path / "SomeModel"
         model_dir.mkdir()
@@ -358,6 +368,12 @@ class TestCleanModelName:
 
     def test_strip_mlx_marker(self):
         assert _clean_model_name("Qwen3-30B-MLX-4bit", "4bit") == "Qwen3-30B"
+
+    def test_strip_mxfp4(self):
+        assert _clean_model_name("gpt-oss-120b-MXFP4", "mxfp4") == "gpt-oss-120b"
+
+    def test_strip_nvfp4(self):
+        assert _clean_model_name("Model-NVFP4", "nvfp4") == "Model"
 
     def test_no_quant_suffix(self):
         assert _clean_model_name("Qwen3-30B-A3B", "unknown") == "Qwen3-30B-A3B"
