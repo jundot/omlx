@@ -290,6 +290,65 @@ def parse_tool_calls(
     return cleaned_text, None
 
 
+class ToolCallStreamFilter:
+    """Streaming filter that suppresses tool-call markup from content deltas.
+
+    Buffers a small window of tokens to detect the tool-call start marker
+    from the model's tokenizer.  Content before the marker is emitted
+    normally; once the marker is found, all subsequent content is suppressed
+    (tool calls are parsed from accumulated text after generation).
+
+    Args:
+        tokenizer: The model's tokenizer — uses ``tool_call_start`` to
+            determine what to look for.
+    """
+
+    def __init__(self, tokenizer: Any):
+        self._marker: str = getattr(tokenizer, "tool_call_start", "")
+        self._max_len = len(self._marker) if self._marker else 0
+        self._buffer = ""
+        self._suppressing = False
+
+    @property
+    def active(self) -> bool:
+        """Whether this filter has a marker to look for."""
+        return self._max_len > 0
+
+    def feed(self, text: str) -> str:
+        """Feed a content delta, return the portion safe to emit."""
+        if self._suppressing or not text:
+            return ""
+        if not self.active:
+            return text
+
+        self._buffer += text
+
+        idx = self._buffer.find(self._marker)
+        if idx >= 0:
+            self._suppressing = True
+            safe = self._buffer[:idx]
+            self._buffer = ""
+            return safe
+
+        # Emit content that can't possibly be a partial marker start.
+        # Keep the last (marker_len - 1) chars buffered.
+        safe_len = len(self._buffer) - self._max_len + 1
+        if safe_len > 0:
+            safe = self._buffer[:safe_len]
+            self._buffer = self._buffer[safe_len:]
+            return safe
+
+        return ""
+
+    def finish(self) -> str:
+        """Flush remaining buffer (only if we never found a marker)."""
+        if self._suppressing:
+            return ""
+        buf = self._buffer
+        self._buffer = ""
+        return buf
+
+
 def convert_tools_for_template(
     tools: Optional[List]
 ) -> Optional[List[dict]]:
