@@ -1766,11 +1766,19 @@ async def stream_chat_completion(
     )
     yield f"data: {first_chunk.model_dump_json(exclude_none=True)}\n\n"
 
-    # Stream content token-by-token.  When tools are present, a
-    # ToolCallStreamFilter suppresses tool-call markup so clients
-    # don't see raw XML/tags — tool calls are parsed from accumulated
-    # text after generation and emitted as structured chunks.
-    tool_filter = ToolCallStreamFilter(engine.tokenizer) if has_tools else None
+    # Stream content token-by-token.  When tools are present and the
+    # tokenizer has a known tool-call start marker, a ToolCallStreamFilter
+    # suppresses tool-call markup so clients don't see raw XML/tags.
+    # When no marker is available (fallback parser models), buffer all
+    # content and emit it after generation to ensure markup is cleaned.
+    tool_filter = None
+    stream_content = True
+    if has_tools:
+        _f = ToolCallStreamFilter(engine.tokenizer)
+        if _f.active:
+            tool_filter = _f
+        else:
+            stream_content = False
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
             if first_token_time is None and output.new_text:
@@ -1779,7 +1787,7 @@ async def stream_chat_completion(
             if output.new_text:
                 accumulated_text += output.new_text
 
-            if output.new_text:
+            if stream_content and output.new_text:
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
 
                 # Emit reasoning_content delta
@@ -1823,45 +1831,45 @@ async def stream_chat_completion(
         yield "data: [DONE]\n\n"
         return
 
-    # Flush remaining buffered content from thinking parser
-    thinking_delta, content_delta = thinking_parser.finish()
-    if thinking_delta:
-        chunk = ChatCompletionChunk(
-            id=response_id,
-            model=request.model,
-            choices=[ChatCompletionChunkChoice(
-                delta=ChatCompletionChunkDelta(reasoning_content=thinking_delta),
-                finish_reason=None,
-            )],
-        )
-        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
-    if content_delta:
-        if tool_filter:
-            content_delta = tool_filter.feed(content_delta)
+    # Flush remaining buffered content from thinking/tool-call parsers
+    if stream_content:
+        thinking_delta, content_delta = thinking_parser.finish()
+        if thinking_delta:
+            chunk = ChatCompletionChunk(
+                id=response_id,
+                model=request.model,
+                choices=[ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(reasoning_content=thinking_delta),
+                    finish_reason=None,
+                )],
+            )
+            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
         if content_delta:
-            chunk = ChatCompletionChunk(
-                id=response_id,
-                model=request.model,
-                choices=[ChatCompletionChunkChoice(
-                    delta=ChatCompletionChunkDelta(content=content_delta),
-                    finish_reason=None,
-                )],
-            )
-            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+            if tool_filter:
+                content_delta = tool_filter.feed(content_delta)
+            if content_delta:
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(content=content_delta),
+                        finish_reason=None,
+                    )],
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
-    # Flush any remaining buffered content from the tool-call filter
-    if tool_filter:
-        remaining = tool_filter.finish()
-        if remaining:
-            chunk = ChatCompletionChunk(
-                id=response_id,
-                model=request.model,
-                choices=[ChatCompletionChunkChoice(
-                    delta=ChatCompletionChunkDelta(content=remaining),
-                    finish_reason=None,
-                )],
-            )
-            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+        if tool_filter:
+            remaining = tool_filter.finish()
+            if remaining:
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(content=remaining),
+                        finish_reason=None,
+                    )],
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Parse tool calls from accumulated text
     tool_calls = None
@@ -1889,6 +1897,29 @@ async def stream_chat_completion(
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
         )
+
+        # Buffered mode: emit thinking and cleaned content now
+        if not stream_content:
+            if thinking_content:
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(reasoning_content=thinking_content),
+                        finish_reason=None,
+                    )],
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+            if cleaned_text:
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(content=cleaned_text),
+                        finish_reason=None,
+                    )],
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Emit tool call chunks if found
     if tool_calls:
@@ -2011,6 +2042,15 @@ async def stream_anthropic_messages(
     block_index = 0
     last_output = None  # Track last output for tool_calls and token counts
 
+    # Filter tool-call markup from streamed content when tools are present
+    # and the tokenizer has a known start marker.
+    has_tools = bool(kwargs.get("tools"))
+    tool_filter = None
+    if has_tools:
+        _f = ToolCallStreamFilter(engine.tokenizer)
+        if _f.active:
+            tool_filter = _f
+
     # Calculate input tokens before streaming starts
     # This is needed for message_start event
     estimated_input_tokens = 0
@@ -2059,18 +2099,22 @@ async def stream_anthropic_messages(
                         index=block_index, thinking=thinking_delta
                     )
 
-                # Emit regular content as text block
+                # Emit regular content as text block — filter tool-call
+                # markup when a known start marker is available.
                 if content_delta:
-                    # Close thinking block if transitioning to text
-                    if thinking_block_started and not text_block_started:
-                        yield create_content_block_stop_event(index=block_index)
-                        block_index += 1
-                    if not text_block_started:
-                        yield create_content_block_start_event(
-                            index=block_index, block_type="text"
-                        )
-                        text_block_started = True
-                    yield create_text_delta_event(index=block_index, text=content_delta)
+                    if tool_filter:
+                        content_delta = tool_filter.feed(content_delta)
+                    if content_delta:
+                        # Close thinking block if transitioning to text
+                        if thinking_block_started and not text_block_started:
+                            yield create_content_block_stop_event(index=block_index)
+                            block_index += 1
+                        if not text_block_started:
+                            yield create_content_block_start_event(
+                                index=block_index, block_type="text"
+                            )
+                            text_block_started = True
+                        yield create_text_delta_event(index=block_index, text=content_delta)
 
             if output.finished:
                 break
@@ -2090,15 +2134,32 @@ async def stream_anthropic_messages(
             thinking_block_started = True
         yield create_thinking_delta_event(index=block_index, thinking=thinking_delta)
     if content_delta:
-        if thinking_block_started and not text_block_started:
-            yield create_content_block_stop_event(index=block_index)
-            block_index += 1
-        if not text_block_started:
-            yield create_content_block_start_event(
-                index=block_index, block_type="text"
-            )
-            text_block_started = True
-        yield create_text_delta_event(index=block_index, text=content_delta)
+        if tool_filter:
+            content_delta = tool_filter.feed(content_delta)
+        if content_delta:
+            if thinking_block_started and not text_block_started:
+                yield create_content_block_stop_event(index=block_index)
+                block_index += 1
+            if not text_block_started:
+                yield create_content_block_start_event(
+                    index=block_index, block_type="text"
+                )
+                text_block_started = True
+            yield create_text_delta_event(index=block_index, text=content_delta)
+
+    # Flush any remaining buffered content from the tool-call filter
+    if tool_filter:
+        remaining = tool_filter.finish()
+        if remaining:
+            if not text_block_started:
+                if thinking_block_started:
+                    yield create_content_block_stop_event(index=block_index)
+                    block_index += 1
+                yield create_content_block_start_event(
+                    index=block_index, block_type="text"
+                )
+                text_block_started = True
+            yield create_text_delta_event(index=block_index, text=remaining)
 
     # 4. Close open blocks
     if thinking_block_started and not text_block_started:

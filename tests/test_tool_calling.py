@@ -8,7 +8,10 @@ Tests JSON schema validation, JSON extraction, and tool conversion functions.
 import json
 import pytest
 
+from unittest.mock import MagicMock
+
 from omlx.api.tool_calling import (
+    ToolCallStreamFilter,
     build_json_system_prompt,
     convert_tools_for_template,
     extract_json_from_text,
@@ -599,3 +602,91 @@ class TestFormatToolCallForMessage:
         result = format_tool_call_for_message(tool_call)
 
         assert result["function"]["arguments"] == "{}"
+
+
+def _make_tokenizer(tool_call_start=""):
+    """Create a mock tokenizer with optional tool_call_start."""
+    tok = MagicMock(spec=[])
+    if tool_call_start:
+        tok.tool_call_start = tool_call_start
+    return tok
+
+
+class TestToolCallStreamFilter:
+    """Tests for ToolCallStreamFilter."""
+
+    def test_no_marker_passthrough(self):
+        """No tool_call_start attribute -> all text passes through."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        assert not f.active
+        assert f.feed("hello world") == "hello world"
+        assert f.finish() == ""
+
+    def test_active_property(self):
+        """Filter is active when marker is non-empty."""
+        f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
+        assert f.active
+
+    def test_text_without_marker(self):
+        """Marker exists but text has none -> all text passes through."""
+        f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
+        result = f.feed("Hello world!")
+        result += f.finish()
+        assert result == "Hello world!"
+
+    def test_marker_in_middle(self):
+        """Text before marker passes, text after is suppressed."""
+        f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
+        result = f.feed('Answer<tool_call>{"name":"func"}')
+        assert result == "Answer"
+        assert f.feed("more text") == ""
+        assert f.finish() == ""
+
+    def test_marker_split_across_feeds(self):
+        """Marker split across two feed() calls."""
+        f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
+        r1 = f.feed("Hello <tool_")
+        r2 = f.feed("call>JSON data")
+        assert r1 + r2 == "Hello "
+
+    def test_false_partial_match(self):
+        """Text that starts like marker but doesn't match."""
+        f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
+        result = f.feed("Use <tool_tip> for help")
+        result += f.finish()
+        assert result == "Use <tool_tip> for help"
+
+    def test_marker_at_start(self):
+        """Marker at the very start of text."""
+        f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
+        assert f.feed('<tool_call>{"name":"x"}') == ""
+        assert f.finish() == ""
+
+    def test_empty_feed(self):
+        """Empty string input."""
+        f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
+        assert f.feed("") == ""
+
+    def test_multiple_small_feeds(self):
+        """Character-by-character feeding."""
+        f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
+        text = "Hi<tool_call>data"
+        result = ""
+        for ch in text:
+            result += f.feed(ch)
+        result += f.finish()
+        assert result == "Hi"
+
+    def test_finish_flushes_buffer_no_marker(self):
+        """finish() emits buffered chars when no marker found."""
+        f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
+        # Feed text shorter than marker - all buffered
+        r1 = f.feed("<tool")
+        r2 = f.finish()
+        assert r1 + r2 == "<tool"
+
+    def test_suppressing_blocks_finish(self):
+        """Once suppressing, finish() returns nothing."""
+        f = ToolCallStreamFilter(_make_tokenizer("<tc>"))
+        f.feed("text<tc>rest")
+        assert f.finish() == ""
