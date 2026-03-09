@@ -406,6 +406,13 @@
     "bench.metrics.e2e.description": "Total time from request submission to complete response. Includes prefill + generation.",
     "bench.metrics.throughput.name": "Total Throughput",
     "bench.metrics.throughput.description": "Overall tokens (input + output) per second. Measures total system utilization.",
+    "bench.metrics.batch_size.name": "Batch Size",
+    "bench.metrics.batch_size.description": "Number of concurrent requests processed together. Higher batch sizes improve total throughput but increase per-request latency.",
+    "bench.metrics.speedup.name": "Speedup",
+    "bench.metrics.speedup.description": "Token generation throughput multiplier compared to single-request baseline (1x). Higher is better.",
+    "bench.metrics.pp_tps_req.name": "pp TPS/req",
+    "bench.metrics.pp_tps_req.full_name": "(Per-Request Prompt Processing TPS)",
+    "bench.metrics.pp_tps_req.description": "Prompt processing throughput divided by batch size. Shows per-request prefill speed under batching load.",
 
     "chat.title": "Chat - oMLX Admin",
     "chat.brand": "oMLX Chat",

@@ -406,6 +406,13 @@
   "bench.metrics.e2e.description": "요청 제출부터 응답 완료까지의 총 시간. 프리필 + 생성을 포함합니다.",
   "bench.metrics.throughput.name": "총 처리량",
   "bench.metrics.throughput.description": "초당 전체 토큰 수 (입력 + 출력). 시스템 전체 활용도를 측정합니다.",
+  "bench.metrics.batch_size.name": "배치 크기",
+  "bench.metrics.batch_size.description": "동시에 처리되는 요청 수. 배치 크기가 클수록 총 처리량은 향상되지만 요청당 지연 시간이 증가합니다.",
+  "bench.metrics.speedup.name": "속도 향상",
+  "bench.metrics.speedup.description": "단일 요청 기준(1x) 대비 토큰 생성 처리량 배수. 높을수록 좋습니다.",
+  "bench.metrics.pp_tps_req.name": "pp TPS/req",
+  "bench.metrics.pp_tps_req.full_name": "(요청당 프롬프트 처리 TPS)",
+  "bench.metrics.pp_tps_req.description": "프롬프트 처리 처리량을 배치 크기로 나눈 값. 배칭 부하에서의 요청당 프리필 속도를 나타냅니다.",
 
   "chat.title": "채팅 - oMLX 관리자",
   "chat.brand": "oMLX 채팅",

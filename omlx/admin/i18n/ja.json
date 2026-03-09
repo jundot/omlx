@@ -406,6 +406,13 @@
   "bench.metrics.e2e.description": "リクエスト送信から応答完了までの合計時間。プリフィル＋生成を含みます。",
   "bench.metrics.throughput.name": "合計スループット",
   "bench.metrics.throughput.description": "毎秒の全トークン数（入力＋出力）。システム全体の使用率を測定します。",
+  "bench.metrics.batch_size.name": "バッチサイズ",
+  "bench.metrics.batch_size.description": "同時に処理されるリクエスト数。バッチサイズが大きいほど合計スループットは向上しますが、リクエストあたりのレイテンシが増加します。",
+  "bench.metrics.speedup.name": "スピードアップ",
+  "bench.metrics.speedup.description": "単一リクエストベースライン（1x）と比較したトークン生成スループットの倍率。高いほど良い。",
+  "bench.metrics.pp_tps_req.name": "pp TPS/req",
+  "bench.metrics.pp_tps_req.full_name": "（リクエストあたりのプロンプト処理TPS）",
+  "bench.metrics.pp_tps_req.description": "プロンプト処理スループットをバッチサイズで割った値。バッチング負荷下でのリクエストあたりのプリフィル速度を示します。",
 
   "chat.title": "チャット - oMLX 管理画面",
   "chat.brand": "oMLXチャット",
