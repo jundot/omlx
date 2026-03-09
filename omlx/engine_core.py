@@ -222,8 +222,12 @@ class EngineCore:
             except Exception as e:
                 import traceback
                 logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
-                # Propagate error to all running requests so they don't hang
-                for rid in list(self.scheduler.running.keys()):
+                # Fail all requests and remove from scheduler to prevent
+                # infinite loop (has_requests() must return False).
+                failed_ids = await loop.run_in_executor(
+                    self._mlx_executor, self.scheduler.fail_all_requests
+                )
+                for rid in failed_ids:
                     collector = self._output_collectors.get(rid)
                     if collector is not None:
                         collector.put(
