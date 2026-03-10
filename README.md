@@ -74,7 +74,7 @@ pip install -e .          # Core only
 pip install -e ".[mcp]"   # With MCP (Model Context Protocol) support
 ```
 
-Requires Python 3.10+ and Apple Silicon (M1/M2/M3/M4).
+Requires macOS 15.0+ (Sequoia), Python 3.10+, and Apple Silicon (M1/M2/M3/M4).
 
 ## Quickstart
 
