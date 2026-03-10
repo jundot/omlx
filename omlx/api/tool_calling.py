@@ -295,7 +295,8 @@ class ToolCallStreamFilter:
 
     Detects known tool-call start envelopes during streaming and suppresses
     control markup from assistant-visible content. Supports tokenizer-defined
-    delimiters plus fallback text formats handled by ``parse_tool_calls``.
+    delimiters, namespaced XML envelopes, and high-confidence bracket-format
+    envelopes handled by ``parse_tool_calls``.
 
     Once a tool-call start envelope is detected, the remainder of the stream
     is suppressed from content deltas (structured tool calls are emitted at
@@ -312,6 +313,11 @@ class ToolCallStreamFilter:
         if marker:
             self._start_markers.insert(0, marker)
         self._namespaced_open_re = re.compile(r"<[A-Za-z_][\w.-]*:tool_call>")
+        self._bracket_prefix = "[Calling tool:"
+        self._bracket_call_re = re.compile(
+            r'^\[Calling tool:\s*(\w+)\(({.*?})\)\]',
+            re.DOTALL,
+        )
         self._buffer = ""
         self._suppressing = False
 
@@ -395,6 +401,26 @@ class ToolCallStreamFilter:
             safe = self._buffer[:idx]
             self._buffer = ""
             return safe
+
+        # Bracket envelopes are only suppressed when we see a complete
+        # parseable tool-call shape. Otherwise keep as literal text.
+        bracket_idx = self._buffer.find(self._bracket_prefix)
+        if bracket_idx >= 0:
+            bracket_candidate = self._buffer[bracket_idx:]
+            if self._bracket_call_re.match(bracket_candidate):
+                self._suppressing = True
+                safe = self._buffer[:bracket_idx]
+                self._buffer = ""
+                return safe
+
+            # Preserve non-bracket content before a potential bracket envelope
+            # and keep bracket candidate buffered until it can be classified.
+            if bracket_idx > 0:
+                safe = self._buffer[:bracket_idx]
+                self._buffer = self._buffer[bracket_idx:]
+                return safe
+
+            return ""
 
         # Emit content that cannot be part of an opening envelope.
         keep = self._partial_suffix_len(self._buffer)

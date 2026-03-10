@@ -699,6 +699,15 @@ class TestToolCallStreamFilter:
         result += f.finish()
         assert result == "Heads up: [Calling tool: maybe later]"
 
+    def test_bracket_tool_call_suppresses_when_complete(self):
+        """A complete parseable bracket envelope should be suppressed."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Lead in [Calling tool:")
+        r2 = f.feed(' get_weather({"city":"SF"})]')
+        assert r1 == "Lead in "
+        assert r2 == ""
+        assert f.finish() == ""
+
     def test_partial_non_tool_namespaced_literal_is_preserved(self):
         """Namespaced-looking suffixes that are not :tool_call remain visible."""
         f = ToolCallStreamFilter(_make_tokenizer())

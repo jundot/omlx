@@ -1356,6 +1356,101 @@ class TestStreamingHelperFunctions:
         assert "stop" in finish_reasons
 
     @pytest.mark.asyncio
+    async def test_stream_chat_completion_with_bracket_tool_call_parses_without_leak(self):
+        """Valid bracket tool-call envelopes should not leak into streamed content."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Let me check. [Calling tool:",
+                new_text="Let me check. [Calling tool:",
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+                tool_calls=None,
+            ),
+            MockGenerationOutput(
+                text=(
+                    "Let me check. "
+                    "[Calling tool: get_weather({\"city\":\"SF\"})]"
+                ),
+                new_text=' get_weather({"city":"SF"})]',
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+
+        content_deltas = []
+        tool_call_deltas = []
+        finish_reasons = []
+        for payload in payloads:
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            content = delta.get("content")
+            if content:
+                content_deltas.append(content)
+            if delta.get("tool_calls"):
+                tool_call_deltas.extend(delta["tool_calls"])
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                finish_reasons.append(finish_reason)
+
+        streamed_content = "".join(content_deltas)
+        assert "[Calling tool:" not in streamed_content
+        assert streamed_content == "Let me check. "
+        assert len(tool_call_deltas) == 1
+        assert tool_call_deltas[0]["function"]["name"] == "get_weather"
+        assert json.loads(tool_call_deltas[0]["function"]["arguments"]) == {"city": "SF"}
+        assert "tool_calls" in finish_reasons
+
+    @pytest.mark.asyncio
     async def test_stream_chat_completion_with_hyphen_namespaced_tool_call_parses_without_leak(self):
         """Hyphenated namespaced tool_call tags should parse into structured tool_calls."""
         from omlx.server import stream_chat_completion
@@ -1619,6 +1714,96 @@ class TestStreamingHelperFunctions:
         assert streamed_content == "Heads up: [Calling tool: maybe later]"
         assert tool_use_starts == []
         assert "end_turn" in stop_reasons
+
+    @pytest.mark.asyncio
+    async def test_stream_anthropic_messages_with_bracket_tool_call_parses_without_leak(self):
+        """Anthropic streaming should suppress valid bracket tool envelopes and emit tool_use blocks."""
+        from omlx.server import stream_anthropic_messages
+        from omlx.api.anthropic_models import MessagesRequest, AnthropicMessage
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Let me check. [Calling tool:",
+                new_text="Let me check. [Calling tool:",
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+                tool_calls=None,
+            ),
+            MockGenerationOutput(
+                text=(
+                    "Let me check. "
+                    "[Calling tool: get_weather({\"city\":\"SF\"})]"
+                ),
+                new_text=' get_weather({"city":"SF"})]',
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = MessagesRequest(
+            model="test-model",
+            max_tokens=256,
+            messages=[AnthropicMessage(role="user", content="Hi")],
+            stream=True,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_anthropic_messages(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        parsed_events = parse_sse_events("".join(events))
+        text_deltas = [
+            event.get("delta", {}).get("text")
+            for event in parsed_events
+            if event.get("type") == "content_block_delta"
+            and event.get("delta", {}).get("type") == "text_delta"
+        ]
+        text_deltas = [text for text in text_deltas if text]
+        tool_use_starts = [
+            event for event in parsed_events
+            if event.get("type") == "content_block_start"
+            and event.get("content_block", {}).get("type") == "tool_use"
+        ]
+        stop_reasons = [
+            event.get("delta", {}).get("stop_reason")
+            for event in parsed_events
+            if event.get("type") == "message_delta"
+        ]
+        stop_reasons = [reason for reason in stop_reasons if reason]
+
+        streamed_content = "".join(text_deltas)
+        assert "[Calling tool:" not in streamed_content
+        assert streamed_content == "Let me check. "
+        assert len(tool_use_starts) == 1
+        assert tool_use_starts[0]["content_block"]["name"] == "get_weather"
+        assert "tool_use" in stop_reasons
 
 
 class TestStreamingEdgeCases:
