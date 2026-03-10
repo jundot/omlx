@@ -293,26 +293,83 @@ def parse_tool_calls(
 class ToolCallStreamFilter:
     """Streaming filter that suppresses tool-call markup from content deltas.
 
-    Buffers a small window of tokens to detect the tool-call start marker
-    from the model's tokenizer.  Content before the marker is emitted
-    normally; once the marker is found, all subsequent content is suppressed
-    (tool calls are parsed from accumulated text after generation).
+    Detects known tool-call start envelopes during streaming and suppresses
+    control markup from assistant-visible content. Supports tokenizer-defined
+    delimiters plus fallback text formats handled by ``parse_tool_calls``.
+
+    Once a tool-call start envelope is detected, the remainder of the stream
+    is suppressed from content deltas (structured tool calls are emitted at
+    completion after parsing accumulated text).
 
     Args:
-        tokenizer: The model's tokenizer — uses ``tool_call_start`` to
-            determine what to look for.
+        tokenizer: The model's tokenizer. Uses tokenizer-defined
+            ``tool_call_start`` when available.
     """
 
     def __init__(self, tokenizer: Any):
-        self._marker: str = getattr(tokenizer, "tool_call_start", "")
-        self._max_len = len(self._marker) if self._marker else 0
+        marker = getattr(tokenizer, "tool_call_start", "") or ""
+        self._start_markers: List[str] = ["<tool_call>", "[Calling tool:"]
+        if marker:
+            self._start_markers.insert(0, marker)
+        self._max_marker_len = max((len(m) for m in self._start_markers), default=0)
+        self._namespaced_open_re = re.compile(r"<[A-Za-z_][\w.-]*:tool_call>")
         self._buffer = ""
         self._suppressing = False
 
     @property
     def active(self) -> bool:
-        """Whether this filter has a marker to look for."""
-        return self._max_len > 0
+        """Whether this filter should run for tool-enabled streams."""
+        return True
+
+    def _find_start_index(self, text: str) -> int:
+        """Return index of earliest detected tool-call opening envelope."""
+        indexes: List[int] = []
+
+        for marker in self._start_markers:
+            idx = text.find(marker)
+            if idx >= 0:
+                indexes.append(idx)
+
+        namespaced_match = self._namespaced_open_re.search(text)
+        if namespaced_match:
+            indexes.append(namespaced_match.start())
+
+        return min(indexes) if indexes else -1
+
+    @staticmethod
+    def _partial_prefix_len(text: str, marker: str) -> int:
+        """Longest suffix of text that is a proper prefix of marker."""
+        max_len = min(len(text), len(marker) - 1)
+        for n in range(max_len, 0, -1):
+            if text.endswith(marker[:n]):
+                return n
+        return 0
+
+    @staticmethod
+    def _could_be_partial_namespaced_open(candidate: str) -> bool:
+        """Return True if candidate could prefix a namespaced <ns:tool_call> tag."""
+        if not candidate.startswith("<"):
+            return False
+        if ">" in candidate:
+            return False
+        if candidate == "<":
+            return True
+        return re.match(r"^<[A-Za-z_][\w.-]*(?::[\w.-]*)?$", candidate) is not None
+
+    def _partial_suffix_len(self, text: str) -> int:
+        """Length of trailing suffix that might be an opening-marker prefix."""
+        keep = 0
+        for marker in self._start_markers:
+            keep = max(keep, self._partial_prefix_len(text, marker))
+
+        last_lt = text.rfind("<")
+        if last_lt >= 0:
+            candidate = text[last_lt:]
+            if self._could_be_partial_namespaced_open(candidate):
+                keep = max(keep, len(candidate))
+
+        # Cap retained suffix window to avoid unbounded buffering on malformed text.
+        return min(keep, 128)
 
     def feed(self, text: str) -> str:
         """Feed a content delta, return the portion safe to emit."""
@@ -322,28 +379,42 @@ class ToolCallStreamFilter:
             return text
 
         self._buffer += text
-
-        idx = self._buffer.find(self._marker)
+        idx = self._find_start_index(self._buffer)
         if idx >= 0:
             self._suppressing = True
             safe = self._buffer[:idx]
             self._buffer = ""
             return safe
 
-        # Emit content that can't possibly be a partial marker start.
-        # Keep the last (marker_len - 1) chars buffered.
-        safe_len = len(self._buffer) - self._max_len + 1
-        if safe_len > 0:
-            safe = self._buffer[:safe_len]
-            self._buffer = self._buffer[safe_len:]
+        # Emit content that cannot be part of an opening envelope.
+        keep = self._partial_suffix_len(self._buffer)
+        if keep == 0:
+            safe = self._buffer
+            self._buffer = ""
+            return safe
+
+        if len(self._buffer) > keep:
+            safe = self._buffer[:-keep]
+            self._buffer = self._buffer[-keep:]
             return safe
 
         return ""
 
     def finish(self) -> str:
-        """Flush remaining buffer (only if we never found a marker)."""
+        """Flush remaining safe buffer content.
+
+        In clean-output strict mode, unresolved marker-like suffixes are dropped
+        so partial control markup does not leak into user-visible text.
+        """
         if self._suppressing:
+            self._buffer = ""
             return ""
+
+        keep = self._partial_suffix_len(self._buffer)
+        if keep == len(self._buffer):
+            self._buffer = ""
+            return ""
+
         buf = self._buffer
         self._buffer = ""
         return buf

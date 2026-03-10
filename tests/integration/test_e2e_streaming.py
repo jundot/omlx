@@ -548,6 +548,724 @@ class TestStreamingHelperFunctions:
         data = json.loads(json_str)
         assert data["choices"][0]["delta"].get("role") == "assistant"
 
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_with_tools_streams_content_incrementally(self):
+        """Tool availability must not force full buffering of normal text deltas."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Hello",
+                new_text="Hello",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="Hello world",
+                new_text=" world",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+        content_deltas = [
+            payload["choices"][0].get("delta", {}).get("content")
+            for payload in payloads
+            if payload.get("choices")
+        ]
+        content_deltas = [delta for delta in content_deltas if delta]
+
+        # With two streamed model outputs, we expect two incremental content chunks,
+        # not one buffered chunk emitted only at completion.
+        assert content_deltas == ["Hello", " world"]
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_with_tools_and_tool_calls_keeps_prior_content(self):
+        """A tool_call finish should end the turn, not suppress already-generated text."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Let me check that for you.",
+                new_text="Let me check that for you.",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="Let me check that for you.",
+                new_text="",
+                completion_tokens=1,
+                finished=True,
+                finish_reason="tool_calls",
+                tool_calls=[{
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"SF\"}",
+                }],
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+        content_deltas = []
+        saw_tool_call_delta = False
+        finish_reasons = []
+
+        for payload in payloads:
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            content = delta.get("content")
+            if content:
+                content_deltas.append(content)
+            if delta.get("tool_calls"):
+                saw_tool_call_delta = True
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                finish_reasons.append(finish_reason)
+
+        assert content_deltas == ["Let me check that for you."]
+        assert saw_tool_call_delta is True
+        assert "tool_calls" in finish_reasons
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_with_tools_parsed_from_text_does_not_leak_markup(self):
+        """Parsed-from-text tool calls must not appear in streamed content deltas."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        # Non-Harmony path: no output.tool_calls; tool calls parsed from inline text.
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Let me check",
+                new_text="Let me check",
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+                tool_calls=None,
+            ),
+            MockGenerationOutput(
+                text=(
+                    "Let me check that for you."
+                    "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}</tool_call>"
+                ),
+                new_text=(
+                    " that for you."
+                    "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}</tool_call>"
+                ),
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+
+        content_deltas = []
+        tool_call_deltas = []
+        finish_reasons = []
+        content_event_indexes = []
+        tool_call_event_indexes = []
+        for idx, payload in enumerate(payloads):
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            content = delta.get("content")
+            if content:
+                content_deltas.append(content)
+                content_event_indexes.append(idx)
+            if delta.get("tool_calls"):
+                tool_call_deltas.extend(delta["tool_calls"])
+                tool_call_event_indexes.append(idx)
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                finish_reasons.append(finish_reason)
+
+        streamed_content = "".join(content_deltas)
+        assert "<tool_call>" not in streamed_content
+        assert "</tool_call>" not in streamed_content
+        assert content_deltas == ["Let me check", " that for you."]
+        assert streamed_content == "Let me check that for you."
+        assert streamed_content.count("Let me check that for you.") == 1
+        assert len(tool_call_deltas) == 1
+        assert tool_call_deltas[0]["function"]["name"] == "get_weather"
+        assert json.loads(tool_call_deltas[0]["function"]["arguments"]) == {"city": "SF"}
+        assert content_event_indexes
+        assert tool_call_event_indexes
+        assert max(content_event_indexes) < min(tool_call_event_indexes)
+        assert "tool_calls" in finish_reasons
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_with_tools_parsed_from_split_text_does_not_leak_partial_markup(self):
+        """Split <tool_call> markup across chunks must not leak raw fragments in content deltas."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        # Non-Harmony path with fragmented tool-call markup across chunks.
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Let me check that for you.<tool_",
+                new_text="Let me check that for you.<tool_",
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+                tool_calls=None,
+            ),
+            MockGenerationOutput(
+                text=(
+                    "Let me check that for you."
+                    "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}</to"
+                ),
+                new_text=(
+                    "call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}</to"
+                ),
+                completion_tokens=2,
+                finished=False,
+                finish_reason=None,
+                tool_calls=None,
+            ),
+            MockGenerationOutput(
+                text=(
+                    "Let me check that for you."
+                    "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}</tool_call>"
+                ),
+                new_text="ol_call>",
+                completion_tokens=3,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+
+        content_deltas = []
+        tool_call_deltas = []
+        finish_reasons = []
+        content_event_indexes = []
+        tool_call_event_indexes = []
+        for idx, payload in enumerate(payloads):
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            content = delta.get("content")
+            if content:
+                content_deltas.append(content)
+                content_event_indexes.append(idx)
+            if delta.get("tool_calls"):
+                tool_call_deltas.extend(delta["tool_calls"])
+                tool_call_event_indexes.append(idx)
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                finish_reasons.append(finish_reason)
+
+        streamed_content = "".join(content_deltas)
+        assert "<tool_" not in streamed_content
+        assert "</to" not in streamed_content
+        assert "<tool_call>" not in streamed_content
+        assert "</tool_call>" not in streamed_content
+        assert content_deltas == ["Let me check that for you."]
+        assert streamed_content == "Let me check that for you."
+        assert len(tool_call_deltas) == 1
+        assert tool_call_deltas[0]["function"]["name"] == "get_weather"
+        assert json.loads(tool_call_deltas[0]["function"]["arguments"]) == {"city": "SF"}
+        assert content_event_indexes
+        assert tool_call_event_indexes
+        assert max(content_event_indexes) < min(tool_call_event_indexes)
+        assert "tool_calls" in finish_reasons
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_with_tools_parsed_from_namespaced_text_does_not_leak_markup(self):
+        """Supported namespaced tags must not leak into streamed content deltas."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Let me check ",
+                new_text="Let me check ",
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+                tool_calls=None,
+            ),
+            MockGenerationOutput(
+                text=(
+                    "Let me check "
+                    "that for you."
+                    "<minimax:tool_call>"
+                    "<invoke name=\"get_weather\">"
+                    "<parameter name=\"city\">\"SF\"</parameter>"
+                    "</invoke>"
+                    "</minimax:tool_call>"
+                ),
+                new_text=(
+                    "that for you."
+                    "<minimax:tool_call>"
+                    "<invoke name=\"get_weather\">"
+                    "<parameter name=\"city\">\"SF\"</parameter>"
+                    "</invoke>"
+                    "</minimax:tool_call>"
+                ),
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+
+        content_deltas = []
+        tool_call_deltas = []
+        finish_reasons = []
+        content_event_indexes = []
+        tool_call_event_indexes = []
+        for idx, payload in enumerate(payloads):
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            content = delta.get("content")
+            if content:
+                content_deltas.append(content)
+                content_event_indexes.append(idx)
+            if delta.get("tool_calls"):
+                tool_call_deltas.extend(delta["tool_calls"])
+                tool_call_event_indexes.append(idx)
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                finish_reasons.append(finish_reason)
+
+        streamed_content = "".join(content_deltas)
+        assert "<minimax:tool_call>" not in streamed_content
+        assert "</minimax:tool_call>" not in streamed_content
+        assert "<invoke" not in streamed_content
+        assert "<parameter" not in streamed_content
+        assert content_deltas == ["Let me check ", "that for you."]
+        assert streamed_content == "Let me check that for you."
+        assert len(tool_call_deltas) == 1
+        assert tool_call_deltas[0]["function"]["name"] == "get_weather"
+        assert json.loads(tool_call_deltas[0]["function"]["arguments"]) == {"city": "SF"}
+        assert content_event_indexes
+        assert tool_call_event_indexes
+        assert max(content_event_indexes) < min(tool_call_event_indexes)
+        assert "tool_calls" in finish_reasons
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_with_tools_parsed_from_tokenizer_delimiters_does_not_leak_markup(self):
+        """Split tokenizer delimiters must not leak into streamed content deltas."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.tokenizer.has_tool_calling = True
+        engine.tokenizer.tool_call_start = "<|tool|>"
+        engine.tokenizer.tool_call_end = "<|/tool|>"
+
+        def tool_parser(payload: str, _tools):
+            parsed = json.loads(payload)
+            return {"name": parsed["name"], "arguments": parsed["arguments"]}
+
+        engine.tokenizer.tool_parser = tool_parser
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Let me check that for you.<|to",
+                new_text="Let me check that for you.<|to",
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+                tool_calls=None,
+            ),
+            MockGenerationOutput(
+                text=(
+                    "Let me check that for you."
+                    "<|tool|>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}<|/to"
+                ),
+                new_text=(
+                    "ol|>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}<|/to"
+                ),
+                completion_tokens=2,
+                finished=False,
+                finish_reason=None,
+                tool_calls=None,
+            ),
+            MockGenerationOutput(
+                text=(
+                    "Let me check that for you."
+                    "<|tool|>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}<|/tool|>"
+                ),
+                new_text="ol|>",
+                completion_tokens=3,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+
+        content_deltas = []
+        tool_call_deltas = []
+        finish_reasons = []
+        content_event_indexes = []
+        tool_call_event_indexes = []
+        for idx, payload in enumerate(payloads):
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            content = delta.get("content")
+            if content:
+                content_deltas.append(content)
+                content_event_indexes.append(idx)
+            if delta.get("tool_calls"):
+                tool_call_deltas.extend(delta["tool_calls"])
+                tool_call_event_indexes.append(idx)
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                finish_reasons.append(finish_reason)
+
+        streamed_content = "".join(content_deltas)
+        assert "<|to" not in streamed_content
+        assert "<|tool|>" not in streamed_content
+        assert "<|/tool|>" not in streamed_content
+        assert len(content_deltas) >= 1
+        assert streamed_content == "Let me check that for you."
+        assert len(tool_call_deltas) == 1
+        assert tool_call_deltas[0]["function"]["name"] == "get_weather"
+        assert json.loads(tool_call_deltas[0]["function"]["arguments"]) == {"city": "SF"}
+        assert content_event_indexes
+        assert tool_call_event_indexes
+        assert max(content_event_indexes) < min(tool_call_event_indexes)
+        assert "tool_calls" in finish_reasons
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_suppresses_unmatched_tool_like_literal_suffix_under_clean_output_strict(self):
+        """Clean-output strict contract suppresses unmatched tool-like suffixes."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Use literal marker <tool_",
+                new_text="Use literal marker <tool_",
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+
+        content_deltas = []
+        tool_call_deltas = []
+        finish_reasons = []
+        for payload in payloads:
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            content = delta.get("content")
+            if content:
+                content_deltas.append(content)
+            if delta.get("tool_calls"):
+                tool_call_deltas.extend(delta["tool_calls"])
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                finish_reasons.append(finish_reason)
+
+        streamed_content = "".join(content_deltas)
+        assert "<tool_" not in streamed_content
+        assert streamed_content == "Use literal marker "
+        assert tool_call_deltas == []
+        assert "stop" in finish_reasons
+
 
 class TestStreamingEdgeCases:
     """Tests for edge cases in streaming responses."""
