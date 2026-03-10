@@ -2,7 +2,7 @@
             <!-- Tab Navigation -->
             <div class="flex items-center gap-2 mb-10 animate-fade-in-up">
                 <button
-                    @click="activeTab = 'global'"
+                    @click="setSettingsTab('global')"
                     :class="activeTab === 'global'
                         ? 'bg-neutral-900 text-white'
                         : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
@@ -11,7 +11,7 @@
                     {{ t('settings.tab.global') }}
                 </button>
                 <button
-                    @click="activeTab = 'models'"
+                    @click="setSettingsTab('models')"
                     :class="activeTab === 'models'
                         ? 'bg-neutral-900 text-white'
                         : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"

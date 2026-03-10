@@ -20,7 +20,7 @@
             <!-- Center Navigation -->
             <div class="flex items-center gap-1 bg-neutral-100 rounded-full p-1">
                 <button
-                    @click="mainTab = 'status'"
+                    @click="setMainTab('status')"
                     :class="mainTab === 'status'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
@@ -31,7 +31,7 @@
                 </button>
                 <div class="relative" @mouseenter="modelsDropdown = true" @mouseleave="modelsDropdown = false">
                     <button
-                        @click="mainTab = 'models'"
+                        @click="setMainTab('models')"
                         :class="mainTab === 'models'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -58,7 +58,7 @@
                         x-cloak
                     >
                         <button
-                            @click="mainTab = 'models'; modelsTab = 'manager'; modelsDropdown = false; loadHFModels();"
+                            @click="setModelsTab('manager'); modelsDropdown = false; loadHFModels();"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'models' && modelsTab === 'manager'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -68,7 +68,7 @@
                             {{ t('navbar.dropdown.manager') }}
                         </button>
                         <button
-                            @click="mainTab = 'models'; modelsTab = 'downloader'; modelsDropdown = false; loadHFModels(); loadHFTasks(); if (!hfRecommendedLoaded) loadRecommendedModels();"
+                            @click="setModelsTab('downloader'); modelsDropdown = false; loadHFModels(); loadHFTasks(); if (!hfRecommendedLoaded) loadRecommendedModels();"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'models' && modelsTab === 'downloader'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -81,7 +81,7 @@
                 </div>
                 <div class="relative" @mouseenter="settingsDropdown = true" @mouseleave="settingsDropdown = false">
                     <button
-                        @click="mainTab = 'settings'"
+                        @click="setMainTab('settings')"
                         :class="mainTab === 'settings'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -103,7 +103,7 @@
                         x-cloak
                     >
                         <button
-                            @click="mainTab = 'settings'; activeTab = 'global'; settingsDropdown = false"
+                            @click="setSettingsTab('global'); settingsDropdown = false"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'settings' && activeTab === 'global'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -113,7 +113,7 @@
                             {{ t('navbar.dropdown.global_settings') }}
                         </button>
                         <button
-                            @click="mainTab = 'settings'; activeTab = 'models'; settingsDropdown = false"
+                            @click="setSettingsTab('models'); settingsDropdown = false"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'settings' && activeTab === 'models'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -125,7 +125,7 @@
                     </div>
                 </div>
                 <button
-                    @click="mainTab = 'logs'; if (!logContent) loadLogs()"
+                    @click="setMainTab('logs'); if (!logContent) loadLogs()"
                     :class="mainTab === 'logs'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
@@ -135,7 +135,7 @@
                     {{ t('navbar.tab.logs') }}
                 </button>
                 <button
-                    @click="mainTab = 'bench'"
+                    @click="setMainTab('bench')"
                     :class="mainTab === 'bench'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
