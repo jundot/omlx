@@ -178,7 +178,7 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
         Tuple of (cleaned_text, tool_calls or None)
     """
     tool_calls = []
-    pattern = r'\[Calling tool:\s*(\w+)\(({.*?})\)\]'
+    pattern = r'\[Calling tool:\s*([A-Za-z_][\w.-]*)\(({.*?})\)\]'
     for match in re.finditer(pattern, text, re.DOTALL):
         name = match.group(1)
         args_str = match.group(2)
@@ -298,9 +298,8 @@ class ToolCallStreamFilter:
     delimiters, namespaced XML envelopes, and high-confidence bracket-format
     envelopes handled by ``parse_tool_calls``.
 
-    Once a tool-call start envelope is detected, the remainder of the stream
-    is suppressed from content deltas (structured tool calls are emitted at
-    completion after parsing accumulated text).
+    Suppression is envelope-bounded: control markup is removed, then visible
+    prose after a closed envelope continues streaming normally.
 
     Args:
         tokenizer: The model's tokenizer. Uses tokenizer-defined
@@ -309,37 +308,54 @@ class ToolCallStreamFilter:
 
     def __init__(self, tokenizer: Any):
         marker = getattr(tokenizer, "tool_call_start", "") or ""
-        self._start_markers: List[str] = ["<tool_call>"]
-        if marker:
-            self._start_markers.insert(0, marker)
-        self._namespaced_open_re = re.compile(r"<[A-Za-z_][\w.-]*:tool_call>")
+        marker_end = getattr(tokenizer, "tool_call_end", "") or ""
+        self._marker_pairs: List[Tuple[str, str]] = [("<tool_call>", "</tool_call>")]
+        if marker and marker_end:
+            self._marker_pairs.insert(0, (marker, marker_end))
+        self._namespaced_open_re = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>")
         self._bracket_prefix = "[Calling tool:"
         self._bracket_call_re = re.compile(
-            r'^\[Calling tool:\s*(\w+)\(({.*?})\)\]',
+            r'^\[Calling tool:\s*([A-Za-z_][\w.-]*)\(({.*?})\)\]',
             re.DOTALL,
         )
         self._buffer = ""
-        self._suppressing = False
+        self._suppressing_until: Optional[str] = None
 
     @property
     def active(self) -> bool:
         """Whether this filter should run for tool-enabled streams."""
         return True
 
-    def _find_start_index(self, text: str) -> int:
-        """Return index of earliest detected tool-call opening envelope."""
-        indexes: List[int] = []
+    def _find_start_envelope(self, text: str) -> Optional[Tuple[int, int, Optional[str]]]:
+        """Find earliest complete opening envelope.
 
-        for marker in self._start_markers:
+        Returns:
+            tuple(index, consume_len, close_marker_or_none)
+            - close_marker_or_none is a close marker to wait for, or ``None``
+              when the whole envelope is already contained in consume_len.
+        """
+        starts: List[Tuple[int, int, Optional[str]]] = []
+
+        for marker, close in self._marker_pairs:
             idx = text.find(marker)
             if idx >= 0:
-                indexes.append(idx)
+                starts.append((idx, len(marker), close))
 
-        namespaced_match = self._namespaced_open_re.search(text)
-        if namespaced_match:
-            indexes.append(namespaced_match.start())
+        ns_match = self._namespaced_open_re.search(text)
+        if ns_match:
+            ns = ns_match.group(1)
+            starts.append((ns_match.start(), len(ns_match.group(0)), f"</{ns}:tool_call>"))
 
-        return min(indexes) if indexes else -1
+        bracket_idx = text.find(self._bracket_prefix)
+        if bracket_idx >= 0:
+            bracket_candidate = text[bracket_idx:]
+            bracket_match = self._bracket_call_re.match(bracket_candidate)
+            if bracket_match:
+                starts.append((bracket_idx, bracket_match.end(), None))
+
+        if not starts:
+            return None
+        return min(starts, key=lambda x: x[0])
 
     @staticmethod
     def _partial_prefix_len(text: str, marker: str) -> int:
@@ -375,7 +391,7 @@ class ToolCallStreamFilter:
     def _partial_suffix_len(self, text: str) -> int:
         """Length of trailing suffix that might be an opening-marker prefix."""
         keep = 0
-        for marker in self._start_markers:
+        for marker, _close in self._marker_pairs:
             keep = max(keep, self._partial_prefix_len(text, marker))
 
         last_lt = text.rfind("<")
@@ -384,57 +400,59 @@ class ToolCallStreamFilter:
             if self._could_be_partial_namespaced_open(candidate):
                 keep = max(keep, len(candidate))
 
+        bracket_idx = text.find(self._bracket_prefix)
+        if bracket_idx >= 0:
+            bracket_candidate = text[bracket_idx:]
+            # Hold unresolved bracket prefix until we can classify parseable
+            # envelope vs literal prose.
+            if "]" not in bracket_candidate:
+                keep = max(keep, len(bracket_candidate))
+
         # Cap retained suffix window to avoid unbounded buffering on malformed text.
         return min(keep, 128)
 
     def feed(self, text: str) -> str:
         """Feed a content delta, return the portion safe to emit."""
-        if self._suppressing or not text:
+        if not text:
             return ""
         if not self.active:
             return text
 
         self._buffer += text
-        idx = self._find_start_index(self._buffer)
-        if idx >= 0:
-            self._suppressing = True
-            safe = self._buffer[:idx]
-            self._buffer = ""
-            return safe
+        out: List[str] = []
 
-        # Bracket envelopes are only suppressed when we see a complete
-        # parseable tool-call shape. Otherwise keep as literal text.
-        bracket_idx = self._buffer.find(self._bracket_prefix)
-        if bracket_idx >= 0:
-            bracket_candidate = self._buffer[bracket_idx:]
-            if self._bracket_call_re.match(bracket_candidate):
-                self._suppressing = True
-                safe = self._buffer[:bracket_idx]
+        while self._buffer:
+            if self._suppressing_until is not None:
+                end_idx = self._buffer.find(self._suppressing_until)
+                if end_idx < 0:
+                    keep = self._partial_prefix_len(self._buffer, self._suppressing_until)
+                    self._buffer = self._buffer[-keep:] if keep else ""
+                    break
+                self._buffer = self._buffer[end_idx + len(self._suppressing_until):]
+                self._suppressing_until = None
+                continue
+
+            start = self._find_start_envelope(self._buffer)
+            if start:
+                idx, consume_len, close_marker = start
+                if idx > 0:
+                    out.append(self._buffer[:idx])
+                self._buffer = self._buffer[idx + consume_len:]
+                if close_marker is not None:
+                    self._suppressing_until = close_marker
+                continue
+
+            keep = self._partial_suffix_len(self._buffer)
+            if keep == 0:
+                out.append(self._buffer)
                 self._buffer = ""
-                return safe
+                break
+            if len(self._buffer) > keep:
+                out.append(self._buffer[:-keep])
+                self._buffer = self._buffer[-keep:]
+            break
 
-            # Preserve non-bracket content before a potential bracket envelope
-            # and keep bracket candidate buffered until it can be classified.
-            if bracket_idx > 0:
-                safe = self._buffer[:bracket_idx]
-                self._buffer = self._buffer[bracket_idx:]
-                return safe
-
-            return ""
-
-        # Emit content that cannot be part of an opening envelope.
-        keep = self._partial_suffix_len(self._buffer)
-        if keep == 0:
-            safe = self._buffer
-            self._buffer = ""
-            return safe
-
-        if len(self._buffer) > keep:
-            safe = self._buffer[:-keep]
-            self._buffer = self._buffer[-keep:]
-            return safe
-
-        return ""
+        return "".join(out)
 
     def finish(self) -> str:
         """Flush remaining safe buffer content.
@@ -442,16 +460,20 @@ class ToolCallStreamFilter:
         In clean-output strict mode, unresolved marker-like suffixes are dropped
         so partial control markup does not leak into user-visible text.
         """
-        if self._suppressing:
+        if self._suppressing_until is not None:
             self._buffer = ""
+            self._suppressing_until = None
             return ""
 
         keep = self._partial_suffix_len(self._buffer)
-        if keep == len(self._buffer):
+        if keep >= len(self._buffer):
             self._buffer = ""
             return ""
 
-        buf = self._buffer
+        if keep:
+            buf = self._buffer[:-keep]
+        else:
+            buf = self._buffer
         self._buffer = ""
         return buf
 

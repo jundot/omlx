@@ -686,9 +686,9 @@ class TestToolCallStreamFilter:
         assert r1 + r2 == ""
 
     def test_suppressing_blocks_finish(self):
-        """Once suppressing, finish() returns nothing."""
-        f = ToolCallStreamFilter(_make_tokenizer("<tc>"))
-        f.feed("text<tc>rest")
+        """An unresolved open envelope keeps buffered control text suppressed at finish()."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        f.feed("text<tool_call>rest")
         assert f.finish() == ""
 
     def test_bracket_literal_passthrough(self):
@@ -707,6 +707,31 @@ class TestToolCallStreamFilter:
         assert r1 == "Lead in "
         assert r2 == ""
         assert f.finish() == ""
+
+    def test_bracket_tool_call_suppresses_envelope_but_preserves_trailing_text(self):
+        """Suppression must not truncate prose that follows a complete bracket envelope."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Before [Calling tool:")
+        r2 = f.feed(' get_weather({"city":"SF"})] After text')
+        r3 = f.finish()
+        assert r1 + r2 + r3 == "Before  After text"
+
+    def test_xml_tool_call_suppresses_envelope_but_preserves_trailing_text(self):
+        """Raw XML envelope suppression should resume normal text after close tag."""
+        f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
+        result = f.feed(
+            'Before <tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call> After'
+        )
+        result += f.finish()
+        assert result == "Before  After"
+
+    def test_bracket_tool_call_with_hyphen_name_suppresses_when_complete(self):
+        """Bracket detector should treat hyphenated tool names as valid calls."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Lead in [Calling tool:")
+        r2 = f.feed(' get-weather({"city":"SF"})] tail')
+        r3 = f.finish()
+        assert r1 + r2 + r3 == "Lead in  tail"
 
     def test_partial_non_tool_namespaced_literal_is_preserved(self):
         """Namespaced-looking suffixes that are not :tool_call remain visible."""
