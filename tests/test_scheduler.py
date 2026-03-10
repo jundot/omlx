@@ -1242,3 +1242,142 @@ class TestExtractCacheStatesRotatingNormalization:
         assert bool(mx.all(normalized_keys == expected_keys).item())
         assert bool(mx.all(normalized_values == expected_values).item())
         assert normalized_meta == ("0", "128", "1280", "128")
+
+
+class TestCacheCorruptionRecovery:
+    """Tests for cache corruption detection and recovery."""
+
+    def _make_scheduler(self, mock_model, mock_tokenizer):
+        """Create a Scheduler with requests in running state."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        for i in range(3):
+            req = Request(
+                request_id=f"req-{i}",
+                prompt=f"test prompt {i}",
+                sampling_params=SamplingParams(),
+                prompt_token_ids=[1, 2, 3],
+                num_prompt_tokens=3,
+                status=RequestStatus.RUNNING,
+                batch_uid=i,
+                remaining_tokens=[1, 2, 3],
+            )
+            scheduler.running[req.request_id] = req
+            scheduler.requests[req.request_id] = req
+        return scheduler
+
+    def test_reschedule_resets_all_fields(self, mock_model, mock_tokenizer):
+        """Rescheduling must reset all request fields for clean re-prefill."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        req = scheduler.running["req-0"]
+        # Simulate partial generation state
+        req.output_token_ids = [10, 20, 30]
+        req.output_text = "partial output"
+        req.num_computed_tokens = 5
+        req.block_table = MagicMock()
+        req.shared_prefix_blocks = 4
+        req._extracted_cache = MagicMock()
+        req._model_cache_config = MagicMock()
+        req.think_prefix_sent = True
+        req.prompt_cache = MagicMock()
+        req.cached_tokens = 10
+
+        scheduler._reschedule_running_requests()
+
+        assert req.status == RequestStatus.WAITING
+        assert req.batch_uid is None
+        assert req.prompt_cache is None
+        assert req.cached_tokens == 0
+        assert req.remaining_tokens == [1, 2, 3]
+        assert req.block_table is None
+        assert req.shared_prefix_blocks == 0
+        assert req.output_token_ids == []
+        assert req.output_text == ""
+        assert req.num_computed_tokens == 0
+        assert req._extracted_cache is None
+        assert req._model_cache_config is None
+        assert req.think_prefix_sent is False
+
+    def test_reschedule_corruption_increments_counter(
+        self, mock_model, mock_tokenizer
+    ):
+        """Corruption reschedule increments per-request retry counter."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+
+        failed = scheduler._reschedule_running_requests(is_corruption=True)
+
+        assert failed == []
+        for req in scheduler.waiting:
+            assert req.cache_corruption_retries == 1
+
+    def test_reschedule_corruption_fails_after_max_retries(
+        self, mock_model, mock_tokenizer
+    ):
+        """Requests exceeding max corruption retries are failed."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        # Set one request near the limit
+        scheduler.running["req-1"].cache_corruption_retries = 3
+
+        failed = scheduler._reschedule_running_requests(
+            is_corruption=True, max_corruption_retries=3
+        )
+
+        assert failed == ["req-1"]
+        assert "req-1" not in scheduler.running
+        assert "req-1" not in scheduler.requests
+        # Other requests should be rescheduled
+        waiting_ids = {r.request_id for r in scheduler.waiting}
+        assert "req-0" in waiting_ids
+        assert "req-2" in waiting_ids
+
+    def test_reschedule_no_corruption_does_not_increment_counter(
+        self, mock_model, mock_tokenizer
+    ):
+        """Non-corruption reschedule (e.g. PrefillAborted) does not touch counter."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+
+        failed = scheduler._reschedule_running_requests(is_corruption=False)
+
+        assert failed == []
+        for req in scheduler.waiting:
+            assert req.cache_corruption_retries == 0
+
+    def test_fail_all_requests_clears_everything(
+        self, mock_model, mock_tokenizer
+    ):
+        """fail_all_requests removes all running and waiting requests."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        # Also add a waiting request
+        wait_req = Request(
+            request_id="req-wait",
+            prompt="waiting",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=[4, 5],
+            num_prompt_tokens=2,
+        )
+        scheduler.waiting.append(wait_req)
+        scheduler.requests[wait_req.request_id] = wait_req
+
+        failed_ids = scheduler.fail_all_requests()
+
+        assert set(failed_ids) == {"req-0", "req-1", "req-2", "req-wait"}
+        assert len(scheduler.running) == 0
+        assert len(scheduler.waiting) == 0
+        assert not scheduler.has_requests()
+        # Verify requests dict is also cleaned up (no memory leak)
+        for rid in failed_ids:
+            assert rid not in scheduler.requests
+
+    def test_fail_all_requests_preserves_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        """fail_all_requests resets batch_generator but preserves block cache."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler.batch_generator = MagicMock()
+        scheduler.block_aware_cache = MagicMock()
+
+        scheduler.fail_all_requests()
+
+        assert scheduler.batch_generator is None
+        assert scheduler._current_sampler_params is None
+        # Cache should NOT be cleared (not a corruption error)
+        scheduler.block_aware_cache.clear.assert_not_called()

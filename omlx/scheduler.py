@@ -2470,6 +2470,39 @@ class Scheduler:
         """Check if there are any pending or running requests."""
         return bool(self.waiting or self.running)
 
+    def fail_all_requests(self) -> List[str]:
+        """Remove all running and waiting requests after unrecoverable error.
+
+        Used as a safety net by engine_core when step() raises an
+        unexpected exception, to prevent infinite loops.
+
+        Only resets batch_generator (not full cache) because this method
+        is called for non-corruption errors — corruption is already
+        handled inside step().
+
+        Returns:
+            List of failed request IDs.
+        """
+        failed_ids: List[str] = []
+        for request_id in list(self.running):
+            failed_ids.append(request_id)
+            req = self.requests.pop(request_id, None)
+            if req is not None:
+                req._extracted_cache = None
+                req.prompt_cache = None
+        self.running.clear()
+        for request in list(self.waiting):
+            failed_ids.append(request.request_id)
+            req = self.requests.pop(request.request_id, None)
+            if req is not None:
+                req._extracted_cache = None
+                req.prompt_cache = None
+        self.waiting.clear()
+        # Reset batch generator only (cache is not corrupted)
+        self.batch_generator = None
+        self._current_sampler_params = None
+        return failed_ids
+
     def get_num_waiting(self) -> int:
         """Get number of waiting requests."""
         return len(self.waiting)
@@ -3046,6 +3079,10 @@ class Scheduler:
         if hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
 
+        # Clear pending VLM embeddings
+        if hasattr(self.model, "clear_pending_embeddings"):
+            self.model.clear_pending_embeddings()
+
         # Clear caches
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
@@ -3062,25 +3099,67 @@ class Scheduler:
 
         logger.info("Cache recovery completed")
 
-    def _reschedule_running_requests(self) -> None:
-        """Move running requests back to waiting queue for retry."""
-        count = len(self.running)
+    def _reschedule_running_requests(
+        self, is_corruption: bool = False, max_corruption_retries: int = 3
+    ) -> List[str]:
+        """Move running requests back to waiting queue for retry.
+
+        Args:
+            is_corruption: If True, increment corruption retry counter and
+                fail requests that exceed max_corruption_retries.
+            max_corruption_retries: Max corruption retries before failing a request.
+
+        Returns:
+            List of request IDs that exceeded max retries (corruption only).
+        """
+        failed_ids: List[str] = []
+        count = 0
         for request_id, request in list(self.running.items()):
-            # Reset request state
+            if is_corruption:
+                request.cache_corruption_retries += 1
+                if request.cache_corruption_retries > max_corruption_retries:
+                    failed_ids.append(request_id)
+                    del self.running[request_id]
+                    # Clean up from requests dict (prevent memory leak)
+                    req = self.requests.pop(request_id, None)
+                    if req is not None:
+                        req._extracted_cache = None
+                        req.prompt_cache = None
+                    continue
+
+            # Reset scheduling state
             request.status = RequestStatus.WAITING
             request.batch_uid = None
+
+            # Reset cache state
             request.prompt_cache = None
             request.cached_tokens = 0
             request.remaining_tokens = request.prompt_token_ids
+            request.block_table = None
+            request.shared_prefix_blocks = 0
+
+            # Reset generation output (prevent duplicate tokens on re-prefill)
+            request.output_token_ids = []
+            request.output_text = ""
+            request.num_computed_tokens = 0
+
+            # Reset extracted cache (prevent GPU memory leak)
+            request._extracted_cache = None
+            request._model_cache_config = None
+
+            # Reset reasoning model state
+            request.think_prefix_sent = False
 
             # Move to waiting queue (at front for priority)
             self.waiting.appendleft(request)
             del self.running[request_id]
+            count += 1
 
         if count > 0:
-            logger.info(f"Rescheduled {count} requests for retry")
+            logger.info(f"Rescheduled {count} requests for re-prefill")
+        return failed_ids
 
-    def step(self, max_retries: int = 1) -> SchedulerOutput:
+    def step(self) -> SchedulerOutput:
         """
         Execute one scheduling step with automatic error recovery.
 
@@ -3088,10 +3167,8 @@ class Scheduler:
         1. Schedules waiting requests into the batch
         2. Runs one generation step via BatchGenerator
         3. Processes outputs and handles finished requests
-        4. Automatically recovers from cache corruption errors
-
-        Args:
-            max_retries: Number of times to retry on cache errors (default 1)
+        4. On cache corruption: clears all cache and reschedules requests
+           for re-prefill (no error raised to caller)
 
         Returns:
             SchedulerOutput with results of this step
@@ -3105,69 +3182,78 @@ class Scheduler:
         if self.memory_monitor is not None:
             self._check_memory_pressure()
 
-        for attempt in range(max_retries + 1):
-            try:
-                # Schedule waiting requests
-                scheduled = self._schedule_waiting()
-                output.scheduled_request_ids = [r.request_id for r in scheduled]
-                output.num_scheduled_tokens = sum(r.num_prompt_tokens for r in scheduled)
+        try:
+            # Schedule waiting requests
+            scheduled = self._schedule_waiting()
+            output.scheduled_request_ids = [r.request_id for r in scheduled]
+            output.num_scheduled_tokens = sum(r.num_prompt_tokens for r in scheduled)
 
-                # Run generation step if we have running requests
-                if self.batch_generator is not None and self.running:
-                    responses = self.batch_generator.next()
-                    output.has_work = True
+            # Run generation step if we have running requests
+            if self.batch_generator is not None and self.running:
+                responses = self.batch_generator.next()
+                output.has_work = True
 
-                    if responses:
-                        outputs, finished_ids = self._process_batch_responses(responses)
-                        output.outputs = outputs
-                        output.finished_request_ids = finished_ids
-                        self._cleanup_finished(finished_ids)
+                if responses:
+                    outputs, finished_ids = self._process_batch_responses(responses)
+                    output.outputs = outputs
+                    output.finished_request_ids = finished_ids
+                    self._cleanup_finished(finished_ids)
 
-                # Success - break out of retry loop
-                break
+        except _PrefillAbortedError:
+            # Prefill was interrupted by a pending abort.
+            # BatchGenerator is in an inconsistent state (partial
+            # prefill), so reset it entirely. Pending aborts will
+            # be processed at the start of the next step().
+            self.batch_generator = None
+            self._current_sampler_params = None
+            self._boundary_cache_snapshots.clear()
+            if self._boundary_snapshot_store is not None:
+                self._boundary_snapshot_store.cleanup_all()
+            self._boundary_snapshot_required = None
+            # Move any running requests back to waiting so they
+            # can be rescheduled with a fresh BatchGenerator.
+            self._reschedule_running_requests()
 
-            except _PrefillAbortedError:
-                # Prefill was interrupted by a pending abort.
-                # BatchGenerator is in an inconsistent state (partial
-                # prefill), so reset it entirely. Pending aborts will
-                # be processed at the start of the next step().
-                self.batch_generator = None
-                self._current_sampler_params = None
-                self._boundary_cache_snapshots.clear()
-                if self._boundary_snapshot_store is not None:
-                    self._boundary_snapshot_store.cleanup_all()
-                self._boundary_snapshot_required = None
-                # Move any running requests back to waiting so they
-                # can be rescheduled with a fresh BatchGenerator.
-                self._reschedule_running_requests()
-                break
-
-            except (TypeError, AttributeError, ValueError) as e:
-                # Catch cache corruption errors (NoneType, shape mismatch, etc.)
-                if self._is_cache_corruption_error(e):
-                    if attempt < max_retries:
-                        import traceback
-                        logger.warning(
-                            f"Cache corruption detected (attempt {attempt + 1}): {e}, "
-                            f"performing recovery and retry..."
-                        )
-                        logger.debug(f"Cache corruption traceback:\n{traceback.format_exc()}")
-                        # Deep reset to recover
-                        self._recover_from_cache_error()
-                        # Re-add any running requests back to waiting
-                        self._reschedule_running_requests()
-                    else:
-                        logger.error(
-                            f"Cache corruption not recoverable after "
-                            f"{max_retries + 1} attempts"
-                        )
-                        raise
-                else:
-                    raise
-            except Exception as e:
+        except (TypeError, AttributeError, ValueError) as e:
+            if self._is_cache_corruption_error(e):
                 import traceback
-                logger.error(f"Error in batch generation step: {e}\n{traceback.format_exc()}")
+                logger.warning(
+                    f"Cache corruption detected: {e}, "
+                    f"clearing cache and re-prefilling..."
+                )
+                logger.debug(
+                    f"Cache corruption traceback:\n{traceback.format_exc()}"
+                )
+                # Full reset: clear batch generator, all caches, VLM state
+                self._recover_from_cache_error()
+                # Reschedule requests for re-prefill from scratch.
+                # Requests exceeding max corruption retries are failed.
+                failed_ids = self._reschedule_running_requests(
+                    is_corruption=True
+                )
+                for rid in failed_ids:
+                    output.outputs.append(
+                        RequestOutput(
+                            request_id=rid,
+                            finished=True,
+                            finish_reason="error",
+                            error=(
+                                f"Cache corruption not recoverable "
+                                f"after retries: {e}"
+                            ),
+                        )
+                    )
+                    output.finished_request_ids.append(rid)
+            else:
                 raise
+
+        except Exception as e:
+            import traceback
+            logger.error(
+                f"Error in batch generation step: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            raise
 
         # Clear finished tracking for next step
         self.finished_req_ids = set()

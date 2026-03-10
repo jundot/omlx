@@ -514,6 +514,11 @@ class TestEngineCoreGenerateCancellation:
             try:
                 await engine.start()
 
+                # Prevent step() from running (MockModel can't support
+                # BatchGenerator), so the engine loop stays idle and
+                # doesn't interfere with cancellation testing.
+                engine.scheduler.has_requests = lambda: False
+
                 # Create two generate tasks
                 task1 = asyncio.create_task(
                     engine.generate(

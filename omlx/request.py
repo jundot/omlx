@@ -141,6 +141,9 @@ class Request:
     # Harmony model support (gpt-oss models)
     is_harmony_model: bool = False      # True if model uses Harmony format
 
+    # Cache corruption recovery
+    cache_corruption_retries: int = 0   # Per-request corruption retry counter
+
     @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""
