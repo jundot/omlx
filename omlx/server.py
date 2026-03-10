@@ -601,6 +601,9 @@ def get_sampling_params(
     """
     global_sampling = _server_state.sampling
 
+    # Resolve alias so per-model settings are found by real model ID
+    model_id = resolve_model_id(model_id)
+
     # Get per-model settings if available
     model_settings = None
     if model_id and _server_state.settings_manager:
@@ -679,6 +682,19 @@ def get_sampling_params(
     return temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty
 
 
+def resolve_model_id(model_id: str | None) -> str | None:
+    """Resolve a model alias to its real model ID.
+
+    Returns the resolved ID, or the original value if no alias match.
+    """
+    if model_id is None:
+        return None
+    pool = _server_state.engine_pool
+    if pool is None:
+        return model_id
+    return pool.resolve_model_id(model_id, _server_state.settings_manager)
+
+
 def get_max_context_window(model_id: str | None = None) -> int | None:
     """
     Get effective max context window limit.
@@ -688,6 +704,9 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     Returns:
         Max context window token count, or None if not set.
     """
+    # Resolve alias so per-model settings are found by real model ID
+    model_id = resolve_model_id(model_id)
+
     model_settings = None
     if model_id and _server_state.settings_manager:
         model_settings = _server_state.settings_manager.get_settings(model_id)
@@ -1413,12 +1432,15 @@ async def create_chat_completion(
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
 
+    # Resolve alias to real model ID for settings lookups
+    resolved_model = resolve_model_id(request.model) or request.model
+
     # Get per-model settings
     max_tool_result_tokens = None
     merged_ct_kwargs = {}
     forced_keys: set[str] = set()
     if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(request.model)
+        ms = _server_state.settings_manager.get_settings(resolved_model)
         max_tool_result_tokens = ms.max_tool_result_tokens
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
@@ -2284,12 +2306,15 @@ async def create_anthropic_message(
 
     engine = await get_engine_for_model(request.model)
 
+    # Resolve alias to real model ID for settings lookups
+    resolved_model = resolve_model_id(request.model) or request.model
+
     # Get per-model settings
     max_tool_result_tokens = None
     merged_ct_kwargs = {}
     forced_keys: set[str] = set()
     if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(request.model)
+        ms = _server_state.settings_manager.get_settings(resolved_model)
         max_tool_result_tokens = ms.max_tool_result_tokens
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
@@ -2335,7 +2360,7 @@ async def create_anthropic_message(
     # Apply max_tokens from model settings if force_sampling is enabled
     max_tokens = request.max_tokens
     if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(request.model)
+        ms = _server_state.settings_manager.get_settings(resolved_model)
         force = _server_state.sampling.force_sampling or (ms and ms.force_sampling)
         if force and ms and ms.max_tokens is not None:
             max_tokens = ms.max_tokens
