@@ -588,7 +588,8 @@ def get_sampling_params(
     model_id: str | None = None,
     req_min_p: float | None = None,
     req_presence_penalty: float | None = None,
-) -> tuple[float, float, int, float, float, float]:
+    req_frequency_penalty: float | None = None,
+) -> tuple[float, float, int, float, float, float, float]:
     """
     Get effective sampling parameters with per-model settings support.
 
@@ -597,7 +598,7 @@ def get_sampling_params(
     - Otherwise: request > model settings > global defaults
 
     Returns:
-        tuple of (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty)
+        tuple of (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty)
     """
     global_sampling = _server_state.sampling
 
@@ -673,13 +674,22 @@ def get_sampling_params(
     else:
         presence_penalty = 0.0
 
+    # Frequency penalty: request > model settings > default (0.0)
+    if req_frequency_penalty is not None:
+        frequency_penalty = req_frequency_penalty
+    elif model_settings and getattr(model_settings, 'frequency_penalty', None) is not None:
+        frequency_penalty = model_settings.frequency_penalty
+    else:
+        frequency_penalty = 0.0
+
     logger.debug(
         f"Sampling params: temperature={temperature}, top_p={top_p}, top_k={top_k}, "
-        f"repetition_penalty={repetition_penalty}, min_p={min_p}, presence_penalty={presence_penalty}"
+        f"repetition_penalty={repetition_penalty}, min_p={min_p}, presence_penalty={presence_penalty}, "
+        f"frequency_penalty={frequency_penalty}"
         f"{' (forced)' if force else ''}"
         f"{f' (model: {model_id})' if model_id else ''}"
     )
-    return temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty
+    return temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty
 
 
 def resolve_model_id(model_id: str | None) -> str | None:
@@ -1343,10 +1353,11 @@ async def create_completion(
     total_prompt_tokens = 0
     total_cached_tokens = 0
 
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty = get_sampling_params(
         request.temperature, request.top_p, request.model,
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
+        req_frequency_penalty=getattr(request, 'frequency_penalty', None),
     )
 
     for i, prompt in enumerate(prompts):
@@ -1361,6 +1372,7 @@ async def create_completion(
                 min_p=min_p,
                 repetition_penalty=repetition_penalty,
                 presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
                 stop=request.stop,
             ),
         )
@@ -1511,10 +1523,11 @@ async def create_chat_completion(
     validate_context_window(num_prompt_tokens, request.model)
 
     # Prepare kwargs
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty = get_sampling_params(
         request.temperature, request.top_p, request.model,
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
+        req_frequency_penalty=getattr(request, 'frequency_penalty', None),
     )
     chat_kwargs = {
         "max_tokens": request.max_tokens or _server_state.sampling.max_tokens,
@@ -1524,6 +1537,7 @@ async def create_chat_completion(
         "min_p": min_p,
         "repetition_penalty": repetition_penalty,
         "presence_penalty": presence_penalty,
+        "frequency_penalty": frequency_penalty,
     }
 
     # Add tools if provided (includes MCP tools)
@@ -1675,10 +1689,11 @@ async def stream_completion(
     first_token_time = None
     last_output = None
 
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty = get_sampling_params(
         request.temperature, request.top_p, request.model,
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
+        req_frequency_penalty=getattr(request, 'frequency_penalty', None),
     )
     try:
         async for output in engine.stream_generate(
@@ -1690,6 +1705,7 @@ async def stream_completion(
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
             stop=request.stop,
         ):
             if first_token_time is None and output.new_text:
@@ -2358,7 +2374,7 @@ async def create_anthropic_message(
         )
 
     # Prepare kwargs
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty = get_sampling_params(
         request.temperature, request.top_p, request.model,
     )
 
@@ -2378,6 +2394,7 @@ async def create_anthropic_message(
         "min_p": min_p,
         "repetition_penalty": repetition_penalty,
         "presence_penalty": presence_penalty,
+        "frequency_penalty": frequency_penalty,
     }
 
     # Merge MCP tools with user-provided Anthropic tools

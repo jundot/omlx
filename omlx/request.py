@@ -60,6 +60,7 @@ class SamplingParams:
     min_p: float = 0.0
     repetition_penalty: float = 1.0
     presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
     stop: Optional[List[str]] = None
     stop_token_ids: Optional[List[int]] = None
 

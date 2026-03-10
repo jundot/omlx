@@ -40,6 +40,7 @@ class InternalRequest:
     top_k: int = 0
     min_p: float = 0.0
     presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
     stream: bool = False
 
     # Stop conditions

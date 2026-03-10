@@ -79,6 +79,7 @@ class OpenAIAdapter(BaseAdapter):
             top_p=request.top_p if request.top_p is not None else 1.0,
             min_p=request.min_p if request.min_p is not None else 0.0,
             presence_penalty=request.presence_penalty if request.presence_penalty is not None else 0.0,
+            frequency_penalty=request.frequency_penalty if request.frequency_penalty is not None else 0.0,
             stream=request.stream or False,
             stop=request.stop if isinstance(request.stop, list) else (
                 [request.stop] if request.stop else None

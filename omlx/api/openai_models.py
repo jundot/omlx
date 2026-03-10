@@ -139,6 +139,7 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[List[str]] = None
     min_p: float | None = None
     presence_penalty: float | None = None
+    frequency_penalty: float | None = None
     # Tool calling
     tools: Optional[List[ToolDefinition]] = None
     tool_choice: Optional[Union[str, dict]] = None  # "auto", "none", or specific tool
@@ -208,6 +209,7 @@ class CompletionRequest(BaseModel):
     stop: Optional[List[str]] = None
     min_p: float | None = None
     presence_penalty: float | None = None
+    frequency_penalty: float | None = None
 
 
 class CompletionChoice(BaseModel):
