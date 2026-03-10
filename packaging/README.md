@@ -4,7 +4,7 @@ Packages oMLX as a macOS menubar app using venvstacks.
 
 ## Requirements
 
-- macOS 14.0+ (Sonoma)
+- macOS 15.0+ (Sequoia) — required by MLX >= 0.29.2
 - Apple Silicon (M1/M2/M3/M4)
 - Python 3.11+
 - venvstacks: `pip install venvstacks`

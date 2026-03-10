@@ -56,6 +56,31 @@ def _show_error_dialog(title: str, message: str) -> None:
         pass
 
 
+def _check_os_version() -> None:
+    """Verify macOS version is 15.0+ (required by MLX >= 0.29.2)."""
+    import platform
+
+    mac_ver = platform.mac_ver()[0]
+    if not mac_ver:
+        return
+    parts = mac_ver.split(".")
+    try:
+        major = int(parts[0])
+    except (ValueError, IndexError):
+        return
+    if major < 15:
+        _show_error_dialog(
+            "macOS 15.0 Required",
+            f"oMLX requires macOS 15.0 (Sequoia) or later.\n\n"
+            f"Your system is running macOS {mac_ver}.\n\n"
+            f"MLX >= 0.29.2 requires macOS 15.0+. "
+            f"Please update your operating system to use oMLX.",
+        )
+        sys.exit(1)
+
+
+_check_os_version()
+
 try:
     from .app import main
 
@@ -64,10 +89,20 @@ except Exception as e:
     exc_text = traceback.format_exc()
     crash_log = _write_crash_log(exc_text)
 
-    # Build a concise message for the dialog (full traceback is in crash log)
-    error_line = str(e).replace("\n", " ")[:200]
-    _show_error_dialog(
-        "oMLX Launch Error",
-        f"{type(e).__name__}: {error_line}\n\nCrash log: {crash_log}",
-    )
+    error_str = str(e)
+    if "mlx" in error_str.lower() or "libmlx" in exc_text.lower():
+        _show_error_dialog(
+            "MLX Compatibility Error",
+            "oMLX failed to load the MLX framework.\n\n"
+            "This usually means your macOS version is too old. "
+            "oMLX requires macOS 15.0 (Sequoia) or later.\n\n"
+            f"Crash log: {crash_log}",
+        )
+    else:
+        # Build a concise message for the dialog (full traceback is in crash log)
+        error_line = error_str.replace("\n", " ")[:200]
+        _show_error_dialog(
+            "oMLX Launch Error",
+            f"{type(e).__name__}: {error_line}\n\nCrash log: {crash_log}",
+        )
     sys.exit(1)

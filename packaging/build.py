@@ -464,7 +464,7 @@ int main(int argc, char *argv[]) {
 
     launcher_bin = macos_dir / app_name
     result = subprocess.run(
-        ["cc", "-arch", "arm64", "-mmacosx-version-min=14.0", "-O2",
+        ["cc", "-arch", "arm64", "-mmacosx-version-min=15.0", "-O2",
          "-o", str(launcher_bin), str(launcher_c)],
         capture_output=True, text=True,
     )
@@ -574,7 +574,7 @@ def create_app_bundle():
         "CFBundlePackageType": "APPL",
         "CFBundleSignature": "????",
         "CFBundleIconFile": "AppIcon",
-        "LSMinimumSystemVersion": "14.0",
+        "LSMinimumSystemVersion": "15.0",
         "LSUIElement": True,
         "NSHighResolutionCapable": True,
         "LSArchitecturePriority": ["arm64"],
