@@ -17,6 +17,10 @@
 </p>
 
 <p align="center">
+  <a href="mailto:junkim.dot@gmail.com">junkim.dot@gmail.com</a>
+</p>
+
+<p align="center">
   <a href="#설치">설치</a> ·
   <a href="#빠른-시작">빠른 시작</a> ·
   <a href="#기능">기능</a> ·

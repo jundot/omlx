@@ -17,6 +17,10 @@
 </p>
 
 <p align="center">
+  <a href="mailto:junkim.dot@gmail.com">junkim.dot@gmail.com</a>
+</p>
+
+<p align="center">
   <a href="#インストール">インストール</a> ·
   <a href="#クイックスタート">クイックスタート</a> ·
   <a href="#機能">機能</a> ·

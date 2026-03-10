@@ -17,6 +17,10 @@
 </p>
 
 <p align="center">
+  <a href="mailto:junkim.dot@gmail.com">junkim.dot@gmail.com</a>
+</p>
+
+<p align="center">
   <a href="#安装">安装</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#功能">功能</a> ·
