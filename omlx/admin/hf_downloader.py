@@ -24,6 +24,10 @@ from huggingface_hub.utils import (
 
 logger = logging.getLogger(__name__)
 
+# Timeout for HuggingFace API calls (seconds).
+# Prevents server from hanging when HF is unreachable.
+_HF_API_TIMEOUT = 10
+
 
 class DownloadStatus(str, enum.Enum):
     """Status of a download task."""
@@ -162,12 +166,15 @@ class HFDownloader:
         api = HfApi()
 
         async def _fetch(sort: str) -> list[dict]:
-            models = await asyncio.to_thread(
-                api.list_models,
-                author="mlx-community",
-                sort=sort,
-                limit=limit,
-                expand=["safetensors", "downloads", "likes", "trendingScore"],
+            models = await asyncio.wait_for(
+                asyncio.to_thread(
+                    api.list_models,
+                    author="mlx-community",
+                    sort=sort,
+                    limit=limit,
+                    expand=["safetensors", "downloads", "likes", "trendingScore"],
+                ),
+                timeout=_HF_API_TIMEOUT,
             )
             results = []
             for m in models:
@@ -226,12 +233,15 @@ class HFDownloader:
         api = HfApi()
         sort_key = _SORT_MAP.get(sort, "trendingScore")
 
-        models = await asyncio.to_thread(
-            api.list_models,
-            search=query,
-            sort=sort_key,
-            limit=limit,
-            expand=["safetensors", "downloads", "likes", "trendingScore"],
+        models = await asyncio.wait_for(
+            asyncio.to_thread(
+                api.list_models,
+                search=query,
+                sort=sort_key,
+                limit=limit,
+                expand=["safetensors", "downloads", "likes", "trendingScore"],
+            ),
+            timeout=_HF_API_TIMEOUT,
         )
 
         results = []
@@ -282,10 +292,13 @@ class HFDownloader:
             Dict with model details including description, files, tags, etc.
         """
         api = HfApi()
-        info = await asyncio.to_thread(
-            api.model_info,
-            repo_id,
-            files_metadata=True,
+        info = await asyncio.wait_for(
+            asyncio.to_thread(
+                api.model_info,
+                repo_id,
+                files_metadata=True,
+            ),
+            timeout=_HF_API_TIMEOUT,
         )
 
         # Extract file list with sizes
@@ -317,10 +330,13 @@ class HFDownloader:
         # Fetch model card (README.md) content
         model_card = ""
         try:
-            card_path = await asyncio.to_thread(
-                hf_hub_download,
-                repo_id=repo_id,
-                filename="README.md",
+            card_path = await asyncio.wait_for(
+                asyncio.to_thread(
+                    hf_hub_download,
+                    repo_id=repo_id,
+                    filename="README.md",
+                ),
+                timeout=_HF_API_TIMEOUT,
             )
             if card_path:
                 card_text = Path(card_path).read_text(encoding="utf-8")
@@ -517,11 +533,14 @@ class HFDownloader:
             # Get total repo size for progress estimation
             try:
                 api = HfApi()
-                model_info = await asyncio.to_thread(
-                    api.model_info,
-                    task.repo_id,
-                    token=hf_token or None,
-                    expand=["safetensors"],
+                model_info = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        api.model_info,
+                        task.repo_id,
+                        token=hf_token or None,
+                        expand=["safetensors"],
+                    ),
+                    timeout=_HF_API_TIMEOUT,
                 )
                 if model_info.safetensors and model_info.safetensors.get("parameters"):
                     # Calculate size from safetensors metadata (most accurate)

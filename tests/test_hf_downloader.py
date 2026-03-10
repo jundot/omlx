@@ -1178,3 +1178,67 @@ class TestCalcSafetensorsDiskSize:
 
         assert _calc_safetensors_disk_size({"parameters": {}}) == 0
         assert _calc_safetensors_disk_size({}) == 0
+
+
+# =============================================================================
+# Timeout Tests
+# =============================================================================
+
+
+class TestHFAPITimeouts:
+    """Test that HF API calls respect timeouts when HuggingFace is unreachable."""
+
+    @pytest.mark.asyncio
+    async def test_get_recommended_models_timeout(self):
+        """get_recommended_models should raise TimeoutError when HF is unreachable."""
+        import time as time_mod
+
+        def slow_list_models(**kwargs):
+            time_mod.sleep(5)
+            return []
+
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+             patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = slow_list_models
+            mock_api_cls.return_value = mock_api
+
+            with pytest.raises(asyncio.TimeoutError):
+                await HFDownloader.get_recommended_models(
+                    max_memory_bytes=16 * 1024**3
+                )
+
+    @pytest.mark.asyncio
+    async def test_search_models_timeout(self):
+        """search_models should raise TimeoutError when HF is unreachable."""
+        import time as time_mod
+
+        def slow_list_models(**kwargs):
+            time_mod.sleep(5)
+            return []
+
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+             patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = slow_list_models
+            mock_api_cls.return_value = mock_api
+
+            with pytest.raises(asyncio.TimeoutError):
+                await HFDownloader.search_models(query="test")
+
+    @pytest.mark.asyncio
+    async def test_get_model_info_timeout(self):
+        """get_model_info should raise TimeoutError when HF is unreachable."""
+        import time as time_mod
+
+        def slow_model_info(*args, **kwargs):
+            time_mod.sleep(5)
+
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+             patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.model_info.side_effect = slow_model_info
+            mock_api_cls.return_value = mock_api
+
+            with pytest.raises(asyncio.TimeoutError):
+                await HFDownloader.get_model_info("org/model")

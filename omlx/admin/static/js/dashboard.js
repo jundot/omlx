@@ -1592,6 +1592,8 @@
                 this.hfError = '';
                 this.hfSuccess = '';
                 this.hfDownloading = true;
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 15000);
 
                 try {
                     const response = await fetch('/admin/api/hf/download', {
@@ -1601,6 +1603,7 @@
                             repo_id: repoId,
                             hf_token: this.hfToken,
                         }),
+                        signal: controller.signal,
                     });
 
                     if (response.ok) {
@@ -1612,13 +1615,18 @@
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
-                        const data = await response.json();
+                        const data = await response.json().catch(() => ({}));
                         this.hfError = data.detail || window.t('js.error.start_download_failed');
                     }
                 } catch (err) {
+                    if (err.name === 'AbortError') {
+                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                    } else {
+                        this.hfError = window.t('js.error.start_download_connection');
+                    }
                     console.error('Failed to start download:', err);
-                    this.hfError = window.t('js.error.start_download_connection');
                 } finally {
+                    clearTimeout(timeoutId);
                     this.hfDownloading = false;
                     this.$nextTick(() => lucide.createIcons());
                 }
@@ -1742,8 +1750,10 @@
 
             async loadRecommendedModels() {
                 this.hfRecommendedLoading = true;
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 15000);
                 try {
-                    const response = await fetch('/admin/api/hf/recommended');
+                    const response = await fetch('/admin/api/hf/recommended', { signal: controller.signal });
                     if (response.ok) {
                         this.hfRecommended = await response.json();
                         this.hfRecommendedLoaded = true;
@@ -1751,10 +1761,21 @@
                         this.hfPage.popular = 1;
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
+                    } else {
+                        const data = await response.json().catch(() => ({}));
+                        this.hfError = data.detail || 'Failed to load recommended models';
+                        setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
+                    if (err.name === 'AbortError') {
+                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                    } else {
+                        this.hfError = 'Failed to connect to HuggingFace.';
+                    }
+                    setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Failed to load recommended models:', err);
                 } finally {
+                    clearTimeout(timeoutId);
                     this.hfRecommendedLoading = false;
                     this.$nextTick(() => lucide.createIcons());
                 }
@@ -1811,13 +1832,15 @@
                 this.hfSearchLoading = true;
                 this.hfRecommendedTab = 'search';
                 this.hfPage.search = 1;
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 15000);
                 try {
                     const params = new URLSearchParams({
                         q: this.hfSearchQuery,
                         sort: this.hfSearchSort,
                         limit: '100',
                     });
-                    const response = await fetch(`/admin/api/hf/search?${params}`);
+                    const response = await fetch(`/admin/api/hf/search?${params}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
                         this.hfSearchResults = data.models || [];
@@ -1826,10 +1849,21 @@
                         this.addSearchHistory(this.hfSearchQuery.trim());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
+                    } else {
+                        const data = await response.json().catch(() => ({}));
+                        this.hfError = data.detail || 'Search failed';
+                        setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
+                    if (err.name === 'AbortError') {
+                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                    } else {
+                        this.hfError = 'Failed to connect to HuggingFace.';
+                    }
+                    setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Search failed:', err);
                 } finally {
+                    clearTimeout(timeoutId);
                     this.hfSearchLoading = false;
                     this.$nextTick(() => lucide.createIcons());
                 }
@@ -1877,19 +1911,30 @@
             async openModelDetail(repoId) {
                 this.hfModelDetailLoading = true;
                 this.hfModelDetail = null;
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 15000);
                 try {
                     const params = new URLSearchParams({ repo_id: repoId });
-                    const response = await fetch(`/admin/api/hf/model-info?${params}`);
+                    const response = await fetch(`/admin/api/hf/model-info?${params}`, { signal: controller.signal });
                     if (response.ok) {
                         this.hfModelDetail = await response.json();
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
-                        console.error('Failed to fetch model info');
+                        const data = await response.json().catch(() => ({}));
+                        this.hfError = data.detail || 'Failed to fetch model info';
+                        setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
+                    if (err.name === 'AbortError') {
+                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                    } else {
+                        this.hfError = 'Failed to connect to HuggingFace.';
+                    }
+                    setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Failed to fetch model info:', err);
                 } finally {
+                    clearTimeout(timeoutId);
                     this.hfModelDetailLoading = false;
                     this.$nextTick(() => lucide.createIcons());
                 }

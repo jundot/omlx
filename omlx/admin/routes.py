@@ -2087,10 +2087,18 @@ async def get_recommended_models(is_admin: bool = Depends(require_admin)):
 
     from .hf_downloader import HFDownloader
 
-    result = await HFDownloader.get_recommended_models(
-        max_memory_bytes=max_memory, result_limit=50
-    )
-    return result
+    try:
+        result = await HFDownloader.get_recommended_models(
+            max_memory_bytes=max_memory, result_limit=50
+        )
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="HuggingFace API request timed out. The service may be temporarily unavailable.",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.get("/api/hf/search")
@@ -2106,12 +2114,20 @@ async def search_hf_models(
 
     from .hf_downloader import HFDownloader
 
-    result = await HFDownloader.search_models(
-        query=q.strip(),
-        sort=sort,
-        limit=min(limit, 100),
-    )
-    return result
+    try:
+        result = await HFDownloader.search_models(
+            query=q.strip(),
+            sort=sort,
+            limit=min(limit, 100),
+        )
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="HuggingFace API request timed out. The service may be temporarily unavailable.",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.get("/api/hf/model-info")
@@ -2127,11 +2143,22 @@ async def get_hf_model_info(
 
     from .hf_downloader import HFDownloader
 
+    from huggingface_hub.utils import RepositoryNotFoundError
+
     try:
         result = await HFDownloader.get_model_info(repo_id=repo_id.strip())
         return result
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="HuggingFace API request timed out. The service may be temporarily unavailable.",
+        )
+    except RepositoryNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"Model '{repo_id.strip()}' not found"
+        )
     except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.get("/api/hf/models")
