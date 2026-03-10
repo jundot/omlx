@@ -321,6 +321,13 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         return sampled, list(logprobs)
 
     def _process_prompts(self, prompts):
+        # Clear stale mRoPE position state from prior _process_prompts() call.
+        # With prefill_batch_size=1, _next() calls _process_prompts() once per
+        # prompt sequentially; the previous call's cached _position_ids would
+        # cause shape mismatches for mRoPE models (e.g. Qwen3.5).
+        if hasattr(self.model, "clear_vlm_position_state"):
+            self.model.clear_vlm_position_state()
+
         (
             uids,
             inputs,
@@ -3278,7 +3285,7 @@ class Scheduler:
                             ),
                         )
                     )
-                    output.finished_request_ids.append(rid)
+                    output.finished_request_ids.add(rid)
             else:
                 raise
 
