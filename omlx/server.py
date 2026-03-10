@@ -781,6 +781,11 @@ def init_server(
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
 
+    # Refresh i18n with loaded language setting
+    from .admin.routes import _refresh_i18n_globals
+
+    _refresh_i18n_globals()
+
     # Initialize auth with persistent secret key
     if global_settings:
         if not global_settings.auth.secret_key:

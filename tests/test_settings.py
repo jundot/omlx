@@ -345,7 +345,7 @@ class TestAuthSettings:
         """Test conversion to dictionary."""
         settings = AuthSettings(api_key="my-key")
         result = settings.to_dict()
-        assert result == {"api_key": "my-key", "secret_key": None}
+        assert result == {"api_key": "my-key", "secret_key": None, "skip_api_key_verification": False}
 
     def test_from_dict(self):
         """Test creation from dictionary."""
