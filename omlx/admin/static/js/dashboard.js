@@ -218,7 +218,6 @@
 
                 window.addEventListener('popstate', () => {
                     this.applyTabStateFromUrl();
-                    this.handleMainTabChange(this.mainTab);
                 });
             },
 
@@ -236,11 +235,11 @@
                     this.stopLogRefresh();
                 }
                 if (value === 'models') {
-                    await this.loadHFModels();
-                    await this.loadHFTasks();
+                    const loads = [this.loadHFModels(), this.loadHFTasks()];
                     if (this.modelsTab === 'downloader' && !this.hfRecommendedLoaded) {
-                        await this.loadRecommendedModels();
+                        loads.push(this.loadRecommendedModels());
                     }
+                    await Promise.all(loads);
                     const hasActive = this.hfTasks.some(t =>
                         t.status === 'pending' || t.status === 'downloading');
                     if (hasActive) this.startHFRefresh();
