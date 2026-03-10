@@ -161,6 +161,9 @@ class MockEnginePool:
     def current_model_memory(self) -> int:
         return 1000000
 
+    def resolve_model_id(self, model_id_or_alias, settings_manager=None):
+        return model_id_or_alias
+
     def get_model_ids(self) -> List[str]:
         return [m["id"] for m in self._models]
 
