@@ -152,6 +152,12 @@ class ServerManager:
                     self._consecutive_health_failures = 0
                     self._last_healthy_time = time.time()
                     self._update_status(ServerStatus.RUNNING)
+                elif self._process and self._process.poll() is not None:
+                    # Server crashed during startup
+                    exit_code = self._process.returncode
+                    self._try_auto_restart(
+                        f"Server exited with code {exit_code} during startup"
+                    )
             self._stop_health_check.wait(5)
 
     def _try_auto_restart(self, reason: str) -> None:
@@ -400,6 +406,16 @@ class ServerManager:
                 self._log_file_handle.close()
                 self._log_file_handle = None
 
+            return True
+
+        except ProcessLookupError:
+            # Process already dead — treat as successful stop
+            logger.info("Server process already exited during stop")
+            self._process = None
+            if self._log_file_handle:
+                self._log_file_handle.close()
+                self._log_file_handle = None
+            self._update_status(ServerStatus.STOPPED)
             return True
 
         except Exception as e:
