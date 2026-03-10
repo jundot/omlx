@@ -1642,6 +1642,106 @@ class TestStreamingHelperFunctions:
         assert "tool_calls" in finish_reasons
 
     @pytest.mark.asyncio
+    async def test_stream_chat_completion_with_long_bracket_tool_call_does_not_leak_markup(self):
+        """Long bracket envelopes should remain suppressed until complete."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        long_note = "x" * 320
+        final_text = (
+            "Before "
+            f'[Calling tool: get_weather({{"note":"{long_note}"}})]'
+            " After"
+        )
+        split_at = final_text.index("] After")
+
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text=final_text[:split_at],
+                new_text=final_text[:split_at],
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+                tool_calls=None,
+            ),
+            MockGenerationOutput(
+                text=final_text,
+                new_text=final_text[split_at:],
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"note": {"type": "string"}},
+                    "required": ["note"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+
+        content_deltas = []
+        tool_call_deltas = []
+        finish_reasons = []
+        for payload in payloads:
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            content = delta.get("content")
+            if content:
+                content_deltas.append(content)
+            if delta.get("tool_calls"):
+                tool_call_deltas.extend(delta["tool_calls"])
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                finish_reasons.append(finish_reason)
+
+        streamed_content = "".join(content_deltas)
+        assert "[Calling tool:" not in streamed_content
+        assert streamed_content == "Before  After"
+        assert len(tool_call_deltas) == 1
+        assert tool_call_deltas[0]["function"]["name"] == "get_weather"
+        assert json.loads(tool_call_deltas[0]["function"]["arguments"]) == {"note": long_note}
+        assert "tool_calls" in finish_reasons
+
+    @pytest.mark.asyncio
     async def test_stream_chat_completion_with_hyphen_namespaced_tool_call_parses_without_leak(self):
         """Hyphenated namespaced tool_call tags should parse into structured tool_calls."""
         from omlx.server import stream_chat_completion
@@ -1818,6 +1918,87 @@ class TestStreamingHelperFunctions:
 
         streamed_content = "".join(content_deltas)
         assert streamed_content == "Keep literal suffix <alpha:beta"
+        assert tool_call_deltas == []
+        assert "stop" in finish_reasons
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_preserves_non_tool_angle_identifier_suffix_literal(self):
+        """Trailing '<identifier' literal should not be dropped as tool-control markup."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Use <alpha",
+                new_text="Use <alpha",
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+
+        content_deltas = []
+        tool_call_deltas = []
+        finish_reasons = []
+        for payload in payloads:
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            content = delta.get("content")
+            if content:
+                content_deltas.append(content)
+            if delta.get("tool_calls"):
+                tool_call_deltas.extend(delta["tool_calls"])
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                finish_reasons.append(finish_reason)
+
+        streamed_content = "".join(content_deltas)
+        assert streamed_content == "Use <alpha"
         assert tool_call_deltas == []
         assert "stop" in finish_reasons
 

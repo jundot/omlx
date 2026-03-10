@@ -733,6 +733,29 @@ class TestToolCallStreamFilter:
         r3 = f.finish()
         assert r1 + r2 + r3 == "Lead in  tail"
 
+    def test_long_unresolved_bracket_envelope_does_not_leak_control_markup(self):
+        """Long unresolved bracket calls should stay buffered until envelope is complete."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        long_note = "x" * 320
+        prefix = 'Before [Calling tool: get_weather({"note":"'
+        chunk1 = prefix + long_note
+        chunk2 = '"})] After'
+
+        r1 = f.feed(chunk1)
+        r2 = f.feed(chunk2)
+        r3 = f.finish()
+        result = r1 + r2 + r3
+
+        assert "[Calling tool:" not in result
+        assert result == "Before  After"
+
+    def test_finish_preserves_non_tool_angle_identifier_suffix_literal(self):
+        """Non-tool literal tails like '<alpha' should not be dropped at stream end."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed("Use <alpha")
+        result += f.finish()
+        assert result == "Use <alpha"
+
     def test_partial_non_tool_namespaced_literal_is_preserved(self):
         """Namespaced-looking suffixes that are not :tool_call remain visible."""
         f = ToolCallStreamFilter(_make_tokenizer())

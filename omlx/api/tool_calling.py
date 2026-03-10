@@ -407,9 +407,41 @@ class ToolCallStreamFilter:
             # envelope vs literal prose.
             if "]" not in bracket_candidate:
                 keep = max(keep, len(bracket_candidate))
+                # Do not cap unresolved bracket candidates: capping can leak
+                # raw control markup once the prefix grows past the cap.
+                return keep
 
         # Cap retained suffix window to avoid unbounded buffering on malformed text.
         return min(keep, 128)
+
+    def _should_drop_tail_at_finish(self, tail: str) -> bool:
+        """Whether unresolved tail should be suppressed under strict mode."""
+        if not tail:
+            return False
+
+        for marker, _close in self._marker_pairs:
+            if marker.startswith(tail):
+                return True
+
+        if not tail.startswith("<"):
+            return False
+        if ">" in tail:
+            return False
+
+        body = tail[1:]
+        if not body:
+            return True
+        if body.startswith("/"):
+            return False
+
+        if ":" not in body:
+            # Preserve plain literal tails like "<alpha".
+            return False
+
+        ns, suffix = body.split(":", 1)
+        if not re.match(r"^[A-Za-z_][\w.-]*$", ns):
+            return False
+        return "tool_call".startswith(suffix)
 
     def feed(self, text: str) -> str:
         """Feed a content delta, return the portion safe to emit."""
@@ -467,8 +499,11 @@ class ToolCallStreamFilter:
 
         keep = self._partial_suffix_len(self._buffer)
         if keep >= len(self._buffer):
+            tail = self._buffer
             self._buffer = ""
-            return ""
+            if self._should_drop_tail_at_finish(tail):
+                return ""
+            return tail
 
         if keep:
             buf = self._buffer[:-keep]
