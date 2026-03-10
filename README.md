@@ -232,7 +232,7 @@ Supports all function calling formats available in mlx-lm, JSON schema validatio
 | Kimi K2 | `<\|tool_calls_section_begin\|>` |
 | Longcat | `<longcat_tool_call>` |
 
-Models not listed above may still work if their chat template accepts `tools` and their output uses a recognized `<tool_call>` XML format. Streaming requests with tool calls buffer all content and emit results at completion.
+Models not listed above may still work if their chat template accepts `tools` and their output uses a recognized `<tool_call>` XML format. For tool-enabled streaming, assistant text is emitted incrementally while known tool-call control markup is suppressed from visible content; structured tool calls are emitted after parsing the completed turn.
 
 ## Models
 
