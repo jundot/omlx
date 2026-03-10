@@ -77,13 +77,18 @@ EMBEDDING_MODEL_TYPES = {
     "xlm-roberta",
     "xlm_roberta",
     "modernbert",
-    "qwen3",
-    "gemma3-text",
-    "gemma3_text",
     "siglip",
     "colqwen2_5",
     "colqwen2-5",
     "lfm2",
+}
+
+# Model types that have both embedding and LLM variants.
+# These require architecture-based disambiguation via EMBEDDING_ARCHITECTURES.
+AMBIGUOUS_EMBEDDING_MODEL_TYPES = {
+    "qwen3",
+    "gemma3-text",
+    "gemma3_text",
 }
 
 # Known embedding architectures
@@ -134,8 +139,8 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     Checks:
     1. architectures field for reranker-specific classes (SequenceClassification)
-    2. model_type field against known embedding types
-    3. architectures field for embedding-specific classes
+    2. architectures field for embedding-specific classes
+    3. model_type field against known embedding types (unambiguous only)
     4. VLM detection via architectures, model_type, or vision_config presence
 
     Args:
@@ -160,7 +165,13 @@ def detect_model_type(model_path: Path) -> ModelType:
         if arch in RERANKER_ARCHITECTURES:
             return "reranker"
 
-    # Check model_type field for embedding
+    # Check architectures field for embedding (before model_type to avoid
+    # false positives from ambiguous model types like qwen3, gemma3-text)
+    for arch in architectures:
+        if arch in EMBEDDING_ARCHITECTURES:
+            return "embedding"
+
+    # Check model_type field for unambiguous embedding types
     model_type = config.get("model_type", "")
     # Normalize: replace hyphens with underscores and lowercase
     normalized_type = model_type.lower().replace("-", "_")
@@ -168,10 +179,17 @@ def detect_model_type(model_path: Path) -> ModelType:
     if normalized_type in EMBEDDING_MODEL_TYPES or model_type in EMBEDDING_MODEL_TYPES:
         return "embedding"
 
-    # Check architectures field for embedding
-    for arch in architectures:
-        if arch in EMBEDDING_ARCHITECTURES:
-            return "embedding"
+    # Ambiguous embedding types (have both embedding and LLM variants):
+    # only classified as embedding if architecture matched above
+    if (
+        normalized_type in AMBIGUOUS_EMBEDDING_MODEL_TYPES
+        or model_type in AMBIGUOUS_EMBEDDING_MODEL_TYPES
+    ):
+        logger.info(
+            f"Model type '{model_type}' has both embedding and LLM variants, "
+            f"but architecture {architectures} is not an embedding architecture "
+            "— treating as LLM"
+        )
 
     # Check for VLM: architectures field
     for arch in architectures:

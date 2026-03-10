@@ -153,6 +153,41 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
 
+    def test_detect_qwen3_causal_lm_is_llm(self, tmp_path):
+        """Qwen3 with CausalLM architecture should be LLM, not embedding."""
+        config = {
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_qwen3_embedding_by_architecture(self, tmp_path):
+        """Qwen3 with TextEmbedding architecture should be embedding."""
+        config = {
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForTextEmbedding"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "embedding"
+
+    def test_detect_qwen3_no_architecture_defaults_to_llm(self, tmp_path):
+        """Qwen3 without architectures field should default to LLM."""
+        config = {
+            "model_type": "qwen3",
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_gemma3_text_without_embedding_arch_is_llm(self, tmp_path):
+        """gemma3_text with non-embedding architecture should be LLM."""
+        config = {
+            "model_type": "gemma3_text",
+            "architectures": ["Gemma3TextForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
     def test_detect_vlm_model_type_requires_vision_config(self, tmp_path):
         """VLM_MODEL_TYPES match without vision_config should fall back to LLM."""
         config = {
