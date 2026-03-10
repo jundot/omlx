@@ -1242,3 +1242,93 @@ class TestHFAPITimeouts:
 
             with pytest.raises(asyncio.TimeoutError):
                 await HFDownloader.get_model_info("org/model")
+
+
+class TestHFEndpointPassthrough:
+    """Verify that custom HF endpoint is passed to snapshot_download and hf_hub_download."""
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        d = tmp_path / "models"
+        d.mkdir()
+        return d
+
+    @pytest.mark.asyncio
+    async def test_snapshot_download_receives_endpoint(self, model_dir):
+        """snapshot_download should receive endpoint= when mirror is configured."""
+        target_dir = model_dir / "model"
+        target_dir.mkdir()
+        (target_dir / "config.json").write_text("{}")
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.siblings = []
+        mock_api.model_info.return_value = mock_info
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, "https://hf-mirror.com"),
+        ), patch("omlx.admin.hf_downloader.snapshot_download") as mock_download:
+            downloader = HFDownloader(model_dir=str(model_dir))
+            task = await downloader.start_download("owner/model")
+            await asyncio.sleep(0.5)
+
+            mock_download.assert_called_once()
+            call_kwargs = mock_download.call_args[1]
+            assert call_kwargs["endpoint"] == "https://hf-mirror.com"
+
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_snapshot_download_endpoint_none_without_mirror(self, model_dir):
+        """snapshot_download should receive endpoint=None when no mirror is configured."""
+        target_dir = model_dir / "model"
+        target_dir.mkdir()
+        (target_dir / "config.json").write_text("{}")
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls, \
+             patch("omlx.admin.hf_downloader.snapshot_download") as mock_download:
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.siblings = []
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            downloader = HFDownloader(model_dir=str(model_dir))
+            task = await downloader.start_download("owner/model")
+            await asyncio.sleep(0.5)
+
+            mock_download.assert_called_once()
+            call_kwargs = mock_download.call_args[1]
+            assert call_kwargs["endpoint"] is None
+
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_hf_hub_download_receives_endpoint(self):
+        """hf_hub_download for README should receive endpoint= when mirror is configured."""
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.id = "org/test-model"
+        mock_info.downloads = 100
+        mock_info.likes = 10
+        mock_info.tags = []
+        mock_info.pipeline_tag = "text-generation"
+        mock_info.created_at = None
+        mock_info.last_modified = None
+        mock_info.safetensors = None
+        mock_info.card_data = None
+        mock_info.siblings = []
+        mock_api.model_info.return_value = mock_info
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, "https://hf-mirror.com"),
+        ), patch("omlx.admin.hf_downloader.hf_hub_download") as mock_hf_download:
+            mock_hf_download.side_effect = Exception("no readme")
+
+            await HFDownloader.get_model_info("org/test-model")
+
+            mock_hf_download.assert_called_once()
+            call_kwargs = mock_hf_download.call_args[1]
+            assert call_kwargs["endpoint"] == "https://hf-mirror.com"

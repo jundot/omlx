@@ -29,17 +29,21 @@ logger = logging.getLogger(__name__)
 _HF_API_TIMEOUT = 10
 
 
-def _get_hf_api() -> HfApi:
-    """Create HfApi instance with configured endpoint."""
+def _get_hf_api() -> tuple[HfApi, str | None]:
+    """Create HfApi instance with configured endpoint.
+
+    Returns:
+        Tuple of (HfApi instance, endpoint URL or None).
+    """
     try:
         from ..settings import get_settings
 
         endpoint = get_settings().huggingface.endpoint
         if endpoint:
-            return HfApi(endpoint=endpoint)
+            return HfApi(endpoint=endpoint), endpoint
     except (RuntimeError, AttributeError):
         pass
-    return HfApi()
+    return HfApi(), None
 
 
 class DownloadStatus(str, enum.Enum):
@@ -176,7 +180,7 @@ class HFDownloader:
         Returns:
             Dict with 'trending' and 'popular' lists.
         """
-        api = _get_hf_api()
+        api, _endpoint = _get_hf_api()
 
         async def _fetch(sort: str) -> list[dict]:
             models = await asyncio.wait_for(
@@ -243,7 +247,7 @@ class HFDownloader:
         Returns:
             Dict with 'models' list and 'total' count.
         """
-        api = _get_hf_api()
+        api, _endpoint = _get_hf_api()
         sort_key = _SORT_MAP.get(sort, "trendingScore")
 
         models = await asyncio.wait_for(
@@ -304,7 +308,7 @@ class HFDownloader:
         Returns:
             Dict with model details including description, files, tags, etc.
         """
-        api = _get_hf_api()
+        api, endpoint = _get_hf_api()
         info = await asyncio.wait_for(
             asyncio.to_thread(
                 api.model_info,
@@ -348,6 +352,7 @@ class HFDownloader:
                     hf_hub_download,
                     repo_id=repo_id,
                     filename="README.md",
+                    endpoint=endpoint,
                 ),
                 timeout=_HF_API_TIMEOUT,
             )
@@ -545,7 +550,7 @@ class HFDownloader:
         try:
             # Get total repo size for progress estimation
             try:
-                api = _get_hf_api()
+                api, endpoint = _get_hf_api()
                 model_info = await asyncio.wait_for(
                     asyncio.to_thread(
                         api.model_info,
@@ -580,6 +585,7 @@ class HFDownloader:
                 repo_id=task.repo_id,
                 local_dir=str(target_dir),
                 token=hf_token or None,
+                endpoint=endpoint,
             )
 
             # Check if cancelled while downloading
