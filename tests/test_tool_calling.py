@@ -616,9 +616,9 @@ class TestToolCallStreamFilter:
     """Tests for ToolCallStreamFilter."""
 
     def test_no_marker_passthrough(self):
-        """No tool_call_start attribute -> all text passes through."""
+        """Without tokenizer marker, fallback envelopes are still active."""
         f = ToolCallStreamFilter(_make_tokenizer())
-        assert not f.active
+        assert f.active
         assert f.feed("hello world") == "hello world"
         assert f.finish() == ""
 
@@ -677,16 +677,38 @@ class TestToolCallStreamFilter:
         result += f.finish()
         assert result == "Hi"
 
-    def test_finish_flushes_buffer_no_marker(self):
-        """finish() emits buffered chars when no marker found."""
+    def test_finish_drops_partial_marker_suffix_under_strict_mode(self):
+        """finish() suppresses unresolved control-marker suffixes."""
         f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
         # Feed text shorter than marker - all buffered
         r1 = f.feed("<tool")
         r2 = f.finish()
-        assert r1 + r2 == "<tool"
+        assert r1 + r2 == ""
 
     def test_suppressing_blocks_finish(self):
         """Once suppressing, finish() returns nothing."""
         f = ToolCallStreamFilter(_make_tokenizer("<tc>"))
         f.feed("text<tc>rest")
+        assert f.finish() == ""
+
+    def test_bracket_literal_passthrough(self):
+        """Bracket-style literal text should pass through unchanged."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed("Heads up: [Calling tool:")
+        result += f.feed(" maybe later]")
+        result += f.finish()
+        assert result == "Heads up: [Calling tool: maybe later]"
+
+    def test_partial_non_tool_namespaced_literal_is_preserved(self):
+        """Namespaced-looking suffixes that are not :tool_call remain visible."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed("Keep literal <alpha:beta")
+        result += f.finish()
+        assert result == "Keep literal <alpha:beta"
+
+    def test_hyphen_namespaced_tool_call_open_suppresses_markup(self):
+        """Hyphenated namespace tool-call open tag should trigger suppression."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed("Before <foo-bar:tool_call><invoke name=\"x\">")
+        assert result == "Before "
         assert f.finish() == ""

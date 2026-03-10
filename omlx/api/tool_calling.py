@@ -278,7 +278,7 @@ def parse_tool_calls(
         return _parse_xml_tool_calls(cleaned_text)
 
     # Fallback: namespaced tool_call tags (e.g. <minimax:tool_call>)
-    ns_match = re.search(r'<(\w+):tool_call>', cleaned_text)
+    ns_match = re.search(r'<([A-Za-z_][\w.-]*):tool_call>', cleaned_text)
     if ns_match:
         ns = ns_match.group(1)
         return _parse_namespaced_tool_calls(cleaned_text, ns)
@@ -308,10 +308,9 @@ class ToolCallStreamFilter:
 
     def __init__(self, tokenizer: Any):
         marker = getattr(tokenizer, "tool_call_start", "") or ""
-        self._start_markers: List[str] = ["<tool_call>", "[Calling tool:"]
+        self._start_markers: List[str] = ["<tool_call>"]
         if marker:
             self._start_markers.insert(0, marker)
-        self._max_marker_len = max((len(m) for m in self._start_markers), default=0)
         self._namespaced_open_re = re.compile(r"<[A-Za-z_][\w.-]*:tool_call>")
         self._buffer = ""
         self._suppressing = False
@@ -352,9 +351,20 @@ class ToolCallStreamFilter:
             return False
         if ">" in candidate:
             return False
-        if candidate == "<":
+
+        body = candidate[1:]
+        if not body:
             return True
-        return re.match(r"^<[A-Za-z_][\w.-]*(?::[\w.-]*)?$", candidate) is not None
+        if body.startswith("/"):
+            return False
+
+        if ":" not in body:
+            return re.match(r"^[A-Za-z_][\w.-]*$", body) is not None
+
+        ns, suffix = body.split(":", 1)
+        if not re.match(r"^[A-Za-z_][\w.-]*$", ns):
+            return False
+        return "tool_call".startswith(suffix)
 
     def _partial_suffix_len(self, text: str) -> int:
         """Length of trailing suffix that might be an opening-marker prefix."""
