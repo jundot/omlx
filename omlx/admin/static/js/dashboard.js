@@ -2,6 +2,9 @@
     const OCR_CONFIG_MODEL_TYPES = new Set([
         'deepseekocr', 'deepseekocr_2', 'dots_ocr', 'glm_ocr',
     ]);
+    const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
+    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
+    const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader']);
 
     function dashboard() {
         return {
@@ -190,6 +193,7 @@
             async init() {
                 // Apply theme
                 this.applyTheme();
+                this.applyTabStateFromUrl();
 
                 await Promise.all([
                     this.loadGlobalSettings(),
@@ -199,43 +203,98 @@
                     lucide.createIcons();
                 });
 
-                // Load stats and start polling if starting on status tab
-                if (this.mainTab === 'status') {
-                    await this.loadStats();
-                    this.startStatsRefresh();
-                }
+                await this.handleMainTabChange(this.mainTab);
 
                 // Watch for main tab changes to manage refresh timers
                 this.$watch('mainTab', (value) => {
-                    if (value === 'status') {
-                        this.loadStats();
-                        this.startStatsRefresh();
-                    } else {
-                        this.stopStatsRefresh();
-                    }
-                    if (value === 'logs') {
-                        this.loadLogs();
-                        this.startLogRefresh();
-                    } else {
-                        this.stopLogRefresh();
-                    }
-                    if (value === 'models') {
-                        this.loadHFModels();
-                        this.loadHFTasks();
-                        if (this.modelsTab === 'downloader') {
-                            if (!this.hfRecommendedLoaded) this.loadRecommendedModels();
-                        }
-                        const hasActive = this.hfTasks.some(t =>
-                            t.status === 'pending' || t.status === 'downloading');
-                        if (hasActive) this.startHFRefresh();
-                    } else {
-                        this.stopHFRefresh();
-                    }
-                    if (value === 'bench') {
-                        if (!this.benchDeviceInfo) this.loadBenchDeviceInfo();
-                    }
-                    this.$nextTick(() => lucide.createIcons());
+                    this.handleMainTabChange(value);
                 });
+
+                window.addEventListener('popstate', () => {
+                    this.applyTabStateFromUrl();
+                    this.handleMainTabChange(this.mainTab);
+                });
+            },
+
+            async handleMainTabChange(value) {
+                if (value === 'status') {
+                    await this.loadStats();
+                    this.startStatsRefresh();
+                } else {
+                    this.stopStatsRefresh();
+                }
+                if (value === 'logs') {
+                    await this.loadLogs();
+                    this.startLogRefresh();
+                } else {
+                    this.stopLogRefresh();
+                }
+                if (value === 'models') {
+                    await this.loadHFModels();
+                    await this.loadHFTasks();
+                    if (this.modelsTab === 'downloader' && !this.hfRecommendedLoaded) {
+                        await this.loadRecommendedModels();
+                    }
+                    const hasActive = this.hfTasks.some(t =>
+                        t.status === 'pending' || t.status === 'downloading');
+                    if (hasActive) this.startHFRefresh();
+                } else {
+                    this.stopHFRefresh();
+                }
+                if (value === 'bench' && !this.benchDeviceInfo) {
+                    await this.loadBenchDeviceInfo();
+                }
+                this.$nextTick(() => lucide.createIcons());
+            },
+
+            applyTabStateFromUrl() {
+                const params = new URLSearchParams(window.location.search);
+                const mainTab = params.get('tab');
+                const settingsTab = params.get('settingsTab');
+                const modelsTab = params.get('modelsTab');
+
+                this.mainTab = DASHBOARD_MAIN_TABS.has(mainTab) ? mainTab : 'status';
+                this.activeTab = DASHBOARD_SETTINGS_TABS.has(settingsTab) ? settingsTab : 'global';
+                this.modelsTab = DASHBOARD_MODELS_TABS.has(modelsTab) ? modelsTab : 'manager';
+            },
+
+            syncTabStateToUrl() {
+                const url = new URL(window.location.href);
+                url.searchParams.set('tab', this.mainTab);
+
+                if (this.mainTab === 'settings') {
+                    url.searchParams.set('settingsTab', this.activeTab);
+                } else {
+                    url.searchParams.delete('settingsTab');
+                }
+
+                if (this.mainTab === 'models') {
+                    url.searchParams.set('modelsTab', this.modelsTab);
+                } else {
+                    url.searchParams.delete('modelsTab');
+                }
+
+                window.history.replaceState({}, '', url);
+            },
+
+            setMainTab(tab) {
+                if (!DASHBOARD_MAIN_TABS.has(tab)) return;
+                this.mainTab = tab;
+                this.syncTabStateToUrl();
+            },
+
+            setSettingsTab(tab) {
+                if (!DASHBOARD_SETTINGS_TABS.has(tab)) return;
+                this.activeTab = tab;
+                this.mainTab = 'settings';
+                this.syncTabStateToUrl();
+            },
+
+            setModelsTab(tab) {
+                if (!DASHBOARD_MODELS_TABS.has(tab)) return;
+                this.modelsTab = tab;
+                this.mainTab = 'models';
+                this.syncTabStateToUrl();
             },
 
             async loadGlobalSettings() {

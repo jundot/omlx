@@ -3,7 +3,7 @@
                     <!-- Sub-tab navigation (Manager / Downloader) -->
                     <div class="flex items-center gap-2 mb-10 animate-fade-in-up">
                         <button
-                            @click="modelsTab = 'manager'; loadHFModels();"
+                            @click="setModelsTab('manager'); loadHFModels();"
                             :class="modelsTab === 'manager'
                                 ? 'bg-neutral-900 text-white'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
@@ -11,7 +11,7 @@
                             {{ t('models.tab.manager') }}
                         </button>
                         <button
-                            @click="modelsTab = 'downloader'; if (!hfRecommendedLoaded) loadRecommendedModels(); loadHFTasks();"
+                            @click="setModelsTab('downloader'); if (!hfRecommendedLoaded) loadRecommendedModels(); loadHFTasks();"
                             :class="modelsTab === 'downloader'
                                 ? 'bg-neutral-900 text-white'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
