@@ -1323,6 +1323,7 @@ class TestCacheCorruptionRecovery:
 
         assert failed == ["req-1"]
         assert "req-1" not in scheduler.running
+        assert "req-1" not in scheduler.requests
         # Other requests should be rescheduled
         waiting_ids = {r.request_id for r in scheduler.waiting}
         assert "req-0" in waiting_ids
@@ -1354,6 +1355,7 @@ class TestCacheCorruptionRecovery:
             num_prompt_tokens=2,
         )
         scheduler.waiting.append(wait_req)
+        scheduler.requests[wait_req.request_id] = wait_req
 
         failed_ids = scheduler.fail_all_requests()
 
@@ -1361,3 +1363,21 @@ class TestCacheCorruptionRecovery:
         assert len(scheduler.running) == 0
         assert len(scheduler.waiting) == 0
         assert not scheduler.has_requests()
+        # Verify requests dict is also cleaned up (no memory leak)
+        for rid in failed_ids:
+            assert rid not in scheduler.requests
+
+    def test_fail_all_requests_preserves_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        """fail_all_requests resets batch_generator but preserves block cache."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler.batch_generator = MagicMock()
+        scheduler.block_aware_cache = MagicMock()
+
+        scheduler.fail_all_requests()
+
+        assert scheduler.batch_generator is None
+        assert scheduler._current_sampler_params is None
+        # Cache should NOT be cleared (not a corruption error)
+        scheduler.block_aware_cache.clear.assert_not_called()

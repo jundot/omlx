@@ -2476,17 +2476,31 @@ class Scheduler:
         Used as a safety net by engine_core when step() raises an
         unexpected exception, to prevent infinite loops.
 
+        Only resets batch_generator (not full cache) because this method
+        is called for non-corruption errors — corruption is already
+        handled inside step().
+
         Returns:
             List of failed request IDs.
         """
         failed_ids: List[str] = []
         for request_id in list(self.running):
             failed_ids.append(request_id)
+            req = self.requests.pop(request_id, None)
+            if req is not None:
+                req._extracted_cache = None
+                req.prompt_cache = None
         self.running.clear()
         for request in list(self.waiting):
             failed_ids.append(request.request_id)
+            req = self.requests.pop(request.request_id, None)
+            if req is not None:
+                req._extracted_cache = None
+                req.prompt_cache = None
         self.waiting.clear()
-        self._recover_from_cache_error()
+        # Reset batch generator only (cache is not corrupted)
+        self.batch_generator = None
+        self._current_sampler_params = None
         return failed_ids
 
     def get_num_waiting(self) -> int:
@@ -3106,6 +3120,11 @@ class Scheduler:
                 if request.cache_corruption_retries > max_corruption_retries:
                     failed_ids.append(request_id)
                     del self.running[request_id]
+                    # Clean up from requests dict (prevent memory leak)
+                    req = self.requests.pop(request_id, None)
+                    if req is not None:
+                        req._extracted_cache = None
+                        req.prompt_cache = None
                     continue
 
             # Reset scheduling state
