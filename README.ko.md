@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <a href="mailto:junkim.dot@gmail.com">junkim.dot@gmail.com</a>
+  <a href="mailto:junkim.dot@gmail.com">junkim.dot@gmail.com</a> · <a href="https://omlx.ai/me">https://omlx.ai/me</a>
 </p>
 
 <p align="center">
