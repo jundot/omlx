@@ -98,6 +98,10 @@
   "models.downloader.section_label": "模型",
   "models.downloader.heading": "模型下载器",
   "models.downloader.description": "从 HuggingFace 下载模型并浏览可用模型。",
+  "models.downloader.mirror_settings": "镜像设置",
+  "models.downloader.mirror_cancel": "取消",
+  "models.downloader.mirror_save": "保存",
+  "models.downloader.mirror_saving": "保存中...",
   "models.downloader.download_section": "从 HuggingFace 下载",
   "models.downloader.repo_id": "仓库 ID",
   "models.downloader.repo_placeholder": "mlx-community/Llama-3-8B-4bit",
@@ -216,6 +220,11 @@
   "settings.mcp.restart_badge": "需要重启",
   "settings.mcp.config_path": "配置路径",
   "settings.mcp.config_placeholder": "MCP 配置文件路径",
+
+  "settings.huggingface.endpoint": "镜像端点",
+  "settings.huggingface.endpoint_hint": "HuggingFace API 自定义端点 URL（例如 https://hf-mirror.com）",
+  "settings.huggingface.endpoint_clear_hint": "要使用默认端点，请清空输入框并保存。",
+
   "settings.advanced.section_label": "高级",
   "settings.advanced.restart_badge": "需要重启",
   "settings.advanced.batching": "批处理",

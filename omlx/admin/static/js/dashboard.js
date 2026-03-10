@@ -24,6 +24,7 @@
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256 },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
+                huggingface: { endpoint: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
                 ui: { language: 'en' },
@@ -127,6 +128,11 @@
             // Models sub-tab state
             modelsTab: 'manager',
             modelsDropdown: false,
+
+            // HF Mirror settings modal
+            showHfMirrorModal: false,
+            hfMirrorEndpoint: '',
+            hfMirrorSaving: false,
 
             // HF Downloader state
             hfRepoId: '',
@@ -258,6 +264,7 @@
                             cache: { ...this.globalSettings.cache, ...data.cache },
                             sampling: { ...this.globalSettings.sampling, ...data.sampling },
                             mcp: { ...this.globalSettings.mcp, ...data.mcp },
+                            huggingface: { ...this.globalSettings.huggingface, ...data.huggingface },
                             auth: { ...this.globalSettings.auth, ...data.auth },
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             system: { ...this.globalSettings.system, ...data.system },
@@ -1579,6 +1586,39 @@
 
             applyTheme() {
                 document.documentElement.setAttribute('data-theme', this.theme);
+            },
+
+            // =================================================================
+            // HuggingFace Mirror Settings
+            // =================================================================
+
+            openHfMirrorModal() {
+                this.hfMirrorEndpoint = this.globalSettings.huggingface.endpoint || '';
+                this.showHfMirrorModal = true;
+            },
+
+            async saveHfMirrorEndpoint() {
+                this.hfMirrorSaving = true;
+                try {
+                    const response = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ hf_endpoint: this.hfMirrorEndpoint }),
+                    });
+                    if (response.ok) {
+                        this.globalSettings.huggingface.endpoint = this.hfMirrorEndpoint;
+                        this.showHfMirrorModal = false;
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await response.json();
+                        alert(Array.isArray(data.detail) ? data.detail.join(', ') : (data.detail || 'Failed to save'));
+                    }
+                } catch (err) {
+                    console.error('Failed to save HF mirror endpoint:', err);
+                } finally {
+                    this.hfMirrorSaving = false;
+                }
             },
 
             // =================================================================

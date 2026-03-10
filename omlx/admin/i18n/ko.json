@@ -104,6 +104,10 @@
   "models.downloader.section_label": "모델",
   "models.downloader.heading": "모델 다운로드",
   "models.downloader.description": "HuggingFace에서 모델을 다운로드하고 사용 가능한 모델을 탐색합니다.",
+  "models.downloader.mirror_settings": "미러 설정",
+  "models.downloader.mirror_cancel": "취소",
+  "models.downloader.mirror_save": "저장",
+  "models.downloader.mirror_saving": "저장 중...",
   "models.downloader.download_section": "HuggingFace에서 다운로드",
   "models.downloader.repo_id": "리포지토리 ID",
   "models.downloader.repo_placeholder": "mlx-community/Llama-3-8B-4bit",
@@ -235,6 +239,10 @@
   "settings.mcp.restart_badge": "재시작 필요",
   "settings.mcp.config_path": "설정 경로",
   "settings.mcp.config_placeholder": "MCP 설정 파일 경로",
+
+  "settings.huggingface.endpoint": "미러 엔드포인트",
+  "settings.huggingface.endpoint_hint": "HuggingFace API 커스텀 엔드포인트 URL (예: https://hf-mirror.com)",
+  "settings.huggingface.endpoint_clear_hint": "기본 엔드포인트를 사용하려면 입력값을 삭제하고 저장하세요.",
 
   "settings.advanced.section_label": "고급",
   "settings.advanced.restart_badge": "재시작 필요",

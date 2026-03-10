@@ -29,6 +29,19 @@ logger = logging.getLogger(__name__)
 _HF_API_TIMEOUT = 10
 
 
+def _get_hf_api() -> HfApi:
+    """Create HfApi instance with configured endpoint."""
+    try:
+        from ..settings import get_settings
+
+        endpoint = get_settings().huggingface.endpoint
+        if endpoint:
+            return HfApi(endpoint=endpoint)
+    except (RuntimeError, AttributeError):
+        pass
+    return HfApi()
+
+
 class DownloadStatus(str, enum.Enum):
     """Status of a download task."""
 
@@ -163,7 +176,7 @@ class HFDownloader:
         Returns:
             Dict with 'trending' and 'popular' lists.
         """
-        api = HfApi()
+        api = _get_hf_api()
 
         async def _fetch(sort: str) -> list[dict]:
             models = await asyncio.wait_for(
@@ -230,7 +243,7 @@ class HFDownloader:
         Returns:
             Dict with 'models' list and 'total' count.
         """
-        api = HfApi()
+        api = _get_hf_api()
         sort_key = _SORT_MAP.get(sort, "trendingScore")
 
         models = await asyncio.wait_for(
@@ -291,7 +304,7 @@ class HFDownloader:
         Returns:
             Dict with model details including description, files, tags, etc.
         """
-        api = HfApi()
+        api = _get_hf_api()
         info = await asyncio.wait_for(
             asyncio.to_thread(
                 api.model_info,
@@ -532,7 +545,7 @@ class HFDownloader:
         try:
             # Get total repo size for progress estimation
             try:
-                api = HfApi()
+                api = _get_hf_api()
                 model_info = await asyncio.wait_for(
                     asyncio.to_thread(
                         api.model_info,

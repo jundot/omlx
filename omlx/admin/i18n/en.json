@@ -104,6 +104,10 @@
     "models.downloader.section_label": "Models",
     "models.downloader.heading": "Model Downloader",
     "models.downloader.description": "Download models from HuggingFace and browse available models.",
+    "models.downloader.mirror_settings": "Mirror Settings",
+    "models.downloader.mirror_cancel": "Cancel",
+    "models.downloader.mirror_save": "Save",
+    "models.downloader.mirror_saving": "Saving...",
     "models.downloader.download_section": "Download from HuggingFace",
     "models.downloader.repo_id": "Repository ID",
     "models.downloader.repo_placeholder": "mlx-community/Llama-3-8B-4bit",
@@ -235,6 +239,10 @@
     "settings.mcp.restart_badge": "Restart needed",
     "settings.mcp.config_path": "Config Path",
     "settings.mcp.config_placeholder": "Path to MCP config",
+
+    "settings.huggingface.endpoint": "Mirror Endpoint",
+    "settings.huggingface.endpoint_hint": "Custom endpoint URL for HuggingFace API (e.g. https://hf-mirror.com)",
+    "settings.huggingface.endpoint_clear_hint": "To use the default endpoint, clear the field and save.",
 
     "settings.advanced.section_label": "Advanced",
     "settings.advanced.restart_badge": "Restart needed",

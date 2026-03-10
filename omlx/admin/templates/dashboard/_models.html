@@ -102,7 +102,17 @@
                         <!-- Header -->
                         <div class="mb-8">
                             <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('models.downloader.section_label') }}</h2>
-                            <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('models.downloader.heading') }}</h3>
+                            <div class="flex items-center gap-3">
+                                <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('models.downloader.heading') }}</h3>
+                                <div class="relative group">
+                                    <button @click="openHfMirrorModal()"
+                                            class="p-1.5 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all">
+                                        <i data-lucide="settings" class="w-4 h-4"></i>
+                                    </button>
+                                    <div class="absolute left-1/2 -translate-x-1/2 top-full mt-1.5 px-2.5 py-1 text-xs font-medium text-white bg-neutral-800 rounded-md whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none"
+                                         x-text="t('models.downloader.mirror_settings')"></div>
+                                </div>
+                            </div>
                             <p class="text-sm text-neutral-500 mt-2">{{ t('models.downloader.description') }}</p>
                         </div>
 

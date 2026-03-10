@@ -85,6 +85,10 @@ def serve_command(args):
     # Ensure required directories exist
     settings.ensure_directories()
 
+    # Apply HuggingFace endpoint if configured
+    if settings.huggingface.endpoint:
+        os.environ["HF_ENDPOINT"] = settings.huggingface.endpoint
+
     # Save CLI args to settings.json if non-default values provided
     if _has_cli_overrides(args):
         try:
@@ -323,6 +327,14 @@ Example directory structure:
         type=str,
         default=None,
         help="Path to MCP configuration file (JSON/YAML) for tool integration",
+    )
+
+    # HuggingFace options
+    serve_parser.add_argument(
+        "--hf-endpoint",
+        type=str,
+        default=None,
+        help="Custom HuggingFace Hub endpoint URL (e.g., https://hf-mirror.com)",
     )
 
     # Base path and auth

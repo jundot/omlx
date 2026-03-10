@@ -15,6 +15,7 @@ from omlx.settings import (
     CacheSettings,
     ClaudeCodeSettings,
     GlobalSettings,
+    HuggingFaceSettings,
     LoggingSettings,
     MCPSettings,
     MemorySettings,
@@ -386,6 +387,43 @@ class TestMCPSettings:
         data = {"config_path": "/some/path.json"}
         settings = MCPSettings.from_dict(data)
         assert settings.config_path == "/some/path.json"
+
+
+class TestHuggingFaceSettings:
+    """Tests for HuggingFaceSettings dataclass."""
+
+    def test_defaults(self):
+        """Test default values."""
+        settings = HuggingFaceSettings()
+        assert settings.endpoint == ""
+
+    def test_custom_values(self):
+        """Test custom values."""
+        settings = HuggingFaceSettings(endpoint="https://hf-mirror.com")
+        assert settings.endpoint == "https://hf-mirror.com"
+
+    def test_to_dict(self):
+        """Test conversion to dictionary."""
+        settings = HuggingFaceSettings(endpoint="https://hf-mirror.com")
+        result = settings.to_dict()
+        assert result == {"endpoint": "https://hf-mirror.com"}
+
+    def test_to_dict_empty(self):
+        """Test conversion to dictionary with empty endpoint."""
+        settings = HuggingFaceSettings()
+        result = settings.to_dict()
+        assert result == {"endpoint": ""}
+
+    def test_from_dict(self):
+        """Test creation from dictionary."""
+        data = {"endpoint": "https://hf-mirror.com"}
+        settings = HuggingFaceSettings.from_dict(data)
+        assert settings.endpoint == "https://hf-mirror.com"
+
+    def test_from_dict_defaults(self):
+        """Test creation from empty dictionary uses defaults."""
+        settings = HuggingFaceSettings.from_dict({})
+        assert settings.endpoint == ""
 
 
 class TestLoggingSettings:
@@ -794,6 +832,27 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert len(errors) >= 3
 
+    def test_validate_hf_endpoint_empty_ok(self):
+        """Test empty HuggingFace endpoint passes validation."""
+        settings = GlobalSettings()
+        settings.huggingface.endpoint = ""
+        errors = settings.validate()
+        assert not any("huggingface" in e.lower() for e in errors)
+
+    def test_validate_hf_endpoint_valid(self):
+        """Test valid HuggingFace endpoint passes validation."""
+        settings = GlobalSettings()
+        settings.huggingface.endpoint = "https://hf-mirror.com"
+        errors = settings.validate()
+        assert not any("huggingface" in e.lower() for e in errors)
+
+    def test_validate_hf_endpoint_invalid(self):
+        """Test invalid HuggingFace endpoint fails validation."""
+        settings = GlobalSettings()
+        settings.huggingface.endpoint = "not-a-url"
+        errors = settings.validate()
+        assert any("huggingface" in e.lower() for e in errors)
+
     def test_env_override_server(self):
         """Test environment variable override for server settings."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -901,6 +960,17 @@ class TestGlobalSettings:
             ):
                 settings = GlobalSettings.load(base_path=tmpdir)
                 assert settings.mcp.config_path == "/env/mcp.json"
+
+    def test_env_override_hf_endpoint(self):
+        """Test environment variable override for HuggingFace settings."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {"OMLX_HF_ENDPOINT": "https://hf-mirror.com"},
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.huggingface.endpoint == "https://hf-mirror.com"
 
     def test_env_override_invalid_port_logs_warning(self):
         """Test invalid OMLX_PORT logs warning and keeps default."""

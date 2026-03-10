@@ -38,6 +38,49 @@
 
     <!-- Model Settings Modal -->
     {% include "dashboard/_modal_model_settings.html" %}
+
+    <!-- HF Mirror Settings Modal -->
+    <div x-show="showHfMirrorModal" x-cloak
+         class="fixed inset-0 z-50 overflow-y-auto"
+         @keydown.escape.window="showHfMirrorModal = false">
+        <div class="fixed inset-0 bg-black/50" @click="showHfMirrorModal = false"></div>
+        <div class="flex min-h-full items-center justify-center p-4">
+            <div class="relative bg-white rounded-2xl shadow-2xl max-w-md w-[28rem] overflow-hidden"
+                 @click.stop>
+                <div class="flex items-center justify-between px-6 py-4 border-b border-neutral-200">
+                    <h3 class="text-base font-semibold text-neutral-900">{{ t('models.downloader.mirror_settings') }}</h3>
+                    <button @click="showHfMirrorModal = false"
+                            class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all">
+                        <i data-lucide="x" class="w-4 h-4"></i>
+                    </button>
+                </div>
+                <div class="px-6 py-5">
+                    <label class="block text-sm font-medium text-neutral-700 mb-1.5">{{ t('settings.huggingface.endpoint') }}</label>
+                    <p class="text-xs text-neutral-400 mb-1.5">{{ t('settings.huggingface.endpoint_hint') }}</p>
+                    <p class="text-xs text-neutral-400 mb-3">{{ t('settings.huggingface.endpoint_clear_hint') }}</p>
+                    <input type="text" x-model="hfMirrorEndpoint"
+                           placeholder="https://huggingface.co"
+                           @keydown.enter="saveHfMirrorEndpoint()"
+                           class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                </div>
+                <div class="flex items-center justify-end gap-3 px-6 py-4 border-t border-neutral-100 bg-neutral-50">
+                    <button @click="showHfMirrorModal = false"
+                            class="px-4 py-2 text-sm text-neutral-600 hover:text-neutral-900 transition-colors">
+                        {{ t('models.downloader.mirror_cancel') }}
+                    </button>
+                    <button @click="saveHfMirrorEndpoint()"
+                            :disabled="hfMirrorSaving"
+                            class="px-4 py-2 text-sm font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 transition-all">
+                        <span x-show="!hfMirrorSaving">{{ t('models.downloader.mirror_save') }}</span>
+                        <span x-show="hfMirrorSaving" class="flex items-center gap-2">
+                            <svg class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                            {{ t('models.downloader.mirror_saving') }}
+                        </span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
 {% endblock %}
 

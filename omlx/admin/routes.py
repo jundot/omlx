@@ -105,6 +105,9 @@ class GlobalSettingsRequest(BaseModel):
     # MCP settings
     mcp_config: Optional[str] = None
 
+    # HuggingFace settings
+    hf_endpoint: Optional[str] = None
+
     # Sampling defaults
     sampling_max_context_window: Optional[int] = None
     sampling_max_tokens: Optional[int] = None
@@ -1393,6 +1396,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "mcp": {
             "config_path": global_settings.mcp.config_path,
         },
+        "huggingface": {
+            "endpoint": global_settings.huggingface.endpoint,
+        },
         "sampling": {
             "max_context_window": global_settings.sampling.max_context_window,
             "max_tokens": global_settings.sampling.max_tokens,
@@ -1571,6 +1577,19 @@ async def update_global_settings(
     # Apply MCP settings (restart required)
     if request.mcp_config is not None:
         global_settings.mcp.config_path = request.mcp_config if request.mcp_config else None
+
+    # Apply HuggingFace settings (Live - immediately applied via env var)
+    if request.hf_endpoint is not None:
+        global_settings.huggingface.endpoint = request.hf_endpoint
+        if request.hf_endpoint:
+            os.environ["HF_ENDPOINT"] = request.hf_endpoint
+        elif "HF_ENDPOINT" in os.environ:
+            del os.environ["HF_ENDPOINT"]
+        runtime_applied.append("hf_endpoint")
+        logger.info(
+            f"HuggingFace endpoint updated to: "
+            f"{request.hf_endpoint or '(default)'}"
+        )
 
     # Apply sampling settings (Live - immediately applied)
     sampling_changed = False
