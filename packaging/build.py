@@ -69,9 +69,12 @@ def clean_all(preserve_venv: bool = False):
     ]
 
     def _rm_onerror(func, path, exc_info):
-        """Handle .DS_Store and other permission errors during rmtree."""
+        """Handle .DS_Store, permission errors, and non-empty dirs during rmtree."""
         os.chmod(path, 0o777)
-        func(path)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            func(path)
 
     for d in dirs_to_clean:
         if preserve_venv and d in venv_dirs:
@@ -98,6 +101,104 @@ def run_cmd(cmd: list, cwd: Path = None, check: bool = True):
         print(f"  ✗ Command failed with code {result.returncode}")
         sys.exit(1)
     return result
+
+
+def _resolve_mlx_version(toml_path: Path) -> str:
+    """Resolve the mlx version that venvstacks locked.
+
+    Reads the locked requirements file to find the exact mlx version,
+    falling back to the latest version from PyPI if no lock file exists.
+    """
+    req_file = (
+        SCRIPT_DIR
+        / "requirements"
+        / "framework-mlx-framework"
+        / "requirements-framework-mlx-framework-macosx_arm64.txt"
+    )
+    if req_file.exists():
+        import re as _re
+
+        content = req_file.read_text()
+        match = _re.search(r"^mlx==(\S+)", content, _re.MULTILINE)
+        if match:
+            return match.group(1)
+
+    # No lock file yet — query PyPI for the latest version
+    import json
+    import urllib.request
+
+    data = json.loads(
+        urllib.request.urlopen("https://pypi.org/pypi/mlx/json").read()
+    )
+    return data["info"]["version"]
+
+
+def swap_platform_wheels(
+    export_dir: Path, macos_target: str, python_version: str = "3.11"
+):
+    """Replace mlx and mlx-metal in exported venvstacks with platform-specific wheels.
+
+    Downloads the wheels for the given macOS target (e.g. "26.0") and replaces
+    the existing packages in the framework layer's site-packages. This allows
+    building on macOS 15 while targeting macOS 26 wheels that contain
+    M5 Neural Accelerator matmul kernels.
+    """
+    import zipfile
+
+    site_packages = (
+        export_dir
+        / "framework-mlx-framework"
+        / "lib"
+        / f"python{python_version}"
+        / "site-packages"
+    )
+    if not site_packages.exists():
+        print(f"  ✗ site-packages not found: {site_packages}")
+        sys.exit(1)
+
+    platform_tag = f"macosx_{macos_target.replace('.', '_')}_arm64"
+    toml_path = SCRIPT_DIR / "venvstacks.toml"
+    mlx_version = _resolve_mlx_version(toml_path)
+    packages = ["mlx", "mlx-metal"]
+
+    print(f"\n  Swapping mlx/mlx-metal to {platform_tag} (v{mlx_version})...")
+
+    # Download platform-specific wheels
+    wheels_tmp = SCRIPT_DIR / "_platform_wheels"
+    if wheels_tmp.exists():
+        shutil.rmtree(wheels_tmp)
+    wheels_tmp.mkdir()
+
+    for pkg in packages:
+        run_cmd([
+            sys.executable, "-m", "pip", "download",
+            f"{pkg}=={mlx_version}",
+            "--platform", platform_tag,
+            f"--python-version={python_version}",
+            "--only-binary", ":all:",
+            "--no-deps",
+            "-d", str(wheels_tmp),
+        ])
+
+    # Remove existing mlx/mlx-metal from site-packages
+    for item in site_packages.iterdir():
+        name = item.name.lower()
+        if name in ("mlx", "mlx_metal") or name.startswith(
+            ("mlx-", "mlx_metal-")
+        ):
+            if item.is_dir():
+                shutil.rmtree(item)
+                print(f"    Removed {item.name}")
+
+    # Install downloaded wheels into site-packages
+    for whl in wheels_tmp.glob("*.whl"):
+        print(f"    Installing {whl.name}")
+        with zipfile.ZipFile(whl) as zf:
+            zf.extractall(site_packages)
+
+    # Cleanup
+    shutil.rmtree(wheels_tmp)
+    print(f"  ✓ Swapped to {platform_tag}")
 
 
 def _parse_git_requirements(toml_path: Path) -> list[tuple[str, str]]:
@@ -847,6 +948,10 @@ def main():
                         help="Skip venvstacks build")
     parser.add_argument("--dmg-only", action="store_true",
                         help="Only create DMG from existing build")
+    parser.add_argument("--macos-target",
+                        help="Target macOS version for mlx/mlx-metal wheels "
+                        "(e.g. 26.0). Downloads platform-specific wheels "
+                        "with M5 Neural Accelerator support.")
     args = parser.parse_args()
 
     print(f"Building {APP_NAME} v{VERSION}")
@@ -870,6 +975,10 @@ def main():
         elif not EXPORT_DIR.exists():
             print("Warning: No existing envs found, building venvstacks...")
             build_venvstacks()
+
+        # Swap mlx/mlx-metal wheels for target macOS version
+        if args.macos_target:
+            swap_platform_wheels(EXPORT_DIR, args.macos_target)
 
         app_dir = create_app_bundle()
         sign_app(app_dir)
