@@ -1576,6 +1576,142 @@ class TestStallDetection:
 
 
 # =============================================================================
+# Sequential Download Queue Tests
+# =============================================================================
+
+
+class TestSequentialDownloadQueue:
+    """Test that only one download runs at a time."""
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        d = tmp_path / "models"
+        d.mkdir()
+        return d
+
+    @pytest.mark.asyncio
+    async def test_second_download_stays_pending(self, model_dir):
+        """When two downloads are started, only the first should be DOWNLOADING."""
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=lambda **kwargs: time.sleep(30),
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.safetensors = {"parameters": {"BF16": 5000}}
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            task1 = await downloader.start_download("owner/model-a")
+            task2 = await downloader.start_download("owner/model-b")
+
+            # Give first task time to acquire semaphore
+            await asyncio.sleep(1)
+
+            assert task1.status == DownloadStatus.DOWNLOADING
+            assert task2.status == DownloadStatus.PENDING
+
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_queued_download_starts_after_first_completes(self, model_dir):
+        """Second download should start after first one finishes."""
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+        ) as mock_download:
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.safetensors = {"parameters": {"BF16": 5000}}
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            task1 = await downloader.start_download("owner/model-a")
+            task2 = await downloader.start_download("owner/model-b")
+
+            # Let both tasks finish (snapshot_download returns immediately)
+            await asyncio.sleep(2)
+
+            assert task1.status == DownloadStatus.COMPLETED
+            assert task2.status == DownloadStatus.COMPLETED
+
+            await downloader.shutdown()
+
+
+# =============================================================================
+# Mtime-based Activity Detection Tests
+# =============================================================================
+
+
+class TestMtimeActivityDetection:
+    """Test that file mtime changes prevent false stall detection."""
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        d = tmp_path / "models"
+        d.mkdir()
+        return d
+
+    @pytest.mark.asyncio
+    async def test_mtime_prevents_false_stall(self, model_dir, monkeypatch):
+        """Download should not stall if file mtimes are updating."""
+        import omlx.admin.hf_downloader as dl_module
+
+        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 3)
+
+        target = model_dir / "model"
+        target.mkdir()
+        # Create a file (size won't change, but mtime will)
+        test_file = target / "partial.bin"
+        test_file.write_bytes(b"x" * 1000)
+
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        # Simulate mtime advancing on each call
+        call_count = 0
+        original_get_latest_mtime = HFDownloader._get_latest_mtime
+
+        @staticmethod
+        def mock_get_latest_mtime(path):
+            nonlocal call_count
+            call_count += 1
+            # Return current time to simulate active writes
+            return time.time()
+
+        monkeypatch.setattr(
+            HFDownloader, "_get_latest_mtime", mock_get_latest_mtime
+        )
+
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=lambda **kwargs: time.sleep(30),
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.safetensors = {"parameters": {"BF16": 5000}}
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            task = await downloader.start_download("owner/model")
+            # Wait longer than stall timeout
+            await asyncio.sleep(8)
+
+            # Should still be downloading because mtime keeps updating
+            assert task.status == DownloadStatus.DOWNLOADING
+
+            await downloader.shutdown()
+
+
+# =============================================================================
 # Etag Timeout Tests
 # =============================================================================
 

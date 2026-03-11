@@ -403,6 +403,7 @@ class HFDownloader:
         self._progress_tasks: dict[str, asyncio.Task] = {}
         self._on_complete = on_complete
         self._cancelled: set[str] = set()
+        self._download_sem = asyncio.Semaphore(1)
 
     @property
     def model_dir(self) -> Path:
@@ -577,80 +578,93 @@ class HFDownloader:
     async def _run_download(self, task_id: str, hf_token: str) -> None:
         """Execute a download task.
 
-        Fetches repo info for total size, then runs snapshot_download in a thread
-        while polling the target directory for progress updates.
+        Waits for the download semaphore (only one download runs at a time),
+        then fetches repo info for total size and runs snapshot_download in a
+        thread while polling the target directory for progress updates.
         """
         task = self._tasks[task_id]
-        task.status = DownloadStatus.DOWNLOADING
-        task.started_at = time.time()
-
-        # Derive model name from repo_id (last part)
-        model_name = task.repo_id.split("/")[-1]
-        target_dir = self._model_dir / model_name
 
         try:
-            # Get total repo size for progress estimation
-            try:
-                api, endpoint = _get_hf_api()
-                model_info = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        api.model_info,
-                        task.repo_id,
-                        token=hf_token or None,
-                        expand=["safetensors"],
-                    ),
-                    timeout=_HF_API_TIMEOUT,
-                )
-                if model_info.safetensors and model_info.safetensors.get("parameters"):
-                    # Calculate size from safetensors metadata (most accurate)
-                    task.total_size = _calc_safetensors_disk_size(dict(model_info.safetensors))
-                elif model_info.siblings:
-                    # Fallback to siblings size if safetensors not available
-                    task.total_size = sum(
-                        s.size for s in model_info.siblings if s.size
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Could not fetch repo info for {task.repo_id}: {e}. "
-                    "Progress estimation will be unavailable."
-                )
+            async with self._download_sem:
+                # Check if cancelled while waiting in queue
+                if task_id in self._cancelled:
+                    return
 
-            # Start progress polling
-            self._progress_tasks[task_id] = asyncio.create_task(
-                self._poll_progress(task_id, target_dir)
-            )
+                task.status = DownloadStatus.DOWNLOADING
+                task.started_at = time.time()
 
-            # Run snapshot_download in a thread (blocking call)
-            await asyncio.to_thread(
-                snapshot_download,
-                repo_id=task.repo_id,
-                local_dir=str(target_dir),
-                token=hf_token or None,
-                endpoint=endpoint,
-                etag_timeout=30,
-            )
+                # Derive model name from repo_id (last part)
+                model_name = task.repo_id.split("/")[-1]
+                target_dir = self._model_dir / model_name
 
-            # Check if cancelled while downloading
-            if task_id in self._cancelled:
-                return
-
-            # Success
-            task.status = DownloadStatus.COMPLETED
-            task.progress = 100.0
-            task.downloaded_size = task.total_size or self._get_dir_size(target_dir)
-            task.completed_at = time.time()
-
-            logger.info(
-                f"Download completed: {task.repo_id} -> {target_dir} "
-                f"({time.time() - task.started_at:.1f}s)"
-            )
-
-            # Trigger model pool refresh
-            if self._on_complete:
+                # Get total repo size for progress estimation
                 try:
-                    await self._on_complete()
+                    api, endpoint = _get_hf_api()
+                    model_info = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            api.model_info,
+                            task.repo_id,
+                            token=hf_token or None,
+                            expand=["safetensors"],
+                        ),
+                        timeout=_HF_API_TIMEOUT,
+                    )
+                    if model_info.safetensors and model_info.safetensors.get(
+                        "parameters"
+                    ):
+                        task.total_size = _calc_safetensors_disk_size(
+                            dict(model_info.safetensors)
+                        )
+                    elif model_info.siblings:
+                        task.total_size = sum(
+                            s.size for s in model_info.siblings if s.size
+                        )
                 except Exception as e:
-                    logger.error(f"Error in download completion callback: {e}")
+                    logger.warning(
+                        f"Could not fetch repo info for {task.repo_id}: {e}. "
+                        "Progress estimation will be unavailable."
+                    )
+
+                # Start progress polling
+                self._progress_tasks[task_id] = asyncio.create_task(
+                    self._poll_progress(task_id, target_dir)
+                )
+
+                # Run snapshot_download in a thread (blocking call)
+                await asyncio.to_thread(
+                    snapshot_download,
+                    repo_id=task.repo_id,
+                    local_dir=str(target_dir),
+                    token=hf_token or None,
+                    endpoint=endpoint,
+                    etag_timeout=30,
+                )
+
+                # Check if cancelled while downloading
+                if task_id in self._cancelled:
+                    return
+
+                # Success
+                task.status = DownloadStatus.COMPLETED
+                task.progress = 100.0
+                task.downloaded_size = task.total_size or self._get_dir_size(
+                    target_dir
+                )
+                task.completed_at = time.time()
+
+                logger.info(
+                    f"Download completed: {task.repo_id} -> {target_dir} "
+                    f"({time.time() - task.started_at:.1f}s)"
+                )
+
+                # Trigger model pool refresh
+                if self._on_complete:
+                    try:
+                        await self._on_complete()
+                    except Exception as e:
+                        logger.error(
+                            f"Error in download completion callback: {e}"
+                        )
 
         except asyncio.CancelledError:
             if task.status not in (
@@ -687,18 +701,20 @@ class HFDownloader:
             self._active_tasks.pop(task_id, None)
 
     async def _poll_progress(self, task_id: str, target_dir: Path) -> None:
-        """Poll the target directory size to estimate download progress.
+        """Poll the target directory to estimate download progress.
 
-        Also detects stalled downloads: if no size change is observed for
-        _STALL_TIMEOUT seconds, the task is marked as failed and the
-        download thread is cancelled.
+        Uses both directory size and file modification times to detect
+        activity. huggingface_hub pre-allocates large files and fills them
+        in, so size alone may not change for extended periods. File mtimes
+        are updated on each write syscall and serve as a more reliable
+        liveness signal.
         """
         task = self._tasks.get(task_id)
         if task is None:
             return
 
         last_size = 0
-        last_change_at = time.time()
+        last_activity_at = time.time()
 
         try:
             while task.status == DownloadStatus.DOWNLOADING:
@@ -716,13 +732,19 @@ class HFDownloader:
                         (current_size / task.total_size) * 100, 99.0
                     )
 
-                # Stall detection
-                if current_size > last_size:
+                # Activity detection: size change OR file mtime change
+                if current_size != last_size:
                     last_size = current_size
-                    last_change_at = time.time()
-                elif (
+                    last_activity_at = time.time()
+                else:
+                    latest_mtime = self._get_latest_mtime(target_dir)
+                    if latest_mtime > last_activity_at:
+                        last_activity_at = latest_mtime
+
+                # Stall detection
+                if (
                     current_size > 0
-                    and (time.time() - last_change_at) > _STALL_TIMEOUT
+                    and (time.time() - last_activity_at) > _STALL_TIMEOUT
                 ):
                     task.status = DownloadStatus.FAILED
                     task.error = (
@@ -740,6 +762,25 @@ class HFDownloader:
                     break
         except asyncio.CancelledError:
             pass
+
+    @staticmethod
+    def _get_latest_mtime(path: Path) -> float:
+        """Return the most recent modification time of any file in a directory."""
+        if not path.exists():
+            return 0.0
+        latest = 0.0
+        try:
+            for f in path.rglob("*"):
+                if f.is_file():
+                    try:
+                        mt = f.stat().st_mtime
+                        if mt > latest:
+                            latest = mt
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return latest
 
     @staticmethod
     def _get_dir_size(path: Path) -> int:
