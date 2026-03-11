@@ -450,6 +450,8 @@
     "chat.confirm_delete_chat": "Are you sure you want to delete this chat?",
     "chat.confirm_clear_all": "Are you sure you want to delete ALL chat history? This cannot be undone.",
     "chat.error.incorrect_api_key": "API key is incorrect. Please re-enter your API key.",
+    "chat.attach_file": "Attach file",
+    "chat.upload_hint": "Attach images, videos, or audio • Drag & drop or click paperclip",
 
     "js.error.required_fields": "Required fields cannot be empty: {fields}",
     "js.error.api_key_min_length": "API key must be at least 4 characters",

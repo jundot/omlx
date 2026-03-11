@@ -329,6 +329,142 @@
         .sidebar-overlay.hidden { display: none; }
         .user-edit-btn { left: -28px; }
     }
+
+    /* File upload styles */
+    .file-preview-container {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--border-faint);
+    }
+
+    .file-preview-item {
+        position: relative;
+        width: 80px;
+        height: 80px;
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-faint);
+    }
+
+    .file-preview-item img,
+    .file-preview-item video {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+    }
+
+    .file-preview-item.audio {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        gap: 4px;
+    }
+
+    .file-preview-item.audio svg {
+        width: 32px;
+        height: 32px;
+        color: var(--text-tertiary);
+    }
+
+    .file-preview-item.audio .filename {
+        font-size: 9px;
+        color: var(--text-secondary);
+        max-width: 70px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        text-align: center;
+    }
+
+    .file-remove-btn {
+        position: absolute;
+        top: 4px;
+        right: 4px;
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        background: rgba(0, 0, 0, 0.6);
+        color: white;
+        border: none;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 14px;
+        line-height: 1;
+    }
+
+    .file-remove-btn:hover {
+        background: rgba(0, 0, 0, 0.8);
+    }
+
+    .attach-btn {
+        width: 36px;
+        height: 36px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 50%;
+        border: none;
+        background: transparent;
+        color: var(--text-tertiary);
+        cursor: pointer;
+        transition: all 0.15s;
+        flex-shrink: 0;
+    }
+
+    .attach-btn:hover {
+        background: var(--bg-secondary);
+        color: var(--text-secondary);
+    }
+
+    .drop-zone {
+        position: relative;
+    }
+
+    .drop-zone.drag-over::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        border: 2px dashed var(--text-tertiary);
+        border-radius: 1.5rem;
+        background: var(--bg-secondary);
+        opacity: 0.5;
+        pointer-events: none;
+    }
+
+    .user-files-preview {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-bottom: 4px;
+        max-width: 280px;
+    }
+
+    .user-files-preview .file-thumb {
+        width: 50px;
+        height: 50px;
+        border-radius: 6px;
+        overflow: hidden;
+        background: var(--bg-tertiary);
+    }
+
+    .user-files-preview .file-thumb img,
+    .user-files-preview .file-thumb video {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+    }
+
+    .user-files-preview .file-thumb.audio-thumb {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
 </style>
 {% endblock %}
 
@@ -491,11 +627,33 @@
                         <!-- User Message -->
                         <div x-show="msg.role === 'user'" class="flex justify-end">
                             <div class="user-message">
-                                <button @click="startEdit(index)" class="user-edit-btn" title="{{ t('chat.edit_tooltip') }}">
+                                <button @click="startEdit(index)" class="user-edit-btn" title="{{ t('chat.edit_tooltip') }}" x-show="!msg._files">
                                     <i data-lucide="pencil" class="w-4 h-4"></i>
                                 </button>
                                 <template x-if="editingIndex !== index">
-                                    <div class="user-message-bubble" x-html="renderMarkdown(msg.content)"></div>
+                                    <div>
+                                        <!-- Show attached files preview -->
+                                        <template x-if="msg._files && msg._files.length > 0">
+                                            <div class="user-files-preview">
+                                                <template x-for="(file, fIndex) in msg._files" :key="fIndex">
+                                                    <div class="file-thumb">
+                                                        <template x-if="file.type === 'image'">
+                                                            <img :src="file.url">
+                                                        </template>
+                                                        <template x-if="file.type === 'video'">
+                                                            <video :src="file.url"></video>
+                                                        </template>
+                                                        <template x-if="file.type === 'audio'">
+                                                            <div class="audio-thumb">
+                                                                <i data-lucide="music" class="w-5 h-5" style="color: var(--text-tertiary);"></i>
+                                                            </div>
+                                                        </template>
+                                                    </div>
+                                                </template>
+                                            </div>
+                                        </template>
+                                        <div class="user-message-bubble" x-html="renderMarkdown(msg.content)"></div>
+                                    </div>
                                 </template>
                                 <template x-if="editingIndex === index">
                                     <div class="user-message-bubble" style="padding: 0; background: transparent;">
@@ -564,24 +722,69 @@
         <!-- Input Area -->
         <div class="p-4 border-t border-border-faint bg-surface-primary flex-shrink-0">
             <div class="max-w-4xl mx-auto">
-                <div class="input-container flex items-end">
-                    <textarea
-                        x-model="inputMessage"
-                        @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); sendMessage(); }"
-                        @input="autoResize($event.target)"
-                        placeholder="{{ t('chat.input_placeholder') }}"
-                        :disabled="!apiKeySet || !currentModel || isStreaming"
-                        rows="1"
-                        class="flex-1 px-4 py-3 bg-transparent resize-none outline-none text-sm max-h-32"
-                        style="color: var(--text-primary);"
-                    ></textarea>
-                    <button
-                        @click="sendMessage()"
-                        :disabled="!inputMessage.trim() || !apiKeySet || !currentModel || isStreaming"
-                        class="w-10 h-10 m-1 bg-neutral-900 hover:bg-neutral-800 disabled:bg-neutral-300 rounded-full transition-colors flex items-center justify-center flex-shrink-0"
-                    >
-                        <i data-lucide="arrow-up" class="w-4 h-4 text-white"></i>
-                    </button>
+                <div class="input-container drop-zone"
+                     :class="{ 'drag-over': isDragging }"
+                     @dragover.prevent="isDragging = true"
+                     @dragleave.prevent="isDragging = false"
+                     @drop.prevent="handleDrop($event)">
+
+                    <!-- File Previews -->
+                    <div x-show="pendingFiles.length > 0" class="file-preview-container">
+                        <template x-for="(file, index) in pendingFiles" :key="index">
+                            <div class="file-preview-item"
+                                 :class="{ 'audio': file.type === 'audio' }">
+                                <template x-if="file.type === 'image'">
+                                    <img :src="file.url" :alt="file.filename">
+                                </template>
+                                <template x-if="file.type === 'video'">
+                                    <video :src="file.url" muted></video>
+                                </template>
+                                <template x-if="file.type === 'audio'">
+                                    <div class="audio" style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%;">
+                                        <i data-lucide="music" class="w-8 h-8" style="color: var(--text-tertiary);"></i>
+                                        <span class="filename" x-text="file.filename"></span>
+                                    </div>
+                                </template>
+                                <button class="file-remove-btn" @click="removeFile(index)">&times;</button>
+                            </div>
+                        </template>
+                    </div>
+
+                    <div class="flex items-end">
+                        <!-- Hidden file input -->
+                        <input type="file"
+                               x-ref="fileInput"
+                               @change="handleFileSelect($event)"
+                               accept="image/*,video/*,audio/*"
+                               multiple
+                               class="hidden">
+
+                        <!-- Attach button -->
+                        <button class="attach-btn"
+                                @click="$refs.fileInput.click()"
+                                :disabled="!apiKeySet || !currentModel || isStreaming"
+                                title="{{ t('chat.attach_file') }}">
+                            <i data-lucide="paperclip" class="w-5 h-5"></i>
+                        </button>
+
+                        <textarea
+                            x-model="inputMessage"
+                            @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); sendMessage(); }"
+                            @input="autoResize($event.target)"
+                            placeholder="{{ t('chat.input_placeholder') }}"
+                            :disabled="!apiKeySet || !currentModel || isStreaming"
+                            rows="1"
+                            class="flex-1 px-2 py-3 bg-transparent resize-none outline-none text-sm max-h-32"
+                            style="color: var(--text-primary);"
+                        ></textarea>
+                        <button
+                            @click="sendMessage()"
+                            :disabled="(!inputMessage.trim() && pendingFiles.length === 0) || !apiKeySet || !currentModel || isStreaming"
+                            class="w-10 h-10 m-1 bg-neutral-900 hover:bg-neutral-800 disabled:bg-neutral-300 rounded-full transition-colors flex items-center justify-center flex-shrink-0"
+                        >
+                            <i data-lucide="arrow-up" class="w-4 h-4 text-white"></i>
+                        </button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -652,6 +855,11 @@
             // Edit State
             editingIndex: null,
             editContent: '',
+
+            // File Upload State
+            pendingFiles: [],
+            isDragging: false,
+            isUploading: false,
 
             async init() {
                 // Auto-inject API key from server (admin session already authenticated)
@@ -831,34 +1039,110 @@
             },
 
             async sendMessage() {
-                if (!this.inputMessage.trim() || !this.currentModel || this.isStreaming) return;
+                if ((!this.inputMessage.trim() && this.pendingFiles.length === 0) || !this.currentModel || this.isStreaming) return;
 
                 const userMessage = this.inputMessage.trim();
+                const files = [...this.pendingFiles];
                 this.inputMessage = '';
+                this.pendingFiles = [];
 
                 // Create new chat if needed
                 if (!this.currentChatId) {
                     this.currentChatId = 'chat_' + Date.now();
                 }
 
-                // Add user message
-                this.messages.push({
-                    role: 'user',
-                    content: userMessage
-                });
+                // Build message content - multimodal format
+                let messageContent;
+                if (files.length > 0) {
+                    // Build content array for multimodal message
+                    const contentParts = [];
+
+                    // Add text if present
+                    if (userMessage) {
+                        contentParts.push({
+                            type: 'text',
+                            text: userMessage
+                        });
+                    }
+
+                    // Add files
+                    for (const file of files) {
+                        if (file.type === 'image') {
+                            contentParts.push({
+                                type: 'image_url',
+                                image_url: { url: file.url }
+                            });
+                        } else if (file.type === 'video') {
+                            contentParts.push({
+                                type: 'video_url',
+                                video_url: { url: file.url }
+                            });
+                        } else if (file.type === 'audio') {
+                            contentParts.push({
+                                type: 'input_audio',
+                                input_audio: { data: file.url }
+                            });
+                        }
+                    }
+
+                    messageContent = contentParts;
+
+                    // Store for display
+                    this.messages.push({
+                        role: 'user',
+                        content: userMessage || '[Attached files]',
+                        _files: files  // For display purposes
+                    });
+                } else {
+                    // Text-only message
+                    messageContent = userMessage;
+
+                    this.messages.push({
+                        role: 'user',
+                        content: userMessage
+                    });
+                }
 
                 // Force scroll to bottom when sending message
                 this.forceScrollToBottom();
 
-                // Start streaming
-                await this.streamResponse();
+                // Start streaming with multimodal content
+                await this.streamResponse(messageContent);
             },
 
-            async streamResponse() {
+            async streamResponse(messageContent = null) {
                 this.isStreaming = true;
                 this.streamingContent = '';
                 this.abortController = new AbortController();
                 this.autoScrollEnabled = true; // Enable auto-scroll at start of streaming
+
+                // Build messages for API - use provided content or existing messages
+                let messagesForAPI;
+                if (messageContent !== null) {
+                    // Use the provided content for the last user message
+                    messagesForAPI = this.messages.slice(0, -1).map(msg => {
+                        const { _files, ...cleanMsg } = msg;
+                        return {
+                            role: cleanMsg.role,
+                            content: cleanMsg.content
+                        };
+                    });
+                    // Add the last message with multimodal content
+                    const lastMsg = this.messages[this.messages.length - 1];
+                    messagesForAPI.push({
+                        role: lastMsg.role,
+                        content: messageContent
+                    });
+                } else {
+                    // Regenerate - use existing messages
+                    messagesForAPI = this.messages.map(msg => {
+                        const { _files, ...cleanMsg } = msg;
+                        return {
+                            role: cleanMsg.role,
+                            content: cleanMsg.content
+                        };
+                    });
+                }
 
                 try {
                     const response = await fetch('/v1/chat/completions', {
@@ -869,7 +1153,7 @@
                         },
                         body: JSON.stringify({
                             model: this.currentModel,
-                            messages: this.messages,
+                            messages: messagesForAPI,
                             stream: true
                         }),
                         signal: this.abortController.signal
@@ -1432,6 +1716,75 @@
                     lightTheme.disabled = this.theme === 'dark';
                     darkTheme.disabled = this.theme === 'light';
                 }
+            },
+
+            // File upload methods
+            handleFileSelect(event) {
+                const files = event.target.files;
+                if (files) {
+                    this.processFiles(files);
+                }
+                event.target.value = '';
+            },
+
+            handleDragOver(event) {
+                event.preventDefault();
+                this.isDragging = true;
+            },
+
+            handleDragLeave(event) {
+                event.preventDefault();
+                this.isDragging = false;
+            },
+
+            handleDrop(event) {
+                event.preventDefault();
+                this.isDragging = false;
+                const files = event.dataTransfer.files;
+                if (files) {
+                    this.processFiles(files);
+                }
+            },
+
+            async processFiles(files) {
+                this.isUploading = true;
+
+                for (const file of files) {
+                    try {
+                        const uploadedFile = await this.uploadFile(file);
+                        this.pendingFiles.push(uploadedFile);
+                    } catch (error) {
+                        console.error('Upload failed:', error);
+                        alert(`Failed to upload ${file.name}: ${error.message}`);
+                    }
+                }
+
+                this.isUploading = false;
+                this.$nextTick(() => lucide.createIcons());
+            },
+
+            async uploadFile(file) {
+                const formData = new FormData();
+                formData.append('file', file);
+
+                const response = await fetch('/v1/files/upload', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${this.getApiKey()}`
+                    },
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Upload failed');
+                }
+
+                return await response.json();
+            },
+
+            removeFile(index) {
+                this.pendingFiles.splice(index, 1);
             }
         };
     }

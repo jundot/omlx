@@ -39,8 +39,10 @@ The server provides:
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import os
 import time
 import uuid
@@ -52,7 +54,7 @@ from typing import Optional, Union
 
 import secrets
 
-from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -1640,6 +1642,66 @@ async def create_chat_completion(
             total_tokens=output.prompt_tokens + output.completion_tokens,
         ),
     )
+
+
+# File upload configuration
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+ALLOWED_VIDEO_TYPES = {"video/mp4", "video/webm", "video/quicktime"}
+ALLOWED_AUDIO_TYPES = {"audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/x-m4a"}
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
+
+
+@app.post("/v1/files/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    _: bool = Depends(verify_api_key),
+):
+    """
+    Upload a file (image, video, or audio) and return a base64 data URI.
+
+    Returns:
+        {
+            "url": "data:image/jpeg;base64,...",
+            "type": "image" | "video" | "audio",
+            "filename": "original_filename.jpg"
+        }
+    """
+    # Validate file size
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB"
+        )
+
+    # Detect content type
+    content_type = file.content_type or mimetypes.guess_type(file.filename or "")[0]
+    if not content_type:
+        raise HTTPException(status_code=400, detail="Could not determine file type")
+
+    # Categorize file type
+    if content_type in ALLOWED_IMAGE_TYPES:
+        file_type = "image"
+    elif content_type in ALLOWED_VIDEO_TYPES:
+        file_type = "video"
+    elif content_type in ALLOWED_AUDIO_TYPES:
+        file_type = "audio"
+    else:
+        allowed = ALLOWED_IMAGE_TYPES | ALLOWED_VIDEO_TYPES | ALLOWED_AUDIO_TYPES
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type: {content_type}. Allowed types: {allowed}"
+        )
+
+    # Convert to base64 data URI
+    base64_data = base64.b64encode(contents).decode("utf-8")
+    data_uri = f"data:{content_type};base64,{base64_data}"
+
+    return {
+        "url": data_uri,
+        "type": file_type,
+        "filename": file.filename or "uploaded_file"
+    }
 
 
 def _inject_json_instruction(messages: list, instruction: str) -> list:
