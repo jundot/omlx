@@ -562,6 +562,23 @@ def create_app_bundle():
     print("  Creating launcher...")
     _create_c_launcher(macos_dir, APP_NAME)
 
+    # Create CLI launcher script (for terminal use: oMLX.app/Contents/MacOS/omlx-cli)
+    # Named "omlx-cli" to avoid case-insensitive collision with "oMLX" on APFS.
+    print("  Creating CLI launcher script...")
+    cli_launcher = macos_dir / "omlx-cli"
+    cli_launcher.write_text(
+        '#!/bin/bash\n'
+        'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+        'CONTENTS="$(dirname "$DIR")"\n'
+        'LAYERS="$CONTENTS/Frameworks"\n'
+        '[ ! -d "$LAYERS" ] && LAYERS="$CONTENTS/Python"\n'
+        'export PYTHONHOME="$LAYERS/cpython-3.11"\n'
+        'export PYTHONPATH="$CONTENTS/Resources:$LAYERS/app-omlx-app/lib/python3.11/site-packages:$LAYERS/framework-mlx-framework/lib/python3.11/site-packages"\n'
+        'export PYTHONDONTWRITEBYTECODE=1\n'
+        'exec "$DIR/python3" -m omlx.cli "$@"\n'
+    )
+    cli_launcher.chmod(0o755)
+
     # Create Info.plist
     print("  Creating Info.plist...")
     info_plist = {

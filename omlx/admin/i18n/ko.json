@@ -94,6 +94,7 @@
   "status.integrations.copy_command_tooltip": "명령어 복사",
   "status.integrations.opencode_desc": "터미널 AI 코딩 어시스턴트",
   "status.integrations.openclaw_desc": "메시징 통합 AI 어시스턴트",
+  "status.integrations.openclaw_tools_profile": "도구",
   "status.engines.section_label": "엔진 버전",
   "status.engines.unknown_version": "알 수 없음",
 

@@ -30,7 +30,7 @@
                 huggingface: { endpoint: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
-                integrations: { codex_model: null, opencode_model: null, openclaw_model: null },
+                integrations: { codex_model: null, opencode_model: null, openclaw_model: null, openclaw_tools_profile: 'coding' },
                 ui: { language: 'en' },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
@@ -845,25 +845,32 @@
             },
 
             get codexCommand() {
-                const port = this.stats.port || 8000;
                 const model = this.globalSettings.integrations.codex_model || 'select-a-model';
-                const parts = [];
-                parts.push(`OPENAI_BASE_URL=http://${this.displayHost}:${port}/v1`);
+                const parts = [`/Applications/oMLX.app/Contents/MacOS/omlx-cli launch codex --model ${model}`];
                 if (this.stats.api_key) {
-                    parts.push(`OPENAI_API_KEY=${this.stats.api_key}`);
+                    parts.push(`--api-key ${this.stats.api_key}`);
                 }
-                parts.push(`codex -m ${model}`);
                 return parts.join(' ');
             },
 
             get opencodeCommand() {
                 const model = this.globalSettings.integrations.opencode_model || 'select-a-model';
-                return `/Applications/oMLX.app/Contents/MacOS/omlx-cli launch opencode --model ${model}`;
+                const parts = [`/Applications/oMLX.app/Contents/MacOS/omlx-cli launch opencode --model ${model}`];
+                if (this.stats.api_key) {
+                    parts.push(`--api-key ${this.stats.api_key}`);
+                }
+                return parts.join(' ');
             },
 
             get openclawCommand() {
                 const model = this.globalSettings.integrations.openclaw_model || 'select-a-model';
-                return `/Applications/oMLX.app/Contents/MacOS/omlx-cli launch openclaw --model ${model}`;
+                const profile = this.globalSettings.integrations.openclaw_tools_profile || 'coding';
+                const parts = [`/Applications/oMLX.app/Contents/MacOS/omlx-cli launch openclaw --model ${model}`];
+                if (this.stats.api_key) {
+                    parts.push(`--api-key ${this.stats.api_key}`);
+                }
+                parts.push(`--tools-profile ${profile}`);
+                return parts.join(' ');
             },
 
             async saveIntegrationSettings() {
@@ -875,6 +882,7 @@
                             integrations_codex_model: this.globalSettings.integrations.codex_model,
                             integrations_opencode_model: this.globalSettings.integrations.opencode_model,
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
+                            integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
                         }),
                     });
                     if (!response.ok) {

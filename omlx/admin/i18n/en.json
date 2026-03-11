@@ -94,6 +94,7 @@
     "status.integrations.copy_command_tooltip": "Copy command",
     "status.integrations.opencode_desc": "AI coding assistant in terminal",
     "status.integrations.openclaw_desc": "AI assistant with messaging integration",
+    "status.integrations.openclaw_tools_profile": "Tools",
     "status.engines.section_label": "Engine Versions",
     "status.engines.unknown_version": "unknown",
 

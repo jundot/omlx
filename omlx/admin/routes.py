@@ -144,6 +144,7 @@ class GlobalSettingsRequest(BaseModel):
     integrations_codex_model: Optional[str] = None
     integrations_opencode_model: Optional[str] = None
     integrations_openclaw_model: Optional[str] = None
+    integrations_openclaw_tools_profile: Optional[str] = None
 
     # UI settings
     ui_language: Optional[str] = None
@@ -1554,6 +1555,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "codex_model": global_settings.integrations.codex_model,
             "opencode_model": global_settings.integrations.opencode_model,
             "openclaw_model": global_settings.integrations.openclaw_model,
+            "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
         },
         "system": {
             "total_memory_bytes": memory_info["total_bytes"],
@@ -1812,6 +1814,11 @@ async def update_global_settings(
     if "integrations_openclaw_model" in request.model_fields_set:
         global_settings.integrations.openclaw_model = (
             request.integrations_openclaw_model
+        )
+        integrations_changed = True
+    if "integrations_openclaw_tools_profile" in request.model_fields_set:
+        global_settings.integrations.openclaw_tools_profile = (
+            request.integrations_openclaw_tools_profile
         )
         integrations_changed = True
 

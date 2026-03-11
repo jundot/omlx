@@ -281,6 +281,158 @@
                         </div>
                     </div>
 
+                    <!-- Other Integrations -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="plug" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.integrations.section_label') }}</span>
+                            </div>
+                        </div>
+                        <div class="px-6 py-5 space-y-6">
+                            <!-- Codex -->
+                            <div>
+                                <div class="flex items-center gap-2 mb-3">
+                                    <span class="text-base font-bold text-neutral-800">Codex</span>
+                                    <span class="text-xs text-neutral-400">OpenAI Codex CLI</span>
+                                </div>
+                                <div class="flex gap-4 items-start">
+                                    <div class="w-48 flex-shrink-0">
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
+                                        <select x-model="globalSettings.integrations.codex_model"
+                                                @change="globalSettings.integrations.codex_model = globalSettings.integrations.codex_model || null; saveIntegrationSettings()"
+                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                            <option value="">{{ t('status.integrations.select_model') }}</option>
+                                            <template x-for="m in llmModels" :key="m.id">
+                                                <option :value="m.id" x-text="m.id"></option>
+                                            </template>
+                                        </select>
+                                        <div x-show="globalSettings.integrations.codex_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.integrations.codex_model)"
+                                             x-cloak
+                                             class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                                            <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+                                            <span>{{ t('status.integrations.model_unavailable') }}</span>
+                                        </div>
+                                    </div>
+                                    <div class="flex-1 min-w-0">
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.command') }}</label>
+                                        <div class="relative group">
+                                            <pre class="px-4 py-3 pr-12 bg-neutral-100 text-neutral-800 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all leading-relaxed"
+                                                 x-text="codexCommand"></pre>
+                                            <button x-data="{ copied: false }"
+                                                    @click="copyToClipboard(codexCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                                    class="absolute top-2.5 right-2.5 p-1.5 rounded-md transition-all opacity-0 group-hover:opacity-100"
+                                                    :class="copied ? 'text-green-500 opacity-100' : 'bg-white/80 text-neutral-400 hover:text-neutral-700'"
+                                                    :title="window.t('status.integrations.copy_command_tooltip')">
+                                                <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="border-t border-neutral-100 my-2"></div>
+
+                            <!-- OpenCode -->
+                            <div>
+                                <div class="flex items-center gap-2 mb-3">
+                                    <span class="text-base font-bold text-neutral-800">OpenCode</span>
+                                    <span class="text-xs text-neutral-400">{{ t('status.integrations.opencode_desc') }}</span>
+                                </div>
+                                <div class="flex gap-4 items-start">
+                                    <div class="w-48 flex-shrink-0">
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
+                                        <select x-model="globalSettings.integrations.opencode_model"
+                                                @change="globalSettings.integrations.opencode_model = globalSettings.integrations.opencode_model || null; saveIntegrationSettings()"
+                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                            <option value="">{{ t('status.integrations.select_model') }}</option>
+                                            <template x-for="m in llmModels" :key="m.id">
+                                                <option :value="m.id" x-text="m.id"></option>
+                                            </template>
+                                        </select>
+                                        <div x-show="globalSettings.integrations.opencode_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.integrations.opencode_model)"
+                                             x-cloak
+                                             class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                                            <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+                                            <span>{{ t('status.integrations.model_unavailable') }}</span>
+                                        </div>
+                                    </div>
+                                    <div class="flex-1 min-w-0">
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.command') }}</label>
+                                        <div class="relative group">
+                                            <pre class="px-4 py-3 pr-12 bg-neutral-100 text-neutral-800 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all leading-relaxed"
+                                                 x-text="opencodeCommand"></pre>
+                                            <button x-data="{ copied: false }"
+                                                    @click="copyToClipboard(opencodeCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                                    class="absolute top-2.5 right-2.5 p-1.5 rounded-md transition-all opacity-0 group-hover:opacity-100"
+                                                    :class="copied ? 'text-green-500 opacity-100' : 'bg-white/80 text-neutral-400 hover:text-neutral-700'"
+                                                    :title="window.t('status.integrations.copy_command_tooltip')">
+                                                <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="border-t border-neutral-100 my-2"></div>
+
+                            <!-- OpenClaw -->
+                            <div>
+                                <div class="flex items-center gap-2 mb-3">
+                                    <span class="text-base font-bold text-neutral-800">OpenClaw</span>
+                                    <span class="text-xs text-neutral-400">{{ t('status.integrations.openclaw_desc') }}</span>
+                                </div>
+                                <div class="flex gap-4 items-start">
+                                    <div class="w-48 flex-shrink-0">
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
+                                        <select x-model="globalSettings.integrations.openclaw_model"
+                                                @change="globalSettings.integrations.openclaw_model = globalSettings.integrations.openclaw_model || null; saveIntegrationSettings()"
+                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                            <option value="">{{ t('status.integrations.select_model') }}</option>
+                                            <template x-for="m in llmModels" :key="m.id">
+                                                <option :value="m.id" x-text="m.id"></option>
+                                            </template>
+                                        </select>
+                                        <div x-show="globalSettings.integrations.openclaw_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.integrations.openclaw_model)"
+                                             x-cloak
+                                             class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                                            <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+                                            <span>{{ t('status.integrations.model_unavailable') }}</span>
+                                        </div>
+                                    </div>
+                                    <div class="w-36 flex-shrink-0">
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.openclaw_tools_profile') }}</label>
+                                        <select x-model="globalSettings.integrations.openclaw_tools_profile"
+                                                @change="saveIntegrationSettings()"
+                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                            <option value="minimal">Minimal</option>
+                                            <option value="coding">Coding</option>
+                                            <option value="messaging">Messaging</option>
+                                            <option value="full">Full</option>
+                                        </select>
+                                    </div>
+                                    <div class="flex-1 min-w-0">
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.command') }}</label>
+                                        <div class="relative group">
+                                            <pre class="px-4 py-3 pr-12 bg-neutral-100 text-neutral-800 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all leading-relaxed"
+                                                 x-text="openclawCommand"></pre>
+                                            <button x-data="{ copied: false }"
+                                                    @click="copyToClipboard(openclawCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                                    class="absolute top-2.5 right-2.5 p-1.5 rounded-md transition-all opacity-0 group-hover:opacity-100"
+                                                    :class="copied ? 'text-green-500 opacity-100' : 'bg-white/80 text-neutral-400 hover:text-neutral-700'"
+                                                    :title="window.t('status.integrations.copy_command_tooltip')">
+                                                <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Engine Versions -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">

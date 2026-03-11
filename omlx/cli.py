@@ -212,6 +212,98 @@ def serve_command(args):
 
 
 
+def launch_command(args):
+    """Launch an external tool integrated with oMLX."""
+    import requests
+
+    from .integrations import get_integration, list_integrations
+
+    tool_name = args.tool
+
+    if tool_name == "list":
+        print("Available integrations:")
+        for integ in list_integrations():
+            installed = "installed" if integ.is_installed() else "not installed"
+            print(f"  {integ.name:12s} {integ.display_name} ({installed})")
+        return
+
+    integration = get_integration(tool_name)
+    if integration is None:
+        print(f"Unknown integration: {tool_name}")
+        print("Available: " + ", ".join(i.name for i in list_integrations()))
+        sys.exit(1)
+
+    # Check if oMLX server is running
+    port = args.port or 8000
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        resp = requests.get(f"{base_url}/health", timeout=3)
+        resp.raise_for_status()
+    except Exception:
+        print(f"oMLX server is not running at {base_url}")
+        print("Start the server first: omlx serve")
+        sys.exit(1)
+
+    # Get API key from CLI args
+    api_key = getattr(args, "api_key", None) or ""
+
+    # Build headers for authenticated requests
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # Determine model
+    model = args.model
+    if not model:
+        # Fetch available models from server
+        try:
+            resp = requests.get(f"{base_url}/v1/models", headers=headers, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            models = [
+                m["id"]
+                for m in data.get("data", [])
+                if m.get("model_type") in ("llm", "vlm", None)
+            ]
+        except Exception:
+            models = []
+
+        if not models:
+            print("No models available. Load a model first.")
+            sys.exit(1)
+
+        if len(models) == 1:
+            model = models[0]
+            print(f"Using model: {model}")
+        else:
+            print("Available models:")
+            for i, m in enumerate(models, 1):
+                print(f"  {i}. {m}")
+            while True:
+                try:
+                    choice = input("Select model number: ").strip()
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(models):
+                        model = models[idx]
+                        break
+                    print(f"Please enter 1-{len(models)}")
+                except (ValueError, EOFError):
+                    print(f"Please enter 1-{len(models)}")
+
+    # Check if tool is installed
+    if not integration.is_installed():
+        print(f"{integration.display_name} is not installed.")
+        print(f"Install: {integration.install_hint}")
+        sys.exit(1)
+
+    # Launch
+    print(f"Launching {integration.display_name} with model {model}...")
+    tools_profile = getattr(args, "tools_profile", "coding")
+    integration.launch(
+        port=port, api_key=api_key, model=model, tools_profile=tools_profile
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="omlx: Production-ready LLM server for Apple Silicon",
@@ -219,6 +311,7 @@ def main():
         epilog="""
 Examples:
   omlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+  omlx launch codex --model qwen3.5
         """,
     )
     subparsers = parser.add_subparsers(dest="command", help="Commands")
@@ -351,10 +444,50 @@ Example directory structure:
         help="API key for authentication (optional)",
     )
 
+    # Launch command
+    launch_parser = subparsers.add_parser(
+        "launch",
+        help="Launch an external tool with oMLX integration",
+        description="Configure and launch external coding tools (Codex, OpenCode, OpenClaw) "
+        "to use the running oMLX server.",
+    )
+    launch_parser.add_argument(
+        "tool",
+        type=str,
+        help="Tool to launch: codex, opencode, openclaw, or 'list' to show available",
+    )
+    launch_parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Model to use (interactive selection if not specified)",
+    )
+    launch_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="oMLX server port (default: 8000)",
+    )
+    launch_parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key for oMLX server authentication",
+    )
+    launch_parser.add_argument(
+        "--tools-profile",
+        type=str,
+        default="coding",
+        choices=["minimal", "coding", "messaging", "full"],
+        help="OpenClaw tools profile (default: coding)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "serve":
         serve_command(args)
+    elif args.command == "launch":
+        launch_command(args)
     else:
         parser.print_help()
         sys.exit(1)

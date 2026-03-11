@@ -94,6 +94,7 @@
   "status.integrations.copy_command_tooltip": "コマンドをコピー",
   "status.integrations.opencode_desc": "ターミナルAIコーディングアシスタント",
   "status.integrations.openclaw_desc": "メッセージング統合AIアシスタント",
+  "status.integrations.openclaw_tools_profile": "ツール",
   "status.engines.section_label": "エンジンバージョン",
   "status.engines.unknown_version": "不明",
 

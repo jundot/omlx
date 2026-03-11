@@ -546,6 +546,35 @@ class ClaudeCodeSettings:
 
 
 @dataclass
+class IntegrationSettings:
+    """Other integrations settings (Codex, OpenCode, OpenClaw)."""
+
+    codex_model: str | None = None
+    opencode_model: str | None = None
+    openclaw_model: str | None = None
+    openclaw_tools_profile: str = "coding"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "codex_model": self.codex_model,
+            "opencode_model": self.opencode_model,
+            "openclaw_model": self.openclaw_model,
+            "openclaw_tools_profile": self.openclaw_tools_profile,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> IntegrationSettings:
+        """Create from dictionary."""
+        return cls(
+            codex_model=data.get("codex_model", None),
+            opencode_model=data.get("opencode_model", None),
+            openclaw_model=data.get("openclaw_model", None),
+            openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
+        )
+
+
+@dataclass
 class GlobalSettings:
     """
     Global settings for oMLX.
@@ -569,6 +598,7 @@ class GlobalSettings:
     sampling: SamplingSettings = field(default_factory=SamplingSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
+    integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
 
     @classmethod
@@ -653,6 +683,10 @@ class GlobalSettings:
                 self.logging = LoggingSettings.from_dict(data["logging"])
             if "claude_code" in data:
                 self.claude_code = ClaudeCodeSettings.from_dict(data["claude_code"])
+            if "integrations" in data:
+                self.integrations = IntegrationSettings.from_dict(
+                    data["integrations"]
+                )
             if "ui" in data:
                 self.ui = UISettings.from_dict(data["ui"])
 
@@ -818,6 +852,7 @@ class GlobalSettings:
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
+            "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
         }
 
@@ -997,6 +1032,7 @@ class GlobalSettings:
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
+            "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
         }
 
