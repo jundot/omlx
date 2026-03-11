@@ -904,6 +904,7 @@
                                         if (!this.thinkingState.isInThinking) {
                                             this.streamingContent += '<think>';
                                             this.thinkingState.isInThinking = true;
+                                            this.thinkingState.thinkingStartTime = Date.now();
                                         }
                                         this.streamingContent += delta.reasoning_content;
                                         this.scrollToBottom();
@@ -911,7 +912,8 @@
                                     if (delta?.content) {
                                         // Close thinking block if transitioning
                                         if (this.thinkingState.isInThinking) {
-                                            this.streamingContent += '</think>';
+                                            const elapsed = Date.now() - this.thinkingState.thinkingStartTime;
+                                            this.streamingContent += `</think data-elapsed="${elapsed}">`;
                                             this.thinkingState.isInThinking = false;
                                         }
                                         this.streamingContent += delta.content;
@@ -926,7 +928,8 @@
 
                     // Close unclosed thinking block
                     if (this.thinkingState.isInThinking) {
-                        this.streamingContent += '</think>';
+                        const elapsed = Date.now() - this.thinkingState.thinkingStartTime;
+                        this.streamingContent += `</think data-elapsed="${elapsed}">`;
                         this.thinkingState.isInThinking = false;
                     }
 
@@ -1100,7 +1103,7 @@
             },
 
             extractThinking(text) {
-                const thinkingRegex = /<think>([\s\S]*?)<\/think>/g;
+                const thinkingRegex = /<think>([\s\S]*?)<\/think(?:\s+data-elapsed="(\d+)")?>/g;
                 const thinkingBlocks = [];
                 let cleanText = text;
                 let match;
@@ -1108,6 +1111,7 @@
                 while ((match = thinkingRegex.exec(text)) !== null) {
                     thinkingBlocks.push({
                         content: match[1].trim(),
+                        elapsed: match[2] ? parseInt(match[2]) : null,
                         placeholder: `THINKINGPLACEHOLDER${thinkingBlocks.length}`
                     });
                 }
@@ -1118,11 +1122,16 @@
                 return { thinkingBlocks, cleanText };
             },
 
-            renderThinkingBlock(content, index, messageId) {
-                // Estimate thinking time based on content length
-                const wordsPerSecond = 3;
-                const wordCount = content.split(/\s+/).length;
-                const thinkingTime = Math.max(1, Math.round(wordCount / wordsPerSecond));
+            renderThinkingBlock(content, index, messageId, elapsed) {
+                let thinkingTime;
+                if (elapsed != null) {
+                    thinkingTime = (elapsed / 1000).toFixed(1);
+                } else {
+                    // Fallback estimate for history reload (no timing data)
+                    const wordsPerSecond = 3;
+                    const wordCount = content.split(/\s+/).length;
+                    thinkingTime = Math.max(1, Math.round(wordCount / wordsPerSecond));
+                }
 
                 const uniqueId = `${messageId || Date.now()}_${index}`;
 
@@ -1158,7 +1167,7 @@
                     if (thinkingBlocks.length > 0) {
                         const messageTimestamp = Date.now();
                         const thinkingHtml = thinkingBlocks.map((block, index) =>
-                            this.renderThinkingBlock(block.content, index, messageTimestamp)
+                            this.renderThinkingBlock(block.content, index, messageTimestamp, block.elapsed)
                         ).join('');
                         html = thinkingHtml + html;
                     }
@@ -1183,7 +1192,7 @@
                     let remaining = text;
 
                     // Process complete think blocks first
-                    const completeThinkRegex = /<think>([\s\S]*?)<\/think>/g;
+                    const completeThinkRegex = /<think>([\s\S]*?)<\/think(?:\s+data-elapsed="(\d+)")?>/g;
                     let lastIndex = 0;
                     let match;
                     let blockIndex = 0;
@@ -1193,7 +1202,8 @@
                         if (beforeContent.trim()) {
                             html += marked.parse(beforeContent);
                         }
-                        html += this.renderThinkingBlock(match[1].trim(), blockIndex++, 'streaming');
+                        const elapsed = match[2] ? parseInt(match[2]) : null;
+                        html += this.renderThinkingBlock(match[1].trim(), blockIndex++, 'streaming', elapsed);
                         lastIndex = match.index + match[0].length;
                     }
 
