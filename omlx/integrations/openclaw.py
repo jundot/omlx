@@ -42,12 +42,13 @@ class OpenClawIntegration(Integration):
         port: int,
         api_key: str,
         model: str,
+        host: str = "127.0.0.1",
         tools_profile: str = "coding",
     ) -> None:
         def updater(config: dict) -> None:
             config.setdefault("models", {}).setdefault("providers", {})
             provider_config = {
-                "baseUrl": f"http://127.0.0.1:{port}/v1",
+                "baseUrl": f"http://{host}:{port}/v1",
                 "apiKey": api_key or "omlx",
                 "api": "openai-completions",
             }
@@ -155,10 +156,11 @@ class OpenClawIntegration(Integration):
         port: int,
         api_key: str,
         model: str,
+        host: str = "127.0.0.1",
         tools_profile: str = "coding",
         **kwargs,
     ) -> None:
-        self.configure(port, api_key, model, tools_profile=tools_profile)
+        self.configure(port, api_key, model, host=host, tools_profile=tools_profile)
         self.configure_exec_approvals(tools_profile)
 
         env = os.environ.copy()
@@ -185,7 +187,7 @@ class OpenClawIntegration(Integration):
                 env=env,
             )
             # Onboarding overwrites config, re-apply
-            self.configure(port, api_key, model, tools_profile=tools_profile)
+            self.configure(port, api_key, model, host=host, tools_profile=tools_profile)
             self.configure_exec_approvals(tools_profile)
 
         _, gw_port = self._gateway_info()
