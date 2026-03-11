@@ -286,6 +286,19 @@ class TestDiscoverModels:
         assert models["llama-3b"].model_type == "llm"
         assert models["llama-3b"].engine_type == "batched"
 
+    def test_discover_model_dir_is_itself_a_model(self, tmp_path):
+        """Test that pointing directly at a model directory works."""
+        model_dir = tmp_path / "Qwen3-5-9B-MLX-4bit"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "qwen2"}))
+        (model_dir / "model.safetensors").write_bytes(b"0" * 1000)
+
+        models = discover_models(model_dir)
+        assert len(models) == 1
+        assert "Qwen3-5-9B-MLX-4bit" in models
+        assert models["Qwen3-5-9B-MLX-4bit"].model_type == "llm"
+        assert models["Qwen3-5-9B-MLX-4bit"].engine_type == "batched"
+
     def test_discover_multiple_models(self, tmp_path):
         """Test discovery of multiple models."""
         # Create first LLM model
