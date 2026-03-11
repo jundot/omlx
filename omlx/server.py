@@ -1820,6 +1820,9 @@ async def stream_chat_completion(
         _f = ToolCallStreamFilter(engine.tokenizer)
         if _f.active:
             tool_filter = _f
+        else:
+            # Buffer all content if no marker available to ensure markup is cleaned
+            stream_content = False
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
             if first_token_time is None and output.new_text:
@@ -1845,7 +1848,7 @@ async def stream_chat_completion(
 
             # Only stream regular content if we are NOT in tool-request mode
             # (In tool-request mode, content is buffered to prevent XML tags from leaking)
-            if stream_content and not has_tools and content_delta:
+            if stream_content and content_delta:
                 if tool_filter:
                     content_delta = tool_filter.feed(content_delta)
                 if content_delta:
@@ -1941,16 +1944,6 @@ async def stream_chat_completion(
 
         # Buffered mode: emit thinking and cleaned content now
         if not stream_content:
-            if thinking_content:
-                chunk = ChatCompletionChunk(
-                    id=response_id,
-                    model=request.model,
-                    choices=[ChatCompletionChunkChoice(
-                        delta=ChatCompletionChunkDelta(reasoning_content=thinking_content),
-                        finish_reason=None,
-                    )],
-                )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
             if cleaned_text:
                 chunk = ChatCompletionChunk(
                     id=response_id,
