@@ -299,6 +299,24 @@ class TestDiscoverModels:
         assert models["Qwen3-5-9B-MLX-4bit"].model_type == "llm"
         assert models["Qwen3-5-9B-MLX-4bit"].engine_type == "batched"
 
+    def test_discover_no_fallback_when_subdirs_have_models(self, tmp_path):
+        """Fallback should not trigger when subdirectory models exist,
+        even if model_dir itself has config.json."""
+        # model_dir itself looks like a model
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (tmp_path / "model.safetensors").write_bytes(b"0" * 1000)
+
+        # but it also has a valid model subdirectory
+        sub = tmp_path / "qwen-7b"
+        sub.mkdir()
+        (sub / "config.json").write_text(json.dumps({"model_type": "qwen2"}))
+        (sub / "model.safetensors").write_bytes(b"0" * 2000)
+
+        models = discover_models(tmp_path)
+        assert len(models) == 1
+        assert "qwen-7b" in models
+        assert tmp_path.name not in models
+
     def test_discover_multiple_models(self, tmp_path):
         """Test discovery of multiple models."""
         # Create first LLM model
