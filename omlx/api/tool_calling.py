@@ -369,16 +369,14 @@ class ToolCallStreamFilter:
             ns = ns_match.group(1)
             starts.append((ns_match.start(), len(ns_match.group(0)), f"</{ns}:tool_call>"))
 
-        bracket_idx = -1
         for bp in self._bracket_prefixes:
-            idx = text.find(bp)
-            if idx >= 0 and (bracket_idx < 0 or idx < bracket_idx):
-                bracket_idx = idx
-        if bracket_idx >= 0:
-            bracket_candidate = text[bracket_idx:]
-            bracket_match = self._bracket_call_re.match(bracket_candidate)
-            if bracket_match:
-                starts.append((bracket_idx, bracket_match.end(), None))
+            bracket_idx = text.find(bp)
+            while bracket_idx >= 0:
+                bracket_candidate = text[bracket_idx:]
+                bracket_match = self._bracket_call_re.match(bracket_candidate)
+                if bracket_match:
+                    starts.append((bracket_idx, bracket_match.end(), None))
+                bracket_idx = text.find(bp, bracket_idx + 1)
 
         if not starts:
             return None
@@ -429,8 +427,8 @@ class ToolCallStreamFilter:
 
         bracket_idx = -1
         for bp in self._bracket_prefixes:
-            idx = text.find(bp)
-            if idx >= 0 and (bracket_idx < 0 or idx < bracket_idx):
+            idx = text.rfind(bp)
+            if idx > bracket_idx:
                 bracket_idx = idx
         if bracket_idx >= 0:
             bracket_candidate = text[bracket_idx:]
