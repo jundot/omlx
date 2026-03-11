@@ -670,7 +670,7 @@ def get_ssd_disk_info(cache_dir: str) -> dict:
     Get disk information for the SSD cache directory.
 
     Returns:
-        Dictionary with total_bytes, free_bytes, total_formatted, free_formatted.
+        Dictionary with total_bytes, total_formatted.
     """
     try:
         check_path = Path(cache_dir).expanduser().resolve()
@@ -679,17 +679,13 @@ def get_ssd_disk_info(cache_dir: str) -> dict:
         stat = shutil.disk_usage(check_path)
         return {
             "total_bytes": stat.total,
-            "free_bytes": stat.free,
             "total_formatted": format_size(stat.total),
-            "free_formatted": format_size(stat.free),
         }
     except Exception as e:
         logger.warning(f"Failed to get disk info for {cache_dir}: {e}")
         return {
             "total_bytes": 0,
-            "free_bytes": 0,
             "total_formatted": "Unknown",
-            "free_formatted": "Unknown",
         }
 
 
@@ -1565,8 +1561,6 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "auto_model_memory": memory_info["auto_limit_formatted"],
             "ssd_total_bytes": disk_info["total_bytes"],
             "ssd_total": disk_info["total_formatted"],
-            "ssd_free_bytes": disk_info["free_bytes"],
-            "ssd_free": disk_info["free_formatted"],
         },
         "ui": {
             "language": global_settings.ui.language,
