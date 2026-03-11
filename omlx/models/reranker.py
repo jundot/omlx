@@ -323,7 +323,8 @@ class MLXRerankerModel:
         attention_mask = mx.array(padded_attention_mask)
 
         # Forward pass — get logits for all positions
-        logits = self.model(input_ids)
+        # Pass mask so left-padded tokens are properly ignored
+        logits = self.model(input_ids, mask=attention_mask)
 
         # Extract logits at the last position for each sample
         # logits shape: (batch_size, seq_len, vocab_size)
