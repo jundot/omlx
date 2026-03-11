@@ -270,8 +270,11 @@ class MLXRerankerModel:
         """
         Rerank using CausalLM yes/no logit scoring (e.g., Qwen3-Reranker).
 
-        Constructs instruction prompts, runs a forward pass, and extracts
-        relevance scores from the logits of yes/no tokens at the last position.
+        Constructs instruction prompts, runs per-document forward passes, and
+        extracts relevance scores from the logits of yes/no tokens at the last
+        position. Each document is processed individually since mlx-lm models
+        generate their own causal mask internally and don't accept an external
+        padding mask.
         """
         import mlx.core as mx
 
@@ -308,45 +311,29 @@ class MLXRerankerModel:
             full_ids = prefix_tokens + content_ids + suffix_tokens
             all_input_ids.append(full_ids)
 
-        # Pad to same length
-        max_len = max(len(ids) for ids in all_input_ids)
-        # Pad on the left (common for causal LMs)
-        pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
-        padded_input_ids = []
-        padded_attention_mask = []
+        # Per-document forward pass and score extraction.
+        # mlx-lm models generate their own causal attention mask internally
+        # and don't support external padding masks, so we process each
+        # document individually to ensure correct attention computation.
+        scores = []
+        total_tokens = 0
         for ids in all_input_ids:
-            pad_len = max_len - len(ids)
-            padded_input_ids.append([pad_token_id] * pad_len + ids)
-            padded_attention_mask.append([0] * pad_len + [1] * len(ids))
-
-        input_ids = mx.array(padded_input_ids)
-        attention_mask = mx.array(padded_attention_mask)
-
-        # Forward pass — get logits for all positions
-        # Pass mask so left-padded tokens are properly ignored
-        logits = self.model(input_ids, mask=attention_mask)
-
-        # Extract logits at the last position for each sample
-        # logits shape: (batch_size, seq_len, vocab_size)
-        last_logits = logits[:, -1, :]
-
-        # Extract yes/no logits and compute scores
-        true_logits = last_logits[:, self._token_true_id]
-        false_logits = last_logits[:, self._token_false_id]
-        paired = mx.stack([false_logits, true_logits], axis=1)
-        log_probs = mx.softmax(paired, axis=1)
-        scores_array = log_probs[:, 1]
-
-        mx.eval(scores_array)
-        scores = scores_array.tolist()
+            input_ids = mx.array([ids])  # (1, seq_len)
+            logits = self.model(input_ids)
+            # Extract yes/no logits at the last position
+            last_logits = logits[0, -1, :]
+            true_logit = last_logits[self._token_true_id]
+            false_logit = last_logits[self._token_false_id]
+            paired = mx.array([false_logit, true_logit])
+            probs = mx.softmax(paired)
+            mx.eval(probs)
+            scores.append(probs[1].item())
+            total_tokens += len(ids)
 
         # Sort indices by score (descending)
         indexed_scores = list(enumerate(scores))
         indexed_scores.sort(key=lambda x: x[1], reverse=True)
         sorted_indices = [idx for idx, _ in indexed_scores]
-
-        # Count tokens
-        total_tokens = sum(len(ids) for ids in all_input_ids)
 
         return RerankOutput(
             scores=scores,
