@@ -5,6 +5,7 @@ class Omlx < Formula
   sha256 "ce56167b04a399c4eefc898b0115ddc181b1e57a74da813fa0408c6570904c9e"
   license "Apache-2.0"
 
+  depends_on "rust" => :build
   depends_on "python@3.11"
   depends_on :macos
   depends_on arch: :arm64
@@ -25,8 +26,10 @@ class Omlx < Formula
     # Upgrade pip to ensure modern resolver (handles git deps, etc.)
     system libexec/"bin/pip", "install", "--upgrade", "pip"
 
-    # Install package - pip resolves ALL deps from pyproject.toml
-    system libexec/"bin/pip", "install", buildpath
+    # Build pydantic-core from source with headerpad to prevent
+    # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths)
+    ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
+    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core", buildpath
 
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end
