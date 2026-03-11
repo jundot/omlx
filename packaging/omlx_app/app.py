@@ -278,11 +278,11 @@ class OMLXAppDelegate(NSObject):
             self._update_info = None
 
     def _is_newer_version(self, latest: str, current: str) -> bool:
-        """Simple semantic version comparison."""
+        """PEP 440 version comparison (handles beta/rc versions)."""
         try:
-            latest_parts = [int(x) for x in latest.split(".")[:3]]
-            current_parts = [int(x) for x in current.split(".")[:3]]
-            return latest_parts > current_parts
+            from packaging.version import Version
+
+            return Version(latest) > Version(current)
         except Exception:
             return False
 
