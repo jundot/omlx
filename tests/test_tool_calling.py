@@ -769,3 +769,130 @@ class TestToolCallStreamFilter:
         result = f.feed("Before <foo-bar:tool_call><invoke name=\"x\">")
         assert result == "Before "
         assert f.finish() == ""
+
+    # --- [Tool call: ...] format tests (issue #159) ---
+
+    def test_tool_call_prefix_literal_passthrough(self):
+        """[Tool call: ...] literal text that is not a valid call passes through."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed("Heads up: [Tool call:")
+        result += f.feed(" maybe later]")
+        result += f.finish()
+        assert result == "Heads up: [Tool call: maybe later]"
+
+    def test_tool_call_prefix_suppresses_with_args(self):
+        """A complete [Tool call: name(args)] envelope should be suppressed."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Lead in [Tool call:")
+        r2 = f.feed(' get_weather({"city":"SF"})]')
+        assert r1 == "Lead in "
+        assert r2 == ""
+        assert f.finish() == ""
+
+    def test_tool_call_prefix_suppresses_without_args(self):
+        """A complete [Tool call: name] envelope (no args) should be suppressed."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Next: [Tool call:")
+        r2 = f.feed(" mcp__notebooklm__chat_configure]")
+        assert r1 == "Next: "
+        assert r2 == ""
+        assert f.finish() == ""
+
+    def test_tool_call_prefix_preserves_trailing_text(self):
+        """Suppression must preserve prose after a closed [Tool call: ...] envelope."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Before [Tool call:")
+        r2 = f.feed(' get_weather({"city":"SF"})] After text')
+        r3 = f.finish()
+        assert r1 + r2 + r3 == "Before  After text"
+
+    def test_tool_call_prefix_unresolved_dropped_at_finish(self):
+        """Unresolved [Tool call: prefix at stream end should be dropped."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Text [Tool call:")
+        r2 = f.feed(" some_tool")
+        r3 = f.finish()
+        assert r1 + r2 + r3 == "Text "
+
+    def test_calling_tool_prefix_suppresses_without_args(self):
+        """[Calling tool: name] without args should also be suppressed."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Next: [Calling tool:")
+        r2 = f.feed(" mcp__notebooklm__chat_configure]")
+        assert r1 == "Next: "
+        assert r2 == ""
+        assert f.finish() == ""
+
+
+class TestParseBracketToolCalls:
+    """Tests for bracket-style tool call parsing (issue #159)."""
+
+    def test_tool_call_prefix_with_args(self):
+        """[Tool call: name(args)] should be parsed as a tool call."""
+        from omlx.api.tool_calling import _parse_bracket_tool_calls
+
+        text = 'Hello [Tool call: get_weather({"city":"Tokyo"})] done'
+        cleaned, tool_calls = _parse_bracket_tool_calls(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_weather"
+        assert json.loads(tool_calls[0].function.arguments) == {"city": "Tokyo"}
+        assert "done" in cleaned
+        assert "[Tool call:" not in cleaned
+
+    def test_tool_call_prefix_without_args(self):
+        """[Tool call: name] without args should be parsed with empty arguments."""
+        from omlx.api.tool_calling import _parse_bracket_tool_calls
+
+        text = "Next [Tool call: mcp__notebooklm__chat_configure] done"
+        cleaned, tool_calls = _parse_bracket_tool_calls(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "mcp__notebooklm__chat_configure"
+        assert tool_calls[0].function.arguments == "{}"
+        assert "[Tool call:" not in cleaned
+
+    def test_calling_tool_prefix_without_args(self):
+        """[Calling tool: name] without args should also be parsed."""
+        from omlx.api.tool_calling import _parse_bracket_tool_calls
+
+        text = "Next [Calling tool: do_thing] done"
+        cleaned, tool_calls = _parse_bracket_tool_calls(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "do_thing"
+        assert tool_calls[0].function.arguments == "{}"
+
+    def test_calling_tool_prefix_with_args_still_works(self):
+        """Existing [Calling tool: name(args)] format must still parse correctly."""
+        from omlx.api.tool_calling import _parse_bracket_tool_calls
+
+        text = '[Calling tool: get_weather({"city":"SF"})]'
+        cleaned, tool_calls = _parse_bracket_tool_calls(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_weather"
+        assert json.loads(tool_calls[0].function.arguments) == {"city": "SF"}
+
+    def test_mixed_formats_parsed(self):
+        """Both [Tool call:] and [Calling tool:] in same text should parse."""
+        from omlx.api.tool_calling import _parse_bracket_tool_calls
+
+        text = (
+            '[Tool call: tool_a({"x":1})] middle '
+            '[Calling tool: tool_b({"y":2})]'
+        )
+        cleaned, tool_calls = _parse_bracket_tool_calls(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 2
+        names = {tc.function.name for tc in tool_calls}
+        assert names == {"tool_a", "tool_b"}
+
+    def test_no_match_returns_none(self):
+        """Plain text without bracket patterns returns None tool_calls."""
+        from omlx.api.tool_calling import _parse_bracket_tool_calls
+
+        text = "Just some regular text"
+        cleaned, tool_calls = _parse_bracket_tool_calls(text)
+        assert tool_calls is None
+        assert cleaned == text

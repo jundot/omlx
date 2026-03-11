@@ -113,7 +113,7 @@ def convert_anthropic_to_internal(
                     tool_name = block_dict.get("name", "")
                     tool_input = block_dict.get("input", {})
                     text_parts.append(
-                        f"[Tool call: {tool_name}({json.dumps(tool_input)})]"
+                        f"[Calling tool: {tool_name}({json.dumps(tool_input)})]"
                     )
 
                 elif block_type == "tool_result":

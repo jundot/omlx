@@ -168,18 +168,20 @@ def _parse_namespaced_tool_calls(text: str, namespace: str) -> Tuple[str, Option
 
 def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     """
-    Fallback parser for [Calling tool: name(args)] format.
+    Fallback parser for bracket-style tool call formats.
 
-    This format can appear when models mimic text-formatted tool calls
-    from conversation history. Parses the JSON arguments from within
-    the parentheses.
+    Recognizes both ``[Calling tool: name(args)]`` and ``[Tool call: name(args)]``
+    prefixes, with or without arguments.  Models may emit the args-less form
+    ``[Tool call: name]`` when mimicking conversation history.
 
     Returns:
         Tuple of (cleaned_text, tool_calls or None)
     """
     tool_calls = []
-    pattern = r'\[Calling tool:\s*([A-Za-z_][\w.-]*)\(({.*?})\)\]'
-    for match in re.finditer(pattern, text, re.DOTALL):
+    # Match with args first (higher fidelity)
+    pattern_with_args = r'\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)\(({.*?})\)\]'
+    matched_spans: list = []
+    for match in re.finditer(pattern_with_args, text, re.DOTALL):
         name = match.group(1)
         args_str = match.group(2)
         try:
@@ -194,11 +196,32 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
                 arguments=json.dumps(arguments, ensure_ascii=False),
             ),
         ))
+        matched_spans.append(match.span())
+
+    # Match without args (model-generated simplified form)
+    pattern_no_args = r'\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)\]'
+    for match in re.finditer(pattern_no_args, text):
+        # Skip if this span overlaps with an already-matched with-args span
+        start, end = match.span()
+        if any(s <= start < e for s, e in matched_spans):
+            continue
+        name = match.group(1)
+        tool_calls.append(ToolCall(
+            id=f"call_{uuid.uuid4().hex[:8]}",
+            type="function",
+            function=FunctionCall(
+                name=name,
+                arguments="{}",
+            ),
+        ))
+        matched_spans.append((start, end))
 
     if not tool_calls:
         return text, None
 
-    cleaned = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+    # Remove all matched spans from text
+    cleaned = re.sub(pattern_with_args, '', text, flags=re.DOTALL)
+    cleaned = re.sub(pattern_no_args, '', cleaned).strip()
     return cleaned, tool_calls
 
 
@@ -283,8 +306,8 @@ def parse_tool_calls(
         ns = ns_match.group(1)
         return _parse_namespaced_tool_calls(cleaned_text, ns)
 
-    # Fallback: [Calling tool: name(args)] format (from text-formatted history)
-    if '[Calling tool:' in cleaned_text:
+    # Fallback: bracket tool call formats (from text-formatted history)
+    if '[Calling tool:' in cleaned_text or '[Tool call:' in cleaned_text:
         return _parse_bracket_tool_calls(cleaned_text)
 
     return cleaned_text, None
@@ -313,9 +336,9 @@ class ToolCallStreamFilter:
         if marker and marker_end:
             self._marker_pairs.insert(0, (marker, marker_end))
         self._namespaced_open_re = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>")
-        self._bracket_prefix = "[Calling tool:"
+        self._bracket_prefixes = ["[Calling tool:", "[Tool call:"]
         self._bracket_call_re = re.compile(
-            r'^\[Calling tool:\s*([A-Za-z_][\w.-]*)\(({.*?})\)\]',
+            r'^\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)(?:\(({.*?})\))?\]',
             re.DOTALL,
         )
         self._buffer = ""
@@ -346,7 +369,11 @@ class ToolCallStreamFilter:
             ns = ns_match.group(1)
             starts.append((ns_match.start(), len(ns_match.group(0)), f"</{ns}:tool_call>"))
 
-        bracket_idx = text.find(self._bracket_prefix)
+        bracket_idx = -1
+        for bp in self._bracket_prefixes:
+            idx = text.find(bp)
+            if idx >= 0 and (bracket_idx < 0 or idx < bracket_idx):
+                bracket_idx = idx
         if bracket_idx >= 0:
             bracket_candidate = text[bracket_idx:]
             bracket_match = self._bracket_call_re.match(bracket_candidate)
@@ -400,7 +427,11 @@ class ToolCallStreamFilter:
             if self._could_be_partial_namespaced_open(candidate):
                 keep = max(keep, len(candidate))
 
-        bracket_idx = text.find(self._bracket_prefix)
+        bracket_idx = -1
+        for bp in self._bracket_prefixes:
+            idx = text.find(bp)
+            if idx >= 0 and (bracket_idx < 0 or idx < bracket_idx):
+                bracket_idx = idx
         if bracket_idx >= 0:
             bracket_candidate = text[bracket_idx:]
             # Hold unresolved bracket prefix until we can classify parseable
@@ -421,6 +452,11 @@ class ToolCallStreamFilter:
 
         for marker, _close in self._marker_pairs:
             if marker.startswith(tail):
+                return True
+
+        # Drop unresolved bracket tool-call prefixes
+        for bp in self._bracket_prefixes:
+            if tail.startswith(bp):
                 return True
 
         if not tail.startswith("<"):

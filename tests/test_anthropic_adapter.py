@@ -569,3 +569,53 @@ class TestAnthropicStreamingEvents:
 
         # Model should be in message_start event
         assert "claude-3-opus" in result
+
+
+class TestAnthropicToolUseConversion:
+    """Tests for tool_use block conversion in convert_anthropic_to_internal (issue #159)."""
+
+    def test_tool_use_block_converted_to_calling_tool_format(self):
+        """tool_use blocks should be converted to [Calling tool: ...] format, not [Tool call: ...]."""
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+        from omlx.api.anthropic_models import MessagesRequest, AnthropicMessage
+
+        request = MessagesRequest(
+            model="test-model",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="What is the weather?"),
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        {"type": "text", "text": "Let me check."},
+                        {
+                            "type": "tool_use",
+                            "id": "call_123",
+                            "name": "get_weather",
+                            "input": {"city": "Tokyo"},
+                        },
+                    ],
+                ),
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_123",
+                            "content": "Sunny, 25C",
+                        },
+                    ],
+                ),
+            ],
+        )
+
+        messages = convert_anthropic_to_internal(request)
+
+        # Find the assistant message that should contain the tool call
+        assistant_msgs = [m for m in messages if m["role"] == "assistant"]
+        assert len(assistant_msgs) == 1
+        content = assistant_msgs[0]["content"]
+
+        # Must use [Calling tool: ...] not [Tool call: ...]
+        assert "[Calling tool: get_weather(" in content
+        assert "[Tool call:" not in content
