@@ -167,12 +167,26 @@ class MLXRerankerModel:
                 "This model may not be a compatible CausalLM reranker."
             )
 
-        # Pre-compute prefix and suffix tokens for the prompt template
-        prefix = (
-            f"<|im_start|>system\n{self._CAUSAL_LM_SYSTEM_PROMPT}<|im_end|>\n"
-            f"<|im_start|>user\n"
+        # Pre-compute prefix and suffix tokens for the prompt template.
+        # Use apply_chat_template() for portability across tokenizer formats,
+        # then split on a sentinel to extract prefix/suffix boundaries.
+        _SENTINEL = "<<__CONTENT_SENTINEL__>>"
+        messages = [
+            {"role": "system", "content": self._CAUSAL_LM_SYSTEM_PROMPT},
+            {"role": "user", "content": _SENTINEL},
+        ]
+        template_str = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
         )
-        suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        parts = template_str.split(_SENTINEL)
+        if len(parts) != 2:
+            raise ValueError(
+                f"Chat template produced unexpected format; "
+                f"could not split on sentinel. Template: {template_str!r}"
+            )
+        prefix = parts[0]
+        # Append <think> block for models that use thinking-then-answering format
+        suffix = parts[1] + "<think>\n\n</think>\n\n"
 
         self._prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
         self._suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False)
