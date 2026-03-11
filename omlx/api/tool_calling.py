@@ -479,19 +479,25 @@ class ToolCallStreamFilter:
 
     def _sanitize_prefix_before_suppression(self, text: str) -> str:
         """Strip unresolved bracket-control prefixes while preserving prose."""
-        if self._bracket_prefix not in text:
+        if not any(bp in text for bp in self._bracket_prefixes):
             return text
 
         out: List[str] = []
         cursor = 0
         while cursor < len(text):
-            bracket_idx = text.find(self._bracket_prefix, cursor)
+            bracket_idx = -1
+            bracket_prefix = ""
+            for bp in self._bracket_prefixes:
+                idx = text.find(bp, cursor)
+                if idx >= 0 and (bracket_idx < 0 or idx < bracket_idx):
+                    bracket_idx = idx
+                    bracket_prefix = bp
             if bracket_idx < 0:
                 out.append(text[cursor:])
                 break
 
             out.append(text[cursor:bracket_idx])
-            after_prefix = bracket_idx + len(self._bracket_prefix)
+            after_prefix = bracket_idx + len(bracket_prefix)
             close_idx = text.find("]", after_prefix)
             if close_idx < 0:
                 # Drop only the marker token; keep following prose.
