@@ -140,6 +140,11 @@ class GlobalSettingsRequest(BaseModel):
     claude_code_sonnet_model: Optional[str] = None
     claude_code_haiku_model: Optional[str] = None
 
+    # Other integrations settings
+    integrations_codex_model: Optional[str] = None
+    integrations_opencode_model: Optional[str] = None
+    integrations_openclaw_model: Optional[str] = None
+
     # UI settings
     ui_language: Optional[str] = None
 
@@ -668,7 +673,10 @@ def get_ssd_disk_info(cache_dir: str) -> dict:
         Dictionary with total_bytes, free_bytes, total_formatted, free_formatted.
     """
     try:
-        stat = shutil.disk_usage(cache_dir)
+        check_path = Path(cache_dir).expanduser().resolve()
+        while not check_path.exists() and check_path.parent != check_path:
+            check_path = check_path.parent
+        stat = shutil.disk_usage(check_path)
         return {
             "total_bytes": stat.total,
             "free_bytes": stat.free,
@@ -1546,6 +1554,11 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "sonnet_model": global_settings.claude_code.sonnet_model,
             "haiku_model": global_settings.claude_code.haiku_model,
         },
+        "integrations": {
+            "codex_model": global_settings.integrations.codex_model,
+            "opencode_model": global_settings.integrations.opencode_model,
+            "openclaw_model": global_settings.integrations.openclaw_model,
+        },
         "system": {
             "total_memory_bytes": memory_info["total_bytes"],
             "total_memory": memory_info["total_formatted"],
@@ -1790,6 +1803,31 @@ async def update_global_settings(
             f"opus={global_settings.claude_code.opus_model}, "
             f"sonnet={global_settings.claude_code.sonnet_model}, "
             f"haiku={global_settings.claude_code.haiku_model}"
+        )
+
+    # Apply integrations settings (Live - immediately applied)
+    integrations_changed = False
+    if "integrations_codex_model" in request.model_fields_set:
+        global_settings.integrations.codex_model = request.integrations_codex_model
+        integrations_changed = True
+    if "integrations_opencode_model" in request.model_fields_set:
+        global_settings.integrations.opencode_model = (
+            request.integrations_opencode_model
+        )
+        integrations_changed = True
+    if "integrations_openclaw_model" in request.model_fields_set:
+        global_settings.integrations.openclaw_model = (
+            request.integrations_openclaw_model
+        )
+        integrations_changed = True
+
+    if integrations_changed:
+        runtime_applied.append("integrations")
+        logger.info(
+            f"Integration settings updated: "
+            f"codex={global_settings.integrations.codex_model}, "
+            f"opencode={global_settings.integrations.opencode_model}, "
+            f"openclaw={global_settings.integrations.openclaw_model}"
         )
 
     # Apply UI settings

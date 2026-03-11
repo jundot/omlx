@@ -30,6 +30,7 @@
                 huggingface: { endpoint: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
+                integrations: { codex_model: null, opencode_model: null, openclaw_model: null },
                 ui: { language: 'en' },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '', ssd_free_bytes: 0, ssd_free: '' },
             },
@@ -332,6 +333,7 @@
                             huggingface: { ...this.globalSettings.huggingface, ...data.huggingface },
                             auth: { ...this.globalSettings.auth, ...data.auth },
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
+                            integrations: { ...this.globalSettings.integrations, ...data.integrations },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = data.ui || { language: 'en' };
@@ -362,10 +364,10 @@
                         this.processMemoryPercent = pmState.percent;
 
 
-                        // Calculate cache percent from stored value (based on free space)
+                        // Calculate cache percent from stored value (based on total capacity)
                         this.cachePercent = this.parseCacheToPercent(
                             this.globalSettings.cache.ssd_cache_max_size,
-                            this.globalSettings.system.ssd_free_bytes
+                            this.globalSettings.system.ssd_total_bytes
                         );
                         // Sync the cache string value from percent
                         this.updateCacheFromSlider();
@@ -839,6 +841,47 @@
                     }
                 } catch (err) {
                     console.error('Failed to save Claude Code settings:', err);
+                }
+            },
+
+            get codexCommand() {
+                const port = this.stats.port || 8000;
+                const model = this.globalSettings.integrations.codex_model || 'select-a-model';
+                const parts = [];
+                parts.push(`OPENAI_BASE_URL=http://${this.displayHost}:${port}/v1`);
+                if (this.stats.api_key) {
+                    parts.push(`OPENAI_API_KEY=${this.stats.api_key}`);
+                }
+                parts.push(`codex -m ${model}`);
+                return parts.join(' ');
+            },
+
+            get opencodeCommand() {
+                const model = this.globalSettings.integrations.opencode_model || 'select-a-model';
+                return `/Applications/oMLX.app/Contents/MacOS/omlx-cli launch opencode --model ${model}`;
+            },
+
+            get openclawCommand() {
+                const model = this.globalSettings.integrations.openclaw_model || 'select-a-model';
+                return `/Applications/oMLX.app/Contents/MacOS/omlx-cli launch openclaw --model ${model}`;
+            },
+
+            async saveIntegrationSettings() {
+                try {
+                    const response = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            integrations_codex_model: this.globalSettings.integrations.codex_model,
+                            integrations_opencode_model: this.globalSettings.integrations.opencode_model,
+                            integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
+                        }),
+                    });
+                    if (!response.ok) {
+                        console.error('Failed to save integration settings');
+                    }
+                } catch (err) {
+                    console.error('Failed to save integration settings:', err);
                 }
             },
 
@@ -1443,9 +1486,9 @@
                 }
             },
 
-            // Parse cache size string (e.g., "10GB") to percent of SSD free space
-            parseCacheToPercent(cacheStr, freeBytes) {
-                if (!cacheStr || cacheStr === 'auto' || !freeBytes || freeBytes === 0) {
+            // Parse cache size string (e.g., "10GB") to percent of SSD total capacity
+            parseCacheToPercent(cacheStr, totalBytes) {
+                if (!cacheStr || cacheStr === 'auto' || !totalBytes || totalBytes === 0) {
                     return 10; // Default 10%
                 }
 
@@ -1459,14 +1502,14 @@
                 else if (unit === 'GB') bytes *= 1024 * 1024 * 1024;
                 else if (unit === 'MB') bytes *= 1024 * 1024;
 
-                const percent = Math.round((bytes / freeBytes) * 100);
-                return percent; // Allow >100% for manual input
+                const percent = Math.round((bytes / totalBytes) * 100);
+                return Math.min(100, percent);
             },
 
             // Convert percent to cache size string
-            percentToCacheString(percent, freeBytes) {
-                if (!freeBytes || freeBytes === 0) return 'auto';
-                const bytes = Math.floor((percent / 100) * freeBytes);
+            percentToCacheString(percent, totalBytes) {
+                if (!totalBytes || totalBytes === 0) return 'auto';
+                const bytes = Math.floor((percent / 100) * totalBytes);
                 const gb = Math.floor(bytes / (1024 * 1024 * 1024));
                 return `${gb}GB`;
             },
@@ -1588,16 +1631,16 @@
                     const parsed = this._parseSettingsGB(val);
                     if (parsed !== null) return parsed;
                 }
-                const freeBytes = this.globalSettings.system?.ssd_free_bytes || 0;
-                if (!freeBytes) return 0;
-                const bytes = Math.floor((this.cachePercent / 100) * freeBytes);
+                const totalBytes = this.globalSettings.system?.ssd_total_bytes || 0;
+                if (!totalBytes) return 0;
+                const bytes = Math.floor((this.cachePercent / 100) * totalBytes);
                 return Math.round(bytes / (1024 * 1024 * 1024));
             },
 
             // Update cache from slider
             updateCacheFromSlider() {
-                const freeBytes = this.globalSettings.system?.ssd_free_bytes || 0;
-                this.globalSettings.cache.ssd_cache_max_size = this.percentToCacheString(this.cachePercent, freeBytes);
+                const totalBytes = this.globalSettings.system?.ssd_total_bytes || 0;
+                this.globalSettings.cache.ssd_cache_max_size = this.percentToCacheString(this.cachePercent, totalBytes);
             },
 
             // Update cache from manual GB input
@@ -1605,11 +1648,11 @@
                 const gb = parseInt(gbValue) || 0;
                 this.globalSettings.cache.ssd_cache_max_size = `${gb}GB`;
 
-                // Update percent slider (allow >100%)
-                const freeBytes = this.globalSettings.system?.ssd_free_bytes || 0;
-                if (freeBytes > 0) {
+                // Update percent slider
+                const totalBytes = this.globalSettings.system?.ssd_total_bytes || 0;
+                if (totalBytes > 0) {
                     const bytes = gb * 1024 * 1024 * 1024;
-                    this.cachePercent = Math.round((bytes / freeBytes) * 100);
+                    this.cachePercent = Math.min(100, Math.round((bytes / totalBytes) * 100));
                 }
             },
 
