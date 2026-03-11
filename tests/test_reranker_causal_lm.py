@@ -1,0 +1,152 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for CausalLM-based reranker support."""
+
+import json
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from omlx.models.reranker import MLXRerankerModel, RerankOutput
+
+
+class TestCausalLMReranker:
+    """Tests for CausalLM reranker (e.g., Qwen3-Reranker) functionality."""
+
+    def _make_model_dir(self, tmp_path, name="Qwen3-Reranker-0.6B"):
+        """Create a mock model directory with CausalLM reranker config."""
+        model_dir = tmp_path / name
+        model_dir.mkdir()
+        config = {
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForCausalLM"],
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+        return model_dir
+
+    def test_validate_architecture_accepts_causal_lm_reranker(self, tmp_path):
+        """CausalLM architecture is accepted when directory name contains 'reranker'."""
+        model_dir = self._make_model_dir(tmp_path, "Qwen3-Reranker-0.6B")
+        model = MLXRerankerModel(str(model_dir))
+        # Should not raise
+        model._validate_architecture()
+
+    def test_validate_architecture_rejects_plain_causal_lm(self, tmp_path):
+        """CausalLM architecture is rejected when directory name lacks reranker hint."""
+        model_dir = self._make_model_dir(tmp_path, "Qwen3-0.6B")
+        model = MLXRerankerModel(str(model_dir))
+        with pytest.raises(ValueError, match="does not contain"):
+            model._validate_architecture()
+
+    def test_rerank_causal_lm_scoring(self, tmp_path):
+        """Test _rerank_causal_lm produces correct scores from mocked logits."""
+        model_dir = self._make_model_dir(tmp_path)
+
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = True
+        model._loaded = True
+        model._token_true_id = 9693  # "yes"
+        model._token_false_id = 2152  # "no"
+        model._prefix_tokens = [1, 2, 3]
+        model._suffix_tokens = [4, 5]
+
+        # Mock tokenizer: return simple token IDs for each document
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.return_value = {
+            "input_ids": [[10, 11, 12], [20, 21, 22]],
+        }
+        model.processor = mock_tokenizer
+
+        # Mock model forward pass: return logits where "yes" > "no" for doc 0,
+        # and "no" > "yes" for doc 1
+        import mlx.core as mx
+        import numpy as np
+
+        call_count = [0]
+
+        def mock_forward(input_ids):
+            vocab_size = 10000
+            seq_len = input_ids.shape[1]
+            logits = mx.zeros((1, seq_len, vocab_size))
+            # Set logits at last position
+            last_pos = np.zeros(vocab_size)
+            if call_count[0] == 0:
+                # Doc 0: yes=5.0, no=0.0 → high relevance
+                last_pos[9693] = 5.0
+                last_pos[2152] = 0.0
+            else:
+                # Doc 1: yes=0.0, no=5.0 → low relevance
+                last_pos[9693] = 0.0
+                last_pos[2152] = 5.0
+            call_count[0] += 1
+            # Construct logits with the last position set
+            logits_np = np.zeros((1, seq_len, vocab_size), dtype=np.float32)
+            logits_np[0, -1, :] = last_pos
+            return mx.array(logits_np)
+
+        model.model = MagicMock(side_effect=mock_forward)
+
+        result = model._rerank_causal_lm("test query", ["relevant doc", "irrelevant doc"])
+
+        assert isinstance(result, RerankOutput)
+        assert len(result.scores) == 2
+        # Doc 0 should have high score (yes >> no)
+        assert result.scores[0] > 0.9
+        # Doc 1 should have low score (no >> yes)
+        assert result.scores[1] < 0.1
+        # Sorted indices: doc 0 first
+        assert result.indices == [0, 1]
+        assert result.total_tokens > 0
+
+    def test_rerank_causal_lm_empty_documents(self, tmp_path):
+        """Test rerank with empty document list returns empty result."""
+        model_dir = self._make_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = True
+        model._loaded = True
+
+        result = model.rerank("test query", [])
+        assert result.scores == []
+        assert result.indices == []
+        assert result.total_tokens == 0
+
+    def test_rerank_dispatches_to_causal_lm(self, tmp_path):
+        """Test that rerank() dispatches to _rerank_causal_lm when _is_causal_lm is True."""
+        model_dir = self._make_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = True
+        model._loaded = True
+
+        mock_result = RerankOutput(scores=[0.9], indices=[0], total_tokens=10)
+        with patch.object(model, "_rerank_causal_lm", return_value=mock_result) as mock_method:
+            result = model.rerank("query", ["doc"])
+            mock_method.assert_called_once()
+            assert result.scores == [0.9]
+
+    def test_max_length_default_for_causal_lm(self, tmp_path):
+        """Test that CausalLM reranker uses 8192 as effective max_length by default."""
+        model_dir = self._make_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = True
+        model._loaded = True
+
+        mock_result = RerankOutput(scores=[0.5], indices=[0], total_tokens=10)
+        with patch.object(model, "_rerank_causal_lm", return_value=mock_result) as mock_method:
+            model.rerank("query", ["doc"])
+            # Default max_length=512 should be upgraded to 8192 for CausalLM
+            _, kwargs = mock_method.call_args
+            # The third positional arg is max_length
+            args, _ = mock_method.call_args
+            assert args[2] == 8192  # query, documents, max_length
+
+    def test_max_length_explicit_override(self, tmp_path):
+        """Test that explicit max_length is respected even for CausalLM."""
+        model_dir = self._make_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = True
+        model._loaded = True
+
+        mock_result = RerankOutput(scores=[0.5], indices=[0], total_tokens=10)
+        with patch.object(model, "_rerank_causal_lm", return_value=mock_result) as mock_method:
+            model.rerank("query", ["doc"], max_length=1024)
+            args, _ = mock_method.call_args
+            assert args[2] == 1024
