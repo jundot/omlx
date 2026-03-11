@@ -78,6 +78,97 @@ class TestVerifyApiKey:
             _server_state.api_key = original_key
 
 
+class TestSubKeyVerification:
+    """Tests for sub key API authentication."""
+
+    def test_sub_key_accepted_for_api(self):
+        """Test that a sub key is accepted for API authentication."""
+        from omlx.server import verify_api_key, _server_state
+        from omlx.settings import SubKeyEntry
+        from fastapi.security import HTTPAuthorizationCredentials
+        import asyncio
+
+        original_key = _server_state.api_key
+        original_gs = _server_state.global_settings
+        _server_state.api_key = "main-key"
+
+        # Create mock global_settings with sub keys
+        from unittest.mock import MagicMock
+        mock_gs = MagicMock()
+        mock_gs.auth.sub_keys = [
+            SubKeyEntry(key="sub-key-1", name="Test Sub Key"),
+        ]
+        mock_gs.auth.skip_api_key_verification = False
+        mock_gs.server.host = "127.0.0.1"
+        _server_state.global_settings = mock_gs
+
+        try:
+            credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="sub-key-1")
+            result = asyncio.run(verify_api_key(credentials=credentials))
+            assert result is True
+        finally:
+            _server_state.api_key = original_key
+            _server_state.global_settings = original_gs
+
+    def test_invalid_sub_key_rejected(self):
+        """Test that an invalid sub key is rejected."""
+        from omlx.server import verify_api_key, _server_state
+        from omlx.settings import SubKeyEntry
+        from fastapi.security import HTTPAuthorizationCredentials
+        from fastapi import HTTPException
+        import asyncio
+
+        original_key = _server_state.api_key
+        original_gs = _server_state.global_settings
+        _server_state.api_key = "main-key"
+
+        from unittest.mock import MagicMock
+        mock_gs = MagicMock()
+        mock_gs.auth.sub_keys = [
+            SubKeyEntry(key="sub-key-1", name="Test Sub Key"),
+        ]
+        mock_gs.auth.skip_api_key_verification = False
+        mock_gs.server.host = "0.0.0.0"
+        _server_state.global_settings = mock_gs
+
+        try:
+            credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="wrong-key")
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(verify_api_key(credentials=credentials))
+            assert exc_info.value.status_code == 401
+        finally:
+            _server_state.api_key = original_key
+            _server_state.global_settings = original_gs
+
+    def test_main_key_still_works_for_api(self):
+        """Test that the main key still works for API authentication."""
+        from omlx.server import verify_api_key, _server_state
+        from omlx.settings import SubKeyEntry
+        from fastapi.security import HTTPAuthorizationCredentials
+        import asyncio
+
+        original_key = _server_state.api_key
+        original_gs = _server_state.global_settings
+        _server_state.api_key = "main-key"
+
+        from unittest.mock import MagicMock
+        mock_gs = MagicMock()
+        mock_gs.auth.sub_keys = [
+            SubKeyEntry(key="sub-key-1", name="Test Sub Key"),
+        ]
+        mock_gs.auth.skip_api_key_verification = False
+        mock_gs.server.host = "0.0.0.0"
+        _server_state.global_settings = mock_gs
+
+        try:
+            credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="main-key")
+            result = asyncio.run(verify_api_key(credentials=credentials))
+            assert result is True
+        finally:
+            _server_state.api_key = original_key
+            _server_state.global_settings = original_gs
+
+
 class TestSkipApiKeyVerification:
     """Tests for skip_api_key_verification feature."""
 

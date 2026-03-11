@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from omlx.admin.auth import validate_api_key, verify_api_key
+from omlx.admin.auth import validate_api_key, verify_any_api_key, verify_api_key
 from omlx.model_settings import ModelSettings
 import omlx.server  # noqa: F401 — ensure server module is imported first (triggers set_admin_getters)
 import omlx.admin.routes as admin_routes
@@ -167,6 +167,41 @@ class TestVerifyApiKeyAdmin:
 
     def test_both_empty(self):
         assert verify_api_key("", "") is False
+
+
+class TestVerifyAnyApiKey:
+    """Tests for verify_any_api_key() checking main key + sub keys."""
+
+    def test_matches_main_key(self):
+        from omlx.settings import SubKeyEntry
+        sub_keys = [SubKeyEntry(key="sub1"), SubKeyEntry(key="sub2")]
+        assert verify_any_api_key("main-key", "main-key", sub_keys) is True
+
+    def test_matches_sub_key(self):
+        from omlx.settings import SubKeyEntry
+        sub_keys = [SubKeyEntry(key="sub1"), SubKeyEntry(key="sub2")]
+        assert verify_any_api_key("sub2", "main-key", sub_keys) is True
+
+    def test_no_match(self):
+        from omlx.settings import SubKeyEntry
+        sub_keys = [SubKeyEntry(key="sub1")]
+        assert verify_any_api_key("wrong", "main-key", sub_keys) is False
+
+    def test_empty_api_key(self):
+        from omlx.settings import SubKeyEntry
+        sub_keys = [SubKeyEntry(key="sub1")]
+        assert verify_any_api_key("", "main-key", sub_keys) is False
+
+    def test_no_main_key_matches_sub(self):
+        from omlx.settings import SubKeyEntry
+        sub_keys = [SubKeyEntry(key="sub1")]
+        assert verify_any_api_key("sub1", "", sub_keys) is True
+
+    def test_empty_sub_keys(self):
+        assert verify_any_api_key("main-key", "main-key", []) is True
+
+    def test_no_match_empty_sub_keys(self):
+        assert verify_any_api_key("wrong", "main-key", []) is False
 
 
 def _mock_global_settings(api_key=None):

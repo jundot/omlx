@@ -12,8 +12,10 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import shutil
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 
@@ -30,6 +32,7 @@ from .auth import (
     validate_api_key,
     verify_api_key,
 )
+from ..settings import SubKeyEntry
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +54,19 @@ class SetupApiKeyRequest(BaseModel):
 
     api_key: str
     api_key_confirm: str
+
+
+class CreateSubKeyRequest(BaseModel):
+    """Request model for creating a sub API key."""
+
+    key: str
+    name: str = ""
+
+
+class DeleteSubKeyRequest(BaseModel):
+    """Request model for deleting a sub API key."""
+
+    key: str
 
 
 class ModelSettingsRequest(BaseModel):
@@ -821,6 +837,7 @@ async def login(request: LoginRequest, response: Response):
             detail="No API key configured. Please set up an API key first.",
         )
 
+    # Main key only — sub keys must not grant admin login
     if not verify_api_key(request.api_key, server_api_key):
         raise HTTPException(
             status_code=401,
@@ -944,6 +961,7 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
     global_settings = _get_global_settings()
     server_api_key = global_settings.auth.api_key if global_settings else None
 
+    # Main key only — sub keys must not grant admin login
     if not key or not server_api_key or not verify_api_key(key, server_api_key):
         return RedirectResponse(url="/admin", status_code=302)
 
@@ -957,6 +975,107 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
         max_age=86400,
     )
     return response
+
+
+# =============================================================================
+# Sub Key Management Routes
+# =============================================================================
+
+
+@router.post("/api/sub-keys")
+async def create_sub_key(
+    request: CreateSubKeyRequest, is_admin: bool = Depends(require_admin)
+):
+    """Create a new sub API key.
+
+    Sub keys can only be used for API authentication, not admin login.
+
+    Args:
+        request: CreateSubKeyRequest with key and optional name.
+
+    Returns:
+        JSON with the created sub key entry.
+
+    Raises:
+        HTTPException: 400 if validation fails or key already exists.
+    """
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    # Validate key format
+    is_valid, error_msg = validate_api_key(request.key)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
+
+    # Check for duplicate (against main key and existing sub keys)
+    if global_settings.auth.api_key and secrets.compare_digest(
+        request.key, global_settings.auth.api_key
+    ):
+        raise HTTPException(
+            status_code=400, detail="Sub key cannot be the same as the main key"
+        )
+
+    for sk in global_settings.auth.sub_keys:
+        if sk.key and secrets.compare_digest(request.key, sk.key):
+            raise HTTPException(
+                status_code=400, detail="This key already exists"
+            )
+
+    entry = SubKeyEntry(
+        key=request.key,
+        name=request.name or "",
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    global_settings.auth.sub_keys.append(entry)
+
+    try:
+        global_settings.save()
+    except Exception as e:
+        # Rollback
+        global_settings.auth.sub_keys.pop()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to save settings: {e}"
+        )
+
+    logger.info(f"Sub key created: {request.name or '(unnamed)'}")
+    return {"success": True, "sub_key": entry.to_dict()}
+
+
+@router.delete("/api/sub-keys")
+async def delete_sub_key(
+    request: DeleteSubKeyRequest, is_admin: bool = Depends(require_admin)
+):
+    """Delete a sub API key.
+
+    Args:
+        request: DeleteSubKeyRequest with the key to delete.
+
+    Returns:
+        JSON with success status.
+
+    Raises:
+        HTTPException: 404 if key not found.
+    """
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    # Find and remove the key
+    for i, sk in enumerate(global_settings.auth.sub_keys):
+        if sk.key and secrets.compare_digest(request.key, sk.key):
+            removed = global_settings.auth.sub_keys.pop(i)
+            try:
+                global_settings.save()
+            except Exception as e:
+                global_settings.auth.sub_keys.insert(i, removed)
+                raise HTTPException(
+                    status_code=500, detail=f"Failed to save settings: {e}"
+                )
+            logger.info(f"Sub key deleted: {sk.name or '(unnamed)'}")
+            return {"success": True}
+
+    raise HTTPException(status_code=404, detail="Sub key not found")
 
 
 # =============================================================================
@@ -1411,6 +1530,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "api_key_set": bool(global_settings.auth.api_key),
             "api_key": global_settings.auth.api_key or "",
             "skip_api_key_verification": global_settings.auth.skip_api_key_verification,
+            "sub_keys": [sk.to_dict() for sk in global_settings.auth.sub_keys],
         },
         "claude_code": {
             "context_scaling_enabled": global_settings.claude_code.context_scaling_enabled,

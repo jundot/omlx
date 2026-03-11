@@ -127,6 +127,32 @@ def verify_api_key(api_key: str, server_api_key: str) -> bool:
     return secrets.compare_digest(api_key, server_api_key)
 
 
+def verify_any_api_key(api_key: str, main_key: str, sub_keys: list) -> bool:
+    """Verify an API key against the main key and all sub keys.
+
+    Uses constant-time comparison for each key to prevent timing attacks.
+    Checks the main key first, then iterates through sub keys.
+
+    Args:
+        api_key: The API key provided by the client.
+        main_key: The server's main API key.
+        sub_keys: List of SubKeyEntry objects with .key attribute.
+
+    Returns:
+        True if the API key matches any configured key, False otherwise.
+    """
+    if not api_key:
+        return False
+    # Check main key
+    if main_key and secrets.compare_digest(api_key, main_key):
+        return True
+    # Check sub keys
+    for sk in sub_keys:
+        if sk.key and secrets.compare_digest(api_key, sk.key):
+            return True
+    return False
+
+
 def validate_api_key(api_key: str) -> tuple[bool, str]:
     """Validate API key format requirements.
 

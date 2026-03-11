@@ -50,8 +50,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Union
 
-import secrets
-
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
@@ -219,7 +217,12 @@ def get_mcp_manager():
 async def verify_api_key(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> bool:
-    """Verify API key if configured."""
+    """Verify API key if configured.
+
+    Checks the provided Bearer token against the main API key and all sub keys.
+    """
+    from .admin.auth import verify_any_api_key
+
     # No auth required if no API key is configured
     if _server_state.api_key is None:
         return True
@@ -236,8 +239,15 @@ async def verify_api_key(
     if credentials is None:
         raise HTTPException(status_code=401, detail="API key required")
 
-    # Constant-time comparison
-    if not secrets.compare_digest(credentials.credentials, _server_state.api_key):
+    # Check main key and sub keys
+    sub_keys = (
+        _server_state.global_settings.auth.sub_keys
+        if _server_state.global_settings is not None
+        else []
+    )
+    if not verify_any_api_key(
+        credentials.credentials, _server_state.api_key, sub_keys
+    ):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     return True

@@ -332,12 +332,39 @@ class MemorySettings:
 
 
 @dataclass
+class SubKeyEntry:
+    """A sub API key entry for API-only authentication."""
+
+    key: str
+    name: str = ""
+    created_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "key": self.key,
+            "name": self.name,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SubKeyEntry:
+        """Create from dictionary."""
+        return cls(
+            key=data.get("key", ""),
+            name=data.get("name", ""),
+            created_at=data.get("created_at", ""),
+        )
+
+
+@dataclass
 class AuthSettings:
     """Authentication configuration settings."""
 
     api_key: str | None = None
     secret_key: str | None = None
     skip_api_key_verification: bool = False
+    sub_keys: list[SubKeyEntry] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -345,6 +372,7 @@ class AuthSettings:
             "api_key": self.api_key,
             "secret_key": self.secret_key,
             "skip_api_key_verification": self.skip_api_key_verification,
+            "sub_keys": [sk.to_dict() for sk in self.sub_keys],
         }
 
     @classmethod
@@ -354,6 +382,9 @@ class AuthSettings:
             api_key=data.get("api_key"),
             secret_key=data.get("secret_key"),
             skip_api_key_verification=data.get("skip_api_key_verification", False),
+            sub_keys=[
+                SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])
+            ],
         )
 
 
