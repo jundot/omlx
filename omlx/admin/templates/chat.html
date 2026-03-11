@@ -398,7 +398,7 @@
                     <span class="text-sm truncate flex-1" style="color: var(--text-primary);" x-text="chat.title || window.t('chat.new_chat_title')"></span>
                     <button @click.stop="deleteChat(chat.id)"
                             class="opacity-0 group-hover:opacity-100 p-1 hover:bg-red-100 rounded transition-opacity"
-                            title="{{ t('chat.delete_tooltip') }}"
+                            title="{{ t('chat.delete_tooltip') }}">
                         <i data-lucide="trash-2" class="w-3 h-3 text-red-500"></i>
                     </button>
                 </div>
@@ -508,7 +508,7 @@
                                         ></textarea>
                                         <div class="inline-edit-actions">
                                             <button @click="cancelEdit" class="px-3 py-1.5 text-sm border rounded-lg hover:bg-neutral-100" style="border-color: var(--border-normal); color: var(--text-secondary);">{{ t('chat.edit_cancel') }}</button>
-                                            <button @click="saveEdit(index)" class="px-3 py-1.5 text-sm bg-neutral-900 text-white rounded-lg hover:bg-neutral-800">{{ t('chat.edit_save') }}</button>
+                                            <button @click="saveEdit(index)" class="px-3 py-1.5 text-sm bg-neutral-900 text-white rounded-lg hover:bg-neutral-800" style="color: white;">{{ t('chat.edit_save') }}</button>
                                         </div>
                                     </div>
                                 </template>
