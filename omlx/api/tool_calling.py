@@ -178,7 +178,7 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
         Tuple of (cleaned_text, tool_calls or None)
     """
     tool_calls = []
-    pattern = r'\[Calling tool:\s*(\w+)\(({.*?})\)\]'
+    pattern = r'\[Calling tool:\s*([A-Za-z_][\w.-]*)\(({.*?})\)\]'
     for match in re.finditer(pattern, text, re.DOTALL):
         name = match.group(1)
         args_str = match.group(2)
@@ -278,7 +278,7 @@ def parse_tool_calls(
         return _parse_xml_tool_calls(cleaned_text)
 
     # Fallback: namespaced tool_call tags (e.g. <minimax:tool_call>)
-    ns_match = re.search(r'<(\w+):tool_call>', cleaned_text)
+    ns_match = re.search(r'<([A-Za-z_][\w.-]*):tool_call>', cleaned_text)
     if ns_match:
         ns = ns_match.group(1)
         return _parse_namespaced_tool_calls(cleaned_text, ns)
@@ -293,58 +293,222 @@ def parse_tool_calls(
 class ToolCallStreamFilter:
     """Streaming filter that suppresses tool-call markup from content deltas.
 
-    Buffers a small window of tokens to detect the tool-call start marker
-    from the model's tokenizer.  Content before the marker is emitted
-    normally; once the marker is found, all subsequent content is suppressed
-    (tool calls are parsed from accumulated text after generation).
+    Detects known tool-call start envelopes during streaming and suppresses
+    control markup from assistant-visible content. Supports tokenizer-defined
+    delimiters, namespaced XML envelopes, and high-confidence bracket-format
+    envelopes handled by ``parse_tool_calls``.
+
+    Suppression is envelope-bounded: control markup is removed, then visible
+    prose after a closed envelope continues streaming normally.
 
     Args:
-        tokenizer: The model's tokenizer — uses ``tool_call_start`` to
-            determine what to look for.
+        tokenizer: The model's tokenizer. Uses tokenizer-defined
+            ``tool_call_start`` when available.
     """
 
     def __init__(self, tokenizer: Any):
-        self._marker: str = getattr(tokenizer, "tool_call_start", "")
-        self._max_len = len(self._marker) if self._marker else 0
+        marker = getattr(tokenizer, "tool_call_start", "") or ""
+        marker_end = getattr(tokenizer, "tool_call_end", "") or ""
+        self._marker_pairs: List[Tuple[str, str]] = [("<tool_call>", "</tool_call>")]
+        if marker and marker_end:
+            self._marker_pairs.insert(0, (marker, marker_end))
+        self._namespaced_open_re = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>")
+        self._bracket_prefix = "[Calling tool:"
+        self._bracket_call_re = re.compile(
+            r'^\[Calling tool:\s*([A-Za-z_][\w.-]*)\(({.*?})\)\]',
+            re.DOTALL,
+        )
         self._buffer = ""
-        self._suppressing = False
+        self._suppressing_until: Optional[str] = None
 
     @property
     def active(self) -> bool:
-        """Whether this filter has a marker to look for."""
-        return self._max_len > 0
+        """Whether this filter should run for tool-enabled streams."""
+        return True
+
+    def _find_start_envelope(self, text: str) -> Optional[Tuple[int, int, Optional[str]]]:
+        """Find earliest complete opening envelope.
+
+        Returns:
+            tuple(index, consume_len, close_marker_or_none)
+            - close_marker_or_none is a close marker to wait for, or ``None``
+              when the whole envelope is already contained in consume_len.
+        """
+        starts: List[Tuple[int, int, Optional[str]]] = []
+
+        for marker, close in self._marker_pairs:
+            idx = text.find(marker)
+            if idx >= 0:
+                starts.append((idx, len(marker), close))
+
+        ns_match = self._namespaced_open_re.search(text)
+        if ns_match:
+            ns = ns_match.group(1)
+            starts.append((ns_match.start(), len(ns_match.group(0)), f"</{ns}:tool_call>"))
+
+        bracket_idx = text.find(self._bracket_prefix)
+        if bracket_idx >= 0:
+            bracket_candidate = text[bracket_idx:]
+            bracket_match = self._bracket_call_re.match(bracket_candidate)
+            if bracket_match:
+                starts.append((bracket_idx, bracket_match.end(), None))
+
+        if not starts:
+            return None
+        return min(starts, key=lambda x: x[0])
+
+    @staticmethod
+    def _partial_prefix_len(text: str, marker: str) -> int:
+        """Longest suffix of text that is a proper prefix of marker."""
+        max_len = min(len(text), len(marker) - 1)
+        for n in range(max_len, 0, -1):
+            if text.endswith(marker[:n]):
+                return n
+        return 0
+
+    @staticmethod
+    def _could_be_partial_namespaced_open(candidate: str) -> bool:
+        """Return True if candidate could prefix a namespaced <ns:tool_call> tag."""
+        if not candidate.startswith("<"):
+            return False
+        if ">" in candidate:
+            return False
+
+        body = candidate[1:]
+        if not body:
+            return True
+        if body.startswith("/"):
+            return False
+
+        if ":" not in body:
+            return re.match(r"^[A-Za-z_][\w.-]*$", body) is not None
+
+        ns, suffix = body.split(":", 1)
+        if not re.match(r"^[A-Za-z_][\w.-]*$", ns):
+            return False
+        return "tool_call".startswith(suffix)
+
+    def _partial_suffix_len(self, text: str) -> int:
+        """Length of trailing suffix that might be an opening-marker prefix."""
+        keep = 0
+        for marker, _close in self._marker_pairs:
+            keep = max(keep, self._partial_prefix_len(text, marker))
+
+        last_lt = text.rfind("<")
+        if last_lt >= 0:
+            candidate = text[last_lt:]
+            if self._could_be_partial_namespaced_open(candidate):
+                keep = max(keep, len(candidate))
+
+        bracket_idx = text.find(self._bracket_prefix)
+        if bracket_idx >= 0:
+            bracket_candidate = text[bracket_idx:]
+            # Hold unresolved bracket prefix until we can classify parseable
+            # envelope vs literal prose.
+            if "]" not in bracket_candidate:
+                keep = max(keep, len(bracket_candidate))
+                # Do not cap unresolved bracket candidates: capping can leak
+                # raw control markup once the prefix grows past the cap.
+                return keep
+
+        # Cap retained suffix window to avoid unbounded buffering on malformed text.
+        return min(keep, 128)
+
+    def _should_drop_tail_at_finish(self, tail: str) -> bool:
+        """Whether unresolved tail should be suppressed under strict mode."""
+        if not tail:
+            return False
+
+        for marker, _close in self._marker_pairs:
+            if marker.startswith(tail):
+                return True
+
+        if not tail.startswith("<"):
+            return False
+        if ">" in tail:
+            return False
+
+        body = tail[1:]
+        if not body:
+            return True
+        if body.startswith("/"):
+            return False
+
+        if ":" not in body:
+            # Preserve plain literal tails like "<alpha".
+            return False
+
+        ns, suffix = body.split(":", 1)
+        if not re.match(r"^[A-Za-z_][\w.-]*$", ns):
+            return False
+        return "tool_call".startswith(suffix)
 
     def feed(self, text: str) -> str:
         """Feed a content delta, return the portion safe to emit."""
-        if self._suppressing or not text:
+        if not text:
             return ""
         if not self.active:
             return text
 
         self._buffer += text
+        out: List[str] = []
 
-        idx = self._buffer.find(self._marker)
-        if idx >= 0:
-            self._suppressing = True
-            safe = self._buffer[:idx]
-            self._buffer = ""
-            return safe
+        while self._buffer:
+            if self._suppressing_until is not None:
+                end_idx = self._buffer.find(self._suppressing_until)
+                if end_idx < 0:
+                    keep = self._partial_prefix_len(self._buffer, self._suppressing_until)
+                    self._buffer = self._buffer[-keep:] if keep else ""
+                    break
+                self._buffer = self._buffer[end_idx + len(self._suppressing_until):]
+                self._suppressing_until = None
+                continue
 
-        # Emit content that can't possibly be a partial marker start.
-        # Keep the last (marker_len - 1) chars buffered.
-        safe_len = len(self._buffer) - self._max_len + 1
-        if safe_len > 0:
-            safe = self._buffer[:safe_len]
-            self._buffer = self._buffer[safe_len:]
-            return safe
+            start = self._find_start_envelope(self._buffer)
+            if start:
+                idx, consume_len, close_marker = start
+                if idx > 0:
+                    out.append(self._buffer[:idx])
+                self._buffer = self._buffer[idx + consume_len:]
+                if close_marker is not None:
+                    self._suppressing_until = close_marker
+                continue
 
-        return ""
+            keep = self._partial_suffix_len(self._buffer)
+            if keep == 0:
+                out.append(self._buffer)
+                self._buffer = ""
+                break
+            if len(self._buffer) > keep:
+                out.append(self._buffer[:-keep])
+                self._buffer = self._buffer[-keep:]
+            break
+
+        return "".join(out)
 
     def finish(self) -> str:
-        """Flush remaining buffer (only if we never found a marker)."""
-        if self._suppressing:
+        """Flush remaining safe buffer content.
+
+        In clean-output strict mode, unresolved marker-like suffixes are dropped
+        so partial control markup does not leak into user-visible text.
+        """
+        if self._suppressing_until is not None:
+            self._buffer = ""
+            self._suppressing_until = None
             return ""
-        buf = self._buffer
+
+        keep = self._partial_suffix_len(self._buffer)
+        if keep >= len(self._buffer):
+            tail = self._buffer
+            self._buffer = ""
+            if self._should_drop_tail_at_finish(tail):
+                return ""
+            return tail
+
+        if keep:
+            buf = self._buffer[:-keep]
+        else:
+            buf = self._buffer
         self._buffer = ""
         return buf
 

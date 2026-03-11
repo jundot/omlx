@@ -1819,11 +1819,9 @@ async def stream_chat_completion(
     )
     yield f"data: {first_chunk.model_dump_json(exclude_none=True)}\n\n"
 
-    # Stream content token-by-token.  When tools are present and the
-    # tokenizer has a known tool-call start marker, a ToolCallStreamFilter
-    # suppresses tool-call markup so clients don't see raw XML/tags.
-    # When no marker is available (fallback parser models), buffer all
-    # content and emit it after generation to ensure markup is cleaned.
+    # Stream content token-by-token. When tools are present, a
+    # ToolCallStreamFilter suppresses known tool-call control markup so
+    # clients do not see raw envelopes/tags in assistant content deltas.
     tool_filter = None
     stream_content = True
     if has_tools:
@@ -2095,8 +2093,7 @@ async def stream_anthropic_messages(
     block_index = 0
     last_output = None  # Track last output for tool_calls and token counts
 
-    # Filter tool-call markup from streamed content when tools are present
-    # and the tokenizer has a known start marker.
+    # Filter tool-call markup from streamed content when tools are present.
     has_tools = bool(kwargs.get("tools"))
     tool_filter = None
     if has_tools:

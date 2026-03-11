@@ -616,9 +616,9 @@ class TestToolCallStreamFilter:
     """Tests for ToolCallStreamFilter."""
 
     def test_no_marker_passthrough(self):
-        """No tool_call_start attribute -> all text passes through."""
+        """Without tokenizer marker, fallback envelopes are still active."""
         f = ToolCallStreamFilter(_make_tokenizer())
-        assert not f.active
+        assert f.active
         assert f.feed("hello world") == "hello world"
         assert f.finish() == ""
 
@@ -677,16 +677,95 @@ class TestToolCallStreamFilter:
         result += f.finish()
         assert result == "Hi"
 
-    def test_finish_flushes_buffer_no_marker(self):
-        """finish() emits buffered chars when no marker found."""
+    def test_finish_drops_partial_marker_suffix_under_strict_mode(self):
+        """finish() suppresses unresolved control-marker suffixes."""
         f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
         # Feed text shorter than marker - all buffered
         r1 = f.feed("<tool")
         r2 = f.finish()
-        assert r1 + r2 == "<tool"
+        assert r1 + r2 == ""
 
     def test_suppressing_blocks_finish(self):
-        """Once suppressing, finish() returns nothing."""
-        f = ToolCallStreamFilter(_make_tokenizer("<tc>"))
-        f.feed("text<tc>rest")
+        """An unresolved open envelope keeps buffered control text suppressed at finish()."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        f.feed("text<tool_call>rest")
+        assert f.finish() == ""
+
+    def test_bracket_literal_passthrough(self):
+        """Bracket-style literal text should pass through unchanged."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed("Heads up: [Calling tool:")
+        result += f.feed(" maybe later]")
+        result += f.finish()
+        assert result == "Heads up: [Calling tool: maybe later]"
+
+    def test_bracket_tool_call_suppresses_when_complete(self):
+        """A complete parseable bracket envelope should be suppressed."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Lead in [Calling tool:")
+        r2 = f.feed(' get_weather({"city":"SF"})]')
+        assert r1 == "Lead in "
+        assert r2 == ""
+        assert f.finish() == ""
+
+    def test_bracket_tool_call_suppresses_envelope_but_preserves_trailing_text(self):
+        """Suppression must not truncate prose that follows a complete bracket envelope."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Before [Calling tool:")
+        r2 = f.feed(' get_weather({"city":"SF"})] After text')
+        r3 = f.finish()
+        assert r1 + r2 + r3 == "Before  After text"
+
+    def test_xml_tool_call_suppresses_envelope_but_preserves_trailing_text(self):
+        """Raw XML envelope suppression should resume normal text after close tag."""
+        f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
+        result = f.feed(
+            'Before <tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call> After'
+        )
+        result += f.finish()
+        assert result == "Before  After"
+
+    def test_bracket_tool_call_with_hyphen_name_suppresses_when_complete(self):
+        """Bracket detector should treat hyphenated tool names as valid calls."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Lead in [Calling tool:")
+        r2 = f.feed(' get-weather({"city":"SF"})] tail')
+        r3 = f.finish()
+        assert r1 + r2 + r3 == "Lead in  tail"
+
+    def test_long_unresolved_bracket_envelope_does_not_leak_control_markup(self):
+        """Long unresolved bracket calls should stay buffered until envelope is complete."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        long_note = "x" * 320
+        prefix = 'Before [Calling tool: get_weather({"note":"'
+        chunk1 = prefix + long_note
+        chunk2 = '"})] After'
+
+        r1 = f.feed(chunk1)
+        r2 = f.feed(chunk2)
+        r3 = f.finish()
+        result = r1 + r2 + r3
+
+        assert "[Calling tool:" not in result
+        assert result == "Before  After"
+
+    def test_finish_preserves_non_tool_angle_identifier_suffix_literal(self):
+        """Non-tool literal tails like '<alpha' should not be dropped at stream end."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed("Use <alpha")
+        result += f.finish()
+        assert result == "Use <alpha"
+
+    def test_partial_non_tool_namespaced_literal_is_preserved(self):
+        """Namespaced-looking suffixes that are not :tool_call remain visible."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed("Keep literal <alpha:beta")
+        result += f.finish()
+        assert result == "Keep literal <alpha:beta"
+
+    def test_hyphen_namespaced_tool_call_open_suppresses_markup(self):
+        """Hyphenated namespace tool-call open tag should trigger suppression."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed("Before <foo-bar:tool_call><invoke name=\"x\">")
+        assert result == "Before "
         assert f.finish() == ""
