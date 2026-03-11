@@ -111,6 +111,13 @@ SUPPORTED_RERANKER_ARCHITECTURES = {
     "XLMRobertaForSequenceClassification",  # omlx native implementation
 }
 
+# CausalLM-based reranker architectures.
+# These are standard CausalLM models fine-tuned for reranking via yes/no logit scoring.
+# Detected by architecture + heuristic (model name or tokenizer hints).
+CAUSAL_LM_RERANKER_ARCHITECTURES = {
+    "Qwen3ForCausalLM",
+}
+
 # Unsupported reranker architectures (future support)
 UNSUPPORTED_RERANKER_ARCHITECTURES = {
     "BertForSequenceClassification",
@@ -131,6 +138,19 @@ class DiscoveredModel:
     engine_type: EngineType  # "batched", "vlm", "embedding", or "reranker"
     estimated_size: int  # Estimated memory usage in bytes
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
+
+
+def _is_causal_lm_reranker(model_path: Path) -> bool:
+    """
+    Heuristic check for CausalLM models fine-tuned as rerankers.
+
+    CausalLM rerankers (e.g., Qwen3-Reranker) use the same architecture as
+    their base LLMs but are fine-tuned to output yes/no logits for relevance
+    scoring. We detect them by checking the model directory name for "reranker"
+    or "rerank" keywords, since config.json is identical to a standard LLM.
+    """
+    name_lower = model_path.name.lower()
+    return "reranker" in name_lower or "rerank" in name_lower
 
 
 def detect_model_type(model_path: Path) -> ModelType:
@@ -164,6 +184,14 @@ def detect_model_type(model_path: Path) -> ModelType:
     for arch in architectures:
         if arch in RERANKER_ARCHITECTURES:
             return "reranker"
+
+    # Check for CausalLM-based rerankers (e.g., Qwen3-Reranker).
+    # These use a standard CausalLM architecture but are fine-tuned for reranking
+    # via yes/no logit scoring. Detected by architecture + model directory name hint.
+    for arch in architectures:
+        if arch in CAUSAL_LM_RERANKER_ARCHITECTURES:
+            if _is_causal_lm_reranker(model_path):
+                return "reranker"
 
     # Check architectures field for embedding (before model_type to avoid
     # false positives from ambiguous model types like qwen3, gemma3-text)

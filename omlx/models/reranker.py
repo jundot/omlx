@@ -3,11 +3,12 @@
 MLX Reranker Model wrapper.
 
 This module provides a wrapper for document reranking using SequenceClassification
-models on Apple's MLX framework.
+and CausalLM-based reranker models on Apple's MLX framework.
 
 Supports:
 - ModernBertForSequenceClassification (via mlx-embeddings)
 - XLMRobertaForSequenceClassification (omlx native implementation)
+- CausalLM-based rerankers (e.g., Qwen3-Reranker) via yes/no logit scoring
 """
 
 import json
@@ -16,7 +17,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Tuple
 
-from ..model_discovery import SUPPORTED_RERANKER_ARCHITECTURES
+from ..model_discovery import (
+    CAUSAL_LM_RERANKER_ARCHITECTURES,
+    SUPPORTED_RERANKER_ARCHITECTURES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,15 +41,17 @@ class RerankOutput:
 
 class MLXRerankerModel:
     """
-    Wrapper around mlx-embeddings for document reranking.
+    Wrapper for document reranking on Apple's MLX framework.
 
-    This class provides a unified interface for loading and running
-    SequenceClassification models for reranking on Apple's MLX framework.
+    Supports two reranking paradigms:
 
-    Supported architectures:
-    - ModernBertForSequenceClassification
-    - BertForSequenceClassification
-    - XLMRobertaForSequenceClassification
+    1. SequenceClassification models (encoder-based):
+       - ModernBertForSequenceClassification (via mlx-embeddings)
+       - XLMRobertaForSequenceClassification (omlx native implementation)
+
+    2. CausalLM-based rerankers (decoder-based):
+       - Qwen3-Reranker and similar models that use yes/no logit scoring
+       - Uses instruction prompts and extracts relevance from token logits
 
     Example:
         >>> model = MLXRerankerModel("BAAI/bge-reranker-v2-m3")
@@ -53,6 +59,16 @@ class MLXRerankerModel:
         >>> output = model.rerank("What is ML?", ["ML is...", "Weather is..."])
         >>> print(output.scores)  # [0.95, 0.12]
     """
+
+    # CausalLM reranker prompt template (Qwen3-Reranker format)
+    _CAUSAL_LM_SYSTEM_PROMPT = (
+        "Judge whether the Document meets the requirements based on the "
+        'Query and the Instruct provided. Note that the answer can only be '
+        '"yes" or "no".'
+    )
+    _CAUSAL_LM_DEFAULT_INSTRUCTION = (
+        "Given a web search query, retrieve relevant passages that answer the query"
+    )
 
     def __init__(self, model_name: str):
         """
@@ -67,6 +83,11 @@ class MLXRerankerModel:
         self.processor = None
         self._loaded = False
         self._num_labels: int | None = None
+        self._is_causal_lm = False
+        self._token_true_id: int | None = None
+        self._token_false_id: int | None = None
+        self._prefix_tokens: list[int] | None = None
+        self._suffix_tokens: list[int] | None = None
 
     def _get_architecture(self) -> str | None:
         """Get the model architecture from config.json."""
@@ -125,6 +146,46 @@ class MLXRerankerModel:
 
         return model, tokenizer
 
+    def _load_causal_lm(self) -> Tuple[Any, Any]:
+        """Load a CausalLM-based reranker model using mlx-lm."""
+        from mlx_lm import load as mlx_lm_load
+
+        model_path = str(self.model_name)
+        model, tokenizer_wrapper = mlx_lm_load(model_path)
+
+        # mlx-lm returns a TokenizerWrapper; unwrap to get the underlying
+        # transformers tokenizer which supports __call__ for batch encoding.
+        tokenizer = getattr(tokenizer_wrapper, "_tokenizer", tokenizer_wrapper)
+
+        # Resolve yes/no token IDs from tokenizer
+        self._token_true_id = tokenizer.convert_tokens_to_ids("yes")
+        self._token_false_id = tokenizer.convert_tokens_to_ids("no")
+
+        if self._token_true_id is None or self._token_false_id is None:
+            raise ValueError(
+                "Could not find 'yes'/'no' token IDs in tokenizer. "
+                "This model may not be a compatible CausalLM reranker."
+            )
+
+        # Pre-compute prefix and suffix tokens for the prompt template
+        prefix = (
+            f"<|im_start|>system\n{self._CAUSAL_LM_SYSTEM_PROMPT}<|im_end|>\n"
+            f"<|im_start|>user\n"
+        )
+        suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+        self._prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
+        self._suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False)
+
+        logger.info(
+            f"CausalLM reranker tokens: yes={self._token_true_id}, "
+            f"no={self._token_false_id}, "
+            f"prefix_len={len(self._prefix_tokens)}, "
+            f"suffix_len={len(self._suffix_tokens)}"
+        )
+
+        return model, tokenizer
+
     def load(self) -> None:
         """Load the model and processor/tokenizer."""
         if self._loaded:
@@ -137,7 +198,12 @@ class MLXRerankerModel:
         logger.info(f"Loading reranker model: {self.model_name} (arch={arch})")
 
         try:
-            if arch == "XLMRobertaForSequenceClassification":
+            if arch in CAUSAL_LM_RERANKER_ARCHITECTURES:
+                # CausalLM-based reranker (e.g., Qwen3-Reranker)
+                self.model, self.processor = self._load_causal_lm()
+                self._is_causal_lm = True
+                self._num_labels = 2  # yes/no
+            elif arch == "XLMRobertaForSequenceClassification":
                 # Use omlx native implementation
                 self.model, self.processor = self._load_xlm_roberta()
                 self._num_labels = getattr(self.model.config, "num_labels", None)
@@ -154,13 +220,14 @@ class MLXRerankerModel:
             self._loaded = True
             logger.info(
                 f"Reranker model loaded successfully: {self.model_name} "
-                f"(num_labels={self._num_labels})"
+                f"(arch={arch}, num_labels={self._num_labels}, "
+                f"causal_lm={self._is_causal_lm})"
             )
 
         except ImportError as e:
             raise ImportError(
-                "mlx-embeddings or transformers is required for reranking. "
-                "Install with: pip install mlx-embeddings transformers"
+                "mlx-lm, mlx-embeddings, or transformers is required for reranking. "
+                "Install with: pip install mlx-lm mlx-embeddings transformers"
             ) from e
         except Exception as e:
             logger.error(f"Failed to load reranker model: {e}")
@@ -186,10 +253,114 @@ class MLXRerankerModel:
         if not self._loaded:
             self.load()
 
-        import mlx.core as mx
-
         if not documents:
             return RerankOutput(scores=[], indices=[], total_tokens=0)
+
+        if self._is_causal_lm:
+            return self._rerank_causal_lm(query, documents, max_length)
+        else:
+            return self._rerank_seq_classification(query, documents, max_length)
+
+    def _rerank_causal_lm(
+        self,
+        query: str,
+        documents: list[str],
+        max_length: int = 8192,
+    ) -> RerankOutput:
+        """
+        Rerank using CausalLM yes/no logit scoring (e.g., Qwen3-Reranker).
+
+        Constructs instruction prompts, runs a forward pass, and extracts
+        relevance scores from the logits of yes/no tokens at the last position.
+        """
+        import mlx.core as mx
+
+        tokenizer = self.processor
+        prefix_tokens = self._prefix_tokens
+        suffix_tokens = self._suffix_tokens
+
+        # Compute max tokens available for the instruction content
+        max_content_tokens = max_length - len(prefix_tokens) - len(suffix_tokens)
+
+        # Format and tokenize each query-document pair
+        pairs_text = []
+        for doc in documents:
+            content = (
+                f"<Instruct>: {self._CAUSAL_LM_DEFAULT_INSTRUCTION}\n"
+                f"<Query>: {query}\n"
+                f"<Document>: {doc}"
+            )
+            pairs_text.append(content)
+
+        # Tokenize content parts (without prefix/suffix)
+        content_encodings = tokenizer(
+            pairs_text,
+            padding=False,
+            truncation=True,
+            return_attention_mask=False,
+            max_length=max_content_tokens,
+            add_special_tokens=False,
+        )
+
+        # Assemble full token sequences: prefix + content + suffix
+        all_input_ids = []
+        for content_ids in content_encodings["input_ids"]:
+            full_ids = prefix_tokens + content_ids + suffix_tokens
+            all_input_ids.append(full_ids)
+
+        # Pad to same length
+        max_len = max(len(ids) for ids in all_input_ids)
+        # Pad on the left (common for causal LMs)
+        pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+        padded_input_ids = []
+        padded_attention_mask = []
+        for ids in all_input_ids:
+            pad_len = max_len - len(ids)
+            padded_input_ids.append([pad_token_id] * pad_len + ids)
+            padded_attention_mask.append([0] * pad_len + [1] * len(ids))
+
+        input_ids = mx.array(padded_input_ids)
+        attention_mask = mx.array(padded_attention_mask)
+
+        # Forward pass — get logits for all positions
+        logits = self.model(input_ids)
+
+        # Extract logits at the last position for each sample
+        # logits shape: (batch_size, seq_len, vocab_size)
+        last_logits = logits[:, -1, :]
+
+        # Extract yes/no logits and compute scores
+        true_logits = last_logits[:, self._token_true_id]
+        false_logits = last_logits[:, self._token_false_id]
+        paired = mx.stack([false_logits, true_logits], axis=1)
+        log_probs = mx.softmax(paired, axis=1)
+        scores_array = log_probs[:, 1]
+
+        mx.eval(scores_array)
+        scores = scores_array.tolist()
+
+        # Sort indices by score (descending)
+        indexed_scores = list(enumerate(scores))
+        indexed_scores.sort(key=lambda x: x[1], reverse=True)
+        sorted_indices = [idx for idx, _ in indexed_scores]
+
+        # Count tokens
+        total_tokens = sum(len(ids) for ids in all_input_ids)
+
+        return RerankOutput(
+            scores=scores,
+            indices=sorted_indices,
+            total_tokens=total_tokens,
+        )
+
+    def _rerank_seq_classification(
+        self,
+        query: str,
+        documents: list[str],
+        max_length: int = 512,
+    ) -> RerankOutput:
+        """Rerank using SequenceClassification models (encoder-based)."""
+        import mlx.core as mx
 
         # Get the underlying tokenizer from TokenizerWrapper (mlx-embeddings only)
         # Don't unwrap transformers tokenizers which also have _tokenizer attribute
@@ -305,7 +476,7 @@ class MLXRerankerModel:
         Validate that the model architecture is supported.
 
         Raises:
-            ValueError: If the architecture is not supported by mlx-embeddings
+            ValueError: If the architecture is not supported
         """
         config_path = Path(self.model_name) / "config.json"
         if not config_path.exists():
@@ -324,12 +495,12 @@ class MLXRerankerModel:
             return
 
         arch = architectures[0]
-        if arch not in SUPPORTED_RERANKER_ARCHITECTURES:
-            supported_list = ", ".join(sorted(SUPPORTED_RERANKER_ARCHITECTURES))
+        all_supported = SUPPORTED_RERANKER_ARCHITECTURES | CAUSAL_LM_RERANKER_ARCHITECTURES
+        if arch not in all_supported:
+            supported_list = ", ".join(sorted(all_supported))
             raise ValueError(
                 f"Unsupported reranker architecture: {arch}. "
-                f"Currently supported architectures: {supported_list}. "
-                f"This model may be supported in a future version of mlx-embeddings."
+                f"Currently supported architectures: {supported_list}."
             )
 
     def get_model_info(self) -> dict:
