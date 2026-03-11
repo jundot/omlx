@@ -1820,8 +1820,6 @@ async def stream_chat_completion(
         _f = ToolCallStreamFilter(engine.tokenizer)
         if _f.active:
             tool_filter = _f
-        else:
-            stream_content = False
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
             if first_token_time is None and output.new_text:
@@ -1830,36 +1828,36 @@ async def stream_chat_completion(
             if output.new_text:
                 accumulated_text += output.new_text
 
-            if stream_content and output.new_text:
-                thinking_delta, content_delta = thinking_parser.feed(output.new_text)
+            # ALWAYS feed the thinking parser regardless of has_tools
+            thinking_delta, content_delta = thinking_parser.feed(output.new_text)
 
-                # Emit reasoning_content delta
-                if thinking_delta:
+            # ALWAYS emit reasoning_content delta
+            if thinking_delta:
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(reasoning_content=thinking_delta),
+                        finish_reason=None,
+                    )],
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
+            # Only stream regular content if we are NOT in tool-request mode
+            # (In tool-request mode, content is buffered to prevent XML tags from leaking)
+            if stream_content and not has_tools and content_delta:
+                if tool_filter:
+                    content_delta = tool_filter.feed(content_delta)
+                if content_delta:
                     chunk = ChatCompletionChunk(
                         id=response_id,
                         model=request.model,
                         choices=[ChatCompletionChunkChoice(
-                            delta=ChatCompletionChunkDelta(reasoning_content=thinking_delta),
+                            delta=ChatCompletionChunkDelta(content=content_delta),
                             finish_reason=None,
                         )],
                     )
                     yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
-
-                # Emit content delta — filter out tool-call markup when
-                # tools are present so clients see clean streamed text.
-                if content_delta:
-                    if tool_filter:
-                        content_delta = tool_filter.feed(content_delta)
-                    if content_delta:
-                        chunk = ChatCompletionChunk(
-                            id=response_id,
-                            model=request.model,
-                            choices=[ChatCompletionChunkChoice(
-                                delta=ChatCompletionChunkDelta(content=content_delta),
-                                finish_reason=None,
-                            )],
-                        )
-                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
     except Exception as e:
         logger.error(f"Error during chat streaming: {e}")
         error_chunk = ChatCompletionChunk(

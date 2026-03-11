@@ -304,8 +304,22 @@ class ToolCallStreamFilter:
     """
 
     def __init__(self, tokenizer: Any):
-        self._marker: str = getattr(tokenizer, "tool_call_start", "")
-        self._max_len = len(self._marker) if self._marker else 0
+        marker = getattr(tokenizer, "tool_call_start", "")
+        if marker:
+            self._markers = [marker]
+        else:
+            # Comprehensive fallback markers for models without native tool parsers:
+            # Covers Qwen, Llama-3-Tool, GLM, MiniMax, and common XML patterns.
+            self._markers = [
+                "<tool_call>", 
+                "<function=", 
+                "<invoke", 
+                "[Calling tool:", 
+                "<minimax:tool_call>",
+                "<|plugin|>"
+            ]
+            
+        self._max_len = max([len(m) for m in self._markers]) if self._markers else 0
         self._buffer = ""
         self._suppressing = False
 
@@ -323,15 +337,17 @@ class ToolCallStreamFilter:
 
         self._buffer += text
 
-        idx = self._buffer.find(self._marker)
-        if idx >= 0:
-            self._suppressing = True
-            safe = self._buffer[:idx]
-            self._buffer = ""
-            return safe
+        # Check for any marker
+        for marker in self._markers:
+            idx = self._buffer.find(marker)
+            if idx >= 0:
+                self._suppressing = True
+                safe = self._buffer[:idx]
+                self._buffer = ""
+                return safe
 
         # Emit content that can't possibly be a partial marker start.
-        # Keep the last (marker_len - 1) chars buffered.
+        # Keep the last (max_len - 1) chars buffered.
         safe_len = len(self._buffer) - self._max_len + 1
         if safe_len > 0:
             safe = self._buffer[:safe_len]

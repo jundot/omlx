@@ -615,12 +615,21 @@ def _make_tokenizer(tool_call_start=""):
 class TestToolCallStreamFilter:
     """Tests for ToolCallStreamFilter."""
 
-    def test_no_marker_passthrough(self):
-        """No tool_call_start attribute -> all text passes through."""
+    def test_fallback_markers_when_no_tokenizer_marker(self):
+        """No tool_call_start in tokenizer -> fallback markers are used and filter is active."""
         f = ToolCallStreamFilter(_make_tokenizer())
-        assert not f.active
-        assert f.feed("hello world") == "hello world"
+        assert f.active
+        # Should catch fallback marker <tool_call>
+        assert f.feed("Answer<tool_call>") == "Answer"
         assert f.finish() == ""
+
+    def test_multiple_markers_detection(self):
+        """Any of the fallback markers should trigger suppression."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        assert f.feed("Ok<function=test") == "Ok"
+        
+        f2 = ToolCallStreamFilter(_make_tokenizer())
+        assert f2.feed("Calling[Calling tool:test") == "Calling"
 
     def test_active_property(self):
         """Filter is active when marker is non-empty."""
