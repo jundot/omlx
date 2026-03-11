@@ -369,11 +369,11 @@
         <!-- Sidebar Header -->
         <div class="p-4 border-b border-border-faint flex-shrink-0">
             <div class="flex items-center justify-between">
-                <div class="flex items-center gap-2">
+                <a href="/admin/dashboard" class="flex items-center gap-2 hover:opacity-80 transition-opacity">
                     <img x-show="theme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX" class="w-[30px] h-[30px]">
                     <img x-show="theme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX" class="w-[30px] h-[30px]" x-cloak>
                     <span class="font-semibold">{{ t('chat.brand') }}</span>
-                </div>
+                </a>
                 <button @click="sidebarOpen = false" class="p-1.5 hover:bg-neutral-100 rounded-md" style="color: var(--text-primary);">
                     <i data-lucide="panel-left-close" class="w-4 h-4"></i>
                 </button>
