@@ -30,6 +30,7 @@ The server provides:
     - POST /v1/completions - Text completions
     - POST /v1/chat/completions - Chat completions
     - POST /v1/messages - Anthropic Messages API
+    - POST /v1/responses - OpenAI Responses API (Codex compatibility)
     - GET /v1/models - List available models (with load status)
     - GET /health - Health check
     - GET /v1/mcp/tools - List MCP tools
@@ -115,6 +116,25 @@ from .api.rerank_models import (
     RerankResult,
     RerankUsage,
 )
+from .api.responses_models import (
+    OutputContent,
+    OutputItem,
+    ResponseObject,
+    ResponsesRequest,
+    ResponsesTool,
+    ResponseUsage,
+    TextConfig,
+)
+from .api.responses_utils import (
+    ResponseStore,
+    build_function_call_output_item,
+    build_message_output_item,
+    build_response_usage,
+    convert_responses_input_to_messages,
+    convert_responses_tools,
+    convert_stored_response_to_messages,
+    format_sse_event,
+)
 from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
@@ -191,6 +211,7 @@ class ServerState:
     global_settings: Optional[object] = None  # GlobalSettings
     hf_downloader: Optional[object] = None  # HFDownloader
     process_memory_enforcer: Optional[object] = None  # ProcessMemoryEnforcer
+    responses_store: ResponseStore = field(default_factory=ResponseStore)
 
 
 # Global server state instance
@@ -248,6 +269,7 @@ async def verify_api_key(
     if not verify_any_api_key(
         credentials.credentials, _server_state.api_key, sub_keys
     ):
+        logger.warning("Rejected API key: %r", credentials.credentials)
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     return True
@@ -2589,6 +2611,615 @@ async def count_anthropic_tokens(
     logger.debug(f"Token count: {input_tokens} tokens for {len(messages)} messages")
 
     return TokenCountResponse(input_tokens=input_tokens)
+
+
+# =============================================================================
+# Responses API (/v1/responses) — OpenAI Codex compatibility
+# =============================================================================
+
+
+@app.post("/v1/responses")
+async def create_response(
+    request: ResponsesRequest,
+    http_request: FastAPIRequest,
+    _: bool = Depends(verify_api_key),
+):
+    """Create a response (OpenAI Responses API)."""
+    logger.debug(
+        f"Responses API request: model={request.model}, stream={request.stream}"
+    )
+
+    load_start = time.perf_counter()
+    engine = await get_engine_for_model(request.model)
+    model_load_duration = time.perf_counter() - load_start
+
+    resolved_model = resolve_model_id(request.model) or request.model
+
+    # Build previous context from previous_response_id
+    previous_messages = None
+    if request.previous_response_id:
+        prev = _server_state.responses_store.get(request.previous_response_id)
+        if prev:
+            previous_messages = convert_stored_response_to_messages(prev)
+
+    # Convert Responses API input → internal messages
+    messages = convert_responses_input_to_messages(
+        request.input, request.instructions, previous_messages
+    )
+
+    # Convert tools: flat → nested
+    openai_tools = convert_responses_tools(request.tools)
+
+    # Get per-model settings
+    max_tool_result_tokens = None
+    merged_ct_kwargs = {}
+    forced_keys: set[str] = set()
+    if _server_state.settings_manager:
+        ms = _server_state.settings_manager.get_settings(resolved_model)
+        max_tool_result_tokens = ms.max_tool_result_tokens
+        if ms.chat_template_kwargs:
+            merged_ct_kwargs.update(ms.chat_template_kwargs)
+        forced_keys = set(ms.forced_ct_kwargs or [])
+
+    # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
+    # are NOT called here because convert_responses_input_to_messages() already
+    # returns plain dicts in {"role": str, "content": str} format.
+    # Those extract functions expect Pydantic Message objects from OpenAI/Anthropic requests.
+
+    # Handle text.format (structured output)
+    response_format = None
+    if request.text and request.text.format:
+        fmt = request.text.format
+        if fmt.type == "json_object":
+            response_format = {"type": "json_object"}
+        elif fmt.type == "json_schema":
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": fmt.name or "response",
+                    "schema": fmt.schema_ or {},
+                    "strict": fmt.strict or False,
+                },
+            }
+        if response_format:
+            from .api.openai_models import ResponseFormat
+
+            rf = ResponseFormat(**response_format)
+            json_instruction = build_json_system_prompt(rf)
+            if json_instruction:
+                messages = _inject_json_instruction(messages, json_instruction)
+
+    # Merge MCP tools
+    effective_tools = openai_tools
+    if _server_state.mcp_manager and openai_tools:
+        effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
+
+    # Convert tools for chat template
+    tools_for_template = (
+        convert_tools_for_template(effective_tools) if effective_tools else None
+    )
+
+    # Validate context window
+    try:
+        num_prompt_tokens = engine.count_chat_tokens(
+            messages,
+            tools_for_template,
+            chat_template_kwargs=merged_ct_kwargs or None,
+        )
+    except Exception as e:
+        err_name = type(e).__name__.lower()
+        err_msg = str(e).lower()
+        if (
+            "template" in err_name
+            or "template" in err_msg
+            or isinstance(e, (AssertionError, ValueError))
+        ):
+            raise HTTPException(
+                status_code=400, detail=f"Chat template error: {e}"
+            )
+        raise
+    validate_context_window(num_prompt_tokens, request.model)
+
+    # Build sampling kwargs
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty = (
+        get_sampling_params(request.temperature, request.top_p, request.model)
+    )
+    chat_kwargs = {
+        "max_tokens": request.max_output_tokens or _server_state.sampling.max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
+        "repetition_penalty": repetition_penalty,
+        "presence_penalty": presence_penalty,
+        "frequency_penalty": frequency_penalty,
+    }
+    if tools_for_template:
+        chat_kwargs["tools"] = tools_for_template
+    if merged_ct_kwargs:
+        chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+
+    if request.stream:
+        return StreamingResponse(
+            _with_sse_keepalive(
+                stream_responses_api(
+                    engine,
+                    messages,
+                    request,
+                    model_load_duration=model_load_duration,
+                    **chat_kwargs,
+                ),
+                http_request=http_request,
+            ),
+            media_type="text/event-stream",
+        )
+
+    # Non-streaming
+    start_time = time.perf_counter()
+    output = await _run_with_disconnect_guard(
+        http_request,
+        engine.chat(messages=messages, **chat_kwargs),
+    )
+    if output is None:
+        return
+
+    elapsed = time.perf_counter() - start_time
+    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+    logger.info(
+        f"Responses API: {output.completion_tokens} tokens in {elapsed:.2f}s "
+        f"({tokens_per_sec:.1f} tok/s)"
+    )
+
+    get_server_metrics().record_request_complete(
+        prompt_tokens=output.prompt_tokens,
+        completion_tokens=output.completion_tokens,
+        cached_tokens=output.cached_tokens,
+        generation_duration=elapsed,
+        model_id=request.model,
+    )
+
+    # Process output text
+    raw_text = clean_special_tokens(output.text) if output.text else ""
+    thinking_content, regular_content = extract_thinking(raw_text)
+
+    # Parse tool calls
+    if engine.model_type == "gpt_oss" and output.tool_calls:
+        tool_calls = output.tool_calls
+        cleaned_text = regular_content
+    else:
+        cleaned_text, tool_calls = parse_tool_calls(
+            regular_content,
+            tokenizer=engine.tokenizer,
+            tools=tools_for_template,
+        )
+
+    # Build output items
+    output_items: list[OutputItem] = []
+    output_items.append(
+        build_message_output_item(cleaned_text.strip() if cleaned_text else "")
+    )
+
+    if tool_calls:
+        for tc in tool_calls:
+            if hasattr(tc, "function"):
+                # ToolCall Pydantic model
+                call_id = tc.id
+                name = tc.function.name
+                arguments = tc.function.arguments
+            elif isinstance(tc, dict):
+                call_id = tc.get("call_id", tc.get("id", f"call_{uuid.uuid4().hex[:8]}"))
+                name = tc.get("name", "")
+                arguments = tc.get("arguments", "{}")
+            else:
+                continue
+            output_items.append(
+                build_function_call_output_item(
+                    name=name,
+                    arguments=arguments,
+                    call_id=call_id,
+                )
+            )
+
+    usage = build_response_usage(output.prompt_tokens, output.completion_tokens)
+
+    response_obj = ResponseObject(
+        model=request.model,
+        status="completed",
+        output=output_items,
+        usage=usage,
+        tools=request.tools or [],
+        tool_choice=request.tool_choice or "auto",
+        temperature=temperature,
+        top_p=top_p,
+        max_output_tokens=request.max_output_tokens,
+        previous_response_id=request.previous_response_id,
+    )
+
+    # Store response
+    if request.store:
+        _server_state.responses_store.put(
+            response_obj.id, response_obj.model_dump(exclude_none=True)
+        )
+
+    return response_obj
+
+
+async def stream_responses_api(
+    engine: BaseEngine,
+    messages: list,
+    request: ResponsesRequest,
+    model_load_duration: float = 0.0,
+    **kwargs,
+) -> AsyncIterator[str]:
+    """Stream Responses API events (SSE with named event types)."""
+    from .api.shared_models import IDPrefix, generate_id
+
+    start_time = time.perf_counter()
+    first_token_time = None
+    last_output = None
+    accumulated_text = ""
+    has_tools = bool(kwargs.get("tools"))
+    thinking_parser = ThinkingParser()
+    seq = 0
+
+    response_id = generate_id(IDPrefix.RESPONSE)
+    msg_id = generate_id(IDPrefix.MESSAGE)
+
+    # Build initial response object (in_progress, empty output)
+    initial_response = ResponseObject(
+        id=response_id,
+        model=request.model,
+        status="in_progress",
+        output=[],
+        tools=request.tools or [],
+        tool_choice=request.tool_choice or "auto",
+        temperature=request.temperature,
+        top_p=request.top_p,
+        max_output_tokens=request.max_output_tokens,
+        previous_response_id=request.previous_response_id,
+    )
+    initial_data = initial_response.model_dump(exclude_none=True)
+
+    # 1. response.created
+    seq += 1
+    yield format_sse_event("response.created", {
+        "type": "response.created",
+        "response": initial_data,
+        "sequence_number": seq,
+    })
+
+    # 2. response.in_progress
+    seq += 1
+    yield format_sse_event("response.in_progress", {
+        "type": "response.in_progress",
+        "response": initial_data,
+        "sequence_number": seq,
+    })
+
+    # 3. response.output_item.added (message)
+    msg_item = {
+        "type": "message",
+        "id": msg_id,
+        "status": "in_progress",
+        "role": "assistant",
+        "content": [],
+    }
+    seq += 1
+    yield format_sse_event("response.output_item.added", {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": msg_item,
+        "sequence_number": seq,
+    })
+
+    # 4. response.content_part.added
+    content_part = {"type": "output_text", "text": "", "annotations": []}
+    seq += 1
+    yield format_sse_event("response.content_part.added", {
+        "type": "response.content_part.added",
+        "item_id": msg_id,
+        "output_index": 0,
+        "content_index": 0,
+        "part": content_part,
+        "sequence_number": seq,
+    })
+
+    # 5. Stream tokens
+    tool_filter = None
+    stream_content = True
+    if has_tools:
+        _f = ToolCallStreamFilter(engine.tokenizer)
+        if _f.active:
+            tool_filter = _f
+        else:
+            stream_content = False
+
+    try:
+        async for output in engine.stream_chat(messages=messages, **kwargs):
+            if first_token_time is None and output.new_text:
+                first_token_time = time.perf_counter()
+            last_output = output
+            if output.new_text:
+                accumulated_text += output.new_text
+
+            if stream_content and output.new_text:
+                _thinking, content_delta = thinking_parser.feed(output.new_text)
+                if content_delta:
+                    if tool_filter:
+                        content_delta = tool_filter.feed(content_delta)
+                    if content_delta:
+                        seq += 1
+                        yield format_sse_event("response.output_text.delta", {
+                            "type": "response.output_text.delta",
+                            "item_id": msg_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": content_delta,
+                            "sequence_number": seq,
+                        })
+    except Exception as e:
+        logger.error(f"Error during Responses API streaming: {e}")
+        seq += 1
+        yield format_sse_event("response.failed", {
+            "type": "response.failed",
+            "response": {**initial_data, "status": "failed"},
+            "sequence_number": seq,
+        })
+        return
+
+    # Flush remaining content from parsers
+    if stream_content:
+        _thinking, content_delta = thinking_parser.finish()
+        if content_delta:
+            if tool_filter:
+                content_delta = tool_filter.feed(content_delta)
+            if content_delta:
+                seq += 1
+                yield format_sse_event("response.output_text.delta", {
+                    "type": "response.output_text.delta",
+                    "item_id": msg_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": content_delta,
+                    "sequence_number": seq,
+                })
+        if tool_filter:
+            remaining = tool_filter.finish()
+            if remaining:
+                seq += 1
+                yield format_sse_event("response.output_text.delta", {
+                    "type": "response.output_text.delta",
+                    "item_id": msg_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": remaining,
+                    "sequence_number": seq,
+                })
+
+    # Parse tool calls from accumulated text
+    tool_calls = None
+    cleaned_text = accumulated_text
+    if last_output and last_output.tool_calls:
+        tool_calls = last_output.tool_calls
+        cleaned_text = ""
+    elif has_tools and accumulated_text:
+        thinking_content, regular_content = extract_thinking(accumulated_text)
+        cleaned_text, tool_calls = parse_tool_calls(
+            regular_content,
+            tokenizer=engine.tokenizer,
+            tools=kwargs.get("tools"),
+        )
+        if not stream_content and cleaned_text:
+            seq += 1
+            yield format_sse_event("response.output_text.delta", {
+                "type": "response.output_text.delta",
+                "item_id": msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": cleaned_text,
+                "sequence_number": seq,
+            })
+    else:
+        # No tools — use raw accumulated text minus thinking
+        thinking_content, regular_content = extract_thinking(accumulated_text)
+        cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
+
+    final_text = cleaned_text.strip() if cleaned_text else ""
+
+    # 6. response.output_text.done
+    seq += 1
+    yield format_sse_event("response.output_text.done", {
+        "type": "response.output_text.done",
+        "item_id": msg_id,
+        "output_index": 0,
+        "content_index": 0,
+        "text": final_text,
+        "sequence_number": seq,
+    })
+
+    # 7. response.content_part.done
+    seq += 1
+    yield format_sse_event("response.content_part.done", {
+        "type": "response.content_part.done",
+        "item_id": msg_id,
+        "output_index": 0,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": final_text, "annotations": []},
+        "sequence_number": seq,
+    })
+
+    # 8. response.output_item.done (message)
+    seq += 1
+    yield format_sse_event("response.output_item.done", {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "type": "message",
+            "id": msg_id,
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": final_text, "annotations": []}],
+        },
+        "sequence_number": seq,
+    })
+
+    # Build output items for final response
+    output_items = [
+        {
+            "type": "message",
+            "id": msg_id,
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": final_text, "annotations": []}],
+        }
+    ]
+
+    # 9-12. Emit function call items if present
+    if tool_calls:
+        output_index = 1
+        for tc in tool_calls:
+            if hasattr(tc, "function"):
+                call_id = tc.id
+                name = tc.function.name
+                arguments = tc.function.arguments
+            elif isinstance(tc, dict):
+                call_id = tc.get("call_id", tc.get("id", f"call_{uuid.uuid4().hex[:8]}"))
+                name = tc.get("name", "")
+                arguments = tc.get("arguments", "{}")
+            else:
+                continue
+
+            fc_id = generate_id(IDPrefix.FUNCTION_CALL)
+            fc_item = {
+                "type": "function_call",
+                "id": fc_id,
+                "call_id": call_id,
+                "name": name,
+                "arguments": "",
+                "status": "in_progress",
+            }
+
+            # output_item.added
+            seq += 1
+            yield format_sse_event("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": fc_item,
+                "sequence_number": seq,
+            })
+
+            # function_call_arguments.delta
+            seq += 1
+            yield format_sse_event("response.function_call_arguments.delta", {
+                "type": "response.function_call_arguments.delta",
+                "item_id": fc_id,
+                "output_index": output_index,
+                "delta": arguments,
+                "sequence_number": seq,
+            })
+
+            # function_call_arguments.done
+            seq += 1
+            yield format_sse_event("response.function_call_arguments.done", {
+                "type": "response.function_call_arguments.done",
+                "item_id": fc_id,
+                "output_index": output_index,
+                "arguments": arguments,
+                "sequence_number": seq,
+            })
+
+            # output_item.done
+            completed_fc = {
+                "type": "function_call",
+                "id": fc_id,
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+                "status": "completed",
+            }
+            seq += 1
+            yield format_sse_event("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": completed_fc,
+                "sequence_number": seq,
+            })
+
+            output_items.append(completed_fc)
+            output_index += 1
+
+    # Record metrics
+    usage_data = None
+    if last_output and last_output.finished:
+        end_time = time.perf_counter()
+        ttft = (first_token_time - start_time) if first_token_time else (end_time - start_time)
+        gen_duration = end_time - (first_token_time or start_time)
+        get_server_metrics().record_request_complete(
+            prompt_tokens=last_output.prompt_tokens,
+            completion_tokens=last_output.completion_tokens,
+            cached_tokens=last_output.cached_tokens,
+            prefill_duration=ttft,
+            generation_duration=gen_duration,
+            model_id=request.model,
+        )
+        usage_data = {
+            "input_tokens": last_output.prompt_tokens,
+            "output_tokens": last_output.completion_tokens,
+            "total_tokens": last_output.prompt_tokens + last_output.completion_tokens,
+            "output_tokens_details": {"reasoning_tokens": 0},
+        }
+
+    # 13. response.completed — MUST always be sent
+    final_response = {
+        "id": response_id,
+        "object": "response",
+        "created_at": initial_response.created_at,
+        "model": request.model,
+        "status": "completed",
+        "output": output_items,
+        "usage": usage_data,
+        "tool_choice": request.tool_choice or "auto",
+        "tools": [t.model_dump(exclude_none=True) for t in request.tools] if request.tools else [],
+        "temperature": request.temperature,
+        "top_p": request.top_p,
+        "max_output_tokens": request.max_output_tokens,
+    }
+    if request.previous_response_id:
+        final_response["previous_response_id"] = request.previous_response_id
+
+    seq += 1
+    yield format_sse_event("response.completed", {
+        "type": "response.completed",
+        "response": final_response,
+        "sequence_number": seq,
+    })
+
+    # Store for future previous_response_id usage
+    if request.store:
+        _server_state.responses_store.put(response_id, final_response)
+
+
+@app.get("/v1/responses/{response_id}")
+async def get_response(
+    response_id: str,
+    _: bool = Depends(verify_api_key),
+):
+    """Retrieve a stored response."""
+    data = _server_state.responses_store.get(response_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Response not found")
+    return data
+
+
+@app.delete("/v1/responses/{response_id}")
+async def delete_response(
+    response_id: str,
+    _: bool = Depends(verify_api_key),
+):
+    """Delete a stored response."""
+    if not _server_state.responses_store.delete(response_id):
+        raise HTTPException(status_code=404, detail="Response not found")
+    return {"id": response_id, "object": "response.deleted", "deleted": True}
 
 
 # =============================================================================
