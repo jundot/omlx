@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 # Prevents server from hanging when HF is unreachable.
 _HF_API_TIMEOUT = 10
 
+# Seconds with no download progress before considering the download stalled.
+_STALL_TIMEOUT = 120
+
 
 def _get_hf_api() -> tuple[HfApi, str | None]:
     """Create HfApi instance with configured endpoint.
@@ -70,6 +73,7 @@ class DownloadTask:
     created_at: float = field(default_factory=time.time)
     started_at: float = 0.0
     completed_at: float = 0.0
+    retry_count: int = 0
 
     def to_dict(self) -> dict:
         """Serialize task to a JSON-compatible dict."""
@@ -84,6 +88,7 @@ class DownloadTask:
             "created_at": self.created_at,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
+            "retry_count": self.retry_count,
         }
 
 
@@ -481,9 +486,6 @@ class HFDownloader:
         if active_task and not active_task.done():
             active_task.cancel()
 
-        # Clean up partial download
-        self._cleanup_partial(task)
-
         logger.info(f"Download cancelled: {task.repo_id} (task_id={task_id})")
         return True
 
@@ -506,6 +508,45 @@ class HFDownloader:
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
         return True
+
+    async def retry_download(
+        self, task_id: str, hf_token: str = ""
+    ) -> DownloadTask:
+        """Retry a failed or cancelled download, resuming from existing files.
+
+        Since partial files are preserved on disk, snapshot_download will
+        automatically skip already-completed files.
+
+        Args:
+            task_id: The task ID of the failed/cancelled download.
+            hf_token: Optional HuggingFace token for gated models.
+
+        Returns:
+            The new DownloadTask.
+
+        Raises:
+            ValueError: If task not found or not in retryable state.
+        """
+        old_task = self._tasks.get(task_id)
+        if old_task is None:
+            raise ValueError(f"Task not found: {task_id}")
+
+        if old_task.status not in (DownloadStatus.FAILED, DownloadStatus.CANCELLED):
+            raise ValueError(
+                f"Task {task_id} is not retryable (status: {old_task.status.value})"
+            )
+
+        repo_id = old_task.repo_id
+        old_retry_count = old_task.retry_count
+
+        # Remove old task entry
+        del self._tasks[task_id]
+        self._cancelled.discard(task_id)
+
+        # Start fresh download (snapshot_download resumes from existing files)
+        new_task = await self.start_download(repo_id, hf_token)
+        new_task.retry_count = old_retry_count + 1
+        return new_task
 
     def get_tasks(self) -> list[dict]:
         """Return all tasks as serializable dicts, ordered by creation time."""
@@ -586,6 +627,7 @@ class HFDownloader:
                 local_dir=str(target_dir),
                 token=hf_token or None,
                 endpoint=endpoint,
+                etag_timeout=30,
             )
 
             # Check if cancelled while downloading
@@ -611,9 +653,11 @@ class HFDownloader:
                     logger.error(f"Error in download completion callback: {e}")
 
         except asyncio.CancelledError:
-            if task.status != DownloadStatus.CANCELLED:
+            if task.status not in (
+                DownloadStatus.CANCELLED,
+                DownloadStatus.FAILED,
+            ):
                 task.status = DownloadStatus.CANCELLED
-            self._cleanup_partial(task)
         except RepositoryNotFoundError:
             task.status = DownloadStatus.FAILED
             task.error = (
@@ -643,10 +687,18 @@ class HFDownloader:
             self._active_tasks.pop(task_id, None)
 
     async def _poll_progress(self, task_id: str, target_dir: Path) -> None:
-        """Poll the target directory size to estimate download progress."""
+        """Poll the target directory size to estimate download progress.
+
+        Also detects stalled downloads: if no size change is observed for
+        _STALL_TIMEOUT seconds, the task is marked as failed and the
+        download thread is cancelled.
+        """
         task = self._tasks.get(task_id)
         if task is None:
             return
+
+        last_size = 0
+        last_change_at = time.time()
 
         try:
             while task.status == DownloadStatus.DOWNLOADING:
@@ -663,6 +715,29 @@ class HFDownloader:
                     task.progress = min(
                         (current_size / task.total_size) * 100, 99.0
                     )
+
+                # Stall detection
+                if current_size > last_size:
+                    last_size = current_size
+                    last_change_at = time.time()
+                elif (
+                    current_size > 0
+                    and (time.time() - last_change_at) > _STALL_TIMEOUT
+                ):
+                    task.status = DownloadStatus.FAILED
+                    task.error = (
+                        f"Download stalled: no progress for {_STALL_TIMEOUT}s. "
+                        "Try retrying the download."
+                    )
+                    logger.warning(
+                        f"Download stalled for {task.repo_id} "
+                        f"(task_id={task_id})"
+                    )
+                    # Cancel the snapshot_download thread
+                    active_task = self._active_tasks.get(task_id)
+                    if active_task and not active_task.done():
+                        active_task.cancel()
+                    break
         except asyncio.CancelledError:
             pass
 

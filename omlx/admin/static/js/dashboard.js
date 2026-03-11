@@ -1854,6 +1854,26 @@
                 }
             },
 
+            async retryHFDownload(taskId) {
+                try {
+                    const response = await fetch(`/admin/api/hf/retry/${taskId}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ hf_token: this.hfToken || '' }),
+                    });
+                    if (response.ok) {
+                        await this.loadHFTasks();
+                        this.startHFRefresh();
+                    } else {
+                        const data = await response.json().catch(() => ({}));
+                        this.hfError = data.detail || 'Retry failed';
+                        setTimeout(() => { this.hfError = ''; }, 5000);
+                    }
+                } catch (err) {
+                    console.error('Failed to retry download:', err);
+                }
+            },
+
             async removeHFTask(taskId) {
                 try {
                     const response = await fetch(`/admin/api/hf/task/${taskId}`, {

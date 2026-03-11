@@ -155,6 +155,12 @@ class HFDownloadRequest(BaseModel):
     hf_token: str = ""
 
 
+class HFRetryRequest(BaseModel):
+    """Request model for retrying a HuggingFace model download."""
+
+    hf_token: str = ""
+
+
 # =============================================================================
 # Runtime Settings Application Functions
 # =============================================================================
@@ -2196,6 +2202,23 @@ async def cancel_hf_download(
             status_code=404, detail="Task not found or not cancellable"
         )
     return {"success": True}
+
+
+@router.post("/api/hf/retry/{task_id}")
+async def retry_hf_download(
+    task_id: str,
+    request: HFRetryRequest = HFRetryRequest(),
+    is_admin: bool = Depends(require_admin),
+):
+    """Retry a failed or cancelled download, resuming from existing files."""
+    if _hf_downloader is None:
+        raise HTTPException(status_code=503, detail="Downloader not initialized")
+
+    try:
+        task = await _hf_downloader.retry_download(task_id, request.hf_token)
+        return {"success": True, "task": task.to_dict()}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/api/hf/task/{task_id}")

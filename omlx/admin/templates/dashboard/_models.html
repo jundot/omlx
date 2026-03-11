@@ -524,6 +524,12 @@
                                                             :title="window.t('models.queue.cancel_tooltip')">
                                                         <i data-lucide="x" class="w-4 h-4"></i>
                                                     </button>
+                                                    <button x-show="task.status === 'failed' || task.status === 'cancelled'" x-cloak
+                                                            @click="retryHFDownload(task.task_id)"
+                                                            class="p-1.5 text-neutral-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"
+                                                            :title="window.t('models.queue.retry_tooltip') || 'Retry download'">
+                                                        <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+                                                    </button>
                                                     <button x-show="task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'" x-cloak
                                                             @click="removeHFTask(task.task_id)"
                                                             class="p-1.5 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all"

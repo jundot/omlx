@@ -32,6 +32,10 @@ class TestDownloadTask:
         assert task.started_at == 0.0
         assert task.completed_at == 0.0
 
+    def test_default_retry_count(self):
+        task = DownloadTask(task_id="test-id", repo_id="owner/model")
+        assert task.retry_count == 0
+
     def test_to_dict(self):
         task = DownloadTask(
             task_id="abc-123",
@@ -49,6 +53,11 @@ class TestDownloadTask:
         assert d["progress"] == 45.7  # rounded to 1 decimal
         assert d["total_size"] == 1000000
         assert d["downloaded_size"] == 456700
+        assert d["retry_count"] == 0
+
+    def test_to_dict_retry_count(self):
+        task = DownloadTask(task_id="t", repo_id="o/m", retry_count=3)
+        assert task.to_dict()["retry_count"] == 3
 
     def test_to_dict_status_values(self):
         for status in DownloadStatus:
@@ -286,7 +295,12 @@ class TestHFDownloader:
     # --- Cancel Download ---
 
     @pytest.mark.asyncio
-    async def test_cancel_download(self, downloader):
+    async def test_cancel_download(self, downloader, model_dir):
+        # Create partial files to verify they are preserved after cancel
+        target = model_dir / "model"
+        target.mkdir(exist_ok=True)
+        (target / "partial.bin").write_bytes(b"x" * 100)
+
         with patch(
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
@@ -307,6 +321,10 @@ class TestHFDownloader:
             success = await downloader.cancel_download(task.task_id)
             assert success is True
             assert task.status == DownloadStatus.CANCELLED
+
+            # Partial files should be preserved for resume
+            assert target.exists()
+            assert (target / "partial.bin").exists()
 
             await downloader.shutdown()
 
@@ -1332,3 +1350,265 @@ class TestHFEndpointPassthrough:
             mock_hf_download.assert_called_once()
             call_kwargs = mock_hf_download.call_args[1]
             assert call_kwargs["endpoint"] == "https://hf-mirror.com"
+
+
+# =============================================================================
+# Retry Download Tests
+# =============================================================================
+
+
+class TestRetryDownload:
+    """Test download retry functionality."""
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        d = tmp_path / "models"
+        d.mkdir()
+        return d
+
+    @pytest.fixture
+    def downloader(self, model_dir):
+        return HFDownloader(model_dir=str(model_dir))
+
+    @pytest.mark.asyncio
+    async def test_retry_failed_download(self, downloader, model_dir):
+        """Retry a failed download should create a new task with incremented retry_count."""
+        # Create partial files that should be preserved
+        target = model_dir / "model"
+        target.mkdir()
+        (target / "partial.bin").write_bytes(b"x" * 100)
+
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download"
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.siblings = []
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            # Start and fail a download
+            task = await downloader.start_download("owner/model")
+            task.status = DownloadStatus.FAILED
+            task.error = "Network error"
+            old_task_id = task.task_id
+
+            # Retry
+            new_task = await downloader.retry_download(old_task_id)
+            assert new_task.repo_id == "owner/model"
+            assert new_task.retry_count == 1
+            assert new_task.task_id != old_task_id
+            # Old task should be removed
+            assert old_task_id not in {t["task_id"] for t in downloader.get_tasks()}
+            # Partial files should still exist
+            assert (target / "partial.bin").exists()
+
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_retry_cancelled_download(self, downloader):
+        """Retry a cancelled download should work."""
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download"
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.siblings = []
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            task = await downloader.start_download("owner/model")
+            task.status = DownloadStatus.CANCELLED
+            old_task_id = task.task_id
+
+            new_task = await downloader.retry_download(old_task_id)
+            assert new_task.repo_id == "owner/model"
+            assert new_task.retry_count == 1
+
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_retry_increments_count(self, downloader):
+        """Multiple retries should increment retry_count."""
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download"
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.siblings = []
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            task = await downloader.start_download("owner/model")
+            task.status = DownloadStatus.FAILED
+
+            task2 = await downloader.retry_download(task.task_id)
+            assert task2.retry_count == 1
+            task2.status = DownloadStatus.FAILED
+
+            task3 = await downloader.retry_download(task2.task_id)
+            assert task3.retry_count == 2
+
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_retry_active_download_raises(self, downloader):
+        """Retrying an active download should raise ValueError."""
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=lambda **kwargs: time.sleep(10),
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.siblings = []
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            task = await downloader.start_download("owner/model")
+            await asyncio.sleep(0.2)
+
+            with pytest.raises(ValueError, match="not retryable"):
+                await downloader.retry_download(task.task_id)
+
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_retry_nonexistent_raises(self, downloader):
+        """Retrying a nonexistent task should raise ValueError."""
+        with pytest.raises(ValueError, match="not found"):
+            await downloader.retry_download("nonexistent-id")
+
+
+# =============================================================================
+# Stall Detection Tests
+# =============================================================================
+
+
+class TestStallDetection:
+    """Test download stall detection in _poll_progress."""
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        d = tmp_path / "models"
+        d.mkdir()
+        return d
+
+    @pytest.mark.asyncio
+    async def test_stall_detection_marks_task_failed(self, model_dir, monkeypatch):
+        """Download should be marked failed when stalled for _STALL_TIMEOUT seconds."""
+        import omlx.admin.hf_downloader as dl_module
+
+        # Use a very short stall timeout for testing
+        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 2)
+
+        target = model_dir / "model"
+        target.mkdir()
+        # Create a file so current_size > 0 (needed to trigger stall detection)
+        (target / "partial.bin").write_bytes(b"x" * 1000)
+
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=lambda **kwargs: time.sleep(30),
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.safetensors = {"parameters": {"BF16": 5000}}
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            task = await downloader.start_download("owner/model")
+
+            # Wait for stall detection to kick in (2s timeout + polling intervals)
+            await asyncio.sleep(8)
+
+            assert task.status == DownloadStatus.FAILED
+            assert "stalled" in task.error.lower()
+
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_no_stall_when_size_zero(self, model_dir, monkeypatch):
+        """Stall detection should not trigger when current_size is 0."""
+        import omlx.admin.hf_downloader as dl_module
+
+        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 1)
+
+        # Empty directory - no files yet
+        target = model_dir / "model"
+        target.mkdir()
+
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=lambda **kwargs: time.sleep(10),
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.safetensors = {"parameters": {"BF16": 5000}}
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            task = await downloader.start_download("owner/model")
+            await asyncio.sleep(5)
+
+            # Should still be downloading, not stalled
+            assert task.status in (
+                DownloadStatus.DOWNLOADING,
+                DownloadStatus.COMPLETED,
+            )
+
+            await downloader.shutdown()
+
+
+# =============================================================================
+# Etag Timeout Tests
+# =============================================================================
+
+
+class TestEtagTimeout:
+    """Verify etag_timeout is passed to snapshot_download."""
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        d = tmp_path / "models"
+        d.mkdir()
+        return d
+
+    @pytest.mark.asyncio
+    async def test_etag_timeout_passed(self, model_dir):
+        """snapshot_download should receive etag_timeout=30."""
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download"
+        ) as mock_download:
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.siblings = []
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            downloader = HFDownloader(model_dir=str(model_dir))
+            await downloader.start_download("owner/model")
+            await asyncio.sleep(0.5)
+
+            mock_download.assert_called_once()
+            call_kwargs = mock_download.call_args[1]
+            assert call_kwargs["etag_timeout"] == 30
+
+            await downloader.shutdown()
