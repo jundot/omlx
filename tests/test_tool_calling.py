@@ -767,6 +767,18 @@ class TestToolCallStreamFilter:
         result += f.finish()
         assert result == "literal [Calling tool: maybe later] and then  done"
 
+    def test_unresolved_bracket_prefix_before_parseable_envelope_does_not_leak_marker(self):
+        """An unresolved early bracket prefix must not leak when a later call is parseable."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        text = (
+            "Before [Calling tool: unfinished and then "
+            '[Calling tool: get_weather({"city":"NY"})] done'
+        )
+        result = f.feed(text)
+        result += f.finish()
+        assert "[Calling tool:" not in result
+        assert result == "Before  unfinished and then  done"
+
     def test_finish_preserves_non_tool_angle_identifier_suffix_literal(self):
         """Non-tool literal tails like '<alpha' should not be dropped at stream end."""
         f = ToolCallStreamFilter(_make_tokenizer())

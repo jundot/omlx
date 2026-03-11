@@ -477,6 +477,33 @@ class ToolCallStreamFilter:
             return False
         return "tool_call".startswith(suffix)
 
+    def _sanitize_prefix_before_suppression(self, text: str) -> str:
+        """Strip unresolved bracket-control prefixes while preserving prose."""
+        if self._bracket_prefix not in text:
+            return text
+
+        out: List[str] = []
+        cursor = 0
+        while cursor < len(text):
+            bracket_idx = text.find(self._bracket_prefix, cursor)
+            if bracket_idx < 0:
+                out.append(text[cursor:])
+                break
+
+            out.append(text[cursor:bracket_idx])
+            after_prefix = bracket_idx + len(self._bracket_prefix)
+            close_idx = text.find("]", after_prefix)
+            if close_idx < 0:
+                # Drop only the marker token; keep following prose.
+                cursor = after_prefix
+                continue
+
+            # Preserve balanced literal bracket text that is not being suppressed.
+            out.append(text[bracket_idx:close_idx + 1])
+            cursor = close_idx + 1
+
+        return "".join(out)
+
     def feed(self, text: str) -> str:
         """Feed a content delta, return the portion safe to emit."""
         if not text:
@@ -502,7 +529,7 @@ class ToolCallStreamFilter:
             if start:
                 idx, consume_len, close_marker = start
                 if idx > 0:
-                    out.append(self._buffer[:idx])
+                    out.append(self._sanitize_prefix_before_suppression(self._buffer[:idx]))
                 self._buffer = self._buffer[idx + consume_len:]
                 if close_marker is not None:
                     self._suppressing_until = close_marker
