@@ -368,6 +368,12 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
                     f"(not a model or organization folder)"
                 )
 
+    # Fallback: if no models found and the directory itself is a model, register it.
+    # This supports pointing directly at a single model folder, e.g.:
+    #   /Models/Qwen3.5-9B-MLX-4bit/  (contains config.json and weight files)
+    if not models and _is_model_dir(model_dir):
+        _register_model(models, model_dir, model_dir.name)
+
     return models
 
 
