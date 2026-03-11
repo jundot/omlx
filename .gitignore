@@ -93,6 +93,9 @@ tmp/
 temp/
 *.tmp
 
+# Git worktrees
+.worktrees/
+
 # MLX cache
 .mlx_cache/
 
