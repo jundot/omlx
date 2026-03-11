@@ -271,7 +271,10 @@ class MLXRerankerModel:
             return RerankOutput(scores=[], indices=[], total_tokens=0)
 
         if self._is_causal_lm:
-            return self._rerank_causal_lm(query, documents, max_length)
+            # CausalLM rerankers use longer prompts (instruction + query + doc)
+            # and need a higher default max_length than encoder-based models.
+            effective_max_length = max_length if max_length != 512 else 8192
+            return self._rerank_causal_lm(query, documents, effective_max_length)
         else:
             return self._rerank_seq_classification(query, documents, max_length)
 
