@@ -203,6 +203,177 @@ class TestVerifyAnyApiKey:
     def test_no_match_empty_sub_keys(self):
         assert verify_any_api_key("wrong", "main-key", []) is False
 
+    def test_none_main_key_no_sub_keys(self):
+        assert verify_any_api_key("anything", None, []) is False
+
+    def test_none_main_key_matches_sub(self):
+        from omlx.settings import SubKeyEntry
+        sub_keys = [SubKeyEntry(key="sub1")]
+        assert verify_any_api_key("sub1", None, sub_keys) is True
+
+    def test_matches_first_sub_key(self):
+        from omlx.settings import SubKeyEntry
+        sub_keys = [SubKeyEntry(key="sub1"), SubKeyEntry(key="sub2"), SubKeyEntry(key="sub3")]
+        assert verify_any_api_key("sub1", "main-key", sub_keys) is True
+
+
+class TestLoginRejectsSubKey:
+    """Tests that sub keys cannot be used for admin login."""
+
+    def test_sub_key_rejected_for_login(self):
+        """Sub key should NOT grant admin login — only main key works."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key="main-key")
+        mock_settings.auth.sub_keys = [
+            __import__("omlx.settings", fromlist=["SubKeyEntry"]).SubKeyEntry(
+                key="sub-key-1", name="Test"
+            )
+        ]
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.LoginRequest(api_key="sub-key-1")
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(admin_routes.login(request, MagicMock()))
+            assert exc_info.value.status_code == 401
+        finally:
+            _restore_getter(original)
+
+    def test_main_key_still_works_for_login(self):
+        """Main key should still work for admin login."""
+        mock_settings = _mock_global_settings(api_key="main-key")
+        mock_settings.auth.sub_keys = [
+            __import__("omlx.settings", fromlist=["SubKeyEntry"]).SubKeyEntry(
+                key="sub-key-1", name="Test"
+            )
+        ]
+        mock_response = MagicMock()
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.LoginRequest(api_key="main-key")
+            result = asyncio.run(admin_routes.login(request, mock_response))
+            assert result["success"] is True
+        finally:
+            _restore_getter(original)
+
+
+class TestSubKeyCRUD:
+    """Tests for sub key create/delete endpoints."""
+
+    def test_create_sub_key_success(self):
+        """Creating a valid sub key should succeed."""
+        mock_settings = _mock_global_settings(api_key="main-key")
+        mock_settings.auth.sub_keys = []
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.CreateSubKeyRequest(key="new-sub-key", name="My Sub Key")
+            result = asyncio.run(admin_routes.create_sub_key(request, is_admin=True))
+            assert result["success"] is True
+            assert result["sub_key"]["key"] == "new-sub-key"
+            assert result["sub_key"]["name"] == "My Sub Key"
+            assert len(mock_settings.auth.sub_keys) == 1
+            mock_settings.save.assert_called_once()
+        finally:
+            _restore_getter(original)
+
+    def test_create_sub_key_duplicate_main_key(self):
+        """Creating a sub key identical to the main key should fail."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key="main-key")
+        mock_settings.auth.sub_keys = []
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.CreateSubKeyRequest(key="main-key")
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(admin_routes.create_sub_key(request, is_admin=True))
+            assert exc_info.value.status_code == 400
+            assert "same as the main key" in exc_info.value.detail
+        finally:
+            _restore_getter(original)
+
+    def test_create_sub_key_duplicate_existing(self):
+        """Creating a sub key that already exists should fail."""
+        from fastapi import HTTPException
+        from omlx.settings import SubKeyEntry
+
+        mock_settings = _mock_global_settings(api_key="main-key")
+        mock_settings.auth.sub_keys = [SubKeyEntry(key="existing-sub")]
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.CreateSubKeyRequest(key="existing-sub")
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(admin_routes.create_sub_key(request, is_admin=True))
+            assert exc_info.value.status_code == 400
+            assert "already exists" in exc_info.value.detail
+        finally:
+            _restore_getter(original)
+
+    def test_create_sub_key_too_short(self):
+        """Creating a sub key that's too short should fail."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key="main-key")
+        mock_settings.auth.sub_keys = []
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.CreateSubKeyRequest(key="abc")
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(admin_routes.create_sub_key(request, is_admin=True))
+            assert exc_info.value.status_code == 400
+            assert "at least 4" in exc_info.value.detail
+        finally:
+            _restore_getter(original)
+
+    def test_delete_sub_key_success(self):
+        """Deleting an existing sub key should succeed."""
+        from omlx.settings import SubKeyEntry
+
+        mock_settings = _mock_global_settings(api_key="main-key")
+        mock_settings.auth.sub_keys = [SubKeyEntry(key="sub-to-delete", name="Test")]
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.DeleteSubKeyRequest(key="sub-to-delete")
+            result = asyncio.run(admin_routes.delete_sub_key(request, is_admin=True))
+            assert result["success"] is True
+            assert len(mock_settings.auth.sub_keys) == 0
+            mock_settings.save.assert_called_once()
+        finally:
+            _restore_getter(original)
+
+    def test_delete_sub_key_not_found(self):
+        """Deleting a non-existent sub key should return 404."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key="main-key")
+        mock_settings.auth.sub_keys = []
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.DeleteSubKeyRequest(key="nonexistent")
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(admin_routes.delete_sub_key(request, is_admin=True))
+            assert exc_info.value.status_code == 404
+        finally:
+            _restore_getter(original)
+
+    def test_create_sub_key_rollback_on_save_failure(self):
+        """Sub key should be rolled back if save() fails."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key="main-key")
+        mock_settings.auth.sub_keys = []
+        mock_settings.save.side_effect = IOError("disk full")
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.CreateSubKeyRequest(key="new-sub-key")
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(admin_routes.create_sub_key(request, is_admin=True))
+            assert exc_info.value.status_code == 500
+            # Sub key should be rolled back
+            assert len(mock_settings.auth.sub_keys) == 0
+        finally:
+            _restore_getter(original)
+
 
 def _mock_global_settings(api_key=None):
     """Create a mock GlobalSettings with the given API key."""
