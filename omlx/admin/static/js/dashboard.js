@@ -30,7 +30,7 @@
                 huggingface: { endpoint: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
-                integrations: { codex_model: null, opencode_model: null, openclaw_model: null, openclaw_tools_profile: 'coding' },
+                integrations: { codex_model: null, opencode_model: null, openclaw_model: null, openclaw_tools_profile: 'full' },
                 ui: { language: 'en' },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
@@ -864,7 +864,7 @@
 
             get openclawCommand() {
                 const model = this.globalSettings.integrations.openclaw_model || 'select-a-model';
-                const profile = this.globalSettings.integrations.openclaw_tools_profile || 'coding';
+                const profile = this.globalSettings.integrations.openclaw_tools_profile || 'full';
                 const parts = [`/Applications/oMLX.app/Contents/MacOS/omlx-cli launch openclaw --model ${model}`];
                 if (this.stats.api_key) {
                     parts.push(`--api-key ${this.stats.api_key}`);

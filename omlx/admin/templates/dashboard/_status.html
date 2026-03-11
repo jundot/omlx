@@ -297,7 +297,7 @@
                                     <span class="text-xs text-neutral-400">OpenAI Codex CLI</span>
                                 </div>
                                 <div class="flex gap-4 items-start">
-                                    <div class="w-48 flex-shrink-0">
+                                    <div class="w-64 flex-shrink-0">
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
                                         <select x-model="globalSettings.integrations.codex_model"
                                                 @change="globalSettings.integrations.codex_model = globalSettings.integrations.codex_model || null; saveIntegrationSettings()"
@@ -341,7 +341,7 @@
                                     <span class="text-xs text-neutral-400">{{ t('status.integrations.opencode_desc') }}</span>
                                 </div>
                                 <div class="flex gap-4 items-start">
-                                    <div class="w-48 flex-shrink-0">
+                                    <div class="w-64 flex-shrink-0">
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
                                         <select x-model="globalSettings.integrations.opencode_model"
                                                 @change="globalSettings.integrations.opencode_model = globalSettings.integrations.opencode_model || null; saveIntegrationSettings()"
