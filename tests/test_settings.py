@@ -335,6 +335,7 @@ class TestAuthSettings:
         settings = AuthSettings()
         assert settings.api_key is None
         assert settings.secret_key is None
+        assert settings.sub_keys == []
 
     def test_custom_values(self):
         """Test custom values."""
@@ -346,7 +347,24 @@ class TestAuthSettings:
         """Test conversion to dictionary."""
         settings = AuthSettings(api_key="my-key")
         result = settings.to_dict()
-        assert result == {"api_key": "my-key", "secret_key": None, "skip_api_key_verification": False}
+        assert result == {
+            "api_key": "my-key",
+            "secret_key": None,
+            "skip_api_key_verification": False,
+            "sub_keys": [],
+        }
+
+    def test_to_dict_with_sub_keys(self):
+        """Test conversion to dictionary with sub keys."""
+        from omlx.settings import SubKeyEntry
+        settings = AuthSettings(
+            api_key="my-key",
+            sub_keys=[SubKeyEntry(key="sk1", name="Test", created_at="2024-01-01")],
+        )
+        result = settings.to_dict()
+        assert len(result["sub_keys"]) == 1
+        assert result["sub_keys"][0]["key"] == "sk1"
+        assert result["sub_keys"][0]["name"] == "Test"
 
     def test_from_dict(self):
         """Test creation from dictionary."""
@@ -354,6 +372,20 @@ class TestAuthSettings:
         settings = AuthSettings.from_dict(data)
         assert settings.api_key == "loaded-key"
         assert settings.secret_key == "loaded-secret"
+        assert settings.sub_keys == []
+
+    def test_from_dict_with_sub_keys(self):
+        """Test creation from dictionary with sub keys."""
+        data = {
+            "api_key": "loaded-key",
+            "sub_keys": [
+                {"key": "sk1", "name": "My Key", "created_at": "2024-01-01"},
+            ],
+        }
+        settings = AuthSettings.from_dict(data)
+        assert len(settings.sub_keys) == 1
+        assert settings.sub_keys[0].key == "sk1"
+        assert settings.sub_keys[0].name == "My Key"
 
     def test_from_dict_backward_compat(self):
         """Test creation from dictionary without secret_key (backward compat)."""
@@ -361,6 +393,7 @@ class TestAuthSettings:
         settings = AuthSettings.from_dict(data)
         assert settings.api_key == "loaded-key"
         assert settings.secret_key is None
+        assert settings.sub_keys == []
 
 
 class TestMCPSettings:

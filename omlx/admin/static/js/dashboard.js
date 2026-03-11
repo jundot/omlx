@@ -25,7 +25,7 @@
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
                 huggingface: { endpoint: '' },
-                auth: { api_key_set: false, api_key: '', skip_api_key_verification: false },
+                auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
                 ui: { language: 'en' },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '', ssd_free_bytes: 0, ssd_free: '' },
@@ -55,6 +55,13 @@
 
             // Auth UI state
             showApiKey: false,
+            // Sub key management
+            newSubKeyValue: '',
+            newSubKeyName: '',
+            showNewSubKeyForm: false,
+            showNewSubKey: false,
+            subKeyError: '',
+            showSubKeys: {},
 
             // Saving state
             saving: false,
@@ -411,6 +418,66 @@
                     this.$nextTick(() => lucide.createIcons());
                 } finally {
                     this.saving = false;
+                }
+            },
+
+            // Sub key management
+            generateSubKey() {
+                const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+                const rand = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+                    .map(b => chars[b % chars.length]).join('');
+                this.newSubKeyValue = 'omlx-' + rand;
+                this.showNewSubKey = true;
+            },
+
+            async createSubKey() {
+                this.subKeyError = '';
+                if (!this.newSubKeyValue || this.newSubKeyValue.length < 4) {
+                    this.subKeyError = window.t('js.error.api_key_min_length');
+                    return;
+                }
+                if (/\s/.test(this.newSubKeyValue)) {
+                    this.subKeyError = window.t('js.error.api_key_no_whitespace');
+                    return;
+                }
+                try {
+                    const response = await fetch('/admin/api/sub-keys', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ key: this.newSubKeyValue, name: this.newSubKeyName }),
+                    });
+                    if (response.ok) {
+                        this.newSubKeyValue = '';
+                        this.newSubKeyName = '';
+                        this.showNewSubKeyForm = false;
+                        this.showNewSubKey = false;
+                        await this.loadGlobalSettings();
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await response.json();
+                        this.subKeyError = data.detail || window.t('js.error.save_settings_failed');
+                    }
+                } catch (err) {
+                    this.subKeyError = window.t('js.error.save_settings_failed');
+                }
+            },
+
+            async deleteSubKey(key) {
+                if (!confirm(window.t('settings.auth.sub_keys_delete_confirm'))) return;
+                try {
+                    const response = await fetch('/admin/api/sub-keys', {
+                        method: 'DELETE',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ key }),
+                    });
+                    if (response.ok) {
+                        await this.loadGlobalSettings();
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (err) {
+                    console.error('Failed to delete sub key:', err);
                 }
             },
 
