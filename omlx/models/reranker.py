@@ -500,9 +500,26 @@ class MLXRerankerModel:
             return
 
         arch = architectures[0]
-        all_supported = SUPPORTED_RERANKER_ARCHITECTURES | CAUSAL_LM_RERANKER_ARCHITECTURES
-        if arch not in all_supported:
-            supported_list = ", ".join(sorted(all_supported))
+
+        # CausalLM reranker architectures require the directory name heuristic
+        # to distinguish from regular LLMs with the same architecture.
+        if arch in CAUSAL_LM_RERANKER_ARCHITECTURES:
+            from ..model_discovery import _is_causal_lm_reranker
+
+            if not _is_causal_lm_reranker(Path(self.model_name)):
+                raise ValueError(
+                    f"Architecture {arch} is a CausalLM that can be used as a "
+                    f"reranker, but the model directory name "
+                    f"'{Path(self.model_name).name}' does not contain "
+                    f"'reranker' or 'rerank'. Please rename the directory or "
+                    f"use the correct model."
+                )
+            return
+
+        if arch not in SUPPORTED_RERANKER_ARCHITECTURES:
+            supported_list = ", ".join(
+                sorted(SUPPORTED_RERANKER_ARCHITECTURES | CAUSAL_LM_RERANKER_ARCHITECTURES)
+            )
             raise ValueError(
                 f"Unsupported reranker architecture: {arch}. "
                 f"Currently supported architectures: {supported_list}."
