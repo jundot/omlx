@@ -84,7 +84,7 @@ Requires macOS 15.0+ (Sequoia), Python 3.10+, and Apple Silicon (M1/M2/M3/M4).
 
 ### macOS App
 
-Launch oMLX from your Applications folder. The Welcome screen guides you through three steps - model directory, server start, and first model download. That's it.
+Launch oMLX from your Applications folder. The Welcome screen guides you through three steps - model directory, server start, and first model download. That's it. To connect OpenClaw, OpenCode, or Codex, see [Integrations](#integrations).
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX Welcome Screen" width="360">
@@ -188,6 +188,14 @@ Search and download MLX models from HuggingFace directly in the admin dashboard.
   <img src="docs/images/downloader_omlx.png" alt="oMLX Model Downloader" width="720">
 </p>
 
+### Integrations
+
+Set up OpenClaw, OpenCode, and Codex directly from the admin dashboard with a single click. No manual config editing required.
+
+<p align="center">
+  <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
+</p>
+
 ### Performance Benchmark
 
 One-click benchmarking from the admin panel. Measures prefill (PP) and text generation (TG) tokens per second, with partial prefix cache hit testing for realistic performance numbers.
@@ -277,6 +285,9 @@ omlx serve --model-dir ~/models --prefill-batch-size 8 --completion-batch-size 3
 
 # With MCP tools
 omlx serve --model-dir ~/models --mcp-config mcp.json
+
+# HuggingFace mirror endpoint (for restricted regions)
+omlx serve --model-dir ~/models --hf-endpoint https://hf-mirror.com
 
 # API key authentication
 omlx serve --model-dir ~/models --api-key your-secret-key
