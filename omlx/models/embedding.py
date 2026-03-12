@@ -88,6 +88,13 @@ class MLXEmbeddingModel:
                 "mlx-embeddings is required for embedding generation. "
                 "Install with: pip install mlx-embeddings"
             )
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"No safetensors weight files found for '{self.model_name}'. "
+                f"mlx-embeddings requires models in safetensors format. "
+                f"If this is a PyTorch model, use an MLX-converted version "
+                f"(e.g., from mlx-community on HuggingFace)."
+            )
         except Exception as e:
             logger.error(f"Failed to load embedding model: {e}")
             raise

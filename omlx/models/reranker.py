@@ -243,6 +243,13 @@ class MLXRerankerModel:
                 "mlx-lm, mlx-embeddings, or transformers is required for reranking. "
                 "Install with: pip install mlx-lm mlx-embeddings transformers"
             ) from e
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"No safetensors weight files found for '{self.model_name}'. "
+                f"Reranker models require weights in safetensors format. "
+                f"If this is a PyTorch model, use an MLX-converted version "
+                f"(e.g., from mlx-community on HuggingFace)."
+            )
         except Exception as e:
             logger.error(f"Failed to load reranker model: {e}")
             raise
