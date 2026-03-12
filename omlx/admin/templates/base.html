@@ -10,8 +10,10 @@
     <link rel="stylesheet" href="/admin/static/fonts/inter/inter.css">
 
     <!-- CJK Font (conditional, self-hosted) -->
-    {% if current_lang == 'zh' or current_lang == 'zh-TW' %}
+    {% if current_lang == 'zh' %}
     <link rel="stylesheet" href="/admin/static/fonts/noto-sans-sc/noto-sans-sc.css">
+    {% elif current_lang == 'zh-TW' %}
+    <link rel="stylesheet" href="/admin/static/fonts/noto-sans-tc/noto-sans-tc.css">
     {% elif current_lang == 'ko' %}
     <link rel="stylesheet" href="/admin/static/fonts/noto-sans-kr/noto-sans-kr.css">
     {% elif current_lang == 'ja' %}
@@ -46,8 +48,10 @@
         :root {
             {% if current_lang == 'ko' %}
             --font-sans: 'Noto Sans KR', 'Inter', system-ui, sans-serif;
-            {% elif current_lang == 'zh' or current_lang == 'zh-TW' %}
+            {% elif current_lang == 'zh' %}
             --font-sans: 'Noto Sans SC', 'Inter', system-ui, sans-serif;
+            {% elif current_lang == 'zh-TW' %}
+            --font-sans: 'Noto Sans TC', 'Inter', system-ui, sans-serif;
             {% elif current_lang == 'ja' %}
             --font-sans: 'Noto Sans JP', 'Inter', system-ui, sans-serif;
             {% else %}
