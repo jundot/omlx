@@ -132,9 +132,7 @@ class TestCausalLMReranker:
         mock_result = RerankOutput(scores=[0.5], indices=[0], total_tokens=10)
         with patch.object(model, "_rerank_causal_lm", return_value=mock_result) as mock_method:
             model.rerank("query", ["doc"])
-            # Default max_length=512 should be upgraded to 8192 for CausalLM
-            _, kwargs = mock_method.call_args
-            # The third positional arg is max_length
+            # max_length=None should use default 8192 for CausalLM
             args, _ = mock_method.call_args
             assert args[2] == 8192  # query, documents, max_length
 
@@ -150,3 +148,16 @@ class TestCausalLMReranker:
             model.rerank("query", ["doc"], max_length=1024)
             args, _ = mock_method.call_args
             assert args[2] == 1024
+
+    def test_max_length_512_explicit_respected_for_causal_lm(self, tmp_path):
+        """Test that explicitly passing max_length=512 is respected (not overridden)."""
+        model_dir = self._make_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = True
+        model._loaded = True
+
+        mock_result = RerankOutput(scores=[0.5], indices=[0], total_tokens=10)
+        with patch.object(model, "_rerank_causal_lm", return_value=mock_result) as mock_method:
+            model.rerank("query", ["doc"], max_length=512)
+            args, _ = mock_method.call_args
+            assert args[2] == 512

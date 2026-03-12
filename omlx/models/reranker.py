@@ -247,11 +247,15 @@ class MLXRerankerModel:
             logger.error(f"Failed to load reranker model: {e}")
             raise
 
+    # Default max_length per model type
+    _DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION = 512
+    _DEFAULT_MAX_LENGTH_CAUSAL_LM = 8192
+
     def rerank(
         self,
         query: str,
         documents: list[str],
-        max_length: int = 512,
+        max_length: int | None = None,
     ) -> RerankOutput:
         """
         Rerank documents by relevance to the query.
@@ -259,7 +263,9 @@ class MLXRerankerModel:
         Args:
             query: The search query
             documents: List of documents to rerank
-            max_length: Maximum token length for each query-document pair
+            max_length: Maximum token length for each query-document pair.
+                If None, uses model-appropriate default (512 for encoder,
+                8192 for CausalLM).
 
         Returns:
             RerankOutput with scores, sorted indices, and token count
@@ -271,12 +277,21 @@ class MLXRerankerModel:
             return RerankOutput(scores=[], indices=[], total_tokens=0)
 
         if self._is_causal_lm:
-            # CausalLM rerankers use longer prompts (instruction + query + doc)
-            # and need a higher default max_length than encoder-based models.
-            effective_max_length = max_length if max_length != 512 else 8192
+            effective_max_length = (
+                max_length
+                if max_length is not None
+                else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
+            )
             return self._rerank_causal_lm(query, documents, effective_max_length)
         else:
-            return self._rerank_seq_classification(query, documents, max_length)
+            effective_max_length = (
+                max_length
+                if max_length is not None
+                else self._DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION
+            )
+            return self._rerank_seq_classification(
+                query, documents, effective_max_length
+            )
 
     def _rerank_causal_lm(
         self,

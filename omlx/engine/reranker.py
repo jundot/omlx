@@ -3,8 +3,9 @@
 Reranker engine for oMLX.
 
 This module provides an engine for document reranking using
-mlx-embeddings SequenceClassification models. Unlike LLM engines,
-reranker engines don't support streaming or chat completion.
+SequenceClassification and CausalLM-based reranker models.
+Unlike LLM engines, reranker engines don't support streaming
+or chat completion.
 """
 
 import gc
@@ -83,7 +84,7 @@ class RerankerEngine(BaseNonStreamingEngine):
         query: str,
         documents: list[str],
         top_n: int | None = None,
-        max_length: int = 512,
+        max_length: int | None = None,
     ) -> RerankOutput:
         """
         Rerank documents by relevance to the query.
@@ -92,7 +93,9 @@ class RerankerEngine(BaseNonStreamingEngine):
             query: The search query
             documents: List of documents to rerank
             top_n: Number of top results to return (None = all)
-            max_length: Maximum token length for each query-document pair
+            max_length: Maximum token length for each query-document pair.
+                If None, uses model-appropriate default (512 for encoder,
+                8192 for CausalLM).
 
         Returns:
             RerankOutput with scores, sorted indices, and token count
