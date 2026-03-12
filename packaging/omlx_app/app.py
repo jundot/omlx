@@ -267,6 +267,7 @@ class OMLXAppDelegate(NSObject):
                         "notes": data.get("body", ""),
                     }
                     logger.info(f"Update available: {latest}")
+                    self._build_menu()
                 else:
                     self._update_info = None
             else:
