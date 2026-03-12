@@ -278,6 +278,49 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     )
 
 
+async def _reload_models() -> tuple[bool, str]:
+    """
+    Reload models: re-read model_settings.json, re-scan dirs, re-apply overrides,
+    and preload pinned models.
+
+    This does NOT re-read settings.json (global settings). It only refreshes
+    the model inventory and per-model settings.
+
+    Returns:
+        Tuple of (success, message)
+    """
+    from ..server import _server_state
+
+    if _server_state.engine_pool is None:
+        return False, "Engine pool not initialized"
+
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        return False, "Global settings not initialized"
+
+    # Re-read model_settings.json from disk
+    settings_manager = _get_settings_manager()
+    if settings_manager is not None:
+        settings_manager._load()
+
+    # Get current model_dirs from global settings
+    model_dirs = global_settings.model.model_dirs or []
+    if not model_dirs and global_settings.model.model_dir:
+        model_dirs = [global_settings.model.model_dir]
+
+    # Unload all, re-discover, re-apply overrides
+    success, msg = await _apply_model_dirs_runtime(model_dirs)
+    if not success:
+        return False, msg
+
+    # Preload pinned models
+    pool = _server_state.engine_pool
+    if pool is not None:
+        await pool.preload_pinned_models()
+
+    return True, msg
+
+
 async def _apply_max_model_memory_runtime(
     max_memory_bytes: int | None,
 ) -> tuple[bool, str]:
@@ -1220,6 +1263,15 @@ async def load_model(
 
     logger.info(f"Manually loaded model: {model_id}")
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
+
+
+@router.post("/api/reload")
+async def reload_models(is_admin: bool = Depends(require_admin)):
+    """Reload models: re-read model settings, re-discover models, preload pinned."""
+    success, message = await _reload_models()
+    if success:
+        return {"status": "ok", "message": message}
+    raise HTTPException(status_code=500, detail=message)
 
 
 @router.put("/api/models/{model_id}/settings")

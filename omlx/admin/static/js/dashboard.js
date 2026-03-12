@@ -54,6 +54,7 @@
             // Models
             models: [],
             loadingModels: false,
+            reloading: false,
             sortBy: 'id',
             sortOrder: 'asc',
 
@@ -591,6 +592,27 @@
                     console.error('Failed to load models:', err);
                 } finally {
                     this.loadingModels = false;
+                }
+            },
+
+            async reloadModels() {
+                if (this.reloading) return;
+                this.reloading = true;
+                try {
+                    const response = await fetch('/admin/api/reload', { method: 'POST' });
+                    if (response.ok) {
+                        await Promise.all([this.loadModels(), this.loadHFModels()]);
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await response.json();
+                        alert(data.detail || window.t('js.error.reload_failed'));
+                    }
+                } catch (err) {
+                    console.error('Failed to reload models:', err);
+                    alert(window.t('js.error.reload_failed'));
+                } finally {
+                    this.reloading = false;
                 }
             },
 
