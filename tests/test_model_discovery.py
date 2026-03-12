@@ -83,6 +83,28 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "reranker"
 
+    def test_detect_causal_lm_reranker(self, tmp_path):
+        """Test detection of CausalLM-based reranker (e.g., Qwen3-Reranker)."""
+        reranker_dir = tmp_path / "Qwen3-Reranker-0.6B-mxfp8"
+        reranker_dir.mkdir()
+        config = {
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForCausalLM"],
+        }
+        (reranker_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(reranker_dir) == "reranker"
+
+    def test_causal_lm_without_reranker_name_is_llm(self, tmp_path):
+        """Test that Qwen3ForCausalLM without 'reranker' in name is LLM."""
+        llm_dir = tmp_path / "Qwen3-0.6B"
+        llm_dir.mkdir()
+        config = {
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForCausalLM"],
+        }
+        (llm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(llm_dir) == "llm"
+
     def test_missing_config_defaults_to_llm(self, tmp_path):
         """Test that missing config.json defaults to LLM."""
         assert detect_model_type(tmp_path) == "llm"
