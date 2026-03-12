@@ -780,6 +780,28 @@ class TestToolCallStreamFilter:
         assert "[Calling tool:" not in result
         assert result == "Before  unfinished and then  done"
 
+    def test_incremental_feeding_unresolved_bracket_split_across_chunks(self):
+        """Bracket prefix split across feed() chunks must still be detected."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Before [Calling tool: unfin")
+        r2 = f.feed('ished then [Calling tool: get_weather({"city":"NY"})] done')
+        r3 = f.finish()
+        result = r1 + r2 + r3
+        assert "[Calling tool:" not in result
+        assert "done" in result
+
+    def test_tool_call_prefix_variant_later_parseable_envelope(self):
+        """[Tool call:] prefix variant must also detect later parseable envelope."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        text = (
+            "Before [Tool call: unfinished and then "
+            '[Tool call: get_weather({"city":"NY"})] done'
+        )
+        result = f.feed(text)
+        result += f.finish()
+        assert "[Tool call:" not in result
+        assert result == "Before  unfinished and then  done"
+
     def test_finish_preserves_non_tool_angle_identifier_suffix_literal(self):
         """Non-tool literal tails like '<alpha' should not be dropped at stream end."""
         f = ToolCallStreamFilter(_make_tokenizer())
