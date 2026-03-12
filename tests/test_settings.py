@@ -23,6 +23,7 @@ from omlx.settings import (
     SamplingSettings,
     SchedulerSettings,
     ServerSettings,
+    _adaptive_system_reserve,
     get_settings,
     get_ssd_capacity,
     get_system_memory,
@@ -108,21 +109,29 @@ class TestModelSettings:
         assert settings.model_dir is None
         assert settings.max_model_memory == "auto"
 
-    def test_get_max_model_memory_bytes_auto(self):
-        """Test auto memory calculation (90% of usable RAM)."""
+    @patch("omlx.settings.get_system_memory", return_value=64 * 1024**3)
+    def test_get_max_model_memory_bytes_auto(self, mock_mem):
+        """Test auto memory calculation with adaptive reserve."""
         settings = ModelSettings(max_model_memory="auto")
-        total = get_system_memory()
-        usable = max(0, total - 8 * 1024**3)
-        expected = int(usable * 0.9)
+        # 64GB: reserve=8GB (20%=12.8GB, capped), usable=56GB, model=50.4GB
+        expected = int((64 - 8) * 1024**3 * 0.9)
         assert settings.get_max_model_memory_bytes() == expected
 
-    def test_get_max_model_memory_bytes_auto_uppercase(self):
+    @patch("omlx.settings.get_system_memory", return_value=64 * 1024**3)
+    def test_get_max_model_memory_bytes_auto_uppercase(self, mock_mem):
         """Test auto memory calculation with uppercase AUTO."""
         settings = ModelSettings(max_model_memory="AUTO")
-        total = get_system_memory()
-        usable = max(0, total - 8 * 1024**3)
-        expected = int(usable * 0.9)
+        expected = int((64 - 8) * 1024**3 * 0.9)
         assert settings.get_max_model_memory_bytes() == expected
+
+    @patch("omlx.settings.get_system_memory", return_value=8 * 1024**3)
+    def test_get_max_model_memory_bytes_auto_8gb(self, mock_mem):
+        """Issue #137: 8GB device must return usable memory, not 0."""
+        settings = ModelSettings(max_model_memory="auto")
+        result = settings.get_max_model_memory_bytes()
+        # reserve=2GB (min clamp), usable=6GB, model=5.4GB
+        assert result == int((8 - 2) * 1024**3 * 0.9)
+        assert result > 0
 
     def test_get_max_model_memory_bytes_explicit(self):
         """Test explicit memory value."""
@@ -528,10 +537,11 @@ class TestMemorySettings:
         assert settings.get_max_process_memory_bytes() is None
 
     @patch("omlx.settings.get_system_memory", return_value=64 * 1024**3)
-    def test_auto_returns_total_minus_8gb(self, mock_mem):
-        """Test auto calculates total - 8GB."""
+    def test_auto_returns_total_minus_reserve(self, mock_mem):
+        """Test auto calculates total - adaptive_reserve."""
         settings = MemorySettings(max_process_memory="auto")
         result = settings.get_max_process_memory_bytes()
+        # 64GB: reserve=8GB (capped) → 56GB
         expected = (64 - 8) * 1024**3
         assert result == expected
 
@@ -559,11 +569,12 @@ class TestMemorySettings:
 
     @patch("omlx.settings.get_system_memory", return_value=12 * 1024**3)
     def test_auto_with_small_memory(self, mock_mem):
-        """Test auto with small system memory (< 8GB usable) uses 10% floor."""
+        """Test auto with small system memory uses adaptive reserve."""
         settings = MemorySettings(max_process_memory="auto")
         result = settings.get_max_process_memory_bytes()
-        # 12GB - 8GB = 4GB, which is > 10% of 12GB (1.2GB), so should be 4GB
-        assert result == 4 * 1024**3
+        # 12GB: reserve=max(2GB, min(2.4GB, 8GB))=2.4GB → 9.6GB
+        expected = 12 * 1024**3 - int(12 * 1024**3 * 0.20)
+        assert result == expected
 
     def test_to_dict(self):
         """Test serialization."""
@@ -1252,6 +1263,35 @@ class TestHelperFunctions:
         """Test SSD capacity with tilde path expansion."""
         capacity = get_ssd_capacity("~/")
         assert capacity > 0
+
+
+class TestAdaptiveSystemReserve:
+    """Tests for _adaptive_system_reserve helper."""
+
+    def test_min_clamp(self):
+        """Small RAM: reserve clamped to 2GB minimum."""
+        # 8GB: 20% = 1.6GB, clamped up to 2GB
+        assert _adaptive_system_reserve(8 * 1024**3) == 2 * 1024**3
+
+    def test_max_clamp(self):
+        """Large RAM: reserve capped at 8GB."""
+        # 64GB: 20% = 12.8GB, capped down to 8GB
+        assert _adaptive_system_reserve(64 * 1024**3) == 8 * 1024**3
+
+    def test_mid_range(self):
+        """Mid-range: 20% of total."""
+        # 32GB: 20% = 6.4GB, within [2GB, 8GB]
+        total = 32 * 1024**3
+        assert _adaptive_system_reserve(total) == int(total * 0.20)
+
+    def test_16gb(self):
+        """16GB: 20% = 3.2GB, above min clamp."""
+        total = 16 * 1024**3
+        assert _adaptive_system_reserve(total) == int(total * 0.20)
+
+    def test_192gb(self):
+        """192GB: 20% = 38.4GB, capped at 8GB."""
+        assert _adaptive_system_reserve(192 * 1024**3) == 8 * 1024**3
 
 
 class TestSettingsVersionMigration:

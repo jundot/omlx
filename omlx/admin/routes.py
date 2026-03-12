@@ -349,9 +349,11 @@ async def _apply_max_process_memory_runtime(
     # Calculate max bytes
     value = max_process_memory.strip().lower()
     if value == "auto":
-        reserved = 8 * 1024**3
+        from ..settings import _adaptive_system_reserve
+
         total = get_system_memory()
-        max_bytes = max(total - reserved, int(total * 0.1))
+        reserve = _adaptive_system_reserve(total)
+        max_bytes = total - reserve
     else:
         percent_str = value.rstrip("%")
         try:

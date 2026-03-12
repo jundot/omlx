@@ -72,6 +72,14 @@ def get_system_memory() -> int:
     return 16 * 1024**3
 
 
+def _adaptive_system_reserve(total: int) -> int:
+    """Adaptive system reservation: 20% of total, clamped to [2GB, 8GB]."""
+    reserve = int(total * 0.20)
+    min_reserve = 2 * 1024**3
+    max_reserve = 8 * 1024**3
+    return max(min_reserve, min(reserve, max_reserve))
+
+
 def get_ssd_capacity(path: str | Path) -> int:
     """
     Return disk capacity in bytes for the given path.
@@ -171,8 +179,8 @@ class ModelSettings:
             return None
         if value == "auto":
             total = get_system_memory()
-            usable = max(0, total - 8 * 1024**3)
-            return int(usable * 0.9)
+            reserve = _adaptive_system_reserve(total)
+            return max(1 * 1024**3, int((total - reserve) * 0.9))
         return parse_size(self.max_model_memory)
 
     def to_dict(self) -> dict[str, Any]:
@@ -303,9 +311,9 @@ class MemorySettings:
         if value == "disabled":
             return None
         if value == "auto":
-            reserved = 8 * 1024**3  # 8GB reserved for system
             total = get_system_memory()
-            return max(total - reserved, int(total * 0.1))
+            reserve = _adaptive_system_reserve(total)
+            return total - reserve
         # Parse percentage like "80%"
         percent_str = value.rstrip("%")
         try:
