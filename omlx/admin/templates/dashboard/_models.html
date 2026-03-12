@@ -32,7 +32,7 @@
                                         class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700
                                                hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5
                                                disabled:opacity-50 disabled:cursor-not-allowed">
-                                    <i data-lucide="rotate-cw" class="w-3.5 h-3.5" :class="reloading && 'animate-spin'"></i>
+                                    <span class="inline-flex" :class="reloading && 'animate-spin'"><i data-lucide="rotate-cw" class="w-3.5 h-3.5"></i></span>
                                     <span x-text="reloading ? window.t('models.manager.reloading') : window.t('models.manager.reload')"></span>
                                 </button>
                             </div>
