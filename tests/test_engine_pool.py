@@ -800,3 +800,40 @@ class TestResolveModelId:
 
         result = pool.resolve_model_id("some-alias", settings_manager=None)
         assert result == "some-alias"
+
+    def test_provider_prefix_alias_match(self, small_mock_model_dir):
+        """Test alias resolution with provider prefix (e.g. omlx/alias)."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        settings_manager = MagicMock()
+        from omlx.model_settings import ModelSettings
+        settings_manager.get_all_settings.return_value = {
+            "model-a": ModelSettings(model_alias="gpt-4"),
+            "model-b": ModelSettings(),
+        }
+
+        result = pool.resolve_model_id("omlx/gpt-4", settings_manager)
+        assert result == "model-a"
+
+    def test_provider_prefix_direct_match(self, small_mock_model_dir):
+        """Test direct match with provider prefix (e.g. provider/model-a)."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        result = pool.resolve_model_id("provider/model-a", settings_manager=None)
+        assert result == "model-a"
+
+    def test_provider_prefix_no_match(self, small_mock_model_dir):
+        """Test prefix strip still returns original when no match found."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        settings_manager = MagicMock()
+        from omlx.model_settings import ModelSettings
+        settings_manager.get_all_settings.return_value = {
+            "model-a": ModelSettings(),
+        }
+
+        result = pool.resolve_model_id("omlx/nonexistent", settings_manager)
+        assert result == "omlx/nonexistent"

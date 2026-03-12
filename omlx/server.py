@@ -531,7 +531,20 @@ async def get_engine(
     try:
         engine = await pool.get_engine(model_id)
     except ModelNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        # Show aliases instead of directory names for user-friendly display
+        available = e.available_models
+        sm = _server_state.settings_manager
+        if sm:
+            display = []
+            for mid in available:
+                ms = sm.get_settings(mid)
+                display.append(ms.model_alias if ms.model_alias else mid)
+            available = display
+        detail = (
+            f"Model '{model_id}' not found. "
+            f"Available models: {', '.join(available) if available else '(none)'}"
+        )
+        raise HTTPException(status_code=404, detail=detail)
     except ModelTooLargeError as e:
         raise HTTPException(status_code=507, detail=str(e))
     except InsufficientMemoryError as e:

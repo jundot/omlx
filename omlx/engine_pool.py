@@ -235,16 +235,29 @@ class EnginePool:
         """Resolve a model alias to its actual model_id (directory name).
 
         Tries exact match in _entries first, then scans model settings
-        for alias match. Returns the original string if no match found.
+        for alias match. If those fail and input contains a provider prefix
+        (e.g. "omlx/my-model"), strips the prefix and retries.
+        Returns the original string if no match found.
         """
         if model_id_or_alias in self._entries:
             return model_id_or_alias
 
+        all_settings = None
         if settings_manager is not None:
             all_settings = settings_manager.get_all_settings()
             for mid, ms in all_settings.items():
                 if ms.model_alias and ms.model_alias == model_id_or_alias:
                     return mid
+
+        # Strip provider prefix (e.g. "omlx/qwen3.5-35b" -> "qwen3.5-35b")
+        if "/" in model_id_or_alias:
+            stripped = model_id_or_alias.split("/", 1)[1]
+            if stripped in self._entries:
+                return stripped
+            if all_settings is not None:
+                for mid, ms in all_settings.items():
+                    if ms.model_alias and ms.model_alias == stripped:
+                        return mid
 
         return model_id_or_alias
 
