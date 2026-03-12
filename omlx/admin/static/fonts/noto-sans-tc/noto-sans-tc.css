@@ -1,0 +1,22 @@
+/* Noto Sans TC - Traditional Chinese */
+@font-face {
+  font-family: 'Noto Sans TC';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('NotoSansTC-Regular.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Noto Sans TC';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('NotoSansTC-Medium.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Noto Sans TC';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('NotoSansTC-Bold.woff2') format('woff2');
+}
