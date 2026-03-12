@@ -750,6 +750,36 @@ class TestToolCallStreamFilter:
         assert "[Calling tool:" not in result
         assert result == "Before  After"
 
+    def test_finish_drops_unresolved_bracket_control_fragment(self):
+        """Unresolved bracket control fragments should be suppressed at finish()."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed('Before [Calling tool: get_weather({"city":"SF"}')
+        result += f.finish()
+        assert result == "Before "
+
+    def test_later_parseable_bracket_envelope_is_detected_after_literal_bracket(self):
+        """A literal early bracket marker must not mask a later parseable envelope."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        text = (
+            "literal [Calling tool: maybe later] and then "
+            '[Calling tool: get_weather({"city":"SF"})] done'
+        )
+        result = f.feed(text)
+        result += f.finish()
+        assert result == "literal [Calling tool: maybe later] and then  done"
+
+    def test_unresolved_bracket_prefix_before_parseable_envelope_does_not_leak_marker(self):
+        """An unresolved early bracket prefix must not leak when a later call is parseable."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        text = (
+            "Before [Calling tool: unfinished and then "
+            '[Calling tool: get_weather({"city":"NY"})] done'
+        )
+        result = f.feed(text)
+        result += f.finish()
+        assert "[Calling tool:" not in result
+        assert result == "Before  unfinished and then  done"
+
     def test_finish_preserves_non_tool_angle_identifier_suffix_literal(self):
         """Non-tool literal tails like '<alpha' should not be dropped at stream end."""
         f = ToolCallStreamFilter(_make_tokenizer())

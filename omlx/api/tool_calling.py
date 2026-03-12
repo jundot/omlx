@@ -381,16 +381,14 @@ class ToolCallStreamFilter:
             ns = ns_match.group(1)
             starts.append((ns_match.start(), len(ns_match.group(0)), f"</{ns}:tool_call>"))
 
-        bracket_idx = -1
         for bp in self._bracket_prefixes:
-            idx = text.find(bp)
-            if idx >= 0 and (bracket_idx < 0 or idx < bracket_idx):
-                bracket_idx = idx
-        if bracket_idx >= 0:
-            bracket_candidate = text[bracket_idx:]
-            bracket_match = self._bracket_call_re.match(bracket_candidate)
-            if bracket_match:
-                starts.append((bracket_idx, bracket_match.end(), None))
+            bracket_idx = text.find(bp)
+            while bracket_idx >= 0:
+                bracket_candidate = text[bracket_idx:]
+                bracket_match = self._bracket_call_re.match(bracket_candidate)
+                if bracket_match:
+                    starts.append((bracket_idx, bracket_match.end(), None))
+                bracket_idx = text.find(bp, bracket_idx + 1)
 
         # One-sided markers: suppress from start marker to end of buffer.
         for sa_marker in self._suppress_after_markers:
@@ -455,8 +453,8 @@ class ToolCallStreamFilter:
 
         bracket_idx = -1
         for bp in self._bracket_prefixes:
-            idx = text.find(bp)
-            if idx >= 0 and (bracket_idx < 0 or idx < bracket_idx):
+            idx = text.rfind(bp)
+            if idx > bracket_idx:
                 bracket_idx = idx
         if bracket_idx >= 0:
             bracket_candidate = text[bracket_idx:]
@@ -510,6 +508,39 @@ class ToolCallStreamFilter:
             return False
         return "tool_call".startswith(suffix)
 
+    def _sanitize_prefix_before_suppression(self, text: str) -> str:
+        """Strip unresolved bracket-control prefixes while preserving prose."""
+        if not any(bp in text for bp in self._bracket_prefixes):
+            return text
+
+        out: List[str] = []
+        cursor = 0
+        while cursor < len(text):
+            bracket_idx = -1
+            bracket_prefix = ""
+            for bp in self._bracket_prefixes:
+                idx = text.find(bp, cursor)
+                if idx >= 0 and (bracket_idx < 0 or idx < bracket_idx):
+                    bracket_idx = idx
+                    bracket_prefix = bp
+            if bracket_idx < 0:
+                out.append(text[cursor:])
+                break
+
+            out.append(text[cursor:bracket_idx])
+            after_prefix = bracket_idx + len(bracket_prefix)
+            close_idx = text.find("]", after_prefix)
+            if close_idx < 0:
+                # Drop only the marker token; keep following prose.
+                cursor = after_prefix
+                continue
+
+            # Preserve balanced literal bracket text that is not being suppressed.
+            out.append(text[bracket_idx:close_idx + 1])
+            cursor = close_idx + 1
+
+        return "".join(out)
+
     def feed(self, text: str) -> str:
         """Feed a content delta, return the portion safe to emit."""
         if self._suppressing or not text:
@@ -541,7 +572,7 @@ class ToolCallStreamFilter:
             if start:
                 idx, consume_len, close_marker = start
                 if idx > 0:
-                    out.append(self._buffer[:idx])
+                    out.append(self._sanitize_prefix_before_suppression(self._buffer[:idx]))
                 self._buffer = self._buffer[idx + consume_len:]
                 if close_marker is not None:
                     self._suppressing_until = close_marker
