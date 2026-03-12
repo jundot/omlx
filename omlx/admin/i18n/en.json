@@ -45,6 +45,8 @@
     "navbar.theme.dark_mode": "Dark Mode",
     "navbar.theme.light_mode": "Light Mode",
     "navbar.logout": "Logout",
+    "navbar.update_available": "Update available: v{version}",
+    "navbar.go_to_github": "Go to GitHub",
 
     "status.section_label": "Status",
     "status.heading": "Serving Stats",

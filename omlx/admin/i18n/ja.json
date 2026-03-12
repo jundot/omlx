@@ -45,6 +45,8 @@
   "navbar.theme.dark_mode": "ダークモード",
   "navbar.theme.light_mode": "ライトモード",
   "navbar.logout": "ログアウト",
+  "navbar.update_available": "アップデートあり: v{version}",
+  "navbar.go_to_github": "GitHubへ移動",
 
   "status.section_label": "ステータス",
   "status.heading": "配信統計",

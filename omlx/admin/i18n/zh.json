@@ -42,6 +42,8 @@
   "navbar.theme.dark_mode": "深色模式",
   "navbar.theme.light_mode": "浅色模式",
   "navbar.logout": "退出登录",
+  "navbar.update_available": "有可用更新: v{version}",
+  "navbar.go_to_github": "前往GitHub",
   "status.section_label": "状态",
   "status.heading": "服务统计",
   "status.clear": "清除",

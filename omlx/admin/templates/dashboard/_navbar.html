@@ -8,11 +8,17 @@
                 </a>
                 <div class="flex flex-col gap-0">
                     <a href="/admin/dashboard" class="font-bold tracking-tight text-xl leading-none">oMLX</a>
-                    <a href="https://github.com/jundot/omlx" target="_blank"
-                       class="relative text-[10px] text-neutral-500 dark:text-neutral-400 leading-none hover:text-neutral-700"
-                       x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+                    <a :href="updateAvailable && releaseUrl ? releaseUrl : 'https://github.com/jundot/omlx'" target="_blank"
+                       class="relative text-[10px] text-neutral-500 dark:text-neutral-400 leading-none hover:text-neutral-700 dark:hover:text-neutral-300"
+                       @mouseenter="versionHover = true" @mouseleave="versionHover = false">
                         v{{ version }}
-                        <span x-show="show" x-cloak class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-[10px] text-white bg-neutral-800 rounded whitespace-nowrap z-50">Go to GitHub</span>
+                        <span x-show="updateAvailable" x-cloak
+                              class="inline-block w-1.5 h-1.5 bg-green-500 rounded-full ml-0.5 align-middle"></span>
+                        <span x-show="versionHover" x-cloak
+                              class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-[10px] text-white bg-neutral-800 rounded whitespace-nowrap z-50"
+                              x-text="updateAvailable && latestVersion
+                                  ? window.t('navbar.update_available').replace('{version}', latestVersion)
+                                  : window.t('navbar.go_to_github')"></span>
                     </a>
                 </div>
             </div>

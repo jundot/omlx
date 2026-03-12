@@ -145,6 +145,13 @@
             hfMirrorEndpoint: '',
             hfMirrorSaving: false,
 
+            // Update check state
+            updateAvailable: false,
+            latestVersion: null,
+            releaseUrl: null,
+            versionHover: false,
+            _updateCheckTimer: null,
+
             // HF Downloader state
             hfRepoId: '',
             hfToken: '',
@@ -211,11 +218,14 @@
 
                 await Promise.all([
                     this.loadGlobalSettings(),
-                    this.loadModels()
+                    this.loadModels(),
+                    this.checkForUpdate()
                 ]);
                 this.$nextTick(() => {
                     lucide.createIcons();
                 });
+
+                this.startUpdateCheckTimer();
 
                 await this.handleMainTabChange(this.mainTab);
 
@@ -308,6 +318,31 @@
                 this.modelsTab = tab;
                 this.mainTab = 'models';
                 this.syncTabStateToUrl();
+            },
+
+            async checkForUpdate() {
+                try {
+                    const resp = await fetch('/admin/api/update-check');
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        this.updateAvailable = data.update_available;
+                        this.latestVersion = data.latest_version;
+                        this.releaseUrl = data.release_url;
+                    }
+                } catch (e) {
+                    // Silently ignore - not critical
+                }
+            },
+
+            startUpdateCheckTimer() {
+                this._updateCheckTimer = setInterval(() => this.checkForUpdate(), 3600000);
+            },
+
+            stopUpdateCheckTimer() {
+                if (this._updateCheckTimer) {
+                    clearInterval(this._updateCheckTimer);
+                    this._updateCheckTimer = null;
+                }
             },
 
             async loadGlobalSettings() {
