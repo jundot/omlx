@@ -114,23 +114,38 @@ class BlockAwarePrefixCache(CacheManager):
 
     def _get_model_num_layers(self, model: Any) -> int:
         """
-        Get the number of layers in the model.
+        Get the expected number of *cache layers* for validation.
+
+        For hybrid models, the number of cache entries (from ``make_cache()``)
+        may be smaller than the architectural layer count (``model.layers``),
+        because some layer types do not produce cache state.
 
         Args:
             model: The MLX model
 
         Returns:
-            Number of layers, or 0 if cannot be determined
+            Number of cache layers, or 0 if cannot be determined
         """
-        # Try various ways to get num_layers
+        # Prefer cache-layer count when available (hybrid-model safe).
+        make_cache = getattr(model, 'make_cache', None)
+        if callable(make_cache):
+            try:
+                cache_list = make_cache()
+                if isinstance(cache_list, list) and len(cache_list) > 0:
+                    return len(cache_list)
+            except Exception as e:
+                logger.debug(f"Could not determine cache layer count via make_cache(): {e}")
+
+        # Fallback to architectural layer count for non-hybrid models.
         if hasattr(model, 'layers'):
             return len(model.layers)
         if hasattr(model, 'args') and hasattr(model.args, 'num_hidden_layers'):
             return model.args.num_hidden_layers
         if hasattr(model, 'config') and hasattr(model.config, 'num_hidden_layers'):
             return model.config.num_hidden_layers
+
         # Cannot determine, return 0 to skip validation
-        logger.debug("Cannot determine model num_layers, cache layer validation disabled")
+        logger.debug("Cannot determine model/cache num_layers, cache layer validation disabled")
         return 0
 
     def set_paged_ssd_cache_manager(self, paged_ssd_cache_manager: Optional[PagedSSDCacheManager]) -> None:
