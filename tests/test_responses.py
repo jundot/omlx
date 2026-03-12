@@ -210,6 +210,112 @@ class TestConvertResponsesInput:
         assert messages[1]["role"] == "assistant"
         assert len(messages[1]["tool_calls"]) == 2
 
+    def test_assistant_message_merged_with_function_call(self):
+        """Assistant message followed by function_call should produce a single
+        assistant message (not two), preventing duplicate assistant turns that
+        confuse chat templates."""
+        items = [
+            InputItem(type="message", role="user", content="Do something"),
+            InputItem(
+                type="message",
+                role="assistant",
+                content=[{"type": "output_text", "text": ""}],
+            ),
+            InputItem(
+                type="function_call",
+                call_id="call_abc",
+                name="exec_command",
+                arguments='{"cmd": "ls"}',
+            ),
+            InputItem(
+                type="function_call_output",
+                call_id="call_abc",
+                output="file1.txt\nfile2.txt",
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        # user, assistant (content + tool_calls merged), tool
+        assert len(messages) == 3
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == ""
+        assert len(messages[1]["tool_calls"]) == 1
+        assert messages[1]["tool_calls"][0]["function"]["name"] == "exec_command"
+        assert messages[2]["role"] == "tool"
+
+    def test_assistant_with_content_merged_with_function_call(self):
+        """Assistant message with non-empty content merges with tool_calls."""
+        items = [
+            InputItem(type="message", role="user", content="Check weather"),
+            InputItem(
+                type="message",
+                role="assistant",
+                content=[{"type": "output_text", "text": "Let me check."}],
+            ),
+            InputItem(
+                type="function_call",
+                call_id="call_1",
+                name="get_weather",
+                arguments='{"city": "Seoul"}',
+            ),
+            InputItem(
+                type="function_call_output",
+                call_id="call_1",
+                output='{"temp": 20}',
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert len(messages) == 3
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == "Let me check."
+        assert len(messages[1]["tool_calls"]) == 1
+
+    def test_multi_round_tool_calls_no_duplicate_assistant(self):
+        """Multiple rounds of tool calls should not create duplicate assistant
+        messages (the pattern that causes model EOS after many rounds)."""
+        items = [
+            InputItem(type="message", role="user", content="Explore the code"),
+        ]
+        # Simulate 3 rounds of tool calls (Codex pattern)
+        for i in range(3):
+            items.extend([
+                InputItem(
+                    type="message",
+                    role="assistant",
+                    content=[{"type": "output_text", "text": ""}],
+                ),
+                InputItem(
+                    type="function_call",
+                    call_id=f"call_{i}",
+                    name="exec_command",
+                    arguments=f'{{"cmd": "cmd_{i}"}}',
+                ),
+                InputItem(
+                    type="function_call_output",
+                    call_id=f"call_{i}",
+                    output=f"result_{i}",
+                ),
+            ])
+        messages = convert_responses_input_to_messages(items)
+        # Count assistant messages — should be exactly 3 (one per round)
+        assistant_msgs = [m for m in messages if m["role"] == "assistant"]
+        assert len(assistant_msgs) == 3
+        # Each assistant message should have tool_calls
+        for msg in assistant_msgs:
+            assert "tool_calls" in msg
+            assert len(msg["tool_calls"]) == 1
+
+    def test_output_text_content_type(self):
+        """output_text content type should be parsed correctly."""
+        items = [
+            InputItem(
+                type="message",
+                role="assistant",
+                content=[{"type": "output_text", "text": "Hello world"}],
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert messages[0]["content"] == "Hello world"
+
     def test_content_parts_array(self):
         items = [
             InputItem(

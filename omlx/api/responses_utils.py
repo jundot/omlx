@@ -30,6 +30,29 @@ def _try_parse_json(s: str):
         return s
 
 
+def _flush_pending_tool_calls(
+    messages: List[Dict[str, Any]],
+    pending: List[Dict[str, Any]],
+) -> None:
+    """Flush accumulated tool calls into messages.
+
+    If the last message is an assistant message without tool_calls, merge
+    into it (avoids duplicate assistant turns that confuse chat templates).
+    Otherwise create a new assistant message.
+    """
+    if not pending:
+        return
+    if (
+        messages
+        and messages[-1].get("role") == "assistant"
+        and "tool_calls" not in messages[-1]
+    ):
+        messages[-1]["tool_calls"] = list(pending)
+    else:
+        messages.append({"role": "assistant", "tool_calls": list(pending)})
+    pending.clear()
+
+
 # =============================================================================
 # Input Conversion
 # =============================================================================
@@ -87,12 +110,7 @@ def convert_responses_input_to_messages(
 
         if item_type == "message":
             # Flush pending tool calls before a new message
-            if pending_tool_calls:
-                messages.append({
-                    "role": "assistant",
-                    "tool_calls": pending_tool_calls,
-                })
-                pending_tool_calls = []
+            _flush_pending_tool_calls(messages, pending_tool_calls)
 
             role = item.role or "user"
             # Map "developer" role to "system"
@@ -105,9 +123,7 @@ def convert_responses_input_to_messages(
                 text_parts = []
                 for part in content:
                     if isinstance(part, dict):
-                        if part.get("type") == "input_text":
-                            text_parts.append(part.get("text", ""))
-                        elif part.get("type") == "text":
+                        if part.get("type") in ("input_text", "text", "output_text"):
                             text_parts.append(part.get("text", ""))
                         elif part.get("type") == "input_image":
                             # Pass through image content for VLM
@@ -136,12 +152,7 @@ def convert_responses_input_to_messages(
 
         elif item.type == "function_call_output":
             # Flush pending tool calls first
-            if pending_tool_calls:
-                messages.append({
-                    "role": "assistant",
-                    "tool_calls": pending_tool_calls,
-                })
-                pending_tool_calls = []
+            _flush_pending_tool_calls(messages, pending_tool_calls)
 
             messages.append({
                 "role": "tool",
@@ -150,11 +161,7 @@ def convert_responses_input_to_messages(
             })
 
     # Flush remaining pending tool calls
-    if pending_tool_calls:
-        messages.append({
-            "role": "assistant",
-            "tool_calls": pending_tool_calls,
-        })
+    _flush_pending_tool_calls(messages, pending_tool_calls)
 
     # Insert merged system message at position 0
     if system_parts:
