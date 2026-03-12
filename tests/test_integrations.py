@@ -52,6 +52,15 @@ class TestCodexIntegration:
         assert 'base_url = "http://127.0.0.1:8000/v1"' in content
         assert 'env_key = "OMLX_API_KEY"' in content
 
+    def test_configure_custom_host(self, tmp_path):
+        codex = CodexIntegration()
+        config_path = tmp_path / "codex" / "config.toml"
+        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
+            codex.configure(port=9000, api_key="key", model="test", host="192.168.1.100")
+
+        content = config_path.read_text()
+        assert 'base_url = "http://192.168.1.100:9000/v1"' in content
+
     def test_configure_creates_backup(self, tmp_path):
         config_path = tmp_path / "config.toml"
         config_path.write_text('model = "old"')
@@ -91,6 +100,15 @@ class TestOpenCodeIntegration:
         assert config["provider"]["omlx"]["options"]["apiKey"] == "test-key"
         assert config["provider"]["omlx"]["models"]["qwen3.5"]["name"] == "qwen3.5"
         assert config["model"] == "omlx/qwen3.5"
+
+    def test_configure_custom_host(self, tmp_path):
+        oc = OpenCodeIntegration()
+        config_path = tmp_path / "opencode" / "opencode.json"
+        with patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path):
+            oc.configure(port=9000, api_key="key", model="test", host="10.0.0.5")
+
+        config = json.loads(config_path.read_text())
+        assert config["provider"]["omlx"]["options"]["baseURL"] == "http://10.0.0.5:9000/v1"
 
     def test_configure_preserves_existing(self, tmp_path):
         config_path = tmp_path / "opencode.json"
@@ -174,6 +192,15 @@ class TestOpenClawIntegration:
         assert config["models"]["providers"]["omlx"]["apiKey"] == "test-key"
         assert config["agents"]["defaults"]["model"]["primary"] == "omlx/qwen3.5"
         assert config["tools"]["profile"] == "coding"
+
+    def test_configure_custom_host(self, tmp_path):
+        config_path = tmp_path / "openclaw" / "openclaw.json"
+        ocl = OpenClawIntegration()
+        with patch.object(OpenClawIntegration, "CONFIG_PATH", config_path):
+            ocl.configure(port=9000, api_key="key", model="test", host="192.168.1.100")
+
+        config = json.loads(config_path.read_text())
+        assert config["models"]["providers"]["omlx"]["baseUrl"] == "http://192.168.1.100:9000/v1"
 
     def test_configure_preserves_existing(self, tmp_path):
         config_path = tmp_path / "openclaw.json"

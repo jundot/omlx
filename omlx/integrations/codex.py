@@ -16,7 +16,7 @@ model_provider = "omlx"
 
 [model_providers.omlx]
 name = "oMLX"
-base_url = "http://127.0.0.1:{port}/v1"
+base_url = "http://{host}:{port}/v1"
 env_key = "OMLX_API_KEY"
 """
 
@@ -43,7 +43,7 @@ class CodexIntegration(Integration):
             f"launch codex --model {model or 'select-a-model'}"
         )
 
-    def configure(self, port: int, api_key: str, model: str) -> None:
+    def configure(self, port: int, api_key: str, model: str, host: str = "127.0.0.1") -> None:
         config_path = self.CONFIG_PATH
         config_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -59,13 +59,14 @@ class CodexIntegration(Integration):
 
         content = _CONFIG_TEMPLATE.format(
             model=model or "select-a-model",
+            host=host,
             port=port,
         )
         config_path.write_text(content, encoding="utf-8")
         print(f"Config written: {config_path}")
 
-    def launch(self, port: int, api_key: str, model: str, **kwargs) -> None:
-        self.configure(port, api_key, model)
+    def launch(self, port: int, api_key: str, model: str, host: str = "127.0.0.1", **kwargs) -> None:
+        self.configure(port, api_key, model, host=host)
 
         env = os.environ.copy()
         env["OMLX_API_KEY"] = api_key or "omlx"

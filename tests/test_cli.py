@@ -205,6 +205,32 @@ class TestServeCommandOptions:
 
 
 
+class TestLaunchCommandOptions:
+    """Tests for launch command options via help output."""
+
+    def test_launch_has_host_port_options(self):
+        """Test that launch command has --host and --port options."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "launch", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0
+        assert "--host" in result.stdout
+        assert "--port" in result.stdout
+
+    def test_launch_has_model_option(self):
+        """Test that launch command has --model option."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "launch", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert "--model" in result.stdout
+
+
 class TestServeCommandFunctions:
     """Tests for serve command function."""
 

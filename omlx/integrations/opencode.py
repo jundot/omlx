@@ -30,14 +30,14 @@ class OpenCodeIntegration(Integration):
             f"launch opencode --model {model or 'select-a-model'}"
         )
 
-    def configure(self, port: int, api_key: str, model: str) -> None:
+    def configure(self, port: int, api_key: str, model: str, host: str = "127.0.0.1") -> None:
         def updater(config: dict) -> None:
             config.setdefault("provider", {})
             provider_config = {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "oMLX",
                 "options": {
-                    "baseURL": f"http://127.0.0.1:{port}/v1",
+                    "baseURL": f"http://{host}:{port}/v1",
                 },
             }
             if api_key:
@@ -56,8 +56,8 @@ class OpenCodeIntegration(Integration):
 
         self._write_json_config(self.CONFIG_PATH, updater)
 
-    def launch(self, port: int, api_key: str, model: str, **kwargs) -> None:
-        self.configure(port, api_key, model)
+    def launch(self, port: int, api_key: str, model: str, host: str = "127.0.0.1", **kwargs) -> None:
+        self.configure(port, api_key, model, host=host)
 
         env = os.environ.copy()
         args = ["opencode"]

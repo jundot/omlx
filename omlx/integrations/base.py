@@ -28,11 +28,11 @@ class Integration:
         """Generate the command string for clipboard/display."""
         raise NotImplementedError
 
-    def configure(self, port: int, api_key: str, model: str) -> None:
+    def configure(self, port: int, api_key: str, model: str, host: str = "127.0.0.1") -> None:
         """Configure the tool (write config files, etc.)."""
         pass
 
-    def launch(self, port: int, api_key: str, model: str, **kwargs) -> None:
+    def launch(self, port: int, api_key: str, model: str, host: str = "127.0.0.1", **kwargs) -> None:
         """Configure and launch the tool."""
         raise NotImplementedError
 

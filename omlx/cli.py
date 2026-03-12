@@ -217,6 +217,7 @@ def launch_command(args):
     import requests
 
     from .integrations import get_integration, list_integrations
+    from .settings import GlobalSettings
 
     tool_name = args.tool
 
@@ -233,9 +234,13 @@ def launch_command(args):
         print("Available: " + ", ".join(i.name for i in list_integrations()))
         sys.exit(1)
 
+    # Resolve host/port: CLI args > env vars > settings.json > defaults
+    settings = GlobalSettings.load()
+    host = args.host or settings.server.host
+    port = args.port or settings.server.port
+
     # Check if oMLX server is running
-    port = args.port or 8000
-    base_url = f"http://127.0.0.1:{port}"
+    base_url = f"http://{host}:{port}"
     try:
         resp = requests.get(f"{base_url}/health", timeout=3)
         resp.raise_for_status()
@@ -300,7 +305,7 @@ def launch_command(args):
     print(f"Launching {integration.display_name} with model {model}...")
     tools_profile = getattr(args, "tools_profile", "coding")
     integration.launch(
-        port=port, api_key=api_key, model=model, tools_profile=tools_profile
+        port=port, api_key=api_key, model=model, host=host, tools_profile=tools_profile
     )
 
 
@@ -463,10 +468,16 @@ Example directory structure:
         help="Model to use (interactive selection if not specified)",
     )
     launch_parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help="oMLX server host (default: from settings or 127.0.0.1)",
+    )
+    launch_parser.add_argument(
         "--port",
         type=int,
         default=None,
-        help="oMLX server port (default: 8000)",
+        help="oMLX server port (default: from settings or 8000)",
     )
     launch_parser.add_argument(
         "--api-key",
