@@ -17,6 +17,7 @@ from omlx.api.tool_calling import (
     extract_json_from_text,
     format_tool_call_for_message,
     parse_json_output,
+    parse_tool_calls,
     validate_json_schema,
 )
 from omlx.api.openai_models import (
@@ -822,6 +823,127 @@ class TestToolCallStreamFilter:
         assert r1 == "Next: "
         assert r2 == ""
         assert f.finish() == ""
+
+
+class TestToolCallStreamFilterBracketPartialPrefix:
+    """Tests for bracket partial prefix detection at token boundaries."""
+
+    def test_bracket_partial_prefix_single_char(self):
+        """'[' as separate token should be buffered, not emitted."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Hello [")
+        r2 = f.feed('Calling tool: Bash({"cmd":"ls"})]')
+        result = r1 + r2 + f.finish()
+        assert result == "Hello "
+
+    def test_bracket_partial_prefix_multi_char(self):
+        """'[Cal' as partial prefix should be buffered."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Hello [Cal")
+        r2 = f.feed('ling tool: Bash({"cmd":"ls"})]')
+        result = r1 + r2 + f.finish()
+        assert result == "Hello "
+
+    def test_bracket_partial_prefix_tool_call_variant(self):
+        """'[' followed by 'Tool call:' should be buffered and suppressed."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("Result [")
+        r2 = f.feed('Tool call: search({"q":"test"})]')
+        result = r1 + r2 + f.finish()
+        assert result == "Result "
+
+    def test_bracket_partial_prefix_false_alarm(self):
+        """'[' followed by non-tool text should be released."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        r1 = f.feed("array [")
+        r2 = f.feed("1, 2, 3]")
+        result = r1 + r2 + f.finish()
+        assert result == "array [1, 2, 3]"
+
+    def test_bracket_char_by_char(self):
+        """Character-by-character feeding should still suppress tool calls."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        text = '[Calling tool: x({"a":1})]'
+        result = ""
+        for ch in text:
+            result += f.feed(ch)
+        result += f.finish()
+        assert result == ""
+
+
+def _make_tokenizer_with_end(tool_call_start="", tool_call_end=""):
+    """Create a mock tokenizer with start and end markers."""
+    tok = MagicMock(spec=[])
+    if tool_call_start is not None:
+        tok.tool_call_start = tool_call_start
+    if tool_call_end is not None:
+        tok.tool_call_end = tool_call_end
+    return tok
+
+
+class TestToolCallStreamFilterSuppressAfterMarker:
+    """Tests for one-sided markers (e.g. Mistral [TOOL_CALLS] with no end marker)."""
+
+    def test_suppress_after_marker_basic(self):
+        """Everything after a one-sided marker should be suppressed."""
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end("[TOOL_CALLS]", "")
+        )
+        result = f.feed('[TOOL_CALLS]func_name[ARGS]{"key":"val"}')
+        result += f.finish()
+        assert result == ""
+
+    def test_suppress_after_marker_with_preceding_text(self):
+        """Text before one-sided marker should pass through."""
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end("[TOOL_CALLS]", "")
+        )
+        r1 = f.feed("Hello ")
+        r2 = f.feed('[TOOL_CALLS]func_name[ARGS]{"key":"val"}')
+        result = r1 + r2 + f.finish()
+        assert result == "Hello "
+
+    def test_suppress_after_marker_partial_prefix(self):
+        """Partial one-sided marker prefix should be buffered."""
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end("[TOOL_CALLS]", "")
+        )
+        r1 = f.feed("[TOOL")
+        r2 = f.feed('_CALLS]func_name[ARGS]{"key":"val"}')
+        result = r1 + r2 + f.finish()
+        assert result == ""
+
+    def test_suppress_after_marker_multi_feed(self):
+        """Permanent suppression persists across multiple feeds."""
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end("[TOOL_CALLS]", "")
+        )
+        r1 = f.feed("Hi [TOOL_CALLS]start")
+        r2 = f.feed(" more data")
+        r3 = f.feed(" even more")
+        result = r1 + r2 + r3 + f.finish()
+        assert result == "Hi "
+
+
+class TestParseToolCallsEmptyEndMarker:
+    """Tests for parse_tool_calls with empty end marker (Mistral)."""
+
+    def test_empty_end_marker_reaches_native_parser(self):
+        """Empty tool_call_end should not block native parser invocation."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "[TOOL_CALLS]"
+        tok.tool_call_end = ""
+        tok.tool_parser = lambda text, tools: {
+            "name": "test_func",
+            "arguments": {"key": "value"},
+        }
+
+        text = "[TOOL_CALLS]ignored"
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "test_func"
 
 
 class TestParseBracketToolCalls:

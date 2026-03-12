@@ -262,7 +262,7 @@ def parse_tool_calls(
         tool_call_end = tokenizer.tool_call_end
         tool_parser = tokenizer.tool_parser
 
-        if all([tool_call_start, tool_call_end, tool_parser]):
+        if tool_call_start is not None and tool_call_end is not None and tool_parser is not None:
             tool_calls = []
             start_escaped = re.escape(tool_call_start)
             end_escaped = re.escape(tool_call_end)
@@ -330,11 +330,22 @@ class ToolCallStreamFilter:
     """
 
     def __init__(self, tokenizer: Any):
-        marker = getattr(tokenizer, "tool_call_start", "") or ""
-        marker_end = getattr(tokenizer, "tool_call_end", "") or ""
+        marker = getattr(tokenizer, "tool_call_start", None)
+        marker_end = getattr(tokenizer, "tool_call_end", None)
+        # Normalize None-like values but preserve empty strings.
+        if marker is None:
+            marker = ""
+        if marker_end is None:
+            marker_end = ""
         self._marker_pairs: List[Tuple[str, str]] = [("<tool_call>", "</tool_call>")]
-        if marker and marker_end:
-            self._marker_pairs.insert(0, (marker, marker_end))
+        self._suppress_after_markers: List[str] = []
+        if marker:
+            if marker_end:
+                self._marker_pairs.insert(0, (marker, marker_end))
+            else:
+                # One-sided markers (e.g. Mistral "[TOOL_CALLS]" with no
+                # end marker): suppress everything after the start marker.
+                self._suppress_after_markers.append(marker)
         self._namespaced_open_re = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>")
         self._bracket_prefixes = ["[Calling tool:", "[Tool call:"]
         self._bracket_call_re = re.compile(
@@ -343,6 +354,7 @@ class ToolCallStreamFilter:
         )
         self._buffer = ""
         self._suppressing_until: Optional[str] = None
+        self._suppressing = False
 
     @property
     def active(self) -> bool:
@@ -379,6 +391,12 @@ class ToolCallStreamFilter:
             bracket_match = self._bracket_call_re.match(bracket_candidate)
             if bracket_match:
                 starts.append((bracket_idx, bracket_match.end(), None))
+
+        # One-sided markers: suppress from start marker to end of buffer.
+        for sa_marker in self._suppress_after_markers:
+            idx = text.find(sa_marker)
+            if idx >= 0:
+                starts.append((idx, len(text) - idx, "__suppress_permanently__"))
 
         if not starts:
             return None
@@ -427,6 +445,14 @@ class ToolCallStreamFilter:
             if self._could_be_partial_namespaced_open(candidate):
                 keep = max(keep, len(candidate))
 
+        # Partial prefix detection for bracket markers (e.g. "[", "[C",
+        # "[Cal" could be start of "[Calling tool:" or "[Tool call:").
+        for bp in self._bracket_prefixes:
+            keep = max(keep, self._partial_prefix_len(text, bp))
+        # Same for suppress-after markers (e.g. "[TOOL" for "[TOOL_CALLS]").
+        for sa_marker in self._suppress_after_markers:
+            keep = max(keep, self._partial_prefix_len(text, sa_marker))
+
         bracket_idx = -1
         for bp in self._bracket_prefixes:
             idx = text.find(bp)
@@ -459,6 +485,11 @@ class ToolCallStreamFilter:
             if tail.startswith(bp):
                 return True
 
+        # Drop unresolved suppress-after marker prefixes
+        for sa_marker in self._suppress_after_markers:
+            if sa_marker.startswith(tail) or tail.startswith(sa_marker):
+                return True
+
         if not tail.startswith("<"):
             return False
         if ">" in tail:
@@ -481,7 +512,7 @@ class ToolCallStreamFilter:
 
     def feed(self, text: str) -> str:
         """Feed a content delta, return the portion safe to emit."""
-        if not text:
+        if self._suppressing or not text:
             return ""
         if not self.active:
             return text
@@ -490,6 +521,12 @@ class ToolCallStreamFilter:
         out: List[str] = []
 
         while self._buffer:
+            if self._suppressing_until == "__suppress_permanently__":
+                self._suppressing = True
+                self._suppressing_until = None
+                self._buffer = ""
+                break
+
             if self._suppressing_until is not None:
                 end_idx = self._buffer.find(self._suppressing_until)
                 if end_idx < 0:
@@ -528,7 +565,7 @@ class ToolCallStreamFilter:
         In clean-output strict mode, unresolved marker-like suffixes are dropped
         so partial control markup does not leak into user-visible text.
         """
-        if self._suppressing_until is not None:
+        if self._suppressing or self._suppressing_until is not None:
             self._buffer = ""
             self._suppressing_until = None
             return ""
