@@ -7,12 +7,14 @@ mlx-embeddings. Unlike LLM engines, embedding engines don't support
 streaming or chat completion.
 """
 
+import asyncio
 import gc
 import logging
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 
+from ..engine_core import get_mlx_executor
 from ..models.embedding import EmbeddingOutput, MLXEmbeddingModel
 from .base import BaseNonStreamingEngine
 
@@ -56,13 +58,18 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         return self._model.hidden_size if self._model else None
 
     async def start(self) -> None:
-        """Start the engine (load model if not loaded)."""
+        """Start the engine (load model if not loaded).
+
+        Model loading runs on the global MLX executor to avoid Metal
+        command buffer races with concurrent BatchGenerator steps.
+        """
         if self._model is not None:
             return
 
         logger.info(f"Starting embedding engine: {self._model_name}")
         self._model = MLXEmbeddingModel(self._model_name)
-        self._model.load()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(get_mlx_executor(), self._model.load)
         logger.info(f"Embedding engine started: {self._model_name}")
 
     async def stop(self) -> None:
@@ -73,9 +80,9 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         logger.info(f"Stopping embedding engine: {self._model_name}")
         self._model = None
 
-        # Force garbage collection to release memory
         gc.collect()
-        mx.clear_cache()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
         logger.info(f"Embedding engine stopped: {self._model_name}")
 
     async def embed(
@@ -100,12 +107,18 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
 
-        return self._model.embed(
-            texts=texts,
-            max_length=max_length,
-            padding=padding,
-            truncation=truncation,
-        )
+        model = self._model
+
+        def _embed_sync():
+            return model.embed(
+                texts=texts,
+                max_length=max_length,
+                padding=padding,
+                truncation=truncation,
+            )
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(get_mlx_executor(), _embed_sync)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

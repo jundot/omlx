@@ -8,12 +8,14 @@ Unlike LLM engines, reranker engines don't support streaming
 or chat completion.
 """
 
+import asyncio
 import gc
 import logging
 from typing import Any, Dict
 
 import mlx.core as mx
 
+from ..engine_core import get_mlx_executor
 from ..models.reranker import MLXRerankerModel, RerankOutput
 from .base import BaseNonStreamingEngine
 
@@ -57,13 +59,18 @@ class RerankerEngine(BaseNonStreamingEngine):
         return self._model.num_labels if self._model else None
 
     async def start(self) -> None:
-        """Start the engine (load model if not loaded)."""
+        """Start the engine (load model if not loaded).
+
+        Model loading runs on the global MLX executor to avoid Metal
+        command buffer races with concurrent BatchGenerator steps.
+        """
         if self._model is not None:
             return
 
         logger.info(f"Starting reranker engine: {self._model_name}")
         self._model = MLXRerankerModel(self._model_name)
-        self._model.load()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(get_mlx_executor(), self._model.load)
         logger.info(f"Reranker engine started: {self._model_name}")
 
     async def stop(self) -> None:
@@ -74,9 +81,9 @@ class RerankerEngine(BaseNonStreamingEngine):
         logger.info(f"Stopping reranker engine: {self._model_name}")
         self._model = None
 
-        # Force garbage collection to release memory
         gc.collect()
-        mx.clear_cache()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
         logger.info(f"Reranker engine stopped: {self._model_name}")
 
     async def rerank(
@@ -103,11 +110,17 @@ class RerankerEngine(BaseNonStreamingEngine):
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
 
-        output = self._model.rerank(
-            query=query,
-            documents=documents,
-            max_length=max_length,
-        )
+        model = self._model
+
+        def _rerank_sync():
+            return model.rerank(
+                query=query,
+                documents=documents,
+                max_length=max_length,
+            )
+
+        loop = asyncio.get_running_loop()
+        output = await loop.run_in_executor(get_mlx_executor(), _rerank_sync)
 
         # Apply top_n filtering if specified
         if top_n is not None and top_n < len(output.indices):
