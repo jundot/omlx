@@ -740,14 +740,18 @@
 
             async loadModels() {
                 try {
-                    const response = await fetch('/v1/models', {
-                        headers: {
-                            'Authorization': `Bearer ${this.getApiKey()}`
-                        }
-                    });
+                    // Fetch models and server health in parallel
+                    const [modelsResponse, healthResponse] = await Promise.all([
+                        fetch('/v1/models', {
+                            headers: {
+                                'Authorization': `Bearer ${this.getApiKey()}`
+                            }
+                        }),
+                        fetch('/health')
+                    ]);
 
-                    if (!response.ok) {
-                        if (response.status === 401) {
+                    if (!modelsResponse.ok) {
+                        if (modelsResponse.status === 401) {
                             alert(window.t('chat.error.incorrect_api_key'));
                             localStorage.removeItem('omlx_chat_api_key');
                             this.apiKeySet = false;
@@ -758,12 +762,23 @@
                         throw new Error('Failed to load models');
                     }
 
-                    const data = await response.json();
-                    this.availableModels = data.data || [];
+                    const modelsData = await modelsResponse.json();
+                    this.availableModels = modelsData.data || [];
 
-                    // Auto-select first model if none selected
+                    // Get default model from health endpoint
+                    let defaultModel = null;
+                    if (healthResponse.ok) {
+                        const healthData = await healthResponse.json();
+                        defaultModel = healthData.default_model;
+                    }
+
+                    // Auto-select default model if set, otherwise first model
                     if (!this.currentModel && this.availableModels.length > 0) {
-                        this.currentModel = this.availableModels[0].id;
+                        if (defaultModel && this.availableModels.some(m => m.id === defaultModel)) {
+                            this.currentModel = defaultModel;
+                        } else {
+                            this.currentModel = this.availableModels[0].id;
+                        }
                     }
                 } catch (error) {
                     console.error('Error loading models:', error);
