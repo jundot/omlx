@@ -104,6 +104,7 @@ class GlobalSettingsRequest(BaseModel):
     model_dirs: Optional[List[str]] = None
     model_dir: Optional[str] = None  # Deprecated: kept for backward compatibility
     max_model_memory: Optional[str] = None
+    model_fallback: Optional[bool] = None
 
     # Memory enforcement
     max_process_memory: Optional[str] = None  # "auto", "disabled", or "XX%"
@@ -1560,6 +1561,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             ],
             "model_dir": str(global_settings.model.get_model_dir(global_settings.base_path)),
             "max_model_memory": global_settings.model.max_model_memory,
+            "model_fallback": global_settings.model.model_fallback,
         },
         "memory": {
             "max_process_memory": global_settings.memory.max_process_memory,
@@ -1711,6 +1713,10 @@ async def update_global_settings(
                 logger.warning(f"Failed to apply max_model_memory runtime: {msg}")
         except ValueError as e:
             logger.warning(f"Invalid max_model_memory format: {e}")
+
+    if request.model_fallback is not None:
+        global_settings.model.model_fallback = request.model_fallback
+        runtime_applied.append("model_fallback")
 
     # Apply process memory enforcement settings (Live)
     if request.max_process_memory is not None:

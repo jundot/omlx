@@ -468,6 +468,7 @@
                             log_level: this.globalSettings.server.log_level,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             max_model_memory: this.globalSettings.model.max_model_memory,
+                            model_fallback: this.globalSettings.model.model_fallback,
                             max_process_memory: this.globalSettings.memory.max_process_memory,
                             max_num_seqs: this.globalSettings.scheduler.max_num_seqs,
                             completion_batch_size: this.globalSettings.scheduler.completion_batch_size,

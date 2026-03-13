@@ -137,6 +137,7 @@ class ModelSettings:
     model_dirs: list[str] = field(default_factory=list)  # [] means ~/.omlx/models
     model_dir: str | None = None  # Deprecated: kept for backward compatibility
     max_model_memory: str = "auto"  # "auto" means 80% of RAM
+    model_fallback: bool = False  # Use default model when requested model not found
 
     def get_model_dirs(self, base_path: Path) -> list[Path]:
         """
@@ -189,6 +190,7 @@ class ModelSettings:
             "model_dirs": self.model_dirs,
             "model_dir": self.model_dirs[0] if self.model_dirs else self.model_dir,
             "max_model_memory": self.max_model_memory,
+            "model_fallback": self.model_fallback,
         }
 
     @classmethod
@@ -202,6 +204,7 @@ class ModelSettings:
             model_dirs=model_dirs,
             model_dir=data.get("model_dir"),
             max_model_memory=data.get("max_model_memory", "auto"),
+            model_fallback=data.get("model_fallback", False),
         )
 
 

@@ -221,6 +221,8 @@
   "settings.server.log_level_trace": "trace - 全内容を含む",
 
   "settings.model.section_label": "モデル",
+  "settings.model.model_fallback": "デフォルトモデルにフォールバック",
+  "settings.model.model_fallback_desc": "リクエストされたモデルが見つからない場合、デフォルトモデルを使用します",
   "settings.model.model_directories": "モデルディレクトリ",
   "settings.model.add": "追加",
   "settings.model.placeholder_primary": "メインモデルディレクトリ",

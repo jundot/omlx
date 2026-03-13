@@ -531,6 +531,22 @@ async def get_engine(
     try:
         engine = await pool.get_engine(model_id)
     except ModelNotFoundError as e:
+        # Fallback to default model if enabled (LLM only)
+        if (
+            engine_type == EngineType.LLM
+            and _server_state.global_settings
+            and _server_state.global_settings.model.model_fallback
+            and _server_state.default_model
+        ):
+            logger.info(
+                f"Model '{model_id}' not found, falling back to "
+                f"default model '{_server_state.default_model}'"
+            )
+            try:
+                return await pool.get_engine(_server_state.default_model)
+            except Exception:
+                pass  # Fall through to original 404
+
         # Show aliases instead of directory names for user-friendly display
         available = e.available_models
         sm = _server_state.settings_manager

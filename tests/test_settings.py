@@ -201,6 +201,7 @@ class TestModelSettings:
             "model_dirs": ["/models"],
             "model_dir": "/models",
             "max_model_memory": "32GB",
+            "model_fallback": False,
         }
 
     def test_from_dict(self):
@@ -209,6 +210,30 @@ class TestModelSettings:
         settings = ModelSettings.from_dict(data)
         assert settings.model_dirs == ["/models"]
         assert settings.max_model_memory == "64GB"
+        assert settings.model_fallback is False
+
+    def test_model_fallback_default(self):
+        """Test model_fallback defaults to False."""
+        settings = ModelSettings()
+        assert settings.model_fallback is False
+
+    def test_model_fallback_to_dict(self):
+        """Test model_fallback is included in to_dict."""
+        settings = ModelSettings(model_dirs=["/models"], model_fallback=True)
+        result = settings.to_dict()
+        assert result["model_fallback"] is True
+
+    def test_model_fallback_from_dict(self):
+        """Test model_fallback is loaded from dict."""
+        data = {"model_dirs": ["/models"], "model_fallback": True}
+        settings = ModelSettings.from_dict(data)
+        assert settings.model_fallback is True
+
+    def test_model_fallback_from_dict_missing(self):
+        """Test model_fallback defaults to False when missing from dict."""
+        data = {"model_dirs": ["/models"]}
+        settings = ModelSettings.from_dict(data)
+        assert settings.model_fallback is False
 
     def test_from_dict_backward_compat(self):
         """Test from_dict migrates old model_dir to model_dirs."""

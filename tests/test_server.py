@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for omlx.server module - sampling parameter resolution and exception handlers."""
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from omlx.exceptions import ModelNotFoundError
 from omlx.model_settings import ModelSettings, ModelSettingsManager
-from omlx.server import SamplingDefaults, ServerState, app, get_sampling_params
+from omlx.server import EngineType, SamplingDefaults, ServerState, app, get_engine, get_sampling_params
+from omlx.settings import GlobalSettings, ModelSettings as GlobalModelSettings
 
 
 class TestGetSamplingParams:
@@ -155,3 +158,84 @@ class TestExceptionHandlers:
         assert response.status_code == 404
         data = response.json()
         assert "detail" in data
+
+
+class TestModelFallback:
+    """Tests for model fallback to default when requested model not found."""
+
+    @pytest.fixture(autouse=True)
+    def setup_server_state(self):
+        """Set up a clean server state for each test."""
+        state = ServerState()
+        with patch("omlx.server._server_state", state):
+            self._state = state
+            yield
+
+    def _setup_pool(self, found_model=None):
+        """Create a mock engine pool."""
+        pool = MagicMock()
+        pool.resolve_model_id.side_effect = lambda mid, _sm: mid
+
+        if found_model:
+            mock_engine = MagicMock()
+
+            async def mock_get_engine(model_id):
+                if model_id == found_model:
+                    return mock_engine
+                raise ModelNotFoundError(model_id, [found_model])
+
+            pool.get_engine = AsyncMock(side_effect=mock_get_engine)
+        else:
+            pool.get_engine = AsyncMock(
+                side_effect=ModelNotFoundError("unknown", [])
+            )
+
+        self._state.engine_pool = pool
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_fallback_disabled_returns_404(self):
+        """When model_fallback is off, unknown model returns 404."""
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.model.model_fallback = False
+        self._state.default_model = "default-model"
+        self._setup_pool(found_model="default-model")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_engine("unknown-model", EngineType.LLM)
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_fallback_enabled_returns_default(self):
+        """When model_fallback is on, unknown model falls back to default."""
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.model.model_fallback = True
+        self._state.default_model = "default-model"
+        self._setup_pool(found_model="default-model")
+
+        engine = await get_engine("unknown-model", EngineType.LLM)
+        assert engine is not None
+
+    @pytest.mark.asyncio
+    async def test_fallback_enabled_no_default_returns_404(self):
+        """When model_fallback is on but no default model, returns 404."""
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.model.model_fallback = True
+        self._state.default_model = None
+        self._setup_pool()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_engine("unknown-model", EngineType.LLM)
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_fallback_not_applied_to_embedding(self):
+        """Fallback should not apply to embedding engine type."""
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.model.model_fallback = True
+        self._state.default_model = "default-model"
+        self._setup_pool(found_model="default-model")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_engine("unknown-model", EngineType.EMBEDDING)
+        assert exc_info.value.status_code == 404

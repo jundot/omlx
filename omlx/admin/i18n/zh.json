@@ -206,6 +206,8 @@
   "settings.server.log_level_debug": "debug",
   "settings.server.log_level_trace": "trace - 包含完整内容",
   "settings.model.section_label": "模型",
+  "settings.model.model_fallback": "回退到默认模型",
+  "settings.model.model_fallback_desc": "当请求的模型未找到时使用默认模型",
   "settings.model.model_directories": "模型目录",
   "settings.model.add": "添加",
   "settings.model.placeholder_primary": "主模型目录",

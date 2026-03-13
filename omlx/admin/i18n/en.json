@@ -221,6 +221,8 @@
     "settings.server.log_level_trace": "trace - includes full content",
 
     "settings.model.section_label": "Model",
+    "settings.model.model_fallback": "Fallback to Default Model",
+    "settings.model.model_fallback_desc": "Use the default model when the requested model is not found",
     "settings.model.model_directories": "Model Directories",
     "settings.model.add": "Add",
     "settings.model.placeholder_primary": "Primary model directory",

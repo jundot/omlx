@@ -221,6 +221,8 @@
   "settings.server.log_level_trace": "trace - 전체 내용 포함",
 
   "settings.model.section_label": "모델",
+  "settings.model.model_fallback": "기본 모델로 대체",
+  "settings.model.model_fallback_desc": "요청된 모델을 찾을 수 없을 때 기본 모델을 사용합니다",
   "settings.model.model_directories": "모델 디렉토리",
   "settings.model.add": "추가",
   "settings.model.placeholder_primary": "기본 모델 디렉토리",
