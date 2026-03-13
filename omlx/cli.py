@@ -51,10 +51,19 @@ def serve_command(args):
     from .settings import init_settings, get_settings
     from .logging_config import configure_file_logging
 
+    try:
+        from ._build_info import build_number
+    except ImportError:
+        build_number = None
+
     # Print version banner
     print(f"\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
     print(f"\033[33m├─ https://github.com/jundot/omlx\033[0m")
-    print(f"\033[33m└─ Version: {__version__}\033[0m")
+    if build_number:
+        print(f"\033[33m├─ Version: {__version__}\033[0m")
+        print(f"\033[33m└─ Build: {build_number}\033[0m")
+    else:
+        print(f"\033[33m└─ Version: {__version__}\033[0m")
     print()
 
     # Initialize global settings first (to get log_level from file if not specified)

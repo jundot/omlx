@@ -5,6 +5,7 @@ A native macOS menubar app for managing the oMLX LLM inference server.
 """
 
 import logging
+import platform
 import time
 import webbrowser
 from pathlib import Path
@@ -36,6 +37,32 @@ from .config import ServerConfig
 from .server_manager import PortConflict, ServerManager, ServerStatus
 
 logger = logging.getLogger(__name__)
+
+
+def _find_matching_dmg(assets: list[dict]) -> str | None:
+    """Select the DMG asset matching the current macOS version.
+
+    DMG filenames follow the pattern: oMLX-0.2.10-macos15-sequoia_260210.dmg
+    Matches 'macosNN' from filename against the running OS major version.
+    Falls back to the single DMG if only one is available.
+    """
+    mac_ver = platform.mac_ver()[0]  # e.g., "15.3.1" or "26.0"
+    os_major = mac_ver.split(".")[0]  # e.g., "15" or "26"
+    os_tag = f"macos{os_major}"  # e.g., "macos15" or "macos26"
+
+    dmg_assets = [a for a in assets if a.get("name", "").endswith(".dmg")]
+
+    # Exact OS match
+    for asset in dmg_assets:
+        name = asset["name"]
+        if f"-{os_tag}-" in name or f"-{os_tag}_" in name:
+            return asset["browser_download_url"]
+
+    # Fallback: single DMG release (no platform tag or only one DMG)
+    if len(dmg_assets) == 1:
+        return dmg_assets[0]["browser_download_url"]
+
+    return None
 
 
 class OMLXAppDelegate(NSObject):
@@ -253,12 +280,8 @@ class OMLXAppDelegate(NSObject):
                 current = __version__
 
                 if self._is_newer_version(latest, current):
-                    # Find DMG asset URL for auto-update
-                    dmg_url = None
-                    for asset in data.get("assets", []):
-                        if asset.get("name", "").endswith(".dmg"):
-                            dmg_url = asset["browser_download_url"]
-                            break
+                    # Find DMG asset matching current macOS version
+                    dmg_url = _find_matching_dmg(data.get("assets", []))
 
                     self._update_info = {
                         "version": latest,
@@ -971,10 +994,20 @@ class OMLXAppDelegate(NSObject):
 
         alert = NSAlert.alloc().init()
         alert.setMessageText_("About oMLX")
+
+        try:
+            from omlx._build_info import build_number
+        except ImportError:
+            build_number = None
+
+        version_text = f"Version: {__version__}"
+        if build_number:
+            version_text += f"\nBuild: {build_number}"
+
         alert.setInformativeText_(
             "oMLX - LLM inference,\noptimized for your Mac\n\n"
             "Built with MLX, mlx-lm, and mlx-vlm\n"
-            f"Version: {__version__}"
+            f"{version_text}"
         )
         alert.addButtonWithTitle_("OK")
         alert.addButtonWithTitle_("GitHub")
