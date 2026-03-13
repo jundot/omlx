@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 _benchmark_runs: dict[str, "BenchmarkRun"] = {}
 
 # Valid prompt lengths for single request tests
-VALID_PROMPT_LENGTHS = [1024, 4096, 8192, 16384, 32768, 65536]
+VALID_PROMPT_LENGTHS = [1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000]
 
 # Valid batch sizes for continuous batching tests
 VALID_BATCH_SIZES = [2, 4, 8]

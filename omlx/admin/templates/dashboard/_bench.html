@@ -46,7 +46,7 @@
                             <div>
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('bench.config.single_request') }}</label>
                                 <div class="flex flex-wrap items-center gap-4">
-                                    <template x-for="pp in [1024, 4096, 8192, 16384, 32768, 65536]" :key="pp">
+                                    <template x-for="pp in [1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000]" :key="pp">
                                         <label class="flex items-center gap-2 cursor-pointer">
                                             <input type="checkbox"
                                                    x-model="benchPromptLengths[pp]"

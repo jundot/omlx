@@ -193,7 +193,7 @@
 
             // Benchmark state
             benchModelId: '',
-            benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false },
+            benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false, 131072: false, 200000: false },
             benchBatchSizes: { 2: true, 4: true, 8: false },
             benchRunning: false,
             benchBenchId: null,
