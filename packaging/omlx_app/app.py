@@ -1005,9 +1005,10 @@ class OMLXAppDelegate(NSObject):
             version_text += f"\nBuild: {build_number}"
 
         alert.setInformativeText_(
+            "LLM inference,\n"
             "optimized for your Mac\n\n"
-            "Special Thanks to 1212.H.\n"
-            "Built with MLX, mlx-lm, and mlx-vlm\n\n"
+            "Built with MLX, mlx-lm, and mlx-vlm\n"
+            "Special Thanks to 1212.H.\n\n"
             f"{version_text}"
         )
         alert.addButtonWithTitle_("OK")
