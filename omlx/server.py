@@ -1138,6 +1138,78 @@ async def health():
     }
 
 
+@app.get("/api/status")
+async def server_status(_: bool = Depends(verify_api_key)):
+    """Lightweight status endpoint for external tool polling (statuslines, scripts)."""
+    from .model_discovery import format_size
+    from .server_metrics import get_server_metrics
+
+    metrics = get_server_metrics()
+    snapshot = metrics.get_snapshot()
+
+    pool = _server_state.engine_pool
+
+    models_discovered = 0
+    models_loaded = 0
+    models_loading = 0
+    loaded_models = []
+    model_memory_used = 0
+    model_memory_max = None
+
+    if pool is not None:
+        models_discovered = pool.model_count
+        models_loaded = pool.loaded_model_count
+        loaded_models = pool.get_loaded_model_ids()
+        model_memory_used = pool.current_model_memory
+        model_memory_max = pool.max_model_memory
+        for entry in pool._entries.values():
+            if entry.is_loading:
+                models_loading += 1
+
+    # Aggregate active/waiting requests across all loaded engines
+    active_requests = 0
+    waiting_requests = 0
+    if pool is not None:
+        for entry in pool._entries.values():
+            engine = entry.engine
+            if engine is None:
+                continue
+            async_core = getattr(engine, "_engine", None)
+            if async_core is None:
+                continue
+            core = getattr(async_core, "engine", None)
+            if core is None:
+                continue
+            active_requests += len(getattr(core, "_output_collectors", {}))
+            sched = getattr(core, "scheduler", None)
+            if sched is not None:
+                waiting_requests += len(getattr(sched, "waiting", []))
+
+    return {
+        "status": "ok",
+        "version": __version__,
+        "uptime_seconds": snapshot["uptime_seconds"],
+        "models_discovered": models_discovered,
+        "models_loaded": models_loaded,
+        "models_loading": models_loading,
+        "default_model": _server_state.default_model,
+        "loaded_models": loaded_models,
+        "total_requests": snapshot["total_requests"],
+        "active_requests": active_requests,
+        "waiting_requests": waiting_requests,
+        "total_prompt_tokens": snapshot["total_prompt_tokens"],
+        "total_completion_tokens": snapshot["total_completion_tokens"],
+        "total_cached_tokens": snapshot["total_cached_tokens"],
+        "cache_efficiency": snapshot["cache_efficiency"],
+        "avg_prefill_tps": snapshot["avg_prefill_tps"],
+        "avg_generation_tps": snapshot["avg_generation_tps"],
+        "model_memory_used": model_memory_used,
+        "model_memory_max": model_memory_max,
+        "model_memory_used_formatted": format_size(model_memory_used) if model_memory_used else "0B",
+        "model_memory_max_formatted": format_size(model_memory_max) if model_memory_max else "unlimited",
+    }
+
+
 @app.get("/v1/models")
 async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
     """List all available models with load status."""
