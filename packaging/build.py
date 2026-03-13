@@ -15,10 +15,12 @@ Usage:
 
 import argparse
 import os
+import platform
 import plistlib
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import re
@@ -577,6 +579,32 @@ int main(int argc, char *argv[]) {
     launcher_bin.chmod(0o755)
 
 
+_MACOS_CODENAMES = {
+    "14": "sonoma",
+    "15": "sequoia",
+    "26": "tahoe",
+}
+
+
+def _write_build_info(omlx_pkg_dir: Path, macos_target: str | None = None):
+    """Write _build_info.py with build number for runtime display.
+
+    Format: YYMMDDHHmmSS-macosNN-codename
+    Example: 260313093001-macos15-sequoia
+    """
+    ts = datetime.now().strftime("%y%m%d%H%M%S")
+    if macos_target:
+        major = macos_target.split(".")[0]
+    else:
+        major = platform.mac_ver()[0].split(".")[0]
+    codename = _MACOS_CODENAMES.get(major, "")
+    tag = f"macos{major}-{codename}" if codename else f"macos{major}"
+    build_number = f"{ts}-{tag}"
+    build_info_file = omlx_pkg_dir / "_build_info.py"
+    build_info_file.write_text(f'build_number = "{build_number}"\n')
+    print(f"  Generated _build_info.py: {build_number}")
+
+
 def create_app_bundle():
     """Create macOS .app bundle."""
     print("\n[2/4] Creating app bundle...")
@@ -981,6 +1009,8 @@ def main():
             swap_platform_wheels(EXPORT_DIR, args.macos_target)
 
         app_dir = create_app_bundle()
+        omlx_pkg_dir = app_dir / "Contents" / "Resources" / "omlx"
+        _write_build_info(omlx_pkg_dir, args.macos_target)
         sign_app(app_dir)
         create_dmg(app_dir)
 
