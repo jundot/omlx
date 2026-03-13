@@ -10,8 +10,6 @@ import logging
 import uuid
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
 from .anthropic_models import (
     AnthropicTool,
     AnthropicUsage,
@@ -23,6 +21,60 @@ from .anthropic_models import (
     SystemContent,
 )
 from .openai_models import ToolCall
+
+_PRESERVE_ROLE_BOUNDARY = "_preserve_role_boundary"
+logger = logging.getLogger(__name__)
+
+
+def _content_block_to_dict(block: Any) -> dict[str, Any] | None:
+    """Normalize Anthropic content blocks to dicts."""
+    if hasattr(block, "model_dump"):
+        return block.model_dump()
+    if isinstance(block, dict):
+        return block
+    return None
+
+
+def _append_anthropic_image_part(image_parts: list[dict], block_dict: dict[str, Any]) -> None:
+    """Convert Anthropic image blocks to OpenAI-style image_url parts."""
+    source = block_dict.get("source", {})
+    if source.get("type") == "base64":
+        media_type = source.get("media_type", "image/jpeg")
+        data = source.get("data", "")
+        image_parts.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{media_type};base64,{data}",
+            },
+        })
+    elif source.get("type") == "url":
+        image_parts.append({
+            "type": "image_url",
+            "image_url": {
+                "url": source.get("url", ""),
+            },
+        })
+
+
+def _build_message_from_parts(
+    role: str,
+    text_parts: list[str],
+    image_parts: list[dict],
+) -> dict[str, Any] | None:
+    """Build a single internal message from accumulated text/image parts."""
+    if image_parts:
+        content_parts = list(image_parts)
+        if text_parts:
+            content_parts.append({
+                "type": "text",
+                "text": "\n".join(text_parts),
+            })
+        return {"role": role, "content": content_parts}
+
+    if text_parts:
+        return {"role": role, "content": "\n".join(text_parts)}
+
+    return None
 
 # =============================================================================
 # Message Conversion: Anthropic -> Internal
@@ -55,6 +107,7 @@ def convert_anthropic_to_internal(
         List of {"role": str, "content": str or list}
     """
     processed_messages: list[dict[str, Any]] = []
+    native_tool_calling = bool(tokenizer and getattr(tokenizer, "has_tool_calling", False))
 
     # Handle system message (Anthropic has separate 'system' field)
     if request.system:
@@ -71,16 +124,89 @@ def convert_anthropic_to_internal(
             # Simple text message
             processed_messages.append({"role": role, "content": content})
         elif isinstance(content, list):
+            if native_tool_calling:
+                if role == "assistant":
+                    text_parts: list[str] = []
+                    image_parts: list[dict] = []
+                    tool_calls: list[dict] = []
+                    for block in content:
+                        block_dict = _content_block_to_dict(block)
+                        if block_dict is None:
+                            continue
+                        block_type = block_dict.get("type", "")
+                        if block_type == "text":
+                            text_parts.append(block_dict.get("text", ""))
+                        elif block_type == "image" and preserve_images:
+                            _append_anthropic_image_part(image_parts, block_dict)
+                        elif block_type == "tool_use":
+                            tool_input = block_dict.get("input", {})
+                            if isinstance(tool_input, str):
+                                try:
+                                    tool_input = json.loads(tool_input)
+                                except (json.JSONDecodeError, ValueError):
+                                    pass
+                            tool_calls.append({
+                                "id": block_dict.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                                "function": {
+                                    "name": block_dict.get("name", ""),
+                                    "arguments": tool_input,
+                                },
+                            })
+                    msg_dict = _build_message_from_parts(role, text_parts, image_parts) or {
+                        "role": role,
+                        "content": "",
+                    }
+                    if tool_calls:
+                        msg_dict["tool_calls"] = tool_calls
+                        msg_dict[_PRESERVE_ROLE_BOUNDARY] = True
+                    processed_messages.append(msg_dict)
+                    continue
+
+                if role == "user":
+                    text_parts = []
+                    image_parts = []
+                    saw_tool_result = False
+                    for block in content:
+                        block_dict = _content_block_to_dict(block)
+                        if block_dict is None:
+                            continue
+                        block_type = block_dict.get("type", "")
+                        if block_type == "text":
+                            text_parts.append(block_dict.get("text", ""))
+                        elif block_type == "image" and preserve_images:
+                            _append_anthropic_image_part(image_parts, block_dict)
+                        elif block_type == "tool_result":
+                            msg_dict = _build_message_from_parts(role, text_parts, image_parts)
+                            if msg_dict:
+                                processed_messages.append(msg_dict)
+                            text_parts = []
+                            image_parts = []
+                            saw_tool_result = True
+                            processed_messages.append({
+                                "role": "tool",
+                                "tool_call_id": block_dict.get("tool_use_id", ""),
+                                "content": _extract_tool_result_content(
+                                    block_dict.get("content", ""),
+                                    max_tokens=max_tool_result_tokens,
+                                    tokenizer=tokenizer,
+                                ),
+                            })
+                        elif block_type == "thinking":
+                            continue
+                    msg_dict = _build_message_from_parts(role, text_parts, image_parts)
+                    if msg_dict:
+                        processed_messages.append(msg_dict)
+                    elif not saw_tool_result:
+                        processed_messages.append({"role": role, "content": ""})
+                    continue
+
             # Content blocks list
             text_parts: list[str] = []
             image_parts: list[dict] = []
+            saw_tool_markup = False
             for block in content:
-                # Handle both Pydantic models and dicts
-                if hasattr(block, "model_dump"):
-                    block_dict = block.model_dump()
-                elif isinstance(block, dict):
-                    block_dict = block
-                else:
+                block_dict = _content_block_to_dict(block)
+                if block_dict is None:
                     continue
 
                 block_type = block_dict.get("type", "")
@@ -89,24 +215,7 @@ def convert_anthropic_to_internal(
                     text_parts.append(block_dict.get("text", ""))
 
                 elif block_type == "image" and preserve_images:
-                    # Anthropic image block -> OpenAI image_url format
-                    source = block_dict.get("source", {})
-                    if source.get("type") == "base64":
-                        media_type = source.get("media_type", "image/jpeg")
-                        data = source.get("data", "")
-                        image_parts.append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{media_type};base64,{data}",
-                            },
-                        })
-                    elif source.get("type") == "url":
-                        image_parts.append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": source.get("url", ""),
-                            },
-                        })
+                    _append_anthropic_image_part(image_parts, block_dict)
 
                 elif block_type == "tool_use":
                     # Tool use in assistant message (model called a tool)
@@ -115,6 +224,7 @@ def convert_anthropic_to_internal(
                     text_parts.append(
                         f"[Calling tool: {tool_name}({json.dumps(tool_input)})]"
                     )
+                    saw_tool_markup = True
 
                 elif block_type == "tool_result":
                     # Tool result in user message (user providing tool output)
@@ -127,25 +237,19 @@ def convert_anthropic_to_internal(
                     is_error = block_dict.get("is_error", False)
                     prefix = "[Tool Error" if is_error else "[Tool Result"
                     text_parts.append(f"{prefix} ({tool_use_id})]: {result_content}")
+                    saw_tool_markup = True
 
                 elif block_type == "thinking":
                     # Thinking blocks are ignored (reasoning content is not passed to model)
                     continue
 
-            if image_parts:
-                # Build multimodal content list for VLM
-                content_parts = []
-                for img in image_parts:
-                    content_parts.append(img)
-                if text_parts:
-                    content_parts.append({
-                        "type": "text",
-                        "text": "\n".join(text_parts),
-                    })
-                processed_messages.append({"role": role, "content": content_parts})
-            else:
-                combined_text = "\n".join(text_parts) if text_parts else ""
-                processed_messages.append({"role": role, "content": combined_text})
+            msg_dict = _build_message_from_parts(role, text_parts, image_parts) or {
+                "role": role,
+                "content": "",
+            }
+            if saw_tool_markup:
+                msg_dict[_PRESERVE_ROLE_BOUNDARY] = True
+            processed_messages.append(msg_dict)
         else:
             # Unknown format
             processed_messages.append({"role": role, "content": str(content)})

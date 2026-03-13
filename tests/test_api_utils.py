@@ -6,9 +6,6 @@ Tests utility functions from api/utils.py and api/anthropic_utils.py for
 text processing, content extraction, and format conversion.
 """
 
-import json
-import pytest
-
 from omlx.api.utils import (
     SPECIAL_TOKENS_PATTERN,
     _consolidate_system_messages,
@@ -272,6 +269,25 @@ class TestExtractTextContent:
         assert "call_123" in result[0]["content"]
         assert "success" in result[0]["content"]
 
+    def test_tool_response_fallback_preserves_role_boundary(self):
+        """Fallback tool history must not merge into adjacent user turns."""
+        messages = [
+            Message(role="user", content="Before"),
+            Message(
+                role="tool",
+                content='{"result": "success"}',
+                tool_call_id="call_123",
+            ),
+            Message(role="user", content="After"),
+        ]
+
+        result = extract_text_content(messages)
+
+        assert len(result) == 3
+        assert result[0]["content"] == "Before"
+        assert "Tool Result" in result[1]["content"]
+        assert result[2]["content"] == "After"
+
     def test_assistant_with_tool_calls(self):
         """Test extracting assistant message with tool calls."""
         messages = [
@@ -295,6 +311,30 @@ class TestExtractTextContent:
         assert result[0]["role"] == "assistant"
         assert "Let me check." in result[0]["content"]
         assert "get_weather" in result[0]["content"]
+
+    def test_assistant_tool_call_fallback_preserves_role_boundary(self):
+        """Fallback assistant tool turns must stay separate from later assistant text."""
+        messages = [
+            Message(
+                role="assistant",
+                content="Let me check.",
+                tool_calls=[
+                    {
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"location": "Tokyo"}',
+                        }
+                    }
+                ],
+            ),
+            Message(role="assistant", content="Done."),
+        ]
+
+        result = extract_text_content(messages)
+
+        assert len(result) == 2
+        assert "get_weather" in result[0]["content"]
+        assert result[1]["content"] == "Done."
 
     def test_developer_role_normalized_to_system(self):
         """Test that 'developer' role is normalized to 'system'."""
@@ -496,6 +536,49 @@ class TestConvertAnthropicToInternal:
 
         assert "toolu_123" in result[0]["content"]
         assert "sunny" in result[0]["content"]
+
+    def test_native_tool_calling_preserves_structured_tool_history(self):
+        """Tool use/result blocks should stay structured when tokenizer supports tools."""
+        class NativeToolTokenizer:
+            has_tool_calling = True
+
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockText(text="Checking"),
+                        ContentBlockToolUse(
+                            id="toolu_123",
+                            name="get_weather",
+                            input={"location": "Tokyo"},
+                        ),
+                    ],
+                ),
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockToolResult(
+                            tool_use_id="toolu_123",
+                            content="The weather is sunny",
+                        )
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(
+            request,
+            tokenizer=NativeToolTokenizer(),
+        )
+
+        assert result[0]["role"] == "assistant"
+        assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert result[1]["role"] == "tool"
+        assert result[1]["tool_call_id"] == "toolu_123"
+        assert result[1]["content"] == "The weather is sunny"
 
 
 class TestConvertAnthropicToolsToInternal:
@@ -968,6 +1051,16 @@ class TestMergeConsecutiveRoles:
         assert len(result) == 1
         assert result[0]["role"] == "user"
         assert result[0]["content"] == "First\n\nSecond"
+
+    def test_preserve_role_boundary_skips_merge(self):
+        """Messages marked as tool-history boundaries must not merge."""
+        msgs = [
+            {"role": "user", "content": "First"},
+            {"role": "user", "content": "Tool", "_preserve_role_boundary": True},
+            {"role": "user", "content": "Third"},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 3
 
     def test_three_consecutive_user_merged(self):
         """Three consecutive user messages should all merge into one."""
