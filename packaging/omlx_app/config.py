@@ -188,14 +188,43 @@ class ServerConfig:
         if "model_dir" in server_settings and server_settings["model_dir"]:
             self.model_dir = server_settings["model_dir"]
 
+    def sync_model_dir_to_server_settings(self):
+        """Write app's model_dir to server's settings.json if model_dirs not already set.
+
+        Called after the welcome screen sets a model directory, so the server
+        picks it up from settings.json instead of a CLI flag.
+        """
+        if not self.model_dir:
+            return
+        settings_file = Path(self.base_path).expanduser() / "settings.json"
+        data = {}
+        if settings_file.exists():
+            try:
+                with open(settings_file) as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        if "model" not in data:
+            data["model"] = {}
+        existing_dirs = data["model"].get("model_dirs", [])
+        if not existing_dirs:
+            data["model"]["model_dirs"] = [self.model_dir]
+            data["model"]["model_dir"] = self.model_dir
+            settings_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(settings_file, "w") as f:
+                json.dump(data, f, indent=2)
+
     def build_serve_args(self) -> list:
-        """Build command line arguments for omlx serve."""
+        """Build command line arguments for omlx serve.
+
+        Note: --model-dir is intentionally NOT passed here. The server reads
+        model_dirs from settings.json directly. Passing --model-dir would
+        overwrite multi-directory settings saved via the web admin.
+        """
         base = str(Path(self.base_path).expanduser())
         args = [
             "serve",
             "--base-path", base,
             "--port", str(self.port),
         ]
-        if self.model_dir:
-            args.extend(["--model-dir", str(Path(self.model_dir).expanduser())])
         return args

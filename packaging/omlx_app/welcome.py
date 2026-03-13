@@ -499,6 +499,7 @@ class WelcomeWindowController(NSObject):
         else:
             self.config.model_dir = ""
         self.config.save()
+        self.config.sync_model_dir_to_server_settings()
 
         # Save API key to server's settings.json
         if api_key:
@@ -694,4 +695,5 @@ class WelcomeWindowController(NSObject):
                 logger.warning(f"Failed to save API key: {e}")
 
         self.config.save()
+        self.config.sync_model_dir_to_server_settings()
         self.window.close()
