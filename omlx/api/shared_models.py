@@ -59,12 +59,18 @@ class BaseUsage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     def model_post_init(self, __context) -> None:
-        """Calculate total_tokens if not explicitly set."""
+        """Calculate total_tokens and sync Anthropic-style aliases."""
         if self.total_tokens == 0 and (self.prompt_tokens > 0 or self.completion_tokens > 0):
             object.__setattr__(
                 self,
                 "total_tokens",
                 self.prompt_tokens + self.completion_tokens,
             )
+        if self.input_tokens == 0 and self.prompt_tokens > 0:
+            object.__setattr__(self, "input_tokens", self.prompt_tokens)
+        if self.output_tokens == 0 and self.completion_tokens > 0:
+            object.__setattr__(self, "output_tokens", self.completion_tokens)

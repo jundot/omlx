@@ -147,6 +147,8 @@ class TestBaseUsage:
         assert usage.prompt_tokens == 0
         assert usage.completion_tokens == 0
         assert usage.total_tokens == 0
+        assert usage.input_tokens == 0
+        assert usage.output_tokens == 0
 
     def test_custom_values(self):
         """Test custom usage values."""
@@ -156,6 +158,8 @@ class TestBaseUsage:
         )
         assert usage.prompt_tokens == 100
         assert usage.completion_tokens == 50
+        assert usage.input_tokens == 100
+        assert usage.output_tokens == 50
 
     def test_total_tokens_auto_calculated(self):
         """Test that total_tokens is auto-calculated."""
@@ -232,3 +236,10 @@ class TestBaseUsage:
         """Test with only completion tokens."""
         usage = BaseUsage(completion_tokens=50)
         assert usage.total_tokens == 50
+
+    def test_input_output_tokens_in_json(self):
+        """Test that input_tokens/output_tokens appear in JSON output."""
+        usage = BaseUsage(prompt_tokens=100, completion_tokens=50)
+        data = usage.model_dump()
+        assert data["input_tokens"] == 100
+        assert data["output_tokens"] == 50
