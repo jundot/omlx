@@ -11,6 +11,7 @@ import pytest
 
 from omlx.api.utils import (
     SPECIAL_TOKENS_PATTERN,
+    _consolidate_system_messages,
     _merge_consecutive_roles,
     clean_output_text,
     extract_harmony_messages,
@@ -839,6 +840,106 @@ class TestExtractHarmonyMessages:
         content = result[0]["content"]
         assert isinstance(content, dict)
         assert content["result"] == "success"
+
+
+class TestConsolidateSystemMessages:
+    """Tests for system message consolidation."""
+
+    def test_no_system_messages(self):
+        """No system messages: return as-is."""
+        msgs = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+        ]
+        result = _consolidate_system_messages(msgs)
+        assert result == msgs
+
+    def test_system_already_first(self):
+        """System message already at position 0: no change."""
+        msgs = [
+            {"role": "system", "content": "Be helpful"},
+            {"role": "user", "content": "Hello"},
+        ]
+        result = _consolidate_system_messages(msgs)
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == "Be helpful"
+
+    def test_system_mid_conversation(self):
+        """System message in the middle should move to front."""
+        msgs = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Be helpful"},
+            {"role": "user", "content": "How are you?"},
+        ]
+        result = _consolidate_system_messages(msgs)
+        assert len(result) == 3
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == "Be helpful"
+        assert result[1]["role"] == "user"
+        assert result[1]["content"] == "Hello"
+
+    def test_multiple_system_messages_merged(self):
+        """Multiple system messages should merge into one at position 0."""
+        msgs = [
+            {"role": "system", "content": "Instruction 1"},
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Instruction 2"},
+        ]
+        result = _consolidate_system_messages(msgs)
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == "Instruction 1\n\nInstruction 2"
+        assert result[1]["role"] == "user"
+
+    def test_empty_system_content_skipped(self):
+        """System messages with empty content should be skipped."""
+        msgs = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": ""},
+            {"role": "system", "content": "Real instruction"},
+        ]
+        result = _consolidate_system_messages(msgs)
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == "Real instruction"
+
+    def test_all_empty_system_returns_original(self):
+        """All system messages empty: treated as no system messages."""
+        msgs = [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": "Hello"},
+        ]
+        result = _consolidate_system_messages(msgs)
+        assert result == msgs
+
+    def test_extract_text_content_developer_mid_conversation(self):
+        """Developer role mid-conversation should consolidate to front."""
+        messages = [
+            Message(role="user", content="Hello"),
+            Message(role="developer", content="New instructions"),
+            Message(role="user", content="What now?"),
+        ]
+        result = extract_text_content(messages)
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == "New instructions"
+        # user messages should be merged (consecutive after system removal)
+        assert all(m["role"] != "system" for m in result[1:])
+
+    def test_extract_text_content_preserves_tool_order(self):
+        """Tool messages should keep relative order after consolidation."""
+        messages = [
+            Message(role="system", content="Be helpful"),
+            Message(role="user", content="Call tool"),
+            Message(role="assistant", content="OK"),
+            Message(role="system", content="Extra instruction"),
+            Message(role="user", content="Continue"),
+        ]
+        result = extract_text_content(messages)
+        assert result[0]["role"] == "system"
+        assert "Be helpful" in result[0]["content"]
+        assert "Extra instruction" in result[0]["content"]
+        assert result[1]["role"] == "user"
 
 
 class TestMergeConsecutiveRoles:

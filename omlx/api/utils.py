@@ -130,6 +130,30 @@ def _extract_multimodal_content_list(content: list) -> list:
 _MERGEABLE_ROLES = {"user", "assistant"}
 
 
+def _consolidate_system_messages(messages: list[dict]) -> list[dict]:
+    """Move all system messages to the front, merged into one.
+
+    Models with strict chat templates (e.g., Qwen3.5) require the system
+    message to appear first.  Clients may send system or developer messages
+    mid-conversation, so we consolidate them defensively.
+    """
+    system_parts: list[str] = []
+    non_system: list[dict] = []
+    for msg in messages:
+        if msg.get("role") == "system":
+            content = msg.get("content", "")
+            if content:
+                system_parts.append(content)
+        else:
+            non_system.append(msg)
+
+    if not system_parts:
+        return messages
+
+    merged_system = {"role": "system", "content": "\n\n".join(system_parts)}
+    return [merged_system] + non_system
+
+
 def _merge_consecutive_roles(messages: list[dict]) -> list[dict]:
     """Merge consecutive messages with the same mergeable role.
 
@@ -293,7 +317,9 @@ def extract_text_content(
             # Unknown format, try to convert
             processed_messages.append({"role": role, "content": str(content)})
 
-    return _merge_consecutive_roles(processed_messages)
+    return _merge_consecutive_roles(
+        _consolidate_system_messages(processed_messages)
+    )
 
 
 def extract_multimodal_content(
@@ -420,7 +446,7 @@ def extract_multimodal_content(
         else:
             processed_messages.append({"role": role, "content": str(content)})
 
-    return processed_messages
+    return _consolidate_system_messages(processed_messages)
 
 
 # =============================================================================
@@ -629,4 +655,6 @@ def extract_harmony_messages(
         else:
             processed_messages.append({"role": role, "content": str(content)})
 
-    return _merge_consecutive_roles(processed_messages)
+    return _merge_consecutive_roles(
+        _consolidate_system_messages(processed_messages)
+    )
