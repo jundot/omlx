@@ -313,6 +313,35 @@ def parse_tool_calls(
     return cleaned_text, None
 
 
+def parse_tool_calls_with_thinking_fallback(
+    thinking_content: str,
+    regular_content: str,
+    tokenizer: Any,
+    tools: Optional[List] = None,
+) -> Tuple[str, Optional[List[ToolCall]]]:
+    """Parse tool calls from content, falling back to thinking if none found.
+
+    Small reasoning models sometimes generate tool call XML inside <think>
+    blocks instead of after </think>. This function first tries the normal
+    content, then falls back to parsing from thinking content.
+
+    Args:
+        thinking_content: Text extracted from <think>...</think> blocks.
+        regular_content: Text outside thinking blocks.
+        tokenizer: mlx-lm's TokenizerWrapper.
+        tools: Tool definitions for type conversion (optional).
+
+    Returns:
+        Tuple of (cleaned_text, tool_calls or None).
+        cleaned_text comes from regular_content only (thinking text is
+        never promoted to content).
+    """
+    cleaned_text, tool_calls = parse_tool_calls(regular_content, tokenizer, tools)
+    if not tool_calls and thinking_content:
+        _, tool_calls = parse_tool_calls(thinking_content, tokenizer, tools)
+    return cleaned_text, tool_calls
+
+
 class ToolCallStreamFilter:
     """Streaming filter that suppresses tool-call markup from content deltas.
 

@@ -144,6 +144,7 @@ from .api.tool_calling import (
     convert_tools_for_template,
     parse_json_output,
     parse_tool_calls,
+    parse_tool_calls_with_thinking_fallback,
 )
 from .api.thinking import ThinkingParser, extract_thinking
 from .api.utils import clean_output_text, clean_special_tokens, extract_harmony_messages, extract_multimodal_content, extract_text_content
@@ -1745,8 +1746,10 @@ async def create_chat_completion(
         ]
         cleaned_text = regular_content
     else:
-        # Parse tool calls from regular content (not thinking)
-        cleaned_text, tool_calls = parse_tool_calls(
+        # Parse tool calls from regular content, falling back to thinking
+        # content for small models that emit tool calls inside <think> blocks
+        cleaned_text, tool_calls = parse_tool_calls_with_thinking_fallback(
+            thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=tools_for_template,
@@ -2075,8 +2078,10 @@ async def stream_chat_completion(
         cleaned_text = ""
     elif has_tools and accumulated_text:
         # Separate thinking from content, then parse tool calls from content
+        # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(accumulated_text)
-        cleaned_text, tool_calls = parse_tool_calls(
+        cleaned_text, tool_calls = parse_tool_calls_with_thinking_fallback(
+            thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
@@ -2376,8 +2381,10 @@ async def stream_anthropic_messages(
         ]
     elif kwargs.get("tools"):
         # Non-Harmony: separate thinking, then parse tool calls from content
-        _, regular_content = extract_thinking(accumulated_text)
-        cleaned_text, tool_calls = parse_tool_calls(
+        # (falls back to thinking content for small models)
+        thinking_content, regular_content = extract_thinking(accumulated_text)
+        cleaned_text, tool_calls = parse_tool_calls_with_thinking_fallback(
+            thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
@@ -2641,8 +2648,10 @@ async def create_anthropic_message(
         ]
         cleaned_text = regular_content
     else:
-        # Parse tool calls from regular content (not thinking)
-        cleaned_text, tool_calls = parse_tool_calls(
+        # Parse tool calls from regular content, falling back to thinking
+        # content for small models that emit tool calls inside <think> blocks
+        cleaned_text, tool_calls = parse_tool_calls_with_thinking_fallback(
+            thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=internal_tools,
@@ -2945,7 +2954,10 @@ async def create_response(
         tool_calls = output.tool_calls
         cleaned_text = regular_content
     else:
-        cleaned_text, tool_calls = parse_tool_calls(
+        # Falls back to thinking content for small models that emit
+        # tool calls inside <think> blocks
+        cleaned_text, tool_calls = parse_tool_calls_with_thinking_fallback(
+            thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=tools_for_template,
@@ -3165,7 +3177,8 @@ async def stream_responses_api(
         cleaned_text = ""
     elif has_tools and accumulated_text:
         thinking_content, regular_content = extract_thinking(accumulated_text)
-        cleaned_text, tool_calls = parse_tool_calls(
+        cleaned_text, tool_calls = parse_tool_calls_with_thinking_fallback(
+            thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
