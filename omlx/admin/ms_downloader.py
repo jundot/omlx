@@ -143,6 +143,16 @@ def _extract_model_size_from_files(file_list: list) -> int:
     return total
 
 
+def _format_model_size(size_bytes: int) -> str:
+    """Format model size in bytes to a human-readable string."""
+    if size_bytes < 1024**2:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024**3:
+        return f"{size_bytes / 1024**2:.1f} MB"
+    else:
+        return f"{size_bytes / 1024**3:.1f} GB"
+
+
 def _parse_ms_model_entry(entry: dict) -> dict:
     """Parse a ModelScope API model entry into a normalized dict.
 
@@ -152,19 +162,30 @@ def _parse_ms_model_entry(entry: dict) -> dict:
     Returns:
         Normalized model dict matching the HF format.
     """
-    model_id = entry.get("Path") or entry.get("Name", "")
-    name = entry.get("Name") or model_id.split("/")[-1] if model_id else ""
+    # Path is the organization/owner, Name is the model name
+    # repo_id should be "owner/model" format
+    path = entry.get("Path") or ""
+    name = entry.get("Name") or ""
+    if path and name:
+        model_id = f"{path}/{name}"
+    elif name:
+        model_id = name
+    else:
+        model_id = path
+    
     downloads = entry.get("Downloads") or 0
     likes = entry.get("Likes") or entry.get("Stars") or 0
+    # StorageSize is the total size in bytes
+    size = entry.get("StorageSize") or 0
 
     return {
         "repo_id": model_id,
-        "name": name,
+        "name": name or model_id.split("/")[-1],
         "downloads": downloads,
         "likes": likes,
         "trending_score": 0,
-        "size": 0,
-        "size_formatted": "",
+        "size": size,
+        "size_formatted": _format_model_size(size) if size > 0 else "",
         "params": None,
         "params_formatted": None,
     }
@@ -189,8 +210,7 @@ class MSDownloader:
     ) -> dict:
         """Fetch trending and popular MLX models from ModelScope.
 
-        Queries ModelScope API for models with 'mlx' tag, filtered by
-        system memory capacity.
+        Uses SDK's list_models to get models from mlx-community organization.
 
         Args:
             max_memory_bytes: Maximum model size in bytes (typically system memory).
@@ -200,22 +220,28 @@ class MSDownloader:
         Returns:
             Dict with 'trending' and 'popular' lists.
         """
+        api = _get_ms_api()
+        if api is None:
+            logger.warning("ModelScope SDK not available")
+            return {"trending": [], "popular": []}
 
-        async def _fetch(sort: str) -> list[dict]:
+        async def _fetch_from_sdk() -> list[dict]:
             try:
-                data = await _ms_rest_search(
-                    query="mlx",
-                    sort=sort,
-                    page_size=limit,
+                # Use SDK to list models from mlx-community organization
+                data = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        api.list_models,
+                        "mlx-community",
+                        page_size=limit,
+                    ),
+                    timeout=_MS_API_TIMEOUT + 5,
                 )
             except Exception as e:
                 logger.warning(f"ModelScope recommended fetch failed: {e}")
                 return []
 
-            models_data = data.get("Data", {}).get("Models", [])
-            if not models_data:
-                # Try alternative response structure
-                models_data = data.get("Data", {}).get("Model", [])
+            # Parse models from SDK response
+            models_data = data.get("Models", [])
             if not models_data:
                 models_data = data.get("models", [])
 
@@ -223,22 +249,28 @@ class MSDownloader:
             for entry in models_data:
                 m = _parse_ms_model_entry(entry)
                 downloads = m.get("downloads", 0)
+                size = m.get("size", 0)
+                # Filter by minimum downloads
                 if downloads < _MIN_DOWNLOADS:
                     continue
+                # Filter by memory size (only if size is available)
+                if size > 0 and size > max_memory_bytes:
+                    continue
                 results.append(m)
-                if len(results) >= result_limit:
+                if len(results) >= result_limit * 2:  # Fetch more to split into trending/popular
                     break
 
             return results
 
-        trending, popular = await asyncio.gather(
-            _fetch("Default"),
-            _fetch("Downloads"),
-        )
+        models = await _fetch_from_sdk()
+
+        # Sort by downloads for popular, keep original order for trending
+        trending = models[:result_limit]
+        popular = sorted(models, key=lambda x: x.get("downloads", 0), reverse=True)[:result_limit]
 
         return {
-            "trending": trending[:result_limit],
-            "popular": popular[:result_limit],
+            "trending": trending,
+            "popular": popular,
         }
 
     @staticmethod
@@ -247,7 +279,10 @@ class MSDownloader:
         sort: str = "trending",
         limit: int = 100,
     ) -> dict:
-        """Search ModelScope models by query string.
+        """Search MLX models in mlx-community on ModelScope.
+
+        Since ModelScope REST API is unreliable, we use SDK to list
+        models from mlx-community and filter by query string.
 
         Args:
             query: Search query string.
@@ -257,34 +292,52 @@ class MSDownloader:
         Returns:
             Dict with 'models' list and 'total' count.
         """
-        sort_key = _MS_SORT_MAP.get(sort, "Default")
+        api = _get_ms_api()
+        if api is None:
+            logger.warning("ModelScope SDK not available")
+            return {"models": [], "total": 0}
 
         try:
-            data = await _ms_rest_search(
-                query=query,
-                sort=sort_key,
-                page_size=min(limit, 100),
+            # Fetch models from mlx-community organization
+            data = await asyncio.wait_for(
+                asyncio.to_thread(
+                    api.list_models,
+                    "mlx-community",
+                    page_size=200,  # Get more models to filter from
+                ),
+                timeout=_MS_API_TIMEOUT + 5,
             )
         except Exception as e:
             logger.error(f"ModelScope search failed: {e}")
             return {"models": [], "total": 0}
 
-        models_data = data.get("Data", {}).get("Models", [])
-        if not models_data:
-            models_data = data.get("Data", {}).get("Model", [])
+        models_data = data.get("Models", [])
         if not models_data:
             models_data = data.get("models", [])
 
-        total = data.get("Data", {}).get("TotalCount", len(models_data))
-
-        results = []
+        # Filter by query string (case-insensitive)
+        query_lower = query.lower()
+        filtered = []
         for entry in models_data:
-            m = _parse_ms_model_entry(entry)
-            results.append(m)
+            name = entry.get("Name", "")
+            if query_lower in name.lower():
+                m = _parse_ms_model_entry(entry)
+                filtered.append(m)
+
+        # Sort results
+        if sort == "downloads":
+            filtered.sort(key=lambda x: x.get("downloads", 0), reverse=True)
+        elif sort == "created":
+            pass  # Keep original order (newest first by default)
+        elif sort == "updated":
+            pass  # Keep original order
+
+        # Limit results
+        results = filtered[:limit]
 
         return {
-            "models": results[:limit],
-            "total": total,
+            "models": results,
+            "total": len(filtered),
         }
 
     @staticmethod
@@ -475,6 +528,10 @@ class MSDownloader:
     async def cancel_download(self, task_id: str) -> bool:
         """Cancel an active download.
 
+        Note: Due to Python threading limitations, the actual download thread
+        cannot be interrupted immediately. The download will be marked as
+        cancelled and files will be cleaned up when the thread completes.
+
         Args:
             task_id: The task ID to cancel.
 
@@ -488,9 +545,10 @@ class MSDownloader:
         if task.status not in (DownloadStatus.PENDING, DownloadStatus.DOWNLOADING):
             return False
 
-        # Mark as cancelled
+        # Mark as cancelled - the running thread will check this flag
         self._cancelled.add(task_id)
         task.status = DownloadStatus.CANCELLED
+        task.error = "Cancellation requested. Download will stop shortly."
 
         # Stop progress polling
         progress_task = self._progress_tasks.pop(task_id, None)
@@ -641,13 +699,26 @@ class MSDownloader:
                     dl_kwargs["token"] = ms_token
 
                 # Run snapshot_download in a thread (blocking call)
+                # Note: Thread cannot be interrupted, cancellation is checked after completion
                 await asyncio.to_thread(
                     ms_snapshot_download,
                     **dl_kwargs,
                 )
 
-                # Check if cancelled while downloading
+                # Check if cancelled while downloading - clean up downloaded files
                 if task_id in self._cancelled:
+                    logger.info(
+                        f"MS Download was cancelled during execution: {task.repo_id}. "
+                        "Cleaning up downloaded files..."
+                    )
+                    # Clean up the downloaded directory
+                    if target_dir.exists():
+                        import shutil
+                        try:
+                            shutil.rmtree(target_dir)
+                            logger.info(f"Cleaned up cancelled download: {target_dir}")
+                        except Exception as cleanup_err:
+                            logger.warning(f"Failed to clean up {target_dir}: {cleanup_err}")
                     return
 
                 # Success

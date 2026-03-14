@@ -599,10 +599,10 @@
                                         <div class="px-6 py-5">
                                             <div class="flex items-end gap-4">
                                                 <div class="flex-1">
-                                                    <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5" x-text="window.t('models.downloader.ms_repo_id')"></label>
+                                                    <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.downloader.repo_id') }}</label>
                                                     <input type="text" x-model="msRepoId"
                                                            @keydown.enter="startMSDownload()"
-                                                           :placeholder="window.t('models.downloader.ms_repo_placeholder')"
+                                                           placeholder="mlx-community/Qwen2.5-7B-Instruct-MLX"
                                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm
                                                                   focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all
                                                                   bg-white font-mono text-xs">
@@ -649,13 +649,44 @@
                                         </div>
                                         <div class="px-6 py-5">
                                             <div class="flex items-center gap-3">
-                                                <div class="flex-1">
+                                                <!-- Search input with history -->
+                                                <div class="flex-1 relative">
                                                     <input type="text" x-model="msSearchQuery"
+                                                           @input="msDebounceSearch()"
                                                            @keydown.enter="mImmediateSearch()"
+                                                           @focus="msSearchHistoryOpen = true"
+                                                           @blur="closeMsSearchHistory()"
                                                            :placeholder="window.t('models.search.ms_placeholder')"
                                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm
                                                                   focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                    <!-- Search history dropdown -->
+                                                    <div x-show="msSearchHistoryOpen && msSearchHistory.length > 0 && !msSearchQuery.trim()"
+                                                         x-cloak
+                                                         class="absolute top-full left-0 right-0 mt-1 bg-white rounded-xl shadow-lg border border-neutral-200 py-1 z-50">
+                                                        <div class="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('models.search.recent_searches') }}</div>
+                                                        <template x-for="(item, idx) in msSearchHistory" :key="idx">
+                                                            <button @mousedown.prevent="selectMsSearchHistory(item)"
+                                                                    class="w-full px-3 py-2 text-left text-sm text-neutral-700 hover:bg-neutral-50 flex items-center gap-2 transition-colors">
+                                                                <i data-lucide="clock" class="w-3 h-3 text-neutral-400 shrink-0"></i>
+                                                                <span x-text="item" class="truncate"></span>
+                                                            </button>
+                                                        </template>
+                                                    </div>
                                                 </div>
+                                                <!-- Sort dropdown -->
+                                                <div class="w-52">
+                                                    <select x-model="msSearchSort"
+                                                            @change="if (msSearchQuery.trim()) mImmediateSearch()"
+                                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm
+                                                                   focus:ring-2 focus:ring-neutral-900 focus:border-transparent
+                                                                   transition-all bg-white appearance-none cursor-pointer">
+                                                        <option value="trending">{{ t('models.search.sort.trending') }}</option>
+                                                        <option value="downloads">{{ t('models.search.sort.downloads') }}</option>
+                                                        <option value="created">{{ t('models.search.sort.created') }}</option>
+                                                        <option value="updated">{{ t('models.search.sort.updated') }}</option>
+                                                    </select>
+                                                </div>
+                                                <!-- Search button -->
                                                 <button @click="mImmediateSearch()"
                                                         :disabled="msSearchLoading || !msSearchQuery.trim()"
                                                         class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full
@@ -674,10 +705,19 @@
                                             <div class="flex items-center gap-3">
                                                 <i data-lucide="star" class="w-4 h-4 text-neutral-500"></i>
                                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.browse.section_label') }}</span>
+                                                <span x-show="globalSettings.system.total_memory" x-cloak
+                                                      class="text-xs text-neutral-400" x-text="window.t('models.browse.system_suffix').replace('{memory}', globalSettings.system.total_memory)"></span>
                                             </div>
                                             <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5">
-                                                <button @click="msRecommendedTab = 'recommended'"
-                                                        :class="msRecommendedTab === 'recommended'
+                                                <button @click="msRecommendedTab = 'trending'"
+                                                        :class="msRecommendedTab === 'trending'
+                                                            ? 'bg-white text-neutral-900 shadow-sm'
+                                                            : 'text-neutral-500 hover:text-neutral-700'"
+                                                        class="px-3 py-1 text-xs font-medium rounded-md transition-all">
+                                                    {{ t('models.browse.tab.trending') }}
+                                                </button>
+                                                <button @click="msRecommendedTab = 'popular'"
+                                                        :class="msRecommendedTab === 'popular'
                                                             ? 'bg-white text-neutral-900 shadow-sm'
                                                             : 'text-neutral-500 hover:text-neutral-700'"
                                                         class="px-3 py-1 text-xs font-medium rounded-md transition-all">
@@ -696,71 +736,128 @@
                                             </div>
                                         </div>
 
-                                        <!-- Recommended tab -->
-                                        <div x-show="msRecommendedTab === 'recommended'">
-                                            <!-- Loading -->
-                                            <div x-show="msRecommendedLoading" x-cloak class="px-6 py-12 text-center">
-                                                <div class="inline-block w-5 h-5 border-2 border-neutral-300 border-t-neutral-600 rounded-full animate-spin mb-3"></div>
-                                                <p class="text-sm text-neutral-500">{{ t('models.browse.loading') }}</p>
+                                        <!-- Loading state for recommended -->
+                                        <div x-show="msRecommendedLoading && (msRecommendedTab === 'trending' || msRecommendedTab === 'popular')" x-cloak class="px-6 py-12 text-center">
+                                            <div class="inline-block w-5 h-5 border-2 border-neutral-300 border-t-neutral-600 rounded-full animate-spin mb-3"></div>
+                                            <p class="text-sm text-neutral-500">{{ t('models.browse.loading') }}</p>
+                                        </div>
+
+                                        <!-- Not loaded state for recommended -->
+                                        <div x-show="!msRecommendedLoading && !msRecommendedLoaded && (msRecommendedTab === 'trending' || msRecommendedTab === 'popular')" x-cloak class="px-6 py-12 text-center">
+                                            <i data-lucide="star" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
+                                            <p class="text-sm text-neutral-500">{{ t('models.browse.load_prompt') }}</p>
+                                            <button @click="loadMsRecommendedModels()"
+                                                    class="mt-3 px-4 py-2 text-xs font-medium text-neutral-600 hover:text-neutral-800
+                                                           bg-neutral-100 hover:bg-neutral-200 rounded-lg transition-all">
+                                                {{ t('models.browse.load_button') }}
+                                            </button>
+                                        </div>
+
+                                        <!-- Trending tab -->
+                                        <template x-if="msRecommendedLoaded && !msRecommendedLoading">
+                                            <div x-show="msRecommendedTab === 'trending'">
+                                                <div class="divide-y divide-neutral-100">
+                                                    <template x-if="(msRecommended.trending || []).length === 0">
+                                                        <div class="px-6 py-8 text-center">
+                                                            <p class="text-sm text-neutral-500">{{ t('models.browse.no_trending') }}</p>
+                                                        </div>
+                                                    </template>
+                                                    <template x-for="model in getMsPagedModels('trending')" :key="model.repo_id">
+                                                        <div class="px-6 py-3.5 flex items-center justify-between hover:bg-neutral-50 transition-colors">
+                                                            <div class="min-w-0 flex-1">
+                                                                <button @click="openMsModelDetail(model.repo_id)"
+                                                                   class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer" x-text="model.name || model.repo_id"></button>
+                                                                <div class="flex items-center gap-3 mt-0.5">
+                                                                    <span x-show="model.size_formatted" x-cloak class="text-xs text-neutral-400" x-text="model.size_formatted"></span>
+                                                                    <span class="text-xs text-neutral-400" x-text="'&#11015; ' + formatDownloads(model.downloads)"></span>
+                                                                    <span class="text-xs text-neutral-400" x-text="'&#9829; ' + model.likes"></span>
+                                                                </div>
+                                                            </div>
+                                                            <div class="flex items-center gap-2 shrink-0 ml-4">
+                                                                <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
+                                                                      class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">
+                                                                    {{ t('models.browse.tight_fit') }}
+                                                                </span>
+                                                                <button @click="downloadMsModel(model.repo_id)"
+                                                                        :disabled="msDownloading"
+                                                                        class="px-3.5 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100
+                                                                               hover:bg-neutral-900 hover:text-white rounded-lg transition-all
+                                                                               disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
+                                                                    <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                                                                    {{ t('models.downloader.download_button') }}
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    </template>
+                                                </div>
+                                                <!-- Pagination -->
+                                                <template x-if="getMsTotalPages('trending') > 1">
+                                                    <div class="px-6 py-3 border-t border-neutral-100 flex items-center justify-center gap-1">
+                                                        <template x-for="p in getMsTotalPages('trending')" :key="p">
+                                                            <button @click="setMsPage('trending', p)"
+                                                                    :class="msPage.trending === p
+                                                                        ? 'bg-neutral-900 text-white'
+                                                                        : 'text-neutral-600 hover:bg-neutral-100'"
+                                                                    class="w-8 h-8 text-xs font-medium rounded-lg transition-all"
+                                                                    x-text="p"></button>
+                                                        </template>
+                                                    </div>
+                                                </template>
                                             </div>
-                                            <!-- Not loaded -->
-                                            <div x-show="!msRecommendedLoading && !msRecommendedLoaded" x-cloak class="px-6 py-12 text-center">
-                                                <i data-lucide="star" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
-                                                <p class="text-sm text-neutral-500">{{ t('models.browse.load_prompt') }}</p>
-                                                <button @click="loadMsRecommendedModels()"
-                                                        class="mt-3 px-4 py-2 text-xs font-medium text-neutral-600 hover:text-neutral-800
-                                                               bg-neutral-100 hover:bg-neutral-200 rounded-lg transition-all">
-                                                    {{ t('models.browse.load_button') }}
-                                                </button>
-                                            </div>
-                                            <!-- Loaded -->
-                                            <template x-if="msRecommendedLoaded && !msRecommendedLoading">
-                                                <div>
-                                                    <template x-if="msRecommended.length === 0">
+                                        </template>
+
+                                        <!-- Popular tab -->
+                                        <template x-if="msRecommendedLoaded && !msRecommendedLoading">
+                                            <div x-show="msRecommendedTab === 'popular'">
+                                                <div class="divide-y divide-neutral-100">
+                                                    <template x-if="(msRecommended.popular || []).length === 0">
                                                         <div class="px-6 py-8 text-center">
                                                             <p class="text-sm text-neutral-500">{{ t('models.browse.no_popular') }}</p>
                                                         </div>
                                                     </template>
-                                                    <div class="divide-y divide-neutral-100">
-                                                        <template x-for="model in getMsPagedModels('recommended')" :key="model.repo_id">
-                                                            <div class="px-6 py-3.5 flex items-center justify-between hover:bg-neutral-50 transition-colors">
-                                                                <div class="min-w-0 flex-1">
-                                                                    <button @click="openMsModelDetail(model.repo_id)"
-                                                                       class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer" x-text="model.name || model.repo_id"></button>
-                                                                    <div class="flex items-center gap-3 mt-0.5">
-                                                                        <span x-show="model.size_formatted" x-cloak class="text-xs text-neutral-400" x-text="model.size_formatted"></span>
-                                                                        <span class="text-xs text-neutral-400" x-text="'&#11015; ' + formatDownloads(model.downloads)"></span>
-                                                                        <span class="text-xs text-neutral-400" x-text="'&#9829; ' + model.likes"></span>
-                                                                    </div>
-                                                                </div>
-                                                                <div class="flex items-center gap-2 shrink-0 ml-4">
-                                                                    <button @click="downloadMsModel(model.repo_id)"
-                                                                            :disabled="msDownloading"
-                                                                            class="px-3.5 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100
-                                                                                   hover:bg-neutral-900 hover:text-white rounded-lg transition-all
-                                                                                   disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
-                                                                        <i data-lucide="download" class="w-3.5 h-3.5"></i>
-                                                                        {{ t('models.downloader.download_button') }}
-                                                                    </button>
+                                                    <template x-for="model in getMsPagedModels('popular')" :key="model.repo_id">
+                                                        <div class="px-6 py-3.5 flex items-center justify-between hover:bg-neutral-50 transition-colors">
+                                                            <div class="min-w-0 flex-1">
+                                                                <button @click="openMsModelDetail(model.repo_id)"
+                                                                   class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer" x-text="model.name || model.repo_id"></button>
+                                                                <div class="flex items-center gap-3 mt-0.5">
+                                                                    <span x-show="model.size_formatted" x-cloak class="text-xs text-neutral-400" x-text="model.size_formatted"></span>
+                                                                    <span class="text-xs text-neutral-400" x-text="'&#11015; ' + formatDownloads(model.downloads)"></span>
+                                                                    <span class="text-xs text-neutral-400" x-text="'&#9829; ' + model.likes"></span>
                                                                 </div>
                                                             </div>
-                                                        </template>
-                                                    </div>
-                                                    <template x-if="getMsTotalPages('recommended') > 1">
-                                                        <div class="px-6 py-3 border-t border-neutral-100 flex items-center justify-center gap-1">
-                                                            <template x-for="p in getMsTotalPages('recommended')" :key="p">
-                                                                <button @click="setMsPage('recommended', p)"
-                                                                        :class="msPage.recommended === p
-                                                                            ? 'bg-neutral-900 text-white'
-                                                                            : 'text-neutral-600 hover:bg-neutral-100'"
-                                                                        class="w-8 h-8 text-xs font-medium rounded-lg transition-all"
-                                                                        x-text="p"></button>
-                                                            </template>
+                                                            <div class="flex items-center gap-2 shrink-0 ml-4">
+                                                                <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
+                                                                      class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">
+                                                                    {{ t('models.browse.tight_fit') }}
+                                                                </span>
+                                                                <button @click="downloadMsModel(model.repo_id)"
+                                                                        :disabled="msDownloading"
+                                                                        class="px-3.5 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100
+                                                                               hover:bg-neutral-900 hover:text-white rounded-lg transition-all
+                                                                               disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
+                                                                    <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                                                                    {{ t('models.downloader.download_button') }}
+                                                                </button>
+                                                            </div>
                                                         </div>
                                                     </template>
                                                 </div>
-                                            </template>
-                                        </div>
+                                                <!-- Pagination -->
+                                                <template x-if="getMsTotalPages('popular') > 1">
+                                                    <div class="px-6 py-3 border-t border-neutral-100 flex items-center justify-center gap-1">
+                                                        <template x-for="p in getMsTotalPages('popular')" :key="p">
+                                                            <button @click="setMsPage('popular', p)"
+                                                                    :class="msPage.popular === p
+                                                                        ? 'bg-neutral-900 text-white'
+                                                                        : 'text-neutral-600 hover:bg-neutral-100'"
+                                                                    class="w-8 h-8 text-xs font-medium rounded-lg transition-all"
+                                                                    x-text="p"></button>
+                                                        </template>
+                                                    </div>
+                                                </template>
+                                            </div>
+                                        </template>
 
                                         <!-- MS Search Results tab -->
                                         <div x-show="msRecommendedTab === 'search'">

@@ -204,20 +204,24 @@
             _msRefreshTimer: null,
 
             // MS Recommended models state
-            msRecommended: [],
+            msRecommended: { trending: [], popular: [] },
             msRecommendedLoaded: false,
             msRecommendedLoading: false,
-            msRecommendedTab: 'recommended',
+            msRecommendedTab: 'trending',
 
             // MS Pagination state
-            msPage: { recommended: 1, search: 1 },
+            msPage: { trending: 1, popular: 1, search: 1 },
             msPageSize: 10,
 
             // MS Search state
             msSearchQuery: '',
+            msSearchSort: 'trending',
             msSearchResults: [],
             msSearchLoading: false,
             msSearchLoaded: false,
+            msSearchHistory: JSON.parse(localStorage.getItem('msSearchHistory') || '[]'),
+            msSearchHistoryOpen: false,
+            msSearchDebounceTimer: null,
 
             // MS Model detail modal
             msModelDetail: null,
@@ -2314,8 +2318,13 @@
             },
 
             async startMSDownload() {
-                const repoId = this.msRepoId.trim();
+                let repoId = this.msRepoId.trim();
                 if (!repoId) return;
+
+                // Default owner to mlx-community if not specified
+                if (!repoId.includes('/')) {
+                    repoId = 'mlx-community/' + repoId;
+                }
 
                 this.msError = '';
                 this.msSuccess = '';
@@ -2329,7 +2338,7 @@
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             model_id: repoId,
-                            token: this.msToken || null,
+                            ms_token: this.msToken || '',
                         }),
                         signal: controller.signal,
                     });
@@ -2460,9 +2469,10 @@
                     const response = await fetch('/admin/api/ms/recommended', { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
-                        this.msRecommended = data.models || [];
+                        this.msRecommended = data;
                         this.msRecommendedLoaded = true;
-                        this.msPage.recommended = 1;
+                        this.msPage.trending = 1;
+                        this.msPage.popular = 1;
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -2490,14 +2500,16 @@
                 const page = this.msPage[tab] || 1;
                 const size = this.msPageSize;
                 let list;
-                if (tab === 'recommended') list = this.msRecommended || [];
+                if (tab === 'trending') list = (this.msRecommended.trending || []);
+                else if (tab === 'popular') list = (this.msRecommended.popular || []);
                 else list = this.msSearchResults || [];
                 return list.slice((page - 1) * size, page * size);
             },
 
             getMsTotalPages(tab) {
                 let total;
-                if (tab === 'recommended') total = (this.msRecommended || []).length;
+                if (tab === 'trending') total = (this.msRecommended.trending || []).length;
+                else if (tab === 'popular') total = (this.msRecommended.popular || []).length;
                 else total = (this.msSearchResults || []).length;
                 const maxPages = tab === 'search' ? 10 : 5;
                 return Math.min(Math.ceil(total / this.msPageSize), maxPages);
@@ -2519,6 +2531,7 @@
                 try {
                     const params = new URLSearchParams({
                         q: this.msSearchQuery,
+                        sort: this.msSearchSort,
                         limit: '50',
                     });
                     const response = await fetch(`/admin/api/ms/search?${params}`, { signal: controller.signal });
@@ -2549,7 +2562,33 @@
             },
 
             mImmediateSearch() {
+                const query = this.msSearchQuery.trim();
+                if (query) {
+                    // Save to search history
+                    this.msSearchHistory = [query, ...this.msSearchHistory.filter(h => h !== query)].slice(0, 10);
+                    localStorage.setItem('msSearchHistory', JSON.stringify(this.msSearchHistory));
+                }
+                this.msSearchHistoryOpen = false;
                 this.searchMSModels();
+            },
+
+            msDebounceSearch() {
+                clearTimeout(this.msSearchDebounceTimer);
+                this.msSearchDebounceTimer = setTimeout(() => {
+                    if (this.msSearchQuery.trim()) {
+                        this.searchMSModels();
+                    }
+                }, 500);
+            },
+
+            closeMsSearchHistory() {
+                setTimeout(() => { this.msSearchHistoryOpen = false; }, 200);
+            },
+
+            selectMsSearchHistory(item) {
+                this.msSearchQuery = item;
+                this.msSearchHistoryOpen = false;
+                this.mImmediateSearch();
             },
 
             // MS Model detail modal
