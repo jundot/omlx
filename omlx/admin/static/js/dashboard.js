@@ -821,7 +821,7 @@
                                 force_sampling: this.modelSettings.force_sampling,
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,
                                 index_cache_freq: this.modelSettings.enableIndexCache
-                                    ? (this.modelSettings.index_cache_freq || null)
+                                    ? (this.modelSettings.index_cache_freq || 4)
                                     : 0,
                                 max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                     ? (this.modelSettings.max_tool_result_tokens || null)
