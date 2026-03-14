@@ -2601,8 +2601,31 @@ async def delete_hf_model(
                 logger.warning(f"Failed to unload model '{model_name}': {e}")
 
     # Delete from disk
-    shutil.rmtree(model_path)
-    logger.info(f"Deleted model directory: {model_path}")
+    # Handle macOS resource fork files (._*) that may disappear on non-native
+    # filesystems (exFAT, NTFS). Use onexc (Python 3.12+) to avoid
+    # DeprecationWarning, with onerror fallback for older versions.
+    def _handle_onexc(func, path, exc):
+        if isinstance(exc, FileNotFoundError) and Path(path).name.startswith("._"):
+            logger.debug(f"Ignoring missing resource fork file: {path}")
+            return
+        raise exc
+
+    def _handle_onerror(func, path, exc_info):
+        if exc_info[0] == FileNotFoundError and Path(path).name.startswith("._"):
+            logger.debug(f"Ignoring missing resource fork file: {path}")
+            return
+        raise exc_info[1]
+
+    try:
+        import sys
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(model_path, onexc=_handle_onexc)
+        else:
+            shutil.rmtree(model_path, onerror=_handle_onerror)
+        logger.info(f"Deleted model directory: {model_path}")
+    except Exception as e:
+        logger.error(f"Failed to delete model directory {model_path}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete model: {e}")
 
     # Re-discover models
     if engine_pool is not None:
