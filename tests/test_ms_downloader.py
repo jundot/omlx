@@ -455,55 +455,55 @@ class TestMSDownloaderStaticMethods:
 
     @pytest.mark.asyncio
     async def test_get_recommended_models(self):
-        mock_response = {
-            "Data": {
-                "Models": [
-                    {
-                        "Path": "qwen/model",
-                        "Name": "model",
-                        "Downloads": 1000,
-                        "Likes": 50,
-                    },
-                ],
-                "TotalCount": 1,
-            }
+        mock_api = MagicMock()
+        mock_api.list_models.return_value = {
+            "Models": [
+                {
+                    "Path": "qwen",
+                    "Name": "model",
+                    "Downloads": 1000,
+                    "Likes": 50,
+                },
+            ],
         }
 
         with patch(
-            "omlx.admin.ms_downloader._ms_rest_search",
-            new_callable=AsyncMock,
-            return_value=mock_response,
+            "omlx.admin.ms_downloader._get_ms_api",
+            return_value=mock_api,
         ):
             result = await MSDownloader.get_recommended_models(
                 max_memory_bytes=32 * 1024**3,
             )
             assert "trending" in result
             assert "popular" in result
+            # Verify the model is returned
+            assert len(result["trending"]) == 1
+            assert result["trending"][0]["repo_id"] == "qwen/model"
 
     @pytest.mark.asyncio
     async def test_get_recommended_models_filters_low_downloads(self):
-        mock_response = {
-            "Data": {
-                "Models": [
-                    {"Path": "o/low", "Name": "low", "Downloads": 10, "Likes": 1},
-                    {"Path": "o/high", "Name": "high", "Downloads": 1000, "Likes": 50},
-                ],
-                "TotalCount": 2,
-            }
+        mock_api = MagicMock()
+        mock_api.list_models.return_value = {
+            "Models": [
+                {"Path": "o", "Name": "low", "Downloads": 10, "Likes": 1},
+                {"Path": "o", "Name": "high", "Downloads": 1000, "Likes": 50},
+            ],
         }
 
         with patch(
-            "omlx.admin.ms_downloader._ms_rest_search",
-            new_callable=AsyncMock,
-            return_value=mock_response,
+            "omlx.admin.ms_downloader._get_ms_api",
+            return_value=mock_api,
         ):
             result = await MSDownloader.get_recommended_models(
                 max_memory_bytes=32 * 1024**3,
             )
-            # Only the model with downloads >= _MIN_DOWNLOADS should be included
+            # Only the model with downloads >= _MIN_DOWNLOADS (50) should be included
             for category in ["trending", "popular"]:
                 for m in result[category]:
                     assert m["downloads"] >= 50
+            # Verify only the high-download model is returned
+            assert len(result["trending"]) == 1
+            assert result["trending"][0]["repo_id"] == "o/high"
 
     @pytest.mark.asyncio
     async def test_get_model_info(self):

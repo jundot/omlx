@@ -19,7 +19,6 @@ from .hf_downloader import (
     DownloadStatus,
     DownloadTask,
     _format_model_size,
-    _format_param_count,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,14 +45,6 @@ _DEFAULT_MS_ENDPOINT = "https://modelscope.cn"
 
 # Minimum downloads to be included in recommendations.
 _MIN_DOWNLOADS = 50
-
-# Sort mapping for ModelScope REST API.
-_MS_SORT_MAP = {
-    "trending": "Default",
-    "downloads": "Downloads",
-    "created": "GmtCreate",
-    "updated": "GmtModified",
-}
 
 
 def _get_ms_endpoint() -> str:
@@ -86,53 +77,6 @@ def _get_ms_api():
     return MSHubApi()
 
 
-async def _ms_rest_search(
-    query: str = "",
-    sort: str = "Default",
-    page_size: int = 50,
-    page_number: int = 1,
-    tags: str = "",
-) -> dict:
-    """Search models via ModelScope REST API.
-
-    The SDK's list_models only supports owner-based listing.
-    We use the REST API directly for keyword search.
-
-    Args:
-        query: Search keyword.
-        sort: Sort order (Default/Downloads/GmtCreate/GmtModified).
-        page_size: Results per page.
-        page_number: Page number (1-based).
-        tags: Comma-separated tag filter.
-
-    Returns:
-        Raw API response dict.
-    """
-    endpoint = _get_ms_endpoint()
-    url = f"{endpoint}/api/v1/models"
-    params = {
-        "PageSize": page_size,
-        "PageNumber": page_number,
-        "SortBy": sort,
-    }
-    if query:
-        params["Query"] = query
-    if tags:
-        params["Tags"] = tags
-
-    response = await asyncio.wait_for(
-        asyncio.to_thread(
-            requests.get,
-            url,
-            params=params,
-            timeout=_MS_API_TIMEOUT,
-        ),
-        timeout=_MS_API_TIMEOUT + 5,
-    )
-    response.raise_for_status()
-    return response.json()
-
-
 def _extract_model_size_from_files(file_list: list) -> int:
     """Calculate total file size from a list of file metadata dicts."""
     total = 0
@@ -141,16 +85,6 @@ def _extract_model_size_from_files(file_list: list) -> int:
         if isinstance(size, (int, float)):
             total += int(size)
     return total
-
-
-def _format_model_size(size_bytes: int) -> str:
-    """Format model size in bytes to a human-readable string."""
-    if size_bytes < 1024**2:
-        return f"{size_bytes / 1024:.1f} KB"
-    elif size_bytes < 1024**3:
-        return f"{size_bytes / 1024**2:.1f} MB"
-    else:
-        return f"{size_bytes / 1024**3:.1f} GB"
 
 
 def _parse_ms_model_entry(entry: dict) -> dict:

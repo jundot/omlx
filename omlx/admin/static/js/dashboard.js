@@ -2413,7 +2413,7 @@
                     const response = await fetch(`/admin/api/ms/retry/${taskId}`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ token: this.msToken || null }),
+                        body: JSON.stringify({ ms_token: this.msToken || null }),
                     });
                     if (response.ok) {
                         await this.loadMSTasks();
