@@ -174,11 +174,12 @@ Configure sampling parameters, chat template kwargs, TTL, model alias, model typ
 
 ### Built-in Chat
 
-Chat directly with any loaded model from the admin panel. Supports conversation history, model switching, dark mode, reasoning model output, and image upload for VLM/OCR models (click, drag-drop, or paste).
+Chat directly with any loaded model from the admin panel. Supports conversation history, model switching, dark mode, reasoning model output, and image upload for VLM/OCR models.
 
 <p align="center">
-  <img src="docs/images/Screenshot 2026-02-10 at 00.35.20.png" alt="oMLX Chat" width="720">
+  <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="oMLX Chat" width="720">
 </p>
+
 
 ### Model Downloader
 
