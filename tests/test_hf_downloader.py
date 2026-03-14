@@ -950,6 +950,25 @@ class TestSearchModels:
         assert result["total"] == 2
 
     @pytest.mark.asyncio
+    async def test_search_passes_mlx_filter(self):
+        """Verify list_models is called with filter='mlx' to restrict results."""
+        mock_models = [
+            _make_mock_model("org/model-a", disk_size_bytes=4_000_000_000, downloads=500),
+        ]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = mock_models
+            mock_api_cls.return_value = mock_api
+
+            await HFDownloader.search_models(query="test", sort="trending", limit=50)
+
+            call_kwargs = mock_api.list_models.call_args[1]
+            assert call_kwargs["filter"] == "mlx"
+            assert call_kwargs["search"] == "test"
+            assert call_kwargs["limit"] == 50
+
+    @pytest.mark.asyncio
     async def test_search_result_format(self):
         """Verify search results have full repo_id as name."""
         model = _make_mock_model(
