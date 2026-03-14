@@ -1142,33 +1142,52 @@
                 this.abortController = new AbortController();
                 this.autoScrollEnabled = true; // Enable auto-scroll at start of streaming
 
-                // Build messages array for API - convert to multimodal format if image exists
-                // Only include image data for the last user message to avoid re-processing historical images
-                const lastUserMsgIndex = this.messages.findLastIndex(m => m.role === 'user');
+                // Build messages array for API
+                // If the latest message contains an image, only send that message (no history context)
+                // If the latest message is text-only, include full history context
+                const lastMsg = this.messages[this.messages.length - 1];
+                let messagesForApi;
 
-                const messagesForApi = this.messages.map((msg, index) => {
-                    // Only include image data in the last user message
-                    if (msg.imageData && index === lastUserMsgIndex) {
-                        // Multimodal message with image (only for latest user message)
-                        const content = [];
-                        if (msg.content) {
-                            content.push({ type: "text", text: msg.content });
+                if (lastMsg.imageData) {
+                    // Latest message has image - send only this message, no history context
+                    const content = [];
+                    if (lastMsg.content) {
+                        content.push({ type: "text", text: lastMsg.content });
+                    }
+                    content.push({
+                        type: "image_url",
+                        image_url: { url: lastMsg.imageData }
+                    });
+                    messagesForApi = [{
+                        role: lastMsg.role,
+                        content: content
+                    }];
+                } else {
+                    // Latest message is text-only - include full history context
+                    const lastUserMsgIndex = this.messages.findLastIndex(m => m.role === 'user');
+                    messagesForApi = this.messages.map((msg, index) => {
+                        // Only include image data for the last user message if it has one
+                        if (msg.imageData && index === lastUserMsgIndex) {
+                            const content = [];
+                            if (msg.content) {
+                                content.push({ type: "text", text: msg.content });
+                            }
+                            content.push({
+                                type: "image_url",
+                                image_url: { url: msg.imageData }
+                            });
+                            return {
+                                role: msg.role,
+                                content: content
+                            };
                         }
-                        content.push({
-                            type: "image_url",
-                            image_url: { url: msg.imageData }
-                        });
+                        // Plain text message (or historical image message without image data)
                         return {
                             role: msg.role,
-                            content: content
+                            content: msg.content || "[图片]"
                         };
-                    }
-                    // Plain text message (or historical image message without image data)
-                    return {
-                        role: msg.role,
-                        content: msg.content || "[图片]"
-                    };
-                });
+                    });
+                }
 
                 try {
                     const response = await fetch('/v1/chat/completions', {
