@@ -1274,7 +1274,19 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    return _server_state.engine_pool.get_status()
+    status = _server_state.engine_pool.get_status()
+    for m in status["models"]:
+        model_id = m["id"]
+        m["max_context_window"] = get_max_context_window(model_id)
+
+        # Resolve effective max_tokens: model setting > global default
+        max_tokens = _server_state.sampling.max_tokens
+        if _server_state.settings_manager:
+            ms = _server_state.settings_manager.get_settings(model_id)
+            if ms and ms.max_tokens is not None:
+                max_tokens = ms.max_tokens
+        m["max_tokens"] = max_tokens
+    return status
 
 
 @app.post("/v1/models/{model_id}/unload")
