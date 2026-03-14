@@ -26,10 +26,10 @@ class Omlx < Formula
     # Upgrade pip to ensure modern resolver (handles git deps, etc.)
     system libexec/"bin/pip", "install", "--upgrade", "pip"
 
-    # Build pydantic-core from source with headerpad to prevent
+    # Build Rust-based packages from source with headerpad to prevent
     # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths)
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
-    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core", buildpath
+    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken,tokenizers", buildpath
 
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end
