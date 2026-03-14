@@ -15,6 +15,7 @@ from omlx.api.tool_calling import (
     build_json_system_prompt,
     convert_tools_for_template,
     extract_json_from_text,
+    extract_tool_calls_with_thinking,
     format_tool_call_for_message,
     parse_json_output,
     parse_tool_calls,
@@ -1166,3 +1167,40 @@ class TestParseToolCallsWithThinkingFallback:
         )
         assert tool_calls is not None
         assert cleaned == "visible response text"
+
+    def test_extract_tool_calls_with_thinking_sanitizes_reasoning_markup(self):
+        """Sanitized reasoning should keep prose but drop tool-call control text."""
+        thinking = (
+            'Need to inspect first.'
+            '<tool_call>{"name": "read_file", "arguments": {"path": "/tmp/a.py"}}</tool_call>'
+            'Then continue.'
+        )
+        tok = self._make_tokenizer()
+
+        result = extract_tool_calls_with_thinking(thinking, "", tokenizer=tok)
+
+        assert result.tool_calls is not None
+        assert result.tool_calls[0].function.name == "read_file"
+        assert "<tool_call>" not in result.cleaned_thinking
+        assert "</tool_call>" not in result.cleaned_thinking
+        assert "Need to inspect first." in result.cleaned_thinking
+        assert "Then continue." in result.cleaned_thinking
+
+    def test_extract_tool_calls_with_thinking_sanitizes_reasoning_even_when_regular_wins(self):
+        """Thinking cleanup should still run when regular content provides tool calls."""
+        thinking = (
+            'Reason about it.'
+            '<tool_call>{"name": "wrong_tool", "arguments": {}}</tool_call>'
+        )
+        regular = (
+            'Visible text'
+            '<tool_call>{"name": "correct_tool", "arguments": {}}</tool_call>'
+        )
+        tok = self._make_tokenizer()
+
+        result = extract_tool_calls_with_thinking(thinking, regular, tokenizer=tok)
+
+        assert result.tool_calls is not None
+        assert result.tool_calls[0].function.name == "correct_tool"
+        assert result.cleaned_text == "Visible text"
+        assert result.cleaned_thinking == "Reason about it."
