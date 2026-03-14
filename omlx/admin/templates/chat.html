@@ -395,6 +395,21 @@
         border-radius: 8px;
         margin-bottom: 8px;
     }
+    .user-message-image-placeholder {
+        max-width: 192px;
+        height: 80px;
+        background: var(--bg-tertiary);
+        border: 1px dashed var(--border-normal);
+        border-radius: 8px;
+        margin-bottom: 8px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        color: var(--text-muted);
+        font-size: 12px;
+        gap: 4px;
+    }
 
     /* Mobile responsive */
     @media (max-width: 768px) {
@@ -571,9 +586,16 @@
                                 </button>
                                 <template x-if="editingIndex !== index">
                                     <div>
-                                        <!-- Image thumbnail -->
+                                        <!-- Image thumbnail (current session) -->
                                         <template x-if="msg.imagePreview">
                                             <img :src="msg.imagePreview" class="user-message-image">
+                                        </template>
+                                        <!-- Image placeholder (historical messages from localStorage) -->
+                                        <template x-if="msg.hasImage && !msg.imagePreview">
+                                            <div class="user-message-image-placeholder">
+                                                <i data-lucide="image" class="w-6 h-6"></i>
+                                                <span x-text="window.t('chat.image_not_available') || 'Image'"></span>
+                                            </div>
                                         </template>
                                         <div class="user-message-bubble" x-html="renderMarkdown(msg.content)"></div>
                                     </div>
@@ -1040,10 +1062,25 @@
                 if (!this.currentChatId || this.messages.length === 0) return;
 
                 const existingIndex = this.chatHistory.findIndex(c => c.id === this.currentChatId);
+
+                // Strip large image data before saving to localStorage to avoid quota issues
+                // imageData (base64) can be very large, and imagePreview (blob URL) becomes invalid after refresh
+                const messagesForStorage = this.messages.map(msg => {
+                    const stored = { ...msg };
+                    // Remove large base64 data
+                    delete stored.imageData;
+                    // Convert blob URL to a simple flag (blob URLs are invalid after page refresh)
+                    if (stored.imagePreview) {
+                        stored.hasImage = true;
+                        delete stored.imagePreview;
+                    }
+                    return stored;
+                });
+
                 const chatData = {
                     id: this.currentChatId,
                     title: this.messages[0]?.content?.slice(0, 50) || window.t('chat.new_chat_title'),
-                    messages: this.messages,
+                    messages: messagesForStorage,
                     model: this.currentModel,
                     updatedAt: new Date().toISOString()
                 };
@@ -1082,11 +1119,11 @@
                 }
 
                 // Add user message with image info for display
+                // Use imageData (base64) for both display and API to persist across page reloads
                 this.messages.push({
                     role: 'user',
                     content: userText || (imageData ? window.t('chat.default_image_prompt') : ''),
-                    imagePreview: imagePreview,  // blob URL for display
-                    imageData: imageData         // base64 data for API
+                    imagePreview: imageData  // Use base64 data for persistent preview
                 });
 
                 // Force scroll to bottom when sending message

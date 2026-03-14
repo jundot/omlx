@@ -483,6 +483,7 @@
     "chat.error.incorrect_api_key": "API key is incorrect. Please re-enter your API key.",
 
     "chat.upload_image": "Upload image",
+    "chat.image_not_available": "Image",
     "chat.remove_image": "Remove image",
     "chat.drop_image": "Drop image here",
     "chat.paste_image": "Paste image",
