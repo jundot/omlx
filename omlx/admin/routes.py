@@ -286,10 +286,8 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
         primary_dir = model_dirs[0]
         if _hf_downloader is not None:
             _hf_downloader.update_model_dir(primary_dir)
-            logger.debug(f"Updated HF downloader model_dir to {primary_dir}")
         if _ms_downloader is not None:
             _ms_downloader.update_model_dir(primary_dir)
-            logger.debug(f"Updated MS downloader model_dir to {primary_dir}")
 
     # Re-discover models from new directories
     try:
