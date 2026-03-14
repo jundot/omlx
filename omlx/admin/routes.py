@@ -14,6 +14,7 @@ import logging
 import os
 import secrets
 import shutil
+import sys
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -2623,10 +2624,9 @@ async def delete_hf_model(
         if exc_info[0] == FileNotFoundError and Path(path).name.startswith("._"):
             logger.debug(f"Ignoring missing resource fork file: {path}")
             return
-        raise exc_info[1]
+        raise exc_info[1].with_traceback(exc_info[2])
 
     try:
-        import sys
         if sys.version_info >= (3, 12):
             shutil.rmtree(model_path, onexc=_handle_onexc)
         else:
