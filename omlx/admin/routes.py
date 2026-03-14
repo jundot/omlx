@@ -2218,11 +2218,14 @@ async def get_server_stats(
     port = global_settings.server.port if global_settings else 8000
     api_key = global_settings.auth.api_key if global_settings else ""
 
+    from ..utils.install import get_cli_prefix
+
     return {
         **snapshot,
         "host": host,
         "port": port,
         "api_key": api_key or "",
+        "cli_prefix": get_cli_prefix(),
         "claude_code_context_scaling_enabled": (
             global_settings.claude_code.context_scaling_enabled
             if global_settings

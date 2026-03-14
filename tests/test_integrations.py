@@ -31,7 +31,7 @@ class TestCodexIntegration:
     def test_get_command(self):
         codex = CodexIntegration()
         cmd = codex.get_command(port=8000, api_key="test-key", model="qwen3.5")
-        assert "omlx-cli launch codex" in cmd
+        assert "omlx launch codex" in cmd
         assert "--model qwen3.5" in cmd
 
     def test_get_command_no_model(self):
@@ -83,7 +83,7 @@ class TestOpenCodeIntegration:
     def test_get_command(self):
         oc = OpenCodeIntegration()
         cmd = oc.get_command(port=8000, api_key="key", model="qwen3.5")
-        assert "omlx-cli launch opencode" in cmd
+        assert "omlx launch opencode" in cmd
         assert "--model qwen3.5" in cmd
 
     def test_configure_new_file(self, tmp_path):
@@ -215,7 +215,7 @@ class TestOpenClawIntegration:
     def test_get_command(self):
         ocl = OpenClawIntegration()
         cmd = ocl.get_command(port=8000, api_key="key", model="qwen3.5")
-        assert "omlx-cli launch openclaw" in cmd
+        assert "omlx launch openclaw" in cmd
         assert "--model qwen3.5" in cmd
 
     def test_configure_new_file(self, tmp_path):

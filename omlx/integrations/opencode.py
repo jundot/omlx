@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 from omlx.integrations.base import Integration
+from omlx.utils.install import get_cli_prefix
 
 
 class OpenCodeIntegration(Integration):
@@ -26,7 +27,7 @@ class OpenCodeIntegration(Integration):
         self, port: int, api_key: str, model: str, host: str = "127.0.0.1"
     ) -> str:
         return (
-            f"/Applications/oMLX.app/Contents/MacOS/omlx-cli "
+            f"{get_cli_prefix()} "
             f"launch opencode --model {model or 'select-a-model'}"
         )
 

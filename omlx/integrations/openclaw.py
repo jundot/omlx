@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from omlx.integrations.base import Integration
+from omlx.utils.install import get_cli_prefix
 
 DEFAULT_GATEWAY_PORT = 18789
 
@@ -33,7 +34,7 @@ class OpenClawIntegration(Integration):
         self, port: int, api_key: str, model: str, host: str = "127.0.0.1"
     ) -> str:
         return (
-            f"/Applications/oMLX.app/Contents/MacOS/omlx-cli "
+            f"{get_cli_prefix()} "
             f"launch openclaw --model {model or 'select-a-model'}"
         )
 

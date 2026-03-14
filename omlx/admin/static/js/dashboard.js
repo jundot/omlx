@@ -903,8 +903,9 @@
             },
 
             get codexCommand() {
+                const cli = this.stats.cli_prefix || 'omlx';
                 const model = this.globalSettings.integrations.codex_model || 'select-a-model';
-                const parts = [`/Applications/oMLX.app/Contents/MacOS/omlx-cli launch codex --model ${model}`];
+                const parts = [`${cli} launch codex --model ${model}`];
                 if (this.stats.api_key) {
                     parts.push(`--api-key ${this.stats.api_key}`);
                 }
@@ -912,8 +913,9 @@
             },
 
             get opencodeCommand() {
+                const cli = this.stats.cli_prefix || 'omlx';
                 const model = this.globalSettings.integrations.opencode_model || 'select-a-model';
-                const parts = [`/Applications/oMLX.app/Contents/MacOS/omlx-cli launch opencode --model ${model}`];
+                const parts = [`${cli} launch opencode --model ${model}`];
                 if (this.stats.api_key) {
                     parts.push(`--api-key ${this.stats.api_key}`);
                 }
@@ -921,9 +923,10 @@
             },
 
             get openclawCommand() {
+                const cli = this.stats.cli_prefix || 'omlx';
                 const model = this.globalSettings.integrations.openclaw_model || 'select-a-model';
                 const profile = this.globalSettings.integrations.openclaw_tools_profile || 'full';
-                const parts = [`/Applications/oMLX.app/Contents/MacOS/omlx-cli launch openclaw --model ${model}`];
+                const parts = [`${cli} launch openclaw --model ${model}`];
                 if (this.stats.api_key) {
                     parts.push(`--api-key ${this.stats.api_key}`);
                 }
