@@ -776,16 +776,18 @@ class VLMBatchedEngine(BaseEngine):
             yield output
 
     def _apply_ocr_prompt(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Replace the last user text with an OCR-specific prompt if applicable.
+        """Apply a default OCR prompt only when the user sends no text.
 
-        OCR models (DeepSeek-OCR, GLM-OCR, DOTS-OCR) require specific prompt
-        formats for markdown output. When the model is an OCR type and the user
-        sends a generic message with images, substitute the user text with the
-        model's default OCR prompt.
+        OCR models (DeepSeek-OCR, GLM-OCR, DOTS-OCR) work best with specific
+        prompt formats. When the user sends an image without any text, this
+        injects the model's default OCR prompt. If the user provides their own
+        text, it is preserved as-is so they can use custom prompts (e.g.
+        structured extraction with JSON schema).
 
         Only activates when:
         - The model_type is in OCR_MODEL_PROMPTS
         - The last user message contains image content
+        - The last user message has no meaningful text
         """
         model_type = self.model_type or ""
         if model_type not in OCR_MODEL_PROMPTS:
@@ -794,7 +796,7 @@ class VLMBatchedEngine(BaseEngine):
         ocr_prompt = OCR_MODEL_PROMPTS[model_type]
         messages = copy.deepcopy(messages)
 
-        # Find last user message and replace text content
+        # Find last user message
         for msg in reversed(messages):
             if msg.get("role") != "user":
                 continue
@@ -807,24 +809,23 @@ class VLMBatchedEngine(BaseEngine):
                 )
                 if not has_image:
                     break
-                # Replace text parts with OCR prompt
-                new_content = []
-                text_replaced = False
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        if not text_replaced:
-                            new_content.append({"type": "text", "text": ocr_prompt})
-                            text_replaced = True
-                        # Drop extra text parts
-                    else:
-                        new_content.append(part)
-                if not text_replaced:
-                    # No text part found, prepend OCR prompt
-                    new_content.insert(0, {"type": "text", "text": ocr_prompt})
+                # Check if user provided meaningful text
+                user_text = " ".join(
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ).strip()
+                if user_text:
+                    # User provided their own prompt, keep it
+                    break
+                # No user text — inject default OCR prompt
+                new_content = [{"type": "text", "text": ocr_prompt}]
+                new_content.extend(
+                    p
+                    for p in content
+                    if not (isinstance(p, dict) and p.get("type") == "text")
+                )
                 msg["content"] = new_content
-            elif isinstance(content, str):
-                # Plain string — replace directly (shouldn't have images here)
-                msg["content"] = ocr_prompt
             break
 
         return messages

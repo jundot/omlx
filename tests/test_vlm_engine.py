@@ -302,8 +302,8 @@ class TestApplyOcrPrompt:
             }
         ]
 
-    def test_replaces_prompt_for_dots_ocr(self):
-        """dots_ocr model → replaces text with OCR-specific prompt."""
+    def test_preserves_user_prompt_for_dots_ocr(self):
+        """dots_ocr model + user text → user prompt preserved."""
         engine = _make_loaded_engine(model_type="dots_ocr")
         messages = self._make_image_messages("What is this?")
 
@@ -314,14 +314,55 @@ class TestApplyOcrPrompt:
             if isinstance(p, dict) and p.get("type") == "text"
         ]
         assert len(text_parts) == 1
-        assert text_parts[0]["text"] == (
-            "Convert this page to clean Markdown while preserving reading order."
-        )
+        assert text_parts[0]["text"] == "What is this?"
 
-    def test_replaces_prompt_for_deepseekocr(self):
-        """deepseekocr model → replaces text with document conversion prompt."""
+    def test_preserves_user_prompt_for_deepseekocr(self):
+        """deepseekocr model + user text → user prompt preserved."""
         engine = _make_loaded_engine(model_type="deepseekocr")
         messages = self._make_image_messages("Read this document")
+
+        result = engine._apply_ocr_prompt(messages)
+
+        text_parts = [
+            p for p in result[0]["content"]
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
+        assert text_parts[0]["text"] == "Read this document"
+
+    def test_injects_default_prompt_when_no_text(self):
+        """OCR model + image-only → default OCR prompt injected."""
+        engine = _make_loaded_engine(model_type="dots_ocr")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                ],
+            }
+        ]
+
+        result = engine._apply_ocr_prompt(messages)
+
+        assert result[0]["content"][0]["type"] == "text"
+        assert "Markdown" in result[0]["content"][0]["text"]
+
+    def test_injects_default_prompt_when_empty_text(self):
+        """OCR model + empty text + image → default OCR prompt injected."""
+        engine = _make_loaded_engine(model_type="glm_ocr")
+        messages = self._make_image_messages("")
+
+        result = engine._apply_ocr_prompt(messages)
+
+        text_parts = [
+            p for p in result[0]["content"]
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
+        assert text_parts[0]["text"] == "Text Recognition:"
+
+    def test_injects_default_prompt_when_whitespace_only(self):
+        """OCR model + whitespace-only text + image → default OCR prompt injected."""
+        engine = _make_loaded_engine(model_type="deepseekocr")
+        messages = self._make_image_messages("   ")
 
         result = engine._apply_ocr_prompt(messages)
 
@@ -342,9 +383,16 @@ class TestApplyOcrPrompt:
         assert result[0]["content"] == original[0]["content"]
 
     def test_preserves_image_parts(self):
-        """OCR prompt replacement preserves image_url parts."""
+        """OCR prompt injection preserves image_url parts."""
         engine = _make_loaded_engine(model_type="dots_ocr")
-        messages = self._make_image_messages("What is this?")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                ],
+            }
+        ]
 
         result = engine._apply_ocr_prompt(messages)
 
@@ -363,24 +411,6 @@ class TestApplyOcrPrompt:
         engine._apply_ocr_prompt(messages)
 
         assert messages[0]["content"][1]["text"] == original_text
-
-    def test_prepends_ocr_prompt_when_no_text_part(self):
-        """Image-only message → OCR prompt prepended."""
-        engine = _make_loaded_engine(model_type="dots_ocr")
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-                ],
-            }
-        ]
-
-        result = engine._apply_ocr_prompt(messages)
-
-        # OCR prompt should be prepended
-        assert result[0]["content"][0]["type"] == "text"
-        assert "Markdown" in result[0]["content"][0]["text"]
 
 
 # ---------------------------------------------------------------------------
