@@ -1245,6 +1245,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "chat_template_kwargs": settings.chat_template_kwargs,
                 "forced_ct_kwargs": settings.forced_ct_kwargs,
                 "ttl_seconds": settings.ttl_seconds,
+                "index_cache_freq": settings.index_cache_freq,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
