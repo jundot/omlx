@@ -2,6 +2,9 @@
     const OCR_CONFIG_MODEL_TYPES = new Set([
         'deepseekocr', 'deepseekocr_2', 'dots_ocr', 'glm_ocr',
     ]);
+    const DSA_MODEL_TYPES = new Set([
+        'deepseek_v32', 'glm_moe_dsa',
+    ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader']);
@@ -767,6 +770,8 @@
                     enableToolResultLimit: !!(settings.max_tool_result_tokens),
                     max_tool_result_tokens: settings.max_tool_result_tokens || null,
                     ttl_seconds: settings.ttl_seconds ?? null,
+                    enableIndexCache: !!(settings.index_cache_freq),
+                    index_cache_freq: settings.index_cache_freq || null,
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
@@ -815,6 +820,9 @@
                                 presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
                                 force_sampling: this.modelSettings.force_sampling,
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,
+                                index_cache_freq: this.modelSettings.enableIndexCache
+                                    ? (this.modelSettings.index_cache_freq || null)
+                                    : 0,
                                 max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                     ? (this.modelSettings.max_tool_result_tokens || null)
                                     : 0,

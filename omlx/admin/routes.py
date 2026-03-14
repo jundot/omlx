@@ -88,6 +88,7 @@ class ModelSettingsRequest(BaseModel):
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     forced_ct_kwargs: Optional[list[str]] = None
     ttl_seconds: Optional[int] = None
+    index_cache_freq: Optional[int] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
 
@@ -1430,6 +1431,13 @@ async def update_model_settings(
         current_settings.forced_ct_kwargs = request.forced_ct_kwargs
     if "ttl_seconds" in sent:
         current_settings.ttl_seconds = request.ttl_seconds
+    if "index_cache_freq" in sent:
+        # 0 means disable (reset to None)
+        current_settings.index_cache_freq = (
+            request.index_cache_freq
+            if request.index_cache_freq and request.index_cache_freq >= 2
+            else None
+        )
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry
@@ -1443,16 +1451,17 @@ async def update_model_settings(
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
 
-    # Warn if engine type actually changed while model is loaded
+    # Warn if engine type or index_cache_freq changed while model is loaded
     requires_reload = (
-        "model_type_override" in sent
-        and entry.engine is not None
-        and entry.engine_type != prev_engine_type
+        entry.engine is not None
+        and (
+            ("model_type_override" in sent and entry.engine_type != prev_engine_type)
+            or "index_cache_freq" in sent
+        )
     )
     if requires_reload:
         logger.info(
-            f"Model type changed for loaded model {model_id} "
-            f"(now {entry.model_type}/{entry.engine_type}). "
+            f"Settings changed for loaded model {model_id}. "
             f"Reload required to take effect."
         )
 

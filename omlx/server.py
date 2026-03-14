@@ -960,6 +960,7 @@ def init_server(
     )
 
     # Discover models (use pinned models from settings file)
+    _server_state.engine_pool._settings_manager = _server_state.settings_manager
     _server_state.engine_pool.discover_models(dir_list, pinned_models)
     _server_state.engine_pool.apply_settings_overrides(_server_state.settings_manager)
 
