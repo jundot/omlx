@@ -597,7 +597,10 @@
                                                 <span x-text="window.t('chat.image_not_available') || 'Image'"></span>
                                             </div>
                                         </template>
-                                        <div class="user-message-bubble" x-html="renderMarkdown(msg.content)"></div>
+                                        <!-- Text content (only show if there's text) -->
+                                        <template x-if="msg.content">
+                                            <div class="user-message-bubble" x-html="renderMarkdown(msg.content)"></div>
+                                        </template>
                                     </div>
                                 </template>
                                 <template x-if="editingIndex === index">
@@ -1107,7 +1110,6 @@
                 // Store the values before clearing
                 const userText = hasText ? this.inputMessage.trim() : '';
                 const imageData = this.pendingImage;
-                const imagePreview = this.pendingImagePreview;
 
                 // Clear input state
                 this.inputMessage = '';
@@ -1119,11 +1121,12 @@
                 }
 
                 // Add user message with image info for display
-                // Use imageData (base64) for both display and API to persist across page reloads
+                // Allow empty text when only image is sent
                 this.messages.push({
                     role: 'user',
-                    content: userText || (imageData ? window.t('chat.default_image_prompt') : ''),
-                    imagePreview: imageData  // Use base64 data for persistent preview
+                    content: userText,  // Can be empty if only image
+                    imagePreview: imageData,  // For display
+                    imageData: imageData      // For API
                 });
 
                 // Force scroll to bottom when sending message
