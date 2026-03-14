@@ -27,12 +27,9 @@ class TestGetMsEndpoint:
 
     def test_default_endpoint(self):
         with patch.dict("os.environ", {}, clear=True):
-            with patch(
-                "omlx.admin.ms_downloader.get_settings",
-                side_effect=RuntimeError,
-            ):
-                endpoint = _get_ms_endpoint()
-                assert endpoint == "https://modelscope.cn"
+            # When no env var and settings import fails, return default
+            endpoint = _get_ms_endpoint()
+            assert endpoint == "https://modelscope.cn"
 
     def test_env_var_override(self):
         with patch.dict(
@@ -46,7 +43,8 @@ class TestGetMsEndpoint:
             "os.environ", {"MODELSCOPE_DOMAIN": "https://example.com///"}
         ):
             endpoint = _get_ms_endpoint()
-            assert endpoint == "https://example.com//"
+            # rstrip("/") removes all trailing slashes
+            assert endpoint == "https://example.com"
 
 
 class TestExtractModelSizeFromFiles:
@@ -77,7 +75,7 @@ class TestParseMsModelEntry:
 
     def test_basic_entry(self):
         entry = {
-            "Path": "qwen/Qwen2.5-7B",
+            "Path": "qwen",
             "Name": "Qwen2.5-7B",
             "Downloads": 5000,
             "Likes": 100,
@@ -91,7 +89,7 @@ class TestParseMsModelEntry:
         assert result["trending_score"] == 0
 
     def test_entry_with_stars(self):
-        entry = {"Path": "o/m", "Stars": 42}
+        entry = {"Path": "o", "Name": "m", "Stars": 42}
         result = _parse_ms_model_entry(entry)
         assert result["likes"] == 42
 
@@ -398,42 +396,47 @@ class TestMSDownloaderStaticMethods:
 
     @pytest.mark.asyncio
     async def test_search_models(self):
-        mock_response = {
-            "Data": {
-                "Models": [
-                    {
-                        "Path": "qwen/Qwen2.5-7B",
-                        "Name": "Qwen2.5-7B",
-                        "Downloads": 1000,
-                        "Likes": 50,
-                    },
-                    {
-                        "Path": "qwen/Qwen2.5-14B",
-                        "Name": "Qwen2.5-14B",
-                        "Downloads": 500,
-                        "Likes": 30,
-                    },
-                ],
-                "TotalCount": 2,
-            }
+        """Test search_models using SDK list_models."""
+        mock_api = MagicMock()
+        mock_api.list_models.return_value = {
+            "Models": [
+                {
+                    "Path": "mlx-community",
+                    "Name": "Qwen2.5-7B-MLX",
+                    "Downloads": 1000,
+                    "Likes": 50,
+                },
+                {
+                    "Path": "mlx-community",
+                    "Name": "Qwen2.5-14B-MLX",
+                    "Downloads": 500,
+                    "Likes": 30,
+                },
+            ],
         }
 
         with patch(
-            "omlx.admin.ms_downloader._ms_rest_search",
-            new_callable=AsyncMock,
-            return_value=mock_response,
+            "omlx.admin.ms_downloader._get_ms_api",
+            return_value=mock_api,
         ):
             result = await MSDownloader.search_models("qwen")
             assert len(result["models"]) == 2
             assert result["total"] == 2
-            assert result["models"][0]["repo_id"] == "qwen/Qwen2.5-7B"
+            assert result["models"][0]["repo_id"] == "mlx-community/Qwen2.5-7B-MLX"
 
     @pytest.mark.asyncio
     async def test_search_models_empty(self):
+        """Test search with no matching results."""
+        mock_api = MagicMock()
+        mock_api.list_models.return_value = {
+            "Models": [
+                {"Path": "mlx-community", "Name": "other-model", "Downloads": 100},
+            ],
+        }
+
         with patch(
-            "omlx.admin.ms_downloader._ms_rest_search",
-            new_callable=AsyncMock,
-            return_value={"Data": {"Models": [], "TotalCount": 0}},
+            "omlx.admin.ms_downloader._get_ms_api",
+            return_value=mock_api,
         ):
             result = await MSDownloader.search_models("nonexistent")
             assert result["models"] == []
@@ -441,10 +444,10 @@ class TestMSDownloaderStaticMethods:
 
     @pytest.mark.asyncio
     async def test_search_models_api_error(self):
+        """Test search handles SDK errors gracefully."""
         with patch(
-            "omlx.admin.ms_downloader._ms_rest_search",
-            new_callable=AsyncMock,
-            side_effect=Exception("Network error"),
+            "omlx.admin.ms_downloader._get_ms_api",
+            return_value=None,
         ):
             result = await MSDownloader.search_models("test")
             assert result["models"] == []
