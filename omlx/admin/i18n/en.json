@@ -119,7 +119,9 @@
 
     "models.downloader.section_label": "Models",
     "models.downloader.heading": "Model Downloader",
-    "models.downloader.description": "Download models from HuggingFace and browse available models.",
+    "models.downloader.description": "Download models from HuggingFace or ModelScope and browse available models.",
+    "models.downloader.source.hf": "HuggingFace",
+    "models.downloader.source.ms": "ModelScope",
     "models.downloader.mirror_settings": "Mirror Settings",
     "models.downloader.mirror_cancel": "Cancel",
     "models.downloader.mirror_save": "Save",
@@ -132,8 +134,19 @@
     "models.downloader.hf_token_placeholder": "hf_...",
     "models.downloader.download_button": "Download",
 
+    "models.downloader.ms_download_section": "Download from ModelScope",
+    "models.downloader.ms_repo_id": "Model ID",
+    "models.downloader.ms_repo_placeholder": "qwen/Qwen2.5-7B-Instruct-MLX",
+    "models.downloader.ms_token": "MS Token",
+    "models.downloader.ms_token_optional": "(optional)",
+    "models.downloader.ms_token_placeholder": "your_token...",
+    "models.downloader.ms_mirror_settings": "Mirror Settings",
+    "models.downloader.ms_unavailable": "ModelScope SDK not installed. Install with: pip install omlx[modelscope]",
+
     "models.search.section_label": "Search HuggingFace",
     "models.search.placeholder": "Search models on HuggingFace...",
+    "models.search.ms_section_label": "Search ModelScope",
+    "models.search.ms_placeholder": "Search models on ModelScope...",
     "models.search.recent_searches": "Recent searches",
     "models.search.sort.trending": "Trending",
     "models.search.sort.downloads": "Most Downloads",
@@ -173,6 +186,7 @@
     "models.detail.no_files": "No file information available.",
     "models.detail.no_tags": "No tags available.",
     "models.detail.view_on_hf": "View on HuggingFace",
+    "models.detail.view_on_ms": "View on ModelScope",
     "models.detail.close": "Close",
 
     "settings.tab.global": "Global Settings",

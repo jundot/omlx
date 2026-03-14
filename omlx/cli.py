@@ -98,6 +98,10 @@ def serve_command(args):
     if settings.huggingface.endpoint:
         os.environ["HF_ENDPOINT"] = settings.huggingface.endpoint
 
+    # Apply ModelScope endpoint if configured
+    if settings.modelscope.endpoint:
+        os.environ["MODELSCOPE_DOMAIN"] = settings.modelscope.endpoint
+
     # Save CLI args to settings.json if non-default values provided
     if _has_cli_overrides(args):
         try:
@@ -442,6 +446,14 @@ Example directory structure:
         type=str,
         default=None,
         help="Custom HuggingFace Hub endpoint URL (e.g., https://hf-mirror.com)",
+    )
+
+    # ModelScope options
+    serve_parser.add_argument(
+        "--ms-endpoint",
+        type=str,
+        default=None,
+        help="Custom ModelScope Hub endpoint URL",
     )
 
     # Base path and auth

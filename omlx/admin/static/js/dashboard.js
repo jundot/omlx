@@ -191,6 +191,38 @@
             hfModelDetail: null,
             hfModelDetailLoading: false,
 
+            // ModelScope Downloader state
+            downloaderSource: 'hf',
+            msAvailable: false,
+            msInitialized: false,
+            msRepoId: '',
+            msToken: '',
+            msDownloading: false,
+            msTasks: [],
+            msError: '',
+            msSuccess: '',
+            _msRefreshTimer: null,
+
+            // MS Recommended models state
+            msRecommended: [],
+            msRecommendedLoaded: false,
+            msRecommendedLoading: false,
+            msRecommendedTab: 'recommended',
+
+            // MS Pagination state
+            msPage: { recommended: 1, search: 1 },
+            msPageSize: 10,
+
+            // MS Search state
+            msSearchQuery: '',
+            msSearchResults: [],
+            msSearchLoading: false,
+            msSearchLoaded: false,
+
+            // MS Model detail modal
+            msModelDetail: null,
+            msModelDetailLoading: false,
+
             // Benchmark state
             benchModelId: '',
             benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false, 131072: false, 200000: false },
@@ -258,12 +290,19 @@
                     if (this.modelsTab === 'downloader' && !this.hfRecommendedLoaded) {
                         loads.push(this.loadRecommendedModels());
                     }
+                    if (this.msInitialized && this.msAvailable) {
+                        loads.push(this.loadMSTasks());
+                    }
                     await Promise.all(loads);
                     const hasActive = this.hfTasks.some(t =>
                         t.status === 'pending' || t.status === 'downloading');
                     if (hasActive) this.startHFRefresh();
+                    const hasMsActive = this.msTasks.some(t =>
+                        t.status === 'pending' || t.status === 'downloading');
+                    if (hasMsActive) this.startMSRefresh();
                 } else {
                     this.stopHFRefresh();
+                    this.stopMSRefresh();
                 }
                 if (value === 'bench' && !this.benchDeviceInfo) {
                     await this.loadBenchDeviceInfo();
@@ -2237,6 +2276,8 @@
             closeModelDetail() {
                 this.hfModelDetail = null;
                 this.hfModelDetailLoading = false;
+                this.msModelDetail = null;
+                this.msModelDetailLoading = false;
             },
 
             formatFileSize(bytes) {
@@ -2245,6 +2286,303 @@
                 if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
                 if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
                 return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+            },
+
+            // =================================================================
+            // ModelScope Downloader Functions
+            // =================================================================
+
+            async initMsDownloader() {
+                if (this.msInitialized) return;
+                this.msInitialized = true;
+                try {
+                    const response = await fetch('/admin/api/ms/status');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.msAvailable = data.available === true;
+                    } else {
+                        this.msAvailable = false;
+                    }
+                } catch (err) {
+                    this.msAvailable = false;
+                    console.error('Failed to check MS status:', err);
+                }
+                if (this.msAvailable) {
+                    await this.loadMSTasks();
+                }
+                this.$nextTick(() => lucide.createIcons());
+            },
+
+            async startMSDownload() {
+                const repoId = this.msRepoId.trim();
+                if (!repoId) return;
+
+                this.msError = '';
+                this.msSuccess = '';
+                this.msDownloading = true;
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 20000);
+
+                try {
+                    const response = await fetch('/admin/api/ms/download', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_id: repoId,
+                            token: this.msToken || null,
+                        }),
+                        signal: controller.signal,
+                    });
+
+                    if (response.ok) {
+                        this.msSuccess = window.t('js.success.download_started').replace('{repo_id}', repoId);
+                        this.msRepoId = '';
+                        await this.loadMSTasks();
+                        this.startMSRefresh();
+                        setTimeout(() => { this.msSuccess = ''; }, 5000);
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await response.json().catch(() => ({}));
+                        this.msError = data.detail || window.t('js.error.start_download_failed');
+                    }
+                } catch (err) {
+                    if (err.name === 'AbortError') {
+                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                    } else {
+                        this.msError = window.t('js.error.start_download_connection');
+                    }
+                    console.error('Failed to start MS download:', err);
+                } finally {
+                    clearTimeout(timeoutId);
+                    this.msDownloading = false;
+                    this.$nextTick(() => lucide.createIcons());
+                }
+            },
+
+            async loadMSTasks() {
+                try {
+                    const response = await fetch('/admin/api/ms/tasks');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.msTasks = data.tasks || [];
+
+                        const hasActive = this.msTasks.some(t =>
+                            t.status === 'pending' || t.status === 'downloading');
+                        if (!hasActive) {
+                            this.stopMSRefresh();
+                            if (this.msTasks.some(t => t.status === 'completed')) {
+                                await this.loadHFModels();
+                                await this.loadModels();
+                            }
+                        }
+
+                        this.$nextTick(() => lucide.createIcons());
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (err) {
+                    console.error('Failed to load MS tasks:', err);
+                }
+            },
+
+            async cancelMSDownload(taskId) {
+                try {
+                    const response = await fetch(`/admin/api/ms/cancel/${taskId}`, {
+                        method: 'POST',
+                    });
+                    if (response.ok) {
+                        await this.loadMSTasks();
+                    }
+                } catch (err) {
+                    console.error('Failed to cancel MS download:', err);
+                }
+            },
+
+            async retryMSDownload(taskId) {
+                try {
+                    const response = await fetch(`/admin/api/ms/retry/${taskId}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ token: this.msToken || null }),
+                    });
+                    if (response.ok) {
+                        await this.loadMSTasks();
+                        this.startMSRefresh();
+                    } else {
+                        const data = await response.json().catch(() => ({}));
+                        this.msError = data.detail || 'Retry failed';
+                        setTimeout(() => { this.msError = ''; }, 5000);
+                    }
+                } catch (err) {
+                    console.error('Failed to retry MS download:', err);
+                }
+            },
+
+            async removeMSTask(taskId) {
+                try {
+                    const response = await fetch(`/admin/api/ms/task/${taskId}`, {
+                        method: 'DELETE',
+                    });
+                    if (response.ok) {
+                        await this.loadMSTasks();
+                    }
+                } catch (err) {
+                    console.error('Failed to remove MS task:', err);
+                }
+            },
+
+            startMSRefresh() {
+                this.stopMSRefresh();
+                this._msRefreshTimer = setInterval(() => {
+                    this.loadMSTasks();
+                }, 2000);
+            },
+
+            stopMSRefresh() {
+                if (this._msRefreshTimer) {
+                    clearInterval(this._msRefreshTimer);
+                    this._msRefreshTimer = null;
+                }
+            },
+
+            downloadMsModel(repoId) {
+                this.msRepoId = repoId;
+                this.startMSDownload();
+            },
+
+            // MS Recommended models
+            async loadMsRecommendedModels() {
+                this.msRecommendedLoading = true;
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 20000);
+                try {
+                    const response = await fetch('/admin/api/ms/recommended', { signal: controller.signal });
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.msRecommended = data.models || [];
+                        this.msRecommendedLoaded = true;
+                        this.msPage.recommended = 1;
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await response.json().catch(() => ({}));
+                        this.msError = data.detail || 'Failed to load recommended models';
+                        setTimeout(() => { this.msError = ''; }, 5000);
+                    }
+                } catch (err) {
+                    if (err.name === 'AbortError') {
+                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                    } else {
+                        this.msError = 'Failed to connect to ModelScope.';
+                    }
+                    setTimeout(() => { this.msError = ''; }, 5000);
+                    console.error('Failed to load MS recommended models:', err);
+                } finally {
+                    clearTimeout(timeoutId);
+                    this.msRecommendedLoading = false;
+                    this.$nextTick(() => lucide.createIcons());
+                }
+            },
+
+            // MS Pagination helpers
+            getMsPagedModels(tab) {
+                const page = this.msPage[tab] || 1;
+                const size = this.msPageSize;
+                let list;
+                if (tab === 'recommended') list = this.msRecommended || [];
+                else list = this.msSearchResults || [];
+                return list.slice((page - 1) * size, page * size);
+            },
+
+            getMsTotalPages(tab) {
+                let total;
+                if (tab === 'recommended') total = (this.msRecommended || []).length;
+                else total = (this.msSearchResults || []).length;
+                const maxPages = tab === 'search' ? 10 : 5;
+                return Math.min(Math.ceil(total / this.msPageSize), maxPages);
+            },
+
+            setMsPage(tab, page) {
+                this.msPage[tab] = page;
+                this.$nextTick(() => lucide.createIcons());
+            },
+
+            // MS Search
+            async searchMSModels() {
+                if (!this.msSearchQuery.trim()) return;
+                this.msSearchLoading = true;
+                this.msRecommendedTab = 'search';
+                this.msPage.search = 1;
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 20000);
+                try {
+                    const params = new URLSearchParams({
+                        q: this.msSearchQuery,
+                        limit: '50',
+                    });
+                    const response = await fetch(`/admin/api/ms/search?${params}`, { signal: controller.signal });
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.msSearchResults = data.models || [];
+                        this.msSearchLoaded = true;
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await response.json().catch(() => ({}));
+                        this.msError = data.detail || 'Search failed';
+                        setTimeout(() => { this.msError = ''; }, 5000);
+                    }
+                } catch (err) {
+                    if (err.name === 'AbortError') {
+                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                    } else {
+                        this.msError = 'Failed to connect to ModelScope.';
+                    }
+                    setTimeout(() => { this.msError = ''; }, 5000);
+                    console.error('MS search failed:', err);
+                } finally {
+                    clearTimeout(timeoutId);
+                    this.msSearchLoading = false;
+                    this.$nextTick(() => lucide.createIcons());
+                }
+            },
+
+            mImmediateSearch() {
+                this.searchMSModels();
+            },
+
+            // MS Model detail modal
+            async openMsModelDetail(repoId) {
+                this.msModelDetailLoading = true;
+                this.msModelDetail = null;
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 20000);
+                try {
+                    const params = new URLSearchParams({ model_id: repoId });
+                    const response = await fetch(`/admin/api/ms/model-info?${params}`, { signal: controller.signal });
+                    if (response.ok) {
+                        this.msModelDetail = await response.json();
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await response.json().catch(() => ({}));
+                        this.msError = data.detail || 'Failed to fetch model info';
+                        setTimeout(() => { this.msError = ''; }, 5000);
+                    }
+                } catch (err) {
+                    if (err.name === 'AbortError') {
+                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                    } else {
+                        this.msError = 'Failed to connect to ModelScope.';
+                    }
+                    setTimeout(() => { this.msError = ''; }, 5000);
+                    console.error('Failed to fetch MS model info:', err);
+                } finally {
+                    clearTimeout(timeoutId);
+                    this.msModelDetailLoading = false;
+                    this.$nextTick(() => lucide.createIcons());
+                }
             },
         }
     }

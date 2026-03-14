@@ -213,6 +213,7 @@ class ServerState:
     settings_manager: Optional[object] = None  # ModelSettingsManager
     global_settings: Optional[object] = None  # GlobalSettings
     hf_downloader: Optional[object] = None  # HFDownloader
+    ms_downloader: Optional[object] = None  # MSDownloader
     process_memory_enforcer: Optional[object] = None  # ProcessMemoryEnforcer
     responses_store: ResponseStore = field(default_factory=ResponseStore)
 
@@ -348,6 +349,9 @@ async def lifespan(app: FastAPI):
     if _server_state.hf_downloader is not None:
         await _server_state.hf_downloader.shutdown()
         logger.info("HF Downloader stopped")
+    if _server_state.ms_downloader is not None:
+        await _server_state.ms_downloader.shutdown()
+        logger.info("MS Downloader stopped")
     if _server_state.mcp_manager is not None:
         await _server_state.mcp_manager.stop()
         logger.info("MCP manager stopped")
@@ -1014,6 +1018,24 @@ def init_server(
     )
     set_hf_downloader(_server_state.hf_downloader)
     logger.info("HF Downloader initialized")
+
+    # Initialize ModelScope downloader (optional - requires modelscope SDK)
+    try:
+        from .admin.ms_downloader import MSDownloader, MS_SDK_AVAILABLE
+
+        if MS_SDK_AVAILABLE:
+            from .admin.routes import set_ms_downloader
+
+            _server_state.ms_downloader = MSDownloader(
+                model_dir=dir_list[0],
+                on_complete=_refresh_models_after_download,
+            )
+            set_ms_downloader(_server_state.ms_downloader)
+            logger.info("ModelScope Downloader initialized")
+        else:
+            logger.info("ModelScope SDK not installed, MS downloader disabled")
+    except ImportError:
+        logger.info("ModelScope support not available")
 
 
 _KEEPALIVE_SENTINEL = object()
