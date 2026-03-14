@@ -888,13 +888,21 @@
                     return;
                 }
 
-                // Create preview URL
+                // Clear any existing pending image first
+                this.clearPendingImage();
+
+                // Create preview URL for display
                 this.pendingImagePreview = URL.createObjectURL(file);
 
                 // Read as base64 data URI for API
                 const reader = new FileReader();
                 reader.onload = (e) => {
                     this.pendingImage = e.target.result;
+                };
+                reader.onerror = () => {
+                    console.error('Failed to read image file');
+                    this.clearPendingImage();
+                    alert('Failed to load image. Please try again.');
                 };
                 reader.readAsDataURL(file);
             },
@@ -1184,7 +1192,7 @@
                         // Plain text message (or historical image message without image data)
                         return {
                             role: msg.role,
-                            content: msg.content || "[图片]"
+                            content: msg.content || window.t('chat.image_not_available') || "[Image]"
                         };
                     });
                 }
