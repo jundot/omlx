@@ -1143,24 +1143,30 @@
                 this.autoScrollEnabled = true; // Enable auto-scroll at start of streaming
 
                 // Build messages array for API - convert to multimodal format if image exists
-                const messagesForApi = this.messages.map(msg => {
-                    if (msg.imageData) {
-                        // Multimodal message with image
+                // Only include image data for the last user message to avoid re-processing historical images
+                const lastUserMsgIndex = this.messages.findLastIndex(m => m.role === 'user');
+
+                const messagesForApi = this.messages.map((msg, index) => {
+                    // Only include image data in the last user message
+                    if (msg.imageData && index === lastUserMsgIndex) {
+                        // Multimodal message with image (only for latest user message)
+                        const content = [];
+                        if (msg.content) {
+                            content.push({ type: "text", text: msg.content });
+                        }
+                        content.push({
+                            type: "image_url",
+                            image_url: { url: msg.imageData }
+                        });
                         return {
                             role: msg.role,
-                            content: [
-                                { type: "text", text: msg.content },
-                                {
-                                    type: "image_url",
-                                    image_url: { url: msg.imageData }
-                                }
-                            ]
+                            content: content
                         };
                     }
-                    // Plain text message
+                    // Plain text message (or historical image message without image data)
                     return {
                         role: msg.role,
-                        content: msg.content
+                        content: msg.content || "[图片]"
                     };
                 });
 
