@@ -119,7 +119,9 @@
 
   "models.downloader.section_label": "모델",
   "models.downloader.heading": "모델 다운로드",
-  "models.downloader.description": "HuggingFace에서 모델을 다운로드하고 사용 가능한 모델을 탐색합니다.",
+  "models.downloader.description": "HuggingFace 또는 ModelScope에서 모델을 다운로드하고 사용 가능한 모델을 탐색합니다.",
+  "models.downloader.source.hf": "HuggingFace",
+  "models.downloader.source.ms": "ModelScope",
   "models.downloader.mirror_settings": "미러 설정",
   "models.downloader.mirror_cancel": "취소",
   "models.downloader.mirror_save": "저장",
@@ -132,8 +134,19 @@
   "models.downloader.hf_token_placeholder": "hf_...",
   "models.downloader.download_button": "다운로드",
 
+  "models.downloader.ms_download_section": "ModelScope에서 다운로드",
+  "models.downloader.ms_repo_id": "모델 ID",
+  "models.downloader.ms_repo_placeholder": "qwen/Qwen2.5-7B-Instruct-MLX",
+  "models.downloader.ms_token": "MS 토큰",
+  "models.downloader.ms_token_optional": "(선택사항)",
+  "models.downloader.ms_token_placeholder": "your_token...",
+  "models.downloader.ms_mirror_settings": "미러 설정",
+  "models.downloader.ms_unavailable": "ModelScope SDK가 설치되지 않았습니다. 설치: pip install omlx[modelscope]",
+
   "models.search.section_label": "HuggingFace 검색",
   "models.search.placeholder": "HuggingFace에서 모델 검색...",
+  "models.search.ms_section_label": "ModelScope 검색",
+  "models.search.ms_placeholder": "ModelScope에서 모델 검색...",
   "models.search.recent_searches": "최근 검색",
   "models.search.sort.trending": "인기 급상승",
   "models.search.sort.downloads": "다운로드 순",
@@ -173,6 +186,7 @@
   "models.detail.no_files": "파일 정보가 없습니다.",
   "models.detail.no_tags": "태그가 없습니다.",
   "models.detail.view_on_hf": "HuggingFace에서 보기",
+  "models.detail.view_on_ms": "ModelScope에서 보기",
   "models.detail.close": "닫기",
 
   "settings.tab.global": "기본 설정",

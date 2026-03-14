@@ -119,7 +119,9 @@
 
   "models.downloader.section_label": "モデル",
   "models.downloader.heading": "モデルダウンロード",
-  "models.downloader.description": "HuggingFaceからモデルをダウンロードし、利用可能なモデルを閲覧します。",
+  "models.downloader.description": "HuggingFaceまたはModelScopeからモデルをダウンロードし、利用可能なモデルを閲覧します。",
+  "models.downloader.source.hf": "HuggingFace",
+  "models.downloader.source.ms": "ModelScope",
   "models.downloader.mirror_settings": "ミラー設定",
   "models.downloader.mirror_cancel": "キャンセル",
   "models.downloader.mirror_save": "保存",
@@ -132,8 +134,19 @@
   "models.downloader.hf_token_placeholder": "hf_...",
   "models.downloader.download_button": "ダウンロード",
 
+  "models.downloader.ms_download_section": "ModelScopeからダウンロード",
+  "models.downloader.ms_repo_id": "モデルID",
+  "models.downloader.ms_repo_placeholder": "qwen/Qwen2.5-7B-Instruct-MLX",
+  "models.downloader.ms_token": "MSトークン",
+  "models.downloader.ms_token_optional": "（任意）",
+  "models.downloader.ms_token_placeholder": "your_token...",
+  "models.downloader.ms_mirror_settings": "ミラー設定",
+  "models.downloader.ms_unavailable": "ModelScope SDKがインストールされていません。次のコマンドでインストール: pip install omlx[modelscope]",
+
   "models.search.section_label": "HuggingFace検索",
   "models.search.placeholder": "HuggingFaceでモデルを検索...",
+  "models.search.ms_section_label": "ModelScope検索",
+  "models.search.ms_placeholder": "ModelScopeでモデルを検索...",
   "models.search.recent_searches": "最近の検索",
   "models.search.sort.trending": "トレンド",
   "models.search.sort.downloads": "ダウンロード数順",
@@ -173,6 +186,7 @@
   "models.detail.no_files": "ファイル情報がありません。",
   "models.detail.no_tags": "タグがありません。",
   "models.detail.view_on_hf": "HuggingFaceで表示",
+  "models.detail.view_on_ms": "ModelScopeで表示",
   "models.detail.close": "閉じる",
 
   "settings.tab.global": "グローバル設定",

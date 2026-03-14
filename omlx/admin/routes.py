@@ -126,6 +126,9 @@ class GlobalSettingsRequest(BaseModel):
     # HuggingFace settings
     hf_endpoint: Optional[str] = None
 
+    # ModelScope settings
+    ms_endpoint: Optional[str] = None
+
     # Sampling defaults
     sampling_max_context_window: Optional[int] = None
     sampling_max_tokens: Optional[int] = None
@@ -167,6 +170,19 @@ class HFRetryRequest(BaseModel):
     """Request model for retrying a HuggingFace model download."""
 
     hf_token: str = ""
+
+
+class MSDownloadRequest(BaseModel):
+    """Request model for starting a ModelScope model download."""
+
+    model_id: str
+    ms_token: str = ""
+
+
+class MSRetryRequest(BaseModel):
+    """Request model for retrying a ModelScope model download."""
+
+    ms_token: str = ""
 
 
 # =============================================================================
@@ -263,6 +279,15 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     # Clear entries
     pool._entries.clear()
     pool._current_model_memory = 0
+
+    # Update downloader model directories
+    global _hf_downloader, _ms_downloader
+    if model_dirs:
+        primary_dir = model_dirs[0]
+        if _hf_downloader is not None:
+            _hf_downloader.update_model_dir(primary_dir)
+        if _ms_downloader is not None:
+            _ms_downloader.update_model_dir(primary_dir)
 
     # Re-discover models from new directories
     try:
@@ -648,6 +673,7 @@ _get_engine_pool = None
 _get_settings_manager = None
 _get_global_settings = None
 _hf_downloader = None
+_ms_downloader = None
 
 
 def set_admin_getters(
@@ -684,6 +710,16 @@ def set_hf_downloader(downloader):
     """
     global _hf_downloader
     _hf_downloader = downloader
+
+
+def set_ms_downloader(downloader):
+    """Set the MSDownloader instance for admin routes.
+
+    Args:
+        downloader: MSDownloader instance created during server initialization.
+    """
+    global _ms_downloader
+    _ms_downloader = downloader
 
 
 # =============================================================================
@@ -1586,6 +1622,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "huggingface": {
             "endpoint": global_settings.huggingface.endpoint,
         },
+        "modelscope": {
+            "endpoint": global_settings.modelscope.endpoint,
+        },
         "sampling": {
             "max_context_window": global_settings.sampling.max_context_window,
             "max_tokens": global_settings.sampling.max_tokens,
@@ -1785,6 +1824,19 @@ async def update_global_settings(
         logger.info(
             f"HuggingFace endpoint updated to: "
             f"{request.hf_endpoint or '(default)'}"
+        )
+
+    # Apply ModelScope settings (Live - immediately applied via env var)
+    if request.ms_endpoint is not None:
+        global_settings.modelscope.endpoint = request.ms_endpoint
+        if request.ms_endpoint:
+            os.environ["MODELSCOPE_DOMAIN"] = request.ms_endpoint
+        elif "MODELSCOPE_DOMAIN" in os.environ:
+            del os.environ["MODELSCOPE_DOMAIN"]
+        runtime_applied.append("ms_endpoint")
+        logger.info(
+            f"ModelScope endpoint updated to: "
+            f"{request.ms_endpoint or '(default)'}"
         )
 
     # Apply sampling settings (Live - immediately applied)
@@ -2568,6 +2620,182 @@ async def delete_hf_model(
         logger.info("Model pool refreshed after deletion")
 
     return {"success": True, "message": f"Model '{model_name}' deleted"}
+
+
+# =============================================================================
+# ModelScope Downloader API Routes
+# =============================================================================
+
+
+@router.get("/api/ms/status")
+async def ms_status(is_admin: bool = Depends(require_admin)):
+    """Check if ModelScope downloader is available."""
+    return {"available": _ms_downloader is not None}
+
+
+@router.post("/api/ms/download")
+async def start_ms_download(
+    request: MSDownloadRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Start downloading a model from ModelScope."""
+    if _ms_downloader is None:
+        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+
+    try:
+        task = await _ms_downloader.start_download(
+            request.model_id, request.ms_token
+        )
+        return {"success": True, "task": task.to_dict()}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@router.get("/api/ms/tasks")
+async def list_ms_tasks(is_admin: bool = Depends(require_admin)):
+    """List all ModelScope download tasks."""
+    if _ms_downloader is None:
+        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+
+    return {"tasks": _ms_downloader.get_tasks()}
+
+
+@router.post("/api/ms/cancel/{task_id}")
+async def cancel_ms_download(
+    task_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Cancel an active ModelScope download."""
+    if _ms_downloader is None:
+        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+
+    success = await _ms_downloader.cancel_download(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=404, detail="Task not found or not cancellable"
+        )
+    return {"success": True}
+
+
+@router.post("/api/ms/retry/{task_id}")
+async def retry_ms_download(
+    task_id: str,
+    request: MSRetryRequest = MSRetryRequest(),
+    is_admin: bool = Depends(require_admin),
+):
+    """Retry a failed or cancelled ModelScope download."""
+    if _ms_downloader is None:
+        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+
+    try:
+        task = await _ms_downloader.retry_download(task_id, request.ms_token)
+        return {"success": True, "task": task.to_dict()}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/api/ms/task/{task_id}")
+async def remove_ms_task(
+    task_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Remove a completed, failed, or cancelled ModelScope task."""
+    if _ms_downloader is None:
+        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+
+    success = _ms_downloader.remove_task(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=404, detail="Task not found or still active"
+        )
+    return {"success": True}
+
+
+@router.get("/api/ms/recommended")
+async def get_ms_recommended_models(is_admin: bool = Depends(require_admin)):
+    """Get recommended MLX models from ModelScope filtered by system memory."""
+    if _ms_downloader is None:
+        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+
+    memory_info = get_system_memory_info()
+    max_memory = memory_info["total_bytes"] or 16 * 1024**3
+
+    from .ms_downloader import MSDownloader
+
+    try:
+        result = await MSDownloader.get_recommended_models(
+            max_memory_bytes=max_memory, result_limit=50
+        )
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="ModelScope API request timed out. The service may be temporarily unavailable.",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/api/ms/search")
+async def search_ms_models(
+    q: str = "",
+    sort: str = "trending",
+    limit: int = 100,
+    is_admin: bool = Depends(require_admin),
+):
+    """Search ModelScope models by query."""
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
+
+    from .ms_downloader import MSDownloader
+
+    try:
+        result = await MSDownloader.search_models(
+            query=q.strip(),
+            sort=sort,
+            limit=min(limit, 100),
+        )
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="ModelScope API request timed out. The service may be temporarily unavailable.",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/api/ms/model-info")
+async def get_ms_model_info(
+    model_id: str = "",
+    is_admin: bool = Depends(require_admin),
+):
+    """Get detailed model information from ModelScope."""
+    if not model_id.strip():
+        raise HTTPException(
+            status_code=400, detail="Query parameter 'model_id' is required"
+        )
+
+    from .ms_downloader import MSDownloader
+
+    try:
+        result = await MSDownloader.get_model_info(model_id=model_id.strip())
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="ModelScope API request timed out. The service may be temporarily unavailable.",
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        if "NotExistError" in type(e).__name__ or "404" in str(e):
+            raise HTTPException(
+                status_code=404, detail=f"Model '{model_id.strip()}' not found"
+            )
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 # =============================================================================
