@@ -127,6 +127,19 @@ UNSUPPORTED_RERANKER_ARCHITECTURES = {
 # All known reranker architectures (for model type detection)
 RERANKER_ARCHITECTURES = SUPPORTED_RERANKER_ARCHITECTURES | UNSUPPORTED_RERANKER_ARCHITECTURES
 
+# Unsupported model types — detected and skipped during discovery.
+# These models require audio endpoints (/v1/audio/*) that oMLX doesn't implement.
+# Only top-level config fields are checked; nested audio_config/tts_config in
+# multimodal models (e.g., MiniCPM-o) won't trigger this.
+UNSUPPORTED_MODEL_TYPES = {
+    "whisper",
+    "qwen3_tts",
+}
+
+UNSUPPORTED_ARCHITECTURES = {
+    "WhisperForConditionalGeneration",
+}
+
 
 @dataclass
 class DiscoveredModel:
@@ -138,6 +151,33 @@ class DiscoveredModel:
     engine_type: EngineType  # "batched", "vlm", "embedding", or "reranker"
     estimated_size: int  # Estimated memory usage in bytes
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
+
+
+def _is_unsupported_model(model_path: Path) -> bool:
+    """
+    Check if model is an unsupported type (TTS, ASR, etc.).
+
+    Only checks top-level config fields. Multimodal models with nested
+    audio_config/tts_config (e.g., MiniCPM-o) are not affected.
+    """
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        return False
+
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return False
+
+    architectures = config.get("architectures", [])
+    for arch in architectures:
+        if arch in UNSUPPORTED_ARCHITECTURES:
+            return True
+
+    model_type = config.get("model_type", "")
+    normalized = model_type.lower().replace("-", "_")
+    return normalized in UNSUPPORTED_MODEL_TYPES or model_type in UNSUPPORTED_MODEL_TYPES
 
 
 def _is_causal_lm_reranker(model_path: Path) -> bool:
@@ -297,6 +337,13 @@ def _register_model(
 ) -> None:
     """Try to register a single model directory into the models dict."""
     try:
+        if _is_unsupported_model(model_dir):
+            logger.info(
+                f"Skipping unsupported model: {model_id} "
+                "(TTS/ASR models require audio endpoints not implemented in oMLX)"
+            )
+            return
+
         model_type = detect_model_type(model_dir)
         if model_type == "embedding":
             engine_type: EngineType = "embedding"

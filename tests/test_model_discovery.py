@@ -9,6 +9,7 @@ import pytest
 
 from omlx.model_discovery import (
     DiscoveredModel,
+    _is_unsupported_model,
     detect_model_type,
     discover_models,
     discover_models_from_dirs,
@@ -680,3 +681,92 @@ class TestDiscoverModelsFromDirs:
         )
         assert "model-1" in models
         assert len(models) == 1
+
+
+class TestUnsupportedModels:
+    """Tests for unsupported model detection (TTS, ASR, etc.)."""
+
+    def test_whisper_detected_by_architecture(self, tmp_path):
+        """Whisper model detected as unsupported via architecture."""
+        config = {
+            "model_type": "whisper",
+            "architectures": ["WhisperForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert _is_unsupported_model(tmp_path) is True
+
+    def test_whisper_detected_by_model_type(self, tmp_path):
+        """Whisper model detected as unsupported via model_type alone."""
+        config = {
+            "model_type": "whisper",
+            "architectures": ["SomeCustomWhisperArch"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert _is_unsupported_model(tmp_path) is True
+
+    def test_tts_detected_by_model_type(self, tmp_path):
+        """TTS model detected as unsupported via model_type."""
+        config = {
+            "model_type": "qwen3_tts",
+            "architectures": ["Qwen3TTSForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert _is_unsupported_model(tmp_path) is True
+
+    def test_multimodal_with_audio_not_unsupported(self, tmp_path):
+        """Multimodal model with nested audio_config is NOT unsupported."""
+        config = {
+            "model_type": "minicpmo",
+            "architectures": ["MiniCPMO"],
+            "vision_config": {"model_type": "siglip_vision_model"},
+            "audio_config": {"model_type": "whisper"},
+            "tts_config": {"model_type": "minicpmtts"},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert _is_unsupported_model(tmp_path) is False
+
+    def test_llm_not_unsupported(self, tmp_path):
+        """Regular LLM is not unsupported."""
+        config = {
+            "model_type": "llama",
+            "architectures": ["LlamaForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert _is_unsupported_model(tmp_path) is False
+
+    def test_unsupported_model_skipped_in_discovery(self, tmp_path):
+        """Unsupported models are skipped during discover_models()."""
+        # Create a normal LLM model
+        llm_dir = tmp_path / "llama-3b"
+        llm_dir.mkdir()
+        (llm_dir / "config.json").write_text(
+            json.dumps({"model_type": "llama", "architectures": ["LlamaForCausalLM"]})
+        )
+        (llm_dir / "model.safetensors").write_bytes(b"0" * 1000)
+
+        # Create a whisper ASR model
+        asr_dir = tmp_path / "whisper-large-v3"
+        asr_dir.mkdir()
+        (asr_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "whisper",
+                    "architectures": ["WhisperForConditionalGeneration"],
+                }
+            )
+        )
+        (asr_dir / "model.safetensors").write_bytes(b"0" * 2000)
+
+        # Create a TTS model
+        tts_dir = tmp_path / "Qwen3-TTS"
+        tts_dir.mkdir()
+        (tts_dir / "config.json").write_text(
+            json.dumps({"model_type": "qwen3_tts"})
+        )
+        (tts_dir / "model.safetensors").write_bytes(b"0" * 1500)
+
+        models = discover_models(tmp_path)
+        assert len(models) == 1
+        assert "llama-3b" in models
+        assert "whisper-large-v3" not in models
+        assert "Qwen3-TTS" not in models
