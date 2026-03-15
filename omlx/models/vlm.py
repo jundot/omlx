@@ -254,7 +254,13 @@ class VLMModelAdapter(nn.Module):
             # Legacy single-request path
             result = self._forward_with_embeddings(input_ids, wrapped_cache, **kwargs)
         else:
-            # Standard decode path: token IDs only
+            # Standard decode path: token IDs only.
+            # VLM models that reuse another architecture's LanguageModel
+            # (e.g., MiniCPM-o using qwen3_vl) rely on position state being
+            # initialized by the full Model.__call__(). Since omlx calls the
+            # language model directly, replicate that initialization here.
+            if hasattr(self._vlm_model, "_set_position_state"):
+                self._vlm_model._set_position_state(input_ids)
             result = self._language_model(input_ids, cache=wrapped_cache, **kwargs)
 
         # mlx-vlm models return LanguageModelOutput(logits=...) but
