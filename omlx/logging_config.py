@@ -35,6 +35,14 @@ class RequestContextFilter(logging.Filter):
         return True
 
 
+class AdminStatsAccessFilter(logging.Filter):
+    """Suppress repetitive uvicorn access logs for admin stats polling."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "/admin/api/stats" not in msg
+
+
 class ColoredFormatter(logging.Formatter):
     """
     Colored log formatter for terminal output.
@@ -123,6 +131,7 @@ def configure_logging(
     # Set specific loggers
     logging.getLogger("omlx").setLevel(log_level)
     logging.getLogger("uvicorn").setLevel(log_level)
+    logging.getLogger("uvicorn.access").addFilter(AdminStatsAccessFilter())
 
     # Suppress noisy third-party loggers unless trace level
     third_party_level = log_level if log_level <= 5 else logging.INFO
