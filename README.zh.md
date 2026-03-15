@@ -174,11 +174,12 @@ brew services info omlx     # 查看状态
 
 ### 内置聊天
 
-从管理后台直接与已加载的模型聊天。支持对话历史、模型切换、深色模式和推理模型输出。
+从管理后台直接与已加载的模型聊天。支持对话历史、模型切换、深色模式、推理模型输出，以及 VLM/OCR 模型的图片上传。
 
 <p align="center">
-  <img src="docs/images/Screenshot 2026-02-10 at 00.35.20.png" alt="oMLX 聊天" width="720">
+  <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="oMLX 聊天" width="720">
 </p>
+
 
 ### 模型下载器
 

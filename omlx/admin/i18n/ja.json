@@ -514,6 +514,16 @@
   "chat.confirm_clear_all": "すべてのチャット履歴を削除しますか？この操作は元に戻せません。",
   "chat.error.incorrect_api_key": "APIキーが正しくありません。再入力してください。",
 
+  "chat.upload_image": "画像をアップロード",
+  "chat.remove_image": "画像を削除",
+  "chat.drop_image": "ここに画像をドロップ",
+  "chat.paste_image": "画像を貼り付け",
+  "chat.default_image_prompt": "この画像を説明してください",
+  "chat.error.invalid_image_type": "画像ファイルを選択してください",
+  "chat.error.image_too_large": "画像サイズは10MB以下にしてください",
+  "chat.image_not_available": "画像",
+  "chat.error.image_load_failed": "画像の読み込みに失敗しました。もう一度お試しください。",
+
   "js.error.required_fields": "必須項目が空です: {fields}",
   "js.error.api_key_min_length": "APIキーは4文字以上必要です",
   "js.error.api_key_no_whitespace": "APIキーにスペースを含めることはできません",

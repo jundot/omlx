@@ -514,6 +514,16 @@
   "chat.confirm_clear_all": "모든 대화 기록을 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.",
   "chat.error.incorrect_api_key": "API 키가 올바르지 않습니다. 다시 입력해 주세요.",
 
+  "chat.upload_image": "이미지 업로드",
+  "chat.remove_image": "이미지 제거",
+  "chat.drop_image": "이미지를 여기에 놓으세요",
+  "chat.paste_image": "이미지 붙여넣기",
+  "chat.default_image_prompt": "이 이미지를 설명해주세요",
+  "chat.error.invalid_image_type": "이미지 파일을 선택해주세요",
+  "chat.error.image_too_large": "이미지 크기는 10MB 이하여야 합니다",
+  "chat.image_not_available": "이미지",
+  "chat.error.image_load_failed": "이미지를 불러오지 못했습니다. 다시 시도해 주세요.",
+
   "js.error.required_fields": "필수 항목이 비어 있습니다: {fields}",
   "js.error.api_key_min_length": "API 키는 4자 이상이어야 합니다",
   "js.error.api_key_no_whitespace": "API 키에 공백을 포함할 수 없습니다",

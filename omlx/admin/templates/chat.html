@@ -321,6 +321,96 @@
     [data-theme="dark"] .user-message-bubble code,
     [data-theme="dark"] .user-message-bubble * { color: var(--text-primary) !important; }
 
+    /* Image upload styles */
+    .image-preview-container {
+        padding: 8px;
+        border-bottom: 1px solid var(--border-faint);
+    }
+    .image-preview-wrapper {
+        position: relative;
+        display: inline-block;
+    }
+    .image-preview-wrapper img {
+        height: 80px;
+        width: 80px;
+        object-fit: cover;
+        border-radius: 8px;
+        border: 1px solid var(--border-faint);
+    }
+    .image-remove-btn {
+        position: absolute;
+        top: -6px;
+        right: -6px;
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-normal);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        transition: all 0.15s;
+        color: var(--text-tertiary);
+    }
+    .image-remove-btn:hover {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+    }
+    .image-remove-btn svg {
+        width: 12px;
+        height: 12px;
+    }
+    .image-upload-btn {
+        padding: 12px;
+        color: var(--text-tertiary);
+        transition: color 0.15s;
+        flex-shrink: 0;
+    }
+    .image-upload-btn:hover {
+        color: var(--text-secondary);
+    }
+    .image-upload-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+
+    /* Drag and drop styles */
+    .chat-container {
+        transition: background-color 0.2s, border-color 0.2s;
+    }
+    .chat-container.drag-over {
+        background-color: var(--bg-tertiary);
+    }
+    .chat-container.drag-over .input-container {
+        border-color: var(--text-tertiary);
+        border-style: dashed;
+    }
+
+    /* User message image */
+    .user-message-image {
+        max-width: 192px;
+        max-height: 192px;
+        object-fit: cover;
+        border-radius: 8px;
+        margin-bottom: 8px;
+    }
+    .user-message-image-placeholder {
+        max-width: 192px;
+        height: 80px;
+        background: var(--bg-tertiary);
+        border: 1px dashed var(--border-normal);
+        border-radius: 8px;
+        margin-bottom: 8px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        color: var(--text-muted);
+        font-size: 12px;
+        gap: 4px;
+    }
+
     /* Mobile responsive */
     @media (max-width: 768px) {
         .sidebar-width { position: fixed; z-index: 50; height: 100%; }
@@ -495,7 +585,23 @@
                                     <i data-lucide="pencil" class="w-4 h-4"></i>
                                 </button>
                                 <template x-if="editingIndex !== index">
-                                    <div class="user-message-bubble" x-html="renderMarkdown(msg.content)"></div>
+                                    <div>
+                                        <!-- Image thumbnail (current session) -->
+                                        <template x-if="msg.imagePreview">
+                                            <img :src="msg.imagePreview" class="user-message-image">
+                                        </template>
+                                        <!-- Image placeholder (historical messages from localStorage) -->
+                                        <template x-if="msg.hasImage && !msg.imagePreview">
+                                            <div class="user-message-image-placeholder">
+                                                <i data-lucide="image" class="w-6 h-6"></i>
+                                                <span x-text="window.t('chat.image_not_available') || 'Image'"></span>
+                                            </div>
+                                        </template>
+                                        <!-- Text content (only show if there's text) -->
+                                        <template x-if="msg.content">
+                                            <div class="user-message-bubble" x-html="renderMarkdown(msg.content)"></div>
+                                        </template>
+                                    </div>
                                 </template>
                                 <template x-if="editingIndex === index">
                                     <div class="user-message-bubble" style="padding: 0; background: transparent;">
@@ -564,24 +670,52 @@
         <!-- Input Area -->
         <div class="p-4 border-t border-border-faint bg-surface-primary flex-shrink-0">
             <div class="max-w-4xl mx-auto">
-                <div class="input-container flex items-end">
-                    <textarea
-                        x-model="inputMessage"
-                        @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); sendMessage(); }"
-                        @input="autoResize($event.target)"
-                        placeholder="{{ t('chat.input_placeholder') }}"
-                        :disabled="!apiKeySet || !currentModel || isStreaming"
-                        rows="1"
-                        class="flex-1 px-4 py-3 bg-transparent resize-none outline-none text-sm max-h-32"
-                        style="color: var(--text-primary);"
-                    ></textarea>
-                    <button
-                        @click="sendMessage()"
-                        :disabled="!inputMessage.trim() || !apiKeySet || !currentModel || isStreaming"
-                        class="w-10 h-10 m-1 bg-neutral-900 hover:bg-neutral-800 disabled:bg-neutral-300 rounded-full transition-colors flex items-center justify-center flex-shrink-0"
-                    >
-                        <i data-lucide="arrow-up" class="w-4 h-4 text-white"></i>
-                    </button>
+                <div class="input-container" :class="{ 'drag-over': isDragOver }"
+                     @dragover.prevent="isDragOver = true" @dragleave.prevent="isDragOver = false"
+                     @drop.prevent="handleDrop($event)">
+                    <!-- Hidden file input for image upload -->
+                    <input type="file" id="imageInput" accept="image/*"
+                           x-ref="imageInput" @change="handleImageSelect($event)"
+                           class="hidden">
+
+                    <!-- Image preview area -->
+                    <div x-show="pendingImage" class="image-preview-container" x-cloak>
+                        <div class="image-preview-wrapper">
+                            <img :src="pendingImage" class="h-20 w-20 object-cover rounded-lg">
+                            <button @click="clearPendingImage()" class="image-remove-btn" :title="window.t('chat.remove_image')">
+                                <i data-lucide="x"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="flex items-end">
+                        <!-- Image upload button -->
+                        <button @click="$refs.imageInput.click()"
+                                :disabled="!apiKeySet || !currentModel || isStreaming"
+                                class="image-upload-btn"
+                                :title="window.t('chat.upload_image')">
+                            <i data-lucide="image" class="w-5 h-5"></i>
+                        </button>
+
+                        <textarea
+                            x-model="inputMessage"
+                            @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); sendMessage(); }"
+                            @input="autoResize($event.target)"
+                            @paste="handlePaste($event)"
+                            placeholder="{{ t('chat.input_placeholder') }}"
+                            :disabled="!apiKeySet || !currentModel || isStreaming"
+                            rows="1"
+                            class="flex-1 px-4 py-3 bg-transparent resize-none outline-none text-sm max-h-32"
+                            style="color: var(--text-primary);"
+                        ></textarea>
+                        <button
+                            @click="sendMessage()"
+                            :disabled="(!inputMessage.trim() && !pendingImage) || !apiKeySet || !currentModel || isStreaming"
+                            class="w-10 h-10 m-1 bg-neutral-900 hover:bg-neutral-800 disabled:bg-neutral-300 rounded-full transition-colors flex items-center justify-center flex-shrink-0"
+                        >
+                            <i data-lucide="arrow-up" class="w-4 h-4 text-white"></i>
+                        </button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -653,6 +787,10 @@
             editingIndex: null,
             editContent: '',
 
+            // Image Upload State
+            pendingImage: null,          // base64 data URI for API and preview
+            isDragOver: false,           // drag-and-drop state
+
             async init() {
                 // Auto-inject API key from server (admin session already authenticated)
                 const serverApiKey = {{ api_key | tojson }};
@@ -685,7 +823,107 @@
                 this.$nextTick(() => {
                     this.setupScrollListener();
                 });
+
+                // Setup drag and drop handlers
+                this.setupDragDropHandlers();
             },
+
+            // ===== Image Upload Functions =====
+
+            setupDragDropHandlers() {
+                const container = document.getElementById('messagesContainer');
+                if (!container) return;
+
+                container.addEventListener('dragover', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    container.classList.add('drag-over');
+                });
+
+                container.addEventListener('dragleave', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    container.classList.remove('drag-over');
+                });
+
+                container.addEventListener('drop', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    container.classList.remove('drag-over');
+
+                    const file = e.dataTransfer?.files[0];
+                    if (file) {
+                        this.loadImageFile(file);
+                    }
+                });
+            },
+
+            handleDrop(event) {
+                const file = event.dataTransfer?.files[0];
+                if (file) {
+                    this.loadImageFile(file);
+                }
+            },
+
+            handleImageSelect(event) {
+                const file = event.target.files[0];
+                if (!file) return;
+                this.loadImageFile(file);
+                // Reset the input so the same file can be selected again
+                event.target.value = '';
+            },
+
+            loadImageFile(file) {
+                // Validate file type
+                if (!file.type.startsWith('image/')) {
+                    alert(window.t('chat.error.invalid_image_type'));
+                    return;
+                }
+
+                // Validate file size (max 10MB)
+                const maxSize = 10 * 1024 * 1024;
+                if (file.size > maxSize) {
+                    alert(window.t('chat.error.image_too_large'));
+                    return;
+                }
+
+                // Clear any existing pending image first
+                this.clearPendingImage();
+
+                // Read as base64 data URI for both preview and API
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    this.pendingImage = e.target.result;
+                };
+                reader.onerror = () => {
+                    console.error('Failed to read image file');
+                    this.clearPendingImage();
+                    alert(window.t('chat.error.image_load_failed'));
+                };
+                reader.readAsDataURL(file);
+            },
+
+            clearPendingImage() {
+                this.pendingImage = null;
+            },
+
+            handlePaste(event) {
+                const items = event.clipboardData?.items;
+                if (!items) return;
+
+                for (const item of items) {
+                    if (item.type.startsWith('image/')) {
+                        const file = item.getAsFile();
+                        if (file) {
+                            this.loadImageFile(file);
+                            event.preventDefault();
+                            break;
+                        }
+                    }
+                }
+            },
+
+            // ===== End Image Upload Functions =====
 
             // Setup scroll listener for messages container
             setupScrollListener() {
@@ -826,10 +1064,25 @@
                 if (!this.currentChatId || this.messages.length === 0) return;
 
                 const existingIndex = this.chatHistory.findIndex(c => c.id === this.currentChatId);
+
+                // Strip large image data before saving to localStorage to avoid quota issues
+                // imageData (base64) can be very large, and imagePreview (blob URL) becomes invalid after refresh
+                const messagesForStorage = this.messages.map(msg => {
+                    const stored = { ...msg };
+                    // Remove large base64 data
+                    delete stored.imageData;
+                    // Convert blob URL to a simple flag (blob URLs are invalid after page refresh)
+                    if (stored.imagePreview) {
+                        stored.hasImage = true;
+                        delete stored.imagePreview;
+                    }
+                    return stored;
+                });
+
                 const chatData = {
                     id: this.currentChatId,
                     title: this.messages[0]?.content?.slice(0, 50) || window.t('chat.new_chat_title'),
-                    messages: this.messages,
+                    messages: messagesForStorage,
                     model: this.currentModel,
                     updatedAt: new Date().toISOString()
                 };
@@ -846,20 +1099,33 @@
             },
 
             async sendMessage() {
-                if (!this.inputMessage.trim() || !this.currentModel || this.isStreaming) return;
+                // Check if there's either text or an image to send
+                const hasText = this.inputMessage.trim();
+                const hasImage = this.pendingImage;
 
-                const userMessage = this.inputMessage.trim();
+                if (!hasText && !hasImage) return;
+                if (!this.currentModel || this.isStreaming) return;
+
+                // Store the values before clearing
+                const userText = hasText ? this.inputMessage.trim() : '';
+                const imageData = this.pendingImage;
+
+                // Clear input state
                 this.inputMessage = '';
+                this.clearPendingImage();
 
                 // Create new chat if needed
                 if (!this.currentChatId) {
                     this.currentChatId = 'chat_' + Date.now();
                 }
 
-                // Add user message
+                // Add user message with image info for display
+                // Allow empty text when only image is sent
                 this.messages.push({
                     role: 'user',
-                    content: userMessage
+                    content: userText,  // Can be empty if only image
+                    imagePreview: imageData,  // For display
+                    imageData: imageData      // For API
                 });
 
                 // Force scroll to bottom when sending message
@@ -875,6 +1141,27 @@
                 this.abortController = new AbortController();
                 this.autoScrollEnabled = true; // Enable auto-scroll at start of streaming
 
+                // Build messages array for API - include all messages with their images if available
+                const messagesForApi = this.messages.map((msg) => {
+                    if (msg.imageData) {
+                        // Message with image - build multimodal content
+                        const content = [];
+                        if (msg.content) {
+                            content.push({ type: "text", text: msg.content });
+                        }
+                        content.push({
+                            type: "image_url",
+                            image_url: { url: msg.imageData }
+                        });
+                        return { role: msg.role, content };
+                    }
+                    // Plain text message (or historical image message without image data in localStorage)
+                    return {
+                        role: msg.role,
+                        content: msg.content || window.t('chat.image_not_available') || "[Image]"
+                    };
+                });
+
                 try {
                     const response = await fetch('/v1/chat/completions', {
                         method: 'POST',
@@ -884,7 +1171,7 @@
                         },
                         body: JSON.stringify({
                             model: this.currentModel,
-                            messages: this.messages,
+                            messages: messagesForApi,
                             stream: true
                         }),
                         signal: this.abortController.signal
