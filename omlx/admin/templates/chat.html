@@ -34,6 +34,11 @@
         --border-faint: #e2e8f0;
         --border-normal: #cbd5e1;
         --code-bg: #f3f4f6;
+        --btn-primary: #171717;
+        --btn-primary-hover: #27272a;
+        --btn-primary-text: #ffffff;
+        --text-danger: #ef4444;
+        --bg-danger-hover: rgba(239, 68, 68, 0.1);
     }
 
     [data-theme="dark"] {
@@ -47,20 +52,17 @@
         --border-faint: #3f3f46;
         --border-normal: #52525b;
         --code-bg: #27272a;
+        --btn-primary: #e5e5e5;
+        --btn-primary-hover: #d4d4d4;
+        --btn-primary-text: #18181b;
+        --text-danger: #f87171;
+        --bg-danger-hover: rgba(239, 68, 68, 0.2);
     }
 
     body {
         background-color: var(--bg-primary) !important;
         color: var(--text-primary);
     }
-
-
-    .bg-surface-primary { background-color: var(--bg-primary) !important; }
-    .bg-surface-secondary { background-color: var(--bg-secondary) !important; }
-    .text-text-primary { color: var(--text-primary) !important; }
-    .text-text-secondary { color: var(--text-secondary) !important; }
-    .text-text-tertiary { color: var(--text-tertiary) !important; }
-    .border-border-faint { border-color: var(--border-faint) !important; }
 
     /* Scrollbar */
     .custom-scrollbar::-webkit-scrollbar { width: 6px; }
@@ -174,6 +176,7 @@
     }
     .inline-edit-actions { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
 
+
     /* Thinking container */
     .thinking-container {
         background: var(--bg-secondary);
@@ -246,175 +249,13 @@
     }
 
     /* API Key Modal */
-    .api-key-modal {
-        position: fixed;
-        inset: 0;
-        background: rgba(0, 0, 0, 0.5);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        z-index: 1000;
-    }
     .api-key-modal.hidden { display: none; }
-    .api-key-modal-content {
-        background: var(--bg-primary);
-        border-radius: 1rem;
-        padding: 2rem;
-        max-width: 400px;
-        width: 90%;
-        box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
-    }
 
-    /* Button styles */
-    .btn-primary {
-        background: #18181b;
-        color: white;
-        padding: 0.75rem 1.5rem;
-        border-radius: 0.75rem;
-        font-weight: 500;
-        transition: all 0.2s;
-    }
-    .btn-primary:hover { background: #27272a; }
-    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
-
-    .message-action-btn {
-        width: 28px; height: 28px;
-        display: flex; align-items: center; justify-content: center;
-        border-radius: 6px; border: none;
-        background: transparent; color: var(--text-tertiary);
-        cursor: pointer; transition: all 0.15s;
-    }
-    .message-action-btn:hover { background: var(--bg-secondary); color: var(--text-secondary); }
-    .message-action-btn svg { color: inherit; }
-
-    /* Dark mode adjustments */
-    [data-theme="dark"] .hover\:bg-neutral-100:hover { background: var(--bg-tertiary) !important; }
-    [data-theme="dark"] .bg-neutral-100 { background: var(--bg-tertiary) !important; }
-    [data-theme="dark"] .hover\:bg-neutral-200:hover { background: var(--bg-secondary) !important; }
-    [data-theme="dark"] .hover\:bg-neutral-800:hover { background: #3f3f46 !important; }
-    [data-theme="dark"] .hover\:bg-red-100:hover { background: rgba(239, 68, 68, 0.2) !important; }
-    [data-theme="dark"] .hover\:bg-red-50:hover { background: rgba(239, 68, 68, 0.15) !important; }
-    [data-theme="dark"] .bg-neutral-50 { background: var(--bg-secondary) !important; }
-    [data-theme="dark"] .bg-neutral-900 { background: #e5e5e5 !important; }
-    [data-theme="dark"] .bg-white { background: var(--bg-primary) !important; }
-    [data-theme="dark"] .border-neutral-200 { border-color: var(--border-faint) !important; }
-    [data-theme="dark"] .text-neutral-400 { color: var(--text-muted) !important; }
-    [data-theme="dark"] .text-neutral-500 { color: var(--text-tertiary) !important; }
-    [data-theme="dark"] .text-neutral-600 { color: var(--text-secondary) !important; }
-    [data-theme="dark"] .text-white { color: #18181b !important; }
-    [data-theme="dark"] .user-message-bubble { background: var(--bg-tertiary) !important; }
-    [data-theme="dark"] .focus\:ring-neutral-900:focus { --tw-ring-color: var(--border-normal) !important; }
-    [data-theme="dark"] .text-xl, [data-theme="dark"] .text-2xl { color: var(--text-primary) !important; }
-    [data-theme="dark"] .font-semibold, [data-theme="dark"] .font-bold, [data-theme="dark"] .font-medium { color: var(--text-primary); }
-    [data-theme="dark"] .text-sm { color: var(--text-primary); }
-    [data-theme="dark"] .text-red-500 { color: #f87171 !important; }
-    [data-theme="dark"] .text-red-600 { color: #ef4444 !important; }
-    [data-theme="dark"] .disabled\:bg-neutral-300:disabled { background: var(--bg-tertiary) !important; }
-    [data-theme="dark"] .sidebar-width span { color: var(--text-primary); }
-    [data-theme="dark"] .sidebar-width .text-neutral-600 { color: var(--text-secondary) !important; }
-    [data-theme="dark"] .sidebar-width .text-neutral-500 { color: var(--text-tertiary) !important; }
-    [data-theme="dark"] .markdown-content { color: var(--text-primary) !important; }
-    [data-theme="dark"] .markdown-content p, [data-theme="dark"] .markdown-content li { color: var(--text-primary) !important; }
-    [data-theme="dark"] .user-message-bubble,
-    [data-theme="dark"] .user-message-bubble p,
-    [data-theme="dark"] .user-message-bubble span,
-    [data-theme="dark"] .user-message-bubble code,
-    [data-theme="dark"] .user-message-bubble * { color: var(--text-primary) !important; }
-
-    /* Image upload styles */
-    .image-preview-container {
-        padding: 8px 8px 0;
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-    }
-    .image-preview-wrapper {
-        position: relative;
-        display: inline-block;
-    }
-    .image-preview-wrapper img {
-        height: 64px;
-        width: 64px;
-        object-fit: cover;
-        border-radius: 8px;
-        border: 1px solid var(--border-faint);
-    }
-    .image-remove-btn {
-        position: absolute;
-        top: -6px;
-        right: -6px;
-        width: 20px;
-        height: 20px;
-        border-radius: 50%;
-        background: var(--bg-secondary);
-        border: 1px solid var(--border-normal);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        cursor: pointer;
-        transition: all 0.15s;
-        color: var(--text-tertiary);
-        opacity: 0;
-    }
-    .image-preview-wrapper:hover .image-remove-btn {
-        opacity: 1;
-    }
-    .image-remove-btn:hover {
-        background: var(--bg-tertiary);
-        color: var(--text-primary);
-    }
-    .image-remove-btn svg {
-        width: 12px;
-        height: 12px;
-    }
-    .image-upload-btn {
-        padding: 12px;
-        color: var(--text-tertiary);
-        transition: color 0.15s;
-        flex-shrink: 0;
-    }
-    .image-upload-btn:hover {
-        color: var(--text-secondary);
-    }
-    .image-upload-btn:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-    }
-
-    /* Drag and drop styles */
+    /* Drag and drop state */
     .input-container.drag-over {
         border-color: var(--text-tertiary) !important;
         border-style: dashed !important;
         background-color: var(--bg-tertiary);
-    }
-
-    /* User message images */
-    .user-message-images {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        margin-bottom: 8px;
-    }
-    .user-message-images img {
-        max-width: 192px;
-        max-height: 192px;
-        object-fit: cover;
-        border-radius: 8px;
-        cursor: pointer;
-    }
-    .user-message-image-placeholder {
-        width: 80px;
-        height: 80px;
-        background: var(--bg-tertiary);
-        border: 1px dashed var(--border-normal);
-        border-radius: 8px;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        color: var(--text-muted);
-        font-size: 10px;
-        gap: 2px;
     }
 
     /* Mobile responsive */
@@ -438,19 +279,19 @@
 </script>
 <div class="h-screen flex overflow-hidden" x-data="chatApp()" x-init="init()">
     <!-- API Key Modal -->
-    <div class="api-key-modal" :class="{ 'hidden': apiKeySet }" x-cloak>
-        <div class="api-key-modal-content">
+    <div class="api-key-modal fixed inset-0 bg-black/50 flex items-center justify-center z-[1000]" :class="{ 'hidden': apiKeySet }" x-cloak>
+        <div class="bg-surface rounded-2xl p-8 max-w-[400px] w-[90%] shadow-2xl">
             <h2 class="text-xl font-bold mb-2">{{ t('login.login.label_api_key') }}</h2>
-            <p class="text-sm text-neutral-500 mb-4">{{ t('chat.api_key_prompt') }}</p>
+            <p class="text-sm text-fg-tertiary mb-4">{{ t('chat.api_key_prompt') }}</p>
             <input
                 type="password"
                 x-model="apiKeyInput"
                 @keydown.enter="saveApiKey"
                 placeholder="{{ t('chat.api_key_placeholder') }}"
-                class="w-full px-4 py-3 border border-neutral-200 rounded-xl mb-4 focus:outline-none focus:border-neutral-400"
+                class="w-full px-4 py-3 border border-line rounded-xl mb-4 focus:outline-none focus:border-line-strong"
                 style="background: var(--bg-primary); color: var(--text-primary);"
             >
-            <button @click="saveApiKey" class="btn-primary w-full" :disabled="!apiKeyInput.trim()">
+            <button @click="saveApiKey" class="w-full bg-accent text-accent-fg px-6 py-3 rounded-xl font-medium transition-all hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed" :disabled="!apiKeyInput.trim()">
                 {{ t('chat.api_key_continue') }}
             </button>
         </div>
@@ -460,17 +301,17 @@
     <div class="sidebar-overlay" :class="{ 'hidden': !sidebarOpen }" @click="sidebarOpen = false" x-cloak></div>
 
     <!-- Sidebar -->
-    <div class="sidebar-width h-full bg-surface-primary border-r border-border-faint flex flex-col sidebar-transition"
+    <div class="sidebar-width h-full bg-surface border-r border-line flex flex-col sidebar-transition"
          :class="{ 'sidebar-hidden': !sidebarOpen }">
         <!-- Sidebar Header -->
-        <div class="p-4 border-b border-border-faint flex-shrink-0">
+        <div class="p-4 border-b border-line flex-shrink-0">
             <div class="flex items-center justify-between">
                 <a href="/admin/dashboard" class="flex items-center gap-2 hover:opacity-80 transition-opacity">
                     <img x-show="theme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX" class="w-[30px] h-[30px]">
                     <img x-show="theme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX" class="w-[30px] h-[30px]" x-cloak>
                     <span class="font-semibold">{{ t('chat.brand') }}</span>
                 </a>
-                <button @click="sidebarOpen = false" class="p-1.5 hover:bg-neutral-100 rounded-md" style="color: var(--text-primary);">
+                <button @click="sidebarOpen = false" class="p-1.5 hover:bg-surface-muted rounded-md" style="color: var(--text-primary);">
                     <i data-lucide="panel-left-close" class="w-4 h-4"></i>
                 </button>
             </div>
@@ -478,7 +319,7 @@
 
         <!-- New Chat Button -->
         <div class="p-3 flex-shrink-0">
-            <button @click="startNewChat()" class="w-full flex items-center gap-2 px-3 py-2 bg-neutral-100 hover:bg-neutral-200 rounded-lg text-sm font-medium transition-colors" style="color: var(--text-primary);">
+            <button @click="startNewChat()" class="w-full flex items-center gap-2 px-3 py-2 bg-surface-muted hover:bg-surface-alt rounded-lg text-sm font-medium transition-colors" style="color: var(--text-primary);">
                 <i data-lucide="plus" class="w-4 h-4"></i>
                 {{ t('chat.new_chat') }}
             </button>
@@ -488,36 +329,36 @@
         <div class="flex-1 min-h-0 overflow-y-auto custom-scrollbar px-3">
             <template x-for="chat in chatHistory" :key="chat.id">
                 <div @click="loadChat(chat.id)"
-                     class="group flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer hover:bg-neutral-100 mb-1"
-                     :class="{ 'bg-neutral-100': currentChatId === chat.id }">
+                     class="group flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer hover:bg-surface-muted mb-1"
+                     :class="{ 'bg-surface-muted': currentChatId === chat.id }">
                     <i data-lucide="message-square" class="w-4 h-4 flex-shrink-0" style="color: var(--text-muted);"></i>
                     <span class="text-sm truncate flex-1" style="color: var(--text-primary);" x-text="chat.title || window.t('chat.new_chat_title')"></span>
                     <button @click.stop="deleteChat(chat.id)"
-                            class="opacity-0 group-hover:opacity-100 p-1 hover:bg-red-100 rounded transition-opacity"
+                            class="opacity-0 group-hover:opacity-100 p-1 hover:bg-danger-bg rounded transition-opacity"
                             title="{{ t('chat.delete_tooltip') }}">
-                        <i data-lucide="trash-2" class="w-3 h-3 text-red-500"></i>
+                        <i data-lucide="trash-2" class="w-3 h-3 text-danger"></i>
                     </button>
                 </div>
             </template>
         </div>
 
         <!-- Sidebar Footer -->
-        <div class="p-2 border-t border-border-faint space-y-0.5 flex-shrink-0">
-            <a href="/admin/dashboard" class="flex items-center gap-1.5 px-2 py-1 text-xs text-neutral-500 hover:bg-neutral-100 rounded">
+        <div class="p-2 border-t border-line space-y-0.5 flex-shrink-0">
+            <a href="/admin/dashboard" class="flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
                 <i data-lucide="settings" class="w-3 h-3"></i>
                 {{ t('chat.admin_settings') }}
             </a>
-            <button @click="toggleTheme()" class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-neutral-500 hover:bg-neutral-100 rounded">
+            <button @click="toggleTheme()" class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
                 <i data-lucide="sun" class="w-3 h-3" x-show="theme === 'light'"></i>
                 <i data-lucide="moon" class="w-3 h-3" x-show="theme === 'dark'" x-cloak></i>
                 <span x-text="theme === 'light' ? window.t('navbar.theme.dark_mode') : window.t('navbar.theme.light_mode')"></span>
             </button>
             <button @click="clearAllHistory()" x-show="chatHistory.length > 0"
-                    class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-red-500 hover:bg-red-50 rounded">
+                    class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-danger hover:bg-danger-bg rounded">
                 <i data-lucide="trash-2" class="w-3 h-3"></i>
                 {{ t('chat.clear_all_history') }}
             </button>
-            <button @click="clearApiKey()" class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-neutral-500 hover:bg-neutral-100 rounded">
+            <button @click="clearApiKey()" class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
                 <i data-lucide="key" class="w-3 h-3"></i>
                 {{ t('chat.change_api_key') }}
             </button>
@@ -525,30 +366,30 @@
     </div>
 
     <!-- Main Content -->
-    <div class="flex-1 flex flex-col bg-surface-primary overflow-hidden">
+    <div class="flex-1 flex flex-col bg-surface overflow-hidden">
         <!-- Header -->
-        <header class="h-14 px-4 border-b border-border-faint flex items-center justify-between bg-surface-primary flex-shrink-0">
-            <button @click="sidebarOpen = true" class="p-2 hover:bg-neutral-100 rounded-lg md:hidden" style="color: var(--text-primary);">
+        <header class="h-14 px-4 border-b border-line flex items-center justify-between bg-surface flex-shrink-0">
+            <button @click="sidebarOpen = true" class="p-2 hover:bg-surface-muted rounded-lg md:hidden" style="color: var(--text-primary);">
                 <i data-lucide="menu" class="w-5 h-5"></i>
             </button>
-            <button @click="sidebarOpen = !sidebarOpen" class="p-2 hover:bg-neutral-100 rounded-lg hidden md:block" style="color: var(--text-primary);">
+            <button @click="sidebarOpen = !sidebarOpen" class="p-2 hover:bg-surface-muted rounded-lg hidden md:block" style="color: var(--text-primary);">
                 <i data-lucide="panel-left" class="w-5 h-5"></i>
             </button>
 
             <!-- Model Selector -->
             <div class="relative" x-data="{ open: false }">
-                <button @click="open = !open" class="flex items-center gap-2 px-3 py-1.5 text-sm font-medium hover:bg-neutral-100 rounded-lg" style="color: var(--text-primary);">
+                <button @click="open = !open" class="flex items-center gap-2 px-3 py-1.5 text-sm font-medium hover:bg-surface-muted rounded-lg" style="color: var(--text-primary);">
                     <i data-lucide="cpu" class="w-4 h-4"></i>
                     <span x-text="currentModel || window.t('chat.select_model')"></span>
                     <i data-lucide="chevron-down" class="w-4 h-4"></i>
                 </button>
                 <div x-show="open" @click.away="open = false" x-cloak
-                     class="absolute top-full mt-1 left-1/2 -translate-x-1/2 border border-neutral-200 rounded-lg shadow-lg py-1 min-w-[360px] max-w-[500px] max-h-60 overflow-y-auto z-50"
+                     class="absolute top-full mt-1 left-1/2 -translate-x-1/2 border border-line rounded-lg shadow-lg py-1 min-w-[360px] max-w-[500px] max-h-60 overflow-y-auto z-50"
                      style="background: var(--bg-primary); border-color: var(--border-faint);">
                     <template x-for="model in availableModels" :key="model.id">
                         <button @click="selectModel(model.id); open = false"
-                                class="w-full px-3 py-2 text-sm text-left hover:bg-neutral-100"
-                                :class="{ 'bg-neutral-100': currentModel === model.id }"
+                                class="w-full px-3 py-2 text-sm text-left hover:bg-surface-muted"
+                                :class="{ 'bg-surface-muted': currentModel === model.id }"
                                 style="color: var(--text-primary);">
                             <span x-text="model.id"></span>
                         </button>
@@ -572,8 +413,8 @@
                         <img x-show="theme === 'dark'" src="/admin/static/logo-dark.svg" alt="oMLX" class="w-[60px] h-[60px]" x-cloak>
                         <h1 class="text-2xl font-bold">{{ t('chat.welcome_heading') }}</h1>
                     </div>
-                    <p class="text-neutral-500 mb-6">{{ t('chat.welcome_description') }}</p>
-                    <div class="p-4 bg-neutral-50 rounded-xl text-sm text-neutral-600">
+                    <p class="text-fg-tertiary mb-6">{{ t('chat.welcome_description') }}</p>
+                    <div class="p-4 bg-surface-alt rounded-xl text-sm text-fg-secondary">
                         <i data-lucide="shield-check" class="w-4 h-4 inline mr-1"></i>
                         {{ t('chat.welcome_privacy') }}
                     </div>
@@ -594,17 +435,17 @@
                                     <div>
                                         <!-- Images from content array -->
                                         <template x-if="getImageUrls(msg.content).length > 0">
-                                            <div class="user-message-images">
+                                            <div class="flex flex-wrap gap-2 mb-2">
                                                 <template x-for="imgUrl in getImageUrls(msg.content)" :key="imgUrl.substring(0, 50)">
-                                                    <img :src="imgUrl" @click="window.open(imgUrl, '_blank')">
+                                                    <img :src="imgUrl" @click="window.open(imgUrl, '_blank')" class="max-w-48 max-h-48 object-cover rounded-lg cursor-pointer">
                                                 </template>
                                             </div>
                                         </template>
                                         <!-- Placeholder for stripped images (restored from localStorage) -->
                                         <template x-if="hasStrippedImages(msg.content)">
-                                            <div class="user-message-images">
+                                            <div class="flex flex-wrap gap-2 mb-2">
                                                 <template x-for="(_, i) in getStrippedImageCount(msg.content)" :key="i">
-                                                    <div class="user-message-image-placeholder">
+                                                    <div class="w-20 h-20 bg-surface-muted border border-dashed border-line-strong rounded-lg flex flex-col items-center justify-center text-fg-muted text-[10px] gap-0.5">
                                                         <i data-lucide="image" class="w-5 h-5"></i>
                                                         <span x-text="window.t('chat.image_not_available') || 'Image'"></span>
                                                     </div>
@@ -627,8 +468,8 @@
                                             x-init="$nextTick(() => { $el.focus(); $el.setSelectionRange($el.value.length, $el.value.length); })"
                                         ></textarea>
                                         <div class="inline-edit-actions">
-                                            <button @click="cancelEdit" class="px-3 py-1.5 text-sm border rounded-lg hover:bg-neutral-100" style="border-color: var(--border-normal); color: var(--text-secondary);">{{ t('chat.edit_cancel') }}</button>
-                                            <button @click="saveEdit(index)" class="px-3 py-1.5 text-sm bg-neutral-900 text-white rounded-lg hover:bg-neutral-800" style="color: white;">{{ t('chat.edit_save') }}</button>
+                                            <button @click="cancelEdit" class="px-3 py-1.5 text-sm border rounded-lg hover:bg-surface-muted" style="border-color: var(--border-normal); color: var(--text-secondary);">{{ t('chat.edit_cancel') }}</button>
+                                            <button @click="saveEdit(index)" class="px-3 py-1.5 text-sm bg-accent text-accent-fg rounded-lg hover:bg-accent-hover" style="color: var(--btn-primary-text);">{{ t('chat.edit_save') }}</button>
                                         </div>
                                     </div>
                                 </template>
@@ -643,10 +484,10 @@
                                     <span x-text="msg.model || currentModel || window.t('chat.assistant_label')"></span>
                                 </div>
                                 <div class="flex gap-1">
-                                    <button @click="copyMessage(msg.content)" class="message-action-btn" title="{{ t('chat.copy_tooltip') }}">
+                                    <button @click="copyMessage(msg.content)" class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary" title="{{ t('chat.copy_tooltip') }}">
                                         <i data-lucide="copy" class="w-4 h-4"></i>
                                     </button>
-                                    <button @click="regenerateMessage(index)" class="message-action-btn" title="{{ t('chat.regenerate_tooltip') }}">
+                                    <button @click="regenerateMessage(index)" class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary" title="{{ t('chat.regenerate_tooltip') }}">
                                         <i data-lucide="refresh-cw" class="w-4 h-4"></i>
                                     </button>
                                 </div>
@@ -663,7 +504,7 @@
                             <i data-lucide="cpu" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                             <span x-text="currentModel || window.t('chat.assistant_label')"></span>
                         </div>
-                        <button @click="stopStreaming()" class="message-action-btn" title="{{ t('chat.stop_tooltip') }}">
+                        <button @click="stopStreaming()" class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary" title="{{ t('chat.stop_tooltip') }}">
                             <i data-lucide="square" class="w-4 h-4"></i>
                         </button>
                     </div>
@@ -682,7 +523,7 @@
         </div>
 
         <!-- Input Area -->
-        <div class="p-4 border-t border-border-faint bg-surface-primary flex-shrink-0">
+        <div class="p-4 border-t border-line bg-surface flex-shrink-0">
             <div class="max-w-4xl mx-auto">
                 <div class="input-container" :class="{ 'drag-over': isDragOver }"
                      @dragover.prevent="isDragOver = true" @dragleave.prevent="isDragOver = false"
@@ -693,12 +534,14 @@
                            class="hidden">
 
                     <!-- Image preview area (multi-image) -->
-                    <div x-show="uploadImages.length > 0" class="image-preview-container" x-cloak>
+                    <div x-show="uploadImages.length > 0" class="flex flex-wrap gap-2 px-2 pt-2" x-cloak>
                         <template x-for="(img, idx) in uploadImages" :key="img.id">
-                            <div class="image-preview-wrapper">
-                                <img :src="img.base64">
-                                <button @click="removeImage(idx)" class="image-remove-btn" :title="window.t('chat.remove_image')">
-                                    <i data-lucide="x"></i>
+                            <div class="relative group">
+                                <img :src="img.base64" class="h-16 w-16 object-cover rounded-lg border border-line">
+                                <button @click="removeImage(idx)"
+                                        class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center bg-surface-alt border border-line-strong text-fg-tertiary cursor-pointer transition-all opacity-0 group-hover:opacity-100 hover:bg-surface-muted hover:text-fg"
+                                        :title="window.t('chat.remove_image')">
+                                    <i data-lucide="x" class="w-3 h-3"></i>
                                 </button>
                             </div>
                         </template>
@@ -709,7 +552,7 @@
                         <button x-show="hasVisionSupport()"
                                 @click="$refs.imageInput.click()"
                                 :disabled="!apiKeySet || !currentModel || isStreaming || uploadImages.length >= 10"
-                                class="image-upload-btn"
+                                class="p-3 shrink-0 transition-colors text-fg-tertiary hover:text-fg-secondary disabled:opacity-50 disabled:cursor-not-allowed"
                                 :title="window.t('chat.upload_image')">
                             <i data-lucide="image" class="w-5 h-5"></i>
                         </button>
@@ -729,13 +572,13 @@
                             <button
                                 @click="sendMessage()"
                                 :disabled="(!inputMessage.trim() && uploadImages.length === 0) || !apiKeySet || !currentModel || isStreaming"
-                                class="w-10 h-10 m-1 bg-neutral-900 hover:bg-neutral-800 disabled:bg-neutral-300 rounded-full transition-colors flex items-center justify-center"
+                                class="w-10 h-10 m-1 bg-accent hover:bg-accent-hover disabled:bg-surface-muted rounded-full transition-colors flex items-center justify-center"
                             >
-                                <i data-lucide="arrow-up" class="w-4 h-4 text-white"></i>
+                                <i data-lucide="arrow-up" class="w-4 h-4 text-accent-fg"></i>
                             </button>
                             <!-- Image count badge -->
                             <div x-show="uploadImages.length > 0"
-                                 class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-neutral-700 text-white text-[10px] flex items-center justify-center rounded-full pointer-events-none"
+                                 class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-accent text-accent-fg text-[10px] flex items-center justify-center rounded-full pointer-events-none"
                                  x-text="uploadImages.length"></div>
                         </div>
                     </div>
