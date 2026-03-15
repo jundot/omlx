@@ -32,7 +32,7 @@
 
   "navbar.brand": "oMLX",
   "navbar.admin": "관리",
-  "navbar.tab.status": "상태",
+  "navbar.tab.status": "대시보드",
   "navbar.tab.models": "모델",
   "navbar.tab.settings": "설정",
   "navbar.tab.logs": "로그",

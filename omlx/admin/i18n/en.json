@@ -32,7 +32,7 @@
 
     "navbar.brand": "oMLX",
     "navbar.admin": "Admin",
-    "navbar.tab.status": "Status",
+    "navbar.tab.status": "Dashboard",
     "navbar.tab.models": "Models",
     "navbar.tab.settings": "Settings",
     "navbar.tab.logs": "Logs",

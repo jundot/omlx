@@ -29,7 +29,7 @@
   "dashboard.title": "控制台 - oMLX 管理後台",
   "navbar.brand": "oMLX",
   "navbar.admin": "管理",
-  "navbar.tab.status": "狀態",
+  "navbar.tab.status": "儀表板",
   "navbar.tab.models": "模型",
   "navbar.tab.settings": "設定",
   "navbar.tab.logs": "記錄",
