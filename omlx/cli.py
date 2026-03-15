@@ -49,7 +49,7 @@ def serve_command(args):
 
     from ._version import __version__
     from .settings import init_settings, get_settings
-    from .logging_config import configure_file_logging
+    from .logging_config import configure_file_logging, AdminStatsAccessFilter
 
     try:
         from ._build_info import build_number
@@ -85,6 +85,9 @@ def serve_command(args):
                  "omlx.memory_monitor", "omlx.paged_cache", "omlx.prefix_cache",
                  "omlx.engine_pool", "omlx.model_discovery"]:
         logging.getLogger(name).setLevel(log_level)
+
+    # Suppress repetitive admin stats access logs
+    logging.getLogger("uvicorn.access").addFilter(AdminStatsAccessFilter())
 
     # Suppress noisy third-party loggers unless trace level
     if log_level > TRACE:
