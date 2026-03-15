@@ -510,6 +510,7 @@
     "chat.default_image_prompt": "Describe this image",
     "chat.error.invalid_image_type": "Please select an image file",
     "chat.error.image_too_large": "Image size must be less than 10MB",
+    "chat.error.image_load_failed": "Failed to load image. Please try again.",
 
     "js.error.required_fields": "Required fields cannot be empty: {fields}",
     "js.error.api_key_min_length": "API key must be at least 4 characters",
