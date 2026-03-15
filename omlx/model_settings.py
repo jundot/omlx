@@ -205,7 +205,6 @@ class ModelSettingsManager:
                 settings = self._settings[model_id]
                 return ModelSettings.from_dict(settings.to_dict())
 
-            logger.log(5, "No settings found for model '%s', using defaults", model_id)
             return ModelSettings()
 
     def set_settings(self, model_id: str, settings: ModelSettings) -> None:
