@@ -86,6 +86,24 @@
             outline: none;
             box-shadow: 0 0 0 2px rgba(0,0,0,0.1);
         }
+
+        /* Benchmark tooltip (fixed position, outside overflow containers) */
+        .bench-tip-fixed {
+            position: fixed;
+            z-index: 9999;
+            max-width: 320px;
+            padding: 10px 12px;
+            background: #171717;
+            color: #e5e5e5;
+            font-size: 12px;
+            font-weight: 400;
+            line-height: 1.5;
+            border-radius: 8px;
+            white-space: normal;
+            text-align: left;
+            pointer-events: none;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
     </style>
 
     {% block head %}{% endblock %}

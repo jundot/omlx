@@ -245,6 +245,7 @@
             benchShowMetrics: false,
             benchShowText: false,
             benchCopied: false,
+            benchTip: null,
             benchIncludeImage: false,
             benchDeviceInfo: null,
             benchUploadResults: [],
