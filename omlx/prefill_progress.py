@@ -10,13 +10,14 @@ in the Active Models card.
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 
 class PrefillProgressTracker:
     """Thread-safe tracker for per-request prefill progress.
 
-    Each entry stores (processed_tokens, total_tokens, model_id) for a
+    Each entry stores (processed_tokens, total_tokens, model_id, timing) for a
     request that is currently in its prefill phase.  Entries are auto-removed
     when processed >= total (prefill complete).
 
@@ -25,7 +26,6 @@ class PrefillProgressTracker:
     """
 
     def __init__(self) -> None:
-        # request_id -> {"processed": int, "total": int, "model_id": str}
         self._progress: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
 
@@ -33,15 +33,31 @@ class PrefillProgressTracker:
         """Update prefill progress for a request.
 
         Auto-removes the entry when processed >= total (prefill complete).
+        Tracks timing for speed/ETA calculation.
         """
+        now = time.monotonic()
         with self._lock:
             if processed >= total:
                 self._progress.pop(request_id, None)
             else:
+                prev = self._progress.get(request_id)
+                if prev is not None:
+                    dt = now - prev["last_time"]
+                    dtok = processed - prev["processed"]
+                    if dt > 0 and dtok > 0:
+                        speed = dtok / dt
+                    else:
+                        speed = prev.get("speed", 0.0)
+                else:
+                    speed = 0.0
+
                 self._progress[request_id] = {
                     "processed": processed,
                     "total": total,
                     "model_id": model_id,
+                    "start_time": prev["start_time"] if prev else now,
+                    "last_time": now,
+                    "speed": speed,
                 }
 
     def remove(self, request_id: str) -> None:
@@ -52,15 +68,21 @@ class PrefillProgressTracker:
     def get_model_progress(self, model_id: str) -> List[Dict[str, Any]]:
         """Return list of prefilling requests for a given model."""
         with self._lock:
-            return [
-                {
+            results = []
+            for rid, entry in self._progress.items():
+                if entry["model_id"] != model_id:
+                    continue
+                remaining = entry["total"] - entry["processed"]
+                speed = entry.get("speed", 0.0)
+                eta = remaining / speed if speed > 0 else None
+                results.append({
                     "request_id": rid,
                     "processed": entry["processed"],
                     "total": entry["total"],
-                }
-                for rid, entry in self._progress.items()
-                if entry["model_id"] == model_id
-            ]
+                    "speed": round(speed, 1),
+                    "eta": round(eta, 1) if eta is not None else None,
+                })
+            return results
 
     def clear(self) -> None:
         """Remove all entries."""

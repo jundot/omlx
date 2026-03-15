@@ -191,6 +191,8 @@
                                                     </div>
                                                     <span class="text-[10px] text-blue-500 font-medium w-8 text-right" x-text="(pp.total > 0 ? Math.round(pp.processed / pp.total * 100) : 0) + '%'"></span>
                                                     <span class="text-[10px] text-neutral-400" x-text="formatTokenCount(pp.processed) + ' / ' + formatTokenCount(pp.total) + ' tok'"></span>
+                                                    <span x-show="pp.speed > 0" class="text-[10px] text-neutral-400"
+                                                          x-text="'(' + pp.speed.toFixed(0) + ' tok/s' + (pp.eta != null ? ', ' + (pp.eta >= 60 ? Math.floor(pp.eta / 60) + 'm ' + Math.round(pp.eta % 60) + 's' : Math.round(pp.eta) + 's') + ' left' : '') + ')'"></span>
                                                 </div>
                                             </template>
                                         </div>

@@ -2,8 +2,8 @@
 """Tests for PrefillProgressTracker."""
 
 import threading
-
-import pytest
+import time
+from unittest.mock import patch
 
 from omlx.prefill_progress import PrefillProgressTracker
 
@@ -69,6 +69,32 @@ class TestPrefillProgressTracker:
         self.tracker.clear()
         assert len(self.tracker.get_model_progress("llama-3b")) == 0
         assert len(self.tracker.get_model_progress("qwen-7b")) == 0
+
+    def test_speed_zero_on_first_update(self):
+        self.tracker.update("req-1", 2048, 8192, "llama-3b")
+        result = self.tracker.get_model_progress("llama-3b")
+        assert result[0]["speed"] == 0.0
+        assert result[0]["eta"] is None
+
+    def test_speed_and_eta_calculation(self):
+        t = 100.0
+        with patch("omlx.prefill_progress.time") as mock_time:
+            mock_time.monotonic.return_value = t
+            self.tracker.update("req-1", 0, 8192, "llama-3b")
+
+            # 1 second later, processed 2048 tokens
+            mock_time.monotonic.return_value = t + 1.0
+            self.tracker.update("req-1", 2048, 8192, "llama-3b")
+
+        result = self.tracker.get_model_progress("llama-3b")
+        assert result[0]["speed"] == 2048.0
+        # eta = (8192 - 2048) / 2048 = 3.0 seconds
+        assert result[0]["eta"] == 3.0
+
+    def test_eta_none_when_speed_zero(self):
+        self.tracker.update("req-1", 2048, 8192, "llama-3b")
+        result = self.tracker.get_model_progress("llama-3b")
+        assert result[0]["eta"] is None
 
     def test_thread_safety(self):
         """Concurrent updates from multiple threads should not corrupt state."""
