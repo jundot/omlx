@@ -495,7 +495,7 @@
                                     <i data-lucide="pencil" class="w-4 h-4"></i>
                                 </button>
                                 <template x-if="editingIndex !== index">
-                                    <div class="user-message-bubble" x-html="renderMarkdown(msg.content)"></div>
+                                    <div class="user-message-bubble" x-html="renderContent(msg.content)"></div>
                                 </template>
                                 <template x-if="editingIndex === index">
                                     <div class="user-message-bubble" style="padding: 0; background: transparent;">
@@ -531,7 +531,7 @@
                                     </button>
                                 </div>
                             </div>
-                            <div class="message-body markdown-content" x-html="renderMarkdown(msg.content)"></div>
+                            <div class="message-body markdown-content" x-html="renderContent(msg.content)"></div>
                         </div>
                     </div>
                 </template>
@@ -565,23 +565,81 @@
         <div class="p-4 border-t border-border-faint bg-surface-primary flex-shrink-0">
             <div class="max-w-4xl mx-auto">
                 <div class="input-container flex items-end">
-                    <textarea
-                        x-model="inputMessage"
-                        @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); sendMessage(); }"
-                        @input="autoResize($event.target)"
-                        placeholder="{{ t('chat.input_placeholder') }}"
-                        :disabled="!apiKeySet || !currentModel || isStreaming"
-                        rows="1"
-                        class="flex-1 px-4 py-3 bg-transparent resize-none outline-none text-sm max-h-32"
-                        style="color: var(--text-primary);"
-                    ></textarea>
-                    <button
-                        @click="sendMessage()"
-                        :disabled="!inputMessage.trim() || !apiKeySet || !currentModel || isStreaming"
-                        class="w-10 h-10 m-1 bg-neutral-900 hover:bg-neutral-800 disabled:bg-neutral-300 rounded-full transition-colors flex items-center justify-center flex-shrink-0"
-                    >
-                        <i data-lucide="arrow-up" class="w-4 h-4 text-white"></i>
-                    </button>
+                    <div class="flex-1 flex flex-col">
+                        <!-- Image thumbnails display area -->
+                        <div class="flex flex-wrap gap-2 mb-2 min-h-[1px]" x-show="uploadImages.length > 0">
+                            <template x-for="(image, index) in uploadImages" :key="index">
+                                <div class="relative group">
+                                    <img
+                                        :src="image.preview"
+                                        class="w-16 h-16 object-cover rounded-lg border border-border-faint"
+                                        style="max-width: 64px; max-height: 64px;"
+                                        alt="Uploaded image"
+                                    >
+                                    <button
+                                        @click="removeUploadedImage(index)"
+                                        class="absolute -top-2 -right-2 w-5 h-5 bg-red-500 text-white rounded-full flex items-center justify-center hover:bg-red-600 transition-colors shadow-sm"
+                                        :title="window.t('chat.remove_image')"
+                                        style="display: flex; align-items: center; justify-content: center; font-size: 12px;"
+                                    >
+                                        <i data-lucide="x" class="w-3 h-3"></i>
+                                    </button>
+                                </div>
+                            </template>
+                        </div>
+                        <div class="flex items-end gap-2">
+                            <!-- Image upload button -->
+                            <button
+                                x-show="hasVisionSupport()"
+                                type="button"
+                                @click="triggerImageUpload()"
+                                :disabled="!apiKeySet || !currentModel || isStreaming"
+                                class="p-2 hover:bg-neutral-100 rounded-lg transition-colors flex items-center justify-center"
+                                :title="window.t('chat.add_image')"
+                                style="color: var(--text-secondary);"
+                            >
+                                <i data-lucide="image" class="w-5 h-5"></i>
+                            </button>
+                            <!-- Hidden file input -->
+                            <input
+                                x-show="hasVisionSupport()"
+                                type="file"
+                                x-ref="fileInput"
+                                class="hidden"
+                                multiple
+                                accept="image/jpeg,image/png,image/webp"
+                                @change="handleImageUpload($event)"
+                            />
+                            <!-- Text input -->
+                            <textarea
+                                x-model="inputMessage"
+                                @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); sendMessage(); }"
+                                @input="autoResize($event.target)"
+                                placeholder="{{ t('chat.input_placeholder') }}"
+                                :disabled="!apiKeySet || !currentModel || isStreaming"
+                                rows="1"
+                                class="flex-1 px-4 py-2 bg-transparent resize-none outline-none text-sm max-h-32"
+                                style="color: var(--text-primary);"
+                            ></textarea>
+                            <!-- Send button with image count badge -->
+                            <div class="relative">
+                                <button
+                                    @click="sendMessage()"
+                                    :disabled="(!inputMessage.trim() && uploadImages.length === 0) || !apiKeySet || !currentModel || isStreaming"
+                                    class="w-10 h-10 bg-neutral-900 hover:bg-neutral-800 disabled:bg-neutral-300 rounded-full transition-colors flex items-center justify-center"
+                                    style="color: white;"
+                                >
+                                    <i data-lucide="arrow-up" class="w-5 h-5"></i>
+                                </button>
+                                <!-- Image count badge -->
+                                <div
+                                    x-show="uploadImages.length > 0"
+                                    class="absolute -top-1 -right-1 w-4 h-4 bg-neutral-900 text-white text-[10px] flex items-center justify-center rounded-full"
+                                    x-text="uploadImages.length"
+                                ></div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -652,6 +710,11 @@
             // Edit State
             editingIndex: null,
             editContent: '',
+
+            // Image Upload State
+            uploadImages: [],  // Array of { preview: string, base64: string } objects
+            // Model vision support tracking
+            modelTypeMap: {},  // Map model_id -> model_type ("llm" or "vlm")
 
             async init() {
                 // Auto-inject API key from server (admin session already authenticated)
@@ -780,6 +843,27 @@
                             this.currentModel = this.availableModels[0].id;
                         }
                     }
+
+                    // Fetch model status to detect vision support
+                    try {
+                        const statusResponse = await fetch('/v1/models/status', {
+                            headers: {
+                                'Authorization': `Bearer ${this.getApiKey()}`
+                            }
+                        });
+                        if (statusResponse.ok) {
+                            const statusData = await statusResponse.json();
+                            // Build map of model_id -> model_type
+                            this.modelTypeMap = {};
+                            if (statusData.models) {
+                                statusData.models.forEach(m => {
+                                    this.modelTypeMap[m.id] = m.model_type || 'llm';
+                                });
+                            }
+                        }
+                    } catch (statusError) {
+                        // Model status endpoint not available, fall back to default
+                    }
                 } catch (error) {
                     console.error('Error loading models:', error);
                 }
@@ -787,6 +871,13 @@
 
             selectModel(modelId) {
                 this.currentModel = modelId;
+            },
+
+            // Check if the current model supports vision (VLM)
+            hasVisionSupport() {
+                if (!this.currentModel) return false;
+                const modelType = this.modelTypeMap[this.currentModel];
+                return modelType === 'vlm';
             },
 
             loadChatHistory() {
@@ -807,6 +898,8 @@
             startNewChat() {
                 this.currentChatId = 'chat_' + Date.now();
                 this.messages = [];
+                this.uploadImages = [];
+                this.inputMessage = '';
                 this.sidebarOpen = window.innerWidth >= 768;
             },
 
@@ -815,10 +908,13 @@
                 if (chat) {
                     this.currentChatId = chatId;
                     this.messages = chat.messages || [];
+                    // Restore uploadImages if stored in chat data
+                    this.uploadImages = chat.uploadImages || [];
                     if (chat.model) {
                         this.currentModel = chat.model;
                     }
                 }
+                this.inputMessage = '';
                 this.sidebarOpen = window.innerWidth >= 768;
             },
 
@@ -826,10 +922,28 @@
                 if (!this.currentChatId || this.messages.length === 0) return;
 
                 const existingIndex = this.chatHistory.findIndex(c => c.id === this.currentChatId);
+                
+                // Extract text content for title, handle both string and array format
+                let title = window.t('chat.new_chat_title');
+                const firstMessage = this.messages[0];
+                if (firstMessage) {
+                    if (typeof firstMessage.content === 'string') {
+                        title = firstMessage.content.slice(0, 50);
+                    } else if (Array.isArray(firstMessage.content)) {
+                        // Extract text parts from array format
+                        const textParts = firstMessage.content
+                            .filter(part => part.type === 'input_text')
+                            .map(part => part.text)
+                            .join(' ');
+                        title = textParts.slice(0, 50);
+                    }
+                }
+                
                 const chatData = {
                     id: this.currentChatId,
                     title: this.messages[0]?.content?.slice(0, 50) || window.t('chat.new_chat_title'),
                     messages: this.messages,
+                    uploadImages: this.uploadImages,
                     model: this.currentModel,
                     updatedAt: new Date().toISOString()
                 };
@@ -846,27 +960,130 @@
             },
 
             async sendMessage() {
-                if (!this.inputMessage.trim() || !this.currentModel || this.isStreaming) return;
+                if (!this.currentModel || this.isStreaming) return;
 
-                const userMessage = this.inputMessage.trim();
-                this.inputMessage = '';
+                // Check if there's content (text or images)
+                if (!this.inputMessage.trim() && this.uploadImages.length === 0) {
+                    return;
+                }
+
+                const userText = this.inputMessage.trim();
+                const images = this.uploadImages;
 
                 // Create new chat if needed
                 if (!this.currentChatId) {
                     this.currentChatId = 'chat_' + Date.now();
                 }
 
+                // Build content array for the message
+                let content;
+                if (images.length > 0) {
+                    // Build content array with input_text and input_image parts
+                    content = [];
+                    if (userText) {
+                        content.push({ type: 'input_text', text: userText });
+                    }
+                    // Add all uploaded images as input_image parts
+                    images.forEach(img => {
+                        content.push({ type: 'input_image', image_url: img.base64 });
+                    });
+                } else {
+                    // Text-only message
+                    content = userText;
+                }
+
                 // Add user message
                 this.messages.push({
                     role: 'user',
-                    content: userMessage
+                    content: content
                 });
+
+                // Clear upload state
+                this.uploadImages = [];
+                this.inputMessage = '';
 
                 // Force scroll to bottom when sending message
                 this.forceScrollToBottom();
 
                 // Start streaming
                 await this.streamResponse();
+            },
+
+            // Image upload handlers
+            triggerImageUpload() {
+                if (this.$refs.fileInput) {
+                    this.$refs.fileInput.click();
+                }
+            },
+
+            async handleImageUpload(event) {
+                const files = event.target.files;
+                if (!files || files.length === 0) {
+                    return;
+                }
+
+                const maxImages = 10;  // Maximum images per message
+                const maxFileSize = 10 * 1024 * 1024;  // 10MB
+                const validTypes = ['image/jpeg', 'image/png', 'image/webp'];
+
+                const newImages = [];
+
+                for (let i = 0; i < files.length; i++) {
+                    const file = files[i];
+
+                    // Validate file type
+                    if (!validTypes.includes(file.type)) {
+                        continue;
+                    }
+
+                    // Validate file size
+                    if (file.size > maxFileSize) {
+                        continue;
+                    }
+
+                    // Check if we've reached the limit
+                    if (this.uploadImages.length + newImages.length >= maxImages) {
+                        break;
+                    }
+
+                    // Read file as base64
+                    const base64Data = await this.readImageAsBase64(file);
+                    if (base64Data) {
+                        // Determine mime type from file or use image/jpeg as default
+                        const mimeType = file.type || 'image/jpeg';
+                        newImages.push({
+                            preview: base64Data,
+                            base64: base64Data
+                        });
+                    }
+                }
+
+                this.uploadImages = [...this.uploadImages, ...newImages];
+
+                // Reset file input
+                if (this.$refs.fileInput) {
+                    this.$refs.fileInput.value = '';
+                }
+            },
+
+            readImageAsBase64(file) {
+                return new Promise((resolve) => {
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        const result = e.target?.result;
+                        if (result && typeof result === 'string') {
+                            resolve(result);  // Return the full data URL
+                        } else {
+                            resolve(null);
+                        }
+                    };
+                    reader.onerror = () => resolve(null);
+                    reader.readAsDataURL(file);
+                });
+            },
+
+            removeUploadedImage(index) {
+                this.uploadImages.splice(index, 1);
             },
 
             async streamResponse() {
@@ -1196,6 +1413,30 @@
                 } catch (e) {
                     return text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
                 }
+            },
+
+            // Render content that may be text or array with images (for user messages)
+            renderContent(content) {
+                if (!content) return '';
+
+                // Handle array format (input_text/input_image parts)
+                if (Array.isArray(content)) {
+                    let html = '';
+                    content.forEach(part => {
+                        if (part.type === 'input_text') {
+                            html += marked.parse(part.text || '');
+                        } else if (part.type === 'input_image') {
+                            const url = part.image_url || '';
+                            if (url) {
+                                html += `<div class="my-2"><img src="${this.escapeHtml(url)}" class="max-w-full h-auto rounded-lg border border-border-faint" style="max-height: 256px;" alt="Uploaded image"></div>`;
+                            }
+                        }
+                    });
+                    return html;
+                }
+
+                // Handle simple string content (backward compatible)
+                return this.renderMarkdown(content);
             },
 
             // Render markdown for streaming content (pure HTML generator, no side effects)
