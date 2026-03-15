@@ -171,12 +171,17 @@
                                             <!-- Memory size -->
                                             <span class="text-xs text-neutral-400 font-mono w-16 text-right" x-text="m.estimated_size_formatted"></span>
                                             <!-- Unload button -->
-                                            <button x-show="!m.is_loading"
-                                                    @click="unloadModel(m.id)"
-                                                    class="p-1 rounded-md text-neutral-300 hover:text-red-500 hover:bg-red-50 transition-all opacity-0 group-hover:opacity-100"
-                                                    :title="window.t('status.active_models.unload')">
-                                                <i data-lucide="power-off" class="w-3.5 h-3.5"></i>
-                                            </button>
+                                            <div x-show="!m.is_loading" class="relative opacity-0 group-hover:opacity-100 transition-all"
+                                                 x-data="{ showTip: false }"
+                                                 @mouseenter="showTip = true" @mouseleave="showTip = false">
+                                                <button @click="unloadModel(m.id)"
+                                                        class="p-1 rounded-md text-neutral-300 hover:text-red-500 hover:bg-red-50 transition-all">
+                                                    <i data-lucide="log-out" class="w-3.5 h-3.5"></i>
+                                                </button>
+                                                <div x-show="showTip" x-cloak
+                                                     class="absolute top-1/2 -translate-y-1/2 right-full mr-1.5 px-2 py-1 text-[10px] font-medium text-white bg-neutral-800 rounded whitespace-nowrap z-10"
+                                                     x-text="window.t('status.active_models.unload')"></div>
+                                            </div>
                                         </div>
                                     </div>
                                     <!-- Prefill sub-rows -->

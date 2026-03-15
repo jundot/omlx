@@ -1056,6 +1056,7 @@
                         const alltimeData = await alltimeResponse.json();
                         this.alltimeStats = { ...this.alltimeStats, ...alltimeData };
                     }
+                    this.$nextTick(() => lucide.createIcons());
                 } catch (err) {
                     console.error('Failed to load stats:', err);
                 }
