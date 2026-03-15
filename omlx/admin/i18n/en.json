@@ -48,7 +48,7 @@
     "navbar.update_available": "Update available: v{version}",
     "navbar.go_to_github": "Go to GitHub",
 
-    "status.section_label": "Status",
+    "status.section_label": "Dashboard",
     "status.heading": "Serving Stats",
     "status.clear": "Clear",
     "status.clear_tooltip": "Clear session metrics",

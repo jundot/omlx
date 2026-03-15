@@ -44,7 +44,7 @@
   "navbar.logout": "退出登录",
   "navbar.update_available": "有可用更新: v{version}",
   "navbar.go_to_github": "前往GitHub",
-  "status.section_label": "状态",
+  "status.section_label": "仪表盘",
   "status.heading": "服务统计",
   "status.clear": "清除",
   "status.clear_tooltip": "清除会话指标",

@@ -48,7 +48,7 @@
   "navbar.update_available": "アップデートあり: v{version}",
   "navbar.go_to_github": "GitHubへ移動",
 
-  "status.section_label": "ステータス",
+  "status.section_label": "ダッシュボード",
   "status.heading": "配信統計",
   "status.clear": "クリア",
   "status.clear_tooltip": "セッションメトリクスをクリア",

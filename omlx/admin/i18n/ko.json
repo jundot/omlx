@@ -48,7 +48,7 @@
   "navbar.update_available": "업데이트 가능: v{version}",
   "navbar.go_to_github": "GitHub으로 이동",
 
-  "status.section_label": "상태",
+  "status.section_label": "대시보드",
   "status.heading": "서빙 통계",
   "status.clear": "초기화",
   "status.clear_tooltip": "세션 지표 초기화",

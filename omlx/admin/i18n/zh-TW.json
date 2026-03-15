@@ -42,7 +42,7 @@
   "navbar.theme.dark_mode": "深色模式",
   "navbar.theme.light_mode": "淺色模式",
   "navbar.logout": "登出",
-  "status.section_label": "狀態",
+  "status.section_label": "儀表板",
   "status.heading": "服務統計",
   "status.clear": "清除",
   "status.clear_tooltip": "清除工作階段指標",
