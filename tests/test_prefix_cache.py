@@ -102,6 +102,45 @@ class TestBlockAwarePrefixCache:
         cache2 = BlockAwarePrefixCache(model2, paged_cache)
         assert cache2.expected_num_layers == 24
 
+    def test_get_model_num_layers_with_make_cache(self, paged_cache):
+        """Test make_cache() takes priority over model.layers for hybrid models."""
+        # Hybrid model: 88 architectural layers but only 48 produce cache
+        model = MockModel(num_layers=88)
+        model.make_cache = lambda: [MagicMock() for _ in range(48)]
+        cache = BlockAwarePrefixCache(model, paged_cache)
+        assert cache.expected_num_layers == 48
+
+        # Non-hybrid model: make_cache() returns same count as model.layers
+        model2 = MockModel(num_layers=32)
+        model2.make_cache = lambda: [MagicMock() for _ in range(32)]
+        cache2 = BlockAwarePrefixCache(model2, paged_cache)
+        assert cache2.expected_num_layers == 32
+
+    def test_get_model_num_layers_make_cache_exception(self, paged_cache):
+        """Test fallback to model.layers when make_cache() raises."""
+        model = MockModel(num_layers=88)
+
+        def bad_make_cache():
+            raise RuntimeError("model not initialized")
+
+        model.make_cache = bad_make_cache
+        cache = BlockAwarePrefixCache(model, paged_cache)
+        assert cache.expected_num_layers == 88
+
+    def test_get_model_num_layers_make_cache_empty(self, paged_cache):
+        """Test fallback when make_cache() returns empty list."""
+        model = MockModel(num_layers=32)
+        model.make_cache = lambda: []
+        cache = BlockAwarePrefixCache(model, paged_cache)
+        assert cache.expected_num_layers == 32
+
+    def test_get_model_num_layers_make_cache_non_list(self, paged_cache):
+        """Test fallback when make_cache() returns non-list."""
+        model = MockModel(num_layers=32)
+        model.make_cache = lambda: None
+        cache = BlockAwarePrefixCache(model, paged_cache)
+        assert cache.expected_num_layers == 32
+
     def test_fetch_cache_miss(self, prefix_cache):
         """Test fetch_cache returns miss when no cache exists."""
         tokens = [1, 2, 3, 4, 5, 6, 7, 8]
