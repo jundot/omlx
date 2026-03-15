@@ -2281,7 +2281,12 @@ async def get_server_stats(
     port = global_settings.server.port if global_settings else 8000
     api_key = global_settings.auth.api_key if global_settings else ""
 
+    from ..model_discovery import format_size
+    from ..prefill_progress import get_prefill_tracker
     from ..utils.install import get_cli_prefix
+
+    # Build active_models data for the dashboard card.
+    active_models_data = _build_active_models_data()
 
     return {
         **snapshot,
@@ -2300,6 +2305,76 @@ async def get_server_stats(
             else 200000
         ),
         "engines": _get_engine_info(),
+        "active_models": active_models_data,
+    }
+
+
+def _build_active_models_data() -> dict:
+    """Build active models status for the dashboard Active Models card."""
+    from ..model_discovery import format_size
+    from ..prefill_progress import get_prefill_tracker
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        return {
+            "models": [],
+            "model_memory_used": 0,
+            "model_memory_max": 0,
+            "total_active_requests": 0,
+            "total_waiting_requests": 0,
+        }
+
+    tracker = get_prefill_tracker()
+    status = engine_pool.get_status()
+    models = []
+    total_active = 0
+    total_waiting = 0
+
+    for model_info in status.get("models", []):
+        if not model_info.get("loaded") and not model_info.get("is_loading"):
+            continue
+
+        model_id = model_info["id"]
+        active_requests = 0
+        waiting_requests = 0
+
+        # Get per-model active/waiting request counts.
+        # Follow the same pattern as server.py /api/status endpoint.
+        entry = engine_pool._entries.get(model_id)
+        if entry and entry.engine is not None:
+            async_core = getattr(entry.engine, "_engine", None)
+            if async_core is not None:
+                core = getattr(async_core, "engine", None)
+                if core is not None:
+                    active_requests = len(getattr(core, "_output_collectors", {}))
+                    sched = getattr(core, "scheduler", None)
+                    if sched is not None:
+                        waiting_requests = len(getattr(sched, "waiting", []))
+
+        prefilling = tracker.get_model_progress(model_id)
+
+        models.append({
+            "id": model_id,
+            "estimated_size": model_info.get("estimated_size", 0),
+            "estimated_size_formatted": format_size(
+                model_info.get("estimated_size", 0)
+            ),
+            "pinned": model_info.get("pinned", False),
+            "is_loading": model_info.get("is_loading", False),
+            "active_requests": active_requests,
+            "waiting_requests": waiting_requests,
+            "prefilling": prefilling,
+        })
+
+        total_active += active_requests
+        total_waiting += waiting_requests
+
+    return {
+        "models": models,
+        "model_memory_used": status.get("current_model_memory", 0),
+        "model_memory_max": status.get("max_model_memory", 0),
+        "total_active_requests": total_active,
+        "total_waiting_requests": total_waiting,
     }
 
 

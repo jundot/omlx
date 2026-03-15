@@ -111,6 +111,13 @@
                 port: 8000,
                 api_key: '',
                 engines: {},
+                active_models: {
+                    models: [],
+                    model_memory_used: 0,
+                    model_memory_max: 0,
+                    total_active_requests: 0,
+                    total_waiting_requests: 0,
+                },
             },
             alltimeStats: {
                 total_prompt_tokens: 0,
@@ -1100,6 +1107,24 @@
                 if (value >= 1000000000) return 'text-2xl';
                 if (value >= 1000000) return 'text-3xl';
                 return 'text-5xl';
+            },
+
+            formatSizeBytes(bytes) {
+                if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+                if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(0) + ' MB';
+                return '0';
+            },
+
+            formatTokenCount(n) {
+                if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+                if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+                return String(n);
+            },
+
+            get activeModelsMemoryPercent() {
+                const am = this.stats.active_models;
+                if (!am || !am.model_memory_max) return 0;
+                return Math.min(100, (am.model_memory_used / am.model_memory_max) * 100);
             },
 
             copyToClipboard(text) {

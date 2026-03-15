@@ -100,6 +100,113 @@
                         </div>
                     </div>
 
+                    <!-- Active Models -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.active_models.section_label') }}</span>
+                            </div>
+                            <div class="flex items-center gap-3">
+                                <!-- Memory progress bar -->
+                                <div class="flex items-center gap-2">
+                                    <div class="w-24 h-2 bg-neutral-200 rounded-full overflow-hidden">
+                                        <div class="h-full bg-neutral-700 rounded-full transition-all duration-500"
+                                             :style="'width: ' + activeModelsMemoryPercent + '%'"></div>
+                                    </div>
+                                    <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
+                                          x-text="formatSizeBytes(stats.active_models.model_memory_used) + ' / ' + formatSizeBytes(stats.active_models.model_memory_max)"></span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="divide-y divide-neutral-100">
+                            <!-- Empty state -->
+                            <div x-show="!stats.active_models.models || stats.active_models.models.length === 0"
+                                 class="px-6 py-8 text-center text-sm text-neutral-400">
+                                {{ t('status.active_models.no_models') }}
+                            </div>
+                            <!-- Model rows -->
+                            <template x-for="m in (stats.active_models.models || [])" :key="m.id">
+                                <div class="px-6 py-3">
+                                    <div class="flex items-center justify-between">
+                                        <div class="flex items-center gap-2">
+                                            <!-- Pin icon -->
+                                            <i x-show="m.pinned" data-lucide="pin" class="w-3 h-3 text-neutral-400 flex-shrink-0"></i>
+                                            <span x-show="!m.pinned" class="w-3 flex-shrink-0"></span>
+                                            <!-- Model name -->
+                                            <span class="text-sm font-medium text-neutral-800" x-text="m.id"></span>
+                                        </div>
+                                        <div class="flex items-center gap-3">
+                                            <!-- Status indicator -->
+                                            <div class="flex items-center gap-1.5">
+                                                <!-- Loading spinner -->
+                                                <template x-if="m.is_loading">
+                                                    <div class="flex items-center gap-1.5">
+                                                        <svg class="w-3 h-3 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
+                                                        <span class="text-xs text-blue-500 font-medium">loading</span>
+                                                    </div>
+                                                </template>
+                                                <!-- Prefilling -->
+                                                <template x-if="!m.is_loading && m.prefilling && m.prefilling.length > 0">
+                                                    <div class="flex items-center gap-1.5">
+                                                        <span class="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></span>
+                                                        <span class="text-xs text-blue-600 font-medium" x-text="m.prefilling.length + ' PP' + (m.active_requests > 0 ? ' · ' + m.active_requests + ' ' + window.t('status.active_models.req') : '')"></span>
+                                                    </div>
+                                                </template>
+                                                <!-- Active (generation only) -->
+                                                <template x-if="!m.is_loading && (!m.prefilling || m.prefilling.length === 0) && m.active_requests > 0">
+                                                    <div class="flex items-center gap-1.5">
+                                                        <span class="w-2 h-2 rounded-full bg-green-500"></span>
+                                                        <span class="text-xs text-green-600 font-medium" x-text="m.active_requests + ' ' + window.t('status.active_models.req')"></span>
+                                                    </div>
+                                                </template>
+                                                <!-- Idle -->
+                                                <template x-if="!m.is_loading && (!m.prefilling || m.prefilling.length === 0) && m.active_requests === 0">
+                                                    <div class="flex items-center gap-1.5">
+                                                        <span class="w-2 h-2 rounded-full bg-neutral-300"></span>
+                                                        <span class="text-xs text-neutral-400">idle</span>
+                                                    </div>
+                                                </template>
+                                            </div>
+                                            <!-- Memory size -->
+                                            <span class="text-xs text-neutral-400 font-mono w-16 text-right" x-text="m.estimated_size_formatted"></span>
+                                        </div>
+                                    </div>
+                                    <!-- Prefill sub-rows -->
+                                    <template x-if="m.prefilling && m.prefilling.length > 0">
+                                        <div class="mt-2 ml-5 space-y-1.5">
+                                            <template x-for="pp in m.prefilling" :key="pp.request_id">
+                                                <div class="flex items-center gap-2">
+                                                    <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="pp.request_id.substring(0, 8)"></span>
+                                                    <div class="flex-1 h-1.5 bg-neutral-100 rounded-full overflow-hidden max-w-[120px]">
+                                                        <div class="h-full bg-blue-400 rounded-full transition-all duration-300"
+                                                             :style="'width: ' + (pp.total > 0 ? Math.min(100, pp.processed / pp.total * 100) : 0) + '%'"></div>
+                                                    </div>
+                                                    <span class="text-[10px] text-blue-500 font-medium w-8 text-right" x-text="(pp.total > 0 ? Math.round(pp.processed / pp.total * 100) : 0) + '%'"></span>
+                                                    <span class="text-[10px] text-neutral-400" x-text="formatTokenCount(pp.processed) + ' / ' + formatTokenCount(pp.total) + ' tok'"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+                                </div>
+                            </template>
+                        </div>
+                        <!-- Footer: Active/Waiting totals -->
+                        <div x-show="stats.active_models.total_active_requests > 0 || stats.active_models.total_waiting_requests > 0"
+                             class="px-6 py-3 bg-neutral-50 border-t border-neutral-100 flex items-center gap-3">
+                            <span x-show="stats.active_models.total_active_requests > 0"
+                                  class="text-xs text-neutral-500">
+                                <span class="font-medium text-neutral-600" x-text="window.t('status.active_models.active') + ': ' + stats.active_models.total_active_requests"></span>
+                            </span>
+                            <span x-show="stats.active_models.total_active_requests > 0 && stats.active_models.total_waiting_requests > 0"
+                                  class="text-neutral-300">·</span>
+                            <span x-show="stats.active_models.total_waiting_requests > 0"
+                                  class="text-xs text-neutral-500">
+                                <span class="font-medium text-neutral-600" x-text="window.t('status.active_models.waiting') + ': ' + stats.active_models.total_waiting_requests"></span>
+                            </span>
+                        </div>
+                    </div>
+
                     <!-- API Endpoints -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">

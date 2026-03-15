@@ -1494,6 +1494,7 @@ class Scheduler:
             prefill_batch_size=1,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
+            prompt_progress_callback=self._on_prompt_progress,
             boundary_block_size=self.config.paged_cache_block_size,
             prefill_boundary_callback=(
                 self._on_prefill_boundary_snapshot
@@ -1505,6 +1506,34 @@ class Scheduler:
         bg._memory_limit_bytes = self._memory_limit_bytes
         bg._memory_hard_limit_bytes = self._memory_hard_limit_bytes
         return bg
+
+    def _on_prompt_progress(
+        self, updates: List[Tuple[int, int, int]]
+    ) -> None:
+        """Callback from BatchGenerator's prefill loop.
+
+        Called once per prefill chunk (default 2048 tokens) with a list of
+        (uid, processed_tokens, total_tokens) tuples.  Updates the global
+        PrefillProgressTracker so the admin dashboard can display per-request
+        prefill progress.  Only touches CPU counters — zero GPU overhead.
+        """
+        import os
+
+        from .prefill_progress import get_prefill_tracker
+
+        tracker = get_prefill_tracker()
+        # model_name is a full path; use basename to match engine_pool model_id.
+        model_id = os.path.basename(self.config.model_name.rstrip("/"))
+        for uid, processed, total in updates:
+            request_id = self.uid_to_request_id.get(uid)
+            if request_id is None:
+                continue
+            tracker.update(
+                request_id=request_id,
+                processed=processed,
+                total=total,
+                model_id=model_id,
+            )
 
     def _build_sampler_and_processors(
         self, sampling_params: SamplingParams
@@ -2492,6 +2521,11 @@ class Scheduler:
         if self._boundary_snapshot_store is not None:
             self._boundary_snapshot_store.cleanup_request(request_id)
 
+        # Remove from prefill progress tracker.
+        from .prefill_progress import get_prefill_tracker
+
+        get_prefill_tracker().remove(request_id)
+
         # Mark as aborted
         request.set_finished(RequestStatus.FINISHED_ABORTED)
         self.finished_req_ids.add(request_id)
@@ -2957,6 +2991,13 @@ class Scheduler:
         # active_batch = None after mx.async_eval when all requests finish.
         if finished_ids:
             mx.synchronize(generation_stream)
+
+        # Remove finished requests from prefill progress tracker.
+        from .prefill_progress import get_prefill_tracker
+
+        tracker = get_prefill_tracker()
+        for rid in finished_ids:
+            tracker.remove(rid)
 
         for request_id in finished_ids:
             request = self.running.get(request_id)
