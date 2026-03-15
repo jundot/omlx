@@ -574,10 +574,9 @@ class PreferencesWindowController(NSObject):
         alert = NSAlert.alloc().init()
         alert.setMessageText_("Reset All Settings?")
         alert.setInformativeText_(
-            f"This will delete ALL data in:\n"
+            f"This will delete cache, logs, and server settings in:\n"
             f"{base_path}\n\n"
-            "WARNING: This includes downloaded models, cache, "
-            "logs, and server settings.\n\n"
+            "Downloaded models will be preserved.\n\n"
             "This action cannot be undone."
         )
         alert.setAlertStyle_(NSAlertStyleCritical)
@@ -591,11 +590,22 @@ class PreferencesWindowController(NSObject):
 
             base = Path(base_path)
             if base.exists():
-                try:
-                    shutil.rmtree(base)
-                    logger.info(f"Deleted base directory: {base}")
-                except OSError as e:
-                    logger.error(f"Failed to delete base directory: {e}")
+                model_dir = Path(
+                    self.config.get_effective_model_dir()
+                ).resolve()
+                for item in base.iterdir():
+                    if item.resolve() == model_dir:
+                        continue
+                    try:
+                        if item.is_dir():
+                            shutil.rmtree(item)
+                        else:
+                            item.unlink()
+                    except OSError as e:
+                        logger.error(f"Failed to delete {item}: {e}")
+                logger.info(
+                    f"Reset base directory: {base} (preserved {model_dir})"
+                )
 
             from .config import ServerConfig
 
