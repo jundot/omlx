@@ -323,16 +323,18 @@
 
     /* Image upload styles */
     .image-preview-container {
-        padding: 8px;
-        border-bottom: 1px solid var(--border-faint);
+        padding: 8px 8px 0;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
     }
     .image-preview-wrapper {
         position: relative;
         display: inline-block;
     }
     .image-preview-wrapper img {
-        height: 80px;
-        width: 80px;
+        height: 64px;
+        width: 64px;
         object-fit: cover;
         border-radius: 8px;
         border: 1px solid var(--border-faint);
@@ -341,8 +343,8 @@
         position: absolute;
         top: -6px;
         right: -6px;
-        width: 22px;
-        height: 22px;
+        width: 20px;
+        height: 20px;
         border-radius: 50%;
         background: var(--bg-secondary);
         border: 1px solid var(--border-normal);
@@ -352,6 +354,10 @@
         cursor: pointer;
         transition: all 0.15s;
         color: var(--text-tertiary);
+        opacity: 0;
+    }
+    .image-preview-wrapper:hover .image-remove-btn {
+        opacity: 1;
     }
     .image-remove-btn:hover {
         background: var(--bg-tertiary);
@@ -376,39 +382,39 @@
     }
 
     /* Drag and drop styles */
-    .chat-container {
-        transition: background-color 0.2s, border-color 0.2s;
-    }
-    .chat-container.drag-over {
+    .input-container.drag-over {
+        border-color: var(--text-tertiary) !important;
+        border-style: dashed !important;
         background-color: var(--bg-tertiary);
     }
-    .chat-container.drag-over .input-container {
-        border-color: var(--text-tertiary);
-        border-style: dashed;
-    }
 
-    /* User message image */
-    .user-message-image {
+    /* User message images */
+    .user-message-images {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 8px;
+    }
+    .user-message-images img {
         max-width: 192px;
         max-height: 192px;
         object-fit: cover;
         border-radius: 8px;
-        margin-bottom: 8px;
+        cursor: pointer;
     }
     .user-message-image-placeholder {
-        max-width: 192px;
+        width: 80px;
         height: 80px;
         background: var(--bg-tertiary);
         border: 1px dashed var(--border-normal);
         border-radius: 8px;
-        margin-bottom: 8px;
         display: flex;
         flex-direction: column;
         align-items: center;
         justify-content: center;
         color: var(--text-muted);
-        font-size: 12px;
-        gap: 4px;
+        font-size: 10px;
+        gap: 2px;
     }
 
     /* Mobile responsive */
@@ -586,20 +592,28 @@
                                 </button>
                                 <template x-if="editingIndex !== index">
                                     <div>
-                                        <!-- Image thumbnail (current session) -->
-                                        <template x-if="msg.imagePreview">
-                                            <img :src="msg.imagePreview" class="user-message-image">
-                                        </template>
-                                        <!-- Image placeholder (historical messages from localStorage) -->
-                                        <template x-if="msg.hasImage && !msg.imagePreview">
-                                            <div class="user-message-image-placeholder">
-                                                <i data-lucide="image" class="w-6 h-6"></i>
-                                                <span x-text="window.t('chat.image_not_available') || 'Image'"></span>
+                                        <!-- Images from content array -->
+                                        <template x-if="getImageUrls(msg.content).length > 0">
+                                            <div class="user-message-images">
+                                                <template x-for="imgUrl in getImageUrls(msg.content)" :key="imgUrl.substring(0, 50)">
+                                                    <img :src="imgUrl" @click="window.open(imgUrl, '_blank')">
+                                                </template>
                                             </div>
                                         </template>
-                                        <!-- Text content (only show if there's text) -->
-                                        <template x-if="msg.content">
-                                            <div class="user-message-bubble" x-html="renderMarkdown(msg.content)"></div>
+                                        <!-- Placeholder for stripped images (restored from localStorage) -->
+                                        <template x-if="hasStrippedImages(msg.content)">
+                                            <div class="user-message-images">
+                                                <template x-for="(_, i) in getStrippedImageCount(msg.content)" :key="i">
+                                                    <div class="user-message-image-placeholder">
+                                                        <i data-lucide="image" class="w-5 h-5"></i>
+                                                        <span x-text="window.t('chat.image_not_available') || 'Image'"></span>
+                                                    </div>
+                                                </template>
+                                            </div>
+                                        </template>
+                                        <!-- Text content -->
+                                        <template x-if="getTextContent(msg.content)">
+                                            <div class="user-message-bubble" x-html="renderMarkdown(getTextContent(msg.content))"></div>
                                         </template>
                                     </div>
                                 </template>
@@ -672,26 +686,29 @@
             <div class="max-w-4xl mx-auto">
                 <div class="input-container" :class="{ 'drag-over': isDragOver }"
                      @dragover.prevent="isDragOver = true" @dragleave.prevent="isDragOver = false"
-                     @drop.prevent="handleDrop($event)">
-                    <!-- Hidden file input for image upload -->
-                    <input type="file" id="imageInput" accept="image/*"
+                     @drop.prevent="isDragOver = false; handleDrop($event)">
+                    <!-- Hidden file input for image upload (multiple) -->
+                    <input type="file" id="imageInput" accept="image/*" multiple
                            x-ref="imageInput" @change="handleImageSelect($event)"
                            class="hidden">
 
-                    <!-- Image preview area -->
-                    <div x-show="pendingImage" class="image-preview-container" x-cloak>
-                        <div class="image-preview-wrapper">
-                            <img :src="pendingImage" class="h-20 w-20 object-cover rounded-lg">
-                            <button @click="clearPendingImage()" class="image-remove-btn" :title="window.t('chat.remove_image')">
-                                <i data-lucide="x"></i>
-                            </button>
-                        </div>
+                    <!-- Image preview area (multi-image) -->
+                    <div x-show="uploadImages.length > 0" class="image-preview-container" x-cloak>
+                        <template x-for="(img, idx) in uploadImages" :key="img.id">
+                            <div class="image-preview-wrapper">
+                                <img :src="img.base64">
+                                <button @click="removeImage(idx)" class="image-remove-btn" :title="window.t('chat.remove_image')">
+                                    <i data-lucide="x"></i>
+                                </button>
+                            </div>
+                        </template>
                     </div>
 
                     <div class="flex items-end">
-                        <!-- Image upload button -->
-                        <button @click="$refs.imageInput.click()"
-                                :disabled="!apiKeySet || !currentModel || isStreaming"
+                        <!-- Image upload button (only for VLM models) -->
+                        <button x-show="hasVisionSupport()"
+                                @click="$refs.imageInput.click()"
+                                :disabled="!apiKeySet || !currentModel || isStreaming || uploadImages.length >= 10"
                                 class="image-upload-btn"
                                 :title="window.t('chat.upload_image')">
                             <i data-lucide="image" class="w-5 h-5"></i>
@@ -708,13 +725,19 @@
                             class="flex-1 px-4 py-3 bg-transparent resize-none outline-none text-sm max-h-32"
                             style="color: var(--text-primary);"
                         ></textarea>
-                        <button
-                            @click="sendMessage()"
-                            :disabled="(!inputMessage.trim() && !pendingImage) || !apiKeySet || !currentModel || isStreaming"
-                            class="w-10 h-10 m-1 bg-neutral-900 hover:bg-neutral-800 disabled:bg-neutral-300 rounded-full transition-colors flex items-center justify-center flex-shrink-0"
-                        >
-                            <i data-lucide="arrow-up" class="w-4 h-4 text-white"></i>
-                        </button>
+                        <div class="relative flex-shrink-0">
+                            <button
+                                @click="sendMessage()"
+                                :disabled="(!inputMessage.trim() && uploadImages.length === 0) || !apiKeySet || !currentModel || isStreaming"
+                                class="w-10 h-10 m-1 bg-neutral-900 hover:bg-neutral-800 disabled:bg-neutral-300 rounded-full transition-colors flex items-center justify-center"
+                            >
+                                <i data-lucide="arrow-up" class="w-4 h-4 text-white"></i>
+                            </button>
+                            <!-- Image count badge -->
+                            <div x-show="uploadImages.length > 0"
+                                 class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-neutral-700 text-white text-[10px] flex items-center justify-center rounded-full pointer-events-none"
+                                 x-text="uploadImages.length"></div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -788,8 +811,11 @@
             editContent: '',
 
             // Image Upload State
-            pendingImage: null,          // base64 data URI for API and preview
+            uploadImages: [],            // Array of { id, base64 } for pending images (max 10)
             isDragOver: false,           // drag-and-drop state
+
+            // VLM Detection State
+            modelTypeMap: {},            // { modelId: "llm"|"vlm"|"embedding"|"reranker" }
 
             async init() {
                 // Auto-inject API key from server (admin session already authenticated)
@@ -824,90 +850,82 @@
                     this.setupScrollListener();
                 });
 
-                // Setup drag and drop handlers
-                this.setupDragDropHandlers();
+            },
+
+            // ===== VLM Detection =====
+
+            async fetchModelTypes() {
+                try {
+                    const resp = await fetch('/v1/models/status', {
+                        headers: { 'Authorization': `Bearer ${this.getApiKey()}` }
+                    });
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    const map = {};
+                    for (const m of (data.models || [])) {
+                        map[m.id] = m.model_type || 'llm';
+                    }
+                    this.modelTypeMap = map;
+                } catch (e) {
+                    // Model status endpoint unavailable
+                }
+            },
+
+            hasVisionSupport() {
+                return this.modelTypeMap[this.currentModel] === 'vlm';
             },
 
             // ===== Image Upload Functions =====
 
-            setupDragDropHandlers() {
-                const container = document.getElementById('messagesContainer');
-                if (!container) return;
-
-                container.addEventListener('dragover', (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    container.classList.add('drag-over');
-                });
-
-                container.addEventListener('dragleave', (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    container.classList.remove('drag-over');
-                });
-
-                container.addEventListener('drop', (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    container.classList.remove('drag-over');
-
-                    const file = e.dataTransfer?.files[0];
-                    if (file) {
-                        this.loadImageFile(file);
-                    }
-                });
-            },
-
             handleDrop(event) {
-                const file = event.dataTransfer?.files[0];
-                if (file) {
-                    this.loadImageFile(file);
+                if (!this.hasVisionSupport()) return;
+                const files = event.dataTransfer?.files;
+                if (files) {
+                    Array.from(files).forEach(f => this.loadImageFile(f));
                 }
             },
 
             handleImageSelect(event) {
-                const file = event.target.files[0];
-                if (!file) return;
-                this.loadImageFile(file);
-                // Reset the input so the same file can be selected again
+                const files = event.target.files;
+                if (!files) return;
+                Array.from(files).forEach(f => this.loadImageFile(f));
                 event.target.value = '';
             },
 
             loadImageFile(file) {
-                // Validate file type
                 if (!file.type.startsWith('image/')) {
                     alert(window.t('chat.error.invalid_image_type'));
                     return;
                 }
 
-                // Validate file size (max 10MB)
                 const maxSize = 10 * 1024 * 1024;
                 if (file.size > maxSize) {
                     alert(window.t('chat.error.image_too_large'));
                     return;
                 }
 
-                // Clear any existing pending image first
-                this.clearPendingImage();
+                if (this.uploadImages.length >= 10) return;
 
-                // Read as base64 data URI for both preview and API
                 const reader = new FileReader();
                 reader.onload = (e) => {
-                    this.pendingImage = e.target.result;
+                    this.uploadImages.push({
+                        id: Date.now() + '_' + Math.random().toString(36).substr(2, 5),
+                        base64: e.target.result
+                    });
+                    this.$nextTick(() => lucide.createIcons());
                 };
                 reader.onerror = () => {
-                    console.error('Failed to read image file');
-                    this.clearPendingImage();
                     alert(window.t('chat.error.image_load_failed'));
                 };
                 reader.readAsDataURL(file);
             },
 
-            clearPendingImage() {
-                this.pendingImage = null;
+            removeImage(index) {
+                this.uploadImages.splice(index, 1);
             },
 
             handlePaste(event) {
+                if (!this.hasVisionSupport()) return;
                 const items = event.clipboardData?.items;
                 if (!items) return;
 
@@ -921,6 +939,34 @@
                         }
                     }
                 }
+            },
+
+            // ===== Content Helpers =====
+
+            getTextContent(content) {
+                if (typeof content === 'string') return content;
+                if (Array.isArray(content)) {
+                    return content.filter(p => p.type === 'text').map(p => p.text).join('\n');
+                }
+                return '';
+            },
+
+            getImageUrls(content) {
+                if (!Array.isArray(content)) return [];
+                return content
+                    .filter(p => p.type === 'image_url' && p.image_url?.url)
+                    .map(p => p.image_url.url);
+            },
+
+            hasStrippedImages(content) {
+                if (!Array.isArray(content)) return false;
+                return content.some(p => p.type === 'image_url' && !p.image_url?.url);
+            },
+
+            getStrippedImageCount(content) {
+                if (!Array.isArray(content)) return [];
+                const count = content.filter(p => p.type === 'image_url' && !p.image_url?.url).length;
+                return new Array(count);
             },
 
             // ===== End Image Upload Functions =====
@@ -1018,6 +1064,8 @@
                             this.currentModel = this.availableModels[0].id;
                         }
                     }
+                    // Fetch model types for VLM detection
+                    await this.fetchModelTypes();
                 } catch (error) {
                     console.error('Error loading models:', error);
                 }
@@ -1045,6 +1093,7 @@
             startNewChat() {
                 this.currentChatId = 'chat_' + Date.now();
                 this.messages = [];
+                this.uploadImages = [];
                 this.sidebarOpen = window.innerWidth >= 768;
             },
 
@@ -1065,23 +1114,26 @@
 
                 const existingIndex = this.chatHistory.findIndex(c => c.id === this.currentChatId);
 
-                // Strip large image data before saving to localStorage to avoid quota issues
-                // imageData (base64) can be very large, and imagePreview (blob URL) becomes invalid after refresh
+                // Strip base64 image data from content arrays to avoid localStorage quota issues
                 const messagesForStorage = this.messages.map(msg => {
-                    const stored = { ...msg };
-                    // Remove large base64 data
-                    delete stored.imageData;
-                    // Convert blob URL to a simple flag (blob URLs are invalid after page refresh)
-                    if (stored.imagePreview) {
-                        stored.hasImage = true;
-                        delete stored.imagePreview;
-                    }
-                    return stored;
+                    if (!Array.isArray(msg.content)) return msg;
+                    return {
+                        ...msg,
+                        content: msg.content.map(part => {
+                            if (part.type === 'image_url') {
+                                return { type: 'image_url', image_url: { url: '' } };
+                            }
+                            return part;
+                        })
+                    };
                 });
+
+                const title = this.getTextContent(this.messages[0]?.content)?.slice(0, 50)
+                    || window.t('chat.new_chat_title');
 
                 const chatData = {
                     id: this.currentChatId,
-                    title: this.messages[0]?.content?.slice(0, 50) || window.t('chat.new_chat_title'),
+                    title,
                     messages: messagesForStorage,
                     model: this.currentModel,
                     updatedAt: new Date().toISOString()
@@ -1099,39 +1151,36 @@
             },
 
             async sendMessage() {
-                // Check if there's either text or an image to send
-                const hasText = this.inputMessage.trim();
-                const hasImage = this.pendingImage;
+                const userText = this.inputMessage.trim();
+                const images = [...this.uploadImages];
 
-                if (!hasText && !hasImage) return;
+                if (!userText && images.length === 0) return;
                 if (!this.currentModel || this.isStreaming) return;
-
-                // Store the values before clearing
-                const userText = hasText ? this.inputMessage.trim() : '';
-                const imageData = this.pendingImage;
 
                 // Clear input state
                 this.inputMessage = '';
-                this.clearPendingImage();
+                this.uploadImages = [];
 
-                // Create new chat if needed
                 if (!this.currentChatId) {
                     this.currentChatId = 'chat_' + Date.now();
                 }
 
-                // Add user message with image info for display
-                // Allow empty text when only image is sent
-                this.messages.push({
-                    role: 'user',
-                    content: userText,  // Can be empty if only image
-                    imagePreview: imageData,  // For display
-                    imageData: imageData      // For API
-                });
+                // Build message content (OpenAI content array for images, string for text-only)
+                let content;
+                if (images.length > 0) {
+                    content = [];
+                    for (const img of images) {
+                        content.push({ type: 'image_url', image_url: { url: img.base64 } });
+                    }
+                    if (userText) {
+                        content.push({ type: 'text', text: userText });
+                    }
+                } else {
+                    content = userText;
+                }
 
-                // Force scroll to bottom when sending message
+                this.messages.push({ role: 'user', content });
                 this.forceScrollToBottom();
-
-                // Start streaming
                 await this.streamResponse();
             },
 
@@ -1141,26 +1190,11 @@
                 this.abortController = new AbortController();
                 this.autoScrollEnabled = true; // Enable auto-scroll at start of streaming
 
-                // Build messages array for API - include all messages with their images if available
-                const messagesForApi = this.messages.map((msg) => {
-                    if (msg.imageData) {
-                        // Message with image - build multimodal content
-                        const content = [];
-                        if (msg.content) {
-                            content.push({ type: "text", text: msg.content });
-                        }
-                        content.push({
-                            type: "image_url",
-                            image_url: { url: msg.imageData }
-                        });
-                        return { role: msg.role, content };
-                    }
-                    // Plain text message (or historical image message without image data in localStorage)
-                    return {
-                        role: msg.role,
-                        content: msg.content || window.t('chat.image_not_available') || "[Image]"
-                    };
-                });
+                // Build messages for API - strip metadata, keep content as-is (already OpenAI format)
+                const messagesForApi = this.messages.map(msg => ({
+                    role: msg.role,
+                    content: msg.content
+                }));
 
                 try {
                     const response = await fetch('/v1/chat/completions', {
@@ -1331,14 +1365,14 @@
             },
 
             copyMessage(content) {
-                this._copyText(content);
+                this._copyText(this.getTextContent(content));
             },
 
             // Edit functions
             startEdit(index) {
                 if (this.isStreaming || this.editingIndex !== null) return;
                 this.editingIndex = index;
-                this.editContent = this.messages[index].content;
+                this.editContent = this.getTextContent(this.messages[index].content);
                 this.$nextTick(() => lucide.createIcons());
             },
 

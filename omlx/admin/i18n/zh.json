@@ -491,12 +491,9 @@
 
   "chat.upload_image": "上传图像",
   "chat.remove_image": "移除图像",
-  "chat.drop_image": "拖放图像到这里",
-  "chat.paste_image": "粘贴图像",
-  "chat.default_image_prompt": "描述这张图片",
+  "chat.image_not_available": "图片",
   "chat.error.invalid_image_type": "请选择图像文件",
   "chat.error.image_too_large": "图像大小不能超过 10MB",
-  "chat.image_not_available": "图片",
   "chat.error.image_load_failed": "无法加载图片，请重试。",
 
   "js.error.required_fields": "以下必填字段不能为空：{fields}",

@@ -487,12 +487,9 @@
 
   "chat.upload_image": "上傳圖片",
   "chat.remove_image": "移除圖片",
-  "chat.drop_image": "拖放圖片到這裡",
-  "chat.paste_image": "貼上圖片",
-  "chat.default_image_prompt": "描述這張圖片",
+  "chat.image_not_available": "圖片",
   "chat.error.invalid_image_type": "請選擇圖片檔案",
   "chat.error.image_too_large": "圖片大小不能超過 10MB",
-  "chat.image_not_available": "圖片",
   "chat.error.image_load_failed": "無法載入圖片，請重試。",
 
   "js.error.required_fields": "以下必填欄位不能為空：{fields}",
