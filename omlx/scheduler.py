@@ -2936,7 +2936,13 @@ class Scheduler:
                     f"Request {request_id} finished: {response.finish_reason}, "
                     f"{request.num_output_tokens} tokens"
                 )
-                logger.log(5, "Request %s generated text:\n%s", request_id, output.output_text)
+                # Log full raw text including <think> prefix so TRACE
+                # output matches what accumulated_text sees in the server.
+                _log_text = output.output_text
+                if getattr(request, 'needs_think_prefix', False):
+                    think_tag = getattr(self.tokenizer, 'think_start', '<think>')
+                    _log_text = think_tag + "\n" + _log_text
+                logger.log(5, "Request %s generated text:\n%s", request_id, _log_text)
 
             outputs.append(output)
 

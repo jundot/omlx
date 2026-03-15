@@ -88,7 +88,6 @@ class OMLXAppDelegate(NSObject):
         self._update_info: Optional[dict] = None
         self._last_update_check: float = 0
         self._updater = None  # AppUpdater instance during download
-        self._update_ready = False  # True when staged app is ready to swap
         self._update_progress_text = ""  # Current download progress text
 
         return self
@@ -426,29 +425,10 @@ class OMLXAppDelegate(NSObject):
         )
 
     def updateReadyOnMain_(self, _):
-        """Main thread: show 'Restart to Update' in menu."""
-        self._update_ready = True
+        """Main thread: download complete, auto-install and relaunch."""
         self._updater = None
-        self._update_progress_text = ""
+        self._update_progress_text = "Installing update..."
         self._build_menu()
-
-    @objc.IBAction
-    def installUpdate_(self, sender):
-        """User clicked 'Restart to Update' - perform the swap."""
-        from AppKit import NSAlert, NSAlertFirstButtonReturn
-
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_("Ready to Update")
-        alert.setInformativeText_(
-            "oMLX will quit, install the update, and relaunch.\n"
-            "The server will be stopped during the update."
-        )
-        alert.addButtonWithTitle_("Restart Now")
-        alert.addButtonWithTitle_("Later")
-
-        if alert.runModal() != NSAlertFirstButtonReturn:
-            return
-
         self._perform_update_and_relaunch()
 
     def _perform_update_and_relaunch(self):
@@ -540,12 +520,7 @@ class OMLXAppDelegate(NSObject):
         if self._update_info:
             self.menu.addItem_(NSMenuItem.separatorItem())
 
-            if self._update_ready:
-                update_text = (
-                    f"✅ Restart to Update ({self._update_info['version']})"
-                )
-                update_action = "installUpdate:"
-            elif self._updater is not None:
+            if self._updater is not None:
                 progress = self._update_progress_text or "Downloading..."
                 update_text = f"⬇️ {progress}"
                 update_action = None
@@ -1005,9 +980,10 @@ class OMLXAppDelegate(NSObject):
             version_text += f"\nBuild: {build_number}"
 
         alert.setInformativeText_(
+            "LLM inference,\n"
             "optimized for your Mac\n\n"
-            "Special Thanks to 1212.H.\n"
-            "Built with MLX, mlx-lm, and mlx-vlm\n\n"
+            "Built with MLX, mlx-lm, and mlx-vlm\n"
+            "Special Thanks to 1212.H.\n\n"
             f"{version_text}"
         )
         alert.addButtonWithTitle_("OK")

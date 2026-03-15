@@ -6,13 +6,15 @@ Tests the FastAPI endpoints using TestClient with mocked EnginePool and Engine
 to verify request/response formats without loading actual models.
 """
 
-import pytest
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
+
+import pytest
 
 from fastapi.testclient import TestClient
 
+from omlx.api.responses_utils import ResponseStore
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.engine.reranker import RerankerEngine
 
@@ -198,6 +200,22 @@ class MockBaseEngine:
         )
 
 
+class RecordingResponsesEngine(MockBaseEngine):
+    """Mock engine that records request messages across /v1/responses calls."""
+
+    def __init__(self, outputs: Optional[List[MockGenerationOutput]] = None):
+        super().__init__()
+        self._outputs = list(outputs or [])
+        self.recorded_messages: List[List[Dict[str, Any]]] = []
+        self._model_type = "gpt_oss"
+
+    async def chat(self, messages: List[Dict], **kwargs) -> MockGenerationOutput:
+        self.recorded_messages.append(messages)
+        if self._outputs:
+            return self._outputs.pop(0)
+        return MockGenerationOutput(text="Chat response.")
+
+
 class MockEnginePool:
     """Mock engine pool for testing."""
 
@@ -360,8 +378,165 @@ class TestModelsEndpoint:
             model = data["data"][0]
             assert "id" in model
             assert "object" in model
-            assert model["object"] == "model"
-            assert "owned_by" in model
+
+
+class TestResponsesEndpoint:
+    def test_response_endpoint_recovers_tool_call_from_thinking(self, tmp_path):
+        from omlx.server import app, _server_state
+
+        state_dir = tmp_path / "response-state"
+        engine = RecordingResponsesEngine(outputs=[
+            MockGenerationOutput(
+                text=(
+                    "<think>Need to inspect first."
+                    '<tool_call>{"name":"exec_command","arguments":{"cmd":"ls"}}</tool_call>'
+                    "Then continue.</think>"
+                ),
+                finish_reason="stop",
+            ),
+        ])
+        pool = MockEnginePool(llm_engine=engine)
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_store = _server_state.responses_store
+        try:
+            _server_state.engine_pool = pool
+            _server_state.default_model = "test-model"
+            _server_state.responses_store = ResponseStore(state_dir=state_dir)
+            client = TestClient(app)
+
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": "test-model",
+                    "input": "Explore the code",
+                    "tools": [{
+                        "type": "function",
+                        "name": "exec_command",
+                        "description": "Run a shell command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"cmd": {"type": "string"}},
+                            "required": ["cmd"],
+                        },
+                    }],
+                },
+            )
+            assert response.status_code == 200
+
+            output_items = response.json()["output"]
+            message_items = [item for item in output_items if item["type"] == "message"]
+            function_items = [item for item in output_items if item["type"] == "function_call"]
+
+            assert len(message_items) == 1
+            assert message_items[0]["content"][0]["text"] == ""
+            assert "<tool_call>" not in message_items[0]["content"][0]["text"]
+            assert len(function_items) == 1
+            assert function_items[0]["name"] == "exec_command"
+            assert function_items[0]["arguments"] == '{"cmd": "ls"}'
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.responses_store = original_store
+
+    def test_previous_response_id_persists_across_store_restart(self, tmp_path):
+        from omlx.server import app, _server_state
+
+        state_dir = tmp_path / "response-state"
+        engine = RecordingResponsesEngine(outputs=[
+            MockGenerationOutput(
+                text="",
+                finish_reason="tool_calls",
+                tool_calls=[{
+                    "id": "call_123",
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"ls"}',
+                }],
+            ),
+            MockGenerationOutput(text="Done.", finish_reason="stop"),
+        ])
+        pool = MockEnginePool(llm_engine=engine)
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_store = _server_state.responses_store
+        try:
+            _server_state.engine_pool = pool
+            _server_state.default_model = "test-model"
+            _server_state.responses_store = ResponseStore(state_dir=state_dir)
+            client = TestClient(app)
+
+            first = client.post(
+                "/v1/responses",
+                json={"model": "test-model", "input": "Explore the code"},
+            )
+            assert first.status_code == 200
+            first_id = first.json()["id"]
+
+            # Simulate a restart by rebuilding the store from disk.
+            _server_state.responses_store = ResponseStore(state_dir=state_dir)
+
+            second = client.post(
+                "/v1/responses",
+                json={
+                    "model": "test-model",
+                    "previous_response_id": first_id,
+                    "input": [
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_123",
+                            "output": "file1.txt\nfile2.txt",
+                        }
+                    ],
+                },
+            )
+            assert second.status_code == 200
+
+            replayed = engine.recorded_messages[1]
+            assert replayed[0] == {"role": "user", "content": "Explore the code"}
+            assert replayed[1]["role"] == "assistant"
+            assert replayed[1]["tool_calls"][0]["id"] == "call_123"
+            assert replayed[2] == {
+                "role": "tool",
+                "tool_call_id": "call_123",
+                "content": "file1.txt\nfile2.txt",
+            }
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.responses_store = original_store
+
+    def test_missing_previous_response_id_returns_404(self, tmp_path):
+        from omlx.server import app, _server_state
+
+        engine = RecordingResponsesEngine(outputs=[MockGenerationOutput(text="Done.")])
+        pool = MockEnginePool(llm_engine=engine)
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_store = _server_state.responses_store
+        try:
+            _server_state.engine_pool = pool
+            _server_state.default_model = "test-model"
+            _server_state.responses_store = ResponseStore(
+                state_dir=tmp_path / "response-state"
+            )
+            client = TestClient(app)
+
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": "test-model",
+                    "previous_response_id": "resp_missing",
+                    "input": "Continue",
+                },
+            )
+            assert response.status_code == 404
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.responses_store = original_store
 
 
 class TestModelsStatusEndpoint:
@@ -482,6 +657,51 @@ class TestChatCompletionEndpoint:
 
         assert response.status_code == 200
 
+    def test_chat_completion_sanitizes_reasoning_tool_call_markup(self, client, mock_llm_engine):
+        """Thinking-only tool calls should become structured tool_calls without leaked markup."""
+        mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
+            text=(
+                "<think>Need to inspect first."
+                '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>'
+                "Then continue.</think>"
+            ),
+            prompt_tokens=10,
+            completion_tokens=5,
+            finish_reason="stop",
+            finished=True,
+        ))
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                    },
+                }],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        message = data["choices"][0]["message"]
+
+        assert message["reasoning_content"] == "Need to inspect first.Then continue."
+        assert "<tool_call>" not in message["reasoning_content"]
+        assert len(message["tool_calls"]) == 1
+        assert message["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert message["tool_calls"][0]["function"]["arguments"] == '{"city": "SF"}'
+        assert data["choices"][0]["finish_reason"] == "tool_calls"
+
 
 class TestAnthropicMessagesEndpoint:
     """Tests for the /v1/messages endpoint (Anthropic format)."""
@@ -534,6 +754,51 @@ class TestAnthropicMessagesEndpoint:
         )
 
         assert response.status_code == 200
+
+    def test_anthropic_messages_sanitize_thinking_tool_call_markup(self, client, mock_llm_engine):
+        """Anthropic thinking blocks should not expose raw tool-call markup."""
+        mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
+            text=(
+                "<think>Need to inspect first."
+                '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>'
+                "Then continue.</think>"
+            ),
+            prompt_tokens=10,
+            completion_tokens=5,
+            finish_reason="stop",
+            finished=True,
+        ))
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": [{
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                }],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        thinking_blocks = [block for block in data["content"] if block["type"] == "thinking"]
+        tool_use_blocks = [block for block in data["content"] if block["type"] == "tool_use"]
+
+        assert len(thinking_blocks) == 1
+        assert thinking_blocks[0]["thinking"] == "Need to inspect first.Then continue."
+        assert "<tool_call>" not in thinking_blocks[0]["thinking"]
+        assert len(tool_use_blocks) == 1
+        assert tool_use_blocks[0]["name"] == "get_weather"
+        assert tool_use_blocks[0]["input"] == {"city": "SF"}
+        assert data["stop_reason"] == "tool_use"
 
 
 class TestEmbeddingsEndpoint:

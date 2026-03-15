@@ -622,6 +622,324 @@ class TestStreamingHelperFunctions:
         assert content_deltas == ["Hello", " world"]
 
     @pytest.mark.asyncio
+    async def test_stream_chat_completion_sanitizes_tool_call_markup_inside_reasoning(self):
+        """Reasoning deltas should keep prose while suppressing tool-call markup."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="<think>Need to inspect first.",
+                new_text="<think>Need to inspect first.",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text=(
+                    "<think>Need to inspect first."
+                    '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>'
+                    "Then continue.</think>"
+                ),
+                new_text=(
+                    '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>'
+                    "Then continue.</think>"
+                ),
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+
+        reasoning_deltas = []
+        content_deltas = []
+        tool_call_deltas = []
+        finish_reasons = []
+        for payload in payloads:
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                reasoning_deltas.append(reasoning)
+            content = delta.get("content")
+            if content:
+                content_deltas.append(content)
+            if delta.get("tool_calls"):
+                tool_call_deltas.extend(delta["tool_calls"])
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                finish_reasons.append(finish_reason)
+
+        streamed_reasoning = "".join(reasoning_deltas)
+        assert "<tool_call>" not in streamed_reasoning
+        assert "</tool_call>" not in streamed_reasoning
+        assert "Need to inspect first." in streamed_reasoning
+        assert "Then continue." in streamed_reasoning
+        assert content_deltas == []
+        assert len(tool_call_deltas) == 1
+        assert tool_call_deltas[0]["function"]["name"] == "get_weather"
+        assert json.loads(tool_call_deltas[0]["function"]["arguments"]) == {"city": "SF"}
+        assert "tool_calls" in finish_reasons
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_sanitizes_fragmented_reasoning_tool_call_markup(self):
+        """Fragmented tool-call tags inside reasoning should never leak to the client."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="<think>Need to inspect ",
+                new_text="<think>Need to inspect ",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="<tool_",
+                new_text="<tool_",
+                completion_tokens=2,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text='call>{"name":"get_weather","arguments":{"city":"SF"}}',
+                new_text='call>{"name":"get_weather","arguments":{"city":"SF"}}',
+                completion_tokens=3,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="</tool_call></think>",
+                new_text="</tool_call></think>",
+                completion_tokens=4,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+
+        reasoning_deltas = []
+        tool_call_deltas = []
+        finish_reasons = []
+        for payload in payloads:
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                reasoning_deltas.append(reasoning)
+            if delta.get("tool_calls"):
+                tool_call_deltas.extend(delta["tool_calls"])
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                finish_reasons.append(finish_reason)
+
+        streamed_reasoning = "".join(reasoning_deltas)
+        assert "<tool_" not in streamed_reasoning
+        assert "<tool_call>" not in streamed_reasoning
+        assert "</tool_call>" not in streamed_reasoning
+        assert streamed_reasoning.strip() == "Need to inspect"
+        assert len(tool_call_deltas) == 1
+        assert tool_call_deltas[0]["function"]["name"] == "get_weather"
+        assert json.loads(tool_call_deltas[0]["function"]["arguments"]) == {"city": "SF"}
+        assert "tool_calls" in finish_reasons
+
+    @pytest.mark.asyncio
+    async def test_stream_anthropic_messages_sanitizes_tool_call_markup_inside_thinking(self):
+        """Anthropic thinking blocks should hide raw tool-call markup and emit tool_use."""
+        from omlx.server import stream_anthropic_messages
+        from omlx.api.anthropic_models import MessagesRequest
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="<think>Need to inspect first.",
+                new_text="<think>Need to inspect first.",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text=(
+                    "<think>Need to inspect first."
+                    '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>'
+                    "Then continue.</think>"
+                ),
+                new_text=(
+                    '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>'
+                    "Then continue.</think>"
+                ),
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+            ),
+        ])
+
+        anthropic_tools = [{
+            "name": "get_weather",
+            "description": "Get weather",
+            "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        }]
+        internal_tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = MessagesRequest(
+            model="test-model",
+            max_tokens=256,
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+            tools=anthropic_tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_anthropic_messages(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=internal_tools,
+        ):
+            events.append(event)
+
+        parsed_events = []
+        for event in events:
+            for line in event.split("\n"):
+                if line.startswith("data: "):
+                    try:
+                        parsed_events.append(json.loads(line[6:]))
+                    except json.JSONDecodeError:
+                        pass
+
+        thinking_deltas = []
+        tool_use_blocks = []
+        stop_reasons = []
+        for event in parsed_events:
+            if event.get("type") == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "thinking_delta":
+                    thinking_deltas.append(delta["thinking"])
+            elif event.get("type") == "content_block_start":
+                content_block = event.get("content_block", {})
+                if content_block.get("type") == "tool_use":
+                    tool_use_blocks.append(content_block)
+            elif event.get("type") == "message_delta":
+                stop_reason = event.get("delta", {}).get("stop_reason")
+                if stop_reason:
+                    stop_reasons.append(stop_reason)
+
+        streamed_thinking = "".join(thinking_deltas)
+        assert "<tool_call>" not in streamed_thinking
+        assert "</tool_call>" not in streamed_thinking
+        assert "Need to inspect first." in streamed_thinking
+        assert "Then continue." in streamed_thinking
+        assert len(tool_use_blocks) == 1
+        assert tool_use_blocks[0]["name"] == "get_weather"
+        assert "tool_use" in stop_reasons
+
+    @pytest.mark.asyncio
     async def test_stream_chat_completion_with_tools_and_tool_calls_keeps_prior_content(self):
         """A tool_call finish should end the turn, not suppress already-generated text."""
         from omlx.server import stream_chat_completion

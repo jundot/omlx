@@ -127,20 +127,26 @@ from .api.responses_models import (
 )
 from .api.responses_utils import (
     ResponseStore,
+    ResponseStateCorruptError,
+    ResponseStateNotFoundError,
     build_function_call_output_item,
     build_message_output_item,
+    build_response_store_record,
     build_response_usage,
     convert_responses_input_to_messages,
     convert_responses_tools,
-    convert_stored_response_to_messages,
     format_sse_event,
+    normalize_response_output_to_messages,
 )
 from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
     convert_tools_for_template,
+    extract_tool_calls_with_thinking,
     parse_json_output,
     parse_tool_calls,
+    parse_tool_calls_with_thinking_fallback,
+    sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
 from .api.utils import clean_output_text, clean_special_tokens, extract_harmony_messages, extract_multimodal_content, extract_text_content
@@ -210,6 +216,7 @@ class ServerState:
     settings_manager: Optional[object] = None  # ModelSettingsManager
     global_settings: Optional[object] = None  # GlobalSettings
     hf_downloader: Optional[object] = None  # HFDownloader
+    ms_downloader: Optional[object] = None  # MSDownloader
     process_memory_enforcer: Optional[object] = None  # ProcessMemoryEnforcer
     responses_store: ResponseStore = field(default_factory=ResponseStore)
 
@@ -345,6 +352,9 @@ async def lifespan(app: FastAPI):
     if _server_state.hf_downloader is not None:
         await _server_state.hf_downloader.shutdown()
         logger.info("HF Downloader stopped")
+    if _server_state.ms_downloader is not None:
+        await _server_state.ms_downloader.shutdown()
+        logger.info("MS Downloader stopped")
     if _server_state.mcp_manager is not None:
         await _server_state.mcp_manager.stop()
         logger.info("MCP manager stopped")
@@ -870,6 +880,13 @@ def init_server(
     # Store API key
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
+    response_state_dir = None
+    if global_settings:
+        response_state_dir = (
+            global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
+            / "response-state"
+        )
+    _server_state.responses_store = ResponseStore(state_dir=response_state_dir)
 
     # Refresh i18n with loaded language setting
     from .admin.routes import _refresh_i18n_globals
@@ -943,6 +960,7 @@ def init_server(
     )
 
     # Discover models (use pinned models from settings file)
+    _server_state.engine_pool._settings_manager = _server_state.settings_manager
     _server_state.engine_pool.discover_models(dir_list, pinned_models)
     _server_state.engine_pool.apply_settings_overrides(_server_state.settings_manager)
 
@@ -1004,6 +1022,24 @@ def init_server(
     )
     set_hf_downloader(_server_state.hf_downloader)
     logger.info("HF Downloader initialized")
+
+    # Initialize ModelScope downloader (optional - requires modelscope SDK)
+    try:
+        from .admin.ms_downloader import MSDownloader, MS_SDK_AVAILABLE
+
+        if MS_SDK_AVAILABLE:
+            from .admin.routes import set_ms_downloader
+
+            _server_state.ms_downloader = MSDownloader(
+                model_dir=dir_list[0],
+                on_complete=_refresh_models_after_download,
+            )
+            set_ms_downloader(_server_state.ms_downloader)
+            logger.info("ModelScope Downloader initialized")
+        else:
+            logger.info("ModelScope SDK not installed, MS downloader disabled")
+    except ImportError:
+        logger.info("ModelScope support not available")
 
 
 _KEEPALIVE_SENTINEL = object()
@@ -1261,7 +1297,19 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    return _server_state.engine_pool.get_status()
+    status = _server_state.engine_pool.get_status()
+    for m in status["models"]:
+        model_id = m["id"]
+        m["max_context_window"] = get_max_context_window(model_id)
+
+        # Resolve effective max_tokens: model setting > global default
+        max_tokens = _server_state.sampling.max_tokens
+        if _server_state.settings_manager:
+            ms = _server_state.settings_manager.get_settings(model_id)
+            if ms and ms.max_tokens is not None:
+                max_tokens = ms.max_tokens
+        m["max_tokens"] = max_tokens
+    return status
 
 
 @app.post("/v1/models/{model_id}/unload")
@@ -1716,6 +1764,7 @@ async def create_chat_completion(
     # Separate thinking from content
     raw_text = clean_special_tokens(output.text) if output.text else ""
     thinking_content, regular_content = extract_thinking(raw_text)
+    cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
 
     # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
     # For other models, parse from text output
@@ -1735,12 +1784,17 @@ async def create_chat_completion(
         ]
         cleaned_text = regular_content
     else:
-        # Parse tool calls from regular content (not thinking)
-        cleaned_text, tool_calls = parse_tool_calls(
+        # Parse tool calls from regular content, falling back to thinking
+        # content for small models that emit tool calls inside <think> blocks
+        extraction = extract_tool_calls_with_thinking(
+            thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=tools_for_template,
         )
+        cleaned_text = extraction.cleaned_text
+        tool_calls = extraction.tool_calls
+        cleaned_thinking = extraction.cleaned_thinking
 
     # Process response_format if specified
     if response_format and not tool_calls:
@@ -1762,7 +1816,7 @@ async def create_chat_completion(
         choices=[ChatCompletionChoice(
             message=AssistantMessage(
                 content=cleaned_text.strip() if cleaned_text else None,
-                reasoning_content=thinking_content if thinking_content else None,
+                reasoning_content=cleaned_thinking if cleaned_thinking else None,
                 tool_calls=tool_calls,
             ),
             finish_reason=finish_reason,
@@ -1946,11 +2000,14 @@ async def stream_chat_completion(
     # ToolCallStreamFilter suppresses known tool-call control markup so
     # clients do not see raw envelopes/tags in assistant content deltas.
     tool_filter = None
+    thinking_filter = None
     stream_content = True
     if has_tools:
-        _f = ToolCallStreamFilter(engine.tokenizer)
-        if _f.active:
-            tool_filter = _f
+        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        _thinking_filter = ToolCallStreamFilter(engine.tokenizer)
+        if _content_filter.active:
+            tool_filter = _content_filter
+            thinking_filter = _thinking_filter
         else:
             stream_content = False
     try:
@@ -1966,6 +2023,8 @@ async def stream_chat_completion(
 
                 # Emit reasoning_content delta
                 if thinking_delta:
+                    if thinking_filter:
+                        thinking_delta = thinking_filter.feed(thinking_delta)
                     chunk = ChatCompletionChunk(
                         id=response_id,
                         model=request.model,
@@ -1974,7 +2033,8 @@ async def stream_chat_completion(
                             finish_reason=None,
                         )],
                     )
-                    yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                    if thinking_delta:
+                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
                 # Emit content delta — filter out tool-call markup when
                 # tools are present so clients see clean streamed text.
@@ -2009,15 +2069,30 @@ async def stream_chat_completion(
     if stream_content:
         thinking_delta, content_delta = thinking_parser.finish()
         if thinking_delta:
-            chunk = ChatCompletionChunk(
-                id=response_id,
-                model=request.model,
-                choices=[ChatCompletionChunkChoice(
-                    delta=ChatCompletionChunkDelta(reasoning_content=thinking_delta),
-                    finish_reason=None,
-                )],
-            )
-            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+            if thinking_filter:
+                thinking_delta = thinking_filter.feed(thinking_delta)
+            if thinking_delta:
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(reasoning_content=thinking_delta),
+                        finish_reason=None,
+                    )],
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+        if thinking_filter:
+            remaining_thinking = thinking_filter.finish()
+            if remaining_thinking:
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(reasoning_content=remaining_thinking),
+                        finish_reason=None,
+                    )],
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
         if content_delta:
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
@@ -2065,21 +2140,26 @@ async def stream_chat_completion(
         cleaned_text = ""
     elif has_tools and accumulated_text:
         # Separate thinking from content, then parse tool calls from content
+        # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(accumulated_text)
-        cleaned_text, tool_calls = parse_tool_calls(
+        extraction = extract_tool_calls_with_thinking(
+            thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
         )
+        cleaned_text = extraction.cleaned_text
+        tool_calls = extraction.tool_calls
+        cleaned_thinking = extraction.cleaned_thinking
 
         # Buffered mode: emit thinking and cleaned content now
         if not stream_content:
-            if thinking_content:
+            if cleaned_thinking:
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=request.model,
                     choices=[ChatCompletionChunkChoice(
-                        delta=ChatCompletionChunkDelta(reasoning_content=thinking_content),
+                        delta=ChatCompletionChunkDelta(reasoning_content=cleaned_thinking),
                         finish_reason=None,
                     )],
                 )
@@ -2219,10 +2299,13 @@ async def stream_anthropic_messages(
     # Filter tool-call markup from streamed content when tools are present.
     has_tools = bool(kwargs.get("tools"))
     tool_filter = None
+    thinking_filter = None
     if has_tools:
-        _f = ToolCallStreamFilter(engine.tokenizer)
-        if _f.active:
-            tool_filter = _f
+        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        _thinking_filter = ToolCallStreamFilter(engine.tokenizer)
+        if _content_filter.active:
+            tool_filter = _content_filter
+            thinking_filter = _thinking_filter
 
     # Calculate input tokens before streaming starts
     # This is needed for message_start event
@@ -2263,14 +2346,18 @@ async def stream_anthropic_messages(
 
                 # Emit thinking content as thinking block
                 if thinking_delta:
+                    if thinking_filter:
+                        thinking_delta = thinking_filter.feed(thinking_delta)
                     if not thinking_block_started:
-                        yield create_content_block_start_event(
-                            index=block_index, block_type="thinking"
+                        if thinking_delta:
+                            yield create_content_block_start_event(
+                                index=block_index, block_type="thinking"
+                            )
+                            thinking_block_started = True
+                    if thinking_delta:
+                        yield create_thinking_delta_event(
+                            index=block_index, thinking=thinking_delta
                         )
-                        thinking_block_started = True
-                    yield create_thinking_delta_event(
-                        index=block_index, thinking=thinking_delta
-                    )
 
                 # Emit regular content as text block — filter tool-call
                 # markup when a known start marker is available.
@@ -2300,12 +2387,26 @@ async def stream_anthropic_messages(
     # Flush remaining buffered content from thinking parser
     thinking_delta, content_delta = thinking_parser.finish()
     if thinking_delta:
-        if not thinking_block_started:
-            yield create_content_block_start_event(
-                index=block_index, block_type="thinking"
+        if thinking_filter:
+            thinking_delta = thinking_filter.feed(thinking_delta)
+        if thinking_delta:
+            if not thinking_block_started:
+                yield create_content_block_start_event(
+                    index=block_index, block_type="thinking"
+                )
+                thinking_block_started = True
+            yield create_thinking_delta_event(index=block_index, thinking=thinking_delta)
+    if thinking_filter:
+        remaining_thinking = thinking_filter.finish()
+        if remaining_thinking:
+            if not thinking_block_started:
+                yield create_content_block_start_event(
+                    index=block_index, block_type="thinking"
+                )
+                thinking_block_started = True
+            yield create_thinking_delta_event(
+                index=block_index, thinking=remaining_thinking
             )
-            thinking_block_started = True
-        yield create_thinking_delta_event(index=block_index, thinking=thinking_delta)
     if content_delta:
         if tool_filter:
             content_delta = tool_filter.feed(content_delta)
@@ -2366,12 +2467,16 @@ async def stream_anthropic_messages(
         ]
     elif kwargs.get("tools"):
         # Non-Harmony: separate thinking, then parse tool calls from content
-        _, regular_content = extract_thinking(accumulated_text)
-        cleaned_text, tool_calls = parse_tool_calls(
+        # (falls back to thinking content for small models)
+        thinking_content, regular_content = extract_thinking(accumulated_text)
+        extraction = extract_tool_calls_with_thinking(
+            thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
         )
+        cleaned_text = extraction.cleaned_text
+        tool_calls = extraction.tool_calls
 
     # Emit tool_use blocks if present
     tool_block_start = block_index + 1
@@ -2612,6 +2717,7 @@ async def create_anthropic_message(
     # Separate thinking from content
     raw_text = clean_special_tokens(output.text) if output.text else ""
     thinking_content, regular_content = extract_thinking(raw_text)
+    cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
 
     # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
     # For other models, parse from text output
@@ -2631,12 +2737,17 @@ async def create_anthropic_message(
         ]
         cleaned_text = regular_content
     else:
-        # Parse tool calls from regular content (not thinking)
-        cleaned_text, tool_calls = parse_tool_calls(
+        # Parse tool calls from regular content, falling back to thinking
+        # content for small models that emit tool calls inside <think> blocks
+        extraction = extract_tool_calls_with_thinking(
+            thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=internal_tools,
         )
+        cleaned_text = extraction.cleaned_text
+        tool_calls = extraction.tool_calls
+        cleaned_thinking = extraction.cleaned_thinking
 
     # Convert to Anthropic response format
     response = convert_internal_to_anthropic_response(
@@ -2646,7 +2757,7 @@ async def create_anthropic_message(
         completion_tokens=scale_anthropic_tokens(output.completion_tokens, request.model),
         finish_reason=output.finish_reason,
         tool_calls=tool_calls,
-        thinking=thinking_content if thinking_content else None,
+        thinking=cleaned_thinking if cleaned_thinking else None,
     )
 
     return response
@@ -2719,6 +2830,49 @@ async def count_anthropic_tokens(
 # =============================================================================
 
 
+def _should_store_response(store_flag: Optional[bool]) -> bool:
+    """OpenAI Responses defaults to storing responses unless explicitly disabled."""
+    return store_flag is not False
+
+
+def _resolve_previous_response_messages(previous_response_id: str) -> list[dict]:
+    """Resolve a previous_response_id chain into chat messages."""
+    try:
+        return _server_state.responses_store.resolve_chain_messages(previous_response_id)
+    except ResponseStateNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Response state not found for previous_response_id. "
+                "It may have been deleted, evicted, or lost after restart."
+            ),
+        ) from exc
+    except ResponseStateCorruptError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Stored response state is incomplete or corrupted for "
+                "previous_response_id."
+            ),
+        ) from exc
+
+
+def _store_response_state(
+    public_response: dict,
+    input_messages: list[dict],
+) -> None:
+    """Persist the response object and the normalized conversation state."""
+    output_messages = normalize_response_output_to_messages(
+        public_response.get("output", [])
+    )
+    record = build_response_store_record(
+        public_response,
+        input_messages=input_messages,
+        output_messages=output_messages,
+    )
+    _server_state.responses_store.put(public_response["id"], record)
+
+
 @app.post("/v1/responses")
 async def create_response(
     request: ResponsesRequest,
@@ -2736,12 +2890,14 @@ async def create_response(
 
     resolved_model = resolve_model_id(request.model) or request.model
 
+    current_input_messages = convert_responses_input_to_messages(request.input)
+
     # Build previous context from previous_response_id
     previous_messages = None
     if request.previous_response_id:
-        prev = _server_state.responses_store.get(request.previous_response_id)
-        if prev:
-            previous_messages = convert_stored_response_to_messages(prev)
+        previous_messages = _resolve_previous_response_messages(
+            request.previous_response_id
+        )
 
     # Convert Responses API input → internal messages
     messages = convert_responses_input_to_messages(
@@ -2847,6 +3003,8 @@ async def create_response(
                     engine,
                     messages,
                     request,
+                    input_messages=current_input_messages,
+                    store_response=_should_store_response(request.store),
                     model_load_duration=model_load_duration,
                     **chat_kwargs,
                 ),
@@ -2888,11 +3046,16 @@ async def create_response(
         tool_calls = output.tool_calls
         cleaned_text = regular_content
     else:
-        cleaned_text, tool_calls = parse_tool_calls(
+        # Falls back to thinking content for small models that emit
+        # tool calls inside <think> blocks
+        extraction = extract_tool_calls_with_thinking(
+            thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=tools_for_template,
         )
+        cleaned_text = extraction.cleaned_text
+        tool_calls = extraction.tool_calls
 
     # Build output items
     output_items: list[OutputItem] = []
@@ -2937,9 +3100,10 @@ async def create_response(
     )
 
     # Store response
-    if request.store:
-        _server_state.responses_store.put(
-            response_obj.id, response_obj.model_dump(exclude_none=True)
+    if _should_store_response(request.store):
+        _store_response_state(
+            response_obj.model_dump(exclude_none=True),
+            input_messages=current_input_messages,
         )
 
     return response_obj
@@ -2949,6 +3113,8 @@ async def stream_responses_api(
     engine: BaseEngine,
     messages: list,
     request: ResponsesRequest,
+    input_messages: Optional[list[dict]] = None,
+    store_response: bool = True,
     model_load_duration: float = 0.0,
     **kwargs,
 ) -> AsyncIterator[str]:
@@ -3105,11 +3271,14 @@ async def stream_responses_api(
         cleaned_text = ""
     elif has_tools and accumulated_text:
         thinking_content, regular_content = extract_thinking(accumulated_text)
-        cleaned_text, tool_calls = parse_tool_calls(
+        extraction = extract_tool_calls_with_thinking(
+            thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
         )
+        cleaned_text = extraction.cleaned_text
+        tool_calls = extraction.tool_calls
         if not stream_content and cleaned_text:
             seq += 1
             yield format_sse_event("response.output_text.delta", {
@@ -3296,8 +3465,8 @@ async def stream_responses_api(
     })
 
     # Store for future previous_response_id usage
-    if request.store:
-        _server_state.responses_store.put(response_id, final_response)
+    if store_response:
+        _store_response_state(final_response, input_messages=input_messages or [])
 
 
 @app.get("/v1/responses/{response_id}")

@@ -244,6 +244,9 @@ class HFDownloader:
     ) -> dict:
         """Search HuggingFace models by query string.
 
+        Results are restricted to the MLX library so that only MLX-compatible
+        models are returned (same as https://huggingface.co/models?library=mlx).
+
         Args:
             query: Search query string.
             sort: Sort order (trending/downloads/created/updated/most_params/least_params).
@@ -261,6 +264,7 @@ class HFDownloader:
                 search=query,
                 sort=sort_key,
                 limit=limit,
+                filter="mlx",
                 expand=["safetensors", "downloads", "likes", "trendingScore"],
             ),
             timeout=_HF_API_TIMEOUT,

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 from omlx.integrations.base import Integration
+from omlx.utils.install import get_cli_prefix
 
 
 class OpenCodeIntegration(Integration):
@@ -26,11 +27,19 @@ class OpenCodeIntegration(Integration):
         self, port: int, api_key: str, model: str, host: str = "127.0.0.1"
     ) -> str:
         return (
-            f"/Applications/oMLX.app/Contents/MacOS/omlx-cli "
+            f"{get_cli_prefix()} "
             f"launch opencode --model {model or 'select-a-model'}"
         )
 
-    def configure(self, port: int, api_key: str, model: str, host: str = "127.0.0.1") -> None:
+    def configure(
+        self,
+        port: int,
+        api_key: str,
+        model: str,
+        host: str = "127.0.0.1",
+        context_window: int | None = None,
+        max_tokens: int | None = None,
+    ) -> None:
         def updater(config: dict) -> None:
             config.setdefault("provider", {})
             provider_config = {
@@ -43,11 +52,13 @@ class OpenCodeIntegration(Integration):
             if api_key:
                 provider_config["options"]["apiKey"] = api_key
             if model:
-                provider_config["models"] = {
-                    model: {
-                        "name": model,
-                    },
-                }
+                model_entry: dict = {"name": model}
+                if context_window:
+                    model_entry["limit"] = {
+                        "context": context_window,
+                        "output": max_tokens or context_window,
+                    }
+                provider_config["models"] = {model: model_entry}
             config["provider"]["omlx"] = provider_config
 
             # Set as default model
@@ -57,7 +68,12 @@ class OpenCodeIntegration(Integration):
         self._write_json_config(self.CONFIG_PATH, updater)
 
     def launch(self, port: int, api_key: str, model: str, host: str = "127.0.0.1", **kwargs) -> None:
-        self.configure(port, api_key, model, host=host)
+        context_window = kwargs.pop("context_window", None)
+        max_tokens = kwargs.pop("max_tokens", None)
+        self.configure(
+            port, api_key, model, host=host,
+            context_window=context_window, max_tokens=max_tokens,
+        )
 
         env = os.environ.copy()
         args = ["opencode"]

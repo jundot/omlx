@@ -31,7 +31,7 @@ class TestCodexIntegration:
     def test_get_command(self):
         codex = CodexIntegration()
         cmd = codex.get_command(port=8000, api_key="test-key", model="qwen3.5")
-        assert "omlx-cli launch codex" in cmd
+        assert "omlx launch codex" in cmd
         assert "--model qwen3.5" in cmd
 
     def test_get_command_no_model(self):
@@ -83,7 +83,7 @@ class TestOpenCodeIntegration:
     def test_get_command(self):
         oc = OpenCodeIntegration()
         cmd = oc.get_command(port=8000, api_key="key", model="qwen3.5")
-        assert "omlx-cli launch opencode" in cmd
+        assert "omlx launch opencode" in cmd
         assert "--model qwen3.5" in cmd
 
     def test_configure_new_file(self, tmp_path):
@@ -165,6 +165,46 @@ class TestOpenCodeIntegration:
         config = json.loads(config_path.read_text())
         assert "omlx" in config["provider"]
 
+    def test_configure_with_limits(self, tmp_path):
+        oc = OpenCodeIntegration()
+        config_path = tmp_path / "opencode" / "opencode.json"
+
+        with patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path):
+            oc.configure(
+                port=8000, api_key="key", model="qwen3.5",
+                context_window=32768, max_tokens=8192,
+            )
+
+        config = json.loads(config_path.read_text())
+        model_config = config["provider"]["omlx"]["models"]["qwen3.5"]
+        assert model_config["limit"]["context"] == 32768
+        assert model_config["limit"]["output"] == 8192
+
+    def test_configure_with_context_window_only(self, tmp_path):
+        oc = OpenCodeIntegration()
+        config_path = tmp_path / "opencode" / "opencode.json"
+
+        with patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path):
+            oc.configure(
+                port=8000, api_key="key", model="qwen3.5", context_window=32768
+            )
+
+        config = json.loads(config_path.read_text())
+        model_config = config["provider"]["omlx"]["models"]["qwen3.5"]
+        assert model_config["limit"]["context"] == 32768
+        assert model_config["limit"]["output"] == 32768
+
+    def test_configure_without_limits(self, tmp_path):
+        oc = OpenCodeIntegration()
+        config_path = tmp_path / "opencode" / "opencode.json"
+
+        with patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path):
+            oc.configure(port=8000, api_key="key", model="qwen3.5")
+
+        config = json.loads(config_path.read_text())
+        model_config = config["provider"]["omlx"]["models"]["qwen3.5"]
+        assert "limit" not in model_config
+
     def test_type(self):
         oc = OpenCodeIntegration()
         assert oc.type == "config_file"
@@ -175,7 +215,7 @@ class TestOpenClawIntegration:
     def test_get_command(self):
         ocl = OpenClawIntegration()
         cmd = ocl.get_command(port=8000, api_key="key", model="qwen3.5")
-        assert "omlx-cli launch openclaw" in cmd
+        assert "omlx launch openclaw" in cmd
         assert "--model qwen3.5" in cmd
 
     def test_configure_new_file(self, tmp_path):

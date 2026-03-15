@@ -15,9 +15,11 @@ from omlx.api.tool_calling import (
     build_json_system_prompt,
     convert_tools_for_template,
     extract_json_from_text,
+    extract_tool_calls_with_thinking,
     format_tool_call_for_message,
     parse_json_output,
     parse_tool_calls,
+    parse_tool_calls_with_thinking_fallback,
     validate_json_schema,
 )
 from omlx.api.openai_models import (
@@ -1070,3 +1072,135 @@ class TestParseBracketToolCalls:
         cleaned, tool_calls = _parse_bracket_tool_calls(text)
         assert tool_calls is None
         assert cleaned == text
+
+
+class TestParseToolCallsWithThinkingFallback:
+    """Tests for parse_tool_calls_with_thinking_fallback.
+
+    Verifies that tool calls inside <think> blocks are recovered
+    when small models emit them as reasoning instead of content.
+    """
+
+    def _make_tokenizer(self):
+        tok = MagicMock(spec=[])
+        return tok
+
+    def test_thinking_fallback_xml_tool_call(self):
+        """Tool call only in thinking content is recovered via fallback."""
+        thinking = '<tool_call>{"name": "read_file", "arguments": {"path": "/tmp/a.py"}}</tool_call>'
+        regular = ""
+        tok = self._make_tokenizer()
+
+        cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
+            thinking, regular, tokenizer=tok,
+        )
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "read_file"
+        assert cleaned == ""
+
+    def test_regular_content_takes_priority(self):
+        """When regular content has tool calls, thinking fallback is skipped."""
+        thinking = '<tool_call>{"name": "wrong_tool", "arguments": {}}</tool_call>'
+        regular = '<tool_call>{"name": "correct_tool", "arguments": {}}</tool_call>'
+        tok = self._make_tokenizer()
+
+        cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
+            thinking, regular, tokenizer=tok,
+        )
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "correct_tool"
+
+    def test_no_tool_calls_anywhere(self):
+        """No tool calls in either thinking or regular returns None."""
+        thinking = "Let me think about this..."
+        regular = "Here is my answer."
+        tok = self._make_tokenizer()
+
+        cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
+            thinking, regular, tokenizer=tok,
+        )
+        assert tool_calls is None
+        assert cleaned == "Here is my answer."
+
+    def test_empty_thinking_no_fallback(self):
+        """Empty thinking content skips fallback gracefully."""
+        thinking = ""
+        regular = "Just a regular response."
+        tok = self._make_tokenizer()
+
+        cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
+            thinking, regular, tokenizer=tok,
+        )
+        assert tool_calls is None
+        assert cleaned == "Just a regular response."
+
+    def test_thinking_fallback_qwen_format(self):
+        """Qwen/Llama XML format inside thinking is recovered."""
+        thinking = (
+            '<tool_call>'
+            '<function=read><parameter=filePath>/src/main.py</parameter></function>'
+            '</tool_call>'
+        )
+        regular = ""
+        tok = self._make_tokenizer()
+
+        cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
+            thinking, regular, tokenizer=tok,
+        )
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "read"
+
+    def test_cleaned_text_from_regular_not_thinking(self):
+        """cleaned_text always comes from regular_content, not thinking."""
+        thinking = (
+            'reasoning here '
+            '<tool_call>{"name": "func", "arguments": {}}</tool_call>'
+        )
+        regular = "visible response text"
+        tok = self._make_tokenizer()
+
+        cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
+            thinking, regular, tokenizer=tok,
+        )
+        assert tool_calls is not None
+        assert cleaned == "visible response text"
+
+    def test_extract_tool_calls_with_thinking_sanitizes_reasoning_markup(self):
+        """Sanitized reasoning should keep prose but drop tool-call control text."""
+        thinking = (
+            'Need to inspect first.'
+            '<tool_call>{"name": "read_file", "arguments": {"path": "/tmp/a.py"}}</tool_call>'
+            'Then continue.'
+        )
+        tok = self._make_tokenizer()
+
+        result = extract_tool_calls_with_thinking(thinking, "", tokenizer=tok)
+
+        assert result.tool_calls is not None
+        assert result.tool_calls[0].function.name == "read_file"
+        assert "<tool_call>" not in result.cleaned_thinking
+        assert "</tool_call>" not in result.cleaned_thinking
+        assert "Need to inspect first." in result.cleaned_thinking
+        assert "Then continue." in result.cleaned_thinking
+
+    def test_extract_tool_calls_with_thinking_sanitizes_reasoning_even_when_regular_wins(self):
+        """Thinking cleanup should still run when regular content provides tool calls."""
+        thinking = (
+            'Reason about it.'
+            '<tool_call>{"name": "wrong_tool", "arguments": {}}</tool_call>'
+        )
+        regular = (
+            'Visible text'
+            '<tool_call>{"name": "correct_tool", "arguments": {}}</tool_call>'
+        )
+        tok = self._make_tokenizer()
+
+        result = extract_tool_calls_with_thinking(thinking, regular, tokenizer=tok)
+
+        assert result.tool_calls is not None
+        assert result.tool_calls[0].function.name == "correct_tool"
+        assert result.cleaned_text == "Visible text"
+        assert result.cleaned_thinking == "Reason about it."

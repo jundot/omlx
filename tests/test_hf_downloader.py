@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import shutil
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -663,6 +664,139 @@ class TestHFDownloaderRoutes:
         finally:
             routes_module._get_global_settings = orig
 
+    @pytest.mark.asyncio
+    async def test_delete_model_resource_fork_ignored(self, model_dir_with_models):
+        """._* resource fork files vanishing mid-deletion should not abort the delete."""
+        from omlx.admin.routes import delete_hf_model
+
+        import omlx.admin.routes as routes_module
+
+        mock_settings = MagicMock()
+        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+
+        mock_pool = MagicMock()
+        mock_pool.get_loaded_model_ids.return_value = []
+        mock_pool._entries = {}
+        mock_pool.discover_models = MagicMock()
+
+        mock_settings_mgr = MagicMock()
+        mock_settings_mgr.get_pinned_model_ids.return_value = []
+
+        orig_settings = routes_module._get_global_settings
+        orig_pool = routes_module._get_engine_pool
+        orig_mgr = routes_module._get_settings_manager
+
+        routes_module._get_global_settings = lambda: mock_settings
+        routes_module._get_engine_pool = lambda: mock_pool
+        routes_module._get_settings_manager = lambda: mock_settings_mgr
+
+        try:
+            # Simulate the onerror/onexc callback firing for a vanishing ._* file
+            # inside the model directory (which is the real behavior of shutil.rmtree)
+            original_rmtree = shutil.rmtree
+
+            def rmtree_with_vanishing_fork(path, **kwargs):
+                import sys
+
+                handler = kwargs.get("onexc") or kwargs.get("onerror")
+                if handler:
+                    rf_path = str(model_dir_with_models / "model-a" / "._config.json")
+                    err = FileNotFoundError(rf_path)
+                    if sys.version_info >= (3, 12):
+                        handler(None, rf_path, err)
+                    else:
+                        handler(None, rf_path, (FileNotFoundError, err, None))
+                original_rmtree(path)
+
+            with patch("shutil.rmtree", side_effect=rmtree_with_vanishing_fork):
+                result = await delete_hf_model(model_name="model-a", is_admin=True)
+
+            assert result["success"] is True
+        finally:
+            routes_module._get_global_settings = orig_settings
+            routes_module._get_engine_pool = orig_pool
+            routes_module._get_settings_manager = orig_mgr
+
+    @pytest.mark.asyncio
+    async def test_delete_model_real_error_still_raises(self, model_dir_with_models):
+        """Non-resource-fork errors during deletion must propagate as HTTP 500."""
+        from fastapi import HTTPException
+        from omlx.admin.routes import delete_hf_model
+
+        import omlx.admin.routes as routes_module
+
+        mock_settings = MagicMock()
+        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+
+        mock_pool = MagicMock()
+        mock_pool.get_loaded_model_ids.return_value = []
+
+        orig_settings = routes_module._get_global_settings
+        orig_pool = routes_module._get_engine_pool
+        orig_mgr = routes_module._get_settings_manager
+
+        routes_module._get_global_settings = lambda: mock_settings
+        routes_module._get_engine_pool = lambda: mock_pool
+        routes_module._get_settings_manager = lambda: None
+
+        try:
+            with patch("shutil.rmtree", side_effect=PermissionError("Access denied")):
+                with pytest.raises(HTTPException) as exc_info:
+                    await delete_hf_model(model_name="model-a", is_admin=True)
+            assert exc_info.value.status_code == 500
+        finally:
+            routes_module._get_global_settings = orig_settings
+            routes_module._get_engine_pool = orig_pool
+            routes_module._get_settings_manager = orig_mgr
+
+    @pytest.mark.asyncio
+    async def test_delete_model_dot_underscore_in_dir_name_not_skipped(
+        self, model_dir_with_models
+    ):
+        """FileNotFoundError on a regular file whose parent dir contains ._ should NOT be ignored."""
+        from fastapi import HTTPException
+        from omlx.admin.routes import delete_hf_model
+
+        import omlx.admin.routes as routes_module
+
+        mock_settings = MagicMock()
+        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+
+        mock_pool = MagicMock()
+        mock_pool.get_loaded_model_ids.return_value = []
+
+        orig_settings = routes_module._get_global_settings
+        orig_pool = routes_module._get_engine_pool
+        orig_mgr = routes_module._get_settings_manager
+
+        routes_module._get_global_settings = lambda: mock_settings
+        routes_module._get_engine_pool = lambda: mock_pool
+        routes_module._get_settings_manager = lambda: None
+
+        try:
+            # e.g. /volumes/my._drive/model/config.json — filename is "config.json",
+            # not a resource fork, so the error should propagate
+            def rmtree_error_on_normal_file(path, **kwargs):
+                import sys
+
+                handler = kwargs.get("onexc") or kwargs.get("onerror")
+                if handler:
+                    regular_file = "/volumes/my._drive/model/config.json"
+                    err = FileNotFoundError(regular_file)
+                    if sys.version_info >= (3, 12):
+                        handler(None, regular_file, err)
+                    else:
+                        handler(None, regular_file, (FileNotFoundError, err, None))
+
+            with patch("shutil.rmtree", side_effect=rmtree_error_on_normal_file):
+                with pytest.raises(HTTPException) as exc_info:
+                    await delete_hf_model(model_name="model-a", is_admin=True)
+            assert exc_info.value.status_code == 500
+        finally:
+            routes_module._get_global_settings = orig_settings
+            routes_module._get_engine_pool = orig_pool
+            routes_module._get_settings_manager = orig_mgr
+
 
 # =============================================================================
 # Recommended Models Tests
@@ -948,6 +1082,25 @@ class TestSearchModels:
         assert "total" in result
         assert len(result["models"]) == 2
         assert result["total"] == 2
+
+    @pytest.mark.asyncio
+    async def test_search_passes_mlx_filter(self):
+        """Verify list_models is called with filter='mlx' to restrict results."""
+        mock_models = [
+            _make_mock_model("org/model-a", disk_size_bytes=4_000_000_000, downloads=500),
+        ]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = mock_models
+            mock_api_cls.return_value = mock_api
+
+            await HFDownloader.search_models(query="test", sort="trending", limit=50)
+
+            call_kwargs = mock_api.list_models.call_args[1]
+            assert call_kwargs["filter"] == "mlx"
+            assert call_kwargs["search"] == "test"
+            assert call_kwargs["limit"] == 50
 
     @pytest.mark.asyncio
     async def test_search_result_format(self):

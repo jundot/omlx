@@ -432,6 +432,22 @@ class HuggingFaceSettings:
 
 
 @dataclass
+class ModelScopeSettings:
+    """ModelScope Hub configuration settings."""
+
+    endpoint: str = ""  # Empty string = use default (https://modelscope.cn)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {"endpoint": self.endpoint}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ModelScopeSettings":
+        """Create from dictionary."""
+        return cls(endpoint=data.get("endpoint", ""))
+
+
+@dataclass
 class SamplingSettings:
     """Default sampling parameters for generation."""
 
@@ -606,6 +622,7 @@ class GlobalSettings:
     auth: AuthSettings = field(default_factory=AuthSettings)
     mcp: MCPSettings = field(default_factory=MCPSettings)
     huggingface: HuggingFaceSettings = field(default_factory=HuggingFaceSettings)
+    modelscope: ModelScopeSettings = field(default_factory=ModelScopeSettings)
     sampling: SamplingSettings = field(default_factory=SamplingSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
@@ -688,6 +705,8 @@ class GlobalSettings:
                 self.mcp = MCPSettings.from_dict(data["mcp"])
             if "huggingface" in data:
                 self.huggingface = HuggingFaceSettings.from_dict(data["huggingface"])
+            if "modelscope" in data:
+                self.modelscope = ModelScopeSettings.from_dict(data["modelscope"])
             if "sampling" in data:
                 self.sampling = SamplingSettings.from_dict(data["sampling"])
             if "logging" in data:
@@ -772,6 +791,10 @@ class GlobalSettings:
         if hf_endpoint := os.getenv("OMLX_HF_ENDPOINT"):
             self.huggingface.endpoint = hf_endpoint
 
+        # ModelScope settings
+        if ms_endpoint := os.getenv("OMLX_MS_ENDPOINT"):
+            self.modelscope.endpoint = ms_endpoint
+
         # Logging settings
         if log_dir := os.getenv("OMLX_LOG_DIR"):
             self.logging.log_dir = log_dir
@@ -845,6 +868,10 @@ class GlobalSettings:
         if hasattr(args, "hf_endpoint") and args.hf_endpoint is not None:
             self.huggingface.endpoint = args.hf_endpoint
 
+        # ModelScope settings
+        if hasattr(args, "ms_endpoint") and args.ms_endpoint is not None:
+            self.modelscope.endpoint = args.ms_endpoint
+
     def save(self) -> None:
         """Save current settings to the settings file."""
         self.ensure_directories()
@@ -860,6 +887,7 @@ class GlobalSettings:
             "auth": self.auth.to_dict(),
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),
+            "modelscope": self.modelscope.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
@@ -1010,6 +1038,15 @@ class GlobalSettings:
                     "(must start with http:// or https://)"
                 )
 
+        # ModelScope validation
+        if self.modelscope.endpoint:
+            endpoint = self.modelscope.endpoint.strip()
+            if endpoint and not endpoint.startswith(("http://", "https://")):
+                errors.append(
+                    f"Invalid modelscope endpoint: '{endpoint}' "
+                    "(must start with http:// or https://)"
+                )
+
         return errors
 
     def to_scheduler_config(self) -> SchedulerConfig:
@@ -1040,6 +1077,7 @@ class GlobalSettings:
             "auth": self.auth.to_dict(),
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),
+            "modelscope": self.modelscope.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),

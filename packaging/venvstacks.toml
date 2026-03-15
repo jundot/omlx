@@ -48,6 +48,8 @@ requirements = [
     # mlx-vlm from commit (348466f) - aligned with pyproject.toml
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@348466f3f8f9a0413a6167bf8c1634d02ca2c131",
     "Pillow>=9.0.0",
+    # ModelScope SDK for downloading models from ModelScope Hub
+    "modelscope>=1.10.0",
 ]
 platforms = [
     "macosx_arm64",

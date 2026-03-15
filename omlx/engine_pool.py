@@ -90,6 +90,7 @@ class EnginePool:
         self._current_model_memory = 0
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
+        self._settings_manager: object | None = None  # Set by server
 
     @property
     def max_model_memory(self) -> int | None:
@@ -467,6 +468,11 @@ class EnginePool:
         try:
             logger.info(f"Loading model: {model_id}")
 
+            # Retrieve per-model settings for post-load transforms
+            model_settings = None
+            if self._settings_manager is not None:
+                model_settings = self._settings_manager.get_settings(model_id)
+
             # Create engine based on engine type
             if entry.engine_type == "embedding":
                 # EmbeddingEngine for embedding models
@@ -485,6 +491,7 @@ class EnginePool:
                 engine = BatchedEngine(
                     model_name=entry.model_path,
                     scheduler_config=self._scheduler_config,
+                    model_settings=model_settings,
                 )
 
             try:
@@ -507,6 +514,7 @@ class EnginePool:
                     engine = BatchedEngine(
                         model_name=entry.model_path,
                         scheduler_config=self._scheduler_config,
+                        model_settings=model_settings,
                     )
                     await engine.start()
 

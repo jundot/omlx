@@ -52,6 +52,7 @@ class ModelSettings:
     ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
     model_type_override: Optional[str] = None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
     model_alias: Optional[str] = None  # API-visible name (alternative to directory name)
+    index_cache_freq: Optional[int] = None  # IndexCache: every Nth layer keeps indexer (DSA models only)
 
     # Model management flags
     is_pinned: bool = False

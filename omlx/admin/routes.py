@@ -14,6 +14,7 @@ import logging
 import os
 import secrets
 import shutil
+import sys
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -88,6 +89,7 @@ class ModelSettingsRequest(BaseModel):
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     forced_ct_kwargs: Optional[list[str]] = None
     ttl_seconds: Optional[int] = None
+    index_cache_freq: Optional[int] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
 
@@ -125,6 +127,9 @@ class GlobalSettingsRequest(BaseModel):
 
     # HuggingFace settings
     hf_endpoint: Optional[str] = None
+
+    # ModelScope settings
+    ms_endpoint: Optional[str] = None
 
     # Sampling defaults
     sampling_max_context_window: Optional[int] = None
@@ -167,6 +172,19 @@ class HFRetryRequest(BaseModel):
     """Request model for retrying a HuggingFace model download."""
 
     hf_token: str = ""
+
+
+class MSDownloadRequest(BaseModel):
+    """Request model for starting a ModelScope model download."""
+
+    model_id: str
+    ms_token: str = ""
+
+
+class MSRetryRequest(BaseModel):
+    """Request model for retrying a ModelScope model download."""
+
+    ms_token: str = ""
 
 
 # =============================================================================
@@ -263,6 +281,15 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     # Clear entries
     pool._entries.clear()
     pool._current_model_memory = 0
+
+    # Update downloader model directories
+    global _hf_downloader, _ms_downloader
+    if model_dirs:
+        primary_dir = model_dirs[0]
+        if _hf_downloader is not None:
+            _hf_downloader.update_model_dir(primary_dir)
+        if _ms_downloader is not None:
+            _ms_downloader.update_model_dir(primary_dir)
 
     # Re-discover models from new directories
     try:
@@ -648,6 +675,7 @@ _get_engine_pool = None
 _get_settings_manager = None
 _get_global_settings = None
 _hf_downloader = None
+_ms_downloader = None
 
 
 def set_admin_getters(
@@ -684,6 +712,16 @@ def set_hf_downloader(downloader):
     """
     global _hf_downloader
     _hf_downloader = downloader
+
+
+def set_ms_downloader(downloader):
+    """Set the MSDownloader instance for admin routes.
+
+    Args:
+        downloader: MSDownloader instance created during server initialization.
+    """
+    global _ms_downloader
+    _ms_downloader = downloader
 
 
 # =============================================================================
@@ -1207,6 +1245,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "chat_template_kwargs": settings.chat_template_kwargs,
                 "forced_ct_kwargs": settings.forced_ct_kwargs,
                 "ttl_seconds": settings.ttl_seconds,
+                "index_cache_freq": settings.index_cache_freq,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
@@ -1394,6 +1433,13 @@ async def update_model_settings(
         current_settings.forced_ct_kwargs = request.forced_ct_kwargs
     if "ttl_seconds" in sent:
         current_settings.ttl_seconds = request.ttl_seconds
+    if "index_cache_freq" in sent:
+        # 0 means disable (reset to None)
+        current_settings.index_cache_freq = (
+            request.index_cache_freq
+            if request.index_cache_freq and request.index_cache_freq >= 2
+            else None
+        )
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry
@@ -1407,16 +1453,17 @@ async def update_model_settings(
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
 
-    # Warn if engine type actually changed while model is loaded
+    # Warn if engine type or index_cache_freq changed while model is loaded
     requires_reload = (
-        "model_type_override" in sent
-        and entry.engine is not None
-        and entry.engine_type != prev_engine_type
+        entry.engine is not None
+        and (
+            ("model_type_override" in sent and entry.engine_type != prev_engine_type)
+            or "index_cache_freq" in sent
+        )
     )
     if requires_reload:
         logger.info(
-            f"Model type changed for loaded model {model_id} "
-            f"(now {entry.model_type}/{entry.engine_type}). "
+            f"Settings changed for loaded model {model_id}. "
             f"Reload required to take effect."
         )
 
@@ -1585,6 +1632,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "huggingface": {
             "endpoint": global_settings.huggingface.endpoint,
+        },
+        "modelscope": {
+            "endpoint": global_settings.modelscope.endpoint,
         },
         "sampling": {
             "max_context_window": global_settings.sampling.max_context_window,
@@ -1785,6 +1835,19 @@ async def update_global_settings(
         logger.info(
             f"HuggingFace endpoint updated to: "
             f"{request.hf_endpoint or '(default)'}"
+        )
+
+    # Apply ModelScope settings (Live - immediately applied via env var)
+    if request.ms_endpoint is not None:
+        global_settings.modelscope.endpoint = request.ms_endpoint
+        if request.ms_endpoint:
+            os.environ["MODELSCOPE_DOMAIN"] = request.ms_endpoint
+        elif "MODELSCOPE_DOMAIN" in os.environ:
+            del os.environ["MODELSCOPE_DOMAIN"]
+        runtime_applied.append("ms_endpoint")
+        logger.info(
+            f"ModelScope endpoint updated to: "
+            f"{request.ms_endpoint or '(default)'}"
         )
 
     # Apply sampling settings (Live - immediately applied)
@@ -2218,11 +2281,14 @@ async def get_server_stats(
     port = global_settings.server.port if global_settings else 8000
     api_key = global_settings.auth.api_key if global_settings else ""
 
+    from ..utils.install import get_cli_prefix
+
     return {
         **snapshot,
         "host": host,
         "port": port,
         "api_key": api_key or "",
+        "cli_prefix": get_cli_prefix(),
         "claude_code_context_scaling_enabled": (
             global_settings.claude_code.context_scaling_enabled
             if global_settings
@@ -2546,8 +2612,30 @@ async def delete_hf_model(
                 logger.warning(f"Failed to unload model '{model_name}': {e}")
 
     # Delete from disk
-    shutil.rmtree(model_path)
-    logger.info(f"Deleted model directory: {model_path}")
+    # Handle macOS resource fork files (._*) that may disappear on non-native
+    # filesystems (exFAT, NTFS). Use onexc (Python 3.12+) to avoid
+    # DeprecationWarning, with onerror fallback for older versions.
+    def _handle_onexc(func, path, exc):
+        if isinstance(exc, FileNotFoundError) and Path(path).name.startswith("._"):
+            logger.debug(f"Ignoring missing resource fork file: {path}")
+            return
+        raise exc
+
+    def _handle_onerror(func, path, exc_info):
+        if exc_info[0] == FileNotFoundError and Path(path).name.startswith("._"):
+            logger.debug(f"Ignoring missing resource fork file: {path}")
+            return
+        raise exc_info[1].with_traceback(exc_info[2])
+
+    try:
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(model_path, onexc=_handle_onexc)
+        else:
+            shutil.rmtree(model_path, onerror=_handle_onerror)
+        logger.info(f"Deleted model directory: {model_path}")
+    except Exception as e:
+        logger.error(f"Failed to delete model directory {model_path}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete model: {e}")
 
     # Re-discover models
     if engine_pool is not None:
@@ -2565,6 +2653,182 @@ async def delete_hf_model(
         logger.info("Model pool refreshed after deletion")
 
     return {"success": True, "message": f"Model '{model_name}' deleted"}
+
+
+# =============================================================================
+# ModelScope Downloader API Routes
+# =============================================================================
+
+
+@router.get("/api/ms/status")
+async def ms_status(is_admin: bool = Depends(require_admin)):
+    """Check if ModelScope downloader is available."""
+    return {"available": _ms_downloader is not None}
+
+
+@router.post("/api/ms/download")
+async def start_ms_download(
+    request: MSDownloadRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Start downloading a model from ModelScope."""
+    if _ms_downloader is None:
+        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+
+    try:
+        task = await _ms_downloader.start_download(
+            request.model_id, request.ms_token
+        )
+        return {"success": True, "task": task.to_dict()}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@router.get("/api/ms/tasks")
+async def list_ms_tasks(is_admin: bool = Depends(require_admin)):
+    """List all ModelScope download tasks."""
+    if _ms_downloader is None:
+        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+
+    return {"tasks": _ms_downloader.get_tasks()}
+
+
+@router.post("/api/ms/cancel/{task_id}")
+async def cancel_ms_download(
+    task_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Cancel an active ModelScope download."""
+    if _ms_downloader is None:
+        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+
+    success = await _ms_downloader.cancel_download(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=404, detail="Task not found or not cancellable"
+        )
+    return {"success": True}
+
+
+@router.post("/api/ms/retry/{task_id}")
+async def retry_ms_download(
+    task_id: str,
+    request: MSRetryRequest = MSRetryRequest(),
+    is_admin: bool = Depends(require_admin),
+):
+    """Retry a failed or cancelled ModelScope download."""
+    if _ms_downloader is None:
+        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+
+    try:
+        task = await _ms_downloader.retry_download(task_id, request.ms_token)
+        return {"success": True, "task": task.to_dict()}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/api/ms/task/{task_id}")
+async def remove_ms_task(
+    task_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Remove a completed, failed, or cancelled ModelScope task."""
+    if _ms_downloader is None:
+        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+
+    success = _ms_downloader.remove_task(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=404, detail="Task not found or still active"
+        )
+    return {"success": True}
+
+
+@router.get("/api/ms/recommended")
+async def get_ms_recommended_models(is_admin: bool = Depends(require_admin)):
+    """Get recommended MLX models from ModelScope filtered by system memory."""
+    if _ms_downloader is None:
+        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+
+    memory_info = get_system_memory_info()
+    max_memory = memory_info["total_bytes"] or 16 * 1024**3
+
+    from .ms_downloader import MSDownloader
+
+    try:
+        result = await MSDownloader.get_recommended_models(
+            max_memory_bytes=max_memory, result_limit=50
+        )
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="ModelScope API request timed out. The service may be temporarily unavailable.",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/api/ms/search")
+async def search_ms_models(
+    q: str = "",
+    sort: str = "trending",
+    limit: int = 100,
+    is_admin: bool = Depends(require_admin),
+):
+    """Search ModelScope models by query."""
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
+
+    from .ms_downloader import MSDownloader
+
+    try:
+        result = await MSDownloader.search_models(
+            query=q.strip(),
+            sort=sort,
+            limit=min(limit, 100),
+        )
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="ModelScope API request timed out. The service may be temporarily unavailable.",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/api/ms/model-info")
+async def get_ms_model_info(
+    model_id: str = "",
+    is_admin: bool = Depends(require_admin),
+):
+    """Get detailed model information from ModelScope."""
+    if not model_id.strip():
+        raise HTTPException(
+            status_code=400, detail="Query parameter 'model_id' is required"
+        )
+
+    from .ms_downloader import MSDownloader
+
+    try:
+        result = await MSDownloader.get_model_info(model_id=model_id.strip())
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="ModelScope API request timed out. The service may be temporarily unavailable.",
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        if "NotExistError" in type(e).__name__ or "404" in str(e):
+            raise HTTPException(
+                status_code=404, detail=f"Model '{model_id.strip()}' not found"
+            )
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 # =============================================================================

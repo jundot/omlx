@@ -19,11 +19,22 @@ Also includes structured output (JSON Schema) utilities:
 import json
 import re
 import uuid
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from jsonschema import validate, ValidationError
 
 from .openai_models import FunctionCall, ResponseFormat, ToolCall, ToolDefinition
+
+
+@dataclass(frozen=True)
+class ToolCallExtraction:
+    """Parsed tool-call result plus sanitized reasoning text."""
+
+    cleaned_text: str
+    tool_calls: Optional[List[ToolCall]]
+    cleaned_thinking: str
+    tool_calls_from_thinking: bool = False
 
 
 def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
@@ -311,6 +322,72 @@ def parse_tool_calls(
         return _parse_bracket_tool_calls(cleaned_text)
 
     return cleaned_text, None
+
+
+def sanitize_tool_call_markup(text: str, tokenizer: Any) -> str:
+    """Remove tool-call control markup while preserving surrounding prose."""
+    if not text:
+        return ""
+
+    stream_filter = ToolCallStreamFilter(tokenizer)
+    cleaned = stream_filter.feed(text)
+    cleaned += stream_filter.finish()
+    return cleaned.strip()
+
+
+def extract_tool_calls_with_thinking(
+    thinking_content: str,
+    regular_content: str,
+    tokenizer: Any,
+    tools: Optional[List] = None,
+) -> ToolCallExtraction:
+    """Extract tool calls while keeping a sanitized reasoning transcript."""
+    cleaned_text, tool_calls = parse_tool_calls(regular_content, tokenizer, tools)
+    cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer)
+    tool_calls_from_thinking = False
+
+    if not tool_calls and thinking_content:
+        _, tool_calls = parse_tool_calls(thinking_content, tokenizer, tools)
+        tool_calls_from_thinking = bool(tool_calls)
+
+    return ToolCallExtraction(
+        cleaned_text=cleaned_text,
+        tool_calls=tool_calls,
+        cleaned_thinking=cleaned_thinking,
+        tool_calls_from_thinking=tool_calls_from_thinking,
+    )
+
+
+def parse_tool_calls_with_thinking_fallback(
+    thinking_content: str,
+    regular_content: str,
+    tokenizer: Any,
+    tools: Optional[List] = None,
+) -> Tuple[str, Optional[List[ToolCall]]]:
+    """Parse tool calls from content, falling back to thinking if none found.
+
+    Small reasoning models sometimes generate tool call XML inside <think>
+    blocks instead of after </think>. This function first tries the normal
+    content, then falls back to parsing from thinking content.
+
+    Args:
+        thinking_content: Text extracted from <think>...</think> blocks.
+        regular_content: Text outside thinking blocks.
+        tokenizer: mlx-lm's TokenizerWrapper.
+        tools: Tool definitions for type conversion (optional).
+
+    Returns:
+        Tuple of (cleaned_text, tool_calls or None).
+        cleaned_text comes from regular_content only (thinking text is
+        never promoted to content).
+    """
+    result = extract_tool_calls_with_thinking(
+        thinking_content,
+        regular_content,
+        tokenizer,
+        tools,
+    )
+    return result.cleaned_text, result.tool_calls
 
 
 class ToolCallStreamFilter:

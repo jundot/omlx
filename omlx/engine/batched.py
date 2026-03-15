@@ -43,6 +43,7 @@ class BatchedEngine(BaseEngine):
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
+        model_settings: Any | None = None,
     ):
         """
         Initialize the batched engine.
@@ -53,12 +54,14 @@ class BatchedEngine(BaseEngine):
             scheduler_config: Optional scheduler configuration
             stream_interval: Tokens to batch before streaming (1=every token)
             enable_thinking: Enable thinking mode for reasoning models (passed to chat_template_kwargs)
+            model_settings: Optional per-model settings for post-load transforms
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
+        self._model_settings = model_settings
 
         self._model = None
         self._tokenizer = None
@@ -148,6 +151,13 @@ class BatchedEngine(BaseEngine):
         loop = asyncio.get_running_loop()
         self._model, self._tokenizer = await loop.run_in_executor(
             get_mlx_executor(), _load_model_sync
+        )
+
+        # Apply post-load transforms (e.g., IndexCache for DSA models)
+        from ..utils.model_loading import apply_post_load_transforms
+
+        self._model = apply_post_load_transforms(
+            self._model, self._model_settings
         )
 
         # Create engine config (copy to avoid mutating the shared instance)

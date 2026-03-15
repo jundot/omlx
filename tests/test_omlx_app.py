@@ -172,7 +172,7 @@ class TestServerConfig:
         assert args == ["serve", "--base-path", base, "--port", "8000"]
 
     def test_build_serve_args_with_model_dir(self):
-        """Test build_serve_args includes model_dir when set."""
+        """Test build_serve_args does not include model_dir (server reads settings.json)."""
         config = ServerConfig(
             base_path="/test/base",
             port=9000,
@@ -181,12 +181,10 @@ class TestServerConfig:
         args = config.build_serve_args()
 
         base = str(Path("/test/base").expanduser())
-        model_dir = str(Path("/path/to/models").expanduser())
         assert args == [
             "serve",
             "--base-path", base,
             "--port", "9000",
-            "--model-dir", model_dir,
         ]
 
     def test_build_serve_args_preserves_order(self):

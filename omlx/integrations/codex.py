@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from omlx.integrations.base import Integration
+from omlx.utils.install import get_cli_prefix
 
 # Codex config.toml template with oMLX provider
 _CONFIG_TEMPLATE = """\
@@ -39,7 +40,7 @@ class CodexIntegration(Integration):
         self, port: int, api_key: str, model: str, host: str = "127.0.0.1"
     ) -> str:
         return (
-            f"/Applications/oMLX.app/Contents/MacOS/omlx-cli "
+            f"{get_cli_prefix()} "
             f"launch codex --model {model or 'select-a-model'}"
         )
 
