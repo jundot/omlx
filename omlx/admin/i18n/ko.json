@@ -72,6 +72,7 @@
   "status.active_models.active": "활성",
   "status.active_models.waiting": "대기",
   "status.active_models.req": "요청",
+  "status.active_models.unload": "모델 언로드",
   "status.api.section_label": "API 엔드포인트",
   "status.api.openai": "OpenAI API",
   "status.api.claude": "Claude API",

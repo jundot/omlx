@@ -127,7 +127,7 @@
                             </div>
                             <!-- Model rows -->
                             <template x-for="m in (stats.active_models.models || [])" :key="m.id">
-                                <div class="px-6 py-3">
+                                <div class="px-6 py-3 group">
                                     <div class="flex items-center justify-between">
                                         <div class="flex items-center gap-2">
                                             <!-- Pin icon -->
@@ -170,6 +170,13 @@
                                             </div>
                                             <!-- Memory size -->
                                             <span class="text-xs text-neutral-400 font-mono w-16 text-right" x-text="m.estimated_size_formatted"></span>
+                                            <!-- Unload button -->
+                                            <button x-show="!m.is_loading"
+                                                    @click="unloadModel(m.id)"
+                                                    class="p-1 rounded-md text-neutral-300 hover:text-red-500 hover:bg-red-50 transition-all opacity-0 group-hover:opacity-100"
+                                                    :title="window.t('status.active_models.unload')">
+                                                <i data-lucide="power-off" class="w-3.5 h-3.5"></i>
+                                            </button>
                                         </div>
                                     </div>
                                     <!-- Prefill sub-rows -->

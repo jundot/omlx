@@ -68,6 +68,7 @@
   "status.active_models.active": "活跃",
   "status.active_models.waiting": "等待",
   "status.active_models.req": "请求",
+  "status.active_models.unload": "卸载模型",
   "status.api.section_label": "API 端点",
   "status.api.openai": "OpenAI API",
   "status.api.claude": "Claude API",
