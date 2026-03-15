@@ -1,6 +1,7 @@
 {
     "app.title": "oMLX 管理画面",
     "app.tagline": "Mac向けに最適化されたLLM推論",
+
     "login.title_login": "ログイン - oMLX 管理画面",
     "login.title_setup": "初期設定 - oMLX 管理画面",
     "login.setup.heading": "APIキーの設定",
@@ -26,7 +27,9 @@
     "login.error.no_whitespace": "APIキーにスペースを含めることはできません",
     "login.error.mismatch": "APIキーが一致しません",
     "login.error.setup_failed": "APIキーの設定に失敗しました",
+
     "dashboard.title": "ダッシュボード - oMLX 管理画面",
+
     "navbar.brand": "oMLX",
     "navbar.admin": "管理",
     "navbar.tab.status": "ダッシュボード",
@@ -44,6 +47,7 @@
     "navbar.logout": "ログアウト",
     "navbar.update_available": "アップデートあり: v{version}",
     "navbar.go_to_github": "GitHubへ移動",
+
     "status.section_label": "ダッシュボード",
     "status.heading": "配信統計",
     "status.clear": "クリア",
@@ -101,6 +105,7 @@
     "status.integrations.openclaw_tools_profile": "ツール",
     "status.engines.section_label": "エンジンバージョン",
     "status.engines.unknown_version": "不明",
+
     "models.tab.manager": "管理",
     "models.tab.downloader": "ダウンロード",
     "models.manager.section_label": "モデル",
@@ -117,6 +122,7 @@
     "models.manager.delete_confirm": "削除しますか？",
     "models.manager.delete_yes": "はい",
     "models.manager.delete_no": "いいえ",
+
     "models.downloader.section_label": "モデル",
     "models.downloader.heading": "モデルダウンロード",
     "models.downloader.description": "HuggingFaceまたはModelScopeからモデルをダウンロードし、利用可能なモデルを閲覧します。",
@@ -133,6 +139,7 @@
     "models.downloader.hf_token_optional": "（任意）",
     "models.downloader.hf_token_placeholder": "hf_...",
     "models.downloader.download_button": "ダウンロード",
+
     "models.downloader.ms_download_section": "ModelScopeからダウンロード",
     "models.downloader.ms_repo_id": "モデルID",
     "models.downloader.ms_repo_placeholder": "qwen/Qwen2.5-7B-Instruct-MLX",
@@ -141,6 +148,7 @@
     "models.downloader.ms_token_placeholder": "your_token...",
     "models.downloader.ms_mirror_settings": "ミラー設定",
     "models.downloader.ms_unavailable": "ModelScope SDKがインストールされていません。次のコマンドでインストール: pip install omlx[modelscope]",
+
     "models.search.section_label": "HuggingFace検索",
     "models.search.placeholder": "HuggingFaceでモデルを検索...",
     "models.search.ms_section_label": "ModelScope検索",
@@ -153,6 +161,7 @@
     "models.search.sort.most_params": "パラメータ多い順",
     "models.search.sort.least_params": "パラメータ少ない順",
     "models.search.button": "検索",
+
     "models.browse.section_label": "モデルを閲覧",
     "models.browse.system_suffix": "{memory}システム向け",
     "models.browse.tab.trending": "トレンド",
@@ -169,10 +178,12 @@
     "models.browse.tight_fit": "メモリ余裕少",
     "models.browse.high_oom_risk": "OOMリスク高",
     "models.browse.params_suffix": "パラメータ",
+
     "models.queue.section_label": "ダウンロードキュー",
     "models.queue.downloading": "ダウンロード中...",
     "models.queue.cancel_tooltip": "ダウンロードをキャンセル",
     "models.queue.remove_tooltip": "リストから削除",
+
     "models.detail.loading": "モデル情報を読み込み中...",
     "models.detail.tab.model_card": "モデルカード",
     "models.detail.tab.files": "ファイル",
@@ -183,13 +194,16 @@
     "models.detail.view_on_hf": "HuggingFaceで表示",
     "models.detail.view_on_ms": "ModelScopeで表示",
     "models.detail.close": "閉じる",
+
     "settings.tab.global": "グローバル設定",
     "settings.tab.models": "モデル設定",
+
     "settings.global.section_label": "グローバル設定",
     "settings.global.heading": "サーバー設定",
     "settings.global.restart_notice": "",
     "settings.global.restart_badge": "再起動が必要",
     "settings.global.restart_suffix": "マークの付いた設定はサーバーの再起動が必要です。",
+
     "settings.auth.section_label": "認証と情報",
     "settings.auth.base_path": "ベースパス",
     "settings.auth.base_path_hint": "読み取り専用",
@@ -211,6 +225,7 @@
     "settings.auth.sub_keys_unnamed": "名前なし",
     "settings.auth.sub_keys_empty": "サブキーがありません",
     "settings.auth.sub_keys_generate_tooltip": "ランダムキー生成",
+
     "settings.server.section_label": "サーバー",
     "settings.server.host": "ホスト",
     "settings.server.host_localhost": "ローカルのみ (127.0.0.1)",
@@ -224,6 +239,7 @@
     "settings.server.log_level_info": "info（デフォルト）",
     "settings.server.log_level_debug": "debug",
     "settings.server.log_level_trace": "trace - 全内容を含む",
+
     "settings.model.section_label": "モデル",
     "settings.model.model_fallback": "デフォルトモデルにフォールバック",
     "settings.model.model_fallback_desc": "リクエストされたモデルが見つからない場合、デフォルトモデルを使用します",
@@ -231,6 +247,7 @@
     "settings.model.add": "追加",
     "settings.model.placeholder_primary": "メインモデルディレクトリ",
     "settings.model.placeholder_additional": "追加モデルディレクトリ",
+
     "settings.resource.section_label": "リソース管理",
     "settings.resource.live_badge": "ライブ",
     "settings.resource.memory_limit_total": "メモリ上限（合計）",
@@ -250,9 +267,11 @@
     "settings.resource.hot_cache_disabled_label": "= 無効。",
     "settings.resource.cold_cache_limit": "コールドキャッシュ上限（SSDキャッシュ）",
     "settings.resource.cold_cache_description": "退去されたKVキャッシュブロックの永続SSDストレージ。",
+
     "settings.cache.section_label": "キャッシュ",
     "settings.cache.enabled": "キャッシュ有効",
     "settings.cache.ssd_directory": "SSDキャッシュディレクトリ",
+
     "settings.generation.section_label": "生成デフォルト",
     "settings.generation.max_context_window": "最大コンテキストウィンドウ",
     "settings.generation.max_context_window_hint": "このトークン制限を超えるプロンプトを拒否します",
@@ -265,13 +284,16 @@
     "settings.generation.top_k_hint": "0 = 無効",
     "settings.generation.repetition_penalty": "繰り返しペナルティ",
     "settings.generation.repetition_penalty_hint": "1.0 = 無効",
+
     "settings.mcp.section_label": "MCP",
     "settings.mcp.restart_badge": "再起動が必要",
     "settings.mcp.config_path": "設定パス",
     "settings.mcp.config_placeholder": "MCP設定ファイルのパス",
+
     "settings.huggingface.endpoint": "ミラーエンドポイント",
     "settings.huggingface.endpoint_hint": "HuggingFace APIのカスタムエンドポイントURL（例: https://hf-mirror.com）",
     "settings.huggingface.endpoint_clear_hint": "デフォルトのエンドポイントを使用するには、入力欄を空にして保存してください。",
+
     "settings.advanced.section_label": "詳細設定",
     "settings.advanced.restart_badge": "再起動が必要",
     "settings.advanced.batching": "バッチング",
@@ -282,6 +304,7 @@
     "settings.advanced.cache": "キャッシュ",
     "settings.advanced.initial_cache_blocks": "初期キャッシュブロック数",
     "settings.advanced.initial_cache_blocks_hint": "起動時に事前割り当てするブロック数。大きいほど動的割り当てのオーバーヘッドが減少。",
+
     "settings.language.section_label": "言語",
     "settings.language.label": "インターフェース言語",
     "settings.language.en": "English",
@@ -289,8 +312,10 @@
     "settings.language.zh-TW": "中文（繁體）",
     "settings.language.ko": "한국어",
     "settings.language.ja": "日本語",
+
     "settings.save.button": "設定を保存",
     "settings.save.saving": "保存中...",
+
     "settings.models.section_label": "モデル設定",
     "settings.models.heading": "利用可能なモデル",
     "settings.models.description": "モデルごとのサンプリングパラメータなどを設定します。",
@@ -320,6 +345,7 @@
     "settings.models.badge.presence_penalty": "presence_penalty:",
     "settings.models.badge.tool_result_tokens": "tool_result_tokens:",
     "settings.models.badge.force_sampling": "force_sampling",
+
     "modal.model_settings.section_label": "モデル設定",
     "modal.model_settings.model_alias": "モデルエイリアス",
     "modal.model_settings.model_type": "モデルタイプ",
@@ -368,6 +394,7 @@
     "modal.model_settings.cancel": "キャンセル",
     "modal.model_settings.save": "保存",
     "modal.model_settings.saving": "保存中...",
+
     "logs.section_label": "ログ",
     "logs.heading": "サーバーログ",
     "logs.description": "自動更新でリアルタイムのサーバーログを確認します。",
@@ -383,6 +410,7 @@
     "logs.showing_lines": "{total}行中{lines}行表示",
     "logs.placeholder": "ログがありません。サーバーを起動するとログが生成されます。",
     "logs.last_updated": "最終更新: {time}",
+
     "bench.section_label": "ベンチマーク",
     "bench.heading": "パフォーマンスベンチマーク",
     "bench.description": "単一リクエストと連続バッチングの推論速度を測定します。ベンチマーク前に他のすべてのモデルがアンロードされます。",
@@ -462,6 +490,7 @@
     "bench.metrics.pp_tps_req.name": "pp TPS/req",
     "bench.metrics.pp_tps_req.full_name": "（リクエストあたりのプロンプト処理TPS）",
     "bench.metrics.pp_tps_req.description": "プロンプト処理スループットをバッチサイズで割った値。バッチング負荷下でのリクエストあたりのプリフィル速度を示します。",
+
     "chat.title": "チャット - oMLX 管理画面",
     "chat.brand": "oMLXチャット",
     "chat.api_key_prompt": "チャットを開始するにはAPIキーを入力してください",
@@ -490,12 +519,14 @@
     "chat.confirm_delete_chat": "このチャットを削除しますか？",
     "chat.confirm_clear_all": "すべてのチャット履歴を削除しますか？この操作は元に戻せません。",
     "chat.error.incorrect_api_key": "APIキーが正しくありません。再入力してください。",
+
     "chat.upload_image": "画像をアップロード",
     "chat.remove_image": "画像を削除",
     "chat.image_not_available": "画像",
     "chat.error.invalid_image_type": "画像ファイルを選択してください",
     "chat.error.image_too_large": "画像サイズは10MB以下にしてください",
     "chat.error.image_load_failed": "画像の読み込みに失敗しました。もう一度お試しください。",
+
     "js.error.required_fields": "必須項目が空です: {fields}",
     "js.error.api_key_min_length": "APIキーは4文字以上必要です",
     "js.error.api_key_no_whitespace": "APIキーにスペースを含めることはできません",

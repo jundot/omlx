@@ -1,6 +1,7 @@
 {
     "app.title": "oMLX 管理後台",
     "app.tagline": "LLM 推論，為您的 Mac 優化",
+
     "login.title_login": "登入 - oMLX 管理後台",
     "login.title_setup": "初始化 - oMLX 管理後台",
     "login.setup.heading": "設定 API 金鑰",
@@ -26,7 +27,9 @@
     "login.error.no_whitespace": "API 金鑰不能包含空白字元",
     "login.error.mismatch": "兩次輸入的 API 金鑰不一致",
     "login.error.setup_failed": "API 金鑰設定失敗",
+
     "dashboard.title": "控制台 - oMLX 管理後台",
+
     "navbar.brand": "oMLX",
     "navbar.admin": "管理",
     "navbar.tab.status": "儀表板",
@@ -44,6 +47,7 @@
     "navbar.logout": "登出",
     "navbar.update_available": "有可用更新：v{version}",
     "navbar.go_to_github": "前往 GitHub",
+
     "status.section_label": "儀表板",
     "status.heading": "服務統計",
     "status.clear": "清除",
@@ -101,6 +105,7 @@
     "status.integrations.openclaw_tools_profile": "工具",
     "status.engines.section_label": "引擎版本",
     "status.engines.unknown_version": "未知",
+
     "models.tab.manager": "管理員",
     "models.tab.downloader": "下載工具",
     "models.manager.section_label": "模型",
@@ -117,6 +122,7 @@
     "models.manager.delete_confirm": "確認刪除？",
     "models.manager.delete_yes": "是",
     "models.manager.delete_no": "否",
+
     "models.downloader.section_label": "模型",
     "models.downloader.heading": "模型下載工具",
     "models.downloader.description": "從 HuggingFace 或魔搭社區下載模型並瀏覽可用模型。",
@@ -133,6 +139,7 @@
     "models.downloader.hf_token_optional": "（選填）",
     "models.downloader.hf_token_placeholder": "hf_...",
     "models.downloader.download_button": "下載",
+
     "models.downloader.ms_download_section": "從魔搭社區下載",
     "models.downloader.ms_repo_id": "模型 ID",
     "models.downloader.ms_repo_placeholder": "qwen/Qwen2.5-7B-Instruct-MLX",
@@ -141,6 +148,7 @@
     "models.downloader.ms_token_placeholder": "your_token...",
     "models.downloader.ms_mirror_settings": "鏡像設定",
     "models.downloader.ms_unavailable": "未安裝 ModelScope SDK。請執行：pip install omlx[modelscope]",
+
     "models.search.section_label": "搜尋 HuggingFace",
     "models.search.placeholder": "在 HuggingFace 上搜尋模型...",
     "models.search.ms_section_label": "搜尋魔搭社區",
@@ -153,6 +161,7 @@
     "models.search.sort.most_params": "參數最多",
     "models.search.sort.least_params": "參數最少",
     "models.search.button": "搜尋",
+
     "models.browse.section_label": "瀏覽模型",
     "models.browse.system_suffix": "適用於 {memory} 系統",
     "models.browse.tab.trending": "熱門趨勢",
@@ -169,10 +178,12 @@
     "models.browse.tight_fit": "記憶體吃緊",
     "models.browse.high_oom_risk": "OOM 風險高",
     "models.browse.params_suffix": "參數",
+
     "models.queue.section_label": "下載佇列",
     "models.queue.downloading": "下載中...",
     "models.queue.cancel_tooltip": "取消下載",
     "models.queue.remove_tooltip": "從列表移除",
+
     "models.detail.loading": "正在載入模型資訊...",
     "models.detail.tab.model_card": "模型卡片",
     "models.detail.tab.files": "檔案",
@@ -183,13 +194,16 @@
     "models.detail.view_on_hf": "在 HuggingFace 上檢視",
     "models.detail.view_on_ms": "在魔搭社區檢視",
     "models.detail.close": "關閉",
+
     "settings.tab.global": "全域設定",
     "settings.tab.models": "模型設定",
+
     "settings.global.section_label": "全域設定",
     "settings.global.heading": "伺服器配置",
     "settings.global.restart_notice": "標有",
     "settings.global.restart_badge": "重新啟動",
     "settings.global.restart_suffix": "的設定需要重新啟動伺服器。",
+
     "settings.auth.section_label": "驗證與資訊",
     "settings.auth.base_path": "基礎路徑",
     "settings.auth.base_path_hint": "僅供檢視",
@@ -211,6 +225,7 @@
     "settings.auth.sub_keys_unnamed": "未命名",
     "settings.auth.sub_keys_empty": "尚未設定子金鑰",
     "settings.auth.sub_keys_generate_tooltip": "產生隨機金鑰",
+
     "settings.server.section_label": "伺服器",
     "settings.server.host": "主機",
     "settings.server.host_localhost": "僅本機（127.0.0.1）",
@@ -224,6 +239,7 @@
     "settings.server.log_level_info": "info（預設）",
     "settings.server.log_level_debug": "debug",
     "settings.server.log_level_trace": "trace - 包含完整內容",
+
     "settings.model.section_label": "模型",
     "settings.model.model_fallback": "回退到預設模型",
     "settings.model.model_fallback_desc": "當請求的模型未找到時使用預設模型",
@@ -231,6 +247,7 @@
     "settings.model.add": "新增",
     "settings.model.placeholder_primary": "主要模型目錄",
     "settings.model.placeholder_additional": "附加模型目錄",
+
     "settings.resource.section_label": "資源管理",
     "settings.resource.live_badge": "即時",
     "settings.resource.memory_limit_total": "記憶體限制（總量）",
@@ -250,9 +267,11 @@
     "settings.resource.hot_cache_disabled_label": "= 已停用。",
     "settings.resource.cold_cache_limit": "冷快取限制（SSD 快取）",
     "settings.resource.cold_cache_description": "已驅逐的 KV Cache 區塊的持久化 SSD 儲存空間。",
+
     "settings.cache.section_label": "快取",
     "settings.cache.enabled": "啟用快取",
     "settings.cache.ssd_directory": "SSD 快取目錄",
+
     "settings.generation.section_label": "生成預設值",
     "settings.generation.max_context_window": "最大上下文窗口",
     "settings.generation.max_context_window_hint": "拒絕超過此 Token 限制的 Prompt",
@@ -265,13 +284,16 @@
     "settings.generation.top_k_hint": "0 = 停用",
     "settings.generation.repetition_penalty": "重複懲罰",
     "settings.generation.repetition_penalty_hint": "1.0 = 停用",
+
     "settings.mcp.section_label": "MCP",
     "settings.mcp.restart_badge": "需要重新啟動",
     "settings.mcp.config_path": "設定路徑",
     "settings.mcp.config_placeholder": "MCP 設定檔路徑",
+
     "settings.huggingface.endpoint": "鏡像端點",
     "settings.huggingface.endpoint_hint": "HuggingFace API 自訂端點 URL（例如 https://hf-mirror.com）",
     "settings.huggingface.endpoint_clear_hint": "要使用預設端點，請清除輸入欄位並儲存。",
+
     "settings.advanced.section_label": "進階",
     "settings.advanced.restart_badge": "需要重新啟動",
     "settings.advanced.batching": "批次處理",
@@ -282,6 +304,7 @@
     "settings.advanced.cache": "快取",
     "settings.advanced.initial_cache_blocks": "初始快取區塊數",
     "settings.advanced.initial_cache_blocks_hint": "啟動時預先分配的區塊數。數值越高，動態分配的開銷越小。",
+
     "settings.language.section_label": "語言",
     "settings.language.label": "介面語言",
     "settings.language.en": "English",
@@ -289,8 +312,10 @@
     "settings.language.zh-TW": "中文（繁體）",
     "settings.language.ko": "한국어",
     "settings.language.ja": "日本語",
+
     "settings.save.button": "儲存設定",
     "settings.save.saving": "儲存中...",
+
     "settings.models.section_label": "模型設定",
     "settings.models.heading": "可用模型",
     "settings.models.description": "設定每個模型的參數，包括取樣參數。",
@@ -320,6 +345,7 @@
     "settings.models.badge.presence_penalty": "presence_penalty:",
     "settings.models.badge.tool_result_tokens": "tool_result_tokens:",
     "settings.models.badge.force_sampling": "force_sampling",
+
     "modal.model_settings.section_label": "模型設定",
     "modal.model_settings.model_alias": "模型別名",
     "modal.model_settings.model_type": "模型類型",
@@ -368,6 +394,7 @@
     "modal.model_settings.cancel": "取消",
     "modal.model_settings.save": "儲存",
     "modal.model_settings.saving": "儲存中...",
+
     "logs.section_label": "日誌",
     "logs.heading": "伺服器 Logs",
     "logs.description": "檢視即時伺服器 Logs，支援自動重新整理。",
@@ -383,6 +410,7 @@
     "logs.showing_lines": "顯示 {lines} / {total} 行",
     "logs.placeholder": "暫無記錄。啟動伺服器後將產生記錄。",
     "logs.last_updated": "最後更新：{time}",
+
     "bench.section_label": "基準測試",
     "bench.heading": "效能基準測試",
     "bench.description": "測量單一請求和連續批次處理的推論速度。基準測試前將卸載其他模型。",
@@ -462,6 +490,7 @@
     "bench.metrics.pp_tps_req.name": "pp TPS/req",
     "bench.metrics.pp_tps_req.full_name": "（每請求提示詞處理 TPS）",
     "bench.metrics.pp_tps_req.description": "提示詞處理吞吐量除以批次大小。顯示批次負載下每個請求的預填充速度。",
+
     "chat.title": "聊天 - oMLX 管理後台",
     "chat.brand": "oMLX 對話",
     "chat.api_key_prompt": "輸入您的 oMLX API 金鑰以開始聊天",
@@ -490,12 +519,14 @@
     "chat.confirm_delete_chat": "確定要刪除此對話嗎？",
     "chat.confirm_clear_all": "確定要刪除所有對話記錄嗎？此操作無法復原。",
     "chat.error.incorrect_api_key": "API 金鑰不正確，請重新輸入。",
+
     "chat.upload_image": "上傳圖片",
     "chat.remove_image": "移除圖片",
     "chat.image_not_available": "圖片",
     "chat.error.invalid_image_type": "請選擇圖片檔案",
     "chat.error.image_too_large": "圖片大小不能超過 10MB",
     "chat.error.image_load_failed": "無法載入圖片，請重試。",
+
     "js.error.required_fields": "以下必填欄位不能為空：{fields}",
     "js.error.api_key_min_length": "API 金鑰至少需要 4 個字元",
     "js.error.api_key_no_whitespace": "API 金鑰不能包含空白字元",

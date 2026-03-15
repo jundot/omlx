@@ -1,6 +1,7 @@
 {
     "app.title": "oMLX 管理后台",
     "app.tagline": "LLM 推理，为你的 Mac 优化",
+
     "login.title_login": "登录 - oMLX 管理后台",
     "login.title_setup": "初始化 - oMLX 管理后台",
     "login.setup.heading": "设置 API 密钥",
@@ -26,7 +27,9 @@
     "login.error.no_whitespace": "API 密钥不能包含空白字符",
     "login.error.mismatch": "两次输入的 API 密钥不一致",
     "login.error.setup_failed": "API 密钥设置失败",
+
     "dashboard.title": "控制台 - oMLX 管理后台",
+
     "navbar.brand": "oMLX",
     "navbar.admin": "管理",
     "navbar.tab.status": "仪表盘",
@@ -44,6 +47,7 @@
     "navbar.logout": "退出登录",
     "navbar.update_available": "有可用更新: v{version}",
     "navbar.go_to_github": "前往GitHub",
+
     "status.section_label": "仪表盘",
     "status.heading": "服务统计",
     "status.clear": "清除",
@@ -101,6 +105,7 @@
     "status.integrations.openclaw_tools_profile": "工具",
     "status.engines.section_label": "引擎版本",
     "status.engines.unknown_version": "未知",
+
     "models.tab.manager": "管理器",
     "models.tab.downloader": "下载器",
     "models.manager.section_label": "模型",
@@ -117,6 +122,7 @@
     "models.manager.delete_confirm": "确认删除？",
     "models.manager.delete_yes": "是",
     "models.manager.delete_no": "否",
+
     "models.downloader.section_label": "模型",
     "models.downloader.heading": "模型下载器",
     "models.downloader.description": "从 HuggingFace 或魔搭社区下载模型并浏览可用模型。",
@@ -133,6 +139,7 @@
     "models.downloader.hf_token_optional": "（可选）",
     "models.downloader.hf_token_placeholder": "hf_...",
     "models.downloader.download_button": "下载",
+
     "models.downloader.ms_download_section": "从魔搭社区下载",
     "models.downloader.ms_repo_id": "模型 ID",
     "models.downloader.ms_repo_placeholder": "qwen/Qwen2.5-7B-Instruct-MLX",
@@ -141,6 +148,7 @@
     "models.downloader.ms_token_placeholder": "your_token...",
     "models.downloader.ms_mirror_settings": "镜像设置",
     "models.downloader.ms_unavailable": "未安装 ModelScope SDK。请运行: pip install omlx[modelscope]",
+
     "models.search.section_label": "搜索 HuggingFace",
     "models.search.placeholder": "在 HuggingFace 上搜索模型...",
     "models.search.ms_section_label": "搜索魔搭社区",
@@ -153,6 +161,7 @@
     "models.search.sort.most_params": "参数最多",
     "models.search.sort.least_params": "参数最少",
     "models.search.button": "搜索",
+
     "models.browse.section_label": "浏览模型",
     "models.browse.system_suffix": "适用于 {memory} 系统",
     "models.browse.tab.trending": "热门趋势",
@@ -169,10 +178,12 @@
     "models.browse.tight_fit": "内存偏紧",
     "models.browse.high_oom_risk": "OOM 风险高",
     "models.browse.params_suffix": "参数",
+
     "models.queue.section_label": "下载队列",
     "models.queue.downloading": "下载中...",
     "models.queue.cancel_tooltip": "取消下载",
     "models.queue.remove_tooltip": "从列表移除",
+
     "models.detail.loading": "正在加载模型信息...",
     "models.detail.tab.model_card": "模型卡片",
     "models.detail.tab.files": "文件",
@@ -183,13 +194,16 @@
     "models.detail.view_on_hf": "在 HuggingFace 上查看",
     "models.detail.view_on_ms": "在魔搭社区查看",
     "models.detail.close": "关闭",
+
     "settings.tab.global": "全局设置",
     "settings.tab.models": "模型设置",
+
     "settings.global.section_label": "全局设置",
     "settings.global.heading": "服务器配置",
     "settings.global.restart_notice": "标有",
     "settings.global.restart_badge": "重启",
     "settings.global.restart_suffix": "的设置需要重启服务器。",
+
     "settings.auth.section_label": "认证与信息",
     "settings.auth.base_path": "基础路径",
     "settings.auth.base_path_hint": "只读",
@@ -211,6 +225,7 @@
     "settings.auth.sub_keys_unnamed": "未命名",
     "settings.auth.sub_keys_empty": "暂无子密钥",
     "settings.auth.sub_keys_generate_tooltip": "生成随机密钥",
+
     "settings.server.section_label": "服务器",
     "settings.server.host": "主机",
     "settings.server.host_localhost": "仅本地（127.0.0.1）",
@@ -224,6 +239,7 @@
     "settings.server.log_level_info": "info（默认）",
     "settings.server.log_level_debug": "debug",
     "settings.server.log_level_trace": "trace - 包含完整内容",
+
     "settings.model.section_label": "模型",
     "settings.model.model_fallback": "回退到默认模型",
     "settings.model.model_fallback_desc": "当请求的模型未找到时使用默认模型",
@@ -231,6 +247,7 @@
     "settings.model.add": "添加",
     "settings.model.placeholder_primary": "主模型目录",
     "settings.model.placeholder_additional": "附加模型目录",
+
     "settings.resource.section_label": "资源管理",
     "settings.resource.live_badge": "实时",
     "settings.resource.memory_limit_total": "内存限制（总量）",
@@ -250,9 +267,11 @@
     "settings.resource.hot_cache_disabled_label": "= 已禁用。",
     "settings.resource.cold_cache_limit": "冷缓存限制（SSD 缓存）",
     "settings.resource.cold_cache_description": "被驱逐的 KV Cache 块的持久 SSD 存储。",
+
     "settings.cache.section_label": "缓存",
     "settings.cache.enabled": "启用缓存",
     "settings.cache.ssd_directory": "SSD 缓存目录",
+
     "settings.generation.section_label": "生成默认值",
     "settings.generation.max_context_window": "最大上下文窗口",
     "settings.generation.max_context_window_hint": "拒绝超过此 Token 限制的提示词",
@@ -265,13 +284,16 @@
     "settings.generation.top_k_hint": "0 = 禁用",
     "settings.generation.repetition_penalty": "重复惩罚",
     "settings.generation.repetition_penalty_hint": "1.0 = 禁用",
+
     "settings.mcp.section_label": "MCP",
     "settings.mcp.restart_badge": "需要重启",
     "settings.mcp.config_path": "配置路径",
     "settings.mcp.config_placeholder": "MCP 配置文件路径",
+
     "settings.huggingface.endpoint": "镜像端点",
     "settings.huggingface.endpoint_hint": "HuggingFace API 自定义端点 URL（例如 https://hf-mirror.com）",
     "settings.huggingface.endpoint_clear_hint": "要使用默认端点，请清空输入框并保存。",
+
     "settings.advanced.section_label": "高级",
     "settings.advanced.restart_badge": "需要重启",
     "settings.advanced.batching": "批处理",
@@ -282,6 +304,7 @@
     "settings.advanced.cache": "缓存",
     "settings.advanced.initial_cache_blocks": "初始缓存块数",
     "settings.advanced.initial_cache_blocks_hint": "启动时预分配的块数。值越大，动态分配开销越小。",
+
     "settings.language.section_label": "语言",
     "settings.language.label": "界面语言",
     "settings.language.en": "English",
@@ -289,8 +312,10 @@
     "settings.language.zh-TW": "中文（繁體）",
     "settings.language.ko": "한국어",
     "settings.language.ja": "日本語",
+
     "settings.save.button": "保存设置",
     "settings.save.saving": "保存中...",
+
     "settings.models.section_label": "模型设置",
     "settings.models.heading": "可用模型",
     "settings.models.description": "配置每个模型的设置，包括采样参数。",
@@ -320,6 +345,7 @@
     "settings.models.badge.presence_penalty": "presence_penalty:",
     "settings.models.badge.tool_result_tokens": "tool_result_tokens:",
     "settings.models.badge.force_sampling": "force_sampling",
+
     "modal.model_settings.section_label": "模型设置",
     "modal.model_settings.model_alias": "模型别名",
     "modal.model_settings.model_type": "模型类型",
@@ -368,6 +394,7 @@
     "modal.model_settings.cancel": "取消",
     "modal.model_settings.save": "保存",
     "modal.model_settings.saving": "保存中...",
+
     "logs.section_label": "日志",
     "logs.heading": "服务器日志",
     "logs.description": "查看实时服务器日志，支持自动刷新。",
@@ -383,6 +410,7 @@
     "logs.showing_lines": "显示 {lines} / {total} 行",
     "logs.placeholder": "暂无日志。启动服务器后将产生日志。",
     "logs.last_updated": "最后更新：{time}",
+
     "bench.section_label": "基准测试",
     "bench.heading": "性能基准测试",
     "bench.description": "测量单请求和连续批处理的推理速度。基准测试前将卸载所有其他模型。",
@@ -462,6 +490,7 @@
     "bench.metrics.pp_tps_req.name": "pp TPS/req",
     "bench.metrics.pp_tps_req.full_name": "（每请求提示词处理 TPS）",
     "bench.metrics.pp_tps_req.description": "提示词处理吞吐量除以批量大小。显示批量负载下每个请求的预填充速度。",
+
     "chat.title": "聊天 - oMLX 管理后台",
     "chat.brand": "oMLX 对话",
     "chat.api_key_prompt": "输入你的 oMLX API 密钥以开始聊天",
@@ -490,12 +519,14 @@
     "chat.confirm_delete_chat": "确定要删除此对话吗？",
     "chat.confirm_clear_all": "确定要删除所有对话历史吗？此操作无法撤销。",
     "chat.error.incorrect_api_key": "API 密钥不正确，请重新输入。",
+
     "chat.upload_image": "上传图像",
     "chat.remove_image": "移除图像",
     "chat.image_not_available": "图片",
     "chat.error.invalid_image_type": "请选择图像文件",
     "chat.error.image_too_large": "图像大小不能超过 10MB",
     "chat.error.image_load_failed": "无法加载图片，请重试。",
+
     "js.error.required_fields": "以下必填字段不能为空：{fields}",
     "js.error.api_key_min_length": "API 密钥至少需要 4 个字符",
     "js.error.api_key_no_whitespace": "API 密钥不能包含空白字符",
