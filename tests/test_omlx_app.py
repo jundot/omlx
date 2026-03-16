@@ -22,6 +22,8 @@ import pytest
 
 # Import the modules under test
 sys.path.insert(0, str(Path(__file__).parent.parent / "packaging"))
+import requests
+from omlx_app.admin_client import AdminStatsClient
 from omlx_app.config import ServerConfig, get_app_support_dir, get_config_path, get_log_path
 from omlx_app.server_manager import PortConflict, ServerManager, ServerStatus
 
@@ -293,7 +295,7 @@ class TestServerConfig:
         config.set_server_api_key("roundtrip-key")
         assert config.get_server_api_key() == "roundtrip-key"
 
-    @patch("omlx_app.config.requests.Session")
+    @patch("omlx_app.admin_client.requests.Session")
     def test_update_server_api_key_runtime_success(self, mock_session_cls, tmp_path):
         """Test runtime API key update on running server."""
         config = ServerConfig(base_path=str(tmp_path))
@@ -311,7 +313,7 @@ class TestServerConfig:
         assert result is True
         assert mock_session.post.call_count == 2
 
-    @patch("omlx_app.config.requests.Session")
+    @patch("omlx_app.admin_client.requests.Session")
     def test_update_server_api_key_runtime_server_down(self, mock_session_cls, tmp_path):
         """Test runtime update returns False when server unreachable."""
         import requests as req
@@ -933,3 +935,94 @@ class TestPathHelpers:
 
         assert result == tmp_path / "logs" / "server.log"
         assert (tmp_path / "logs").exists()
+
+
+class TestAdminStatsClient:
+    """Tests for AdminStatsClient session reuse logic."""
+
+    @pytest.fixture
+    def client(self):
+        return AdminStatsClient("http://127.0.0.1:8000", "test-key")
+
+    @patch("omlx_app.admin_client.requests.Session")
+    def test_login_on_first_fetch(self, mock_session_cls, client):
+        """First fetch triggers a login POST."""
+        mock_session = Mock()
+        mock_session_cls.return_value = mock_session
+        mock_session.post.return_value = Mock(status_code=200)
+        mock_session.get.return_value = Mock(status_code=200, json=lambda: {"total_requests": 1})
+
+        result = client.fetch_stats()
+
+        mock_session.post.assert_called_once_with(
+            "http://127.0.0.1:8000/admin/api/login",
+            json={"api_key": "test-key"},
+            timeout=2,
+        )
+        assert result == {"total_requests": 1}
+
+    @patch("omlx_app.admin_client.requests.Session")
+    def test_reuses_session_on_second_fetch(self, mock_session_cls, client):
+        """Second fetch does NOT create a new session or call login."""
+        mock_session = Mock()
+        mock_session_cls.return_value = mock_session
+        mock_session.post.return_value = Mock(status_code=200)
+        mock_session.get.return_value = Mock(status_code=200, json=lambda: {})
+
+        client.fetch_stats()
+        client.fetch_stats()
+
+        assert mock_session_cls.call_count == 1   # only one Session() created
+        assert mock_session.post.call_count == 1  # only one login
+
+    @patch("omlx_app.admin_client.requests.Session")
+    def test_relogins_on_401(self, mock_session_cls, client):
+        """On 401, invalidates session and re-logins."""
+        mock_session = Mock()
+        mock_session_cls.return_value = mock_session
+        mock_session.post.return_value = Mock(status_code=200)
+        # First call: 401, second call (after re-login): 200
+        mock_session.get.side_effect = [
+            Mock(status_code=401),
+            Mock(status_code=200, json=lambda: {"total_requests": 5}),
+        ]
+
+        # Pre-populate session to simulate existing session
+        client._session = mock_session
+
+        result = client.fetch_stats()
+
+        assert mock_session.post.call_count == 1  # re-login happened
+        assert result == {"total_requests": 5}
+
+    @patch("omlx_app.admin_client.requests.Session")
+    def test_login_failure_returns_none(self, mock_session_cls, client):
+        """If login returns non-200, fetch_stats returns None."""
+        mock_session = Mock()
+        mock_session_cls.return_value = mock_session
+        mock_session.post.return_value = Mock(status_code=401)
+
+        result = client.fetch_stats()
+
+        assert result is None
+        assert client._session is None
+
+    @patch("omlx_app.admin_client.requests.Session")
+    def test_connection_error_clears_session(self, mock_session_cls, client):
+        """RequestException during stats fetch clears session."""
+        mock_session = Mock()
+        mock_session_cls.return_value = mock_session
+        mock_session.post.return_value = Mock(status_code=200)
+        mock_session.get.side_effect = requests.RequestException("refused")
+
+        client._session = mock_session  # pre-populate
+        result = client.fetch_stats()
+
+        assert result is None
+        assert client._session is None
+
+    def test_invalidate_clears_session(self, client):
+        """invalidate() discards the current session."""
+        client._session = Mock()
+        client.invalidate()
+        assert client._session is None

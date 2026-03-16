@@ -33,6 +33,7 @@ from AppKit import (
 )
 from Foundation import NSData, NSObject, NSRunLoop, NSDefaultRunLoopMode, NSTimer
 
+from .admin_client import AdminStatsClient
 from .config import ServerConfig
 from .server_manager import PortConflict, ServerManager, ServerStatus
 
@@ -83,6 +84,7 @@ class OMLXAppDelegate(NSObject):
         self._cached_stats: Optional[dict] = None
         self._cached_alltime_stats: Optional[dict] = None
         self._last_stats_fetch: float = 0
+        self._stats_client: Optional[AdminStatsClient] = None
         self._icon_outline: Optional[NSImage] = None
         self._icon_filled: Optional[NSImage] = None
         self._update_info: Optional[dict] = None
@@ -736,49 +738,19 @@ class OMLXAppDelegate(NSObject):
 
     def _fetch_stats(self):
         """Fetch serving stats from the admin API."""
-        try:
-            api_key = self.config.get_server_api_key()
-            base_url = f"http://127.0.0.1:{self.config.port}"
-
-            if not api_key:
-                self._cached_stats = None
-                self._cached_alltime_stats = None
-                return
-
-            session = requests.Session()
-            login_resp = session.post(
-                f"{base_url}/admin/api/login",
-                json={"api_key": api_key},
-                timeout=2,
-            )
-            if login_resp.status_code != 200:
-                self._cached_stats = None
-                self._cached_alltime_stats = None
-                return
-
-            stats_resp = session.get(
-                f"{base_url}/admin/api/stats",
-                timeout=2,
-            )
-            if stats_resp.status_code == 200:
-                self._cached_stats = stats_resp.json()
-            else:
-                self._cached_stats = None
-                self._cached_alltime_stats = None
-
-            alltime_resp = session.get(
-                f"{base_url}/admin/api/stats",
-                params={"scope": "alltime"},
-                timeout=2,
-            )
-            if alltime_resp.status_code == 200:
-                self._cached_alltime_stats = alltime_resp.json()
-            else:
-                self._cached_alltime_stats = None
-
-        except requests.RequestException:
+        api_key = self.config.get_server_api_key()
+        if not api_key:
             self._cached_stats = None
             self._cached_alltime_stats = None
+            return
+
+        if self._stats_client is None:
+            self._stats_client = AdminStatsClient(
+                f"http://127.0.0.1:{self.config.port}", api_key
+            )
+
+        self._cached_stats = self._stats_client.fetch_stats()
+        self._cached_alltime_stats = self._stats_client.fetch_stats(scope="alltime")
 
     # --- Timer callback ---
 
@@ -803,6 +775,8 @@ class OMLXAppDelegate(NSObject):
             ServerStatus.ERROR,
             ServerStatus.UNRESPONSIVE,
         ):
+            if self._stats_client is not None:
+                self._stats_client.invalidate()
             self._cached_stats = None
             self._cached_alltime_stats = None
 
