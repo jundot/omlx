@@ -1,5 +1,4 @@
 import json
-import re
 from pathlib import Path
 
 def normalize():
@@ -12,11 +11,7 @@ def normalize():
         return
 
     with open(en_path, "r", encoding="utf-8") as f:
-        en_text = f.read()
-        
-    en_data = json.loads(en_text)
-    
-    line_pattern = re.compile(r'^(\s*)"([^"]+)"(\s*:\s*)(.*)$')
+        en_data = json.load(f)
 
     for file_path in i18n_dir.glob("*.json"):
         if file_path.name == "en.json":
@@ -27,25 +22,16 @@ def normalize():
         with open(file_path, "r", encoding="utf-8") as f:
             lang_data = json.load(f)
             
-        normalized_lines = []
-        for line in en_text.splitlines():
-            match = line_pattern.match(line)
-            if match:
-                indent, key, colon_space, old_val_part = match.groups()
-                target_value = lang_data.get(key, en_data[key])
-                json_value = json.dumps(target_value, ensure_ascii=False)
-                
-                has_comma = old_val_part.strip().endswith(',')
-                if has_comma:
-                    json_value += ","
-                    
-                new_line = f'{indent}"{key}"{colon_space}{json_value}'
-                normalized_lines.append(new_line)
+        normalized_data = {}
+        for key, value in en_data.items():
+            if key in lang_data:
+                normalized_data[key] = lang_data[key]
             else:
-                normalized_lines.append(line)
+                normalized_data[key] = value
                 
         with open(file_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(normalized_lines) + "\n")
+            json.dump(normalized_data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
 
 if __name__ == "__main__":
     normalize()
