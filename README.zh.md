@@ -78,13 +78,13 @@ pip install -e .          # 仅核心
 pip install -e ".[mcp]"   # 含 MCP（Model Context Protocol）支持
 ```
 
-需要 Python 3.10+ 和 Apple Silicon（M1/M2/M3/M4）。
+需要 macOS 15.0+ (Sequoia), Python 3.10+ 和 Apple Silicon（M1/M2/M3/M4）。
 
 ## 快速开始
 
 ### macOS 应用
 
-从 Applications 文件夹启动 oMLX。欢迎界面会引导你完成三个步骤 — 模型目录设置、服务器启动、首个模型下载。就是这样。
+从 Applications 文件夹启动 oMLX。欢迎界面会引导你完成三个步骤 — 模型目录设置、服务器启动、首个模型下载。就是这样。要连接 OpenClaw、OpenCode 或 Codex，请参阅[集成](#集成)。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX 欢迎界面" width="360">
@@ -189,6 +189,14 @@ brew services info omlx     # 查看状态
   <img src="docs/images/downloader_omlx.png" alt="oMLX 模型下载器" width="720">
 </p>
 
+### 集成
+
+在管理后台中一键设置 OpenClaw、OpenCode 和 Codex。无需手动编辑配置文件。
+
+<p align="center">
+  <img src="docs/images/omlx_integrations.png" alt="oMLX 集成" width="720">
+</p>
+
 ### 性能基准测试
 
 从管理后台一键运行基准测试。测量预填充（PP）和 Token 生成（TG）的每秒 Token 数，包含部分前缀缓存命中测试以获得真实的性能数据。
@@ -233,7 +241,7 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | Kimi K2 | `<\|tool_calls_section_begin\|>` |
 | Longcat | `<longcat_tool_call>` |
 
-上表未列出的模型，只要聊天模板支持 `tools` 参数且输出采用可识别的 `<tool_call>` XML 格式，也有可能正常工作。包含工具调用的流式请求会缓冲全部内容，在完成后统一返回结果。
+上表未列出的模型，只要聊天模板支持 `tools` 参数且输出采用可识别的 `<tool_call>` XML 格式，也有可能正常工作。针对支持工具调用的流式请求，系统会增量发射助手文本，同时隐藏已知的工具调用控制标记；结构化工具调用将在完成整个回合解析后发射。
 
 ## 模型
 
@@ -278,6 +286,9 @@ omlx serve --model-dir ~/models --prefill-batch-size 8 --completion-batch-size 3
 
 # 使用 MCP 工具
 omlx serve --model-dir ~/models --mcp-config mcp.json
+
+# HuggingFace 镜像端点（适用于受限地区）
+omlx serve --model-dir ~/models --hf-endpoint https://hf-mirror.com
 
 # API 密钥认证
 omlx serve --model-dir ~/models --api-key your-secret-key
