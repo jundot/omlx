@@ -14,11 +14,11 @@ name = "mlx-framework"
 runtime = "cpython-3.11"
 requirements = [
     # Core MLX
-    "mlx>=0.29.2",
+    "mlx>=0.31.1",
     # mlx-lm from latest commit (4a21ffd) - aligned with pyproject.toml
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@4a21ffd",
-    # mlx-embeddings from latest commit (88522e2) - aligned with pyproject.toml
-    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@88522e288c0142170a5a44fd93c184d8ed777371",
+    # mlx-embeddings from latest commit (6e2ef52) - aligned with pyproject.toml
+    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@6e2ef5256faadf1d79c3bf339686d43f8db17cdd",
     # Server dependencies
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
@@ -45,8 +45,8 @@ requirements = [
     "mcp>=1.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (348466f) - aligned with pyproject.toml
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@348466f3f8f9a0413a6167bf8c1634d02ca2c131",
+    # mlx-vlm from commit (b7f853a) - aligned with pyproject.toml
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@b7f853a26a0bdcb60a307b1deb01ba5be9ac9ffc",
     "Pillow>=9.0.0",
     # ModelScope SDK for downloading models from ModelScope Hub
     "modelscope>=1.10.0",
