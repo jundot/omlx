@@ -3775,7 +3775,7 @@ class Scheduler:
         return verified
 
     def get_ssd_cache_stats(self) -> Optional[Dict[str, Any]]:
-        """Get paged SSD cache statistics."""
+        """Get paged SSD + prefix cache observability statistics."""
         stats = {}
 
         if self.paged_ssd_cache_manager is not None:
@@ -3785,6 +3785,11 @@ class Scheduler:
             # In paged SSD-only mode, all cache data is on paged SSD
             stats["indexed_blocks"] = self.paged_cache_manager.cold_block_count
             stats["block_size"] = self.config.paged_cache_block_size
+
+        if self.block_aware_cache is not None:
+            # Expose prefix-cache observability so UI can distinguish
+            # "0 indexed blocks" from "sub-block cached (<block_size)".
+            stats["prefix_cache"] = self.block_aware_cache.get_stats_dict()
 
         return stats if stats else None
 

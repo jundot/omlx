@@ -3,9 +3,12 @@
 
 import asyncio
 from dataclasses import fields as dataclass_fields
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from omlx.admin.auth import validate_api_key, verify_any_api_key, verify_api_key
 from omlx.model_settings import ModelSettings
@@ -537,3 +540,164 @@ class TestLoginEndpoint:
             mock_response.set_cookie.assert_called_once()
         finally:
             _restore_getter(original)
+
+
+class TestStatsSecurity:
+    """Tests for /admin/api/stats response hardening."""
+
+    def test_stats_response_does_not_include_raw_api_key(self):
+        """The stats payload must not leak auth.api_key."""
+        mock_settings = MagicMock()
+        mock_settings.server.host = "127.0.0.1"
+        mock_settings.server.port = 9981
+        mock_settings.auth.api_key = "super-secret-key"
+        mock_settings.claude_code.context_scaling_enabled = True
+        mock_settings.claude_code.target_context_size = 200000
+
+        mock_metrics = MagicMock()
+        mock_metrics.get_snapshot.return_value = {
+            "total_prompt_tokens": 0,
+            "total_cached_tokens": 0,
+            "cache_efficiency": 0,
+            "avg_prefill_tps": 0,
+            "avg_generation_tps": 0,
+            "total_requests": 0,
+        }
+
+        with (
+            patch.object(admin_routes, "_get_global_settings", return_value=mock_settings),
+            patch("omlx.server_metrics.get_server_metrics", return_value=mock_metrics),
+            patch.object(admin_routes, "_get_engine_info", return_value={}),
+            patch.object(admin_routes, "_build_active_models_data", return_value={"models": []}),
+            patch.object(admin_routes, "_build_runtime_cache_observability", return_value={"models": []}),
+        ):
+            result = asyncio.run(admin_routes.get_server_stats(is_admin=True))
+
+        assert "api_key" not in result
+
+
+class TestRuntimeCacheObservability:
+    """Tests for runtime cache observability robustness."""
+
+    def test_runtime_cache_ignores_single_model_stats_failure(self):
+        """One model failing stats collection should not break the whole payload."""
+        cache_dir = Path("/tmp/omlx-cache")
+
+        mock_settings = MagicMock()
+        mock_settings.base_path = Path("/tmp/omlx-base")
+        mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+
+        bad_scheduler = MagicMock()
+        bad_scheduler.get_ssd_cache_stats.side_effect = RuntimeError("boom")
+        good_scheduler = MagicMock()
+        good_scheduler.get_ssd_cache_stats.return_value = {
+            "block_size": 1024,
+            "indexed_blocks": 12,
+            "ssd_cache": {
+                "num_files": 3,
+                "total_size_bytes": 4096,
+                "hot_cache_max_bytes": 0,
+                "hot_cache_size_bytes": 0,
+                "hot_cache_entries": 0,
+            },
+        }
+
+        bad_entry = SimpleNamespace(
+            engine=SimpleNamespace(
+                _engine=SimpleNamespace(
+                    engine=SimpleNamespace(scheduler=bad_scheduler)
+                )
+            )
+        )
+        good_entry = SimpleNamespace(
+            engine=SimpleNamespace(
+                _engine=SimpleNamespace(
+                    engine=SimpleNamespace(scheduler=good_scheduler)
+                )
+            )
+        )
+
+        engine_pool = MagicMock()
+        engine_pool.get_status.return_value = {
+            "models": [
+                {"id": "bad-model", "loaded": True},
+                {"id": "good-model", "loaded": True},
+            ]
+        }
+        engine_pool._entries = {
+            "bad-model": bad_entry,
+            "good-model": good_entry,
+        }
+
+        with patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool):
+            payload = admin_routes._build_runtime_cache_observability(mock_settings)
+
+        assert [m["id"] for m in payload["models"]] == ["good-model"]
+        assert payload["total_num_files"] == 3
+        assert payload["total_size_bytes"] == 4096
+        assert payload["effective_block_sizes"] == [1024]
+
+    def test_runtime_cache_marks_sub_block_cached_when_indexed_blocks_zero(self):
+        """Show <block_size indicator only when sub-block cache evidence exists."""
+        cache_dir = Path("/tmp/omlx-cache")
+
+        mock_settings = MagicMock()
+        mock_settings.base_path = Path("/tmp/omlx-base")
+        mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+
+        scheduler = MagicMock()
+        scheduler.get_ssd_cache_stats.return_value = {
+            "block_size": 1024,
+            "indexed_blocks": 0,
+            "ssd_cache": {
+                "num_files": 0,
+                "total_size_bytes": 0,
+            },
+            "prefix_cache": {
+                "partial_block_skips": 2,
+                "partial_tokens_skipped": 1200,
+                "last_partial_tokens_skipped": 577,
+                "last_tokens_to_next_block": 447,
+            },
+        }
+
+        entry = SimpleNamespace(
+            engine=SimpleNamespace(
+                _engine=SimpleNamespace(
+                    engine=SimpleNamespace(scheduler=scheduler)
+                )
+            )
+        )
+
+        engine_pool = MagicMock()
+        engine_pool.get_status.return_value = {
+            "models": [
+                {"id": "qwen-a3b", "loaded": True},
+            ]
+        }
+        engine_pool._entries = {"qwen-a3b": entry}
+
+        with patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool):
+            payload = admin_routes._build_runtime_cache_observability(mock_settings)
+
+        model_payload = payload["models"][0]
+        assert model_payload["indexed_blocks"] == 0
+        assert model_payload["has_sub_block_cache"] is True
+        assert model_payload["indexed_blocks_display"] == "<1024"
+        assert model_payload["last_partial_tokens_skipped"] == 577
+
+
+class TestGlobalSettingsValidation:
+    """Tests for stricter GlobalSettingsRequest validation."""
+
+    def test_integrations_openclaw_tools_profile_rejects_invalid_value(self):
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(
+                integrations_openclaw_tools_profile="invalid-profile"
+            )
+
+    def test_integrations_openclaw_tools_profile_accepts_valid_values(self):
+        req = admin_routes.GlobalSettingsRequest(
+            integrations_openclaw_tools_profile="coding"
+        )
+        assert req.integrations_openclaw_tools_profile == "coding"

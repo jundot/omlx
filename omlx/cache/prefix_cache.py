@@ -111,6 +111,10 @@ class BlockAwarePrefixCache(CacheManager):
         self._hits = 0
         self._misses = 0
         self._tokens_saved = 0
+        self._partial_block_skips = 0
+        self._partial_tokens_skipped = 0
+        self._last_partial_tokens_skipped = 0
+        self._last_tokens_to_next_block = 0
 
     def _get_model_num_layers(self, model: Any) -> int:
         """
@@ -376,6 +380,8 @@ class BlockAwarePrefixCache(CacheManager):
 
         if not new_tokens:
             # All tokens already cached
+            self._last_partial_tokens_skipped = 0
+            self._last_tokens_to_next_block = 0
             return block_table
 
         # Allocate only full blocks (skip partial trailing block).
@@ -385,6 +391,25 @@ class BlockAwarePrefixCache(CacheManager):
         # the last full block, which is critical for non-sliceable caches
         # (ArraysCache/RotatingKVCache) that use last-block-only storage.
         num_new_blocks = len(new_tokens) // self.block_size
+        trailing_partial_tokens = len(new_tokens) % self.block_size
+        self._last_partial_tokens_skipped = trailing_partial_tokens
+        self._last_tokens_to_next_block = (
+            self.block_size - trailing_partial_tokens
+            if trailing_partial_tokens > 0
+            else 0
+        )
+        if trailing_partial_tokens > 0:
+            self._partial_block_skips += 1
+            self._partial_tokens_skipped += trailing_partial_tokens
+            logger.debug(
+                "Skipping trailing partial block for %s: %s token(s) not persisted "
+                "(block_size=%s, needs +%s token(s) to fill next block)",
+                request_id,
+                trailing_partial_tokens,
+                self.block_size,
+                self._last_tokens_to_next_block,
+            )
+
         blocks_saved_to_ssd = 0
 
         for i in range(num_new_blocks):
@@ -1898,6 +1923,11 @@ class BlockAwarePrefixCache(CacheManager):
             misses=self._misses,
             evictions=self.paged_cache.stats.evictions,
             tokens_saved=self._tokens_saved,
+            partial_block_skips=self._partial_block_skips,
+            partial_tokens_skipped=self._partial_tokens_skipped,
+            block_size=self.block_size,
+            last_partial_tokens_skipped=self._last_partial_tokens_skipped,
+            last_tokens_to_next_block=self._last_tokens_to_next_block,
         )
 
     def get_stats_dict(self) -> Dict[str, Any]:
@@ -1915,6 +1945,11 @@ class BlockAwarePrefixCache(CacheManager):
             "misses": self._misses,
             "hit_rate": self._hits / (self._hits + self._misses) if (self._hits + self._misses) > 0 else 0,
             "tokens_saved": self._tokens_saved,
+            "partial_block_skips": self._partial_block_skips,
+            "partial_tokens_skipped": self._partial_tokens_skipped,
+            "block_size": self.block_size,
+            "last_partial_tokens_skipped": self._last_partial_tokens_skipped,
+            "last_tokens_to_next_block": self._last_tokens_to_next_block,
             "active_requests": len(self._request_tables),
             **paged_stats,
         }
@@ -1924,6 +1959,10 @@ class BlockAwarePrefixCache(CacheManager):
         self._hits = 0
         self._misses = 0
         self._tokens_saved = 0
+        self._partial_block_skips = 0
+        self._partial_tokens_skipped = 0
+        self._last_partial_tokens_skipped = 0
+        self._last_tokens_to_next_block = 0
         self.paged_cache.reset_stats()
 
     def clear(self) -> int:

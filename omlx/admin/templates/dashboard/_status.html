@@ -100,6 +100,86 @@
                         </div>
                     </div>
 
+                    <!-- Runtime Cache Observability -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="database" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Runtime Cache Observability</span>
+                            </div>
+                            <div class="text-xs text-neutral-500"
+                                 x-text="formatNumber((stats.runtime_cache?.total_num_files || 0)) + ' files · ' + formatSizeBytes((stats.runtime_cache?.total_size_bytes || 0))"></div>
+                        </div>
+                        <div class="px-6 py-4 space-y-3">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                                <div>
+                                    <div class="text-neutral-400 mb-1">Active base_path</div>
+                                    <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
+                                          x-text="stats.runtime_cache?.base_path || '-' "></code>
+                                </div>
+                                <div>
+                                    <div class="text-neutral-400 mb-1">Effective ssd_cache_dir</div>
+                                    <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
+                                          x-text="stats.runtime_cache?.ssd_cache_dir || '-' "></code>
+                                </div>
+                            </div>
+
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                                <div>
+                                    <div class="text-neutral-400 mb-1">response-state directory</div>
+                                    <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
+                                          x-text="stats.runtime_cache?.response_state_dir || '-' "></code>
+                                </div>
+                                <div>
+                                    <div class="text-neutral-400 mb-1">Effective block size(s)</div>
+                                    <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700"
+                                          x-text="(stats.runtime_cache?.effective_block_sizes || []).length ? (stats.runtime_cache.effective_block_sizes.join(', ') + ' tokens') : '-' "></code>
+                                </div>
+                            </div>
+
+                            <div x-show="stats.runtime_cache?.models && stats.runtime_cache.models.length > 0" x-cloak
+                                 class="overflow-x-auto border border-neutral-100 rounded-lg">
+                                <table class="min-w-full text-xs">
+                                    <thead class="bg-neutral-50 text-neutral-500 uppercase tracking-wider">
+                                        <tr>
+                                            <th class="px-3 py-2 text-left">Model</th>
+                                            <th class="px-3 py-2 text-right">Block Size</th>
+                                            <th class="px-3 py-2 text-right">Indexed Blocks</th>
+                                            <th class="px-3 py-2 text-right">Sub-block Cache</th>
+                                            <th class="px-3 py-2 text-right">Cache Files</th>
+                                            <th class="px-3 py-2 text-right">Cache Size</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="divide-y divide-neutral-100 text-neutral-700">
+                                        <template x-for="m in stats.runtime_cache.models" :key="m.id">
+                                            <tr>
+                                                <td class="px-3 py-2 font-medium" x-text="m.id"></td>
+                                                <td class="px-3 py-2 text-right" x-text="m.block_size || '-' "></td>
+                                                <td class="px-3 py-2 text-right">
+                                                    <span x-show="!m.has_sub_block_cache" x-text="formatNumber(m.indexed_blocks || 0)"></span>
+                                                    <span x-show="m.has_sub_block_cache" class="font-medium text-amber-600" x-text="m.indexed_blocks_display"></span>
+                                                </td>
+                                                <td class="px-3 py-2 text-right">
+                                                    <span x-show="m.has_sub_block_cache"
+                                                          class="text-amber-600"
+                                                          x-text="'cached (' + (m.last_partial_tokens_skipped || m.indexed_blocks_display || ('<' + (m.block_size || '?'))) + ' tokens)'">
+                                                    </span>
+                                                    <span x-show="!m.has_sub_block_cache" class="text-neutral-400">-</span>
+                                                </td>
+                                                <td class="px-3 py-2 text-right" x-text="formatNumber(m.num_files || 0)"></td>
+                                                <td class="px-3 py-2 text-right" x-text="formatSizeBytes(m.total_size_bytes || 0)"></td>
+                                            </tr>
+                                        </template>
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <div class="text-[11px] text-neutral-500">
+                                Note: <span class="font-medium text-amber-600">Sub-block Cache</span> means requests below one full block (for example &lt;1024 tokens on some models) are cached in memory/paged cache but are not counted as indexed SSD blocks.
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Active Models -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
