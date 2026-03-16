@@ -24,15 +24,15 @@ class TestGetSamplingParams:
             self._state = state
             yield
 
-    def test_returns_7_tuple(self):
-        """Test that get_sampling_params returns a 7-tuple."""
+    def test_returns_8_tuple(self):
+        """Test that get_sampling_params returns an 8-tuple."""
         result = get_sampling_params(None, None)
         assert isinstance(result, tuple)
-        assert len(result) == 7
+        assert len(result) == 8
 
     def test_defaults(self):
         """Test default values with no request or model params."""
-        temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty = get_sampling_params(None, None)
+        temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(None, None)
         assert temp == 1.0
         assert top_p == 0.95
         assert top_k == 0
@@ -40,11 +40,13 @@ class TestGetSamplingParams:
         assert min_p == 0.0
         assert presence_penalty == 0.0
         assert frequency_penalty == 0.0
+        assert max_tokens == 32768
 
     def test_request_overrides(self):
         """Test request params override global defaults."""
-        temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty = get_sampling_params(
+        temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
             0.5, 0.8, req_min_p=0.1, req_presence_penalty=0.5, req_frequency_penalty=0.3,
+            req_max_tokens=1024,
         )
         assert temp == 0.5
         assert top_p == 0.8
@@ -53,6 +55,7 @@ class TestGetSamplingParams:
         assert min_p == 0.1
         assert presence_penalty == 0.5
         assert frequency_penalty == 0.3
+        assert max_tokens == 1024
 
     def test_model_settings_override(self):
         """Test model settings override global defaults."""
@@ -63,12 +66,12 @@ class TestGetSamplingParams:
             manager = ModelSettingsManager(Path(tmpdir))
             settings = ModelSettings(
                 temperature=0.3, top_k=50, repetition_penalty=1.2,
-                min_p=0.05, presence_penalty=0.3,
+                min_p=0.05, presence_penalty=0.3, max_tokens=2048,
             )
             manager.set_settings("test-model", settings)
             self._state.settings_manager = manager
 
-            temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty = get_sampling_params(
+            temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
                 None, None, "test-model"
             )
             assert temp == 0.3
@@ -78,6 +81,7 @@ class TestGetSamplingParams:
             assert min_p == 0.05
             assert presence_penalty == 0.3
             assert frequency_penalty == 0.0
+            assert max_tokens == 2048
 
     def test_request_over_model(self):
         """Test request params take priority over model settings."""
@@ -86,15 +90,16 @@ class TestGetSamplingParams:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = ModelSettingsManager(Path(tmpdir))
-            settings = ModelSettings(temperature=0.3, min_p=0.05)
+            settings = ModelSettings(temperature=0.3, min_p=0.05, max_tokens=2048)
             manager.set_settings("test-model", settings)
             self._state.settings_manager = manager
 
-            temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty = get_sampling_params(
-                0.7, None, "test-model", req_min_p=0.1,
+            temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
+                0.7, None, "test-model", req_min_p=0.1, req_max_tokens=4096,
             )
             assert temp == 0.7  # request wins
             assert min_p == 0.1  # request wins over model
+            assert max_tokens == 4096  # request wins over model
 
     def test_model_repetition_penalty(self):
         """Test model-level repetition_penalty overrides global."""
@@ -107,25 +112,61 @@ class TestGetSamplingParams:
             manager.set_settings("test-model", settings)
             self._state.settings_manager = manager
 
-            _, _, _, rep_penalty, _, _, _ = get_sampling_params(None, None, "test-model")
+            _, _, _, rep_penalty, _, _, _, _ = get_sampling_params(None, None, "test-model")
             assert rep_penalty == 1.5
 
     def test_global_repetition_penalty(self):
         """Test global repetition_penalty is used when no model override."""
         self._state.sampling = SamplingDefaults(repetition_penalty=1.3)
 
-        _, _, _, rep_penalty, _, _, _ = get_sampling_params(None, None)
+        _, _, _, rep_penalty, _, _, _, _ = get_sampling_params(None, None)
         assert rep_penalty == 1.3
 
     def test_force_sampling(self):
         """Test force_sampling ignores request params."""
         self._state.sampling = SamplingDefaults(
-            temperature=0.5, top_p=0.8, force_sampling=True
+            temperature=0.5, top_p=0.8, max_tokens=4096, force_sampling=True
         )
 
-        temp, top_p, _, _, _, _, _ = get_sampling_params(0.9, 0.99)
+        temp, top_p, _, _, _, _, _, max_tokens = get_sampling_params(
+            0.9, 0.99, req_max_tokens=8192
+        )
         assert temp == 0.5  # forced, not request
         assert top_p == 0.8  # forced, not request
+        assert max_tokens == 4096  # forced, not request
+
+    def test_force_sampling_model_max_tokens(self):
+        """Test force_sampling with model-level max_tokens overrides global."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+            settings = ModelSettings(max_tokens=8192, force_sampling=True)
+            manager.set_settings("test-model", settings)
+            self._state.settings_manager = manager
+
+            _, _, _, _, _, _, _, max_tokens = get_sampling_params(
+                None, None, "test-model", req_max_tokens=1024
+            )
+            assert max_tokens == 8192  # model setting wins in force mode
+
+    def test_max_tokens_no_request_uses_model_settings(self):
+        """Test that model max_tokens is used when request doesn't specify it."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+            settings = ModelSettings(max_tokens=8192)
+            manager.set_settings("test-model", settings)
+            self._state.settings_manager = manager
+            self._state.sampling = SamplingDefaults(max_tokens=4096)
+
+            _, _, _, _, _, _, _, max_tokens = get_sampling_params(
+                None, None, "test-model"
+            )
+            assert max_tokens == 8192  # model setting, not global 4096
 
 
 class TestExceptionHandlers:

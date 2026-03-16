@@ -660,7 +660,8 @@ def get_sampling_params(
     req_min_p: float | None = None,
     req_presence_penalty: float | None = None,
     req_frequency_penalty: float | None = None,
-) -> tuple[float, float, int, float, float, float, float]:
+    req_max_tokens: int | None = None,
+) -> tuple[float, float, int, float, float, float, float, int]:
     """
     Get effective sampling parameters with per-model settings support.
 
@@ -669,7 +670,7 @@ def get_sampling_params(
     - Otherwise: request > model settings > global defaults
 
     Returns:
-        tuple of (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty)
+        tuple of (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens)
     """
     global_sampling = _server_state.sampling
 
@@ -753,14 +754,28 @@ def get_sampling_params(
     else:
         frequency_penalty = 0.0
 
+    # Max tokens: same hierarchy as other params
+    if force:
+        if model_settings and model_settings.max_tokens is not None:
+            max_tokens = model_settings.max_tokens
+        else:
+            max_tokens = global_sampling.max_tokens
+    else:
+        if req_max_tokens is not None:
+            max_tokens = req_max_tokens
+        elif model_settings and model_settings.max_tokens is not None:
+            max_tokens = model_settings.max_tokens
+        else:
+            max_tokens = global_sampling.max_tokens
+
     logger.debug(
         f"Sampling params: temperature={temperature}, top_p={top_p}, top_k={top_k}, "
         f"repetition_penalty={repetition_penalty}, min_p={min_p}, presence_penalty={presence_penalty}, "
-        f"frequency_penalty={frequency_penalty}"
+        f"frequency_penalty={frequency_penalty}, max_tokens={max_tokens}"
         f"{' (forced)' if force else ''}"
         f"{f' (model: {model_id})' if model_id else ''}"
     )
-    return temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty
+    return temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens
 
 
 def resolve_model_id(model_id: str | None) -> str | None:
@@ -1534,11 +1549,12 @@ async def create_completion(
     total_prompt_tokens = 0
     total_cached_tokens = 0
 
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
         request.temperature, request.top_p, request.model,
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
+        req_max_tokens=request.max_tokens,
     )
 
     for i, prompt in enumerate(prompts):
@@ -1546,7 +1562,7 @@ async def create_completion(
             http_request,
             engine.generate(
                 prompt=prompt,
-                max_tokens=request.max_tokens or _server_state.sampling.max_tokens,
+                max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
@@ -1704,14 +1720,15 @@ async def create_chat_completion(
     validate_context_window(num_prompt_tokens, request.model)
 
     # Prepare kwargs
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
         request.temperature, request.top_p, request.model,
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
+        req_max_tokens=request.max_tokens,
     )
     chat_kwargs = {
-        "max_tokens": request.max_tokens or _server_state.sampling.max_tokens,
+        "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
         "top_k": top_k,
@@ -1876,16 +1893,17 @@ async def stream_completion(
     first_token_time = None
     last_output = None
 
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
         request.temperature, request.top_p, request.model,
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
+        req_max_tokens=request.max_tokens,
     )
     try:
         async for output in engine.stream_generate(
             prompt=prompt,
-            max_tokens=request.max_tokens or _server_state.sampling.max_tokens,
+            max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -2609,17 +2627,10 @@ async def create_anthropic_message(
         )
 
     # Prepare kwargs
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
         request.temperature, request.top_p, request.model,
+        req_max_tokens=request.max_tokens,
     )
-
-    # Apply max_tokens from model settings if force_sampling is enabled
-    max_tokens = request.max_tokens
-    if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(resolved_model)
-        force = _server_state.sampling.force_sampling or (ms and ms.force_sampling)
-        if force and ms and ms.max_tokens is not None:
-            max_tokens = ms.max_tokens
 
     chat_kwargs = {
         "max_tokens": max_tokens,
@@ -2978,11 +2989,11 @@ async def create_response(
     validate_context_window(num_prompt_tokens, request.model)
 
     # Build sampling kwargs
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty = (
-        get_sampling_params(request.temperature, request.top_p, request.model)
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = (
+        get_sampling_params(request.temperature, request.top_p, request.model, req_max_tokens=request.max_output_tokens)
     )
     chat_kwargs = {
-        "max_tokens": request.max_output_tokens or _server_state.sampling.max_tokens,
+        "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
         "top_k": top_k,
