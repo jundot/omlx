@@ -38,7 +38,7 @@ except ImportError:
 _MS_API_TIMEOUT = 15
 
 # Seconds with no download progress before considering the download stalled.
-_STALL_TIMEOUT = 120
+_STALL_TIMEOUT = 300
 
 # Default ModelScope API base URL.
 _DEFAULT_MS_ENDPOINT = "https://modelscope.cn"

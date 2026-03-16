@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 _HF_API_TIMEOUT = 10
 
 # Seconds with no download progress before considering the download stalled.
-_STALL_TIMEOUT = 120
+_STALL_TIMEOUT = 300
 
 
 def _get_hf_api() -> tuple[HfApi, str | None]:
