@@ -295,7 +295,7 @@ class TestServerConfig:
         config.set_server_api_key("roundtrip-key")
         assert config.get_server_api_key() == "roundtrip-key"
 
-    @patch("omlx_app.admin_client.requests.Session")
+    @patch("omlx_app.config.requests.Session")
     def test_update_server_api_key_runtime_success(self, mock_session_cls, tmp_path):
         """Test runtime API key update on running server."""
         config = ServerConfig(base_path=str(tmp_path))
@@ -313,7 +313,7 @@ class TestServerConfig:
         assert result is True
         assert mock_session.post.call_count == 2
 
-    @patch("omlx_app.admin_client.requests.Session")
+    @patch("omlx_app.config.requests.Session")
     def test_update_server_api_key_runtime_server_down(self, mock_session_cls, tmp_path):
         """Test runtime update returns False when server unreachable."""
         import requests as req
@@ -1026,3 +1026,12 @@ class TestAdminStatsClient:
         client._session = Mock()
         client.invalidate()
         assert client._session is None
+
+    def test_matches_same_credentials(self, client):
+        assert client.matches("http://127.0.0.1:8000", "test-key")
+
+    def test_matches_different_api_key(self, client):
+        assert not client.matches("http://127.0.0.1:8000", "other-key")
+
+    def test_matches_different_port(self, client):
+        assert not client.matches("http://127.0.0.1:9999", "test-key")

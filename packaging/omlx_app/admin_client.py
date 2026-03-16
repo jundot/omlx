@@ -72,6 +72,10 @@ class AdminStatsClient:
             return resp.json()
         return None
 
+    def matches(self, base_url: str, api_key: str) -> bool:
+        """Return True if this client was created with the given credentials."""
+        return self._base_url == base_url and self._api_key == api_key
+
     def invalidate(self) -> None:
         """Discard the current session (e.g. server restarted)."""
         self._session = None

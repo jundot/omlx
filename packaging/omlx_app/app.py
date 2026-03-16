@@ -739,15 +739,20 @@ class OMLXAppDelegate(NSObject):
     def _fetch_stats(self):
         """Fetch serving stats from the admin API."""
         api_key = self.config.get_server_api_key()
+        current_base_url = f"http://127.0.0.1:{self.config.port}"
+
         if not api_key:
             self._cached_stats = None
             self._cached_alltime_stats = None
             return
 
+        if self._stats_client is not None and not self._stats_client.matches(
+            current_base_url, api_key
+        ):
+            self._stats_client = None
+
         if self._stats_client is None:
-            self._stats_client = AdminStatsClient(
-                f"http://127.0.0.1:{self.config.port}", api_key
-            )
+            self._stats_client = AdminStatsClient(current_base_url, api_key)
 
         self._cached_stats = self._stats_client.fetch_stats()
         self._cached_alltime_stats = self._stats_client.fetch_stats(scope="alltime")
