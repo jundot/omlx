@@ -15,8 +15,8 @@ runtime = "cpython-3.11"
 requirements = [
     # Core MLX
     "mlx>=0.31.1",
-    # mlx-lm from latest commit (4a21ffd) - aligned with pyproject.toml
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@4a21ffd",
+    # mlx-lm from latest commit (564281f) - aligned with pyproject.toml
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@564281f",
     # mlx-embeddings from latest commit (6e2ef52) - aligned with pyproject.toml
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@6e2ef5256faadf1d79c3bf339686d43f8db17cdd",
     # Server dependencies

@@ -29,8 +29,8 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.31.1",
-    # mlx-lm from latest commit (4a21ffd)
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@4a21ffd",
+    # mlx-lm from latest commit (564281f)
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@564281f",
     # mlx-embeddings from latest commit (6e2ef52)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@6e2ef5256faadf1d79c3bf339686d43f8db17cdd",
     # transformers version aligned with mlx-lm requirement
