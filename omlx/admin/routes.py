@@ -91,6 +91,8 @@ class ModelSettingsRequest(BaseModel):
     forced_ct_kwargs: Optional[list[str]] = None
     ttl_seconds: Optional[int] = None
     index_cache_freq: Optional[int] = None
+    thinking_budget_enabled: Optional[bool] = None
+    thinking_budget_tokens: Optional[int] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
 
@@ -1243,6 +1245,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "presence_penalty": settings.presence_penalty,
                 "force_sampling": settings.force_sampling,
                 "max_tool_result_tokens": settings.max_tool_result_tokens,
+                "thinking_budget_enabled": settings.thinking_budget_enabled,
+                "thinking_budget_tokens": settings.thinking_budget_tokens,
                 "chat_template_kwargs": settings.chat_template_kwargs,
                 "forced_ct_kwargs": settings.forced_ct_kwargs,
                 "ttl_seconds": settings.ttl_seconds,
@@ -1427,6 +1431,12 @@ async def update_model_settings(
         # 0 means disable (reset to None)
         current_settings.max_tool_result_tokens = (
             request.max_tool_result_tokens if request.max_tool_result_tokens and request.max_tool_result_tokens > 0 else None
+        )
+    if "thinking_budget_enabled" in sent:
+        current_settings.thinking_budget_enabled = request.thinking_budget_enabled or False
+    if "thinking_budget_tokens" in sent:
+        current_settings.thinking_budget_tokens = (
+            request.thinking_budget_tokens if request.thinking_budget_tokens and request.thinking_budget_tokens > 0 else None
         )
     if "chat_template_kwargs" in sent:
         current_settings.chat_template_kwargs = request.chat_template_kwargs

@@ -308,6 +308,7 @@ class BatchedEngine(BaseEngine):
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
+            thinking_budget=kwargs.get("thinking_budget", None),
         )
 
         output = await self._engine.generate(
@@ -372,6 +373,7 @@ class BatchedEngine(BaseEngine):
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
+            thinking_budget=kwargs.get("thinking_budget", None),
         )
 
         request_id = await self._engine.add_request(

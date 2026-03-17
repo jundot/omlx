@@ -1573,7 +1573,7 @@ class Scheduler:
             )
 
     def _build_sampler_and_processors(
-        self, sampling_params: SamplingParams
+        self, sampling_params: SamplingParams, request: Any = None
     ) -> Tuple[Callable[[mx.array], mx.array], List[Callable]]:
         """Build per-request sampler and logits processors."""
         sampler = make_sampler(
@@ -1593,7 +1593,140 @@ class Scheduler:
             if sampling_params.frequency_penalty != 0.0
             else None,
         )
+
+        # Add thinking budget processor for reasoning models
+        if (
+            sampling_params.thinking_budget is not None
+            and request is not None
+            and getattr(request, 'needs_think_prefix', False)
+            and not getattr(request, 'is_harmony_model', False)
+        ):
+            think_end_ids = self._resolve_think_end_token_ids()
+            if think_end_ids:
+                from .api.thinking import ThinkingBudgetProcessor
+
+                think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+                leading_ids, trailing_ids = self._resolve_think_close_pattern()
+                processor = ThinkingBudgetProcessor(
+                    think_end_token_ids=think_end_ids,
+                    budget=sampling_params.thinking_budget,
+                    think_start_token_id=think_start_id,
+                    leading_token_ids=leading_ids,
+                    trailing_token_ids=trailing_ids,
+                )
+                logits_processors.append(processor)
+
         return sampler, logits_processors
+
+    def _resolve_think_end_token_ids(self) -> list[int] | None:
+        """Resolve token ID(s) for the close-think tag.
+
+        Uses mlx-lm's built-in think_end_id which supports both
+        </think> and </longcat_think> automatically.
+        """
+        # Tier 1: mlx-lm tokenizer attribute (covers all known think variants)
+        think_end_id = getattr(self.tokenizer, 'think_end_id', None)
+        if think_end_id is not None:
+            return [think_end_id]
+
+        # Tier 2: encode the think_end string
+        think_end_str = getattr(self.tokenizer, 'think_end', '</think>')
+        try:
+            ids = self.tokenizer.encode(think_end_str, add_special_tokens=False)
+            if ids:
+                return list(ids)
+        except Exception:
+            pass
+
+        # Tier 3: direct token lookup
+        try:
+            tid = self.tokenizer.convert_tokens_to_ids("</think>")
+            if tid != getattr(self.tokenizer, 'unk_token_id', None):
+                return [tid]
+        except (AttributeError, KeyError, TypeError):
+            pass
+
+        return None
+
+    def _resolve_think_close_pattern(self) -> tuple[list[int] | None, list[int] | None]:
+        """Detect leading/trailing tokens around </think> from the chat template.
+
+        Different models use different patterns:
+        - Qwen3/3.5, MiniMax: ``\\n</think>\\n\\n``
+        - DeepSeek V3.2, GLM-5: ``</think>`` (no newlines)
+        - GLM-4.6V: ``</think>\\n``
+        - Step-3.5-Flash: ``\\n</think>\\n``
+
+        Returns (leading_token_ids, trailing_token_ids) or (None, None).
+        """
+        import re
+
+        think_end_str = getattr(self.tokenizer, 'think_end', '</think>')
+
+        # Try to get the chat template text
+        template_text = self._get_chat_template_text()
+        if not template_text:
+            return None, None
+
+        # Find the close pattern in the template, e.g. \n</think>\n\n
+        # Look for the think_end_str surrounded by whitespace/newlines in string literals
+        escaped = re.escape(think_end_str)
+        # Match patterns like: \n</think>\n\n or </think> in template strings
+        match = re.search(
+            r'(\\n|\\r|[\n\r])*' + escaped + r'((?:\\n|\\r|[\n\r])*)',
+            template_text,
+        )
+        if not match:
+            return None, None
+
+        # Extract raw leading/trailing whitespace, converting \n escapes to actual newlines
+        raw_leading = (match.group(0).split(think_end_str)[0]
+                       .replace('\\n', '\n').replace('\\r', '\r'))
+        raw_trailing = (match.group(0).split(think_end_str)[1]
+                        .replace('\\n', '\n').replace('\\r', '\r'))
+
+        # Encode to token IDs
+        leading_ids = None
+        trailing_ids = None
+        if raw_leading:
+            try:
+                ids = self.tokenizer.encode(raw_leading, add_special_tokens=False)
+                if ids:
+                    leading_ids = list(ids)
+            except Exception:
+                pass
+        if raw_trailing:
+            try:
+                ids = self.tokenizer.encode(raw_trailing, add_special_tokens=False)
+                if ids:
+                    trailing_ids = list(ids)
+            except Exception:
+                pass
+
+        return leading_ids, trailing_ids
+
+    def _get_chat_template_text(self) -> str | None:
+        """Get chat template text from the tokenizer or model directory."""
+        # Try tokenizer's chat_template attribute (Jinja string)
+        ct = getattr(self.tokenizer, '_chat_template', None)
+        if ct:
+            return ct if isinstance(ct, str) else str(ct)
+        ct = getattr(self.tokenizer, 'chat_template', None)
+        if ct:
+            return ct if isinstance(ct, str) else str(ct)
+
+        # Try reading the .jinja file from model directory
+        import os
+        model_path = getattr(self.config, 'model_name', None) or ''
+        jinja_path = os.path.join(model_path, 'chat_template.jinja')
+        if os.path.isfile(jinja_path):
+            try:
+                with open(jinja_path, 'r', encoding='utf-8') as f:
+                    return f.read()
+            except Exception:
+                pass
+
+        return None
 
     def _ensure_batch_generator(self, sampling_params: SamplingParams) -> None:
         """Ensure BatchGenerator exists with compatible settings."""
@@ -2707,9 +2840,32 @@ class Scheduler:
                 )
                 break
 
+            # Mark as Harmony model if applicable (before think detection)
+            if self._is_harmony_model:
+                request.is_harmony_model = True
+
+            # Check if prompt ends with <think> token for reasoning models.
+            # Must happen before _build_sampler_and_processors so the thinking
+            # budget processor can check needs_think_prefix.
+            think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+            if think_start_id is None:
+                # VLM tokenizers loaded via mlx-vlm may not have think_start_id.
+                # Try to resolve it from the vocabulary directly.
+                try:
+                    think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
+                    if think_start_id == self.tokenizer.unk_token_id:
+                        think_start_id = None
+                except (AttributeError, KeyError, TypeError):
+                    pass
+            if think_start_id and request.prompt_token_ids:
+                # Check last 3 tokens (covers "<think>\n" case)
+                last_tokens = request.prompt_token_ids[-3:]
+                if think_start_id in last_tokens:
+                    request.needs_think_prefix = True
+
             # Per-request sampler/logits processors to avoid BatchGenerator recreation.
             sampler, logits_processors = self._build_sampler_and_processors(
-                request.sampling_params
+                request.sampling_params, request
             )
 
             # Clear stale mRoPE position state to prevent position
@@ -2743,28 +2899,6 @@ class Scheduler:
                 request.status = RequestStatus.RUNNING
                 self.running[request.request_id] = request
                 scheduled.append(request)
-
-                # Mark as Harmony model if applicable
-                if self._is_harmony_model:
-                    request.is_harmony_model = True
-
-                # Check if prompt ends with <think> token for reasoning models
-                # The chat template may end with "<think>\n" so check last few tokens
-                think_start_id = getattr(self.tokenizer, 'think_start_id', None)
-                if think_start_id is None:
-                    # VLM tokenizers loaded via mlx-vlm may not have think_start_id.
-                    # Try to resolve it from the vocabulary directly.
-                    try:
-                        think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
-                        if think_start_id == self.tokenizer.unk_token_id:
-                            think_start_id = None
-                    except (AttributeError, KeyError, TypeError):
-                        pass
-                if think_start_id and request.prompt_token_ids:
-                    # Check last 3 tokens (covers "<think>\n" case)
-                    last_tokens = request.prompt_token_ids[-3:]
-                    if think_start_id in last_tokens:
-                        request.needs_think_prefix = True
 
                 self.total_prompt_tokens += request.num_prompt_tokens
                 cache_info = f", {request.cached_tokens} cached" if request.cached_tokens > 0 else ""

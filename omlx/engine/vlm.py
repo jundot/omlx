@@ -600,6 +600,7 @@ class VLMBatchedEngine(BaseEngine):
             presence_penalty=presence_penalty,
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
+            thinking_budget=kwargs.get("thinking_budget", None),
         )
 
         output = await self._engine.generate(
@@ -659,6 +660,7 @@ class VLMBatchedEngine(BaseEngine):
             presence_penalty=presence_penalty,
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
+            thinking_budget=kwargs.get("thinking_budget", None),
         )
 
         request_id = await self._engine.add_request(

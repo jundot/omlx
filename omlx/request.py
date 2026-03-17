@@ -68,6 +68,9 @@ class SamplingParams:
     logprobs: bool = False  # Whether to return logprobs
     top_logprobs: Optional[int] = None  # Number of top logprobs (1-20)
 
+    # Thinking budget (None = unlimited thinking)
+    thinking_budget: Optional[int] = None
+
     def __post_init__(self):
         if self.stop is None:
             self.stop = []

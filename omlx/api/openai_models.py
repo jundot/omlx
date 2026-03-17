@@ -147,6 +147,8 @@ class ChatCompletionRequest(BaseModel):
     response_format: Optional[Union[ResponseFormat, dict]] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    # Thinking budget (max thinking tokens, None = unlimited)
+    thinking_budget: Optional[int] = None
 
     @field_validator("stop", mode="before")
     @classmethod

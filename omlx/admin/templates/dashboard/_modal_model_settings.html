@@ -148,6 +148,26 @@
                     <div class="w-2/5 pl-6">
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-5">{{ t('modal.model_settings.advanced_label') }}</h3>
                         <div class="overflow-y-auto max-h-[28rem] space-y-4 pr-1">
+                            <!-- Thinking Budget -->
+                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                                <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.thinking_budget') }}</span>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.thinking_budget_hint') }}</p>
+                                    </div>
+                                    <button type="button" @click="modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null;"
+                                            :class="modelSettings.enableThinkingBudget ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="modelSettings.enableThinkingBudget ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div x-show="modelSettings.enableThinkingBudget" x-transition class="pt-1">
+                                    <input type="number" x-model.number="modelSettings.thinking_budget_tokens" placeholder="{{ t('modal.model_settings.thinking_budget_placeholder') }}" min="1" step="100"
+                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                            </div>
+
                             <!-- Limit Tool Result Tokens -->
                             <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
                                 <div class="flex items-start justify-between gap-3">

@@ -819,6 +819,24 @@ def get_sampling_params(
     return temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens
 
 
+def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
+    """Resolve thinking budget: request param > model settings > None."""
+    # Check request-level override (OpenAI format)
+    req_budget = getattr(request, 'thinking_budget', None)
+    # For Anthropic: check thinking.budget_tokens
+    if req_budget is None and hasattr(request, 'thinking') and request.thinking:
+        req_budget = getattr(request.thinking, 'budget_tokens', None)
+    if req_budget is not None:
+        return req_budget
+    # Check model settings
+    resolved = resolve_model_id(model_id)
+    if resolved and _server_state.settings_manager:
+        ms = _server_state.settings_manager.get_settings(resolved)
+        if ms.thinking_budget_enabled and ms.thinking_budget_tokens:
+            return ms.thinking_budget_tokens
+    return None
+
+
 def resolve_model_id(model_id: str | None) -> str | None:
     """Resolve a model alias to its real model ID.
 
@@ -1779,6 +1797,11 @@ async def create_chat_completion(
         "frequency_penalty": frequency_penalty,
     }
 
+    # Add thinking budget if applicable
+    thinking_budget = _resolve_thinking_budget(request, request.model)
+    if thinking_budget is not None:
+        chat_kwargs["thinking_budget"] = thinking_budget
+
     # Add tools if provided (includes MCP tools)
     if tools_for_template:
         chat_kwargs["tools"] = tools_for_template
@@ -2687,6 +2710,11 @@ async def create_anthropic_message(
         "frequency_penalty": frequency_penalty,
     }
 
+    # Add thinking budget if applicable
+    thinking_budget = _resolve_thinking_budget(request, request.model)
+    if thinking_budget is not None:
+        chat_kwargs["thinking_budget"] = thinking_budget
+
     # Merge MCP tools with user-provided Anthropic tools
     user_internal = convert_anthropic_tools_to_internal(request.tools)
     if _server_state.mcp_manager:
@@ -3046,6 +3074,12 @@ async def create_response(
         "presence_penalty": presence_penalty,
         "frequency_penalty": frequency_penalty,
     }
+
+    # Add thinking budget if applicable
+    thinking_budget = _resolve_thinking_budget(request, request.model)
+    if thinking_budget is not None:
+        chat_kwargs["thinking_budget"] = thinking_budget
+
     if tools_for_template:
         chat_kwargs["tools"] = tools_for_template
     if merged_ct_kwargs:

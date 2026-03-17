@@ -53,6 +53,8 @@ class ModelSettings:
     model_type_override: Optional[str] = None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
     model_alias: Optional[str] = None  # API-visible name (alternative to directory name)
     index_cache_freq: Optional[int] = None  # IndexCache: every Nth layer keeps indexer (DSA models only)
+    thinking_budget_enabled: bool = False
+    thinking_budget_tokens: Optional[int] = None
 
     # Model management flags
     is_pinned: bool = False

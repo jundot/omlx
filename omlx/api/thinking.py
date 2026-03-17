@@ -10,7 +10,7 @@ their chain-of-thought reasoning in <think>...</think> tags.
 """
 
 import re
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 
 # Tags used for thinking blocks
@@ -196,3 +196,134 @@ class ThinkingParser:
             return True
 
         return False
+
+
+class ThinkingBudgetProcessor:
+    """Logits processor that enforces a thinking token budget.
+
+    Counts tokens generated while in thinking mode.  When the budget is
+    exceeded, forces the close-think token(s) one at a time, then becomes
+    a no-op for the rest of generation.
+
+    Handles both single-token and multi-token close-think sequences, and
+    supports alternative think markers (e.g. ``<longcat_think>``).
+
+    Args:
+        think_end_token_ids: Token ID(s) for the close-think tag.
+        budget: Maximum number of thinking tokens before forcing close.
+        think_start_token_id: Token ID for the open-think tag (re-entry detection).
+    """
+
+    def __init__(
+        self,
+        think_end_token_ids: List[int],
+        budget: int,
+        think_start_token_id: Optional[int] = None,
+        leading_token_ids: Optional[List[int]] = None,
+        trailing_token_ids: Optional[List[int]] = None,
+    ):
+        self._think_end_ids = think_end_token_ids
+        # Full force sequence: \n + </think> + \n\n (matches training pattern)
+        self._force_sequence = (
+            (leading_token_ids or [])
+            + list(think_end_token_ids)
+            + (trailing_token_ids or [])
+        )
+        self._budget = budget
+        self._think_start_id = think_start_token_id
+
+        # State
+        self._thinking_tokens: int = 0
+        self._in_thinking: bool = True  # Starts True (prompt ends with <think>)
+        self._forcing: bool = False
+        self._force_idx: int = 0
+        self._done: bool = False
+        self._first_call: bool = True
+        # After forced sequence, suppress duplicate </think> tokens
+        self._suppress_end: bool = False
+        # Sliding window for multi-token end detection
+        self._recent_tokens: List[int] = []
+        # Flat set for fast single-token suppression check
+        self._end_id_set = set(think_end_token_ids)
+
+    def __call__(self, tokens, logits):
+        """mlx-lm logits processor: (tokens, logits) -> logits."""
+        import mlx.core as mx
+
+        if self._done:
+            return logits
+
+        # Post-forcing phase: suppress duplicate </think> tokens
+        if self._suppress_end:
+            return self._suppress_end_tokens(logits, mx)
+
+        # Skip state update on first call (tokens contains prompt tokens only)
+        if self._first_call:
+            self._first_call = False
+        elif tokens.size > 0:
+            last_token = tokens[-1].item()
+            self._update_state(last_token)
+
+        # If state changed by _update_state, handle immediately
+        if self._done:
+            return logits
+        if self._suppress_end:
+            return self._suppress_end_tokens(logits, mx)
+
+        if self._forcing:
+            return self._force_next_token(logits, mx)
+
+        if self._in_thinking:
+            self._thinking_tokens += 1
+            if self._thinking_tokens >= self._budget:
+                self._forcing = True
+                self._force_idx = 0
+                return self._force_next_token(logits, mx)
+
+        return logits
+
+    def _update_state(self, token_id: int) -> None:
+        """Update thinking state based on the last generated token."""
+        if self._forcing:
+            self._force_idx += 1
+            if self._force_idx >= len(self._force_sequence):
+                self._in_thinking = False
+                self._forcing = False
+                # Don't set _done — enter suppression mode to prevent
+                # the model from generating a duplicate </think>.
+                self._suppress_end = True
+            return
+
+        # Detect natural close-think via sliding window
+        if len(self._think_end_ids) == 1:
+            if token_id == self._think_end_ids[0]:
+                self._in_thinking = False
+                self._done = True
+                return
+        else:
+            self._recent_tokens.append(token_id)
+            if len(self._recent_tokens) > len(self._think_end_ids):
+                self._recent_tokens.pop(0)
+            if self._recent_tokens == self._think_end_ids:
+                self._in_thinking = False
+                self._done = True
+                return
+
+        # Detect re-entry into thinking (rare but possible)
+        if not self._in_thinking and self._think_start_id and token_id == self._think_start_id:
+            self._in_thinking = True
+
+    def _force_next_token(self, logits, mx):
+        """Force the next token in the close-think + trailing sequence."""
+        target_id = self._force_sequence[self._force_idx]
+        forced = mx.full(logits.shape, float("-inf"))
+        forced[..., target_id] = 0.0
+        return forced
+
+    def _suppress_end_tokens(self, logits, mx):
+        """Suppress duplicate </think> tokens after forced close."""
+        # Set logits of all end-token IDs to -inf so the model
+        # cannot produce another </think>.
+        for tid in self._end_id_set:
+            logits[..., tid] = float("-inf")
+        return logits

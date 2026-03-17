@@ -784,6 +784,8 @@
                     min_p: settings.min_p ?? null,
                     presence_penalty: settings.presence_penalty ?? null,
                     force_sampling: settings.force_sampling || false,
+                    enableThinkingBudget: !!(settings.thinking_budget_tokens),
+                    thinking_budget_tokens: settings.thinking_budget_tokens || null,
                     enableToolResultLimit: !!(settings.max_tool_result_tokens),
                     max_tool_result_tokens: settings.max_tool_result_tokens || null,
                     ttl_seconds: settings.ttl_seconds ?? null,
@@ -839,6 +841,10 @@
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)
+                                    : 0,
+                                thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
+                                thinking_budget_tokens: this.modelSettings.enableThinkingBudget
+                                    ? (this.modelSettings.thinking_budget_tokens || null)
                                     : 0,
                                 max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                     ? (this.modelSettings.max_tool_result_tokens || null)
