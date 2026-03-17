@@ -311,9 +311,31 @@ class EngineCore:
         the request ID into a thread-safe set. The actual abort is processed
         at the start of the next scheduler.step() call, ensuring it runs in
         the same execution context as generation (no race conditions).
+
+        Signals the consumer (stream_outputs/generate) with an abort error
+        so it can exit gracefully. Cleanup is handled by the consumer's
+        finally block, NOT here -- calling _cleanup_request() immediately
+        after put() would clear the output before the consumer can drain it.
         """
         result = self.scheduler.abort_request(request_id)
-        self._cleanup_request(request_id)
+
+        # Signal consumer with abort error so any waiting
+        # stream_outputs() / generate() can exit gracefully.
+        # Matches abort_all_requests() pattern.
+        collector = self._output_collectors.get(request_id)
+        if collector is not None:
+            collector.put(
+                RequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    finish_reason="abort",
+                    error="Request aborted",
+                )
+            )
+        event = self._finished_events.get(request_id)
+        if event is not None:
+            event.set()
+
         return result
 
     async def abort_all_requests(self) -> int:
@@ -471,6 +493,7 @@ class EngineCore:
             # to free scheduler/GPU resources (prevents orphaned requests)
             logger.info(f"Request {request_id} cancelled, aborting")
             await self.abort_request(request_id)
+            self._cleanup_request(request_id)
             raise
 
         # Get the final output from collector

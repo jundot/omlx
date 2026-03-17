@@ -311,8 +311,8 @@ class TestEngineCoreAbortRequest:
                 engine.close()
 
     @pytest.mark.asyncio
-    async def test_abort_request_cleans_up(self, mock_model, mock_tokenizer):
-        """Test abort_request() cleans up tracking state."""
+    async def test_abort_request_signals_consumer(self, mock_model, mock_tokenizer):
+        """Test abort_request() signals consumer with error output."""
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
 
@@ -324,9 +324,21 @@ class TestEngineCoreAbortRequest:
                 request_id = await engine.add_request(prompt="Hello")
                 await engine.abort_request(request_id)
 
+                # Collector should still exist with abort error
+                assert request_id in engine._output_collectors
+                collector = engine._output_collectors[request_id]
+                output = collector.get_nowait()
+                assert output is not None
+                assert output.finished is True
+                assert output.finish_reason == "abort"
+                assert output.error == "Request aborted"
+
+                # Event should be set
+                assert engine._finished_events[request_id].is_set()
+
+                # Consumer's finally block handles cleanup
+                engine._cleanup_request(request_id)
                 assert request_id not in engine._output_collectors
-                assert request_id not in engine._stream_states
-                assert request_id not in engine._finished_events
             finally:
                 await engine.stop()
                 engine.close()
@@ -357,8 +369,8 @@ class TestEngineCoreAbortRequest:
 
                 await engine.abort_request(request_id)
 
-                # Engine-core state cleaned immediately
-                assert request_id not in engine._output_collectors
+                # abort_request signals consumer but does not clean up
+                assert request_id in engine._output_collectors
 
                 # Process the deferred abort (normally happens in step())
                 engine.scheduler._process_pending_aborts()
@@ -367,6 +379,60 @@ class TestEngineCoreAbortRequest:
                 assert request_id not in engine.scheduler.requests
                 assert request_id not in engine.scheduler.running
                 assert request_id not in engine.scheduler.request_id_to_uid
+
+                # Consumer's finally block handles engine-core cleanup
+                engine._cleanup_request(request_id)
+                assert request_id not in engine._output_collectors
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_abort_request_wakes_blocked_stream_outputs(
+        self, mock_model, mock_tokenizer
+    ):
+        """abort_request() must wake a blocked stream_outputs() consumer.
+
+        Regression test: previously abort_request called _cleanup_request
+        which reset the collector's asyncio.Event without waking waiters,
+        causing stream_outputs to block forever.
+        """
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+
+                request_id = await engine.add_request(prompt="Hello")
+
+                # Start consuming stream_outputs in a separate task
+                outputs = []
+
+                async def consume():
+                    async for output in engine.stream_outputs(request_id):
+                        outputs.append(output)
+
+                task = asyncio.create_task(consume())
+                # Let it enter await collector.get()
+                await asyncio.sleep(0.02)
+
+                # Abort from external context while consumer is waiting
+                await engine.abort_request(request_id)
+
+                # The task should complete (not hang forever)
+                # stream_outputs yields abort error then raises RuntimeError
+                with pytest.raises(RuntimeError, match="Request aborted"):
+                    await asyncio.wait_for(task, timeout=1.0)
+
+                # Verify abort error was received
+                assert len(outputs) == 1
+                assert outputs[0].finished is True
+                assert outputs[0].error == "Request aborted"
+
+                # stream_outputs' finally block should have cleaned up
+                assert request_id not in engine._output_collectors
             finally:
                 await engine.stop()
                 engine.close()
