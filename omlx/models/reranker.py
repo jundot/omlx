@@ -17,12 +17,32 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Tuple
 
+import mlx.core as mx
+
 from ..model_discovery import (
     CAUSAL_LM_RERANKER_ARCHITECTURES,
     SUPPORTED_RERANKER_ARCHITECTURES,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _CompiledForward:
+    """Wraps an MLX module to route __call__ through mx.compile.
+
+    Keeps compiled Metal pipeline states alive in memory, preventing
+    kernel eviction after idle periods (~3s on macOS).
+    """
+
+    def __init__(self, module):
+        self._module = module
+        self._compiled = mx.compile(module.__call__, shapeless=True)
+
+    def __call__(self, *args, **kwargs):
+        return self._compiled(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
 
 
 @dataclass
@@ -231,11 +251,14 @@ class MLXRerankerModel:
                     config = self.model.config
                     self._num_labels = getattr(config, "num_labels", None)
 
+            # Try mx.compile for persistent Metal kernel caching
+            self._is_compiled = self._try_compile()
+
             self._loaded = True
             logger.info(
                 f"Reranker model loaded successfully: {self.model_name} "
                 f"(arch={arch}, num_labels={self._num_labels}, "
-                f"causal_lm={self._is_causal_lm})"
+                f"causal_lm={self._is_causal_lm}, compiled={self._is_compiled})"
             )
 
         except ImportError as e:
@@ -253,6 +276,27 @@ class MLXRerankerModel:
         except Exception as e:
             logger.error(f"Failed to load reranker model: {e}")
             raise
+
+    def _try_compile(self) -> bool:
+        """Try to compile the model's forward pass with mx.compile.
+
+        Returns True if compilation succeeded, False otherwise.
+        On failure, self.model is reverted to the original uncompiled model.
+        """
+        original_model = self.model
+        try:
+            self.model = _CompiledForward(original_model)
+            # Trigger compilation with a dummy forward pass
+            test_ids = mx.zeros((1, 4), dtype=mx.int32)
+            _ = self.model(test_ids)
+            logger.info(f"mx.compile enabled for {self.model_name}")
+            return True
+        except Exception as e:
+            logger.info(
+                f"mx.compile unavailable for {self.model_name}: {e}"
+            )
+            self.model = original_model
+            return False
 
     # Default max_length per model type
     _DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION = 512

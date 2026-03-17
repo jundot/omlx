@@ -39,6 +39,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         Args:
             model_name: HuggingFace model name or local path
         """
+        super().__init__()
         self._model_name = model_name
         self._model: Optional[MLXEmbeddingModel] = None
 
@@ -57,6 +58,11 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         """Get the embedding dimension."""
         return self._model.hidden_size if self._model else None
 
+    def _warmup(self) -> None:
+        """Run a minimal embedding to keep Metal pipeline states warm."""
+        if self._model is not None:
+            self._model.embed(["w"], max_length=8)
+
     async def start(self) -> None:
         """Start the engine (load model if not loaded).
 
@@ -70,6 +76,15 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         self._model = MLXEmbeddingModel(self._model_name)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(get_mlx_executor(), self._model.load)
+
+        # If mx.compile failed, activate keepalive to prevent Metal eviction
+        if not self._model._is_compiled:
+            logger.info(
+                f"Activating keepalive for {self._model_name} "
+                f"(mx.compile unavailable)"
+            )
+            self._start_keepalive(loop)
+
         logger.info(f"Embedding engine started: {self._model_name}")
 
     async def stop(self) -> None:
@@ -78,6 +93,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping embedding engine: {self._model_name}")
+        await self._stop_keepalive()
         self._model = None
 
         gc.collect()
@@ -118,7 +134,11 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             )
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(get_mlx_executor(), _embed_sync)
+        self._active_requests += 1
+        try:
+            return await loop.run_in_executor(get_mlx_executor(), _embed_sync)
+        finally:
+            self._active_requests -= 1
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
