@@ -62,7 +62,7 @@ class RerankerEngine(BaseNonStreamingEngine):
     def _warmup(self) -> None:
         """Run a minimal rerank to keep Metal pipeline states warm."""
         if self._model is not None:
-            self._model.rerank("q", ["d"], max_length=8)
+            self._model.rerank("q", ["d"], max_length=64)
 
     async def start(self) -> None:
         """Start the engine (load model if not loaded).
@@ -136,11 +136,19 @@ class RerankerEngine(BaseNonStreamingEngine):
             )
 
         loop = asyncio.get_running_loop()
+        was_compiled = model._is_compiled
         self._active_requests += 1
         try:
             output = await loop.run_in_executor(
                 get_mlx_executor(), _rerank_sync
             )
+            # Circuit breaker: compile was disabled at runtime, start keepalive
+            if was_compiled and not model._is_compiled and self._keepalive_task is None:
+                logger.info(
+                    f"Activating keepalive for {self._model_name} "
+                    f"(mx.compile disabled at runtime)"
+                )
+                self._start_keepalive(loop)
         finally:
             self._active_requests -= 1
 

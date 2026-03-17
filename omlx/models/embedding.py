@@ -203,8 +203,10 @@ class MLXEmbeddingModel:
             except Exception as e:
                 logger.warning(
                     f"compiled embedding path failed for {self.model_name}: {e}; "
-                    f"falling back to eager generate()"
+                    f"disabling compile and falling back to eager generate()"
                 )
+                self._is_compiled = False
+                self._compiled_embed = None
 
         # Eager path fallback
         if embeddings_array is None:

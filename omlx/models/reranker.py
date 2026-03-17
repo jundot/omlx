@@ -484,8 +484,10 @@ class MLXRerankerModel:
             except Exception as e:
                 logger.warning(
                     f"compiled reranker path failed for {self.model_name}: {e}; "
-                    f"falling back to eager forward()"
+                    f"disabling compile and falling back to eager forward()"
                 )
+                self._is_compiled = False
+                self._compiled_seq_logits = None
 
         if logits is None:
             outputs = self.model(
