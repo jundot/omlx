@@ -1258,6 +1258,8 @@ class BlockAwarePrefixCache(CacheManager):
                     # Free ref_counts for all blocks before returning
                     for bid in block_table.block_ids:
                         self.paged_cache.free_block(bid)
+                    block_table.block_ids.clear()
+                    block_table.num_tokens = 0
                     return None  # No valid blocks at all
 
                 # Free ref_counts for blocks we are about to drop
