@@ -13,6 +13,7 @@ REQUIRED_IMAGE_KEYS = [
     "chat.upload_image",
     "chat.remove_image",
     "chat.image_not_available",
+    "chat.image_preview",
     "chat.error.invalid_image_type",
     "chat.error.image_too_large",
     "chat.error.image_load_failed",
@@ -92,6 +93,93 @@ class TestChatImageUpload:
         for key in REQUIRED_IMAGE_KEYS:
             assert key in translations, f"Missing key '{key}' in {lang_file}"
             assert translations[key], f"Empty value for '{key}' in {lang_file}"
+
+
+class TestChatEditImagePreservation:
+    """Test image preservation when editing messages (PR #268)"""
+
+    @staticmethod
+    def get_image_urls(content):
+        """Simulate getImageUrls() from chat.html"""
+        if not isinstance(content, list):
+            return []
+        return [
+            p["image_url"]["url"]
+            for p in content
+            if p.get("type") == "image_url" and p.get("image_url", {}).get("url")
+        ]
+
+    @staticmethod
+    def get_text_content(content):
+        """Simulate getTextContent() from chat.html"""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(
+                p["text"] for p in content if p.get("type") == "text"
+            )
+        return ""
+
+    @staticmethod
+    def build_edit_content(edit_images, new_text):
+        """Simulate saveEdit() content reconstruction from chat.html"""
+        if edit_images:
+            content = []
+            for img in edit_images:
+                content.append({"type": "image_url", "image_url": {"url": img}})
+            content.append({"type": "text", "text": new_text})
+            return content
+        return new_text
+
+    def test_edit_preserves_images(self):
+        """Editing a message with images should preserve the images"""
+        original = [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,def"}},
+            {"type": "text", "text": "What are these?"},
+        ]
+        edit_images = self.get_image_urls(original)
+        edit_text = self.get_text_content(original)
+
+        assert edit_images == [
+            "data:image/png;base64,abc",
+            "data:image/jpeg;base64,def",
+        ]
+        assert edit_text == "What are these?"
+
+        new_content = self.build_edit_content(edit_images, "Describe these images")
+        assert isinstance(new_content, list)
+        images = [p for p in new_content if p["type"] == "image_url"]
+        texts = [p for p in new_content if p["type"] == "text"]
+        assert len(images) == 2
+        assert len(texts) == 1
+        assert texts[0]["text"] == "Describe these images"
+
+    def test_edit_text_only_message(self):
+        """Editing a text-only message should produce string content"""
+        original = "Hello"
+        edit_images = self.get_image_urls(original)
+        edit_text = self.get_text_content(original)
+
+        assert edit_images == []
+        assert edit_text == "Hello"
+
+        new_content = self.build_edit_content(edit_images, "Hi there")
+        assert isinstance(new_content, str)
+        assert new_content == "Hi there"
+
+    def test_edit_stripped_images_not_preserved(self):
+        """Stripped images (empty URL from localStorage) should not be preserved"""
+        restored = [
+            {"type": "image_url", "image_url": {"url": ""}},
+            {"type": "text", "text": "old text"},
+        ]
+        edit_images = self.get_image_urls(restored)
+        assert edit_images == []
+
+        new_content = self.build_edit_content(edit_images, "edited text")
+        assert isinstance(new_content, str)
+        assert new_content == "edited text"
 
 
 if __name__ == "__main__":

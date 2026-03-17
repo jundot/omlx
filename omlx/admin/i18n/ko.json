@@ -523,6 +523,7 @@
   "chat.upload_image": "이미지 업로드",
   "chat.remove_image": "이미지 제거",
   "chat.image_not_available": "이미지",
+  "chat.image_preview": "이미지 미리보기",
   "chat.error.invalid_image_type": "이미지 파일을 선택해주세요",
   "chat.error.image_too_large": "이미지 크기는 10MB 이하여야 합니다",
   "chat.error.image_load_failed": "이미지를 불러오지 못했습니다. 다시 시도해 주세요.",

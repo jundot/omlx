@@ -523,6 +523,7 @@
   "chat.upload_image": "画像をアップロード",
   "chat.remove_image": "画像を削除",
   "chat.image_not_available": "画像",
+  "chat.image_preview": "画像プレビュー",
   "chat.error.invalid_image_type": "画像ファイルを選択してください",
   "chat.error.image_too_large": "画像サイズは10MB以下にしてください",
   "chat.error.image_load_failed": "画像の読み込みに失敗しました。もう一度お試しください。",
