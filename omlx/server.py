@@ -2387,6 +2387,7 @@ async def stream_anthropic_messages(
                         if thinking_block_started and not text_block_started:
                             yield create_content_block_stop_event(index=block_index)
                             block_index += 1
+                            thinking_block_started = False
                         if not text_block_started:
                             yield create_content_block_start_event(
                                 index=block_index, block_type="text"
@@ -2432,6 +2433,7 @@ async def stream_anthropic_messages(
             if thinking_block_started and not text_block_started:
                 yield create_content_block_stop_event(index=block_index)
                 block_index += 1
+                thinking_block_started = False
             if not text_block_started:
                 yield create_content_block_start_event(
                     index=block_index, block_type="text"
@@ -2447,6 +2449,7 @@ async def stream_anthropic_messages(
                 if thinking_block_started:
                     yield create_content_block_stop_event(index=block_index)
                     block_index += 1
+                    thinking_block_started = False
                 yield create_content_block_start_event(
                     index=block_index, block_type="text"
                 )
