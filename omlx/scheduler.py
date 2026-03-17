@@ -1199,12 +1199,24 @@ class Scheduler:
 
         return window_sizes
 
+    # Target range for RotatingKVCache block size alignment.
+    # Using a multiple of window_size within this range reduces SSD I/O
+    # overhead (fewer, larger block files) while keeping cache restore
+    # reprocessing reasonable.
+    _ROTATING_BLOCK_SIZE_MIN = 512
+    _ROTATING_BLOCK_SIZE_MAX = 1024
+
     def _align_block_size_with_rotating_window(self) -> None:
         """
-        Align paged cache block size with RotatingKVCache window size.
+        Align paged cache block size to a multiple of RotatingKVCache
+        window size, targeting 512-1024 tokens per block.
 
-        Strict rotating snapshot restore assumes block boundaries coincide with
-        the rotating window size.
+        Block size must be a multiple of window_size so that block
+        boundaries align with rotation boundaries. When window_size is
+        small (e.g. 128), using it directly as block_size creates too
+        many small files. Instead we pick the smallest multiple of
+        window_size that falls within [_ROTATING_BLOCK_SIZE_MIN,
+        _ROTATING_BLOCK_SIZE_MAX].
         """
         if not self.config.paged_ssd_cache_dir:
             return
@@ -1220,18 +1232,43 @@ class Scheduler:
                 "disable paged cache for this model."
             )
 
-        target_block_size = next(iter(window_sizes))
+        window_size = next(iter(window_sizes))
+
+        # Find the smallest multiple of window_size >= _ROTATING_BLOCK_SIZE_MIN.
+        # If window_size itself is already >= max, just use window_size.
+        lo = self._ROTATING_BLOCK_SIZE_MIN
+        hi = self._ROTATING_BLOCK_SIZE_MAX
+
+        if window_size >= hi:
+            target_block_size = window_size
+        elif window_size >= lo:
+            target_block_size = window_size
+        else:
+            # window_size < lo: pick smallest multiple in [lo, hi]
+            multiplier = (lo + window_size - 1) // window_size  # ceil(lo / ws)
+            target_block_size = multiplier * window_size
+            if target_block_size > hi:
+                # Fall back to largest multiple <= hi
+                target_block_size = (hi // window_size) * window_size
+                if target_block_size < window_size:
+                    target_block_size = window_size
+
         if self.config.paged_cache_block_size != target_block_size:
-            logger.warning(
-                "Aligning paged cache block_size=%s to RotatingKVCache "
-                "window_size=%s for strict boundary snapshots",
+            logger.info(
+                "Aligning paged cache block_size=%s to %s "
+                "(RotatingKVCache window_size=%s, multiplier=%sx)",
                 self.config.paged_cache_block_size,
                 target_block_size,
+                window_size,
+                target_block_size // window_size,
             )
             self.config.paged_cache_block_size = target_block_size
 
     # Default block size for ArraysCache-only hybrid models.
-    _ARRAYS_CACHE_BLOCK_SIZE = 1024
+    # Match prefill_step_size (2048) so that boundary caching ON/OFF
+    # produces identical prefill chunk sizes, eliminating float32↔dtype
+    # roundtrip differences in GatedDeltaNet recurrent state.
+    _ARRAYS_CACHE_BLOCK_SIZE = 2048
 
     def _enlarge_block_size_for_arrays_cache(self) -> None:
         """Enlarge block size for ArraysCache-only hybrid models.

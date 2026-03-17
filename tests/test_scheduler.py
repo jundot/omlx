@@ -1050,7 +1050,9 @@ class TestSchedulerRotatingBlockAlignment:
         scheduler.config.paged_ssd_cache_dir = "/tmp/cache"
         scheduler._align_block_size_with_rotating_window()
 
-        assert scheduler.config.paged_cache_block_size == 128
+        # window_size=128 is below _ROTATING_BLOCK_SIZE_MIN (512),
+        # so it gets rounded up to 512 (smallest multiple of 128 >= 512).
+        assert scheduler.config.paged_cache_block_size == 512
 
     def test_multiple_rotating_window_sizes_raise(self, mock_tokenizer):
         RotatingStub = type("RotatingKVCache", (), {})
