@@ -161,3 +161,96 @@ class TestCausalLMReranker:
             model.rerank("query", ["doc"], max_length=512)
             args, _ = mock_method.call_args
             assert args[2] == 512
+
+
+class TestRerankerCompileFallback:
+    """Tests for reranker compiled path fallback behavior."""
+
+    def _make_model_dir(self, tmp_path, name="bge-reranker-v2-m3"):
+        """Create a mock model directory with SequenceClassification config."""
+        model_dir = tmp_path / name
+        model_dir.mkdir()
+        config = {
+            "model_type": "modernbert",
+            "architectures": ["ModernBertForSequenceClassification"],
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+        return model_dir
+
+    def test_compiled_path_fallback_on_failure(self, tmp_path):
+        """Test that _rerank_seq_classification falls back to eager on compile failure."""
+        import mlx.core as mx
+
+        model_dir = self._make_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._loaded = True
+        model._is_causal_lm = False
+        model._is_compiled = True
+        model._compiled_seq_logits = MagicMock(
+            side_effect=RuntimeError("compile fail")
+        )
+
+        # Mock processor
+        mock_processor = MagicMock()
+        mock_processor.return_value = {
+            "input_ids": [[1, 2, 3, 4]],
+            "attention_mask": [[1, 1, 1, 1]],
+        }
+        model.processor = mock_processor
+
+        # Mock model to return pooler_output
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.pooler_output = mx.array([[0.85]])
+        model.model = MagicMock(return_value=mock_outputs)
+
+        result = model._rerank_seq_classification("query", ["doc"])
+
+        assert len(result.scores) == 1
+        # Compiled path failed, eager path should have been used
+        model.model.assert_called_once()
+
+    def test_eager_path_when_not_compiled(self, tmp_path):
+        """Test that _rerank_seq_classification uses eager path when not compiled."""
+        import mlx.core as mx
+
+        model_dir = self._make_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._loaded = True
+        model._is_causal_lm = False
+        model._is_compiled = False
+        model._compiled_seq_logits = None
+
+        mock_processor = MagicMock()
+        mock_processor.return_value = {
+            "input_ids": [[1, 2, 3]],
+            "attention_mask": [[1, 1, 1]],
+        }
+        model.processor = mock_processor
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.pooler_output = mx.array([[0.7]])
+        model.model = MagicMock(return_value=mock_outputs)
+
+        result = model._rerank_seq_classification("query", ["doc"])
+
+        assert len(result.scores) == 1
+        model.model.assert_called_once()
+
+    def test_try_compile_skips_causal_lm(self, tmp_path):
+        """Test that _try_compile returns False for causal-lm rerankers."""
+        model_dir = tmp_path / "Qwen3-Reranker-0.6B"
+        model_dir.mkdir()
+        config = {
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForCausalLM"],
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = True
+        model.model = MagicMock()
+
+        result = model._try_compile()
+
+        assert result is False
+        assert model._compiled_seq_logits is None

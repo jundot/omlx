@@ -134,6 +134,11 @@ class MLXEmbeddingModel:
             # NOTE: shapeless=True can fail output shape inference for AddMM
             # in some embedding models; use default compile mode.
             self._compiled_embed = mx.compile(_compiled_embed)
+
+            # Warmup: verify compilation actually works with a dummy forward pass
+            test_inputs = {"input_ids": mx.zeros((1, 4), dtype=mx.int32)}
+            _ = self._compiled_embed(test_inputs)
+
             logger.info(
                 f"mx.compile enabled for {self.model_name} "
                 f"(primitive embedding path)"

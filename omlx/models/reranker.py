@@ -27,24 +27,6 @@ from ..model_discovery import (
 logger = logging.getLogger(__name__)
 
 
-class _CompiledForward:
-    """Wraps an MLX module to route __call__ through mx.compile.
-
-    Keeps compiled Metal pipeline states alive in memory, preventing
-    kernel eviction after idle periods (~3s on macOS).
-    """
-
-    def __init__(self, module):
-        self._module = module
-        self._compiled = mx.compile(module.__call__, shapeless=True)
-
-    def __call__(self, *args, **kwargs):
-        return self._compiled(*args, **kwargs)
-
-    def __getattr__(self, name):
-        return getattr(self._module, name)
-
-
 @dataclass
 class RerankOutput:
     """Output from rerank operation."""
@@ -310,6 +292,14 @@ class MLXRerankerModel:
             # NOTE: use default compile mode. shapeless=True can fail shape
             # inference for some linear ops in embedding/reranker stacks.
             self._compiled_seq_logits = mx.compile(_compiled_seq_logits)
+
+            # Warmup: verify compilation actually works with a dummy forward pass
+            test_inputs = {
+                "input_ids": mx.zeros((1, 4), dtype=mx.int32),
+                "attention_mask": mx.ones((1, 4), dtype=mx.int32),
+            }
+            _ = self._compiled_seq_logits(test_inputs)
+
             logger.info(
                 f"mx.compile enabled for {self.model_name} "
                 f"(primitive reranker logits path)"
@@ -483,13 +473,21 @@ class MLXRerankerModel:
         attention_mask = mx.array(inputs["attention_mask"])
 
         # Forward pass (compiled primitive logits path when available)
+        logits = None
         if self._is_compiled and self._compiled_seq_logits is not None:
-            model_inputs = {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-            }
-            logits = self._compiled_seq_logits(model_inputs)
-        else:
+            try:
+                model_inputs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                }
+                logits = self._compiled_seq_logits(model_inputs)
+            except Exception as e:
+                logger.warning(
+                    f"compiled reranker path failed for {self.model_name}: {e}; "
+                    f"falling back to eager forward()"
+                )
+
+        if logits is None:
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,

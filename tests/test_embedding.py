@@ -299,6 +299,112 @@ class TestModelDiscoveryEmbedding:
         assert detect_model_type(tmp_path) == "llm"
 
 
+class TestExtractEmbeddingsArray:
+    """Tests for _extract_embeddings_array method."""
+
+    def test_extract_text_embeds(self):
+        """Test extraction from text_embeds field."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        outputs = MagicMock(spec=[])
+        outputs.text_embeds = mx.array([[0.1, 0.2]])
+        outputs.pooler_output = None
+        outputs.last_hidden_state = None
+
+        result = model._extract_embeddings_array(outputs)
+        assert result is outputs.text_embeds
+
+    def test_extract_pooler_output(self):
+        """Test extraction from pooler_output when text_embeds is absent."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        outputs = MagicMock(spec=[])
+        outputs.pooler_output = mx.array([[0.3, 0.4]])
+        outputs.last_hidden_state = None
+
+        result = model._extract_embeddings_array(outputs)
+        assert result is outputs.pooler_output
+
+    def test_extract_last_hidden_state_mean_pool(self):
+        """Test mean pooling fallback from last_hidden_state."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        outputs = MagicMock(spec=[])
+        outputs.last_hidden_state = mx.ones((1, 4, 3))
+
+        result = model._extract_embeddings_array(outputs)
+        mx.eval(result)
+        assert result.shape == (1, 3)
+
+    def test_extract_raises_when_no_fields(self):
+        """Test ValueError when no embedding fields are present."""
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        outputs = MagicMock(spec=[])
+
+        with pytest.raises(ValueError, match="expected embedding fields"):
+            model._extract_embeddings_array(outputs)
+
+
+class TestEmbeddingCompileFallback:
+    """Tests for embedding compile path fallback behavior."""
+
+    def test_compiled_path_fallback_on_failure(self):
+        """Test that embed() falls back to eager when compiled path raises."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = True
+        model._compiled_embed = MagicMock(side_effect=RuntimeError("compile fail"))
+        model.model = MagicMock()
+        model.processor = MagicMock(spec=[])
+        model.processor._tokenizer = MagicMock()
+
+        # Mock generate to return outputs with text_embeds
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.1, 0.2, 0.3]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+
+        with patch("mlx_embeddings.generate", return_value=mock_outputs):
+            with patch("mlx_embeddings.utils.prepare_inputs"):
+                result = model.embed(["test"])
+
+        assert len(result.embeddings) == 1
+        assert result.embeddings[0] == pytest.approx([0.1, 0.2, 0.3], abs=1e-5)
+
+    def test_is_compiled_false_uses_eager_path(self):
+        """Test that embed() uses eager path when _is_compiled is False."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = MagicMock()
+        model.processor = MagicMock(spec=[])
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.5, 0.6]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+
+        with patch("mlx_embeddings.generate", return_value=mock_outputs):
+            result = model.embed(["test"])
+
+        assert len(result.embeddings) == 1
+
+
 class TestEmbeddingEngine:
     """Tests for EmbeddingEngine."""
 
