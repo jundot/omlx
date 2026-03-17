@@ -78,10 +78,16 @@ class PrefixCacheStats(BaseCacheStats):
     """
     Statistics for prefix cache performance.
 
-    Extends base stats with tokens_saved to track efficiency.
+    Extends base stats with tokens_saved to track efficiency and
+    partial-block skip metrics for observability.
     """
 
     tokens_saved: int = 0
+    partial_block_skips: int = 0
+    partial_tokens_skipped: int = 0
+    block_size: int = 0
+    last_partial_tokens_skipped: int = 0
+    last_tokens_to_next_block: int = 0
     _total_queries: int = field(default=0, repr=False)
 
     @property
@@ -101,6 +107,10 @@ class PrefixCacheStats(BaseCacheStats):
         """Reset all statistics to zero."""
         super().reset()
         self.tokens_saved = 0
+        self.partial_block_skips = 0
+        self.partial_tokens_skipped = 0
+        self.last_partial_tokens_skipped = 0
+        self.last_tokens_to_next_block = 0
         self._total_queries = 0
 
 

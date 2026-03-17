@@ -109,7 +109,6 @@
                 total_requests: 0,
                 host: '127.0.0.1',
                 port: 8000,
-                api_key: '',
                 engines: {},
                 active_models: {
                     models: [],
@@ -117,6 +116,15 @@
                     model_memory_max: 0,
                     total_active_requests: 0,
                     total_waiting_requests: 0,
+                },
+                runtime_cache: {
+                    base_path: '',
+                    ssd_cache_dir: '',
+                    response_state_dir: '',
+                    models: [],
+                    total_num_files: 0,
+                    total_size_bytes: 0,
+                    effective_block_sizes: [],
                 },
             },
             alltimeStats: {
@@ -915,24 +923,31 @@
                 return this.models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type);
             },
 
+            shellQuote(value) {
+                const s = String(value ?? '');
+                if (!s) return "''";
+                return `'${s.replace(/'/g, `'"'"'`)}'`;
+            },
+
+            shellEnvAssign(name, value) {
+                return `${name}=${this.shellQuote(value)}`;
+            },
+
             get claudeCodeCommand() {
                 const mode = this.globalSettings.claude_code.mode;
                 if (mode === 'cloud') {
                     return 'env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u API_TIMEOUT_MS -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC claude';
                 }
-                // Local mode
+                // Local mode (intentionally keyless; provide API key separately if needed)
                 const port = this.stats.port || 8000;
                 const opusModel = this.globalSettings.claude_code.opus_model || 'select-a-model';
                 const sonnetModel = this.globalSettings.claude_code.sonnet_model || 'select-a-model';
                 const haikuModel = this.globalSettings.claude_code.haiku_model || 'select-a-model';
                 const parts = [];
-                parts.push(`ANTHROPIC_BASE_URL=http://${this.displayHost}:${port}`);
-                if (this.stats.api_key) {
-                    parts.push(`ANTHROPIC_AUTH_TOKEN=${this.stats.api_key}`);
-                }
-                parts.push(`ANTHROPIC_DEFAULT_OPUS_MODEL=${opusModel}`);
-                parts.push(`ANTHROPIC_DEFAULT_SONNET_MODEL=${sonnetModel}`);
-                parts.push(`ANTHROPIC_DEFAULT_HAIKU_MODEL=${haikuModel}`);
+                parts.push(this.shellEnvAssign('ANTHROPIC_BASE_URL', `http://${this.displayHost}:${port}`));
+                parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_OPUS_MODEL', opusModel));
+                parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_SONNET_MODEL', sonnetModel));
+                parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_HAIKU_MODEL', haikuModel));
                 parts.push('API_TIMEOUT_MS=3000000');
                 parts.push('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1');
                 parts.push('claude');
@@ -964,33 +979,20 @@
             get codexCommand() {
                 const cli = this.stats.cli_prefix || 'omlx';
                 const model = this.globalSettings.integrations.codex_model || 'select-a-model';
-                const parts = [`${cli} launch codex --model ${model}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.stats.api_key}`);
-                }
-                return parts.join(' ');
+                return `${this.shellQuote(cli)} launch codex --model ${this.shellQuote(model)}`;
             },
 
             get opencodeCommand() {
                 const cli = this.stats.cli_prefix || 'omlx';
                 const model = this.globalSettings.integrations.opencode_model || 'select-a-model';
-                const parts = [`${cli} launch opencode --model ${model}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.stats.api_key}`);
-                }
-                return parts.join(' ');
+                return `${this.shellQuote(cli)} launch opencode --model ${this.shellQuote(model)}`;
             },
 
             get openclawCommand() {
                 const cli = this.stats.cli_prefix || 'omlx';
                 const model = this.globalSettings.integrations.openclaw_model || 'select-a-model';
                 const profile = this.globalSettings.integrations.openclaw_tools_profile || 'full';
-                const parts = [`${cli} launch openclaw --model ${model}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.stats.api_key}`);
-                }
-                parts.push(`--tools-profile ${profile}`);
-                return parts.join(' ');
+                return `${this.shellQuote(cli)} launch openclaw --model ${this.shellQuote(model)} --tools-profile ${this.shellQuote(profile)}`;
             },
 
             async saveIntegrationSettings() {

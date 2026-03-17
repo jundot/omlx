@@ -17,9 +17,10 @@ import shutil
 import sys
 import time
 from collections import deque
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
@@ -151,7 +152,7 @@ class GlobalSettingsRequest(BaseModel):
     integrations_codex_model: Optional[str] = None
     integrations_opencode_model: Optional[str] = None
     integrations_openclaw_model: Optional[str] = None
-    integrations_openclaw_tools_profile: Optional[str] = None
+    integrations_openclaw_tools_profile: Optional[Literal["minimal", "coding", "messaging", "full"]] = None
 
     # UI settings
     ui_language: Optional[str] = None
@@ -2259,6 +2260,145 @@ def _parse_commits_from_pyproject(
     return commits
 
 
+def _build_runtime_cache_observability(
+    global_settings,
+    model_filter: str = "",
+) -> dict:
+    """Build runtime cache observability payload for dashboard.
+
+    Includes the effective runtime paths and per-model SSD cache runtime stats
+    from loaded schedulers, so users can verify real cache state without manual
+    process inspection.
+    """
+    if global_settings is None:
+        return {
+            "base_path": "",
+            "ssd_cache_dir": "",
+            "response_state_dir": "",
+            "models": [],
+            "total_num_files": 0,
+            "total_size_bytes": 0,
+            "effective_block_sizes": [],
+        }
+
+    cache_dir = global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
+    payload = {
+        "base_path": str(global_settings.base_path),
+        "ssd_cache_dir": str(cache_dir),
+        "response_state_dir": str(cache_dir / "response-state"),
+        "models": [],
+        "total_num_files": 0,
+        "total_size_bytes": 0,
+        "effective_block_sizes": [],
+    }
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        return payload
+
+    block_sizes = set()
+
+    for model_info in engine_pool.get_status().get("models", []):
+        model_id = model_info.get("id")
+        if not model_id:
+            continue
+        if model_filter and model_id != model_filter:
+            continue
+        if not model_info.get("loaded"):
+            continue
+
+        entry = engine_pool._entries.get(model_id)
+        if entry is None or entry.engine is None:
+            continue
+
+        async_core = getattr(entry.engine, "_engine", None)
+        core = getattr(async_core, "engine", None) if async_core is not None else None
+        scheduler = getattr(core, "scheduler", None) if core is not None else None
+
+        runtime_stats = None
+        if scheduler is not None and hasattr(scheduler, "get_ssd_cache_stats"):
+            try:
+                runtime_stats = scheduler.get_ssd_cache_stats()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to collect runtime cache stats for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+                continue
+
+        if not runtime_stats:
+            continue
+
+        block_size = runtime_stats.get("block_size")
+        indexed_blocks = runtime_stats.get("indexed_blocks")
+
+        ssd_stats = runtime_stats.get("ssd_cache")
+        if is_dataclass(ssd_stats):
+            ssd_stats = asdict(ssd_stats)
+        elif hasattr(ssd_stats, "to_dict"):
+            ssd_stats = ssd_stats.to_dict()
+        elif not isinstance(ssd_stats, dict):
+            ssd_stats = {}
+
+        prefix_stats = runtime_stats.get("prefix_cache")
+        if is_dataclass(prefix_stats):
+            prefix_stats = asdict(prefix_stats)
+        elif hasattr(prefix_stats, "to_dict"):
+            prefix_stats = prefix_stats.to_dict()
+        elif not isinstance(prefix_stats, dict):
+            prefix_stats = {}
+
+        indexed_blocks_value = indexed_blocks if isinstance(indexed_blocks, int) else 0
+        if not isinstance(block_size, int) or block_size <= 0:
+            block_size = int(prefix_stats.get("block_size", 0) or 0)
+
+        partial_block_skips = int(prefix_stats.get("partial_block_skips", 0) or 0)
+        partial_tokens_skipped = int(prefix_stats.get("partial_tokens_skipped", 0) or 0)
+        last_partial_tokens_skipped = int(
+            prefix_stats.get("last_partial_tokens_skipped", 0) or 0
+        )
+        last_tokens_to_next_block = int(
+            prefix_stats.get("last_tokens_to_next_block", 0) or 0
+        )
+
+        has_sub_block_cache = (
+            indexed_blocks_value == 0
+            and isinstance(block_size, int)
+            and block_size > 0
+            and partial_block_skips > 0
+        )
+
+        model_payload = {
+            "id": model_id,
+            "block_size": block_size,
+            "indexed_blocks": indexed_blocks_value,
+            "indexed_blocks_display": (
+                f"<{block_size}" if has_sub_block_cache else str(indexed_blocks_value)
+            ),
+            "has_sub_block_cache": has_sub_block_cache,
+            "partial_block_skips": partial_block_skips,
+            "partial_tokens_skipped": partial_tokens_skipped,
+            "last_partial_tokens_skipped": last_partial_tokens_skipped,
+            "last_tokens_to_next_block": last_tokens_to_next_block,
+            "num_files": int(ssd_stats.get("num_files", 0) or 0),
+            "total_size_bytes": int(ssd_stats.get("total_size_bytes", 0) or 0),
+            "hot_cache_max_bytes": int(ssd_stats.get("hot_cache_max_bytes", 0) or 0),
+            "hot_cache_size_bytes": int(ssd_stats.get("hot_cache_size_bytes", 0) or 0),
+            "hot_cache_entries": int(ssd_stats.get("hot_cache_entries", 0) or 0),
+        }
+
+        payload["models"].append(model_payload)
+        payload["total_num_files"] += model_payload["num_files"]
+        payload["total_size_bytes"] += model_payload["total_size_bytes"]
+
+        if isinstance(block_size, int) and block_size > 0:
+            block_sizes.add(block_size)
+
+    payload["effective_block_sizes"] = sorted(block_sizes)
+    return payload
+
+
 @router.get("/api/stats")
 async def get_server_stats(
     model: str = "",
@@ -2279,7 +2419,6 @@ async def get_server_stats(
     global_settings = _get_global_settings()
     host = global_settings.server.host if global_settings else "127.0.0.1"
     port = global_settings.server.port if global_settings else 8000
-    api_key = global_settings.auth.api_key if global_settings else ""
 
     from ..model_discovery import format_size
     from ..prefill_progress import get_prefill_tracker
@@ -2287,12 +2426,15 @@ async def get_server_stats(
 
     # Build active_models data for the dashboard card.
     active_models_data = _build_active_models_data()
+    runtime_cache_data = _build_runtime_cache_observability(
+        global_settings,
+        model_filter=model,
+    )
 
     return {
         **snapshot,
         "host": host,
         "port": port,
-        "api_key": api_key or "",
         "cli_prefix": get_cli_prefix(),
         "claude_code_context_scaling_enabled": (
             global_settings.claude_code.context_scaling_enabled
@@ -2306,6 +2448,7 @@ async def get_server_stats(
         ),
         "engines": _get_engine_info(),
         "active_models": active_models_data,
+        "runtime_cache": runtime_cache_data,
     }
 
 
