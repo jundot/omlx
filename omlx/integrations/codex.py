@@ -63,6 +63,7 @@ class CodexIntegration(Integration):
         # Parse existing config lines to preserve other settings
         lines = existing_content.splitlines()
         new_lines = []
+        in_any_section = False
         in_omlx_section = False
         
         # Keys to override at the top level
@@ -72,7 +73,8 @@ class CodexIntegration(Integration):
         }
         
         # If it is a reasoning model, add reasoning effort
-        is_reasoning = any(x in (model or "").lower() for x in ["thinking", "o1", "o3", "r1"])
+        import re
+        is_reasoning = bool(re.search(r'\b(thinking|o1|o3|r1)\b', (model or "").lower()))
         if is_reasoning:
             top_level_overrides["model_reasoning_effort"] = '"high"'
 
@@ -81,10 +83,11 @@ class CodexIntegration(Integration):
         for line in lines:
             stripped = line.strip()
             if stripped.startswith("[") and stripped.endswith("]"):
+                in_any_section = True
                 in_omlx_section = (stripped == "[model_providers.omlx]")
             
             # Handle top-level keys
-            if not in_omlx_section and "=" in stripped:
+            if not in_any_section and "=" in stripped:
                 key = stripped.split("=")[0].strip()
                 if key in top_level_overrides:
                     new_lines.append(f"{key} = {top_level_overrides[key]}")

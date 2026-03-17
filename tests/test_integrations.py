@@ -78,6 +78,34 @@ class TestCodexIntegration:
         assert codex.type == "config_file"
         assert codex.display_name == "Codex"
 
+    def test_configure_preserves_existing(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        existing = """\
+model = "old-model"
+other_key = "value"
+
+[model_providers.custom]
+name = "Custom"
+model = "should-not-override"
+
+[model_providers.omlx]
+name = "old-omlx"
+"""
+        config_path.write_text(existing)
+
+        codex = CodexIntegration()
+        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
+            codex.configure(port=8000, api_key="", model="new-model")
+
+        content = config_path.read_text()
+        assert 'model = "new-model"' in content
+        assert 'model_provider = "omlx"' in content
+        assert 'other_key = "value"' in content
+        assert '[model_providers.custom]' in content
+        assert 'model = "should-not-override"' in content
+        assert '[model_providers.omlx]' in content
+        assert 'name = "oMLX"' in content
+        assert 'old-omlx' not in content
 
 class TestOpenCodeIntegration:
     def test_get_command(self):
