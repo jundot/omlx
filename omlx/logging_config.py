@@ -36,11 +36,15 @@ class RequestContextFilter(logging.Filter):
 
 
 class AdminStatsAccessFilter(logging.Filter):
-    """Suppress repetitive uvicorn access logs for admin stats polling."""
+    """Suppress repetitive uvicorn access logs for admin polling endpoints."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
-        return "/admin/api/stats" not in msg
+        if "/admin/api/stats" in msg:
+            return False
+        if "/admin/api/login" in msg:
+            return False
+        return True
 
 
 class ColoredFormatter(logging.Formatter):

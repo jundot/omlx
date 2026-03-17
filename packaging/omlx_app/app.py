@@ -83,6 +83,7 @@ class OMLXAppDelegate(NSObject):
         self._cached_stats: Optional[dict] = None
         self._cached_alltime_stats: Optional[dict] = None
         self._last_stats_fetch: float = 0
+        self._admin_session: Optional[requests.Session] = None
         self._icon_outline: Optional[NSImage] = None
         self._icon_filled: Optional[NSImage] = None
         self._update_info: Optional[dict] = None
@@ -735,7 +736,12 @@ class OMLXAppDelegate(NSObject):
     # --- Stats fetching ---
 
     def _fetch_stats(self):
-        """Fetch serving stats from the admin API."""
+        """Fetch serving stats from the admin API.
+
+        Reuses a persistent session to avoid re-login on every poll cycle.
+        Only calls /admin/api/login when the session cookie is missing or
+        expired (server returns 401).
+        """
         try:
             api_key = self.config.get_server_api_key()
             base_url = f"http://127.0.0.1:{self.config.port}"
@@ -745,26 +751,41 @@ class OMLXAppDelegate(NSObject):
                 self._cached_alltime_stats = None
                 return
 
-            session = requests.Session()
-            login_resp = session.post(
-                f"{base_url}/admin/api/login",
-                json={"api_key": api_key},
-                timeout=2,
-            )
-            if login_resp.status_code != 200:
-                self._cached_stats = None
-                self._cached_alltime_stats = None
-                return
+            if self._admin_session is None:
+                self._admin_session = requests.Session()
 
+            session = self._admin_session
+
+            # Try fetching stats directly (session cookie may still be valid)
             stats_resp = session.get(
                 f"{base_url}/admin/api/stats",
                 timeout=2,
             )
+
+            # Session expired or missing — login and retry
+            if stats_resp.status_code == 401:
+                login_resp = session.post(
+                    f"{base_url}/admin/api/login",
+                    json={"api_key": api_key},
+                    timeout=2,
+                )
+                if login_resp.status_code != 200:
+                    self._cached_stats = None
+                    self._cached_alltime_stats = None
+                    self._admin_session = None
+                    return
+
+                stats_resp = session.get(
+                    f"{base_url}/admin/api/stats",
+                    timeout=2,
+                )
+
             if stats_resp.status_code == 200:
                 self._cached_stats = stats_resp.json()
             else:
                 self._cached_stats = None
                 self._cached_alltime_stats = None
+                return
 
             alltime_resp = session.get(
                 f"{base_url}/admin/api/stats",
@@ -779,6 +800,7 @@ class OMLXAppDelegate(NSObject):
         except requests.RequestException:
             self._cached_stats = None
             self._cached_alltime_stats = None
+            self._admin_session = None
 
     # --- Timer callback ---
 
@@ -883,11 +905,13 @@ class OMLXAppDelegate(NSObject):
         self.server_manager.stop()
         self._cached_stats = None
         self._cached_alltime_stats = None
+        self._admin_session = None
         self._update_status_display()
 
     @objc.IBAction
     def forceRestart_(self, sender):
         """Force restart the server (kill + start fresh)."""
+        self._admin_session = None
         result = self.server_manager.force_restart()
         if isinstance(result, PortConflict):
             self._handle_port_conflict(result)
