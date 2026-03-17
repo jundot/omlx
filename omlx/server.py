@@ -393,6 +393,36 @@ async def redirect_to_login_handler(request, exc):
     return RedirectResponse(url="/admin", status_code=302)
 
 
+def _status_to_error_type(status_code: int) -> str:
+    """Map HTTP status code to OpenAI error type string."""
+    if status_code == 401:
+        return "authentication_error"
+    if status_code == 404:
+        return "not_found_error"
+    if status_code == 429:
+        return "rate_limit_error"
+    if status_code >= 500:
+        return "server_error"
+    return "invalid_request_error"
+
+
+def _is_api_route(request: FastAPIRequest) -> bool:
+    """Check if request targets an OpenAI-compatible API route."""
+    return request.url.path.startswith("/v1/")
+
+
+def _openai_error_body(message, status_code: int, param=None, code=None) -> dict:
+    """Build an OpenAI-compatible error response body."""
+    return {
+        "error": {
+            "message": message,
+            "type": _status_to_error_type(status_code),
+            "param": param,
+            "code": code,
+        }
+    }
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
     """Log all HTTP errors (4xx/5xx) before returning the response."""
@@ -403,10 +433,11 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
         exc.status_code,
         exc.detail,
     )
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-    )
+    if _is_api_route(request):
+        content = _openai_error_body(exc.detail, exc.status_code)
+    else:
+        content = {"detail": exc.detail}
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 @app.exception_handler(RequestValidationError)
@@ -420,10 +451,19 @@ async def validation_exception_handler(
         request.url.path,
         exc.errors(),
     )
-    return JSONResponse(
-        status_code=422,
-        content={"detail": exc.errors()},
-    )
+    if _is_api_route(request):
+        errors = exc.errors()
+        parts = []
+        for err in errors:
+            loc = " -> ".join(str(x) for x in err.get("loc", []))
+            msg = err.get("msg", "")
+            parts.append(f"{loc}: {msg}" if loc else msg)
+        detail_str = "; ".join(parts)
+        param = errors[0].get("loc", [None])[-1] if errors else None
+        content = _openai_error_body(detail_str, 422, param=param)
+    else:
+        content = {"detail": exc.errors()}
+    return JSONResponse(status_code=422, content=content)
 
 
 @app.exception_handler(Exception)
@@ -435,10 +475,11 @@ async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
         request.url.path,
         exc,
     )
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal server error"},
-    )
+    if _is_api_route(request):
+        content = _openai_error_body("Internal server error", 500)
+    else:
+        content = {"detail": "Internal server error"}
+    return JSONResponse(status_code=500, content=content)
 
 
 class DebugRequestLoggingMiddleware:

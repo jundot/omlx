@@ -198,6 +198,26 @@ class TestExceptionHandlers:
         response = client.get("/v1/nonexistent-endpoint")
         assert response.status_code == 404
         data = response.json()
+        assert "detail" in data or "error" in data
+
+    def test_api_validation_error_openai_format(self, client):
+        """Test that /v1/* validation errors use OpenAI-compatible format."""
+        response = client.post(
+            "/v1/chat/completions",
+            json={"invalid_field": "bad"},
+        )
+        # 422 validation or 500 if server not init - both should have error key
+        data = response.json()
+        assert "error" in data
+        assert "message" in data["error"]
+        assert "type" in data["error"]
+        assert "param" in data["error"]
+
+    def test_non_api_route_detail_format(self, client):
+        """Test that non-/v1/ routes keep the traditional detail format."""
+        response = client.get("/nonexistent-page")
+        assert response.status_code == 404
+        data = response.json()
         assert "detail" in data
 
 

@@ -837,3 +837,28 @@ class TestResolveModelId:
 
         result = pool.resolve_model_id("omlx/nonexistent", settings_manager)
         assert result == "omlx/nonexistent"
+
+    def test_case_insensitive_match(self, small_mock_model_dir):
+        """Test case-insensitive fallback when exact match fails."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        result = pool.resolve_model_id("MODEL-A", settings_manager=None)
+        assert result == "model-a"
+
+    def test_case_insensitive_with_provider_prefix(self, small_mock_model_dir):
+        """Test case-insensitive match after stripping provider prefix."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        result = pool.resolve_model_id("omlx/MODEL-B", settings_manager=None)
+        assert result == "model-b"
+
+    def test_exact_match_preferred_over_case_insensitive(self, small_mock_model_dir):
+        """Test exact match takes priority over case-insensitive."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Exact match should be returned directly
+        result = pool.resolve_model_id("model-a", settings_manager=None)
+        assert result == "model-a"

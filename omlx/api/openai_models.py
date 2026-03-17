@@ -12,7 +12,7 @@ These models define the request and response schemas for:
 
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from omlx.api.shared_models import (
     BaseUsage,
@@ -148,6 +148,14 @@ class ChatCompletionRequest(BaseModel):
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
 
+    @field_validator("stop", mode="before")
+    @classmethod
+    def coerce_stop(cls, v):
+        """Accept stop as a single string (OpenAI compat) and wrap in a list."""
+        if isinstance(v, str):
+            return [v]
+        return v
+
 
 class AssistantMessage(BaseModel):
     """Response message from the assistant."""
@@ -210,6 +218,14 @@ class CompletionRequest(BaseModel):
     min_p: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+
+    @field_validator("stop", mode="before")
+    @classmethod
+    def coerce_stop(cls, v):
+        """Accept stop as a single string (OpenAI compat) and wrap in a list."""
+        if isinstance(v, str):
+            return [v]
+        return v
 
 
 class CompletionChoice(BaseModel):

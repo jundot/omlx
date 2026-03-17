@@ -563,3 +563,55 @@ class TestModelInfo:
         assert resp.object == "list"
         assert len(resp.data) == 2
         assert resp.data[0].id == "gpt-4"
+
+
+# =============================================================================
+# Stop Field Coercion
+# =============================================================================
+
+class TestStopCoercion:
+    """Tests for stop field string-to-list coercion (OpenAI compat)."""
+
+    def test_chat_stop_string_coerced_to_list(self):
+        """A bare string for stop should be wrapped in a list."""
+        req = ChatCompletionRequest(
+            model="m",
+            messages=[Message(role="user", content="hi")],
+            stop="<|endoftext|>",
+        )
+        assert req.stop == ["<|endoftext|>"]
+
+    def test_chat_stop_list_unchanged(self):
+        """A list value for stop should remain unchanged."""
+        req = ChatCompletionRequest(
+            model="m",
+            messages=[Message(role="user", content="hi")],
+            stop=["a", "b"],
+        )
+        assert req.stop == ["a", "b"]
+
+    def test_chat_stop_none_unchanged(self):
+        """None value for stop should remain None."""
+        req = ChatCompletionRequest(
+            model="m",
+            messages=[Message(role="user", content="hi")],
+        )
+        assert req.stop is None
+
+    def test_completion_stop_string_coerced_to_list(self):
+        """CompletionRequest stop string should also be coerced."""
+        req = CompletionRequest(
+            model="m",
+            prompt="hello",
+            stop="eos",
+        )
+        assert req.stop == ["eos"]
+
+    def test_completion_stop_list_unchanged(self):
+        """CompletionRequest stop list should remain unchanged."""
+        req = CompletionRequest(
+            model="m",
+            prompt="hello",
+            stop=["a"],
+        )
+        assert req.stop == ["a"]

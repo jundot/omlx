@@ -232,16 +232,32 @@ class EnginePool:
         entry.is_pinned = pinned
         return True
 
+    def _case_insensitive_entry_match(self, name: str) -> str | None:
+        """Find a model entry matching *name* case-insensitively.
+
+        Returns the actual model_id if found, None otherwise.
+        """
+        lower = name.lower()
+        for mid in self._entries:
+            if mid.lower() == lower:
+                return mid
+        return None
+
     def resolve_model_id(self, model_id_or_alias: str, settings_manager) -> str:
         """Resolve a model alias to its actual model_id (directory name).
 
-        Tries exact match in _entries first, then scans model settings
-        for alias match. If those fail and input contains a provider prefix
-        (e.g. "omlx/my-model"), strips the prefix and retries.
-        Returns the original string if no match found.
+        Tries exact match in _entries first, then case-insensitive match,
+        then scans model settings for alias match. If those fail and input
+        contains a provider prefix (e.g. "omlx/my-model"), strips the prefix
+        and retries. Returns the original string if no match found.
         """
         if model_id_or_alias in self._entries:
             return model_id_or_alias
+
+        # Case-insensitive fallback
+        ci_match = self._case_insensitive_entry_match(model_id_or_alias)
+        if ci_match is not None:
+            return ci_match
 
         all_settings = None
         if settings_manager is not None:
@@ -255,6 +271,9 @@ class EnginePool:
             stripped = model_id_or_alias.split("/", 1)[1]
             if stripped in self._entries:
                 return stripped
+            ci_match = self._case_insensitive_entry_match(stripped)
+            if ci_match is not None:
+                return ci_match
             if all_settings is not None:
                 for mid, ms in all_settings.items():
                     if ms.model_alias and ms.model_alias == stripped:
