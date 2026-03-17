@@ -2419,6 +2419,7 @@ async def get_server_stats(
     global_settings = _get_global_settings()
     host = global_settings.server.host if global_settings else "127.0.0.1"
     port = global_settings.server.port if global_settings else 8000
+    api_key = global_settings.auth.api_key if global_settings else ""
 
     from ..model_discovery import format_size
     from ..prefill_progress import get_prefill_tracker
@@ -2435,6 +2436,7 @@ async def get_server_stats(
         **snapshot,
         "host": host,
         "port": port,
+        "api_key": api_key or "",
         "cli_prefix": get_cli_prefix(),
         "claude_code_context_scaling_enabled": (
             global_settings.claude_code.context_scaling_enabled
