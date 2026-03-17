@@ -108,6 +108,8 @@ class MLXRerankerModel:
         self._token_false_id: int | None = None
         self._prefix_tokens: list[int] | None = None
         self._suffix_tokens: list[int] | None = None
+        self._is_compiled = False
+        self._compiled_seq_logits = None
 
     def _get_architecture(self) -> str | None:
         """Get the model architecture from config.json."""
@@ -278,24 +280,46 @@ class MLXRerankerModel:
             raise
 
     def _try_compile(self) -> bool:
-        """Try to compile the model's forward pass with mx.compile.
+        """Compile reranker scoring path to return primitive logits arrays.
 
-        Returns True if compilation succeeded, False otherwise.
-        On failure, self.model is reverted to the original uncompiled model.
+        Root-cause fix:
+        - Compiling model.__call__ directly can yield arrays without primitives
+          in some MLX output containers.
+        - Compile a narrow function that returns logits only.
         """
-        original_model = self.model
+        if self._is_causal_lm:
+            # CausalLM reranker path uses generation/logit selection logic;
+            # keep eager path until a dedicated compiled scorer is added.
+            logger.info(
+                f"mx.compile skipped for causal-lm reranker {self.model_name}"
+            )
+            self._compiled_seq_logits = None
+            return False
+
+        base_model = self.model
         try:
-            self.model = _CompiledForward(original_model)
-            # Trigger compilation with a dummy forward pass
-            test_ids = mx.zeros((1, 4), dtype=mx.int32)
-            _ = self.model(test_ids)
-            logger.info(f"mx.compile enabled for {self.model_name}")
+            def _compiled_seq_logits(inputs):
+                outputs = base_model(**inputs)
+                if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                    return outputs.pooler_output
+                raise ValueError(
+                    "Model output does not contain pooler_output. "
+                    "Ensure the model is a SequenceClassification model."
+                )
+
+            # NOTE: use default compile mode. shapeless=True can fail shape
+            # inference for some linear ops in embedding/reranker stacks.
+            self._compiled_seq_logits = mx.compile(_compiled_seq_logits)
+            logger.info(
+                f"mx.compile enabled for {self.model_name} "
+                f"(primitive reranker logits path)"
+            )
             return True
         except Exception as e:
             logger.info(
                 f"mx.compile unavailable for {self.model_name}: {e}"
             )
-            self.model = original_model
+            self._compiled_seq_logits = None
             return False
 
     # Default max_length per model type
@@ -458,21 +482,29 @@ class MLXRerankerModel:
         input_ids = mx.array(inputs["input_ids"])
         attention_mask = mx.array(inputs["attention_mask"])
 
-        # Forward pass
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-
-        # Extract scores from pooler_output
-        # pooler_output shape: (batch_size, num_labels)
-        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-            logits = outputs.pooler_output
+        # Forward pass (compiled primitive logits path when available)
+        if self._is_compiled and self._compiled_seq_logits is not None:
+            model_inputs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+            }
+            logits = self._compiled_seq_logits(model_inputs)
         else:
-            raise ValueError(
-                "Model output does not contain pooler_output. "
-                "Ensure the model is a SequenceClassification model."
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
             )
+
+            # Extract scores from pooler_output
+            # pooler_output shape: (batch_size, num_labels)
+            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                logits = outputs.pooler_output
+            else:
+                raise ValueError(
+                    "Model output does not contain pooler_output. "
+                    "Ensure the model is a SequenceClassification model."
+                )
+
 
         # Ensure computation is done
         mx.eval(logits)

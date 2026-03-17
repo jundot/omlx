@@ -7,30 +7,12 @@ text embeddings using Apple's MLX framework.
 """
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from dataclasses import dataclass
+from typing import List, Optional
 
 import mlx.core as mx
 
 logger = logging.getLogger(__name__)
-
-
-class _CompiledForward:
-    """Wraps an MLX module to route __call__ through mx.compile.
-
-    Keeps compiled Metal pipeline states alive in memory, preventing
-    kernel eviction after idle periods (~3s on macOS).
-    """
-
-    def __init__(self, module):
-        self._module = module
-        self._compiled = mx.compile(module.__call__, shapeless=True)
-
-    def __call__(self, *args, **kwargs):
-        return self._compiled(*args, **kwargs)
-
-    def __getattr__(self, name):
-        return getattr(self._module, name)
 
 
 @dataclass
@@ -73,6 +55,8 @@ class MLXEmbeddingModel:
         self.processor = None
         self._loaded = False
         self._hidden_size: Optional[int] = None
+        self._is_compiled = False
+        self._compiled_embed = None
 
     def load(self) -> None:
         """Load the model and processor/tokenizer."""
@@ -86,18 +70,14 @@ class MLXEmbeddingModel:
 
             self.model, self.processor = load(self.model_name)
 
-            # Get hidden size from model config (before wrapping)
+            # Get hidden size from model config
             if hasattr(self.model, "config"):
                 config = self.model.config
                 self._hidden_size = getattr(config, "hidden_size", None)
-                if self._hidden_size is None:
-                    # Try text_config for vision-language models
-                    if hasattr(config, "text_config"):
-                        self._hidden_size = getattr(
-                            config.text_config, "hidden_size", None
-                        )
+                if self._hidden_size is None and hasattr(config, "text_config"):
+                    self._hidden_size = getattr(config.text_config, "hidden_size", None)
 
-            # Try mx.compile for persistent Metal kernel caching
+            # Compile a primitive-only embedding forward path
             self._is_compiled = self._try_compile()
 
             self._loaded = True
@@ -122,25 +102,46 @@ class MLXEmbeddingModel:
             logger.error(f"Failed to load embedding model: {e}")
             raise
 
-    def _try_compile(self) -> bool:
-        """Try to compile the model's forward pass with mx.compile.
+    def _extract_embeddings_array(self, outputs):
+        """Extract embedding tensor from model outputs."""
+        if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
+            return outputs.text_embeds
+        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+            return outputs.pooler_output
+        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+            return mx.mean(outputs.last_hidden_state, axis=1)
+        raise ValueError(
+            "Model output does not contain expected embedding fields "
+            "(text_embeds, pooler_output, or last_hidden_state)"
+        )
 
-        Returns True if compilation succeeded, False otherwise.
-        On failure, self.model is reverted to the original uncompiled model.
+    def _try_compile(self) -> bool:
         """
-        original_model = self.model
+        Compile a primitive-output embedding forward function.
+
+        Root-cause fix:
+        - Compiling model.__call__ directly can return arrays without primitives
+          for some embedding/reranker models, causing eval() runtime errors.
+        - We compile a narrower function that returns only the final embedding array.
+        """
+        base_model = self.model
+
         try:
-            self.model = _CompiledForward(original_model)
-            # Trigger compilation with a dummy forward pass
-            test_ids = mx.zeros((1, 4), dtype=mx.int32)
-            _ = self.model(test_ids)
-            logger.info(f"mx.compile enabled for {self.model_name}")
+            def _compiled_embed(inputs):
+                outputs = base_model(**inputs)
+                return self._extract_embeddings_array(outputs)
+
+            # NOTE: shapeless=True can fail output shape inference for AddMM
+            # in some embedding models; use default compile mode.
+            self._compiled_embed = mx.compile(_compiled_embed)
+            logger.info(
+                f"mx.compile enabled for {self.model_name} "
+                f"(primitive embedding path)"
+            )
             return True
         except Exception as e:
-            logger.info(
-                f"mx.compile unavailable for {self.model_name}: {e}"
-            )
-            self.model = original_model
+            logger.info(f"mx.compile unavailable for {self.model_name}: {e}")
+            self._compiled_embed = None
             return False
 
     def embed(
@@ -166,45 +167,51 @@ class MLXEmbeddingModel:
             self.load()
 
         from mlx_embeddings import generate
+        from mlx_embeddings.utils import prepare_inputs
 
         # Normalize input
         if isinstance(texts, str):
             texts = [texts]
 
         # Get the underlying tokenizer from TokenizerWrapper
-        # TokenizerWrapper uses __getattr__ to forward attribute access,
-        # but __call__ is a special method that isn't forwarded.
-        # Pass _tokenizer directly to mlx-embeddings generate().
         processor = self.processor
         if hasattr(processor, "_tokenizer"):
             processor = processor._tokenizer
 
-        # Use mlx-embeddings generate() for batch processing and future optimizations
-        outputs = generate(
-            self.model,
-            processor,
-            texts,
-            max_length=max_length,
-            padding=padding,
-            truncation=truncation,
-        )
+        embeddings_array = None
 
-        # Extract embeddings from output
-        # mlx-embeddings returns BaseModelOutput with text_embeds (normalized)
-        if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
-            embeddings_array = outputs.text_embeds
-        elif hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-            embeddings_array = outputs.pooler_output
-        elif (
-            hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None
-        ):
-            # Fallback: mean pooling over last_hidden_state
-            embeddings_array = mx.mean(outputs.last_hidden_state, axis=1)
-        else:
-            raise ValueError(
-                "Model output does not contain expected embedding fields "
-                "(text_embeds, pooler_output, or last_hidden_state)"
+        # Compile path: run primitive-output compiled function
+        if self._is_compiled and self._compiled_embed is not None:
+            try:
+                inputs = prepare_inputs(
+                    processor,
+                    None,
+                    texts,
+                    max_length,
+                    padding,
+                    truncation,
+                    None,
+                )
+                if not isinstance(inputs, dict):
+                    inputs = dict(inputs)
+                embeddings_array = self._compiled_embed(inputs)
+            except Exception as e:
+                logger.warning(
+                    f"compiled embedding path failed for {self.model_name}: {e}; "
+                    f"falling back to eager generate()"
+                )
+
+        # Eager path fallback
+        if embeddings_array is None:
+            outputs = generate(
+                self.model,
+                processor,
+                texts,
+                max_length=max_length,
+                padding=padding,
+                truncation=truncation,
             )
+            embeddings_array = self._extract_embeddings_array(outputs)
 
         # Ensure computation is done
         mx.eval(embeddings_array)
