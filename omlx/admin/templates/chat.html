@@ -266,6 +266,65 @@
         .sidebar-overlay.hidden { display: none; }
         .user-edit-btn { left: -28px; }
     }
+
+    /* Image modal */
+    .image-modal {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.9);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 9999;
+        cursor: zoom-out;
+    }
+    .image-modal img {
+        max-width: 90%;
+        max-height: 90%;
+        object-fit: contain;
+        border-radius: 8px;
+        box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+    }
+    .image-modal-close {
+        position: absolute;
+        top: 20px;
+        right: 20px;
+        width: 40px;
+        height: 40px;
+        background: rgba(255, 255, 255, 0.1);
+        border: none;
+        border-radius: 50%;
+        color: white;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: background 0.2s;
+    }
+    .image-modal-close:hover {
+        background: rgba(255, 255, 255, 0.2);
+    }
+
+    /* Edit image preview */
+    .edit-images-preview {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 8px;
+        padding: 8px;
+        background: var(--bg-tertiary);
+        border-radius: 8px;
+    }
+    .edit-images-preview .edit-image-item {
+        position: relative;
+    }
+    .edit-images-preview img {
+        width: 64px;
+        height: 64px;
+        object-fit: cover;
+        border-radius: 6px;
+        border: 1px solid var(--border-faint);
+    }
 </style>
 {% endblock %}
 
@@ -437,7 +496,7 @@
                                         <template x-if="getImageUrls(msg.content).length > 0">
                                             <div class="flex flex-wrap gap-2 mb-2">
                                                 <template x-for="imgUrl in getImageUrls(msg.content)" :key="imgUrl.substring(0, 50)">
-                                                    <img :src="imgUrl" @click="window.open(imgUrl, '_blank')" class="max-w-48 max-h-48 object-cover rounded-lg cursor-pointer">
+                                                    <img :src="imgUrl" @click="openImageModal(imgUrl)" class="max-w-48 max-h-48 object-cover rounded-lg cursor-pointer">
                                                 </template>
                                             </div>
                                         </template>
@@ -460,6 +519,14 @@
                                 </template>
                                 <template x-if="editingIndex === index">
                                     <div class="user-message-bubble" style="padding: 0; background: transparent;">
+                                        <!-- Show preserved images during edit -->
+                                        <div x-show="editImages.length > 0" class="edit-images-preview">
+                                            <template x-for="(img, idx) in editImages" :key="img.substring(0, 50)">
+                                                <div class="edit-image-item">
+                                                    <img :src="img" :alt="window.t('chat.image_preview') || 'Image'">
+                                                </div>
+                                            </template>
+                                        </div>
                                         <textarea
                                             x-model="editContent"
                                             @keydown.enter.ctrl="saveEdit(index)"
@@ -586,6 +653,17 @@
             </div>
         </div>
     </div>
+
+    <!-- Image Modal -->
+    <div x-show="imageModal.show" x-cloak
+         class="image-modal"
+         @click="closeImageModal()"
+         @keydown.escape.window="closeImageModal()">
+        <button class="image-modal-close" @click="closeImageModal()">
+            <i data-lucide="x" class="w-5 h-5"></i>
+        </button>
+        <img :src="imageModal.src" @click.stop alt="Preview" x-show="imageModal.src">
+    </div>
 </div>
 {% endblock %}
 
@@ -652,10 +730,17 @@
             // Edit State
             editingIndex: null,
             editContent: '',
+            editImages: [],              // Preserve images during edit
 
             // Image Upload State
             uploadImages: [],            // Array of { id, base64 } for pending images (max 10)
             isDragOver: false,           // drag-and-drop state
+
+            // Image Modal State
+            imageModal: {
+                show: false,
+                src: ''
+            },
 
             // VLM Detection State
             modelTypeMap: {},            // { modelId: "llm"|"vlm"|"embedding"|"reranker" }
@@ -716,6 +801,18 @@
 
             hasVisionSupport() {
                 return this.modelTypeMap[this.currentModel] === 'vlm';
+            },
+
+            // ===== Image Modal Functions =====
+
+            openImageModal(url) {
+                if (!url) return;
+                this.imageModal = { show: true, src: url };
+                this.$nextTick(() => lucide.createIcons());
+            },
+
+            closeImageModal() {
+                this.imageModal = { show: false, src: '' };
             },
 
             // ===== Image Upload Functions =====
@@ -1216,12 +1313,15 @@
                 if (this.isStreaming || this.editingIndex !== null) return;
                 this.editingIndex = index;
                 this.editContent = this.getTextContent(this.messages[index].content);
+                // Preserve images from the original message
+                this.editImages = this.getImageUrls(this.messages[index].content);
                 this.$nextTick(() => lucide.createIcons());
             },
 
             cancelEdit() {
                 this.editingIndex = null;
                 this.editContent = '';
+                this.editImages = [];
                 this.$nextTick(() => lucide.createIcons());
             },
 
@@ -1233,15 +1333,28 @@
                 // Remove all messages from this index onwards
                 this.messages = this.messages.slice(0, index);
 
+                // Build message content, preserving images
+                let content;
+                if (this.editImages.length > 0) {
+                    content = [];
+                    for (const img of this.editImages) {
+                        content.push({ type: 'image_url', image_url: { url: img } });
+                    }
+                    content.push({ type: 'text', text: newContent });
+                } else {
+                    content = newContent;
+                }
+
                 // Add edited user message
                 this.messages.push({
                     role: 'user',
-                    content: newContent
+                    content
                 });
 
                 // Reset edit state
                 this.editingIndex = null;
                 this.editContent = '';
+                this.editImages = [];
 
                 // Scroll and get new response
                 this.scrollToBottom();
