@@ -232,6 +232,7 @@ def build_patched_libmlx(
         run_cmd([
             "cmake", "..",
             "-DCMAKE_BUILD_TYPE=Release",
+            "-DBUILD_SHARED_LIBS=ON",
             "-DMLX_BUILD_TESTS=OFF",
             "-DMLX_BUILD_BENCHMARKS=OFF",
             "-DMLX_BUILD_PYTHON_BINDINGS=OFF",
@@ -246,8 +247,8 @@ def build_patched_libmlx(
         cwd=str(MLX_BUILD_DIR),
     )
 
-    # locate built dylib
-    src = MLX_BUILD_DIR / "lib" / "libmlx.dylib"
+    # locate built dylib (cmake outputs to build/ directly, not build/lib/)
+    src = MLX_BUILD_DIR / "libmlx.dylib"
     if not src.exists():
         print(f"  ✗ Patched libmlx.dylib not found at {src}")
         return False
