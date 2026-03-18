@@ -812,6 +812,24 @@ class TestGlobalSettings:
             assert custom_cache.exists()
             assert custom_logs.exists()
 
+    def test_ensure_directories_unavailable_model_dir(self):
+        """Test that unavailable model dirs are skipped instead of crashing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir) / "omlx"
+            valid_models = Path(tmpdir) / "valid_models"
+            unavailable = Path("/Volumes/NonExistentDrive/Models")
+
+            settings = GlobalSettings(base_path=base)
+            settings.model.model_dirs = [str(valid_models), str(unavailable)]
+            settings.ensure_directories()
+
+            assert base.exists()
+            assert valid_models.exists()
+            # Unavailable path should be removed from model_dirs
+            resolved_dirs = settings.model.get_model_dirs(base)
+            assert len(resolved_dirs) == 1
+            assert resolved_dirs[0] == valid_models.resolve()
+
     def test_validate_valid_settings(self):
         """Test validation with valid settings."""
         settings = GlobalSettings()

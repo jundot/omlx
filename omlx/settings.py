@@ -905,14 +905,14 @@ class GlobalSettings:
 
     def ensure_directories(self) -> None:
         """Create necessary directories if they don't exist."""
-        directories = [
+        # Required directories - fatal if creation fails
+        required = [
             self.base_path,
-            *self.model.get_model_dirs(self.base_path),
             self.cache.get_ssd_cache_dir(self.base_path),
             self.logging.get_log_dir(self.base_path),
         ]
 
-        for directory in directories:
+        for directory in required:
             if not directory.exists():
                 try:
                     directory.mkdir(parents=True, exist_ok=True)
@@ -920,6 +920,25 @@ class GlobalSettings:
                 except OSError as e:
                     logger.error(f"Failed to create directory {directory}: {e}")
                     raise
+
+        # Model directories - skip unavailable paths (e.g. disconnected external drive)
+        valid_dirs = []
+        for directory in self.model.get_model_dirs(self.base_path):
+            if directory.exists():
+                valid_dirs.append(str(directory))
+                continue
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                logger.debug(f"Created directory: {directory}")
+                valid_dirs.append(str(directory))
+            except OSError as e:
+                logger.warning(
+                    f"Model directory unavailable, skipping: {directory} ({e})"
+                )
+
+        # Update model_dirs to only include valid paths
+        self.model.model_dirs = valid_dirs
+        self.model.model_dir = None
 
     def validate(self) -> list[str]:
         """
