@@ -1357,7 +1357,17 @@ class Scheduler:
             import os
             gc_path = os.path.join(model_path, "generation_config.json")
             if not os.path.exists(gc_path):
-                return None
+                # name_or_path may be a HuggingFace repo ID (e.g. for VLM
+                # tokenizers loaded via AutoProcessor).  Try the HF cache.
+                try:
+                    from huggingface_hub import try_to_load_from_cache
+                    cached = try_to_load_from_cache(model_path, "generation_config.json")
+                    if cached and isinstance(cached, str):
+                        gc_path = cached
+                    else:
+                        return None
+                except (ImportError, Exception):
+                    return None
             with open(gc_path) as f:
                 gc = json.load(f)
             eos = gc.get("eos_token_id")

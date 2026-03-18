@@ -67,6 +67,28 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
     "<|endofassistant|>",
 ]
 
+# Per-model OCR generation defaults from official configs.
+# Applied automatically when no explicit user override is provided.
+OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "glm_ocr": {
+        "temperature": 0.0,
+        "repetition_penalty": 1.1,
+        "max_tokens": 4096,
+    },
+    "deepseekocr": {
+        "temperature": 0.0,
+        "max_tokens": 8192,
+    },
+    "deepseekocr_2": {
+        "temperature": 0.0,
+        "max_tokens": 8192,
+    },
+    "dots_ocr": {
+        "temperature": 0.0,
+        "max_tokens": 8192,
+    },
+}
+
 _video_processor_patched = False
 
 
@@ -581,11 +603,16 @@ class VLMBatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        # OCR models: force temperature=0.0 and add extra stop token IDs
-        # to prevent degeneration (repeated <|user|>, <|im_start|>, etc.).
+        # OCR models: apply per-model generation defaults and add extra
+        # stop token IDs to prevent degeneration.
         extra_stop_ids: list[int] = []
         if self.is_ocr_model:
-            temperature = 0.0
+            defaults = OCR_MODEL_GENERATION_DEFAULTS.get(self.model_type or "", {})
+            temperature = defaults.get("temperature", 0.0)
+            if "repetition_penalty" in defaults:
+                repetition_penalty = defaults["repetition_penalty"]
+            if "max_tokens" in defaults:
+                max_tokens = min(max_tokens, defaults["max_tokens"])
             extra_stop_ids = self._resolve_ocr_stop_token_ids()
 
         from ..request import SamplingParams
@@ -642,10 +669,16 @@ class VLMBatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        # OCR models: force temperature=0.0 and add extra stop token IDs.
+        # OCR models: apply per-model generation defaults and add extra
+        # stop token IDs to prevent degeneration.
         extra_stop_ids: list[int] = []
         if self.is_ocr_model:
-            temperature = 0.0
+            defaults = OCR_MODEL_GENERATION_DEFAULTS.get(self.model_type or "", {})
+            temperature = defaults.get("temperature", 0.0)
+            if "repetition_penalty" in defaults:
+                repetition_penalty = defaults["repetition_penalty"]
+            if "max_tokens" in defaults:
+                max_tokens = min(max_tokens, defaults["max_tokens"])
             extra_stop_ids = self._resolve_ocr_stop_token_ids()
 
         from ..request import SamplingParams
