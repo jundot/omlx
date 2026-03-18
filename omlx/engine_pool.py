@@ -459,9 +459,13 @@ class EnginePool:
         # Force garbage collection to release memory.
         # Run mx.clear_cache on the global MLX executor to avoid concurrent
         # Metal operations with running engines. See issue #85.
+        # Synchronize before clearing to prevent releasing Metal buffers
+        # still referenced by in-flight command buffers. See issue #300.
         gc.collect()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
+        await loop.run_in_executor(
+            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+        )
 
         logger.info(
             f"Unloaded model: {model_id}, "
@@ -528,7 +532,10 @@ class EnginePool:
                         pass
                     gc.collect()
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
+                    await loop.run_in_executor(
+                        get_mlx_executor(),
+                        lambda: (mx.synchronize(), mx.clear_cache()),
+                    )
 
                     engine = BatchedEngine(
                         model_name=entry.model_path,
@@ -559,7 +566,10 @@ class EnginePool:
                     )
                 gc.collect()
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
                 raise ModelLoadingError(
                     f"Model {model_id} load aborted: "
                     f"process memory limit exceeded"

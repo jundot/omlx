@@ -82,7 +82,9 @@ class EmbeddingEngine(BaseNonStreamingEngine):
 
         gc.collect()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
+        await loop.run_in_executor(
+            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+        )
         logger.info(f"Embedding engine stopped: {self._model_name}")
 
     async def embed(

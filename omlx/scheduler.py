@@ -39,6 +39,22 @@ from .cache.prefix_cache import BlockAwarePrefixCache
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .exceptions import is_cache_corruption_error
 
+
+def _sync_and_clear_cache():
+    """Synchronize in-flight GPU work before clearing the Metal buffer cache.
+
+    Without synchronization, mx.clear_cache() can release Metal buffers that
+    are still referenced by in-flight command buffers submitted via
+    mx.async_eval(). This causes the GPU driver to hit a
+    'completeMemory() prepare count underflow' kernel panic on M4 hardware
+    (and SIGSEGV/SIGABRT on M3).
+
+    See: https://github.com/jundot/omlx/issues/300
+    """
+    mx.synchronize(generation_stream)
+    mx.synchronize()  # default stream
+    mx.clear_cache()
+
 # Import tiered cache components
 try:
     from .cache.paged_ssd_cache import PagedSSDCacheManager
@@ -456,7 +472,7 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     emitted=emitted_boundaries,
                     processed_tokens=processed_tokens,
                 )
-                mx.clear_cache()
+                _sync_and_clear_cache()
 
                 if self._memory_limit_bytes > 0:
                     active = mx.get_active_memory()
@@ -571,7 +587,7 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     emitted=emitted_boundaries,
                     processed_tokens=processed_tokens,
                 )
-                mx.clear_cache()
+                _sync_and_clear_cache()
 
                 if self._memory_limit_bytes > 0:
                     active = mx.get_active_memory()
@@ -643,7 +659,7 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                 if batched_extra:
                     batched_extra = _advance_vlm_extra(batched_extra, prompt_checkpoint - 1)
 
-        mx.clear_cache()
+        _sync_and_clear_cache()
 
         # Pass remaining VLM embeddings (last token) to _step if available.
         step_kwargs: Dict[str, Any] = {}
@@ -899,7 +915,7 @@ class SchedulerConfig:
 
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
-    mlx_cache_cleanup_interval: int = 32  # Steps between mx.clear_cache() calls
+    mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
 
 
 @dataclass
@@ -3524,7 +3540,7 @@ class Scheduler:
             self.config.mlx_cache_cleanup_interval > 0
             and self._step_counter % self.config.mlx_cache_cleanup_interval == 0
         ):
-            mx.clear_cache()
+            _sync_and_clear_cache()
         if (
             self.config.gc_cleanup_interval > 0
             and self._step_counter % self.config.gc_cleanup_interval == 0
