@@ -702,13 +702,14 @@ def get_sampling_params(
     req_presence_penalty: float | None = None,
     req_frequency_penalty: float | None = None,
     req_max_tokens: int | None = None,
+    ocr_defaults: dict | None = None,
 ) -> tuple[float, float, int, float, float, float, float, int]:
     """
     Get effective sampling parameters with per-model settings support.
 
     Priority:
     - If force_sampling is True (global or model level): use forced values
-    - Otherwise: request > model settings > global defaults
+    - Otherwise: request > model settings > ocr_defaults > global defaults
 
     Returns:
         tuple of (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens)
@@ -723,6 +724,10 @@ def get_sampling_params(
     if model_id and _server_state.settings_manager:
         model_settings = _server_state.settings_manager.get_settings(model_id)
 
+    # Resolve OCR defaults if not provided by caller
+    if ocr_defaults is None and model_id:
+        ocr_defaults = _get_ocr_defaults(model_id)
+
     # Check force at any level
     force = global_sampling.force_sampling or (
         model_settings and model_settings.force_sampling
@@ -732,6 +737,8 @@ def get_sampling_params(
         # Forced mode: use model settings if available, else global
         if model_settings and model_settings.temperature is not None:
             temperature = model_settings.temperature
+        elif ocr_defaults and "temperature" in ocr_defaults:
+            temperature = ocr_defaults["temperature"]
         else:
             temperature = global_sampling.temperature
 
@@ -745,11 +752,13 @@ def get_sampling_params(
         else:
             top_k = global_sampling.top_k
     else:
-        # Normal mode: priority request > model > global
+        # Normal mode: priority request > model > ocr_defaults > global
         if req_temperature is not None:
             temperature = req_temperature
         elif model_settings and model_settings.temperature is not None:
             temperature = model_settings.temperature
+        elif ocr_defaults and "temperature" in ocr_defaults:
+            temperature = ocr_defaults["temperature"]
         else:
             temperature = global_sampling.temperature
 
@@ -765,9 +774,11 @@ def get_sampling_params(
         else:
             top_k = global_sampling.top_k
 
-    # Repetition penalty: model settings > global default (1.0)
+    # Repetition penalty: model settings > ocr_defaults > global default (1.0)
     if model_settings and model_settings.repetition_penalty is not None:
         repetition_penalty = model_settings.repetition_penalty
+    elif ocr_defaults and "repetition_penalty" in ocr_defaults:
+        repetition_penalty = ocr_defaults["repetition_penalty"]
     else:
         repetition_penalty = getattr(global_sampling, 'repetition_penalty', 1.0)
 
@@ -799,6 +810,8 @@ def get_sampling_params(
     if force:
         if model_settings and model_settings.max_tokens is not None:
             max_tokens = model_settings.max_tokens
+        elif ocr_defaults and "max_tokens" in ocr_defaults:
+            max_tokens = ocr_defaults["max_tokens"]
         else:
             max_tokens = global_sampling.max_tokens
     else:
@@ -806,6 +819,8 @@ def get_sampling_params(
             max_tokens = req_max_tokens
         elif model_settings and model_settings.max_tokens is not None:
             max_tokens = model_settings.max_tokens
+        elif ocr_defaults and "max_tokens" in ocr_defaults:
+            max_tokens = ocr_defaults["max_tokens"]
         else:
             max_tokens = global_sampling.max_tokens
 
@@ -848,6 +863,23 @@ def resolve_model_id(model_id: str | None) -> str | None:
     if pool is None:
         return model_id
     return pool.resolve_model_id(model_id, _server_state.settings_manager)
+
+
+def _get_ocr_defaults(model_id: str | None) -> dict | None:
+    """Get OCR generation defaults for a model, or None if not an OCR model."""
+    if model_id is None:
+        return None
+    pool = _server_state.engine_pool
+    if pool is None:
+        return None
+    entry = pool.get_entry(model_id)
+    if entry is None:
+        return None
+    from .engine.vlm import OCR_MODEL_GENERATION_DEFAULTS, OCR_MODEL_TYPES
+    cmt = getattr(entry, "config_model_type", "")
+    if cmt in OCR_MODEL_TYPES:
+        return OCR_MODEL_GENERATION_DEFAULTS.get(cmt)
+    return None
 
 
 def get_max_context_window(model_id: str | None = None) -> int | None:

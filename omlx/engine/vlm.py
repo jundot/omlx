@@ -603,16 +603,12 @@ class VLMBatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        # OCR models: apply per-model generation defaults and add extra
-        # stop token IDs to prevent degeneration.
+        # OCR models: add extra stop token IDs to prevent degeneration.
+        # Sampling params (temperature, repetition_penalty, max_tokens) are
+        # resolved by get_sampling_params() with OCR defaults as a fallback
+        # layer, so admin/API overrides are respected.
         extra_stop_ids: list[int] = []
         if self.is_ocr_model:
-            defaults = OCR_MODEL_GENERATION_DEFAULTS.get(self.model_type or "", {})
-            temperature = defaults.get("temperature", 0.0)
-            if "repetition_penalty" in defaults:
-                repetition_penalty = defaults["repetition_penalty"]
-            if "max_tokens" in defaults:
-                max_tokens = min(max_tokens, defaults["max_tokens"])
             extra_stop_ids = self._resolve_ocr_stop_token_ids()
 
         from ..request import SamplingParams
@@ -669,16 +665,12 @@ class VLMBatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        # OCR models: apply per-model generation defaults and add extra
-        # stop token IDs to prevent degeneration.
+        # OCR models: add extra stop token IDs to prevent degeneration.
+        # Sampling params (temperature, repetition_penalty, max_tokens) are
+        # resolved by get_sampling_params() with OCR defaults as a fallback
+        # layer, so admin/API overrides are respected.
         extra_stop_ids: list[int] = []
         if self.is_ocr_model:
-            defaults = OCR_MODEL_GENERATION_DEFAULTS.get(self.model_type or "", {})
-            temperature = defaults.get("temperature", 0.0)
-            if "repetition_penalty" in defaults:
-                repetition_penalty = defaults["repetition_penalty"]
-            if "max_tokens" in defaults:
-                max_tokens = min(max_tokens, defaults["max_tokens"])
             extra_stop_ids = self._resolve_ocr_stop_token_ids()
 
         from ..request import SamplingParams
