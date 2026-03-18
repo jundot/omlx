@@ -40,7 +40,6 @@ class RerankerEngine(BaseNonStreamingEngine):
         Args:
             model_name: HuggingFace model name or local path
         """
-        super().__init__()
         self._model_name = model_name
         self._model: MLXRerankerModel | None = None
 
@@ -59,11 +58,6 @@ class RerankerEngine(BaseNonStreamingEngine):
         """Get the number of classification labels."""
         return self._model.num_labels if self._model else None
 
-    def _warmup(self) -> None:
-        """Run a minimal rerank to keep Metal pipeline states warm."""
-        if self._model is not None:
-            self._model.rerank("q", ["d"], max_length=64)
-
     async def start(self) -> None:
         """Start the engine (load model if not loaded).
 
@@ -77,15 +71,6 @@ class RerankerEngine(BaseNonStreamingEngine):
         self._model = MLXRerankerModel(self._model_name)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(get_mlx_executor(), self._model.load)
-
-        # If mx.compile failed, activate keepalive to prevent Metal eviction
-        if not self._model._is_compiled:
-            logger.info(
-                f"Activating keepalive for {self._model_name} "
-                f"(mx.compile unavailable)"
-            )
-            self._start_keepalive(loop)
-
         logger.info(f"Reranker engine started: {self._model_name}")
 
     async def stop(self) -> None:
@@ -94,7 +79,6 @@ class RerankerEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping reranker engine: {self._model_name}")
-        await self._stop_keepalive()
         self._model = None
 
         gc.collect()
@@ -136,21 +120,9 @@ class RerankerEngine(BaseNonStreamingEngine):
             )
 
         loop = asyncio.get_running_loop()
-        was_compiled = model._is_compiled
-        self._active_requests += 1
-        try:
-            output = await loop.run_in_executor(
-                get_mlx_executor(), _rerank_sync
-            )
-            # Circuit breaker: compile was disabled at runtime, start keepalive
-            if was_compiled and not model._is_compiled and self._keepalive_task is None:
-                logger.info(
-                    f"Activating keepalive for {self._model_name} "
-                    f"(mx.compile disabled at runtime)"
-                )
-                self._start_keepalive(loop)
-        finally:
-            self._active_requests -= 1
+        output = await loop.run_in_executor(
+            get_mlx_executor(), _rerank_sync
+        )
 
         # Apply top_n filtering if specified
         if top_n is not None and top_n < len(output.indices):
