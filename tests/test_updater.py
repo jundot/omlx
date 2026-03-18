@@ -310,3 +310,41 @@ class TestAppUpdater:
 
         on_error.assert_called_once()
         assert "write" in on_error.call_args[0][0].lower()
+
+
+class TestVersionComparison:
+    """Tests for version comparison logic used in macOS app update checking.
+
+    Replicates _is_newer_version from omlx_app/app.py to avoid PyObjC dependency.
+    """
+
+    @staticmethod
+    def _is_newer_version(latest: str, current: str) -> bool:
+        try:
+            from packaging.version import Version
+
+            latest_ver = Version(latest)
+            return latest_ver > Version(current) and not latest_ver.is_prerelease
+        except Exception:
+            return False
+
+    def test_stable_newer(self):
+        assert self._is_newer_version("0.2.19", "0.2.18") is True
+
+    def test_dev_not_shown(self):
+        assert self._is_newer_version("0.2.19.dev1", "0.2.18") is False
+
+    def test_dev10_not_shown(self):
+        assert self._is_newer_version("0.2.19.dev10", "0.2.18") is False
+
+    def test_rc_not_shown(self):
+        assert self._is_newer_version("0.2.19rc1", "0.2.18") is False
+
+    def test_stable_from_dev_current(self):
+        assert self._is_newer_version("0.2.19", "0.2.19.dev1") is True
+
+    def test_same_version(self):
+        assert self._is_newer_version("0.2.18", "0.2.18") is False
+
+    def test_older_version(self):
+        assert self._is_newer_version("0.2.17", "0.2.18") is False

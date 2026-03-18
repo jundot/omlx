@@ -302,11 +302,12 @@ class OMLXAppDelegate(NSObject):
             self._update_info = None
 
     def _is_newer_version(self, latest: str, current: str) -> bool:
-        """PEP 440 version comparison (handles beta/rc versions)."""
+        """PEP 440 version comparison. Ignores pre-release versions."""
         try:
             from packaging.version import Version
 
-            return Version(latest) > Version(current)
+            latest_ver = Version(latest)
+            return latest_ver > Version(current) and not latest_ver.is_prerelease
         except Exception:
             return False
 

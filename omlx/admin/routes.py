@@ -3294,7 +3294,11 @@ async def check_update(
         try:
             from packaging.version import Version
 
-            update_available = Version(latest) > Version(_omlx_version)
+            latest_ver = Version(latest)
+            update_available = (
+                latest_ver > Version(_omlx_version)
+                and not latest_ver.is_prerelease
+            )
         except Exception:
             update_available = False
 
