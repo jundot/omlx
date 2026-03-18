@@ -201,6 +201,18 @@ def serve_command(args):
     else:
         print("Mode: Multi-model serving (continuous batching, no cache)")
 
+    # Set MLX buffer cache limit high to prevent the allocator from
+    # immediately releasing Metal buffers when the cache is full.
+    # Without this, allocator::free() can call buf->release() while the
+    # GPU is still using the buffer, causing kernel panics on M4.
+    # With a large cache limit, freed buffers always stay in the pool
+    # and are only released via mx.clear_cache() (which we protect
+    # with mx.synchronize()). See issue #300.
+    import mlx.core as mx
+    total_mem = mx.metal.device_info().get("memory_size", 0)
+    if total_mem > 0:
+        mx.set_cache_limit(total_mem)
+
     # Initialize server
     # Note: pinned_models and default_model are managed via admin page (model_settings.json)
     # Sampling parameters (max_tokens, temperature, etc.) are per-model settings
