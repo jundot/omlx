@@ -203,6 +203,75 @@ def swap_platform_wheels(
     print(f"  ✓ Swapped to {platform_tag}")
 
 
+MLX_SOURCE_DIR = SCRIPT_DIR / "_mlx_source"
+MLX_BUILD_DIR = MLX_SOURCE_DIR / "build"
+
+
+def build_patched_libmlx(
+    export_dir: Path, python_version: str = "3.11"
+) -> bool:
+    """Build per-stream-lock patched libmlx.dylib and replace in site-packages.
+
+    Builds only libmlx.dylib from _mlx_source (which contains the
+    per-stream-lock patch for Metal thread safety, see mlx PR #3247).
+    The metallib from the PyPI wheel is kept as-is to preserve OS-specific
+    GPU shader optimizations.
+
+    Returns True if patched successfully, False otherwise.
+    """
+    if not MLX_SOURCE_DIR.exists():
+        print("  ⚠ _mlx_source not found, skipping MLX patch")
+        return False
+
+    print("\n[MLX Patch] Building per-stream-lock libmlx.dylib...")
+    MLX_BUILD_DIR.mkdir(exist_ok=True)
+
+    # cmake configure (only if not already configured)
+    cmake_cache = MLX_BUILD_DIR / "CMakeCache.txt"
+    if not cmake_cache.exists():
+        run_cmd([
+            "cmake", "..",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DMLX_BUILD_TESTS=OFF",
+            "-DMLX_BUILD_BENCHMARKS=OFF",
+            "-DMLX_BUILD_PYTHON_BINDINGS=OFF",
+            "-DMLX_BUILD_METAL=ON",
+            "-DCMAKE_OSX_ARCHITECTURES=arm64",
+        ], cwd=str(MLX_BUILD_DIR))
+
+    # build libmlx target
+    cpu_count = os.cpu_count() or 4
+    run_cmd(
+        ["cmake", "--build", ".", "--target", "mlx", "-j", str(cpu_count)],
+        cwd=str(MLX_BUILD_DIR),
+    )
+
+    # locate built dylib
+    src = MLX_BUILD_DIR / "lib" / "libmlx.dylib"
+    if not src.exists():
+        print(f"  ✗ Patched libmlx.dylib not found at {src}")
+        return False
+
+    # replace in site-packages
+    dst = (
+        export_dir
+        / "framework-mlx-framework"
+        / "lib"
+        / f"python{python_version}"
+        / "site-packages"
+        / "mlx"
+        / "lib"
+        / "libmlx.dylib"
+    )
+    if not dst.parent.exists():
+        print(f"  ✗ Target directory not found: {dst.parent}")
+        return False
+
+    shutil.copy2(src, dst)
+    print(f"  ✓ Patched libmlx.dylib ({src.stat().st_size / 1024 / 1024:.1f}MB)")
+    return True
+
+
 def _parse_git_requirements(toml_path: Path) -> list[tuple[str, str]]:
     """Extract git-based requirements from venvstacks.toml.
 
@@ -980,6 +1049,9 @@ def main():
                         help="Target macOS version for mlx/mlx-metal wheels "
                         "(e.g. 26.0). Downloads platform-specific wheels "
                         "with M5 Neural Accelerator support.")
+    parser.add_argument("--no-mlx-patch", action="store_true",
+                        help="Skip per-stream-lock MLX patch "
+                        "(use stock PyPI libmlx.dylib)")
     args = parser.parse_args()
 
     print(f"Building {APP_NAME} v{VERSION}")
@@ -1007,6 +1079,10 @@ def main():
         # Swap mlx/mlx-metal wheels for target macOS version
         if args.macos_target:
             swap_platform_wheels(EXPORT_DIR, args.macos_target)
+
+        # Apply per-stream-lock patch to libmlx.dylib (default: on)
+        if not args.no_mlx_patch:
+            build_patched_libmlx(EXPORT_DIR)
 
         app_dir = create_app_bundle()
         omlx_pkg_dir = app_dir / "Contents" / "Resources" / "omlx"
