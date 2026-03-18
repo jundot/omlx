@@ -1063,7 +1063,7 @@
                                         <div x-show="detailTab === 'card'" class="flex-1 min-h-0 overflow-y-auto">
                                             <div x-show="hfModelDetail.model_card" x-cloak>
                                                 <div class="model-card-content"
-                                                     x-html="typeof marked !== 'undefined' ? marked.parse(hfModelDetail.model_card) : hfModelDetail.model_card"></div>
+                                                     x-html="typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(marked.parse(hfModelDetail.model_card)) : ''"></div>
                                             </div>
                                             <div x-show="!hfModelDetail.model_card" x-cloak class="py-8 text-center">
                                                 <i data-lucide="file-text" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
@@ -1164,7 +1164,7 @@
                                         <div x-show="detailTab === 'card'" class="flex-1 min-h-0 overflow-y-auto">
                                             <div x-show="msModelDetail.model_card" x-cloak>
                                                 <div class="model-card-content"
-                                                     x-html="typeof marked !== 'undefined' ? marked.parse(msModelDetail.model_card) : msModelDetail.model_card"></div>
+                                                     x-html="typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(marked.parse(msModelDetail.model_card)) : ''"></div>
                                             </div>
                                             <div x-show="!msModelDetail.model_card" x-cloak class="py-8 text-center">
                                                 <i data-lucide="file-text" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
