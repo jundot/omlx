@@ -11,6 +11,7 @@ from omlx.api.utils import (
     _consolidate_system_messages,
     _merge_consecutive_roles,
     clean_output_text,
+    detect_and_strip_partial,
     extract_harmony_messages,
     extract_multimodal_content,
     extract_text_content,
@@ -1225,3 +1226,201 @@ class TestExtractMultimodalContent:
         content = result[0]["content"]
         assert content[1]["type"] == "image_url"
         assert content[1]["image_url"]["url"] == "https://example.com/a.png"
+
+
+# =============================================================================
+# Partial Mode & Name Preservation
+# =============================================================================
+
+
+class TestDetectAndStripPartial:
+    """Tests for detect_and_strip_partial() helper."""
+
+    def test_detects_partial_assistant(self):
+        """Detects partial=True on final assistant message."""
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "{", "partial": True},
+        ]
+        assert detect_and_strip_partial(messages) is True
+
+    def test_ignores_partial_non_assistant(self):
+        """partial=True on non-assistant final message returns False."""
+        messages = [
+            {"role": "user", "content": "Hello", "partial": True},
+        ]
+        assert detect_and_strip_partial(messages) is False
+
+    def test_strips_partial_from_all_messages(self):
+        """partial field is removed from every message."""
+        messages = [
+            {"role": "user", "content": "Hello", "partial": False},
+            {"role": "assistant", "content": "{", "partial": True},
+        ]
+        detect_and_strip_partial(messages)
+        for msg in messages:
+            assert "partial" not in msg
+
+    def test_empty_messages(self):
+        """Empty message list returns False without error."""
+        assert detect_and_strip_partial([]) is False
+
+    def test_no_partial_field(self):
+        """Messages without partial field return False."""
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+        ]
+        assert detect_and_strip_partial(messages) is False
+
+
+class TestExtractTextContentPreservesNamePartial:
+    """Tests that extract_text_content preserves name and partial fields."""
+
+    def test_preserves_name_on_text_message(self):
+        """name field survives extraction for text messages."""
+        messages = [
+            Message(role="assistant", content="Hello", name="Kimi"),
+        ]
+        result = extract_text_content(messages)
+        assert result[0]["name"] == "Kimi"
+
+    def test_preserves_partial_on_assistant(self):
+        """partial field survives extraction for assistant messages."""
+        messages = [
+            Message(role="assistant", content="{", partial=True),
+        ]
+        result = extract_text_content(messages)
+        assert result[0].get("partial") is True
+
+    def test_no_name_when_absent(self):
+        """name key is absent when not set on source message."""
+        messages = [
+            Message(role="user", content="Hello"),
+        ]
+        result = extract_text_content(messages)
+        assert "name" not in result[0]
+
+    def test_no_partial_when_false(self):
+        """partial key is absent when False on source message."""
+        messages = [
+            Message(role="user", content="Hello"),
+        ]
+        result = extract_text_content(messages)
+        assert "partial" not in result[0]
+
+    def test_preserves_name_on_tool_call_message(self):
+        """name field preserved on assistant message with tool_calls."""
+        messages = [
+            Message(
+                role="assistant",
+                content="Let me call a tool",
+                name="Kimi",
+                tool_calls=[{"id": "1", "function": {"name": "search", "arguments": "{}"}}],
+            ),
+        ]
+        result = extract_text_content(messages)
+        assert result[0].get("name") == "Kimi"
+
+    def test_preserves_name_in_multimodal_extraction(self):
+        """name field survives multimodal extraction."""
+        messages = [
+            Message(role="assistant", content="Hello", name="Kimi"),
+        ]
+        result = extract_multimodal_content(messages)
+        assert result[0]["name"] == "Kimi"
+
+
+class TestNameFieldSchemaAcceptance:
+    """Tests that the `name` field is accepted by the Message schema.
+
+    The `name` field is part of the OpenAI chat completion spec and used by
+    models like Kimi K2/K2.5 for named-assistant persona rendering.  Many
+    templates silently ignore it, so we cannot reliably assert on template
+    output — but we CAN verify that the schema accepts it without error
+    and that it survives message extraction for templates that do use it.
+
+    On models that support it, the assistant `name` field acts as a
+    probability space constraint — the same prompt produces distinctly
+    different character voices depending on the name.  Models that ignore
+    it simply drop the field harmlessly.
+
+    Validated on Kimi-K2-Instruct-0905-mlx-3bit with a HHGTTG roleplay
+    scenario (system: turn-based RP, user: Arthur banging on bathroom
+    door, assistant: partial prefill "*" with name set).  Same prompt,
+    three names, three distinct voices:
+
+        name="Marvin the Paranoid Android":
+            *door creaks open* ... "A damp towel is flung over the
+            shower rail like a limp flag of surrender."
+
+        name="Ford Prefect":
+            *door slides open* ... "I seem to have mistaken this door
+            for the entry to the relaxation chamber of the Starship
+            Heart of Gold."
+
+        name="Zaphod Beeblebrox":
+            "Yes, yes, an hour is precisely how long it takes to
+            negotiate a cease-fire between the fungal colonies behind
+            the soap dish and the mildew syndicate under the sink."
+    """
+
+    def test_name_field_accepted_on_all_roles(self):
+        """Message schema accepts name on user, assistant, and system roles."""
+        msgs = [
+            Message(
+                role="system",
+                content="This is a turn-based roleplaying session set in the "
+                "Hitchhiker's Guide to the Galaxy universe.",
+            ),
+            Message(
+                role="user",
+                content="*bangs on the bathroom door* Oi! It's been an hour! "
+                "Some of us need to use the facilities too, you know!",
+                name="Arthur Dent",
+            ),
+            Message(
+                role="assistant",
+                content="*",
+                name="Marvin the Paranoid Android",
+                partial=True,
+            ),
+        ]
+        # No ValidationError raised — schema accepts name on all roles
+        assert msgs[1].name == "Arthur Dent"
+        assert msgs[2].name == "Marvin the Paranoid Android"
+
+    def test_name_field_survives_extraction_for_template(self):
+        """name is carried through extract_text_content so templates can render it."""
+        msgs = [
+            Message(
+                role="system",
+                content="This is a turn-based roleplaying session set in the "
+                "Hitchhiker's Guide to the Galaxy universe.",
+            ),
+            Message(
+                role="user",
+                content="*bangs on the bathroom door* Oi! It's been an hour! "
+                "Some of us need to use the facilities too, you know!",
+                name="Arthur Dent",
+            ),
+            Message(
+                role="assistant",
+                content="*",
+                name="Marvin the Paranoid Android",
+                partial=True,
+            ),
+        ]
+        result = extract_text_content(msgs)
+
+        # system message is consolidated to front; user and assistant follow
+        assert result[1]["name"] == "Arthur Dent"
+        assert result[2]["name"] == "Marvin the Paranoid Android"
+        # partial also survives for the engine to consume
+        assert result[2]["partial"] is True
+
+    def test_name_absent_when_not_provided(self):
+        """name key does not leak into message dicts when not set."""
+        msgs = [Message(role="user", content="Hello")]
+        result = extract_text_content(msgs)
+        assert "name" not in result[0]

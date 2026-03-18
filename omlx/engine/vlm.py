@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
-from ..api.utils import clean_special_tokens
+from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..models.vlm import VLMModelAdapter
 from ..utils.image import (
     compute_image_hash,
@@ -471,6 +471,8 @@ class VLMBatchedEngine(BaseEngine):
                 return_messages=True,
             )
 
+        # Strip partial field from messages (VLM always uses add_generation_prompt=True)
+        detect_and_strip_partial(formatted_messages)
         template_kwargs = {
             "tokenize": False,
             "add_generation_prompt": True,
@@ -559,6 +561,8 @@ class VLMBatchedEngine(BaseEngine):
     ) -> str:
         """Apply chat template for text-only messages (no images)."""
         if hasattr(self._tokenizer, "apply_chat_template"):
+            # Strip partial field (VLM always uses add_generation_prompt=True)
+            detect_and_strip_partial(messages)
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,

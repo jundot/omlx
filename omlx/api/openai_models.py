@@ -65,6 +65,10 @@ class Message(BaseModel):
     tool_calls: Optional[List[dict]] = None
     # For tool response messages (role="tool")
     tool_call_id: Optional[str] = None
+    # Participant name, rendered into chat template (e.g. Kimi K2/K2.5 named assistants)
+    name: Optional[str] = None
+    # Continue from this message instead of starting a new turn (prefill / partial mode)
+    partial: bool = False
 
 
 # =============================================================================

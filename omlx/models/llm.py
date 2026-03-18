@@ -10,6 +10,7 @@ import logging
 from dataclasses import dataclass
 from typing import Iterator
 
+from ..api.utils import detect_and_strip_partial
 from ..utils.tokenizer import get_tokenizer_config
 
 logger = logging.getLogger(__name__)
@@ -265,11 +266,14 @@ class MLXLanguageModel:
 
         # Apply chat template
         if hasattr(self.tokenizer, 'apply_chat_template'):
+            is_partial = detect_and_strip_partial(messages)
             # Build kwargs for apply_chat_template
             template_kwargs = {
                 "tokenize": False,
-                "add_generation_prompt": True,
+                "add_generation_prompt": not is_partial,
             }
+            if is_partial:
+                template_kwargs["continue_final_message"] = True
 
             # Add tools if provided and supported
             if tools:

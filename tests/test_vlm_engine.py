@@ -724,6 +724,36 @@ class TestCountChatTokens:
 
 
 # ---------------------------------------------------------------------------
+# TestPartialModeVLM
+# ---------------------------------------------------------------------------
+
+class TestPartialModeVLM:
+    """Tests for partial mode in VLM engine — always ignored."""
+
+    def test_apply_chat_template_partial_ignored(self):
+        """VLM _apply_chat_template strips partial but always uses add_generation_prompt=True."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.return_value = "<formatted>"
+        engine = _make_loaded_engine(tokenizer=mock_tokenizer)
+
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "{", "partial": True},
+        ]
+
+        engine._apply_chat_template(messages)
+
+        call_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is True
+        assert "continue_final_message" not in call_kwargs
+
+        # partial field should be stripped from messages
+        call_msgs = mock_tokenizer.apply_chat_template.call_args[0][0]
+        for msg in call_msgs:
+            assert "partial" not in msg
+
+
+# ---------------------------------------------------------------------------
 # TestGetStats
 # ---------------------------------------------------------------------------
 

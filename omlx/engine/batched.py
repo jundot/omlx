@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
-from ..api.utils import clean_special_tokens
+from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..utils.tokenizer import get_tokenizer_config
 from .base import BaseEngine, GenerationOutput
 
@@ -206,10 +206,13 @@ class BatchedEngine(BaseEngine):
                 (e.g. enable_thinking, reasoning_effort). Overrides global _enable_thinking.
         """
         if hasattr(self._tokenizer, 'apply_chat_template'):
+            is_partial = detect_and_strip_partial(messages)
             template_kwargs = {
                 "tokenize": False,
-                "add_generation_prompt": True,
+                "add_generation_prompt": not is_partial,
             }
+            if is_partial:
+                template_kwargs["continue_final_message"] = True
             if tools:
                 template_kwargs["tools"] = tools
             # Global fallback
