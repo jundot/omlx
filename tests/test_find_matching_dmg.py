@@ -50,12 +50,17 @@ def _get_find_matching_dmg():
     saved["omlx._version"] = sys.modules.get("omlx._version")
     sys.modules["omlx._version"] = version_mod
 
+    # Save omlx_app modules before mocking so they can be restored
+    omlx_app_modules = [
+        "omlx_app.app", "omlx_app", "omlx_app.config", "omlx_app.server_manager",
+    ]
+    for mod in omlx_app_modules:
+        saved[mod] = sys.modules.get(mod)
+
     try:
         # Remove cached omlx_app.app module to force reimport
-        sys.modules.pop("omlx_app.app", None)
-        sys.modules.pop("omlx_app", None)
-        sys.modules.pop("omlx_app.config", None)
-        sys.modules.pop("omlx_app.server_manager", None)
+        for mod in omlx_app_modules:
+            sys.modules.pop(mod, None)
 
         # Mock submodules
         sys.modules["omlx_app"] = MagicMock()

@@ -248,6 +248,9 @@ class MockEnginePool:
     def current_model_memory(self) -> int:
         return 1000000
 
+    def get_entry(self, model_id: str):
+        return None
+
     def resolve_model_id(self, model_id_or_alias, settings_manager=None):
         return model_id_or_alias
 
