@@ -605,17 +605,32 @@ class TestMemorySettings:
         """Test serialization."""
         settings = MemorySettings(max_process_memory="75%")
         d = settings.to_dict()
-        assert d == {"max_process_memory": "75%"}
+        assert d == {"max_process_memory": "75%", "prefill_memory_guard": True}
+
+    def test_to_dict_guard_disabled(self):
+        """Test serialization with prefill guard disabled."""
+        settings = MemorySettings(
+            max_process_memory="75%", prefill_memory_guard=False
+        )
+        d = settings.to_dict()
+        assert d["prefill_memory_guard"] is False
 
     def test_from_dict(self):
         """Test deserialization."""
         settings = MemorySettings.from_dict({"max_process_memory": "90%"})
         assert settings.max_process_memory == "90%"
+        assert settings.prefill_memory_guard is True  # default
 
     def test_from_dict_defaults(self):
         """Test deserialization with empty dict uses defaults."""
         settings = MemorySettings.from_dict({})
         assert settings.max_process_memory == "auto"
+        assert settings.prefill_memory_guard is True
+
+    def test_from_dict_guard_disabled(self):
+        """Test deserialization with prefill guard disabled."""
+        settings = MemorySettings.from_dict({"prefill_memory_guard": False})
+        assert settings.prefill_memory_guard is False
 
 
 class TestGlobalSettings:

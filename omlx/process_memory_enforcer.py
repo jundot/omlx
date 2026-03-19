@@ -45,6 +45,7 @@ class ProcessMemoryEnforcer:
         max_bytes: int,
         poll_interval: float = 1.0,
         settings_manager: ModelSettingsManager | None = None,
+        prefill_memory_guard: bool = True,
     ):
         """
         Initialize the process memory enforcer.
@@ -54,11 +55,14 @@ class ProcessMemoryEnforcer:
             max_bytes: Maximum allowed Metal memory in bytes.
             poll_interval: Seconds between memory checks.
             settings_manager: Optional settings manager for TTL checks.
+            prefill_memory_guard: Whether to enable pre-flight memory
+                estimation to reject requests that would exceed limits.
         """
         self._engine_pool = engine_pool
         self._max_bytes = max_bytes
         self._poll_interval = poll_interval
         self._settings_manager = settings_manager
+        self._prefill_memory_guard = prefill_memory_guard
         self._task: asyncio.Task | None = None
         self._running = False
 
@@ -73,6 +77,7 @@ class ProcessMemoryEnforcer:
         self._max_bytes = value
         if self._running:
             self._propagate_memory_limit()
+            self._set_metal_memory_limit()
         logger.info(
             f"Process memory limit changed: "
             f"{_format_gb(old)} -> {_format_gb(value)}"
@@ -89,6 +94,7 @@ class ProcessMemoryEnforcer:
             return
         self._running = True
         self._propagate_memory_limit()
+        self._set_metal_memory_limit()
         self._task = asyncio.create_task(self._enforcement_loop())
         logger.info(
             f"Process memory enforcer started "
@@ -108,6 +114,42 @@ class ProcessMemoryEnforcer:
 
         return max(get_system_memory() - 4 * 1024**3, self._max_bytes)
 
+    def _set_metal_memory_limit(self) -> None:
+        """Set Metal-level memory limit as a safety net.
+
+        Even if advisory in current MLX versions, this encourages more
+        aggressive cache reclamation and may become strict in the future.
+        Only applied when prefill_memory_guard is enabled.
+        """
+        if not self._prefill_memory_guard:
+            return
+        hard_limit = self._get_hard_limit_bytes()
+        if hard_limit <= 0:
+            return
+        try:
+            mx.metal.set_memory_limit(hard_limit)
+            mx.metal.set_cache_limit(hard_limit // 2)
+            logger.info(
+                f"Metal memory limit set: {_format_gb(hard_limit)}, "
+                f"cache limit: {_format_gb(hard_limit // 2)}"
+            )
+        except Exception as e:
+            logger.debug(f"Failed to set Metal memory limit: {e}")
+
+    @property
+    def prefill_memory_guard(self) -> bool:
+        """Whether prefill memory guard is enabled."""
+        return self._prefill_memory_guard
+
+    @prefill_memory_guard.setter
+    def prefill_memory_guard(self, value: bool) -> None:
+        self._prefill_memory_guard = value
+        if self._running:
+            self._propagate_memory_limit()
+            if value:
+                self._set_metal_memory_limit()
+        logger.info(f"Prefill memory guard: {'enabled' if value else 'disabled'}")
+
     def _propagate_memory_limit(self) -> None:
         """Propagate soft/hard memory limits to schedulers for inline prefill checking."""
         hard_limit = self._get_hard_limit_bytes()
@@ -117,6 +159,7 @@ class ProcessMemoryEnforcer:
                 if scheduler is not None:
                     scheduler._memory_limit_bytes = self._max_bytes
                     scheduler._memory_hard_limit_bytes = hard_limit
+                    scheduler._prefill_memory_guard = self._prefill_memory_guard
                     bg = getattr(scheduler, "batch_generator", None)
                     if bg is not None and hasattr(bg, "_memory_limit_bytes"):
                         bg._memory_limit_bytes = self._max_bytes

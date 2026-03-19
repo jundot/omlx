@@ -267,6 +267,8 @@
   "settings.resource.hot_cache_disabled_label": "= 無効。",
   "settings.resource.cold_cache_limit": "コールドキャッシュ上限（SSDキャッシュ）",
   "settings.resource.cold_cache_description": "退去されたKVキャッシュブロックの永続SSDストレージ。",
+  "settings.resource.prefill_memory_guard": "プリフィルメモリガード",
+  "settings.resource.prefill_memory_guard_description": "プリフィル前にメモリを推定し、制限を超えるリクエストを拒否します。",
 
   "settings.cache.section_label": "キャッシュ",
   "settings.cache.enabled": "キャッシュ有効",

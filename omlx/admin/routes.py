@@ -113,6 +113,7 @@ class GlobalSettingsRequest(BaseModel):
 
     # Memory enforcement
     max_process_memory: Optional[str] = None  # "auto", "disabled", or "XX%"
+    memory_prefill_memory_guard: Optional[bool] = None
 
     # Scheduler settings
     max_num_seqs: Optional[int] = None
@@ -1793,6 +1794,23 @@ async def update_global_settings(
                 logger.warning(f"Failed to apply max_process_memory: {msg}")
         except Exception as e:
             logger.warning(f"Error applying max_process_memory: {e}")
+
+    # Apply prefill memory guard setting (Live)
+    if request.memory_prefill_memory_guard is not None:
+        global_settings.memory.prefill_memory_guard = (
+            request.memory_prefill_memory_guard
+        )
+        from ..server import _server_state
+
+        if _server_state.process_memory_enforcer is not None:
+            _server_state.process_memory_enforcer.prefill_memory_guard = (
+                request.memory_prefill_memory_guard
+            )
+        runtime_applied.append("prefill_memory_guard")
+        logger.info(
+            f"Prefill memory guard "
+            f"{'enabled' if request.memory_prefill_memory_guard else 'disabled'}"
+        )
 
     # Apply scheduler settings (restart required)
     if request.max_num_seqs is not None:

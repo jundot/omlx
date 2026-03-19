@@ -312,6 +312,35 @@ class OutOfMemoryError(OMLXMemoryError):
         self.available_bytes = available_bytes
 
 
+class PrefillMemoryExceededError(OMLXMemoryError):
+    """
+    Prefill would exceed memory limits.
+
+    Raised by the pre-flight memory guard when the estimated peak memory
+    for a prefill operation (model weights + KV cache + SDPA attention matrix)
+    exceeds the hard memory limit. This prevents kernel panics from large
+    context windows on memory-constrained systems.
+
+    Attributes:
+        request_id: The request that was rejected.
+        estimated_bytes: Estimated peak memory in bytes.
+        limit_bytes: Hard memory limit in bytes.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        request_id: Optional[str] = None,
+        estimated_bytes: Optional[int] = None,
+        limit_bytes: Optional[int] = None,
+        details: Optional[dict] = None,
+    ):
+        super().__init__(message, details)
+        self.request_id = request_id
+        self.estimated_bytes = estimated_bytes
+        self.limit_bytes = limit_bytes
+
+
 # =============================================================================
 # Engine Pool Exceptions
 # =============================================================================

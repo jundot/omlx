@@ -267,6 +267,8 @@
     "settings.resource.hot_cache_disabled_label": "= disabled.",
     "settings.resource.cold_cache_limit": "Cold Cache Limit (SSD Cache)",
     "settings.resource.cold_cache_description": "Persistent SSD storage for evicted KV cache blocks.",
+    "settings.resource.prefill_memory_guard": "Prefill memory guard",
+    "settings.resource.prefill_memory_guard_description": "Estimate memory before prefill and reject requests that would exceed limits.",
 
     "settings.cache.section_label": "Cache",
     "settings.cache.enabled": "Cache Enabled",

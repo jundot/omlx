@@ -248,6 +248,8 @@
   "settings.resource.hot_cache_disabled_label": "= 已停用。",
   "settings.resource.cold_cache_limit": "冷快取限制（SSD 快取）",
   "settings.resource.cold_cache_description": "已驅逐的 KV Cache 區塊的持久化 SSD 儲存空間。",
+  "settings.resource.prefill_memory_guard": "預填充記憶體守衛",
+  "settings.resource.prefill_memory_guard_description": "在預填充前估算記憶體，拒絕超出限制的請求。",
   "settings.cache.section_label": "快取",
   "settings.cache.enabled": "啟用快取",
   "settings.cache.ssd_directory": "SSD 快取目錄",

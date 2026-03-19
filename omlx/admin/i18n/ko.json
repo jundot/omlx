@@ -267,6 +267,8 @@
   "settings.resource.hot_cache_disabled_label": "= 비활성화.",
   "settings.resource.cold_cache_limit": "Cold Cache 한도 (SSD 캐시)",
   "settings.resource.cold_cache_description": "Hot cache 용량이 초과할 경우 KV 캐시는 Cold cache로 저장됩니다.",
+  "settings.resource.prefill_memory_guard": "프리필 메모리 가드",
+  "settings.resource.prefill_memory_guard_description": "프리필 전 메모리를 추정하여 한도를 초과하는 요청을 거부합니다.",
 
   "settings.cache.section_label": "캐시",
   "settings.cache.enabled": "캐시 활성화",

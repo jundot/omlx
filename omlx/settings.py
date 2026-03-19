@@ -298,6 +298,7 @@ class MemorySettings:
     """Process-level memory enforcement settings."""
 
     max_process_memory: str = "auto"  # "auto" (RAM - 8GB), "disabled", or "XX%"
+    prefill_memory_guard: bool = True  # Estimate memory before prefill, reject if OOM
 
     def get_max_process_memory_bytes(self) -> int | None:
         """
@@ -332,13 +333,17 @@ class MemorySettings:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"max_process_memory": self.max_process_memory}
+        return {
+            "max_process_memory": self.max_process_memory,
+            "prefill_memory_guard": self.prefill_memory_guard,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MemorySettings:
         """Create from dictionary."""
         return cls(
             max_process_memory=data.get("max_process_memory", "auto"),
+            prefill_memory_guard=data.get("prefill_memory_guard", True),
         )
 
 

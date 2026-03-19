@@ -1039,6 +1039,7 @@ class Scheduler:
         # Set by ProcessMemoryEnforcer; propagated to BatchGenerator.
         self._memory_limit_bytes: int = 0  # soft limit
         self._memory_hard_limit_bytes: int = 0  # hard limit (system_ram - 4GB)
+        self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: Dict[str, int] = {}
@@ -2783,7 +2784,57 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
-    def _schedule_waiting(self) -> List[Request]:
+    def _preflight_memory_check(self, request: "Request") -> Optional[str]:
+        """
+        Estimate whether prefill would exceed memory limits.
+
+        Computes worst-case peak memory for the last prefill chunk
+        (model weights + KV cache + SDPA attention matrix) and rejects
+        if it would exceed the hard limit.
+
+        For head_dim > 128, MLX SDPA uses a fallback that materializes
+        the full attention matrix [B, n_q, chunk, kv_len] in float32.
+        For head_dim <= 128, MLX uses a fused kernel with O(n) memory.
+
+        Returns:
+            Error message string if request should be rejected, None if OK.
+        """
+        if not self._prefill_memory_guard:
+            return None
+        if self._memory_hard_limit_bytes <= 0:
+            return None
+        if self.memory_monitor is None:
+            return None
+
+        prompt_tokens = request.num_prompt_tokens
+        cached_tokens = request.cached_tokens or 0
+        new_tokens = max(prompt_tokens - cached_tokens, 0)
+
+        if new_tokens == 0:
+            return None
+
+        peak = self.memory_monitor.estimate_prefill_peak_bytes(
+            new_tokens, self.config.prefill_step_size
+        )
+        if peak == 0:
+            return None  # can't estimate, skip
+
+        current = mx.get_active_memory()
+
+        if current + peak > self._memory_hard_limit_bytes:
+            from .utils.hardware import format_bytes
+
+            return (
+                f"Prefill would require ~{format_bytes(current + peak)} peak "
+                f"(model {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
+                f"but limit is {format_bytes(self._memory_hard_limit_bytes)}. "
+                f"Reduce context length or increase --max-process-memory."
+            )
+        return None
+
+    def _schedule_waiting(
+        self,
+    ) -> tuple[List["Request"], List[RequestOutput]]:
         """
         Move requests from waiting queue to running.
 
@@ -2792,9 +2843,10 @@ class Scheduler:
         with the same cache status (all with cache or all without) in a single batch.
 
         Returns:
-            List of requests that were scheduled
+            Tuple of (scheduled requests, rejected error outputs)
         """
         scheduled = []
+        rejected_outputs: List[RequestOutput] = []
 
         # Track cache status of first scheduled request to ensure homogeneity
         # None = not determined yet, True = has cache, False = no cache
@@ -2894,6 +2946,25 @@ class Scheduler:
                 request.sampling_params, request
             )
 
+            # Pre-flight memory guard: estimate peak memory for this request
+            # and reject if it would exceed the hard limit.
+            preflight_error = self._preflight_memory_check(request)
+            if preflight_error:
+                logger.warning(
+                    f"Request {request.request_id} rejected by prefill "
+                    f"memory guard: {preflight_error}"
+                )
+                self.requests.pop(request.request_id, None)
+                rejected_outputs.append(
+                    RequestOutput(
+                        request_id=request.request_id,
+                        finished=True,
+                        finish_reason="error",
+                        error=preflight_error,
+                    )
+                )
+                continue
+
             # Clear stale mRoPE position state to prevent position
             # contamination from prior requests (VLM or text-only).
             if hasattr(self.model, "clear_vlm_position_state"):
@@ -2939,7 +3010,7 @@ class Scheduler:
         if scheduled:
             self._update_stop_tokens()
 
-        return scheduled
+        return scheduled, rejected_outputs
 
     def _process_batch_responses(
         self, responses: List[Any]
@@ -3470,9 +3541,12 @@ class Scheduler:
 
         try:
             # Schedule waiting requests
-            scheduled = self._schedule_waiting()
+            scheduled, rejected = self._schedule_waiting()
             output.scheduled_request_ids = [r.request_id for r in scheduled]
             output.num_scheduled_tokens = sum(r.num_prompt_tokens for r in scheduled)
+            if rejected:
+                output.outputs.extend(rejected)
+                output.has_work = True
 
             # Run generation step if we have running requests
             if self.batch_generator is not None and self.running:
@@ -3712,16 +3786,40 @@ class Scheduler:
                 elif self.model.dtype == mx.bfloat16:
                     dtype_size = 2
 
+            # Extract num_attention_heads (query heads) for SDPA peak estimation
+            num_attention_heads = (
+                getattr(config, 'num_attention_heads', None)
+                or getattr(config, 'n_head', None)
+                or num_kv_heads
+            )
+
+            # Count KVCache layers for hybrid models
+            num_kv_cache_layers = num_layers
+            if hasattr(self.model, 'make_cache'):
+                try:
+                    cache_list = self.model.make_cache()
+                    from mlx_lm.models.cache import KVCache
+                    num_kv_cache_layers = sum(
+                        1 for c in cache_list if type(c) is KVCache
+                    )
+                    if num_kv_cache_layers == 0:
+                        num_kv_cache_layers = num_layers  # fallback
+                except Exception:
+                    pass
+
             if num_layers and num_kv_heads and head_dim:
                 self.memory_monitor.set_model_info(
                     num_layers=num_layers,
                     num_kv_heads=num_kv_heads,
                     head_dim=head_dim,
                     dtype_size=dtype_size,
+                    num_attention_heads=num_attention_heads,
+                    num_kv_cache_layers=num_kv_cache_layers,
                 )
                 logger.debug(
                     f"Model info for memory estimation: "
-                    f"layers={num_layers}, kv_heads={num_kv_heads}, "
+                    f"layers={num_layers} ({num_kv_cache_layers} KVCache), "
+                    f"kv_heads={num_kv_heads}, q_heads={num_attention_heads}, "
                     f"head_dim={head_dim}, dtype_size={dtype_size}"
                 )
             else:

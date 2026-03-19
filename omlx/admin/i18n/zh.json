@@ -252,6 +252,8 @@
   "settings.resource.hot_cache_disabled_label": "= 已禁用。",
   "settings.resource.cold_cache_limit": "冷缓存限制（SSD 缓存）",
   "settings.resource.cold_cache_description": "被驱逐的 KV Cache 块的持久 SSD 存储。",
+  "settings.resource.prefill_memory_guard": "预填充内存守卫",
+  "settings.resource.prefill_memory_guard_description": "在预填充前估算内存，拒绝超出限制的请求。",
   "settings.cache.section_label": "缓存",
   "settings.cache.enabled": "启用缓存",
   "settings.cache.ssd_directory": "SSD 缓存目录",

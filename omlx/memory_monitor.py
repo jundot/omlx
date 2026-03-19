@@ -97,6 +97,8 @@ class MemoryMonitor:
         self._num_kv_heads: Optional[int] = None
         self._head_dim: Optional[int] = None
         self._dtype_size: int = 2  # Default float16
+        self._num_attention_heads: Optional[int] = None
+        self._num_kv_cache_layers: Optional[int] = None
 
         # PagedCacheManager for KV cache memory measurement
         self._paged_cache_manager: Optional["PagedCacheManager"] = None
@@ -267,6 +269,8 @@ class MemoryMonitor:
         num_kv_heads: int,
         head_dim: int,
         dtype_size: int = 2,
+        num_attention_heads: Optional[int] = None,
+        num_kv_cache_layers: Optional[int] = None,
     ) -> None:
         """
         Set model information for memory estimation.
@@ -276,17 +280,27 @@ class MemoryMonitor:
             num_kv_heads: Number of KV attention heads
             head_dim: Dimension per attention head
             dtype_size: Bytes per element (2 for float16, 4 for float32)
+            num_attention_heads: Number of query attention heads (for SDPA
+                peak estimation). Defaults to num_kv_heads if not set.
+            num_kv_cache_layers: Number of layers that use KVCache
+                (full attention). For hybrid models this may be less than
+                num_layers. Defaults to num_layers.
         """
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
         self._head_dim = head_dim
         self._dtype_size = dtype_size
+        self._num_attention_heads = num_attention_heads or num_kv_heads
+        self._num_kv_cache_layers = num_kv_cache_layers or num_layers
 
         # Log estimated memory per block
         if num_layers and num_kv_heads and head_dim:
             sample_block_mem = self.estimate_block_memory(64)  # 64 tokens
             logger.info(
-                f"Model info set: {num_layers} layers, {num_kv_heads} KV heads, "
+                f"Model info set: {num_layers} layers "
+                f"({self._num_kv_cache_layers} KVCache), "
+                f"{num_kv_heads} KV heads, "
+                f"{self._num_attention_heads} Q heads, "
                 f"{head_dim} head_dim. Estimated memory per 64-token block: "
                 f"{format_bytes(sample_block_mem)}"
             )
@@ -323,6 +337,72 @@ class MemoryMonitor:
         total = per_layer * layers
 
         return total
+
+    def estimate_prompt_kv_bytes(self, num_tokens: int) -> int:
+        """
+        Estimate KV cache memory for a prompt of given length.
+
+        Uses per-layer cache type info if available (hybrid models),
+        otherwise falls back to uniform num_layers estimate.
+
+        Args:
+            num_tokens: Number of prompt tokens.
+
+        Returns:
+            Estimated KV cache memory in bytes.
+        """
+        layers = self._num_kv_cache_layers or self._num_layers or 0
+        kv_heads = self._num_kv_heads or 0
+        dim = self._head_dim or 0
+        dtype = self._dtype_size
+
+        if not (layers and kv_heads and dim):
+            return 0
+
+        # KVCache layers: memory grows with num_tokens
+        per_token = layers * kv_heads * dim * dtype * 2  # keys + values
+        return num_tokens * per_token
+
+    def estimate_prefill_peak_bytes(
+        self, total_prompt_tokens: int, chunk_size: int
+    ) -> int:
+        """
+        Estimate worst-case peak memory during prefill (last chunk).
+
+        MLX SDPA internals (C++ fallback path, head_dim > 128):
+          1. scores = scale*Q @ K^T → [B, n_q, chunk, kv_len] float32
+          2. softmax(scores) → in-place (already float32)
+          3. out = scores @ V → [B, n_q, chunk, head_dim] float32
+          GQA: K/V broadcast, no extra allocation.
+
+        MLX SDPA fused kernel (head_dim <= 128):
+          Tiled computation, O(n) memory. Only output buffer allocated.
+
+        Args:
+            total_prompt_tokens: Total tokens in the prompt.
+            chunk_size: Prefill step size (default 2048).
+
+        Returns:
+            Estimated peak memory in bytes (KV cache + SDPA activation).
+            Returns 0 if model info is not available.
+        """
+        hd = self._head_dim or 0
+        n_q = self._num_attention_heads or 0
+
+        if n_q == 0 or hd == 0:
+            return 0  # can't estimate
+
+        if hd > 128:
+            # Fallback: full attention matrix materialized in float32
+            # scores [B, n_q, chunk, total_tokens] + output [B, n_q, chunk, hd]
+            attn = n_q * chunk_size * total_prompt_tokens * 4
+            attn += n_q * chunk_size * hd * 4  # output buffer (small)
+        else:
+            # Fused kernel: tiled, only output buffer
+            attn = n_q * chunk_size * hd * 4
+
+        kv = self.estimate_prompt_kv_bytes(total_prompt_tokens)
+        return attn + kv
 
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:
         """
