@@ -141,7 +141,7 @@ class MessagesRequest(BaseModel):
     system: str | list[SystemContent] | None = None
     stop_sequences: list[str] | None = None
     stream: bool = False
-    temperature: float | None = 1.0
+    temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
     metadata: dict[str, Any] | None = None
