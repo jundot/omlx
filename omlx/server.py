@@ -1148,6 +1148,17 @@ def init_server(
     except ImportError:
         logger.info("ModelScope support not available")
 
+    # Initialize oQ Quantizer
+    from .admin.oq_manager import OQManager
+    from .admin.routes import set_oq_manager
+
+    _server_state.oq_manager = OQManager(
+        model_dirs=[str(d) for d in dir_list],
+        on_complete=_refresh_models_after_download,
+    )
+    set_oq_manager(_server_state.oq_manager)
+    logger.info("oQ Quantizer initialized")
+
 
 _KEEPALIVE_SENTINEL = object()
 

@@ -296,8 +296,15 @@
             // Accuracy benchmark state
             accModelId: '',
             accBenchmarks: { mmlu: true, hellaswag: true, truthfulqa: true, gsm8k: false, livecodebench: false },
+            accSampleSizes: { mmlu: 300, hellaswag: 200, truthfulqa: 200, gsm8k: 100, livecodebench: 100 },
+            accBenchmarkList: [
+                { key: 'mmlu', label: 'MMLU' },
+                { key: 'hellaswag', label: 'HellaSwag' },
+                { key: 'truthfulqa', label: 'TruthfulQA' },
+                { key: 'gsm8k', label: 'GSM8K' },
+                { key: 'livecodebench', label: 'LiveCodeBench' },
+            ],
             accBatchSize: 1,
-            accFullDataset: false,
             accRunning: false,
             accBenchId: null,
             accProgress: null,
@@ -1591,8 +1598,9 @@
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             model_id: this.accModelId,
-                            benchmarks: selected,
-                            full_dataset: this.accFullDataset,
+                            benchmarks: Object.fromEntries(
+                                selected.map(k => [k, this.accSampleSizes[k]])
+                            ),
                             batch_size: this.accBatchSize,
                         }),
                     });
@@ -1677,7 +1685,7 @@
                 let lines = [];
                 lines.push('Accuracy Benchmark Results');
                 lines.push('Model: ' + this.accModelId);
-                lines.push('Mode: ' + (this.accFullDataset ? 'Full Dataset' : 'Quick'));
+                lines.push('Batch: ' + this.accBatchSize + 'x');
                 lines.push('');
                 lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10));
                 lines.push('-'.repeat(54));
