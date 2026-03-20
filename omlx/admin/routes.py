@@ -196,6 +196,19 @@ class MSRetryRequest(BaseModel):
     ms_token: str = ""
 
 
+class OQStartRequest(BaseModel):
+    """Request model for starting an oQ quantization task."""
+
+    model_path: str
+    oq_level: int
+    enable_clip: bool = False
+    group_size: int = 64
+    clip_num_samples: int = 128
+    clip_seq_length: int = 512
+    clip_n_grid: int = 20
+    calib_dataset: str = "default"
+
+
 # =============================================================================
 # Runtime Settings Application Functions
 # =============================================================================
@@ -685,6 +698,7 @@ _get_settings_manager = None
 _get_global_settings = None
 _hf_downloader = None
 _ms_downloader = None
+_oq_manager = None
 
 
 def set_admin_getters(
@@ -731,6 +745,16 @@ def set_ms_downloader(downloader):
     """
     global _ms_downloader
     _ms_downloader = downloader
+
+
+def set_oq_manager(manager):
+    """Set the OQManager instance for admin routes.
+
+    Args:
+        manager: OQManager instance created during server initialization.
+    """
+    global _oq_manager
+    _oq_manager = manager
 
 
 # =============================================================================
@@ -2673,8 +2697,11 @@ async def remove_hf_task(
 
 
 @router.get("/api/hf/recommended")
-async def get_recommended_models(is_admin: bool = Depends(require_admin)):
-    """Get recommended mlx-community models filtered by system memory."""
+async def get_recommended_models(
+    mlx_only: bool = True,
+    is_admin: bool = Depends(require_admin),
+):
+    """Get recommended models filtered by system memory."""
     if _hf_downloader is None:
         raise HTTPException(status_code=503, detail="Downloader not initialized")
 
@@ -2685,7 +2712,7 @@ async def get_recommended_models(is_admin: bool = Depends(require_admin)):
 
     try:
         result = await HFDownloader.get_recommended_models(
-            max_memory_bytes=max_memory, result_limit=50
+            max_memory_bytes=max_memory, result_limit=50, mlx_only=mlx_only
         )
         return result
     except asyncio.TimeoutError:
@@ -2702,6 +2729,7 @@ async def search_hf_models(
     q: str = "",
     sort: str = "trending",
     limit: int = 100,
+    mlx_only: bool = True,
     is_admin: bool = Depends(require_admin),
 ):
     """Search HuggingFace models by query."""
@@ -2715,6 +2743,7 @@ async def search_hf_models(
             query=q.strip(),
             sort=sort,
             limit=min(limit, 100),
+            mlx_only=mlx_only,
         )
         return result
     except asyncio.TimeoutError:
@@ -3015,8 +3044,11 @@ async def remove_ms_task(
 
 
 @router.get("/api/ms/recommended")
-async def get_ms_recommended_models(is_admin: bool = Depends(require_admin)):
-    """Get recommended MLX models from ModelScope filtered by system memory."""
+async def get_ms_recommended_models(
+    mlx_only: bool = True,
+    is_admin: bool = Depends(require_admin),
+):
+    """Get recommended models from ModelScope filtered by system memory."""
     if _ms_downloader is None:
         raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
 
@@ -3027,7 +3059,7 @@ async def get_ms_recommended_models(is_admin: bool = Depends(require_admin)):
 
     try:
         result = await MSDownloader.get_recommended_models(
-            max_memory_bytes=max_memory, result_limit=50
+            max_memory_bytes=max_memory, result_limit=50, mlx_only=mlx_only
         )
         return result
     except asyncio.TimeoutError:
@@ -3044,6 +3076,7 @@ async def search_ms_models(
     q: str = "",
     sort: str = "trending",
     limit: int = 100,
+    mlx_only: bool = True,
     is_admin: bool = Depends(require_admin),
 ):
     """Search ModelScope models by query."""
@@ -3057,6 +3090,7 @@ async def search_ms_models(
             query=q.strip(),
             sort=sort,
             limit=min(limit, 100),
+            mlx_only=mlx_only,
         )
         return result
     except asyncio.TimeoutError:
@@ -3355,3 +3389,112 @@ async def check_update(
         _update_cache_time = now
 
     return _update_cache
+
+
+# =============================================================================
+# oQ Quantization API Routes
+# =============================================================================
+
+
+@router.get("/api/oq/models")
+async def list_oq_models(is_admin: bool = Depends(require_admin)):
+    """List non-quantized models available for oQ quantization."""
+    if _oq_manager is None:
+        raise HTTPException(
+            status_code=503, detail="oQ quantizer not initialized"
+        )
+    models = await _oq_manager.list_quantizable_models()
+    return {"models": models}
+
+
+@router.get("/api/oq/estimate")
+async def estimate_oq(
+    model_path: str,
+    oq_level: int,
+    is_admin: bool = Depends(require_admin),
+):
+    """Estimate effective bpw and output size for a model at given oQ level."""
+    from ..oq import estimate_bpw_and_size
+
+    try:
+        result = await asyncio.to_thread(
+            estimate_bpw_and_size, model_path, oq_level
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/api/oq/start")
+async def start_oq_quantization(
+    request: OQStartRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Start an oQ quantization task."""
+    if _oq_manager is None:
+        raise HTTPException(
+            status_code=503, detail="oQ quantizer not initialized"
+        )
+    if request.oq_level not in (2, 3, 4, 5, 6, 7, 8):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid oQ level. Must be 2, 3, 4, 5, 6, 7, or 8",
+        )
+    try:
+        task = await _oq_manager.start_quantization(
+            model_path=request.model_path,
+            oq_level=request.oq_level,
+            enable_clip=request.enable_clip,
+            group_size=request.group_size,
+            clip_num_samples=request.clip_num_samples,
+            clip_seq_length=request.clip_seq_length,
+            clip_n_grid=request.clip_n_grid,
+            calib_dataset=request.calib_dataset,
+        )
+        return {"success": True, "task": task.to_dict()}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/api/oq/tasks")
+async def list_oq_tasks(is_admin: bool = Depends(require_admin)):
+    """List all quantization tasks."""
+    if _oq_manager is None:
+        raise HTTPException(
+            status_code=503, detail="oQ quantizer not initialized"
+        )
+    return {"tasks": _oq_manager.get_tasks()}
+
+
+@router.post("/api/oq/cancel/{task_id}")
+async def cancel_oq_task(
+    task_id: str, is_admin: bool = Depends(require_admin)
+):
+    """Cancel an active quantization task."""
+    if _oq_manager is None:
+        raise HTTPException(
+            status_code=503, detail="oQ quantizer not initialized"
+        )
+    success = await _oq_manager.cancel_quantization(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=404, detail="Task not found or not cancellable"
+        )
+    return {"success": True}
+
+
+@router.delete("/api/oq/task/{task_id}")
+async def remove_oq_task(
+    task_id: str, is_admin: bool = Depends(require_admin)
+):
+    """Remove a completed/failed/cancelled task."""
+    if _oq_manager is None:
+        raise HTTPException(
+            status_code=503, detail="oQ quantizer not initialized"
+        )
+    success = _oq_manager.remove_task(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=404, detail="Task not found or still active"
+        )
+    return {"success": True}

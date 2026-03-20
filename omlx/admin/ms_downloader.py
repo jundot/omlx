@@ -125,6 +125,41 @@ def _parse_ms_model_entry(entry: dict) -> dict:
     }
 
 
+async def _fetch_ms_models_rest(
+    query: str = "",
+    page_size: int = 200,
+) -> list[dict]:
+    """Fetch models from ModelScope REST API without org restriction.
+
+    Used when mlx_only is disabled to search across all organizations.
+
+    Args:
+        query: Optional search query to filter by model name.
+        page_size: Number of models to fetch.
+
+    Returns:
+        List of raw model entry dicts from the API response.
+    """
+    endpoint = _get_ms_endpoint()
+    url = f"{endpoint}/api/v1/models/"
+    payload: dict = {"PageSize": page_size}
+    if query:
+        payload["Name"] = query
+    try:
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(
+                requests.put, url, json=payload, timeout=_MS_API_TIMEOUT
+            ),
+            timeout=_MS_API_TIMEOUT + 5,
+        )
+        if resp.status_code == 200:
+            data = resp.json().get("Data", {})
+            return data.get("Models", data.get("models", []))
+    except Exception as e:
+        logger.warning(f"ModelScope REST API fetch failed: {e}")
+    return []
+
+
 class MSDownloader:
     """Manages ModelScope model downloads with progress tracking.
 
@@ -141,43 +176,46 @@ class MSDownloader:
         max_memory_bytes: int,
         limit: int = 60,
         result_limit: int = 50,
+        mlx_only: bool = True,
     ) -> dict:
-        """Fetch trending and popular MLX models from ModelScope.
+        """Fetch trending and popular models from ModelScope.
 
-        Uses SDK's list_models to get models from mlx-community organization.
+        When mlx_only is True, uses SDK to list models from mlx-community
+        organization. When False, uses REST API to search all organizations.
 
         Args:
             max_memory_bytes: Maximum model size in bytes (typically system memory).
             limit: Number of models to fetch per category.
             result_limit: Maximum number of models to return per category.
+            mlx_only: If True, restrict to mlx-community organization.
 
         Returns:
             Dict with 'trending' and 'popular' lists.
         """
-        api = _get_ms_api()
-        if api is None:
-            logger.warning("ModelScope SDK not available")
-            return {"trending": [], "popular": []}
 
-        async def _fetch_from_sdk() -> list[dict]:
-            try:
-                # Use SDK to list models from mlx-community organization
-                data = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        api.list_models,
-                        "mlx-community",
-                        page_size=limit,
-                    ),
-                    timeout=_MS_API_TIMEOUT + 5,
-                )
-            except Exception as e:
-                logger.warning(f"ModelScope recommended fetch failed: {e}")
-                return []
-
-            # Parse models from SDK response
-            models_data = data.get("Models", [])
-            if not models_data:
-                models_data = data.get("models", [])
+        async def _fetch() -> list[dict]:
+            if mlx_only:
+                api = _get_ms_api()
+                if api is None:
+                    logger.warning("ModelScope SDK not available")
+                    return []
+                try:
+                    data = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            api.list_models,
+                            "mlx-community",
+                            page_size=limit,
+                        ),
+                        timeout=_MS_API_TIMEOUT + 5,
+                    )
+                except Exception as e:
+                    logger.warning(f"ModelScope recommended fetch failed: {e}")
+                    return []
+                models_data = data.get("Models", [])
+                if not models_data:
+                    models_data = data.get("models", [])
+            else:
+                models_data = await _fetch_ms_models_rest(page_size=limit)
 
             results = []
             for entry in models_data:
@@ -191,12 +229,12 @@ class MSDownloader:
                 if size > 0 and size > max_memory_bytes:
                     continue
                 results.append(m)
-                if len(results) >= result_limit * 2:  # Fetch more to split into trending/popular
+                if len(results) >= result_limit * 2:
                     break
 
             return results
 
-        models = await _fetch_from_sdk()
+        models = await _fetch()
 
         # Sort by downloads for popular, keep original order for trending
         trending = models[:result_limit]
@@ -212,42 +250,49 @@ class MSDownloader:
         query: str,
         sort: str = "trending",
         limit: int = 100,
+        mlx_only: bool = True,
     ) -> dict:
-        """Search MLX models in mlx-community on ModelScope.
+        """Search models on ModelScope.
 
-        Since ModelScope REST API is unreliable, we use SDK to list
-        models from mlx-community and filter by query string.
+        When mlx_only is True, uses SDK to list models from mlx-community
+        and filters by query string. When False, uses REST API to search
+        across all organizations.
 
         Args:
             query: Search query string.
             sort: Sort order (trending/downloads/created/updated).
             limit: Maximum number of results to return.
+            mlx_only: If True, restrict to mlx-community organization.
 
         Returns:
             Dict with 'models' list and 'total' count.
         """
-        api = _get_ms_api()
-        if api is None:
-            logger.warning("ModelScope SDK not available")
-            return {"models": [], "total": 0}
+        if mlx_only:
+            api = _get_ms_api()
+            if api is None:
+                logger.warning("ModelScope SDK not available")
+                return {"models": [], "total": 0}
 
-        try:
-            # Fetch models from mlx-community organization
-            data = await asyncio.wait_for(
-                asyncio.to_thread(
-                    api.list_models,
-                    "mlx-community",
-                    page_size=200,  # Get more models to filter from
-                ),
-                timeout=_MS_API_TIMEOUT + 5,
+            try:
+                data = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        api.list_models,
+                        "mlx-community",
+                        page_size=200,
+                    ),
+                    timeout=_MS_API_TIMEOUT + 5,
+                )
+            except Exception as e:
+                logger.error(f"ModelScope search failed: {e}")
+                return {"models": [], "total": 0}
+
+            models_data = data.get("Models", [])
+            if not models_data:
+                models_data = data.get("models", [])
+        else:
+            models_data = await _fetch_ms_models_rest(
+                query=query, page_size=200
             )
-        except Exception as e:
-            logger.error(f"ModelScope search failed: {e}")
-            return {"models": [], "total": 0}
-
-        models_data = data.get("Models", [])
-        if not models_data:
-            models_data = data.get("models", [])
 
         # Filter by query string (case-insensitive)
         query_lower = query.lower()

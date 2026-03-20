@@ -7,7 +7,7 @@
     ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
-    const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader']);
+    const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer']);
 
     function dashboard() {
         return {
@@ -189,6 +189,7 @@
             hfRecommendedLoaded: false,
             hfRecommendedLoading: false,
             hfRecommendedTab: 'trending',
+            hfMlxOnly: true,
 
             // Pagination state
             hfPage: { trending: 1, popular: 1, search: 1 },
@@ -227,6 +228,7 @@
             msRecommendedLoaded: false,
             msRecommendedLoading: false,
             msRecommendedTab: 'trending',
+            msMlxOnly: true,
 
             // MS Pagination state
             msPage: { trending: 1, popular: 1, search: 1 },
@@ -245,6 +247,24 @@
             // MS Model detail modal
             msModelDetail: null,
             msModelDetailLoading: false,
+
+            // oQ Quantizer state
+            oqModels: [],
+            oqModelsLoaded: false,
+            oqSelectedModelPath: '',
+            oqLevel: 4,
+            oqStarting: false,
+            oqTasks: [],
+            oqError: '',
+            oqSuccess: '',
+            _oqRefreshTimer: null,
+            // oQ Advanced Settings
+            oqAdvancedOpen: false,
+            oqEnableClip: false,
+            oqGroupSize: 64,
+            oqClipSamples: 128,
+            oqClipSeqLen: 512,
+            oqCalibDataset: 'code_multilingual',
 
             // Benchmark state
             benchModelId: '',
@@ -291,6 +311,28 @@
                     this.handleMainTabChange(value);
                 });
 
+                this.$watch('hfMlxOnly', () => {
+                    this.hfRecommended = { trending: [], popular: [] };
+                    this.hfRecommendedLoaded = false;
+                    this.hfSearchResults = [];
+                    this.hfSearchLoaded = false;
+                    this.loadRecommendedModels();
+                    if (this.hfSearchQuery.trim()) {
+                        this.searchHFModels();
+                    }
+                });
+
+                this.$watch('msMlxOnly', () => {
+                    this.msRecommended = { trending: [], popular: [] };
+                    this.msRecommendedLoaded = false;
+                    this.msSearchResults = [];
+                    this.msSearchLoaded = false;
+                    this.loadMsRecommendedModels();
+                    if (this.msSearchQuery.trim()) {
+                        this.searchMSModels();
+                    }
+                });
+
                 window.addEventListener('popstate', () => {
                     this.applyTabStateFromUrl();
                 });
@@ -310,9 +352,12 @@
                     this.stopLogRefresh();
                 }
                 if (value === 'models') {
-                    const loads = [this.loadHFModels(), this.loadHFTasks()];
+                    const loads = [this.loadHFModels(), this.loadHFTasks(), this.loadOQTasks()];
                     if (this.modelsTab === 'downloader' && !this.hfRecommendedLoaded) {
                         loads.push(this.loadRecommendedModels());
+                    }
+                    if (this.modelsTab === 'quantizer' && !this.oqModelsLoaded) {
+                        loads.push(this.loadOQModels());
                     }
                     if (this.msInitialized && this.msAvailable) {
                         loads.push(this.loadMSTasks());
@@ -324,9 +369,13 @@
                     const hasMsActive = this.msTasks.some(t =>
                         t.status === 'pending' || t.status === 'downloading');
                     if (hasMsActive) this.startMSRefresh();
+                    const hasOqActive = this.oqTasks.some(t =>
+                        ['pending', 'loading', 'quantizing', 'saving'].includes(t.status));
+                    if (hasOqActive) this.startOQRefresh();
                 } else {
                     this.stopHFRefresh();
                     this.stopMSRefresh();
+                    this.stopOQRefresh();
                 }
                 if (value === 'bench' && !this.benchDeviceInfo) {
                     await this.loadBenchDeviceInfo();
@@ -382,6 +431,9 @@
                 this.modelsTab = tab;
                 this.mainTab = 'models';
                 this.syncTabStateToUrl();
+                if (tab === 'quantizer' && !this.oqModelsLoaded) {
+                    this.loadOQModels();
+                }
             },
 
             async checkForUpdate() {
@@ -2158,6 +2210,186 @@
             },
 
             // =================================================================
+            // oQ Quantization Functions
+            // =================================================================
+
+            async loadOQModels() {
+                try {
+                    const response = await fetch('/admin/api/oq/models');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.oqModels = data.models || [];
+                        this.oqModelsLoaded = true;
+                    }
+                } catch (err) {
+                    console.error('Failed to load quantizable models:', err);
+                }
+            },
+
+            async startOQQuantization() {
+                if (!this.oqSelectedModelPath || this.oqStarting) return;
+                this.oqError = '';
+                this.oqSuccess = '';
+                this.oqStarting = true;
+                try {
+                    const response = await fetch('/admin/api/oq/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_path: this.oqSelectedModelPath,
+                            oq_level: this.oqLevel,
+                            enable_clip: this.oqEnableClip,
+                            group_size: this.oqGroupSize,
+                            clip_num_samples: this.oqClipSamples,
+                            clip_seq_length: this.oqClipSeqLen,
+                            calib_dataset: this.oqCalibDataset,
+                        }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.ok) {
+                        const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                        const name = model ? model.name : this.oqSelectedModelPath;
+                        this.oqSuccess = `Quantization started: ${name} → oQ${this.oqLevel}`;
+                        await this.loadOQTasks();
+                        this.startOQRefresh();
+                        setTimeout(() => { this.oqSuccess = ''; }, 5000);
+                    } else {
+                        this.oqError = data.detail || 'Failed to start quantization';
+                    }
+                } catch (err) {
+                    this.oqError = 'Connection error. Server may be unavailable.';
+                } finally {
+                    this.oqStarting = false;
+                    this.$nextTick(() => lucide.createIcons());
+                }
+            },
+
+            async loadOQTasks() {
+                try {
+                    const response = await fetch('/admin/api/oq/tasks');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.oqTasks = data.tasks || [];
+                        const hasActive = this.oqTasks.some(t =>
+                            ['pending', 'loading', 'quantizing', 'saving'].includes(t.status));
+                        if (!hasActive) {
+                            this.stopOQRefresh();
+                            if (this.oqTasks.some(t => t.status === 'completed')) {
+                                await this.loadHFModels();
+                                await this.loadModels();
+                                await this.loadOQModels();
+                            }
+                        }
+                        this.$nextTick(() => lucide.createIcons());
+                    }
+                } catch (err) {
+                    console.error('Failed to load oQ tasks:', err);
+                }
+            },
+
+            async cancelOQTask(taskId) {
+                try {
+                    await fetch(`/admin/api/oq/cancel/${taskId}`, { method: 'POST' });
+                    await this.loadOQTasks();
+                } catch (err) {
+                    console.error('Failed to cancel oQ task:', err);
+                }
+            },
+
+            async removeOQTask(taskId) {
+                try {
+                    await fetch(`/admin/api/oq/task/${taskId}`, { method: 'DELETE' });
+                    await this.loadOQTasks();
+                } catch (err) {
+                    console.error('Failed to remove oQ task:', err);
+                }
+            },
+
+            startOQRefresh() {
+                this.stopOQRefresh();
+                this._oqRefreshTimer = setInterval(() => {
+                    this.loadOQTasks();
+                }, 2000);
+            },
+
+            stopOQRefresh() {
+                if (this._oqRefreshTimer) {
+                    clearInterval(this._oqRefreshTimer);
+                    this._oqRefreshTimer = null;
+                }
+            },
+
+            formatOQProgress(task) {
+                const pct = Math.round(task.progress || 0);
+                return `${pct}% · ${task.phase || task.status}`;
+            },
+
+            formatOQElapsed(task) {
+                if (!task.started_at) return '';
+                const now = task.completed_at || (Date.now() / 1000);
+                const elapsed = now - task.started_at;
+                const mins = Math.floor(elapsed / 60);
+                const secs = Math.floor(elapsed % 60);
+                return `${mins}:${String(secs).padStart(2, '0')}`;
+            },
+
+            oqSelectedModelSupportsClip() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                return model?.supports_clip || false;
+            },
+
+            oqEstimatedMemory() {
+                // Use precise estimate from API if available
+                if (this.oqEstimate) {
+                    if (this.oqEnableClip) {
+                        return this.oqEstimate.memory_clip_formatted || '';
+                    }
+                    return this.oqEstimate.memory_streaming_formatted || '';
+                }
+                // Fallback to rough model-level estimate
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!model) return '';
+                if (this.oqEnableClip) {
+                    return model.memory_clip?.peak_formatted || '';
+                }
+                return model.memory_streaming?.peak_formatted || '';
+            },
+
+            oqEstimate: null,
+            _oqEstimateTimer: null,
+
+            oqEstimatedBpw() {
+                return this.oqEstimate?.effective_bpw?.toFixed(1) || '';
+            },
+
+            oqEstimatedOutputSize() {
+                return this.oqEstimate?.output_size_formatted || '';
+            },
+
+            oqRefreshEstimate() {
+                // Debounce: wait 300ms after last change
+                if (this._oqEstimateTimer) clearTimeout(this._oqEstimateTimer);
+                if (!this.oqSelectedModelPath) {
+                    this.oqEstimate = null;
+                    return;
+                }
+                this._oqEstimateTimer = setTimeout(async () => {
+                    try {
+                        const params = new URLSearchParams({
+                            model_path: this.oqSelectedModelPath,
+                            oq_level: this.oqLevel,
+                        });
+                        const resp = await fetch(`/admin/api/oq/estimate?${params}`);
+                        if (resp.ok) {
+                            this.oqEstimate = await resp.json();
+                        }
+                    } catch (e) {
+                        console.error('Failed to estimate oQ:', e);
+                    }
+                }, 300);
+            },
+
+            // =================================================================
             // Recommended Models Functions
             // =================================================================
 
@@ -2166,7 +2398,7 @@
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 15000);
                 try {
-                    const response = await fetch('/admin/api/hf/recommended', { signal: controller.signal });
+                    const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
                     if (response.ok) {
                         this.hfRecommended = await response.json();
                         this.hfRecommendedLoaded = true;
@@ -2252,6 +2484,7 @@
                         q: this.hfSearchQuery,
                         sort: this.hfSearchSort,
                         limit: '100',
+                        mlx_only: this.hfMlxOnly,
                     });
                     const response = await fetch(`/admin/api/hf/search?${params}`, { signal: controller.signal });
                     if (response.ok) {
@@ -2542,7 +2775,7 @@
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 20000);
                 try {
-                    const response = await fetch('/admin/api/ms/recommended', { signal: controller.signal });
+                    const response = await fetch(`/admin/api/ms/recommended?mlx_only=${this.msMlxOnly}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
                         this.msRecommended = data;
@@ -2609,6 +2842,7 @@
                         q: this.msSearchQuery,
                         sort: this.msSearchSort,
                         limit: '50',
+                        mlx_only: this.msMlxOnly,
                     });
                     const response = await fetch(`/admin/api/ms/search?${params}`, { signal: controller.signal });
                     if (response.ok) {

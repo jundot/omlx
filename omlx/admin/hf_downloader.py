@@ -171,16 +171,18 @@ class HFDownloader:
         max_memory_bytes: int,
         limit: int = 60,
         result_limit: int = 50,
+        mlx_only: bool = True,
     ) -> dict:
-        """Fetch trending and popular mlx-community models that fit in memory.
+        """Fetch trending and popular models that fit in memory.
 
-        Queries HuggingFace Hub for text-generation models from mlx-community,
-        filtered by system memory capacity.
+        Queries HuggingFace Hub for models, optionally restricted to
+        mlx-community. Filtered by system memory capacity.
 
         Args:
             max_memory_bytes: Maximum model size in bytes (typically system memory).
             limit: Number of models to fetch per category from HF API.
             result_limit: Maximum number of models to return per category.
+            mlx_only: If True, restrict to mlx-community author.
 
         Returns:
             Dict with 'trending' and 'popular' lists.
@@ -188,14 +190,15 @@ class HFDownloader:
         api, _endpoint = _get_hf_api()
 
         async def _fetch(sort: str) -> list[dict]:
+            kwargs = {
+                "sort": sort,
+                "limit": limit,
+                "expand": ["safetensors", "downloads", "likes", "trendingScore"],
+            }
+            if mlx_only:
+                kwargs["author"] = "mlx-community"
             models = await asyncio.wait_for(
-                asyncio.to_thread(
-                    api.list_models,
-                    author="mlx-community",
-                    sort=sort,
-                    limit=limit,
-                    expand=["safetensors", "downloads", "likes", "trendingScore"],
-                ),
+                asyncio.to_thread(api.list_models, **kwargs),
                 timeout=_HF_API_TIMEOUT,
             )
             results = []
@@ -241,16 +244,18 @@ class HFDownloader:
         query: str,
         sort: str = "trending",
         limit: int = 100,
+        mlx_only: bool = True,
     ) -> dict:
         """Search HuggingFace models by query string.
 
-        Results are restricted to the MLX library so that only MLX-compatible
-        models are returned (same as https://huggingface.co/models?library=mlx).
+        When mlx_only is True, results are restricted to the MLX library
+        (same as https://huggingface.co/models?library=mlx).
 
         Args:
             query: Search query string.
             sort: Sort order (trending/downloads/created/updated/most_params/least_params).
             limit: Maximum number of results to return.
+            mlx_only: If True, restrict to MLX library models only.
 
         Returns:
             Dict with 'models' list and 'total' count.
@@ -258,15 +263,16 @@ class HFDownloader:
         api, _endpoint = _get_hf_api()
         sort_key = _SORT_MAP.get(sort, "trendingScore")
 
+        kwargs = {
+            "search": query,
+            "sort": sort_key,
+            "limit": limit,
+            "expand": ["safetensors", "downloads", "likes", "trendingScore"],
+        }
+        if mlx_only:
+            kwargs["filter"] = "mlx"
         models = await asyncio.wait_for(
-            asyncio.to_thread(
-                api.list_models,
-                search=query,
-                sort=sort_key,
-                limit=limit,
-                filter="mlx",
-                expand=["safetensors", "downloads", "likes", "trendingScore"],
-            ),
+            asyncio.to_thread(api.list_models, **kwargs),
             timeout=_HF_API_TIMEOUT,
         )
 

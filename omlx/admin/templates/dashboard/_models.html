@@ -18,6 +18,14 @@
                             class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
                             {{ t('models.tab.downloader') }}
                         </button>
+                        <button
+                            @click="setModelsTab('quantizer')"
+                            :class="modelsTab === 'quantizer'
+                                ? 'bg-neutral-900 text-white'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
+                            class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
+                            {{ t('models.tab.quantizer') }}
+                        </button>
                     </div>
 
                     <!-- ==================== MANAGER TAB ==================== -->
@@ -269,6 +277,11 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.browse.section_label') }}</span>
                                     <span x-show="globalSettings.system.total_memory" x-cloak
                                           class="text-xs text-neutral-400" x-text="window.t('models.browse.system_suffix').replace('{memory}', globalSettings.system.total_memory)"></span>
+                                    <label class="flex items-center gap-1.5 ml-2 cursor-pointer select-none">
+                                        <input type="checkbox" x-model="hfMlxOnly"
+                                               class="w-3.5 h-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-500 cursor-pointer">
+                                        <span class="text-xs text-neutral-500 font-medium">{{ t('models.browse.mlx_only') }}</span>
+                                    </label>
                                 </div>
                                 <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5">
                                     <button @click="hfRecommendedTab = 'trending'"
@@ -707,6 +720,11 @@
                                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.browse.section_label') }}</span>
                                                 <span x-show="globalSettings.system.total_memory" x-cloak
                                                       class="text-xs text-neutral-400" x-text="window.t('models.browse.system_suffix').replace('{memory}', globalSettings.system.total_memory)"></span>
+                                                <label class="flex items-center gap-1.5 ml-2 cursor-pointer select-none">
+                                                    <input type="checkbox" x-model="msMlxOnly"
+                                                           class="w-3.5 h-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-500 cursor-pointer">
+                                                    <span class="text-xs text-neutral-500 font-medium">{{ t('models.browse.mlx_only') }}</span>
+                                                </label>
                                             </div>
                                             <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5">
                                                 <button @click="msRecommendedTab = 'trending'"
@@ -993,6 +1011,402 @@
                             </template>
                         </div><!-- end ModelScope Source -->
 
+                    </div>
+
+                    <!-- ==================== QUANTIZER TAB ==================== -->
+                    <div x-show="modelsTab === 'quantizer'" x-cloak
+                         x-effect="oqSelectedModelPath; oqLevel; oqEnableClip; oqRefreshEstimate()">
+                        <!-- Header -->
+                        <div class="mb-8">
+                            <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('models.oq.section_label') }}</h2>
+                            <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('models.oq.heading') }}</h3>
+                            <p class="text-sm text-neutral-500 mt-2">{{ t('models.oq.description') }}</p>
+                        </div>
+
+                        <!-- Quantization Form -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                            <div class="flex items-center gap-3 px-6 py-4 bg-neutral-50 border-b border-neutral-200">
+                                <i data-lucide="sparkles" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.oq.form_section') }}</span>
+                            </div>
+                            <div class="px-6 py-5">
+                                <div class="flex items-end gap-4 flex-wrap">
+                                    <!-- Model Selector -->
+                                    <div class="flex-1">
+                                        <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.oq.select_model') }} <span class="normal-case font-normal">(full precision only)</span></label>
+                                        <select x-model="oqSelectedModelPath"
+                                                class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <option value="">{{ t('models.oq.select_placeholder') }}</option>
+                                            <template x-for="m in oqModels" :key="m.path">
+                                                <option :value="m.path" x-text="m.name + ' (' + m.size_formatted + ')'"></option>
+                                            </template>
+                                        </select>
+                                    </div>
+                                    <!-- oQ Level Selector -->
+                                    <div class="w-96 shrink-0">
+                                        <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.oq.level') }}</label>
+                                        <select x-model.number="oqLevel"
+                                                class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <option value="2" x-text="'oQ2' + (oqEnableClip ? '+' : '') + ' — extreme compression'">oQ2 — extreme compression</option>
+                                            <option value="3" x-text="'oQ3' + (oqEnableClip ? '+' : '') + ' — balanced'">oQ3 — balanced</option>
+                                            <option value="4" selected x-text="'oQ4' + (oqEnableClip ? '+' : '') + ' — recommended'">oQ4 — recommended</option>
+                                            <option value="5" x-text="'oQ5' + (oqEnableClip ? '+' : '') + ' — high quality'">oQ5 — high quality</option>
+                                            <option value="6" x-text="'oQ6' + (oqEnableClip ? '+' : '') + ' — near-lossless'">oQ6 — near-lossless</option>
+                                            <option value="7" x-text="'oQ7' + (oqEnableClip ? '+' : '') + ' — very high quality'">oQ7 — very high quality</option>
+                                            <option value="8" x-text="'oQ8' + (oqEnableClip ? '+' : '') + ' — lossless'">oQ8 — lossless</option>
+                                        </select>
+                                    </div>
+                                    <!-- Start Button -->
+                                    <button @click="startOQQuantization()"
+                                            :disabled="oqStarting || !oqSelectedModelPath"
+                                            class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full hover:bg-neutral-800 disabled:opacity-40 disabled:cursor-not-allowed transition-all duration-200 flex items-center gap-2 whitespace-nowrap">
+                                        <svg x-show="oqStarting" x-cloak class="animate-spin w-4 h-4" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                                        <i x-show="!oqStarting" data-lucide="sparkles" class="w-4 h-4"></i>
+                                        {{ t('models.oq.start_button') }}
+                                    </button>
+                                </div>
+                                <!-- Estimated Memory + BPW + Output Size (below the form row) -->
+                                <div x-show="oqSelectedModelPath" x-cloak class="mt-3 pt-3 border-t border-neutral-100">
+                                    <div class="text-xs text-neutral-400 flex items-center flex-wrap gap-y-1">
+                                        <span class="inline-flex items-center gap-1.5"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg><span x-text="'Estimated memory: ~' + oqEstimatedMemory()"></span></span>
+                                        <span class="inline-flex items-center gap-1.5 ml-5"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg><span x-text="oqEstimatedBpw() ? 'Effective ' + oqEstimatedBpw() + ' bpw' : 'Calculating...'"></span></span>
+                                        <span class="inline-flex items-center gap-1.5 ml-5"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/></svg><span x-text="oqEstimatedOutputSize() ? 'Output size: ~' + oqEstimatedOutputSize() : 'Calculating...'"></span></span>
+                                    </div>
+                                </div>
+                                <!-- Advanced Settings -->
+                                <div class="mt-4 border-t border-neutral-100 pt-3">
+                                    <button @click="oqAdvancedOpen = !oqAdvancedOpen; $nextTick(() => lucide.createIcons())"
+                                            class="flex items-center gap-1.5 text-sm text-neutral-500 hover:text-neutral-700 transition-colors">
+                                        <i :data-lucide="oqAdvancedOpen ? 'chevron-down' : 'chevron-right'" class="w-3.5 h-3.5"></i>
+                                        {{ t('models.oq.advanced_settings') }}
+                                    </button>
+                                    <div x-show="oqAdvancedOpen" x-cloak class="mt-3 space-y-3 pl-1">
+                                        <!-- Clip Optimization -->
+                                        <div class="flex items-center justify-between">
+                                            <div class="flex items-center gap-2">
+                                                <span class="text-sm text-neutral-600">{{ t('models.oq.clip_optimization') }}</span>
+                                                <span x-show="!oqSelectedModelSupportsClip()" x-cloak
+                                                      class="text-[10px] text-neutral-400">(not available for this model)</span>
+                                            </div>
+                                            <button type="button"
+                                                    @click="if(oqSelectedModelSupportsClip()) oqEnableClip = !oqEnableClip"
+                                                    :class="oqEnableClip && oqSelectedModelSupportsClip() ? 'bg-black' : 'bg-neutral-200'"
+                                                    :disabled="!oqSelectedModelSupportsClip()"
+                                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black disabled:opacity-40 disabled:cursor-not-allowed">
+                                                <span :class="oqEnableClip && oqSelectedModelSupportsClip() ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                        <p x-show="oqEnableClip" x-cloak class="text-xs text-amber-600 leading-relaxed">
+                                            {{ t('models.oq.clip_description') }}
+                                        </p>
+                                        <p class="text-[11px] text-neutral-400 leading-relaxed">
+                                            Supported: Qwen3.5 MoE, Qwen3.5. More models coming soon.
+                                        </p>
+                                        <!-- Group Size -->
+                                        <div class="flex items-center justify-between">
+                                            <span class="text-sm text-neutral-600">{{ t('models.oq.group_size') }}</span>
+                                            <select x-model.number="oqGroupSize"
+                                                    class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                                <option value="32">32</option>
+                                                <option value="64" selected>64</option>
+                                                <option value="128">128</option>
+                                            </select>
+                                        </div>
+                                        <!-- Calibration Dataset (clip ON only) -->
+                                        <div x-show="oqEnableClip" x-cloak class="flex items-center justify-between">
+                                            <span class="text-sm text-neutral-600">{{ t('models.oq.calib_dataset') }}</span>
+                                            <select x-model="oqCalibDataset"
+                                                    class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                                <option value="code_multilingual">Code + Multilingual</option>
+                                                <option value="default">Built-in (General)</option>
+                                                <option value="code">Code (StarCoder)</option>
+                                                <option value="multilingual">Multilingual (CulturaX)</option>
+                                                <option value="wikitext">WikiText-2</option>
+                                                <option value="c4">C4 (Web Crawl)</option>
+                                            </select>
+                                        </div>
+                                        <!-- Calibration Samples (clip ON only) -->
+                                        <div x-show="oqEnableClip" x-cloak class="flex items-center justify-between">
+                                            <span class="text-sm text-neutral-600">{{ t('models.oq.calib_samples') }}</span>
+                                            <select x-model.number="oqClipSamples"
+                                                    class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                                <option value="32">32 (fast)</option>
+                                                <option value="128" selected>128</option>
+                                                <option value="256">256</option>
+                                                <option value="512">512 (slow)</option>
+                                            </select>
+                                        </div>
+                                        <!-- Sequence Length (clip ON only) -->
+                                        <div x-show="oqEnableClip" x-cloak class="flex items-center justify-between">
+                                            <span class="text-sm text-neutral-600">{{ t('models.oq.calib_seq_length') }}</span>
+                                            <select x-model.number="oqClipSeqLen"
+                                                    class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                                <option value="256">256</option>
+                                                <option value="512" selected>512</option>
+                                                <option value="1024">1024</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                </div>
+                                <!-- Error -->
+                                <div x-show="oqError" x-cloak
+                                     class="mt-3 px-4 py-2.5 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700 flex items-start gap-2">
+                                    <i data-lucide="alert-circle" class="w-4 h-4 mt-0.5 shrink-0"></i>
+                                    <span x-text="oqError"></span>
+                                </div>
+                                <!-- Success -->
+                                <div x-show="oqSuccess" x-cloak
+                                     class="mt-3 px-4 py-2.5 bg-green-50 border border-green-200 rounded-xl text-sm text-green-700 flex items-start gap-2">
+                                    <i data-lucide="check-circle" class="w-4 h-4 mt-0.5 shrink-0"></i>
+                                    <span x-text="oqSuccess"></span>
+                                </div>
+                                <!-- No models -->
+                                <div x-show="oqModelsLoaded && oqModels.length === 0" x-cloak
+                                     class="mt-3 px-4 py-2.5 bg-neutral-50 border border-neutral-200 rounded-xl text-sm text-neutral-500 flex items-start gap-2">
+                                    <i data-lucide="info" class="w-4 h-4 mt-0.5 shrink-0"></i>
+                                    <span>{{ t('models.oq.no_models') }}</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- oQ Queue Section -->
+                        <template x-if="oqTasks.length > 0">
+                            <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                                <div class="flex items-center gap-3 px-6 py-4 bg-neutral-50 border-b border-neutral-200">
+                                    <i data-lucide="list" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.oq.queue_section') }}</span>
+                                </div>
+                                <div class="divide-y divide-neutral-100">
+                                    <template x-for="task in oqTasks" :key="task.task_id">
+                                        <div class="px-6 py-4">
+                                            <div class="flex items-center justify-between">
+                                                <div class="flex-1 min-w-0">
+                                                    <div class="flex items-center gap-2 flex-wrap">
+                                                        <span class="text-sm font-medium text-neutral-900 truncate" x-text="task.output_name"></span>
+                                                        <span class="px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider rounded-full shrink-0"
+                                                              :class="{
+                                                                  'bg-blue-100 text-blue-700': ['loading','quantizing','saving'].includes(task.status),
+                                                                  'bg-green-100 text-green-700': task.status === 'completed',
+                                                                  'bg-red-100 text-red-700': task.status === 'failed',
+                                                                  'bg-neutral-100 text-neutral-600': task.status === 'pending',
+                                                                  'bg-orange-100 text-orange-700': task.status === 'cancelled',
+                                                              }"
+                                                              x-text="task.status"></span>
+                                                        <span class="text-xs text-neutral-400" x-text="formatOQElapsed(task)"></span>
+                                                    </div>
+                                                    <p x-show="task.phase && !['completed','failed','cancelled'].includes(task.status)"
+                                                       class="text-xs text-neutral-500 mt-1" x-text="task.phase"></p>
+                                                    <p x-show="task.error"
+                                                       class="text-xs text-red-500 mt-1.5 break-all" x-text="task.error"></p>
+                                                    <!-- Progress bar -->
+                                                    <template x-if="['loading','quantizing','saving'].includes(task.status)">
+                                                        <div class="mt-2.5">
+                                                            <div class="h-1.5 bg-neutral-100 rounded-full overflow-hidden">
+                                                                <div class="h-full bg-neutral-900 rounded-full transition-all duration-500"
+                                                                     :style="'width: ' + task.progress + '%'"></div>
+                                                            </div>
+                                                            <div class="mt-1.5 text-xs text-neutral-400" x-text="formatOQProgress(task)"></div>
+                                                        </div>
+                                                    </template>
+                                                </div>
+                                                <!-- Action buttons -->
+                                                <div class="flex items-center gap-2 ml-4 shrink-0">
+                                                    <button x-show="['pending','loading','quantizing','saving'].includes(task.status)"
+                                                            @click="cancelOQTask(task.task_id)"
+                                                            class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
+                                                            :title="t('models.oq.cancel_tooltip')">
+                                                        <i data-lucide="x" class="w-4 h-4"></i>
+                                                    </button>
+                                                    <button x-show="['completed','failed','cancelled'].includes(task.status)"
+                                                            @click="removeOQTask(task.task_id)"
+                                                            class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
+                                                            :title="t('models.oq.remove_tooltip')">
+                                                        <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </template>
+                                </div>
+                            </div>
+                        </template>
+                        <!-- About oQ Quantization -->
+                        <div class="bg-neutral-50 rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="px-6 py-4 border-b border-neutral-200">
+                                <h4 class="text-sm font-semibold text-neutral-700">About oQ Quantization</h4>
+                            </div>
+                            <div class="px-6 py-5 text-xs text-neutral-500 leading-relaxed space-y-4">
+                                <p>
+                                    <strong class="text-neutral-600">oQ</strong> (oMLX Quantization) is a mixed-precision quantization method
+                                    that combines GGUF K-quant layer-position strategy, unsloth Dynamic 2.0 selective protection, and
+                                    AWQ output-MSE clip optimization. it assigns different bit widths per tensor based on sensitivity,
+                                    protecting critical layers (attention, routers, shared experts) while aggressively compressing
+                                    redundant parameters (expert MLP).
+                                </p>
+
+                                <div>
+                                    <strong class="text-neutral-600">How it works</strong>
+                                    <ul class="mt-1.5 ml-4 list-disc space-y-1">
+                                        <li><strong>Rule-based tier classification</strong> — 34 tensor patterns from GGUF/unsloth research.
+                                            MoE routers kept at fp16, attention protected at higher bits, expert MLP at base bits.</li>
+                                        <li><strong>Layer position weighting</strong> — first/last 12.5% of layers get +1 bit (GGUF Q4_K_M strategy).</li>
+                                        <li><strong>MLP asymmetry</strong> — for 512+ expert models, gate_proj ≥ 4-bit to prevent SiLU overflow (unsloth/GGUF Q2_K).</li>
+                                        <li><strong>Streaming quantization</strong> — processes tensors via mmap without loading the full model. ~15-20 GB memory for any model size.</li>
+                                        <li><strong>Enhanced mode (+)</strong> — optional AWQ-style clip optimization using calibration data for better quality at 2-4 bit. requires full model load.</li>
+                                    </ul>
+                                </div>
+
+                                <div>
+                                    <strong class="text-neutral-600">Comparison with other methods</strong>
+                                    <div class="mt-2 overflow-x-auto">
+                                        <table class="w-full text-xs">
+                                            <thead>
+                                                <tr class="border-b border-neutral-200">
+                                                    <th class="text-left py-2 pr-4 font-semibold text-neutral-600"></th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">oQ</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">GGUF K-quant</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">GGUF IQ</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">unsloth Dynamic</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">AWQ</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody class="text-neutral-500">
+                                                <tr class="border-b border-neutral-100">
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Format</td>
+                                                    <td class="py-1.5 px-3">MLX safetensors</td>
+                                                    <td class="py-1.5 px-3">GGUF</td>
+                                                    <td class="py-1.5 px-3">GGUF</td>
+                                                    <td class="py-1.5 px-3">GGUF</td>
+                                                    <td class="py-1.5 px-3">safetensors</td>
+                                                </tr>
+                                                <tr class="border-b border-neutral-100">
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Mixed precision</td>
+                                                    <td class="py-1.5 px-3">34 tensor rules</td>
+                                                    <td class="py-1.5 px-3">~15 type rules</td>
+                                                    <td class="py-1.5 px-3">imatrix per-weight</td>
+                                                    <td class="py-1.5 px-3">per-layer (proprietary)</td>
+                                                    <td class="py-1.5 px-3">per-channel scaling</td>
+                                                </tr>
+                                                <tr class="border-b border-neutral-100">
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">MoE support</td>
+                                                    <td class="py-1.5 px-3">router fp16, MLP asymmetry</td>
+                                                    <td class="py-1.5 px-3">basic</td>
+                                                    <td class="py-1.5 px-3">basic</td>
+                                                    <td class="py-1.5 px-3">router fp16</td>
+                                                    <td class="py-1.5 px-3">limited</td>
+                                                </tr>
+                                                <tr class="border-b border-neutral-100">
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">VLM vision</td>
+                                                    <td class="py-1.5 px-3">preserved (fp16)</td>
+                                                    <td class="py-1.5 px-3">separate mmproj</td>
+                                                    <td class="py-1.5 px-3">separate mmproj</td>
+                                                    <td class="py-1.5 px-3">preserved</td>
+                                                    <td class="py-1.5 px-3">not supported</td>
+                                                </tr>
+                                                <tr class="border-b border-neutral-100">
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">SSM/GatedDeltaNet</td>
+                                                    <td class="py-1.5 px-3">F32 state + 5-bit proj</td>
+                                                    <td class="py-1.5 px-3">F32 state</td>
+                                                    <td class="py-1.5 px-3">F32 state</td>
+                                                    <td class="py-1.5 px-3">supported</td>
+                                                    <td class="py-1.5 px-3">not tested</td>
+                                                </tr>
+                                                <tr class="border-b border-neutral-100">
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Calibration</td>
+                                                    <td class="py-1.5 px-3">optional (Enhanced+)</td>
+                                                    <td class="py-1.5 px-3">none</td>
+                                                    <td class="py-1.5 px-3">imatrix required</td>
+                                                    <td class="py-1.5 px-3">proprietary data</td>
+                                                    <td class="py-1.5 px-3">activation data</td>
+                                                </tr>
+                                                <tr class="border-b border-neutral-100">
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Memory usage</td>
+                                                    <td class="py-1.5 px-3">~15-20 GB (streaming)</td>
+                                                    <td class="py-1.5 px-3">1× model</td>
+                                                    <td class="py-1.5 px-3">1× model</td>
+                                                    <td class="py-1.5 px-3">proprietary</td>
+                                                    <td class="py-1.5 px-3">1.5× model</td>
+                                                </tr>
+                                                <tr>
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Apple Silicon native</td>
+                                                    <td class="py-1.5 px-3">yes (MLX)</td>
+                                                    <td class="py-1.5 px-3">via llama.cpp</td>
+                                                    <td class="py-1.5 px-3">via llama.cpp</td>
+                                                    <td class="py-1.5 px-3">GGUF only</td>
+                                                    <td class="py-1.5 px-3">yes (MLX)</td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <strong class="text-neutral-600">oQ levels</strong>
+                                    <div class="mt-2 overflow-x-auto">
+                                        <table class="w-full text-xs">
+                                            <thead>
+                                                <tr class="border-b border-neutral-200">
+                                                    <th class="text-left py-2 pr-4 font-semibold text-neutral-600">Level</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Base bits</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Protection</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Use case</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody class="text-neutral-500">
+                                                <tr class="border-b border-neutral-100">
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">oQ2</td>
+                                                    <td class="py-1.5 px-3">2-bit</td>
+                                                    <td class="py-1.5 px-3">minimal (attn +2, sensitive layers +1)</td>
+                                                    <td class="py-1.5 px-3">extreme compression, fit large MoE in limited memory</td>
+                                                </tr>
+                                                <tr class="border-b border-neutral-100">
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">oQ3</td>
+                                                    <td class="py-1.5 px-3">2-bit</td>
+                                                    <td class="py-1.5 px-3">full (attn 6-bit, shared expert 6-bit, layer position)</td>
+                                                    <td class="py-1.5 px-3">balanced quality/size tradeoff</td>
+                                                </tr>
+                                                <tr class="border-b border-neutral-100">
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">oQ4</td>
+                                                    <td class="py-1.5 px-3">4-bit</td>
+                                                    <td class="py-1.5 px-3">full</td>
+                                                    <td class="py-1.5 px-3">recommended default</td>
+                                                </tr>
+                                                <tr class="border-b border-neutral-100">
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">oQ5</td>
+                                                    <td class="py-1.5 px-3">5-bit</td>
+                                                    <td class="py-1.5 px-3">full</td>
+                                                    <td class="py-1.5 px-3">high quality</td>
+                                                </tr>
+                                                <tr class="border-b border-neutral-100">
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">oQ6</td>
+                                                    <td class="py-1.5 px-3">6-bit</td>
+                                                    <td class="py-1.5 px-3">full</td>
+                                                    <td class="py-1.5 px-3">near-lossless</td>
+                                                </tr>
+                                                <tr class="border-b border-neutral-100">
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">oQ7</td>
+                                                    <td class="py-1.5 px-3">8-bit</td>
+                                                    <td class="py-1.5 px-3">full</td>
+                                                    <td class="py-1.5 px-3">very high quality</td>
+                                                </tr>
+                                                <tr>
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">oQ8</td>
+                                                    <td class="py-1.5 px-3">8-bit</td>
+                                                    <td class="py-1.5 px-3">minimal</td>
+                                                    <td class="py-1.5 px-3">near-lossless, minimal overhead</td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+
+                                <p class="text-neutral-400">
+                                    oQ models are compatible with all MLX inference tools (oMLX, mlx-lm, LM Studio).
+                                    no custom loader required — standard mlx-lm config.json format.
+                                </p>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
