@@ -56,6 +56,12 @@ class ModelSettings:
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
 
+    # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
+    specprefill_enabled: bool = False
+    specprefill_draft_model: Optional[str] = None  # Path to draft model (must share tokenizer)
+    specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
+    specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
+
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default

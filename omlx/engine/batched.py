@@ -177,6 +177,24 @@ class BatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
+
+        # SpecPrefill: load draft model and pass to scheduler
+        if self._model_settings is not None:
+            specprefill_draft = getattr(self._model_settings, "specprefill_draft_model", None)
+            specprefill_enabled = getattr(self._model_settings, "specprefill_enabled", False)
+            if specprefill_enabled and specprefill_draft:
+                try:
+                    def _load_draft():
+                        draft_model, _ = load(specprefill_draft)
+                        return draft_model
+                    draft_model = await loop.run_in_executor(get_mlx_executor(), _load_draft)
+                    self._engine.engine.scheduler.set_specprefill_draft_model(
+                        draft_model, draft_model_name=specprefill_draft
+                    )
+                    logger.info(f"SpecPrefill: draft model loaded ({specprefill_draft})")
+                except Exception as e:
+                    logger.error(f"SpecPrefill: draft model load failed: {e}")
+
         self._loaded = True
         logger.info(f"BatchedEngine loaded: {self._model_name}")
 
@@ -376,9 +394,17 @@ class BatchedEngine(BaseEngine):
             thinking_budget=kwargs.get("thinking_budget", None),
         )
 
+        # SpecPrefill: pass per-request overrides to engine
+        specprefill_kwargs = {}
+        if kwargs.get("specprefill") is not None:
+            specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
+        if kwargs.get("specprefill_keep_pct") is not None:
+            specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop("specprefill_keep_pct")
+
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            **specprefill_kwargs,
         )
 
         finished_normally = False

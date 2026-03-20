@@ -145,6 +145,11 @@ class Request:
     # Harmony model support (gpt-oss models)
     is_harmony_model: bool = False      # True if model uses Harmony format
 
+    # SpecPrefill (sparse prefill for MoE models)
+    specprefill_indices: Optional[Any] = None  # mx.array of selected token indices
+    specprefill_total_tokens: int = 0  # Original total token count (M)
+    specprefill_position_offset: int = 0  # RoPE offset = M - N
+
     # Cache corruption recovery
     cache_corruption_retries: int = 0   # Per-request corruption retry counter
 

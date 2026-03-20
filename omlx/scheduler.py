@@ -1041,6 +1041,11 @@ class Scheduler:
         self._memory_hard_limit_bytes: int = 0  # hard limit (system_ram - 4GB)
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
 
+        # SpecPrefill: draft model for attention-based sparse prefill
+        self._specprefill_draft_model: Optional[Any] = None
+        # Track active specprefill request for RoPE cleanup
+        self._specprefill_active_request_id: Optional[str] = None
+
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: Dict[str, int] = {}
         self.uid_to_request_id: Dict[int, str] = {}
@@ -2553,6 +2558,10 @@ class Scheduler:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
 
+        # SpecPrefill: score remaining tokens with draft model if applicable.
+        # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
+        self._try_specprefill_scoring(request)
+
         # Add to tracking
         self.requests[request.request_id] = request
         self.waiting.append(request)
@@ -2560,6 +2569,151 @@ class Scheduler:
         logger.debug(
             f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
         )
+
+    def set_specprefill_draft_model(
+        self, draft_model: Any, draft_model_name: Optional[str] = None
+    ) -> None:
+        """Set the draft model for SpecPrefill scoring.
+
+        Creates a separate BlockAwarePrefixCache for the draft model
+        using the existing paged SSD cache infrastructure. The model_name
+        in compute_block_hash() naturally isolates draft blocks from target.
+        """
+        self._specprefill_draft_model = draft_model
+        self._draft_prefix_cache: Optional[Any] = None
+
+        if self.paged_cache_manager is not None and self.paged_ssd_cache_manager is not None:
+            try:
+                from .cache.paged_cache import PagedCacheManager
+                from .cache.prefix_cache import BlockAwarePrefixCache
+
+                name = draft_model_name or "specprefill-draft"
+                draft_paged = PagedCacheManager(
+                    block_size=self.config.paged_cache_block_size,
+                    max_blocks=self.paged_cache_manager.max_blocks,
+                    model_name=name,
+                )
+                self._draft_prefix_cache = BlockAwarePrefixCache(
+                    model=draft_model,
+                    paged_cache_manager=draft_paged,
+                    paged_ssd_cache_manager=self.paged_ssd_cache_manager,
+                )
+                self._draft_prefix_cache.set_cold_restore_callback(
+                    self._restore_block_from_cold
+                )
+                logger.info(
+                    f"SpecPrefill: draft model set with SSD cache (model_name={name})"
+                )
+            except Exception as e:
+                logger.warning(f"SpecPrefill: draft SSD cache setup failed: {e}")
+                logger.info("SpecPrefill: draft model set (no SSD cache)")
+        else:
+            logger.info("SpecPrefill: draft model set (no SSD cache)")
+
+    def _try_specprefill_scoring(self, request: Request) -> None:
+        """Score tokens with draft model if SpecPrefill is applicable.
+
+        Uses paged SSD cache for the draft model: if the prompt prefix
+        was already scored in a previous turn, the draft cache is restored
+        and only the new suffix is prefilled through the draft model.
+        """
+        if self._specprefill_draft_model is None:
+            return
+
+        specprefill_enabled = getattr(request, '_specprefill_enabled', False)
+        if not specprefill_enabled:
+            return
+
+        if request.vlm_inputs_embeds is not None:
+            return
+
+        remaining = request.remaining_tokens or request.prompt_token_ids
+        if remaining is None:
+            return
+
+        n_remaining = len(remaining)
+        from .patches.specprefill import DEFAULT_THRESHOLD, DEFAULT_KEEP_RATE
+        threshold = getattr(request, '_specprefill_threshold', None) or DEFAULT_THRESHOLD
+        keep_pct = getattr(request, '_specprefill_keep_pct', None) or DEFAULT_KEEP_RATE
+
+        if n_remaining <= threshold:
+            return
+
+        try:
+            import time
+            from .patches.specprefill import score_tokens, select_chunks
+
+            # Draft prefix cache lookup
+            draft_cache = None
+            draft_cached_tokens = 0
+            if self._draft_prefix_cache is not None:
+                try:
+                    block_table, draft_remaining = self._draft_prefix_cache.fetch_cache(
+                        request.request_id, remaining
+                    )
+                    if block_table and block_table.num_tokens > 0:
+                        reconstructed = self._draft_prefix_cache.reconstruct_cache(block_table)
+                        if reconstructed:
+                            draft_cache = reconstructed
+                            draft_cached_tokens = block_table.num_tokens
+                except Exception as e:
+                    logger.debug(f"SpecPrefill: draft cache fetch failed: {e}")
+
+            t0 = time.monotonic()
+            importance, used_cache = score_tokens(
+                self._specprefill_draft_model,
+                remaining,
+                prefill_step_size=self.config.prefill_step_size,
+                existing_cache=draft_cache,
+            )
+            selected = select_chunks(importance, keep_pct=keep_pct)
+            t_score = time.monotonic() - t0
+
+            n_selected = selected.shape[0]
+            request.specprefill_indices = selected
+            request.specprefill_total_tokens = n_remaining
+            request.specprefill_position_offset = request.cached_tokens
+
+            cache_info = ""
+            if draft_cached_tokens > 0:
+                cache_info = f", draft cache hit {draft_cached_tokens} tokens"
+
+            logger.info(
+                f"SpecPrefill: scored {n_remaining} tokens in {t_score:.1f}s, "
+                f"selected {n_selected}/{n_remaining} "
+                f"(keep={n_selected/n_remaining*100:.0f}%{cache_info})"
+            )
+
+            # Save draft cache for next turn
+            if self._draft_prefix_cache is not None and used_cache is not None:
+                try:
+                    extracted, mcc = self._extract_cache_states(used_cache)
+                    if extracted:
+                        # Store using prompt tokens (not including output)
+                        self._draft_prefix_cache.store_cache(
+                            request.request_id,
+                            remaining,
+                            extracted,
+                            model_cache_config=mcc,
+                        )
+                except Exception as e:
+                    logger.debug(f"SpecPrefill: draft cache store failed: {e}")
+
+            # Free draft cache from memory
+            del used_cache
+            mx.clear_cache()
+
+        except Exception as e:
+            logger.error(f"SpecPrefill scoring failed, falling back to normal path: {e}")
+            request.specprefill_indices = None
+
+    def _cleanup_specprefill(self, request_id: str) -> None:
+        """Clean up SpecPrefill RoPE patches when a request finishes."""
+        if self._specprefill_active_request_id == request_id:
+            from .patches.specprefill import cleanup_rope
+            cleanup_rope(self.model)
+            self._specprefill_active_request_id = None
+            logger.debug(f"SpecPrefill: RoPE restored for finished request {request_id}")
 
     def _trim_prompt_cache_for_generation(self, cache_list: List[Any]) -> bool:
         """Trim each cache layer by one token for exact-hit generation kickoff."""
@@ -2854,6 +3008,8 @@ class Scheduler:
         # Track VLM status: VLM and text-only requests cannot be in the same prefill batch
         # None = not determined yet, True = VLM request, False = text-only request
         batch_vlm_status: Optional[bool] = None
+        # Track SpecPrefill: these requests must be alone (RoPE patching affects whole model)
+        batch_specprefill_status: Optional[bool] = None
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
             request = self.waiting.popleft()
@@ -2890,6 +3046,24 @@ class Scheduler:
                 request.cached_tokens = 0
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
+
+            # SpecPrefill requests must be alone in the batch (RoPE patching
+            # affects the entire model). Also block scheduling if another
+            # specprefill request is already running (offset RoPE active).
+            request_is_specprefill = request.specprefill_indices is not None
+            if self._specprefill_active_request_id is not None and not request_is_specprefill:
+                # A specprefill request is running — defer all others until it finishes
+                self.waiting.appendleft(request)
+                break
+            if batch_specprefill_status is None:
+                batch_specprefill_status = request_is_specprefill
+            elif batch_specprefill_status != request_is_specprefill:
+                self.waiting.appendleft(request)
+                break
+            if request_is_specprefill and len(scheduled) > 0:
+                # SpecPrefill request must be alone
+                self.waiting.appendleft(request)
+                break
 
             # Check VLM status homogeneity: VLM and text-only requests use
             # different prefill paths (embeddings vs token IDs)
@@ -2969,6 +3143,82 @@ class Scheduler:
             # contamination from prior requests (VLM or text-only).
             if hasattr(self.model, "clear_vlm_position_state"):
                 self.model.clear_vlm_position_state()
+
+            # SpecPrefill: replace tokens with selected subset and pre-fill
+            # cache via sparse_prefill before inserting into BatchGenerator.
+            #
+            # Key design: sparse_prefill processes selected tokens (excluding
+            # the last prompt token). BatchGenerator then processes the last
+            # prompt token to produce generation logits. This avoids:
+            #   - Double-processing the last token (Bug #2)
+            #   - Off-by-one RoPE positions (Bug #1)
+            #
+            # Position math:
+            #   sparse_prefill: N' tokens, adjustment = M - N'
+            #   We subtract 1: adjustment = M - N' - 1
+            #   BatchGenerator last token: pos = N' + (M - N' - 1) = M - 1 ✓
+            #   First gen token: pos = (N'+1) + (M - N' - 1) = M ✓
+            if request.specprefill_indices is not None:
+                try:
+                    from .patches.specprefill import (
+                        sparse_prefill, cleanup_rope,
+                        _find_attention_layers, _get_attn_module,
+                        _OffsetAdjustedRoPE,
+                    )
+                    from mlx_lm.models.cache import make_prompt_cache
+
+                    import time
+                    t0 = time.monotonic()
+
+                    selected = request.specprefill_indices
+                    all_tokens = tokens_to_process
+                    M = len(all_tokens)
+                    pos_offset = request.specprefill_position_offset
+                    last_idx = M - 1
+
+                    # Remove last token from selected set — BatchGenerator
+                    # will process it separately for generation kickoff.
+                    selected_list = selected.tolist()
+                    if last_idx in selected_list:
+                        selected_list.remove(last_idx)
+                        selected = mx.array(sorted(selected_list))
+
+                    # Create simple cache and run sparse prefill with RoPE patching
+                    sp_cache = make_prompt_cache(self.model)
+                    sparse_prefill(
+                        self.model,
+                        all_tokens,
+                        selected,
+                        sp_cache,
+                        step_size=self.config.prefill_step_size,
+                        position_offset=pos_offset,
+                    )
+                    # sparse_prefill installs _OffsetAdjustedRoPE with
+                    # adjustment = M - N'. Subtract 1 to account for the
+                    # extra token BatchGenerator will process.
+                    for _, layer in _find_attention_layers(self.model):
+                        attn = _get_attn_module(layer)
+                        if attn and hasattr(attn, "rope") and isinstance(attn.rope, _OffsetAdjustedRoPE):
+                            attn.rope._adjustment -= 1
+
+                    N = int(selected.shape[0])
+                    t_prefill = time.monotonic() - t0
+                    logger.info(
+                        f"SpecPrefill: sparse prefill {N}/{M} tokens in {t_prefill:.1f}s "
+                        f"(offset={pos_offset})"
+                    )
+
+                    # Set up request as if we had a prefix cache hit
+                    cache_to_use = sp_cache
+                    # Last token for generation kickoff
+                    tokens_to_process = all_tokens[-1:]
+                    self._specprefill_active_request_id = request.request_id
+
+                except Exception as e:
+                    logger.error(f"SpecPrefill sparse prefill failed: {e}")
+                    cleanup_rope(self.model)
+                    request.specprefill_indices = None
+                    # Fall through to normal prefill
 
             # Insert into BatchGenerator with optional cache
             uids = self.batch_generator.insert(
@@ -3213,9 +3463,16 @@ class Scheduler:
                             raw_cache = response.prompt_cache
 
                         if raw_cache:
+                            # SpecPrefill: sparse KV data can't be stored in
+                            # paged cache (hash mismatch with full token IDs).
+                            # Prefix blocks from prior normal requests are
+                            # already in paged cache and unaffected.
+                            if request.specprefill_indices is not None:
+                                raw_cache = None
+
                             # For paged cache, extract actual tensor states
                             # This allows cache to survive BatchGenerator recreation
-                            if self.block_aware_cache is not None:
+                            elif self.block_aware_cache is not None:
                                 extracted_cache, model_cache_config = self._extract_cache_states(raw_cache)
                                 if extracted_cache:
                                     request._extracted_cache = extracted_cache
@@ -3259,6 +3516,10 @@ class Scheduler:
         # active_batch = None after mx.async_eval when all requests finish.
         if finished_ids:
             mx.synchronize(generation_stream)
+
+        # SpecPrefill: restore original RoPE if active request finished
+        for rid in finished_ids:
+            self._cleanup_specprefill(rid)
 
         # Remove finished requests from prefill progress tracker.
         from .prefill_progress import get_prefill_tracker

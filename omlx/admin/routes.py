@@ -93,6 +93,11 @@ class ModelSettingsRequest(BaseModel):
     index_cache_freq: Optional[int] = None
     thinking_budget_enabled: Optional[bool] = None
     thinking_budget_tokens: Optional[int] = None
+    # SpecPrefill (experimental)
+    specprefill_enabled: Optional[bool] = None
+    specprefill_draft_model: Optional[str] = None
+    specprefill_keep_pct: Optional[float] = None
+    specprefill_threshold: Optional[int] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
 
@@ -1219,6 +1224,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
         model_data = {
             "id": model_id,
+            "model_path": model_info.get("model_path", ""),
             "loaded": model_info.get("loaded", False),
             "is_loading": model_info.get("is_loading", False),
             "estimated_size": model_info.get("estimated_size", 0),
@@ -1252,6 +1258,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "forced_ct_kwargs": settings.forced_ct_kwargs,
                 "ttl_seconds": settings.ttl_seconds,
                 "index_cache_freq": settings.index_cache_freq,
+                "specprefill_enabled": settings.specprefill_enabled,
+                "specprefill_draft_model": settings.specprefill_draft_model,
+                "specprefill_keep_pct": settings.specprefill_keep_pct,
+                "specprefill_threshold": settings.specprefill_threshold,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
@@ -1452,6 +1462,16 @@ async def update_model_settings(
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
         )
+    # SpecPrefill settings
+    if "specprefill_enabled" in sent:
+        current_settings.specprefill_enabled = request.specprefill_enabled or False
+    if "specprefill_draft_model" in sent:
+        current_settings.specprefill_draft_model = request.specprefill_draft_model or None
+    if "specprefill_keep_pct" in sent:
+        current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
+    if "specprefill_threshold" in sent:
+        current_settings.specprefill_threshold = request.specprefill_threshold or None
+
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry

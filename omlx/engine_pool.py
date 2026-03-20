@@ -508,6 +508,7 @@ class EnginePool:
                 engine = VLMBatchedEngine(
                     model_name=entry.model_path,
                     scheduler_config=self._scheduler_config,
+                    model_settings=model_settings,
                 )
             else:
                 # BatchedEngine with continuous batching (default)
@@ -637,6 +638,7 @@ class EnginePool:
             "models": [
                 {
                     "id": mid,
+                    "model_path": e.model_path,
                     "loaded": e.engine is not None,
                     "is_loading": e.is_loading,
                     "estimated_size": e.estimated_size,

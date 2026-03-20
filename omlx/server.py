@@ -1843,6 +1843,12 @@ async def create_chat_completion(
     if merged_ct_kwargs:
         chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
 
+    # SpecPrefill: per-request overrides
+    if request.specprefill is not None:
+        chat_kwargs["specprefill"] = request.specprefill
+    if request.specprefill_keep_pct is not None:
+        chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(

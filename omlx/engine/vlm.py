@@ -146,12 +146,14 @@ class VLMBatchedEngine(BaseEngine):
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
+        model_settings: Any | None = None,
     ):
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
+        self._model_settings = model_settings
 
         self._vlm_model = None
         self._processor = None
@@ -263,6 +265,25 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
+
+        # SpecPrefill: load draft model and pass to scheduler
+        if self._model_settings is not None:
+            specprefill_draft = getattr(self._model_settings, "specprefill_draft_model", None)
+            specprefill_enabled = getattr(self._model_settings, "specprefill_enabled", False)
+            if specprefill_enabled and specprefill_draft:
+                try:
+                    from mlx_lm import load as mlx_lm_load
+
+                    def _load_draft():
+                        draft_model, _ = mlx_lm_load(specprefill_draft)
+                        return draft_model
+                    draft_model = await loop.run_in_executor(get_mlx_executor(), _load_draft)
+                    self._engine.engine.scheduler.set_specprefill_draft_model(
+                        draft_model, draft_model_name=specprefill_draft
+                    )
+                    logger.info(f"SpecPrefill: draft model loaded ({specprefill_draft})")
+                except Exception as e:
+                    logger.error(f"SpecPrefill: draft model load failed: {e}")
 
         # Inject mlx-lm tool calling support into VLM tokenizer
         self._inject_tool_calling(self._tokenizer)
@@ -688,12 +709,20 @@ class VLMBatchedEngine(BaseEngine):
             thinking_budget=kwargs.get("thinking_budget", None),
         )
 
+        # SpecPrefill: pass per-request overrides
+        specprefill_kwargs = {}
+        if kwargs.get("specprefill") is not None:
+            specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
+        if kwargs.get("specprefill_keep_pct") is not None:
+            specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop("specprefill_keep_pct")
+
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
+            **specprefill_kwargs,
         )
 
         finished_normally = False
