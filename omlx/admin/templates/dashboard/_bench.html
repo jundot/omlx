@@ -10,6 +10,8 @@
             </th>
             {% endmacro %}
             <div x-show="mainTab === 'bench'" x-cloak>
+                <!-- Throughput tab -->
+                <div x-show="benchTab === 'throughput'" x-cloak>
                 <div class="animate-fade-in-up">
                     <!-- Header -->
                     <div class="mb-8">
@@ -450,4 +452,8 @@
                      x-cloak
                      x-text="benchTip?.text"
                      class="bench-tip-fixed"></div>
+                </div>
+
+                <!-- Accuracy tab -->
+                {% include "dashboard/_bench_accuracy.html" %}
             </div>

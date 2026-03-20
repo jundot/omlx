@@ -1,0 +1,231 @@
+                <div x-show="benchTab === 'accuracy'" x-cloak>
+                <div class="animate-fade-in-up">
+                    <!-- Header -->
+                    <div class="mb-8">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('acc_bench.section_label') }}</h2>
+                                <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('acc_bench.heading') }}</h3>
+                            </div>
+                        </div>
+                        <p class="text-sm text-neutral-500 mt-2">{{ t('acc_bench.description') }}</p>
+                    </div>
+
+                    <!-- Configuration Card -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="settings-2" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('acc_bench.config.section_label') }}</span>
+                            </div>
+                        </div>
+
+                        <div class="px-6 py-5 space-y-5">
+                            <!-- Model Selector -->
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.model') }}</label>
+                                <select x-model="accModelId"
+                                        :disabled="accRunning"
+                                        class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                    <option value="">{{ t('acc_bench.config.model_placeholder') }}</option>
+                                    <template x-for="m in models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type)" :key="m.id">
+                                        <option :value="m.id" x-text="m.id + ' (' + (m.estimated_size ? (m.estimated_size / 1073741824).toFixed(1) + ' GB' : 'unknown') + ')'"></option>
+                                    </template>
+                                </select>
+                            </div>
+
+                            <!-- Benchmark Selection -->
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.benchmarks') }}</label>
+                                <div class="flex flex-wrap items-center gap-4">
+                                    <label class="flex items-center gap-2 cursor-pointer">
+                                        <input type="checkbox" x-model="accBenchmarks.mmlu" :disabled="accRunning"
+                                               class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                        <span class="text-sm text-neutral-600">MMLU</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 cursor-pointer">
+                                        <input type="checkbox" x-model="accBenchmarks.hellaswag" :disabled="accRunning"
+                                               class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                        <span class="text-sm text-neutral-600">HellaSwag</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 cursor-pointer">
+                                        <input type="checkbox" x-model="accBenchmarks.truthfulqa" :disabled="accRunning"
+                                               class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                        <span class="text-sm text-neutral-600">TruthfulQA</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 cursor-pointer">
+                                        <input type="checkbox" x-model="accBenchmarks.gsm8k" :disabled="accRunning"
+                                               class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                        <span class="text-sm text-neutral-600">GSM8K</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 cursor-pointer">
+                                        <input type="checkbox" x-model="accBenchmarks.livecodebench" :disabled="accRunning"
+                                               class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                        <span class="text-sm text-neutral-600">LiveCodeBench</span>
+                                        <span class="inline-flex items-center gap-1 px-1.5 py-0.5 bg-amber-50 text-amber-600 text-[10px] font-medium rounded"
+                                              title="{{ t('acc_bench.config.livecodebench_warning') }}">
+                                            <i data-lucide="alert-triangle" class="w-3 h-3"></i>
+                                            {{ t('acc_bench.config.code_exec') }}
+                                        </span>
+                                    </label>
+                                </div>
+                                <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.benchmarks_hint') }}</p>
+                            </div>
+
+                            <!-- Batch Size -->
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.batch_size') }}</label>
+                                <div class="flex items-center gap-4">
+                                    <template x-for="bs in [1, 2, 4, 8]" :key="bs">
+                                        <label class="flex items-center gap-2 cursor-pointer">
+                                            <input type="radio" name="accBatchSize"
+                                                   :value="bs" x-model.number="accBatchSize"
+                                                   :disabled="accRunning"
+                                                   class="w-4 h-4 border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                            <span class="text-sm text-neutral-600" x-text="bs + 'x'"></span>
+                                        </label>
+                                    </template>
+                                </div>
+                                <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.batch_size_hint') }}</p>
+                            </div>
+
+                            <!-- Full Dataset Option -->
+                            <div>
+                                <label class="flex items-center gap-2 cursor-pointer">
+                                    <input type="checkbox" x-model="accFullDataset" :disabled="accRunning"
+                                           class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                    <span class="text-sm text-neutral-600">{{ t('acc_bench.config.full_dataset') }}</span>
+                                </label>
+                                <p class="text-xs text-neutral-400 mt-1"
+                                   x-show="accFullDataset" x-transition>{{ t('acc_bench.config.full_dataset_warning') }}</p>
+                            </div>
+
+                            <!-- Run / Cancel Button -->
+                            <div class="flex items-center gap-3 pt-2">
+                                <button x-show="!accRunning"
+                                        @click="startAccuracyBenchmark()"
+                                        :disabled="!accModelId || !Object.values(accBenchmarks).some(v => v)"
+                                        class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
+                                    <i data-lucide="play" class="w-4 h-4"></i>
+                                    {{ t('acc_bench.config.run_button') }}
+                                </button>
+                                <button x-show="accRunning"
+                                        @click="cancelAccuracyBenchmark()"
+                                        class="px-6 py-2.5 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 transition-all flex items-center gap-2">
+                                    <i data-lucide="square" class="w-4 h-4"></i>
+                                    {{ t('acc_bench.config.cancel_button') }}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Progress Section -->
+                    <div x-show="accRunning && accProgress" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <div class="px-6 py-4">
+                            <div class="flex items-center justify-between mb-3">
+                                <span class="text-sm font-medium text-neutral-700" x-text="accProgress?.message || 'Preparing...'"></span>
+                                <div class="flex items-center gap-3">
+                                    <span class="text-xs text-neutral-400" x-text="accProgress?.bench_current && accProgress?.bench_total ? (accProgress.bench_current + ' / ' + accProgress.bench_total) : ''"></span>
+                                    <button @click="cancelAccuracyBenchmark()"
+                                            class="px-3 py-1 bg-neutral-900 text-white text-xs font-medium rounded-lg hover:bg-neutral-800 transition-all flex items-center gap-1">
+                                        <i data-lucide="square" class="w-3 h-3"></i>
+                                        {{ t('acc_bench.config.cancel_button') }}
+                                    </button>
+                                </div>
+                            </div>
+                            <!-- Per-question progress bar -->
+                            <div class="w-full bg-neutral-100 rounded-full h-2 overflow-hidden">
+                                <div class="h-full bg-neutral-900 rounded-full transition-all duration-500"
+                                     :style="'width: ' + (accProgress?.bench_total ? (accProgress.bench_current / accProgress.bench_total * 100) : 0) + '%'"></div>
+                            </div>
+                            <!-- Overall benchmark progress -->
+                            <div class="flex items-center gap-2 mt-2">
+                                <span class="text-xs text-neutral-400" x-text="accProgress?.benchmark ? ('Running: ' + accProgress.benchmark.toUpperCase()) : ''"></span>
+                                <span class="text-xs text-neutral-300">·</span>
+                                <span class="text-xs text-neutral-400" x-text="(accProgress?.current || 0) + ' / ' + (accProgress?.total || 0) + ' benchmarks'"></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Error -->
+                    <div x-show="accError" x-cloak class="bg-red-50 border border-red-200 rounded-2xl px-6 py-4 mb-6">
+                        <div class="flex items-center gap-2 text-red-700">
+                            <i data-lucide="alert-circle" class="w-4 h-4 flex-shrink-0"></i>
+                            <span class="text-sm font-medium" x-text="accError"></span>
+                        </div>
+                    </div>
+
+                    <!-- Results Section -->
+                    <template x-for="(r, idx) in accResults" :key="idx">
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-4 animate-fade-in-up">
+                            <div class="px-6 py-4">
+                                <div class="flex items-center justify-between">
+                                    <div class="flex items-center gap-3">
+                                        <div class="w-10 h-10 rounded-xl flex items-center justify-center"
+                                             :class="r.accuracy >= 0.7 ? 'bg-green-50 text-green-600' : r.accuracy >= 0.4 ? 'bg-amber-50 text-amber-600' : 'bg-red-50 text-red-600'">
+                                            <i data-lucide="target" class="w-5 h-5"></i>
+                                        </div>
+                                        <div>
+                                            <h4 class="text-sm font-semibold text-neutral-900" x-text="r.benchmark.toUpperCase()"></h4>
+                                            <span class="text-xs text-neutral-400" x-text="r.correct + ' / ' + r.total + ' correct · ' + r.time_s + 's'"></span>
+                                        </div>
+                                    </div>
+                                    <div class="text-right">
+                                        <span class="text-2xl font-bold tabular-nums"
+                                              :class="r.accuracy >= 0.7 ? 'text-green-600' : r.accuracy >= 0.4 ? 'text-amber-600' : 'text-red-600'"
+                                              x-text="(r.accuracy * 100).toFixed(1) + '%'"></span>
+                                    </div>
+                                </div>
+
+                                <!-- Category breakdown for MMLU -->
+                                <div x-show="r.category_scores && Object.keys(r.category_scores).length > 0" class="mt-4">
+                                    <button @click="r._showCategories = !r._showCategories"
+                                            class="text-xs text-neutral-500 hover:text-neutral-700 flex items-center gap-1 transition-colors">
+                                        <i data-lucide="chevron-right" class="w-3 h-3 transition-transform" :class="r._showCategories ? 'rotate-90' : ''"></i>
+                                        <span x-text="r._showCategories ? '{{ t('acc_bench.results.hide_categories') }}' : '{{ t('acc_bench.results.show_categories') }}'"></span>
+                                    </button>
+                                    <div x-show="r._showCategories" x-transition class="mt-2 max-h-60 overflow-y-auto">
+                                        <table class="w-full text-xs">
+                                            <thead>
+                                                <tr class="border-b border-neutral-100">
+                                                    <th class="text-left py-1.5 px-2 font-medium text-neutral-500">{{ t('acc_bench.results.category') }}</th>
+                                                    <th class="text-right py-1.5 px-2 font-medium text-neutral-500">{{ t('acc_bench.results.score') }}</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <template x-for="[cat, score] in Object.entries(r.category_scores).sort((a, b) => b[1] - a[1])" :key="cat">
+                                                    <tr class="border-b border-neutral-50">
+                                                        <td class="py-1 px-2 text-neutral-600" x-text="cat.replace(/_/g, ' ')"></td>
+                                                        <td class="py-1 px-2 text-right font-medium tabular-nums"
+                                                            :class="score >= 0.7 ? 'text-green-600' : score >= 0.4 ? 'text-amber-600' : 'text-red-500'"
+                                                            x-text="(score * 100).toFixed(1) + '%'"></td>
+                                                    </tr>
+                                                </template>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </template>
+
+                    <!-- Text Export -->
+                    <div x-show="accResults.length > 0" x-cloak class="mt-6">
+                        <button @click="accShowText = !accShowText"
+                                class="flex items-center gap-2 text-sm text-neutral-500 hover:text-neutral-700 transition-colors mb-3">
+                            <i data-lucide="file-text" class="w-4 h-4"></i>
+                            <span x-text="accShowText ? '{{ t('acc_bench.results.hide_text') }}' : '{{ t('acc_bench.results.show_text') }}'"></span>
+                        </button>
+                        <div x-show="accShowText" x-transition class="relative">
+                            <textarea id="accTextarea" readonly
+                                      class="w-full h-48 px-4 py-3 text-xs font-mono bg-neutral-50 border border-neutral-200 rounded-xl resize-none focus:outline-none"
+                                      x-text="accBuildText()"></textarea>
+                            <button @click="accCopyText()"
+                                    class="absolute top-3 right-3 px-3 py-1.5 text-xs font-medium bg-white border border-neutral-200 rounded-lg hover:bg-neutral-50 transition-all flex items-center gap-1.5">
+                                <i :data-lucide="accCopied ? 'check' : 'copy'" class="w-3.5 h-3.5"></i>
+                                <span x-text="accCopied ? 'Copied' : 'Copy'"></span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                </div>

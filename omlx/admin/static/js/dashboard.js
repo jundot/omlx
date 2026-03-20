@@ -8,6 +8,7 @@
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer']);
+    const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy']);
 
     function dashboard() {
         return {
@@ -288,6 +289,24 @@
             benchUploadDone: null,
             benchUploading: false,
 
+            // Bench sub-tab & dropdown
+            benchTab: 'throughput',
+            benchDropdown: false,
+
+            // Accuracy benchmark state
+            accModelId: '',
+            accBenchmarks: { mmlu: true, hellaswag: true, truthfulqa: true, gsm8k: false, livecodebench: false },
+            accBatchSize: 1,
+            accFullDataset: false,
+            accRunning: false,
+            accBenchId: null,
+            accProgress: null,
+            accResults: [],
+            accError: '',
+            accEventSource: null,
+            accShowText: false,
+            accCopied: false,
+
             async init() {
                 // Apply theme
                 this.applyTheme();
@@ -389,9 +408,12 @@
                 const settingsTab = params.get('settingsTab');
                 const modelsTab = params.get('modelsTab');
 
+                const benchTab = params.get('benchTab');
+
                 this.mainTab = DASHBOARD_MAIN_TABS.has(mainTab) ? mainTab : 'status';
                 this.activeTab = DASHBOARD_SETTINGS_TABS.has(settingsTab) ? settingsTab : 'global';
                 this.modelsTab = DASHBOARD_MODELS_TABS.has(modelsTab) ? modelsTab : 'manager';
+                this.benchTab = DASHBOARD_BENCH_TABS.has(benchTab) ? benchTab : 'throughput';
             },
 
             syncTabStateToUrl() {
@@ -408,6 +430,12 @@
                     url.searchParams.set('modelsTab', this.modelsTab);
                 } else {
                     url.searchParams.delete('modelsTab');
+                }
+
+                if (this.mainTab === 'bench') {
+                    url.searchParams.set('benchTab', this.benchTab);
+                } else {
+                    url.searchParams.delete('benchTab');
                 }
 
                 window.history.replaceState({}, '', url);
@@ -1529,6 +1557,156 @@
                     }
                 } catch (err) {
                     console.error('Failed to load device info:', err);
+                }
+            },
+
+            // Bench sub-tab
+            setBenchTab(tab) {
+                if (!DASHBOARD_BENCH_TABS.has(tab)) return;
+                this.benchTab = tab;
+                this.mainTab = 'bench';
+                this.syncTabStateToUrl();
+                if (tab === 'throughput') {
+                    this.loadBenchDeviceInfo();
+                }
+            },
+
+            // Accuracy benchmark functions
+            async startAccuracyBenchmark() {
+                if (!this.accModelId) return;
+                const selected = Object.entries(this.accBenchmarks)
+                    .filter(([_, v]) => v)
+                    .map(([k]) => k);
+                if (selected.length === 0) return;
+
+                this.accRunning = true;
+                this.accResults = [];
+                this.accError = '';
+                this.accProgress = null;
+                this.accShowText = false;
+
+                try {
+                    const resp = await fetch('/admin/api/bench/accuracy/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_id: this.accModelId,
+                            benchmarks: selected,
+                            full_dataset: this.accFullDataset,
+                            batch_size: this.accBatchSize,
+                        }),
+                    });
+                    if (!resp.ok) {
+                        const err = await resp.json();
+                        throw new Error(err.detail || 'Failed to start benchmark');
+                    }
+                    const data = await resp.json();
+                    this.accBenchId = data.bench_id;
+                    this.connectAccSSE(data.bench_id);
+                } catch (err) {
+                    this.accError = err.message;
+                    this.accRunning = false;
+                }
+            },
+
+            connectAccSSE(benchId) {
+                if (this.accEventSource) {
+                    this.accEventSource.close();
+                }
+                const es = new EventSource(`/admin/api/bench/accuracy/${benchId}/stream`);
+                this.accEventSource = es;
+
+                es.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        switch (data.type) {
+                            case 'progress':
+                                this.accProgress = data;
+                                break;
+                            case 'result':
+                                // Add _showCategories toggle for UI
+                                data.data._showCategories = false;
+                                this.accResults.push(data.data);
+                                break;
+                            case 'done':
+                                this.accRunning = false;
+                                this.accProgress = null;
+                                es.close();
+                                this.accEventSource = null;
+                                break;
+                            case 'error':
+                                this.accError = data.message;
+                                this.accRunning = false;
+                                this.accProgress = null;
+                                es.close();
+                                this.accEventSource = null;
+                                break;
+                        }
+                    } catch (err) {
+                        console.error('SSE parse error:', err);
+                    }
+                };
+
+                es.onerror = () => {
+                    this.accRunning = false;
+                    this.accProgress = null;
+                    es.close();
+                    this.accEventSource = null;
+                };
+            },
+
+            async cancelAccuracyBenchmark() {
+                if (!this.accBenchId) return;
+                try {
+                    await fetch(`/admin/api/bench/accuracy/${this.accBenchId}/cancel`, { method: 'POST' });
+                } catch (err) {
+                    console.error('Cancel error:', err);
+                }
+                this.accRunning = false;
+                this.accProgress = null;
+                if (this.accEventSource) {
+                    this.accEventSource.close();
+                    this.accEventSource = null;
+                }
+            },
+
+            accBuildText() {
+                if (this.accResults.length === 0) return '';
+                const pad = (s, w) => s.toString().padStart(w);
+                const rpad = (s, w) => s.toString().padEnd(w);
+                let lines = [];
+                lines.push('Accuracy Benchmark Results');
+                lines.push('Model: ' + this.accModelId);
+                lines.push('Mode: ' + (this.accFullDataset ? 'Full Dataset' : 'Quick'));
+                lines.push('');
+                lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10));
+                lines.push('-'.repeat(54));
+                for (const r of this.accResults) {
+                    lines.push(
+                        rpad(r.benchmark.toUpperCase(), 16) +
+                        pad((r.accuracy * 100).toFixed(1) + '%', 10) +
+                        pad(r.correct, 10) +
+                        pad(r.total, 8) +
+                        pad(r.time_s, 10)
+                    );
+                }
+                return lines.join('\n');
+            },
+
+            accCopyText() {
+                const text = this.accBuildText();
+                const onSuccess = () => {
+                    this.accCopied = true;
+                    setTimeout(() => { this.accCopied = false; }, 2000);
+                };
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(text).then(onSuccess).catch(() => {
+                        const ta = document.getElementById('accTextarea');
+                        if (ta) { ta.select(); document.execCommand('copy'); onSuccess(); }
+                    });
+                } else {
+                    const ta = document.getElementById('accTextarea');
+                    if (ta) { ta.select(); document.execCommand('copy'); onSuccess(); }
                 }
             },
 

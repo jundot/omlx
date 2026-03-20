@@ -95,6 +95,7 @@ include = ["omlx*"]
 
 [tool.setuptools.package-data]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
+"omlx.eval" = ["data/*.jsonl"]
 
 [tool.black]
 line-length = 88
