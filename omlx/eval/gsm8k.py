@@ -77,7 +77,7 @@ class GSM8KBenchmark(BaseBenchmark):
     name = "gsm8k"
     quick_size = 100
 
-    async def load_dataset(self, full: bool = False) -> list[dict]:
+    async def load_dataset(self, sample_size: int = 0) -> list[dict]:
         """Load GSM8K from bundled data."""
         items = load_jsonl(DATA_DIR / "gsm8k_test.jsonl")
 
@@ -94,10 +94,10 @@ class GSM8KBenchmark(BaseBenchmark):
 
         logger.info(f"GSM8K: loaded {len(normalized)} questions")
 
-        if full:
+        if sample_size == 0:
             return normalized
 
-        return deterministic_sample(normalized, self.quick_size)
+        return deterministic_sample(normalized, sample_size)
 
     def get_max_tokens(self) -> int:
         return 512

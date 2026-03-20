@@ -124,7 +124,7 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
     name = "livecodebench"
     quick_size = 100
 
-    async def load_dataset(self, full: bool = False) -> list[dict]:
+    async def load_dataset(self, sample_size: int = 0) -> list[dict]:
         """Load LiveCodeBench from bundled data."""
         items = load_jsonl(DATA_DIR / "livecodebench.jsonl")
 
@@ -160,10 +160,10 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
 
         logger.info(f"LiveCodeBench: loaded {len(normalized)} problems")
 
-        if full:
+        if sample_size == 0:
             return normalized
 
-        return deterministic_sample(normalized, self.quick_size)
+        return deterministic_sample(normalized, sample_size)
 
     def get_max_tokens(self) -> int:
         return 2048

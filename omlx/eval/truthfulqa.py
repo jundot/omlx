@@ -31,7 +31,7 @@ class TruthfulQABenchmark(BaseBenchmark):
     name = "truthfulqa"
     quick_size = 200
 
-    async def load_dataset(self, full: bool = False) -> list[dict]:
+    async def load_dataset(self, sample_size: int = 0) -> list[dict]:
         """Load TruthfulQA MC1 from bundled data."""
         raw_items = load_jsonl(DATA_DIR / "truthfulqa_mc.jsonl")
 
@@ -72,10 +72,10 @@ class TruthfulQABenchmark(BaseBenchmark):
 
         logger.info(f"TruthfulQA: loaded {len(items)} questions")
 
-        if full:
+        if sample_size == 0:
             return items
 
-        return deterministic_sample(items, self.quick_size)
+        return deterministic_sample(items, sample_size)
 
     def format_prompt(self, item: dict) -> list[dict[str, str]]:
         """Format as multiple choice with lettered options."""

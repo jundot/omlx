@@ -21,38 +21,37 @@ class TestAccuracyBenchmarkRequest:
     def test_valid_request(self):
         req = AccuracyBenchmarkRequest(
             model_id="test-model",
-            benchmarks=["mmlu", "gsm8k"],
+            benchmarks={"mmlu": 300, "gsm8k": 100},
         )
         assert req.model_id == "test-model"
-        assert req.benchmarks == ["mmlu", "gsm8k"]
-        assert req.full_dataset is False
+        assert "mmlu" in req.benchmarks
+        assert req.benchmarks["gsm8k"] == 100
 
-    def test_full_dataset_flag(self):
+    def test_full_dataset_size_zero(self):
         req = AccuracyBenchmarkRequest(
             model_id="test-model",
-            benchmarks=["mmlu"],
-            full_dataset=True,
+            benchmarks={"mmlu": 0},
         )
-        assert req.full_dataset is True
+        assert req.benchmarks["mmlu"] == 0
 
     def test_empty_benchmarks_rejected(self):
         with pytest.raises(Exception):
             AccuracyBenchmarkRequest(
                 model_id="test-model",
-                benchmarks=[],
+                benchmarks={},
             )
 
     def test_invalid_benchmark_rejected(self):
         with pytest.raises(Exception):
             AccuracyBenchmarkRequest(
                 model_id="test-model",
-                benchmarks=["invalid_bench"],
+                benchmarks={"invalid_bench": 100},
             )
 
     def test_all_valid_benchmarks(self):
         req = AccuracyBenchmarkRequest(
             model_id="test-model",
-            benchmarks=VALID_BENCHMARKS,
+            benchmarks={b: 100 for b in VALID_BENCHMARKS},
         )
         assert len(req.benchmarks) == 5
 
@@ -66,7 +65,7 @@ class TestRunLifecycle:
     def test_create_run(self):
         req = AccuracyBenchmarkRequest(
             model_id="test-model",
-            benchmarks=["mmlu"],
+            benchmarks={"mmlu": 100},
         )
         run = create_run(req)
         assert run.bench_id is not None
@@ -76,7 +75,7 @@ class TestRunLifecycle:
     def test_get_run(self):
         req = AccuracyBenchmarkRequest(
             model_id="test-model",
-            benchmarks=["mmlu"],
+            benchmarks={"mmlu": 100},
         )
         run = create_run(req)
         found = get_run(run.bench_id)
@@ -88,7 +87,7 @@ class TestRunLifecycle:
     def test_cleanup_old_runs(self):
         req = AccuracyBenchmarkRequest(
             model_id="test-model",
-            benchmarks=["mmlu"],
+            benchmarks={"mmlu": 100},
         )
         run1 = create_run(req)
         run2 = create_run(req)
@@ -103,7 +102,7 @@ class TestRunLifecycle:
     def test_cleanup_error_runs(self):
         req = AccuracyBenchmarkRequest(
             model_id="test-model",
-            benchmarks=["mmlu"],
+            benchmarks={"mmlu": 100},
         )
         run = create_run(req)
         run.status = "error"
@@ -118,7 +117,7 @@ class TestRunAccuracyBenchmark:
         """Verify that a successful run sends a done event."""
         req = AccuracyBenchmarkRequest(
             model_id="test-model",
-            benchmarks=["mmlu"],
+            benchmarks={"mmlu": 100},
         )
         run = create_run(req)
 
@@ -163,7 +162,7 @@ class TestRunAccuracyBenchmark:
         """Verify that cancelling stops the run."""
         req = AccuracyBenchmarkRequest(
             model_id="test-model",
-            benchmarks=["mmlu"],
+            benchmarks={"mmlu": 100},
         )
         run = create_run(req)
         run.status = "cancelled"  # Pre-cancel

@@ -26,7 +26,7 @@ class HellaSwagBenchmark(BaseBenchmark):
     name = "hellaswag"
     quick_size = 200
 
-    async def load_dataset(self, full: bool = False) -> list[dict]:
+    async def load_dataset(self, sample_size: int = 0) -> list[dict]:
         """Load HellaSwag from bundled data."""
         items = load_jsonl(DATA_DIR / "hellaswag_val.jsonl")
 
@@ -43,10 +43,10 @@ class HellaSwagBenchmark(BaseBenchmark):
 
         logger.info(f"HellaSwag: loaded {len(normalized)} questions")
 
-        if full:
+        if sample_size == 0:
             return normalized
 
-        return deterministic_sample(normalized, self.quick_size)
+        return deterministic_sample(normalized, sample_size)
 
     def format_prompt(self, item: dict) -> list[dict[str, str]]:
         """Format context + 4 endings as multiple choice."""

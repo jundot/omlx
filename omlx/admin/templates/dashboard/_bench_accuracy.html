@@ -37,37 +37,33 @@
                             <!-- Benchmark Selection -->
                             <div>
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.benchmarks') }}</label>
-                                <div class="flex flex-wrap items-center gap-4">
-                                    <label class="flex items-center gap-2 cursor-pointer">
-                                        <input type="checkbox" x-model="accBenchmarks.mmlu" :disabled="accRunning"
-                                               class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                        <span class="text-sm text-neutral-600">MMLU</span>
-                                    </label>
-                                    <label class="flex items-center gap-2 cursor-pointer">
-                                        <input type="checkbox" x-model="accBenchmarks.hellaswag" :disabled="accRunning"
-                                               class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                        <span class="text-sm text-neutral-600">HellaSwag</span>
-                                    </label>
-                                    <label class="flex items-center gap-2 cursor-pointer">
-                                        <input type="checkbox" x-model="accBenchmarks.truthfulqa" :disabled="accRunning"
-                                               class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                        <span class="text-sm text-neutral-600">TruthfulQA</span>
-                                    </label>
-                                    <label class="flex items-center gap-2 cursor-pointer">
-                                        <input type="checkbox" x-model="accBenchmarks.gsm8k" :disabled="accRunning"
-                                               class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                        <span class="text-sm text-neutral-600">GSM8K</span>
-                                    </label>
-                                    <label class="flex items-center gap-2 cursor-pointer">
-                                        <input type="checkbox" x-model="accBenchmarks.livecodebench" :disabled="accRunning"
-                                               class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                        <span class="text-sm text-neutral-600">LiveCodeBench</span>
-                                        <span class="inline-flex items-center gap-1 px-1.5 py-0.5 bg-amber-50 text-amber-600 text-[10px] font-medium rounded"
-                                              title="{{ t('acc_bench.config.livecodebench_warning') }}">
-                                            <i data-lucide="alert-triangle" class="w-3 h-3"></i>
-                                            {{ t('acc_bench.config.code_exec') }}
-                                        </span>
-                                    </label>
+                                <div class="space-y-2.5">
+                                    <template x-for="b in accBenchmarkList" :key="b.key">
+                                        <div class="flex items-center justify-between max-w-lg">
+                                            <label class="flex items-center gap-2 cursor-pointer">
+                                                <input type="checkbox" x-model="accBenchmarks[b.key]" :disabled="accRunning"
+                                                       class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                                <span class="text-sm text-neutral-600" x-text="b.label"></span>
+                                                <template x-if="b.key === 'livecodebench'">
+                                                    <span class="inline-flex items-center gap-1 px-1.5 py-0.5 bg-amber-50 text-amber-600 text-[10px] font-medium rounded"
+                                                          title="{{ t('acc_bench.config.livecodebench_warning') }}">
+                                                        <i data-lucide="alert-triangle" class="w-3 h-3"></i>
+                                                        {{ t('acc_bench.config.code_exec') }}
+                                                    </span>
+                                                </template>
+                                            </label>
+                                            <select x-model.number="accSampleSizes[b.key]"
+                                                    :disabled="accRunning || !accBenchmarks[b.key]"
+                                                    class="px-2 py-1 text-xs border border-neutral-200 rounded-lg bg-white disabled:opacity-40 focus:ring-1 focus:ring-neutral-900 focus:border-transparent tabular-nums">
+                                                <option value="30">30</option>
+                                                <option value="50">50</option>
+                                                <option value="100">100</option>
+                                                <option value="200">200</option>
+                                                <option value="300">300</option>
+                                                <option value="0">Full</option>
+                                            </select>
+                                        </div>
+                                    </template>
                                 </div>
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.benchmarks_hint') }}</p>
                             </div>
@@ -87,17 +83,6 @@
                                     </template>
                                 </div>
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.batch_size_hint') }}</p>
-                            </div>
-
-                            <!-- Full Dataset Option -->
-                            <div>
-                                <label class="flex items-center gap-2 cursor-pointer">
-                                    <input type="checkbox" x-model="accFullDataset" :disabled="accRunning"
-                                           class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                    <span class="text-sm text-neutral-600">{{ t('acc_bench.config.full_dataset') }}</span>
-                                </label>
-                                <p class="text-xs text-neutral-400 mt-1"
-                                   x-show="accFullDataset" x-transition>{{ t('acc_bench.config.full_dataset_warning') }}</p>
                             </div>
 
                             <!-- Run / Cancel Button -->

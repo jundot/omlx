@@ -26,8 +26,7 @@ class AccuracyBenchmarkRequest(BaseModel):
     """Request model for starting an accuracy benchmark."""
 
     model_id: str
-    benchmarks: list[str]
-    full_dataset: bool = False
+    benchmarks: dict[str, int]  # name -> sample_size (0 = full dataset)
     batch_size: int = 1
 
     @field_validator("batch_size")
@@ -39,14 +38,16 @@ class AccuracyBenchmarkRequest(BaseModel):
 
     @field_validator("benchmarks")
     @classmethod
-    def validate_benchmarks(cls, v: list[str]) -> list[str]:
+    def validate_benchmarks(cls, v: dict[str, int]) -> dict[str, int]:
         if not v:
             raise ValueError("At least one benchmark is required")
-        for b in v:
-            if b not in VALID_BENCHMARKS:
+        for name, size in v.items():
+            if name not in VALID_BENCHMARKS:
                 raise ValueError(
-                    f"Invalid benchmark '{b}'. Must be one of {VALID_BENCHMARKS}"
+                    f"Invalid benchmark '{name}'. Must be one of {VALID_BENCHMARKS}"
                 )
+            if size < 0:
+                raise ValueError(f"Sample size for '{name}' must be >= 0")
         return v
 
 
@@ -146,7 +147,7 @@ async def run_accuracy_benchmark(
 
         # Phase 3: Run each benchmark
         completed = 0
-        for bench_name in request.benchmarks:
+        for bench_name, sample_size in request.benchmarks.items():
             if run.status == "cancelled":
                 break
 
@@ -168,7 +169,7 @@ async def run_accuracy_benchmark(
             })
 
             try:
-                items = await evaluator.load_dataset(full=request.full_dataset)
+                items = await evaluator.load_dataset(sample_size=sample_size)
             except Exception as e:
                 logger.error(f"Failed to load {bench_name} dataset: {e}")
                 await _send_event(run, {

@@ -58,9 +58,8 @@ class MMLUBenchmark(BaseBenchmark):
     def __init__(self):
         self._few_shot_examples: dict[str, list[dict]] = {}
 
-    async def load_dataset(self, full: bool = False) -> list[dict]:
+    async def load_dataset(self, sample_size: int = 0) -> list[dict]:
         """Load MMLU from bundled data files."""
-        # Load test split
         test_items = load_jsonl(DATA_DIR / "mmlu_test.jsonl")
         all_items = []
         for item in test_items:
@@ -92,10 +91,10 @@ class MMLUBenchmark(BaseBenchmark):
 
         logger.info(f"MMLU: loaded {len(all_items)} questions")
 
-        if full:
+        if sample_size == 0:
             return all_items
 
-        return stratified_sample(all_items, self.quick_size, key="subject")
+        return stratified_sample(all_items, sample_size, key="subject")
 
     def format_prompt(self, item: dict) -> list[dict[str, str]]:
         """Format with 5-shot examples from the same subject."""

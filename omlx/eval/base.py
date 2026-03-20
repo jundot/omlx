@@ -42,11 +42,11 @@ class BaseBenchmark(ABC):
     quick_size: int = 100
 
     @abstractmethod
-    async def load_dataset(self, full: bool = False) -> list[dict]:
-        """Download and load dataset items.
+    async def load_dataset(self, sample_size: int = 0) -> list[dict]:
+        """Load dataset items.
 
         Args:
-            full: If True, load the full dataset. Otherwise load quick subset.
+            sample_size: Number of questions to sample. 0 = full dataset.
 
         Returns:
             List of dataset items (format varies by benchmark).

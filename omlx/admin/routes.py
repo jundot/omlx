@@ -3340,7 +3340,7 @@ async def start_accuracy_benchmark(
     return {
         "bench_id": run.bench_id,
         "status": "started",
-        "benchmarks": bench_request.benchmarks,
+        "benchmarks": list(bench_request.benchmarks.keys()),
     }
 
 
