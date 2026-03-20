@@ -1236,11 +1236,17 @@
                             <div class="px-6 py-4 border-b border-neutral-200">
                                 <h4 class="text-sm font-semibold text-neutral-700">About oQ Quantization</h4>
                             </div>
-                            <div class="px-6 py-5 text-xs text-neutral-500 leading-relaxed space-y-4">
+                            <div class="px-6 py-5 text-sm text-neutral-500 leading-relaxed space-y-4">
+                                <blockquote class="border-l-2 border-neutral-300 pl-4 text-neutral-600 italic font-semibold">
+                                    <p>Quantization should not be exclusive to any particular inference server.</p>
+                                    <p class="mt-1">oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm, LM Studio, and any app
+                                    that supports MLX safetensors format. No custom loader required.</p>
+                                </blockquote>
+
                                 <p>
                                     <strong class="text-neutral-600">oQ</strong> (oMLX Quantization) is a mixed-precision quantization method
                                     that combines GGUF K-quant layer-position strategy, unsloth Dynamic 2.0 selective protection, and
-                                    AWQ output-MSE clip optimization. it assigns different bit widths per tensor based on sensitivity,
+                                    AWQ output-MSE clip optimization. It assigns different bit widths per tensor based on sensitivity,
                                     protecting critical layers (attention, routers, shared experts) while aggressively compressing
                                     redundant parameters (expert MLP).
                                 </p>
@@ -1250,10 +1256,10 @@
                                     <ul class="mt-1.5 ml-4 list-disc space-y-1">
                                         <li><strong>Rule-based tier classification</strong> — 34 tensor patterns from GGUF/unsloth research.
                                             MoE routers kept at fp16, attention protected at higher bits, expert MLP at base bits.</li>
-                                        <li><strong>Layer position weighting</strong> — first/last 12.5% of layers get +1 bit (GGUF Q4_K_M strategy).</li>
-                                        <li><strong>MLP asymmetry</strong> — for 512+ expert models, gate_proj ≥ 4-bit to prevent SiLU overflow (unsloth/GGUF Q2_K).</li>
-                                        <li><strong>Streaming quantization</strong> — processes tensors via mmap without loading the full model. ~15-20 GB memory for any model size.</li>
-                                        <li><strong>Enhanced mode (+)</strong> — optional AWQ-style clip optimization using calibration data for better quality at 2-4 bit. requires full model load.</li>
+                                        <li><strong>Layer position weighting</strong> — First/last 12.5% of layers get +1 bit (GGUF Q4_K_M strategy).</li>
+                                        <li><strong>MLP asymmetry</strong> — For 512+ expert models, gate_proj ≥ 4-bit to prevent SiLU overflow (unsloth/GGUF Q2_K).</li>
+                                        <li><strong>Streaming quantization</strong> — Processes tensors via mmap without loading the full model. ~15-20 GB memory for any model size.</li>
+                                        <li><strong>Enhanced mode (+)</strong> — Optional AWQ-style clip optimization using calibration data for better quality at 2-4 bit. Requires full model load.</li>
                                     </ul>
                                 </div>
 
@@ -1298,113 +1304,49 @@
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">VLM vision</td>
-                                                    <td class="py-1.5 px-3">preserved (fp16)</td>
-                                                    <td class="py-1.5 px-3">separate mmproj</td>
-                                                    <td class="py-1.5 px-3">separate mmproj</td>
-                                                    <td class="py-1.5 px-3">preserved</td>
-                                                    <td class="py-1.5 px-3">not supported</td>
+                                                    <td class="py-1.5 px-3">Preserved (fp16)</td>
+                                                    <td class="py-1.5 px-3">Separate mmproj</td>
+                                                    <td class="py-1.5 px-3">Separate mmproj</td>
+                                                    <td class="py-1.5 px-3">Preserved</td>
+                                                    <td class="py-1.5 px-3">Not supported</td>
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">SSM/GatedDeltaNet</td>
                                                     <td class="py-1.5 px-3">F32 state + 5-bit proj</td>
                                                     <td class="py-1.5 px-3">F32 state</td>
                                                     <td class="py-1.5 px-3">F32 state</td>
-                                                    <td class="py-1.5 px-3">supported</td>
-                                                    <td class="py-1.5 px-3">not tested</td>
+                                                    <td class="py-1.5 px-3">Supported</td>
+                                                    <td class="py-1.5 px-3">Not tested</td>
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Calibration</td>
-                                                    <td class="py-1.5 px-3">optional (Enhanced+)</td>
-                                                    <td class="py-1.5 px-3">none</td>
+                                                    <td class="py-1.5 px-3">Optional (Enhanced+)</td>
+                                                    <td class="py-1.5 px-3">None</td>
                                                     <td class="py-1.5 px-3">imatrix required</td>
-                                                    <td class="py-1.5 px-3">proprietary data</td>
-                                                    <td class="py-1.5 px-3">activation data</td>
+                                                    <td class="py-1.5 px-3">Proprietary data</td>
+                                                    <td class="py-1.5 px-3">Activation data</td>
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Memory usage</td>
                                                     <td class="py-1.5 px-3">~15-20 GB (streaming)</td>
                                                     <td class="py-1.5 px-3">1× model</td>
                                                     <td class="py-1.5 px-3">1× model</td>
-                                                    <td class="py-1.5 px-3">proprietary</td>
+                                                    <td class="py-1.5 px-3">Proprietary</td>
                                                     <td class="py-1.5 px-3">1.5× model</td>
                                                 </tr>
                                                 <tr>
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Apple Silicon native</td>
-                                                    <td class="py-1.5 px-3">yes (MLX)</td>
-                                                    <td class="py-1.5 px-3">via llama.cpp</td>
-                                                    <td class="py-1.5 px-3">via llama.cpp</td>
+                                                    <td class="py-1.5 px-3">Yes (MLX)</td>
+                                                    <td class="py-1.5 px-3">Via llama.cpp</td>
+                                                    <td class="py-1.5 px-3">Via llama.cpp</td>
                                                     <td class="py-1.5 px-3">GGUF only</td>
-                                                    <td class="py-1.5 px-3">yes (MLX)</td>
+                                                    <td class="py-1.5 px-3">Yes (MLX)</td>
                                                 </tr>
                                             </tbody>
                                         </table>
                                     </div>
                                 </div>
 
-                                <div>
-                                    <strong class="text-neutral-600">oQ levels</strong>
-                                    <div class="mt-2 overflow-x-auto">
-                                        <table class="w-full text-xs">
-                                            <thead>
-                                                <tr class="border-b border-neutral-200">
-                                                    <th class="text-left py-2 pr-4 font-semibold text-neutral-600">Level</th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Base bits</th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Protection</th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Use case</th>
-                                                </tr>
-                                            </thead>
-                                            <tbody class="text-neutral-500">
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">oQ2</td>
-                                                    <td class="py-1.5 px-3">2-bit</td>
-                                                    <td class="py-1.5 px-3">minimal (attn +2, sensitive layers +1)</td>
-                                                    <td class="py-1.5 px-3">extreme compression, fit large MoE in limited memory</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">oQ3</td>
-                                                    <td class="py-1.5 px-3">2-bit</td>
-                                                    <td class="py-1.5 px-3">full (attn 6-bit, shared expert 6-bit, layer position)</td>
-                                                    <td class="py-1.5 px-3">balanced quality/size tradeoff</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">oQ4</td>
-                                                    <td class="py-1.5 px-3">4-bit</td>
-                                                    <td class="py-1.5 px-3">full</td>
-                                                    <td class="py-1.5 px-3">recommended default</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">oQ5</td>
-                                                    <td class="py-1.5 px-3">5-bit</td>
-                                                    <td class="py-1.5 px-3">full</td>
-                                                    <td class="py-1.5 px-3">high quality</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">oQ6</td>
-                                                    <td class="py-1.5 px-3">6-bit</td>
-                                                    <td class="py-1.5 px-3">full</td>
-                                                    <td class="py-1.5 px-3">near-lossless</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">oQ7</td>
-                                                    <td class="py-1.5 px-3">8-bit</td>
-                                                    <td class="py-1.5 px-3">full</td>
-                                                    <td class="py-1.5 px-3">very high quality</td>
-                                                </tr>
-                                                <tr>
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">oQ8</td>
-                                                    <td class="py-1.5 px-3">8-bit</td>
-                                                    <td class="py-1.5 px-3">minimal</td>
-                                                    <td class="py-1.5 px-3">near-lossless, minimal overhead</td>
-                                                </tr>
-                                            </tbody>
-                                        </table>
-                                    </div>
-                                </div>
-
-                                <p class="text-neutral-400">
-                                    oQ models are compatible with all MLX inference tools (oMLX, mlx-lm, LM Studio).
-                                    no custom loader required — standard mlx-lm config.json format.
-                                </p>
                             </div>
                         </div>
                     </div>

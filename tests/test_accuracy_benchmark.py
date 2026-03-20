@@ -10,9 +10,14 @@ from omlx.admin.accuracy_benchmark import (
     VALID_BENCHMARKS,
     AccuracyBenchmarkRequest,
     AccuracyBenchmarkRun,
+    _accumulated_results,
+    add_to_queue,
     cleanup_old_runs,
     create_run,
+    get_accumulated_results,
+    get_queue_status,
     get_run,
+    reset_accumulated_results,
     run_accuracy_benchmark,
 )
 
@@ -56,9 +61,41 @@ class TestAccuracyBenchmarkRequest:
         assert len(req.benchmarks) == 5
 
 
+class TestQueueAndResults:
+    def setup_method(self):
+        from omlx.admin.accuracy_benchmark import _queue
+        _queue.clear()
+        reset_accumulated_results()
+
+    def test_add_to_queue(self):
+        req = AccuracyBenchmarkRequest(
+            model_id="model-a",
+            benchmarks={"mmlu": 100},
+        )
+        add_to_queue(req)
+        status = get_queue_status()
+        assert len(status["queue"]) == 1
+        assert status["queue"][0]["model_id"] == "model-a"
+
+    def test_queue_status_empty(self):
+        status = get_queue_status()
+        assert status["running"] is False
+        assert len(status["queue"]) == 0
+
+    def test_accumulated_results(self):
+        _accumulated_results.append({"model_id": "m1", "benchmark": "mmlu", "accuracy": 0.5})
+        results = get_accumulated_results()
+        assert len(results) == 1
+        assert results[0]["model_id"] == "m1"
+
+    def test_reset_accumulated_results(self):
+        _accumulated_results.append({"model_id": "m1", "benchmark": "mmlu", "accuracy": 0.5})
+        reset_accumulated_results()
+        assert len(get_accumulated_results()) == 0
+
+
 class TestRunLifecycle:
     def setup_method(self):
-        # Clean up any leftover runs from previous tests
         from omlx.admin.accuracy_benchmark import _accuracy_runs
         _accuracy_runs.clear()
 

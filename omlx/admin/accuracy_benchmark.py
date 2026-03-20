@@ -3,6 +3,9 @@
 
 Orchestrates MMLU, HellaSwag, TruthfulQA, GSM8K, and LiveCodeBench
 evaluations with real-time progress reporting via SSE events.
+
+Supports server-side queue and persistent result accumulation.
+Results survive browser close and persist until explicitly reset.
 """
 
 import asyncio
@@ -18,6 +21,16 @@ logger = logging.getLogger(__name__)
 
 # Module-level storage for active benchmark runs
 _accuracy_runs: dict[str, "AccuracyBenchmarkRun"] = {}
+
+# Accumulated results — persists until explicit reset
+_accumulated_results: list[dict] = []
+
+# Server-side queue
+_queue: list["AccuracyBenchmarkRequest"] = []
+_queue_running: bool = False
+_current_run_id: Optional[str] = None
+_current_model: Optional[str] = None
+_engine_pool_ref: Any = None
 
 VALID_BENCHMARKS = ["mmlu", "hellaswag", "truthfulqa", "gsm8k", "livecodebench"]
 
@@ -62,6 +75,10 @@ class AccuracyBenchmarkRun:
     task: Optional[asyncio.Task] = None
     results: list[dict] = field(default_factory=list)
     error_message: str = ""
+    last_progress: Optional[dict] = None  # last progress event for reconnect
+
+
+# --- Run management ---
 
 
 def get_run(bench_id: str) -> Optional[AccuracyBenchmarkRun]:
@@ -87,12 +104,157 @@ def cleanup_old_runs() -> None:
         del _accuracy_runs[bid]
 
 
+# --- Accumulated results ---
+
+
+def get_accumulated_results() -> list[dict]:
+    """Get all accumulated benchmark results."""
+    return _accumulated_results
+
+
+def reset_accumulated_results() -> None:
+    """Clear all accumulated results."""
+    _accumulated_results.clear()
+
+
+# --- Queue management ---
+
+
+def add_to_queue(request: AccuracyBenchmarkRequest) -> None:
+    """Add a benchmark request to the queue."""
+    _queue.append(request)
+
+
+def get_queue_status() -> dict:
+    """Get current queue status."""
+    last_progress = None
+    if _current_run_id:
+        run = get_run(_current_run_id)
+        if run:
+            last_progress = run.last_progress
+    return {
+        "running": _queue_running,
+        "current_model": _current_model,
+        "current_bench_id": _current_run_id,
+        "last_progress": last_progress,
+        "queue": [
+            {"model_id": r.model_id, "benchmarks": list(r.benchmarks.keys())}
+            for r in _queue
+        ],
+    }
+
+
+def remove_from_queue(idx: int) -> bool:
+    """Remove an item from the queue by index."""
+    if 0 <= idx < len(_queue):
+        _queue.pop(idx)
+        return True
+    return False
+
+
+def start_next_from_queue(engine_pool: Any) -> Optional[str]:
+    """Pop next item from queue, create run, start background task.
+
+    Returns bench_id if a run was started, None if already running or queue empty.
+    This is synchronous so the caller gets the bench_id immediately.
+    """
+    global _queue_running, _current_run_id, _current_model, _engine_pool_ref
+
+    _engine_pool_ref = engine_pool
+
+    if _queue_running:
+        return None
+
+    if not _queue:
+        return None
+
+    request = _queue.pop(0)
+    _queue_running = True
+    _current_model = request.model_id
+
+    cleanup_old_runs()
+    run = create_run(request)
+    _current_run_id = run.bench_id
+
+    logger.info(
+        f"Queue: starting {request.model_id} "
+        f"benchmarks={list(request.benchmarks.keys())}"
+    )
+
+    async def _run_and_continue():
+        try:
+            await run_accuracy_benchmark(run, engine_pool)
+        except Exception as e:
+            logger.error(f"Queue: error running {request.model_id}: {e}")
+        # Auto-continue with next in queue
+        await _continue_queue(engine_pool)
+
+    run.task = asyncio.create_task(_run_and_continue())
+    return run.bench_id
+
+
+async def _continue_queue(engine_pool: Any) -> None:
+    """Continue processing the queue after a run completes."""
+    global _queue_running, _current_run_id, _current_model
+
+    if not _queue:
+        _queue_running = False
+        _current_run_id = None
+        _current_model = None
+        return
+
+    request = _queue.pop(0)
+    _current_model = request.model_id
+
+    cleanup_old_runs()
+    run = create_run(request)
+    _current_run_id = run.bench_id
+
+    logger.info(
+        f"Queue: continuing with {request.model_id} "
+        f"benchmarks={list(request.benchmarks.keys())}"
+    )
+
+    try:
+        await run_accuracy_benchmark(run, engine_pool)
+    except Exception as e:
+        logger.error(f"Queue: error running {request.model_id}: {e}")
+
+    await _continue_queue(engine_pool)
+
+
+async def cancel_queue() -> None:
+    """Cancel the current run and clear the queue."""
+    global _queue_running, _current_run_id, _current_model
+
+    _queue.clear()
+
+    if _current_run_id:
+        run = get_run(_current_run_id)
+        if run and run.status == "running":
+            run.status = "cancelled"
+            if run.task and not run.task.done():
+                run.task.cancel()
+
+    _queue_running = False
+    _current_run_id = None
+    _current_model = None
+
+
+# --- SSE ---
+
+
 async def _send_event(run: AccuracyBenchmarkRun, event: dict) -> None:
     """Send an SSE event to the client."""
+    if event.get("type") == "progress":
+        run.last_progress = event
     try:
         await run.queue.put(event)
     except Exception:
         pass
+
+
+# --- Benchmark execution ---
 
 
 async def run_accuracy_benchmark(
@@ -103,10 +265,7 @@ async def run_accuracy_benchmark(
     Phases:
     1. Unload all models
     2. Load target model
-    3. For each selected benchmark:
-       a. Download dataset (with progress)
-       b. Run evaluator (with per-question progress)
-       c. Report results
+    3. For each selected benchmark: load data, evaluate, report
     4. Unload model
     5. Send done event
     """
@@ -122,6 +281,7 @@ async def run_accuracy_benchmark(
             await _send_event(run, {
                 "type": "progress",
                 "phase": "unload",
+                "model_id": request.model_id,
                 "benchmark": "",
                 "message": f"Unloading {len(loaded_ids)} model(s)...",
                 "current": 0,
@@ -137,6 +297,7 @@ async def run_accuracy_benchmark(
         await _send_event(run, {
             "type": "progress",
             "phase": "load",
+            "model_id": request.model_id,
             "benchmark": "",
             "message": f"Loading {request.model_id}...",
             "current": 0,
@@ -158,12 +319,13 @@ async def run_accuracy_benchmark(
 
             evaluator = bench_cls()
 
-            # Download dataset
+            # Load dataset
             await _send_event(run, {
                 "type": "progress",
                 "phase": "download",
+                "model_id": request.model_id,
                 "benchmark": bench_name,
-                "message": f"Downloading {bench_name} dataset...",
+                "message": f"Loading {bench_name} dataset...",
                 "current": completed,
                 "total": len(request.benchmarks),
             })
@@ -174,7 +336,7 @@ async def run_accuracy_benchmark(
                 logger.error(f"Failed to load {bench_name} dataset: {e}")
                 await _send_event(run, {
                     "type": "error",
-                    "message": f"Failed to download {bench_name} dataset: {e}",
+                    "message": f"Failed to load {bench_name} dataset: {e}",
                 })
                 run.status = "error"
                 run.error_message = str(e)
@@ -189,6 +351,7 @@ async def run_accuracy_benchmark(
                 await _send_event(run, {
                     "type": "progress",
                     "phase": "eval",
+                    "model_id": request.model_id,
                     "benchmark": bench_name,
                     "message": f"Evaluating {bench_name} ({current}/{total})...",
                     "current": completed,
@@ -200,6 +363,7 @@ async def run_accuracy_benchmark(
             await _send_event(run, {
                 "type": "progress",
                 "phase": "eval",
+                "model_id": request.model_id,
                 "benchmark": bench_name,
                 "message": f"Evaluating {bench_name} (0/{total_items})...",
                 "current": completed,
@@ -230,8 +394,9 @@ async def run_accuracy_benchmark(
                 run.error_message = str(e)
                 return
 
-            # Send result
+            # Build result
             result_data = {
+                "model_id": request.model_id,
                 "benchmark": result.benchmark_name,
                 "accuracy": round(result.accuracy, 4),
                 "total": result.total_questions,
@@ -242,6 +407,9 @@ async def run_accuracy_benchmark(
                 result_data["category_scores"] = {
                     k: round(v, 4) for k, v in result.category_scores.items()
                 }
+
+            # Accumulate persistently
+            _accumulated_results.append(result_data)
 
             run.results.append(result_data)
             completed += 1

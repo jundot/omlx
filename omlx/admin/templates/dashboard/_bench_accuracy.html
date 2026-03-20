@@ -25,7 +25,7 @@
                             <div>
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.model') }}</label>
                                 <select x-model="accModelId"
-                                        :disabled="accRunning"
+                                        :disabled="false"
                                         class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                     <option value="">{{ t('acc_bench.config.model_placeholder') }}</option>
                                     <template x-for="m in models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type)" :key="m.id">
@@ -34,27 +34,32 @@
                                 </select>
                             </div>
 
-                            <!-- Benchmark Selection -->
+                            <!-- Benchmark Selection — Card Grid -->
                             <div>
-                                <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.benchmarks') }}</label>
-                                <div class="space-y-2.5">
+                                <label class="block text-sm font-medium text-neutral-700 mb-3">{{ t('acc_bench.config.benchmarks') }}</label>
+                                <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
                                     <template x-for="b in accBenchmarkList" :key="b.key">
-                                        <div class="flex items-center justify-between max-w-lg">
-                                            <label class="flex items-center gap-2 cursor-pointer">
-                                                <input type="checkbox" x-model="accBenchmarks[b.key]" :disabled="accRunning"
-                                                       class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                                <span class="text-sm text-neutral-600" x-text="b.label"></span>
-                                                <template x-if="b.key === 'livecodebench'">
-                                                    <span class="inline-flex items-center gap-1 px-1.5 py-0.5 bg-amber-50 text-amber-600 text-[10px] font-medium rounded"
-                                                          title="{{ t('acc_bench.config.livecodebench_warning') }}">
-                                                        <i data-lucide="alert-triangle" class="w-3 h-3"></i>
-                                                        {{ t('acc_bench.config.code_exec') }}
-                                                    </span>
-                                                </template>
-                                            </label>
+                                        <div @click="accBenchmarks[b.key] = !accBenchmarks[b.key]"
+                                             class="relative rounded-xl border-2 p-4 cursor-pointer transition-all select-none"
+                                             :class="accBenchmarks[b.key]
+                                                 ? 'border-neutral-900 bg-neutral-900 text-white shadow-md'
+                                                 : 'border-neutral-200 bg-white text-neutral-500 hover:border-neutral-300 hover:shadow-sm'">
+                                            <!-- Check icon -->
+                                            <div class="absolute top-2 right-2">
+                                                <svg x-show="accBenchmarks[b.key]" class="w-4 h-4 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                                            </div>
+                                            <!-- Benchmark name -->
+                                            <div class="text-lg font-bold mb-1" x-text="b.label"></div>
+                                            <!-- Description -->
+                                            <div class="text-[10px] mb-3 opacity-70" x-text="b.desc"></div>
+                                            <!-- Sample size selector -->
                                             <select x-model.number="accSampleSizes[b.key]"
-                                                    :disabled="accRunning || !accBenchmarks[b.key]"
-                                                    class="px-2 py-1 text-xs border border-neutral-200 rounded-lg bg-white disabled:opacity-40 focus:ring-1 focus:ring-neutral-900 focus:border-transparent tabular-nums">
+                                                    @click.stop
+                                                    :disabled="!accBenchmarks[b.key]"
+                                                    class="w-full px-2 py-1 text-xs rounded-lg border transition-all tabular-nums"
+                                                    :class="accBenchmarks[b.key]
+                                                        ? 'bg-white/20 border-white/30 text-white disabled:opacity-40 [&>option]:text-neutral-900'
+                                                        : 'bg-neutral-50 border-neutral-200 text-neutral-600 disabled:opacity-40'">
                                                 <option value="30">30</option>
                                                 <option value="50">50</option>
                                                 <option value="100">100</option>
@@ -62,10 +67,21 @@
                                                 <option value="300">300</option>
                                                 <option value="0">Full</option>
                                             </select>
+                                            <!-- Code exec warning badge -->
+                                            <template x-if="b.key === 'livecodebench'">
+                                                <div class="mt-2">
+                                                    <span class="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium rounded"
+                                                          :class="accBenchmarks[b.key] ? 'bg-amber-400/20 text-amber-200' : 'bg-amber-50 text-amber-500'"
+                                                          title="{{ t('acc_bench.config.livecodebench_warning') }}">
+                                                        <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                                                        {{ t('acc_bench.config.code_exec') }}
+                                                    </span>
+                                                </div>
+                                            </template>
                                         </div>
                                     </template>
                                 </div>
-                                <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.benchmarks_hint') }}</p>
+                                <p class="text-xs text-neutral-400 mt-2">{{ t('acc_bench.config.benchmarks_hint') }}</p>
                             </div>
 
                             <!-- Batch Size -->
@@ -76,7 +92,6 @@
                                         <label class="flex items-center gap-2 cursor-pointer">
                                             <input type="radio" name="accBatchSize"
                                                    :value="bs" x-model.number="accBatchSize"
-                                                   :disabled="accRunning"
                                                    class="w-4 h-4 border-neutral-300 text-neutral-900 focus:ring-neutral-900">
                                             <span class="text-sm text-neutral-600" x-text="bs + 'x'"></span>
                                         </label>
@@ -85,18 +100,17 @@
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.batch_size_hint') }}</p>
                             </div>
 
-                            <!-- Run / Cancel Button -->
+                            <!-- Add & Run Button -->
                             <div class="flex items-center gap-3 pt-2">
-                                <button x-show="!accRunning"
-                                        @click="startAccuracyBenchmark()"
+                                <button @click="addToAccQueue()"
                                         :disabled="!accModelId || !Object.values(accBenchmarks).some(v => v)"
                                         class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
                                     <i data-lucide="play" class="w-4 h-4"></i>
-                                    {{ t('acc_bench.config.run_button') }}
+                                    {{ t('acc_bench.config.add_run') }}
                                 </button>
                                 <button x-show="accRunning"
                                         @click="cancelAccuracyBenchmark()"
-                                        class="px-6 py-2.5 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 transition-all flex items-center gap-2">
+                                        class="px-5 py-2.5 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 transition-all flex items-center gap-2">
                                     <i data-lucide="square" class="w-4 h-4"></i>
                                     {{ t('acc_bench.config.cancel_button') }}
                                 </button>
@@ -104,11 +118,40 @@
                         </div>
                     </div>
 
+                    <!-- Queue Display -->
+                    <div x-show="accCurrentModel || accQueue.length > 0" x-cloak class="mb-6">
+                        <div class="flex items-center gap-2 mb-2">
+                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('acc_bench.config.queue_label') }}</span>
+                        </div>
+                        <div class="flex flex-wrap gap-2">
+                            <!-- Currently running model -->
+                            <div x-show="accCurrentModel" class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-neutral-900 text-white rounded-lg text-sm cursor-default">
+                                <svg class="animate-spin w-3 h-3" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                                <span x-text="accCurrentModel"></span>
+                            </div>
+                            <!-- Queued models -->
+                            <template x-for="(q, idx) in accQueue" :key="idx">
+                                <div class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-neutral-100 rounded-lg text-sm text-neutral-700">
+                                    <span x-text="q.model_id"></span>
+                                    <span class="text-neutral-400 text-xs" x-text="'(' + q.benchmarks.join(', ') + ')'"></span>
+                                    <button @click="removeFromAccQueue(idx)"
+                                            class="ml-1 text-neutral-500 hover:text-red-500 transition-colors">
+                                        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                                    </button>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+
                     <!-- Progress Section -->
-                    <div x-show="accRunning && accProgress" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                    <div x-show="accRunning" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
                         <div class="px-6 py-4">
                             <div class="flex items-center justify-between mb-3">
-                                <span class="text-sm font-medium text-neutral-700" x-text="accProgress?.message || 'Preparing...'"></span>
+                                <div class="flex items-center gap-2">
+                                    <span class="text-xs font-medium text-neutral-400 uppercase" x-text="accCurrentModel"></span>
+                                    <span class="text-neutral-300">·</span>
+                                    <span class="text-sm font-medium text-neutral-700" x-text="accProgress?.message || 'Preparing...'"></span>
+                                </div>
                                 <div class="flex items-center gap-3">
                                     <span class="text-xs text-neutral-400" x-text="accProgress?.bench_current && accProgress?.bench_total ? (accProgress.bench_current + ' / ' + accProgress.bench_total) : ''"></span>
                                     <button @click="cancelAccuracyBenchmark()"
@@ -123,7 +166,6 @@
                                 <div class="h-full bg-neutral-900 rounded-full transition-all duration-500"
                                      :style="'width: ' + (accProgress?.bench_total ? (accProgress.bench_current / accProgress.bench_total * 100) : 0) + '%'"></div>
                             </div>
-                            <!-- Overall benchmark progress -->
                             <div class="flex items-center gap-2 mt-2">
                                 <span class="text-xs text-neutral-400" x-text="accProgress?.benchmark ? ('Running: ' + accProgress.benchmark.toUpperCase()) : ''"></span>
                                 <span class="text-xs text-neutral-300">·</span>
@@ -140,8 +182,18 @@
                         </div>
                     </div>
 
+                    <!-- Results Header with Clear Button -->
+                    <div x-show="accAllResults.length > 0" x-cloak class="flex items-center justify-between mb-4">
+                        <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('acc_bench.results.section_label') }}</span>
+                        <button @click="resetAccResults()"
+                                class="px-3 py-1.5 text-xs font-medium text-neutral-500 bg-neutral-100 rounded-lg hover:bg-neutral-200 hover:text-neutral-700 transition-all flex items-center gap-1.5">
+                            <i data-lucide="trash-2" class="w-3 h-3"></i>
+                            {{ t('acc_bench.results.clear') }}
+                        </button>
+                    </div>
+
                     <!-- Results Section -->
-                    <template x-for="(r, idx) in accResults" :key="idx">
+                    <template x-for="(r, idx) in accAllResults" :key="idx">
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-4 animate-fade-in-up">
                             <div class="px-6 py-4">
                                 <div class="flex items-center justify-between">
@@ -151,7 +203,10 @@
                                             <i data-lucide="target" class="w-5 h-5"></i>
                                         </div>
                                         <div>
-                                            <h4 class="text-sm font-semibold text-neutral-900" x-text="r.benchmark.toUpperCase()"></h4>
+                                            <div class="flex items-center gap-2">
+                                                <h4 class="text-sm font-semibold text-neutral-900" x-text="r.benchmark.toUpperCase()"></h4>
+                                                <span class="text-xs font-medium text-neutral-400 bg-neutral-100 px-1.5 py-0.5 rounded" x-text="r.model_id"></span>
+                                            </div>
                                             <span class="text-xs text-neutral-400" x-text="r.correct + ' / ' + r.total + ' correct · ' + r.time_s + 's'"></span>
                                         </div>
                                     </div>
@@ -195,7 +250,7 @@
                     </template>
 
                     <!-- Text Export -->
-                    <div x-show="accResults.length > 0" x-cloak class="mt-6">
+                    <div x-show="accAllResults.length > 0" x-cloak class="mt-6">
                         <button @click="accShowText = !accShowText"
                                 class="flex items-center gap-2 text-sm text-neutral-500 hover:text-neutral-700 transition-colors mb-3">
                             <i data-lucide="file-text" class="w-4 h-4"></i>
@@ -203,7 +258,7 @@
                         </button>
                         <div x-show="accShowText" x-transition class="relative">
                             <textarea id="accTextarea" readonly
-                                      class="w-full h-48 px-4 py-3 text-xs font-mono bg-neutral-50 border border-neutral-200 rounded-xl resize-none focus:outline-none"
+                                      class="w-full h-96 px-4 py-3 text-xs font-mono bg-neutral-50 border border-neutral-200 rounded-xl resize-y focus:outline-none"
                                       x-text="accBuildText()"></textarea>
                             <button @click="accCopyText()"
                                     class="absolute top-3 right-3 px-3 py-1.5 text-xs font-medium bg-white border border-neutral-200 rounded-lg hover:bg-neutral-50 transition-all flex items-center gap-1.5">

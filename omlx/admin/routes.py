@@ -3134,7 +3134,166 @@ async def get_ms_model_info(
 
 
 # =============================================================================
-# Benchmark API Routes
+# Accuracy Benchmark API Routes (MUST be before throughput {bench_id} routes)
+# =============================================================================
+
+
+@router.post("/api/bench/accuracy/queue/add")
+async def add_to_accuracy_queue(
+    request: Request,
+    is_admin: bool = Depends(require_admin),
+):
+    """Add a model to the accuracy benchmark queue and start if idle."""
+    from .accuracy_benchmark import (
+        AccuracyBenchmarkRequest,
+        add_to_queue,
+        get_queue_status,
+        start_next_from_queue,
+    )
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    body = await request.json()
+    try:
+        bench_request = AccuracyBenchmarkRequest(**body)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    entry = engine_pool.get_entry(bench_request.model_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model not found: {bench_request.model_id}"
+        )
+    if entry.model_type not in ("llm", "vlm", None):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model {bench_request.model_id} is not a supported model (type: {entry.model_type})",
+        )
+
+    add_to_queue(bench_request)
+
+    logger.info(
+        f"Accuracy queue: added {bench_request.model_id} "
+        f"benchmarks={list(bench_request.benchmarks.keys())}"
+    )
+
+    # Start processing if not already running (synchronous — sets bench_id immediately)
+    start_next_from_queue(engine_pool)
+
+    return get_queue_status()
+
+
+@router.get("/api/bench/accuracy/queue/status")
+async def get_accuracy_queue_status(
+    is_admin: bool = Depends(require_admin),
+):
+    """Get accuracy benchmark queue status."""
+    from .accuracy_benchmark import get_queue_status
+
+    return get_queue_status()
+
+
+@router.delete("/api/bench/accuracy/queue/{idx}")
+async def remove_from_accuracy_queue(
+    idx: int,
+    is_admin: bool = Depends(require_admin),
+):
+    """Remove an item from the accuracy benchmark queue."""
+    from .accuracy_benchmark import get_queue_status, remove_from_queue
+
+    if not remove_from_queue(idx):
+        raise HTTPException(status_code=404, detail=f"Queue index {idx} not found")
+
+    return get_queue_status()
+
+
+@router.get("/api/bench/accuracy/results")
+async def get_accumulated_accuracy_results(
+    is_admin: bool = Depends(require_admin),
+):
+    """Get all accumulated accuracy benchmark results."""
+    from .accuracy_benchmark import get_accumulated_results, get_queue_status
+
+    status = get_queue_status()
+    return {
+        "results": get_accumulated_results(),
+        "running": status["running"],
+        "current_model": status["current_model"],
+        "current_bench_id": status["current_bench_id"],
+    }
+
+
+@router.post("/api/bench/accuracy/results/reset")
+async def reset_accuracy_results(
+    is_admin: bool = Depends(require_admin),
+):
+    """Clear all accumulated accuracy benchmark results."""
+    from .accuracy_benchmark import reset_accumulated_results
+
+    reset_accumulated_results()
+    return {"status": "reset"}
+
+
+@router.post("/api/bench/accuracy/cancel")
+async def cancel_accuracy_queue(
+    is_admin: bool = Depends(require_admin),
+):
+    """Cancel the current run and clear the queue."""
+    from .accuracy_benchmark import cancel_queue
+
+    await cancel_queue()
+    return {"status": "cancelled"}
+
+
+@router.get("/api/bench/accuracy/{bench_id}/stream")
+async def stream_accuracy_benchmark(
+    bench_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Stream accuracy benchmark progress via Server-Sent Events."""
+    import json
+
+    from fastapi.responses import StreamingResponse
+
+    from .accuracy_benchmark import get_run
+
+    run = get_run(bench_id)
+    if run is None:
+        raise HTTPException(
+            status_code=404, detail=f"Accuracy benchmark not found: {bench_id}"
+        )
+
+    async def event_generator():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(run.queue.get(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+
+                yield f"data: {json.dumps(event)}\n\n"
+
+                if event.get("type") in ("done", "error"):
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# =============================================================================
+# Benchmark API Routes (Throughput)
 # =============================================================================
 
 
@@ -3278,157 +3437,6 @@ async def get_benchmark_results(
     run = get_run(bench_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"Benchmark not found: {bench_id}")
-
-    return {
-        "bench_id": run.bench_id,
-        "status": run.status,
-        "results": run.results,
-        "error": run.error_message if run.error_message else None,
-    }
-
-
-# =============================================================================
-# Accuracy Benchmark API Routes
-# =============================================================================
-
-
-@router.post("/api/bench/accuracy/start")
-async def start_accuracy_benchmark(
-    request: Request,
-    is_admin: bool = Depends(require_admin),
-):
-    """Start an accuracy benchmark run."""
-    from .accuracy_benchmark import (
-        AccuracyBenchmarkRequest,
-        cleanup_old_runs,
-        create_run,
-        run_accuracy_benchmark,
-    )
-
-    engine_pool = _get_engine_pool()
-    if engine_pool is None:
-        raise HTTPException(status_code=503, detail="Engine pool not initialized")
-
-    body = await request.json()
-    try:
-        bench_request = AccuracyBenchmarkRequest(**body)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    # Validate model exists and is an LLM
-    entry = engine_pool.get_entry(bench_request.model_id)
-    if entry is None:
-        raise HTTPException(
-            status_code=404, detail=f"Model not found: {bench_request.model_id}"
-        )
-    if entry.model_type not in ("llm", "vlm", None):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Model {bench_request.model_id} is not a supported model (type: {entry.model_type})",
-        )
-
-    cleanup_old_runs()
-
-    run = create_run(bench_request)
-    run.task = asyncio.create_task(run_accuracy_benchmark(run, engine_pool))
-
-    logger.info(
-        f"Accuracy benchmark started: {run.bench_id} model={bench_request.model_id} "
-        f"benchmarks={bench_request.benchmarks}"
-    )
-
-    return {
-        "bench_id": run.bench_id,
-        "status": "started",
-        "benchmarks": list(bench_request.benchmarks.keys()),
-    }
-
-
-@router.get("/api/bench/accuracy/{bench_id}/stream")
-async def stream_accuracy_benchmark(
-    bench_id: str,
-    is_admin: bool = Depends(require_admin),
-):
-    """Stream accuracy benchmark progress via Server-Sent Events."""
-    import json
-
-    from fastapi.responses import StreamingResponse
-
-    from .accuracy_benchmark import get_run
-
-    run = get_run(bench_id)
-    if run is None:
-        raise HTTPException(
-            status_code=404, detail=f"Accuracy benchmark not found: {bench_id}"
-        )
-
-    async def event_generator():
-        try:
-            while True:
-                try:
-                    event = await asyncio.wait_for(run.queue.get(), timeout=60.0)
-                except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
-                    continue
-
-                yield f"data: {json.dumps(event)}\n\n"
-
-                if event.get("type") in ("done", "error"):
-                    break
-        except asyncio.CancelledError:
-            pass
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-@router.post("/api/bench/accuracy/{bench_id}/cancel")
-async def cancel_accuracy_benchmark(
-    bench_id: str,
-    is_admin: bool = Depends(require_admin),
-):
-    """Cancel a running accuracy benchmark."""
-    from .accuracy_benchmark import get_run
-
-    run = get_run(bench_id)
-    if run is None:
-        raise HTTPException(
-            status_code=404, detail=f"Accuracy benchmark not found: {bench_id}"
-        )
-
-    if run.status != "running":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Benchmark is not running (status: {run.status})",
-        )
-
-    run.status = "cancelled"
-    if run.task and not run.task.done():
-        run.task.cancel()
-
-    return {"status": "cancelled", "bench_id": bench_id}
-
-
-@router.get("/api/bench/accuracy/{bench_id}/results")
-async def get_accuracy_benchmark_results(
-    bench_id: str,
-    is_admin: bool = Depends(require_admin),
-):
-    """Get results from a completed accuracy benchmark."""
-    from .accuracy_benchmark import get_run
-
-    run = get_run(bench_id)
-    if run is None:
-        raise HTTPException(
-            status_code=404, detail=f"Accuracy benchmark not found: {bench_id}"
-        )
 
     return {
         "bench_id": run.bench_id,

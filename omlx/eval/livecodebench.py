@@ -10,6 +10,7 @@ machine. Mitigations: subprocess with timeout, memory limits via resource
 module, temp file cleanup. Users are warned in the UI before running.
 """
 
+import asyncio
 import json
 import logging
 import os

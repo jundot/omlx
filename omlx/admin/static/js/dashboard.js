@@ -298,17 +298,19 @@
             accBenchmarks: { mmlu: true, hellaswag: true, truthfulqa: true, gsm8k: false, livecodebench: false },
             accSampleSizes: { mmlu: 300, hellaswag: 200, truthfulqa: 200, gsm8k: 100, livecodebench: 100 },
             accBenchmarkList: [
-                { key: 'mmlu', label: 'MMLU' },
-                { key: 'hellaswag', label: 'HellaSwag' },
-                { key: 'truthfulqa', label: 'TruthfulQA' },
-                { key: 'gsm8k', label: 'GSM8K' },
-                { key: 'livecodebench', label: 'LiveCodeBench' },
+                { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects' },
+                { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning' },
+                { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness' },
+                { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning' },
+                { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation' },
             ],
             accBatchSize: 1,
             accRunning: false,
-            accBenchId: null,
+            accCurrentModel: '',
+            accCurrentBenchId: null,
             accProgress: null,
-            accResults: [],
+            accAllResults: [],   // accumulated across all models
+            accQueue: [],        // server queue mirror
             accError: '',
             accEventSource: null,
             accShowText: false,
@@ -403,8 +405,9 @@
                     this.stopMSRefresh();
                     this.stopOQRefresh();
                 }
-                if (value === 'bench' && !this.benchDeviceInfo) {
-                    await this.loadBenchDeviceInfo();
+                if (value === 'bench') {
+                    if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
+                    await this.loadAccState();
                 }
                 this.$nextTick(() => lucide.createIcons());
             },
@@ -1579,21 +1582,59 @@
             },
 
             // Accuracy benchmark functions
-            async startAccuracyBenchmark() {
+
+            async loadAccState() {
+                // Load accumulated results + queue status from server (page load / tab switch)
+                try {
+                    const resp = await fetch('/admin/api/bench/accuracy/results');
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        this.accAllResults = (data.results || []).map(r => ({ ...r, _showCategories: false }));
+                        this.accRunning = data.running || false;
+                        this.accCurrentModel = data.current_model || '';
+                        if (data.current_bench_id && data.running) {
+                            this.accCurrentBenchId = data.current_bench_id;
+                            this.connectAccSSE(data.current_bench_id);
+                        }
+                    }
+                } catch (err) {
+                    console.error('Failed to load accuracy state:', err);
+                }
+                await this.loadAccQueueStatus();
+            },
+
+            async loadAccQueueStatus() {
+                try {
+                    const resp = await fetch('/admin/api/bench/accuracy/queue/status');
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        this.accQueue = data.queue || [];
+                        this.accRunning = data.running || false;
+                        this.accCurrentModel = data.current_model || '';
+                        if (data.current_bench_id) {
+                            this.accCurrentBenchId = data.current_bench_id;
+                        }
+                        // Restore last progress for reconnect
+                        if (data.last_progress && data.running) {
+                            this.accProgress = data.last_progress;
+                        }
+                    }
+                } catch (err) {
+                    console.error('Failed to load queue status:', err);
+                }
+            },
+
+            async addToAccQueue() {
                 if (!this.accModelId) return;
                 const selected = Object.entries(this.accBenchmarks)
                     .filter(([_, v]) => v)
                     .map(([k]) => k);
                 if (selected.length === 0) return;
 
-                this.accRunning = true;
-                this.accResults = [];
                 this.accError = '';
-                this.accProgress = null;
-                this.accShowText = false;
 
                 try {
-                    const resp = await fetch('/admin/api/bench/accuracy/start', {
+                    const resp = await fetch('/admin/api/bench/accuracy/queue/add', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -1606,14 +1647,30 @@
                     });
                     if (!resp.ok) {
                         const err = await resp.json();
-                        throw new Error(err.detail || 'Failed to start benchmark');
+                        throw new Error(err.detail || 'Failed to add to queue');
                     }
                     const data = await resp.json();
-                    this.accBenchId = data.bench_id;
-                    this.connectAccSSE(data.bench_id);
+                    this.accQueue = data.queue || [];
+                    this.accRunning = data.running || false;
+                    this.accCurrentModel = data.current_model || '';
+                    if (data.last_progress) this.accProgress = data.last_progress;
+
+                    // Connect SSE to current run
+                    if (data.current_bench_id) {
+                        this.accCurrentBenchId = data.current_bench_id;
+                        this.connectAccSSE(data.current_bench_id);
+                    }
                 } catch (err) {
                     this.accError = err.message;
-                    this.accRunning = false;
+                }
+            },
+
+            async removeFromAccQueue(idx) {
+                try {
+                    await fetch(`/admin/api/bench/accuracy/queue/${idx}`, { method: 'DELETE' });
+                    await this.loadAccQueueStatus();
+                } catch (err) {
+                    console.error('Failed to remove from queue:', err);
                 }
             },
 
@@ -1621,6 +1678,8 @@
                 if (this.accEventSource) {
                     this.accEventSource.close();
                 }
+                this._stopAccPolling();
+
                 const es = new EventSource(`/admin/api/bench/accuracy/${benchId}/stream`);
                 this.accEventSource = es;
 
@@ -1630,24 +1689,25 @@
                         switch (data.type) {
                             case 'progress':
                                 this.accProgress = data;
+                                this.accCurrentModel = data.model_id || this.accCurrentModel;
                                 break;
                             case 'result':
-                                // Add _showCategories toggle for UI
                                 data.data._showCategories = false;
-                                this.accResults.push(data.data);
+                                this.accAllResults.push(data.data);
                                 break;
                             case 'done':
-                                this.accRunning = false;
                                 this.accProgress = null;
                                 es.close();
                                 this.accEventSource = null;
+                                // Check for next in queue
+                                this._pollForNextRun();
                                 break;
                             case 'error':
                                 this.accError = data.message;
-                                this.accRunning = false;
                                 this.accProgress = null;
                                 es.close();
                                 this.accEventSource = null;
+                                this.loadAccQueueStatus();
                                 break;
                         }
                     } catch (err) {
@@ -1656,48 +1716,142 @@
                 };
 
                 es.onerror = () => {
-                    this.accRunning = false;
-                    this.accProgress = null;
                     es.close();
                     this.accEventSource = null;
+                    // SSE disconnected — fall back to polling
+                    this._startAccPolling();
                 };
             },
 
+            _startAccPolling() {
+                this._stopAccPolling();
+                this._accPollTimer = setInterval(async () => {
+                    await this.loadAccQueueStatus();
+                    // Load latest results too
+                    try {
+                        const resp = await fetch('/admin/api/bench/accuracy/results');
+                        if (resp.ok) {
+                            const data = await resp.json();
+                            this.accAllResults = (data.results || []).map(r => ({ ...r, _showCategories: false }));
+                        }
+                    } catch (e) {}
+                    // Try to reconnect SSE if running
+                    if (this.accRunning && this.accCurrentBenchId && !this.accEventSource) {
+                        this._stopAccPolling();
+                        this.connectAccSSE(this.accCurrentBenchId);
+                    }
+                    if (!this.accRunning) {
+                        this._stopAccPolling();
+                    }
+                }, 3000);
+            },
+
+            _stopAccPolling() {
+                if (this._accPollTimer) {
+                    clearInterval(this._accPollTimer);
+                    this._accPollTimer = null;
+                }
+            },
+
+            _pollForNextRun() {
+                // After a run completes, poll briefly for the next run to start
+                let attempts = 0;
+                const poll = setInterval(async () => {
+                    attempts++;
+                    await this.loadAccQueueStatus();
+                    if (this.accCurrentBenchId && this.accRunning) {
+                        clearInterval(poll);
+                        this.connectAccSSE(this.accCurrentBenchId);
+                    } else if (!this.accRunning || attempts > 10) {
+                        clearInterval(poll);
+                    }
+                }, 1000);
+            },
+
             async cancelAccuracyBenchmark() {
-                if (!this.accBenchId) return;
                 try {
-                    await fetch(`/admin/api/bench/accuracy/${this.accBenchId}/cancel`, { method: 'POST' });
+                    await fetch('/admin/api/bench/accuracy/cancel', { method: 'POST' });
                 } catch (err) {
                     console.error('Cancel error:', err);
                 }
                 this.accRunning = false;
                 this.accProgress = null;
+                this.accQueue = [];
+                this.accCurrentModel = '';
                 if (this.accEventSource) {
                     this.accEventSource.close();
                     this.accEventSource = null;
                 }
             },
 
+            async resetAccResults() {
+                try {
+                    await fetch('/admin/api/bench/accuracy/results/reset', { method: 'POST' });
+                    this.accAllResults = [];
+                } catch (err) {
+                    console.error('Reset error:', err);
+                }
+            },
+
             accBuildText() {
-                if (this.accResults.length === 0) return '';
+                if (this.accAllResults.length === 0) return '';
                 const pad = (s, w) => s.toString().padStart(w);
                 const rpad = (s, w) => s.toString().padEnd(w);
-                let lines = [];
-                lines.push('Accuracy Benchmark Results');
-                lines.push('Model: ' + this.accModelId);
-                lines.push('Batch: ' + this.accBatchSize + 'x');
-                lines.push('');
-                lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10));
-                lines.push('-'.repeat(54));
-                for (const r of this.accResults) {
-                    lines.push(
-                        rpad(r.benchmark.toUpperCase(), 16) +
-                        pad((r.accuracy * 100).toFixed(1) + '%', 10) +
-                        pad(r.correct, 10) +
-                        pad(r.total, 8) +
-                        pad(r.time_s, 10)
-                    );
+
+                // Group by model
+                const models = [...new Set(this.accAllResults.map(r => r.model_id))];
+                const benchmarks = [...new Set(this.accAllResults.map(r => r.benchmark))];
+
+                // Build lookup: model -> benchmark -> accuracy
+                const lookup = {};
+                for (const r of this.accAllResults) {
+                    if (!lookup[r.model_id]) lookup[r.model_id] = {};
+                    lookup[r.model_id][r.benchmark] = r;
                 }
+
+                // Determine column widths
+                const modelWidth = Math.max(12, ...models.map(m => m.length + 2));
+                const benchWidth = Math.max(14, ...benchmarks.map(b => b.length + 2));
+
+                let lines = [];
+                lines.push('Accuracy Benchmark Comparison');
+                lines.push('');
+
+                // Header row
+                let header = rpad('', benchWidth);
+                for (const m of models) header += pad(m, modelWidth);
+                lines.push(header);
+                lines.push('-'.repeat(benchWidth + models.length * modelWidth));
+
+                // Data rows
+                for (const b of benchmarks) {
+                    let row = rpad(b.toUpperCase(), benchWidth);
+                    for (const m of models) {
+                        const r = lookup[m]?.[b];
+                        row += pad(r ? (r.accuracy * 100).toFixed(1) + '%' : '-', modelWidth);
+                    }
+                    lines.push(row);
+                }
+
+                // Detail section per model
+                lines.push('');
+                lines.push('--- Detail ---');
+                for (const m of models) {
+                    lines.push('');
+                    lines.push('Model: ' + m);
+                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10));
+                    lines.push('-'.repeat(54));
+                    for (const r of this.accAllResults.filter(r => r.model_id === m)) {
+                        lines.push(
+                            rpad(r.benchmark.toUpperCase(), 16) +
+                            pad((r.accuracy * 100).toFixed(1) + '%', 10) +
+                            pad(r.correct, 10) +
+                            pad(r.total, 8) +
+                            pad(r.time_s, 10)
+                        );
+                    }
+                }
+
                 return lines.join('\n');
             },
 
