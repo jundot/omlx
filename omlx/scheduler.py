@@ -2636,7 +2636,21 @@ class Scheduler:
         threshold = getattr(request, '_specprefill_threshold', None) or DEFAULT_THRESHOLD
         keep_pct = getattr(request, '_specprefill_keep_pct', None) or DEFAULT_KEEP_RATE
 
+        # Threshold check on TOTAL remaining (not after system exclusion)
         if n_remaining <= threshold:
+            return
+
+        # System prompt protection: exclude system tokens from scoring.
+        # If paged cache already covered the system prompt, remaining
+        # won't include it (effective_system = 0).
+        system_end = request.specprefill_system_end
+        effective_system = max(0, system_end - request.cached_tokens)
+        tokens_to_score = remaining[effective_system:] if effective_system > 0 else remaining
+        n_to_score = len(tokens_to_score)
+
+        # If conversation portion is below threshold after system exclusion,
+        # skip SpecPrefill (system will be full-prefilled by normal path)
+        if n_to_score <= threshold:
             return
 
         try:
@@ -2649,7 +2663,7 @@ class Scheduler:
             if self._draft_prefix_cache is not None:
                 try:
                     block_table, draft_remaining = self._draft_prefix_cache.fetch_cache(
-                        request.request_id, remaining
+                        request.request_id, tokens_to_score
                     )
                     if block_table and block_table.num_tokens > 0:
                         reconstructed = self._draft_prefix_cache.reconstruct_cache(block_table)
@@ -2662,7 +2676,7 @@ class Scheduler:
             t0 = time.monotonic()
             importance, used_cache = score_tokens(
                 self._specprefill_draft_model,
-                remaining,
+                tokens_to_score,
                 prefill_step_size=self.config.prefill_step_size,
                 existing_cache=draft_cache,
             )
@@ -2671,17 +2685,26 @@ class Scheduler:
 
             n_selected = selected.shape[0]
             request.specprefill_indices = selected
-            request.specprefill_total_tokens = n_remaining
-            request.specprefill_position_offset = request.cached_tokens
+            request.specprefill_total_tokens = n_to_score
+            request.specprefill_position_offset = request.cached_tokens + effective_system
+            request._specprefill_system_tokens = effective_system
 
-            cache_info = ""
+            extras = []
             if draft_cached_tokens > 0:
-                cache_info = f", draft cache hit {draft_cached_tokens} tokens"
+                extras.append(f"draft cache hit {draft_cached_tokens}")
+            total_prompt = request.num_prompt_tokens
+            system_total = request.specprefill_system_end
+            cached = request.cached_tokens
+            extras.append(
+                f"prompt {total_prompt} = "
+                f"system {system_total} + conv {total_prompt - system_total}, "
+                f"cached {cached}"
+            )
 
             logger.info(
-                f"SpecPrefill: scored {n_remaining} tokens in {t_score:.1f}s, "
-                f"selected {n_selected}/{n_remaining} "
-                f"(keep={n_selected/n_remaining*100:.0f}%{cache_info})"
+                f"SpecPrefill: scored {n_to_score} tokens in {t_score:.1f}s, "
+                f"selected {n_selected}/{n_to_score} "
+                f"(keep={n_selected/n_to_score*100:.0f}%, {', '.join(extras)})"
             )
 
             # Save draft cache for next turn
@@ -2689,10 +2712,9 @@ class Scheduler:
                 try:
                     extracted, mcc = self._extract_cache_states(used_cache)
                     if extracted:
-                        # Store using prompt tokens (not including output)
                         self._draft_prefix_cache.store_cache(
                             request.request_id,
-                            remaining,
+                            tokens_to_score,
                             extracted,
                             model_cache_config=mcc,
                         )
@@ -3170,9 +3192,30 @@ class Scheduler:
                     import time
                     t0 = time.monotonic()
 
-                    selected = request.specprefill_indices
+                    sp_cache = make_prompt_cache(self.model)
                     all_tokens = tokens_to_process
-                    M = len(all_tokens)
+                    sys_count = getattr(request, '_specprefill_system_tokens', 0)
+
+                    # Phase 1: system prompt full prefill (if not cached)
+                    if sys_count > 0:
+                        sys_arr = mx.array(all_tokens[:sys_count])
+                        step = self.config.prefill_step_size
+                        while sys_arr.size > step:
+                            self.model(sys_arr[:step][None], cache=sp_cache)
+                            mx.eval([c.state for c in sp_cache])
+                            sys_arr = sys_arr[step:]
+                            mx.clear_cache()
+                        if sys_arr.size > 0:
+                            self.model(sys_arr[None], cache=sp_cache)
+                            mx.eval([c.state for c in sp_cache])
+                        logger.info(
+                            f"SpecPrefill: system prompt {sys_count} tokens full prefill"
+                        )
+
+                    # Phase 2: conversation sparse prefill
+                    conv_tokens = all_tokens[sys_count:]
+                    selected = request.specprefill_indices
+                    M = len(conv_tokens)
                     pos_offset = request.specprefill_position_offset
                     last_idx = M - 1
 
@@ -3183,11 +3226,9 @@ class Scheduler:
                         selected_list.remove(last_idx)
                         selected = mx.array(sorted(selected_list))
 
-                    # Create simple cache and run sparse prefill with RoPE patching
-                    sp_cache = make_prompt_cache(self.model)
                     sparse_prefill(
                         self.model,
-                        all_tokens,
+                        conv_tokens,
                         selected,
                         sp_cache,
                         step_size=self.config.prefill_step_size,
@@ -3203,9 +3244,12 @@ class Scheduler:
 
                     N = int(selected.shape[0])
                     t_prefill = time.monotonic() - t0
+                    total_prompt = request.num_prompt_tokens
+                    cached = request.cached_tokens
                     logger.info(
-                        f"SpecPrefill: sparse prefill {N}/{M} tokens in {t_prefill:.1f}s "
-                        f"(offset={pos_offset})"
+                        f"SpecPrefill: sparse prefill {N}/{M} conv tokens in {t_prefill:.1f}s "
+                        f"(total {total_prompt}, cached {cached}, "
+                        f"system {sys_count} full, conv {M} sparse)"
                     )
 
                     # Set up request as if we had a prefix cache hit

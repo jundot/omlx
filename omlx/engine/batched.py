@@ -400,6 +400,8 @@ class BatchedEngine(BaseEngine):
             specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
         if kwargs.get("specprefill_keep_pct") is not None:
             specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop("specprefill_keep_pct")
+        if kwargs.get("specprefill_system_end") is not None:
+            specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
         request_id = await self._engine.add_request(
             prompt=prompt,
@@ -543,6 +545,24 @@ class BatchedEngine(BaseEngine):
         prompt = self._apply_chat_template(
             messages, template_tools, chat_template_kwargs=ct_kwargs
         )
+
+        # SpecPrefill: compute system prompt token count for protection.
+        # Can't template system-only messages (most templates require user),
+        # so compute by subtracting non-system from full prompt tokens.
+        if kwargs.get("specprefill") is not False:
+            non_system = [m for m in messages if m.get("role") not in ("system", "developer")]
+            if len(non_system) < len(messages) and non_system:
+                try:
+                    non_system_prompt = self._apply_chat_template(
+                        non_system, template_tools, chat_template_kwargs=ct_kwargs
+                    )
+                    full_tokens = len(self._tokenizer.encode(prompt))
+                    non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
+                    system_end = full_tokens - non_system_tokens
+                    if system_end > 0:
+                        kwargs["specprefill_system_end"] = system_end
+                except Exception as e:
+                    logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
         async for output in self.stream_generate(
             prompt=prompt,

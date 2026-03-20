@@ -255,6 +255,7 @@ class EngineCore:
         vlm_image_hash: Optional[str] = None,
         specprefill: Optional[bool] = None,
         specprefill_keep_pct: Optional[float] = None,
+        specprefill_system_end: Optional[int] = None,
     ) -> str:
         """
         Add a request for processing.
@@ -300,6 +301,8 @@ class EngineCore:
             request._specprefill_enabled = True
         if specprefill_keep_pct is not None:
             request._specprefill_keep_pct = specprefill_keep_pct
+        if specprefill_system_end is not None and specprefill_system_end > 0:
+            request.specprefill_system_end = specprefill_system_end
 
         # Setup output collector with stream_interval from config
         self._output_collectors[request_id] = RequestOutputCollector(aggregate=True)
