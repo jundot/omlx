@@ -125,6 +125,7 @@ from .api.responses_models import (
     ResponseUsage,
     TextConfig,
 )
+from .api.agent_routes import router as agent_router, set_agent_runtime_getters
 from .api.responses_utils import (
     ResponseStore,
     ResponseStateCorruptError,
@@ -150,6 +151,14 @@ from .api.tool_calling import (
 )
 from .api.thinking import ThinkingParser, extract_thinking
 from .api.utils import clean_output_text, clean_special_tokens, extract_harmony_messages, extract_multimodal_content, extract_text_content
+from .context.runtime import (
+    apply_skill_defaults,
+    apply_tool_policy,
+    resolve_agent_runtime_request,
+)
+from .context.external_agents import build_external_agent_tools
+from .context.state_updater import update_agent_state_from_exchange
+from .context.session_store import append_session_record
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -373,7 +382,34 @@ app = FastAPI(
 # Include MCP routes
 from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
 set_mcp_manager_getter(get_mcp_manager)
+set_agent_runtime_getters(lambda: _server_state.global_settings, get_mcp_manager)
+from .context.bootstrap import set_tool_catalog_getter
+
+
+def _get_bootstrap_tool_catalog() -> list[dict]:
+    tools = []
+    if _server_state.mcp_manager is not None:
+        for tool in _server_state.mcp_manager.get_all_tools():
+            tools.append(
+                {
+                    "name": getattr(tool, "full_name", ""),
+                    "description": getattr(tool, "description", ""),
+                }
+            )
+    for tool in build_external_agent_tools(_server_state.global_settings):
+        function = tool.get("function", {})
+        tools.append(
+            {
+                "name": function.get("name", ""),
+                "description": function.get("description", ""),
+            }
+        )
+    return tools
+
+
+set_tool_catalog_getter(_get_bootstrap_tool_catalog)
 app.include_router(mcp_router)
+app.include_router(agent_router)
 
 # Include admin routes
 from .admin.routes import router as admin_router, set_admin_getters
@@ -1673,12 +1709,18 @@ async def create_chat_completion(
             # Inject JSON instruction into messages
             messages = _inject_json_instruction(messages, json_instruction)
 
-    # Merge MCP tools with user-provided tools
-    effective_tools = request.tools
+    # Merge tools through agent runtime policy
+    runtime = apply_skill_defaults(_server_state.global_settings, resolve_agent_runtime_request(request)) if _server_state.global_settings else resolve_agent_runtime_request(request)
+    user_tools_dicts = [t.model_dump() for t in request.tools] if request.tools else None
+    mcp_tools_dicts = []
     if _server_state.mcp_manager:
-        # Convert Pydantic ToolDefinition models to dicts for merge_tools
-        user_tools_dicts = [t.model_dump() for t in request.tools] if request.tools else None
-        effective_tools = _server_state.mcp_manager.get_merged_tools(user_tools_dicts)
+        mcp_tools_dicts.extend(_server_state.mcp_manager.get_all_tools_openai())
+    mcp_tools_dicts.extend(build_external_agent_tools(_server_state.global_settings))
+    effective_tools = apply_tool_policy(
+        user_tools=user_tools_dicts,
+        mcp_tools=mcp_tools_dicts or None,
+        runtime=runtime,
+    )
 
     # Validate context window before sending to model
     tools_for_template = convert_tools_for_template(effective_tools) if effective_tools else None
@@ -2632,22 +2674,18 @@ async def create_anthropic_message(
         "frequency_penalty": frequency_penalty,
     }
 
-    # Merge MCP tools with user-provided Anthropic tools
+    # Merge tools through agent runtime policy
+    runtime = apply_skill_defaults(_server_state.global_settings, resolve_agent_runtime_request(request)) if _server_state.global_settings else resolve_agent_runtime_request(request)
     user_internal = convert_anthropic_tools_to_internal(request.tools)
+    mcp_openai_tools = []
     if _server_state.mcp_manager:
-        mcp_openai_tools = _server_state.mcp_manager.get_all_tools_openai()
-        combined = (mcp_openai_tools or []) + (user_internal or [])
-        # Deduplicate by function name (user tools take precedence)
-        if combined:
-            seen = {}
-            for tool in combined:
-                name = tool.get("function", {}).get("name", "")
-                seen[name] = tool
-            internal_tools = list(seen.values())
-        else:
-            internal_tools = None
-    else:
-        internal_tools = user_internal
+        mcp_openai_tools.extend(_server_state.mcp_manager.get_all_tools_openai())
+    mcp_openai_tools.extend(build_external_agent_tools(_server_state.global_settings))
+    internal_tools = apply_tool_policy(
+        user_tools=user_internal,
+        mcp_tools=mcp_openai_tools or None,
+        runtime=runtime,
+    )
     if internal_tools:
         chat_kwargs["tools"] = internal_tools
 
@@ -2871,6 +2909,42 @@ def _store_response_state(
         output_messages=output_messages,
     )
     _server_state.responses_store.put(public_response["id"], record)
+    if _server_state.global_settings is not None:
+        metadata = public_response.get("metadata") or {}
+        selector = {}
+        context = metadata.get("omlx_context") or {}
+        if isinstance(context, dict):
+            for key in ("profile", "workspace"):
+                value = context.get(key)
+                if isinstance(value, str) and value.strip():
+                    selector[key] = value.strip()
+        update_agent_state_from_exchange(
+            _server_state.global_settings,
+            selector=selector,
+            input_messages=input_messages,
+            output_messages=output_messages,
+        )
+        append_session_record(
+            _server_state.global_settings,
+            public_response=public_response,
+            input_messages=input_messages,
+            output_messages=output_messages,
+        )
+
+
+def _build_agent_session_metadata(request: ResponsesRequest) -> dict:
+    """Attach agent selector metadata to stored Responses API sessions."""
+    metadata = dict(request.metadata or {})
+    runtime = apply_skill_defaults(_server_state.global_settings, resolve_agent_runtime_request(request)) if _server_state.global_settings else resolve_agent_runtime_request(request)
+    if runtime.selector:
+        metadata["omlx_context"] = runtime.selector
+        if runtime.selector.get("workspace"):
+            metadata["agent_id"] = f"workspace:{runtime.selector['workspace']}"
+        elif runtime.selector.get("profile"):
+            metadata["agent_id"] = f"profile:{runtime.selector['profile']}"
+    else:
+        metadata.setdefault("agent_id", "default")
+    return metadata
 
 
 @app.post("/v1/responses")
@@ -2946,10 +3020,21 @@ async def create_response(
             if json_instruction:
                 messages = _inject_json_instruction(messages, json_instruction)
 
-    # Merge MCP tools
-    effective_tools = openai_tools
-    if _server_state.mcp_manager and openai_tools:
-        effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
+    # Merge tools through agent runtime policy
+    runtime = (
+        apply_skill_defaults(_server_state.global_settings, resolve_agent_runtime_request(request))
+        if _server_state.global_settings
+        else resolve_agent_runtime_request(request)
+    )
+    mcp_openai_tools = []
+    if _server_state.mcp_manager:
+        mcp_openai_tools.extend(_server_state.mcp_manager.get_all_tools_openai())
+    mcp_openai_tools.extend(build_external_agent_tools(_server_state.global_settings))
+    effective_tools = apply_tool_policy(
+        user_tools=openai_tools,
+        mcp_tools=mcp_openai_tools or None,
+        runtime=runtime,
+    )
 
     # Convert tools for chat template
     tools_for_template = (
@@ -3097,6 +3182,7 @@ async def create_response(
         top_p=top_p,
         max_output_tokens=request.max_output_tokens,
         previous_response_id=request.previous_response_id,
+        metadata=_build_agent_session_metadata(request),
     )
 
     # Store response
@@ -3453,6 +3539,7 @@ async def stream_responses_api(
         "temperature": request.temperature,
         "top_p": request.top_p,
         "max_output_tokens": request.max_output_tokens,
+        "metadata": _build_agent_session_metadata(request),
     }
     if request.previous_response_id:
         final_response["previous_response_id"] = request.previous_response_id

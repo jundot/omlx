@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+
+{% block title %}Agent Sessions{% endblock %}
+
+{% block content %}
+<div class="min-h-screen bg-[#f4efe5] text-neutral-900" x-data="agentSessions()" x-init="init()">
+    <header class="sticky top-0 z-20 border-b border-black/10 bg-[#eee4d1]/85 backdrop-blur">
+        <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+            <div>
+                <a href="/admin/dashboard" class="text-xs uppercase tracking-[0.2em] text-neutral-500">oMLX Admin</a>
+                <h1 class="text-2xl font-bold tracking-tight">Agent Sessions</h1>
+            </div>
+            <div class="flex items-center gap-3">
+                <a href="/admin/chat" class="px-4 py-2 rounded-full bg-white/70 hover:bg-white transition">Chat</a>
+                <a href="/admin/dashboard" class="px-4 py-2 rounded-full bg-neutral-900 text-white hover:bg-neutral-800 transition">Dashboard</a>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-[340px_1fr] gap-6">
+        <aside class="rounded-[28px] border border-black/10 bg-white/75 overflow-hidden shadow-sm">
+            <div class="px-5 py-4 border-b border-black/10 flex items-center justify-between">
+                <div>
+                    <p class="text-xs uppercase tracking-[0.18em] text-neutral-500">Agents</p>
+                    <p class="text-sm text-neutral-700">按 Agent 分组查看会话</p>
+                </div>
+                <button @click="load()" class="px-3 py-1.5 rounded-full bg-neutral-900 text-white text-sm">Refresh</button>
+            </div>
+            <div class="p-3 space-y-3 max-h-[75vh] overflow-auto">
+                <template x-for="group in groups" :key="group.agent_id">
+                    <section class="rounded-2xl border border-black/10 bg-[#faf7f0] overflow-hidden">
+                        <button @click="toggleGroup(group.agent_id)"
+                                class="w-full px-4 py-3 flex items-center justify-between text-left transition"
+                                :class="selectedGroup === group.agent_id ? 'bg-[#e7dac0]' : ''">
+                            <div>
+                                <div class="font-semibold" x-text="group.agent_id"></div>
+                                <div class="text-xs text-neutral-500" x-text="`${group.sessions.length} sessions`"></div>
+                            </div>
+                            <span class="text-xs text-neutral-500" x-text="selectedGroup === group.agent_id ? 'OPEN' : 'SHOW'"></span>
+                        </button>
+                        <div x-show="selectedGroup === group.agent_id" x-cloak class="px-2 pb-2">
+                            <template x-for="session in group.sessions" :key="session.response_id">
+                                <button @click="openSession(session.response_id)"
+                                        class="w-full mt-2 rounded-2xl px-3 py-3 text-left border transition"
+                                        :class="selectedSessionId === session.response_id ? 'border-neutral-900 bg-white' : 'border-transparent bg-white/70 hover:border-black/15'">
+                                    <div class="text-xs text-neutral-500" x-text="session.model || 'unknown-model'"></div>
+                                    <div class="font-medium mt-1 leading-6" x-text="session.preview || '(empty)'"></div>
+                                    <div class="text-[11px] text-neutral-500 mt-2 font-mono" x-text="session.response_id"></div>
+                                </button>
+                            </template>
+                        </div>
+                    </section>
+                </template>
+            </div>
+        </aside>
+
+        <section class="space-y-6 min-h-[75vh]">
+            <div class="rounded-[32px] border border-black/10 bg-white shadow-sm overflow-hidden">
+                <div class="px-6 py-5 border-b border-black/10 bg-[linear-gradient(135deg,#f8f1e4,#ffffff)]">
+                    <p class="text-xs uppercase tracking-[0.18em] text-neutral-500">Shared State</p>
+                    <h2 class="text-xl font-semibold" x-text="selectedGroup || 'Select an agent'"></h2>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 p-6">
+                    <template x-for="field in stateFields" :key="field.key">
+                        <section class="rounded-3xl border border-black/10 bg-[#faf8f2] px-5 py-4">
+                            <div class="text-xs uppercase tracking-[0.14em] text-neutral-500" x-text="field.label"></div>
+                            <pre class="mt-3 whitespace-pre-wrap break-words font-sans text-sm leading-7" x-text="agentState[field.key] || '(empty)'"></pre>
+                        </section>
+                    </template>
+                </div>
+            </div>
+
+            <div class="rounded-[32px] border border-black/10 bg-white shadow-sm overflow-hidden">
+                <div class="px-6 py-5 border-b border-black/10 bg-[linear-gradient(135deg,#f8f1e4,#ffffff)]">
+                    <p class="text-xs uppercase tracking-[0.18em] text-neutral-500">Archive Search</p>
+                    <div class="mt-3 flex gap-3">
+                        <input x-model="searchQuery" @keydown.enter="runSearch()"
+                               class="flex-1 px-4 py-3 rounded-2xl border border-black/10 bg-[#faf8f2]"
+                               placeholder="Search archived sessions">
+                        <button @click="runSearch()" class="px-4 py-3 rounded-2xl bg-neutral-900 text-white">Search</button>
+                    </div>
+                </div>
+                <div class="p-6 space-y-3">
+                    <template x-if="!searchMatches.length">
+                        <div class="text-neutral-500 text-sm">No archive hits yet.</div>
+                    </template>
+                    <template x-for="match in searchMatches" :key="`${match.session_id}-${match.response_id}`">
+                        <article class="rounded-2xl border border-black/10 bg-[#faf8f2] px-4 py-3">
+                            <div class="text-xs text-neutral-500 font-mono" x-text="match.session_id"></div>
+                            <div class="mt-1 font-medium" x-text="match.preview || '(empty)'"></div>
+                        </article>
+                    </template>
+                </div>
+            </div>
+
+            <div class="rounded-[32px] border border-black/10 bg-white shadow-sm overflow-hidden">
+                <div class="px-6 py-5 border-b border-black/10 bg-[linear-gradient(135deg,#f8f1e4,#ffffff)]">
+                    <p class="text-xs uppercase tracking-[0.18em] text-neutral-500">Conversation</p>
+                    <h2 class="text-xl font-semibold" x-text="selectedSessionId || 'Select a session'"></h2>
+                </div>
+                <div class="p-6 space-y-4 overflow-auto max-h-[75vh]">
+                    <template x-if="!messages.length">
+                        <div class="h-full min-h-[240px] grid place-items-center text-neutral-500">
+                            从左侧选择一个 Agent 会话
+                        </div>
+                    </template>
+                    <template x-for="(msg, idx) in messages" :key="idx">
+                        <article class="rounded-3xl px-5 py-4 border"
+                                 :class="msg.role === 'user' ? 'ml-auto max-w-3xl bg-neutral-900 text-white border-neutral-900' : 'max-w-4xl bg-[#faf8f2] border-black/10'">
+                            <div class="text-xs uppercase tracking-[0.14em] opacity-60" x-text="msg.role"></div>
+                            <pre class="mt-3 whitespace-pre-wrap break-words font-sans text-sm leading-7" x-text="renderMessage(msg)"></pre>
+                        </article>
+                    </template>
+                </div>
+            </div>
+        </section>
+    </main>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ static('js/alpine.min.js') }}"></script>
+<script>
+function agentSessions() {
+    return {
+        groups: [],
+        selectedGroup: null,
+        selectedSessionId: null,
+        messages: [],
+        searchQuery: '',
+        searchMatches: [],
+        stateFields: [
+            { key: 'mission', label: 'Mission' },
+            { key: 'facts', label: 'Facts' },
+            { key: 'decisions', label: 'Decisions' },
+            { key: 'todo', label: 'Todo' },
+        ],
+        agentState: { mission: '', facts: '', decisions: '', todo: '' },
+        async init() {
+            await this.load();
+        },
+        async load() {
+            const response = await fetch('/admin/api/agent-sessions');
+            const data = await response.json();
+            this.groups = data.groups || [];
+            if (!this.selectedGroup && this.groups.length) {
+                this.selectedGroup = this.groups[0].agent_id;
+            }
+        },
+        toggleGroup(agentId) {
+            this.selectedGroup = this.selectedGroup === agentId ? null : agentId;
+            this.messages = [];
+            this.selectedSessionId = null;
+            this.searchMatches = [];
+            if (this.selectedGroup) {
+                this.loadState();
+            }
+        },
+        renderMessage(msg) {
+            if (msg.content) return msg.content;
+            if (msg.tool_calls) return JSON.stringify(msg.tool_calls, null, 2);
+            return '';
+        },
+        async loadState() {
+            if (!this.selectedGroup) return;
+            const response = await fetch(`/admin/api/agent-state?agent_id=${encodeURIComponent(this.selectedGroup)}`);
+            const data = await response.json();
+            this.agentState = {
+                mission: data.mission || '',
+                facts: data.facts || '',
+                decisions: data.decisions || '',
+                todo: data.todo || '',
+            };
+        },
+        async runSearch() {
+            if (!this.selectedGroup || !this.searchQuery.trim()) return;
+            const response = await fetch(`/admin/api/agent-session-search?agent_id=${encodeURIComponent(this.selectedGroup)}&query=${encodeURIComponent(this.searchQuery)}`);
+            const data = await response.json();
+            this.searchMatches = data.matches || [];
+        },
+        async openSession(responseId) {
+            this.selectedSessionId = responseId;
+            const response = await fetch(`/admin/api/agent-sessions/${responseId}`);
+            const data = await response.json();
+            this.messages = data.messages || [];
+        },
+    };
+}
+</script>
+{% endblock %}

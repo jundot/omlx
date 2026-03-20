@@ -132,6 +132,7 @@ from .embedding_utils import (
 
 # MCP routes
 from .mcp_routes import router as mcp_router, set_mcp_manager_getter
+from .agent_routes import router as agent_router, set_agent_runtime_getters
 
 __all__ = [
     # Models
@@ -229,4 +230,7 @@ __all__ = [
     # MCP routes
     "mcp_router",
     "set_mcp_manager_getter",
+    # Agent routes
+    "agent_router",
+    "set_agent_runtime_getters",
 ]

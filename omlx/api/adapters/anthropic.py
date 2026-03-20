@@ -34,6 +34,9 @@ from ..anthropic_utils import (
     create_text_delta_event,
     map_finish_reason_to_stop_reason,
 )
+from ...context.bootstrap import extract_context_selector, prepend_bootstrap_message
+from ...context.runtime import apply_skill_defaults, resolve_agent_runtime_request
+from ...settings import get_settings
 
 
 class AnthropicAdapter(BaseAdapter):
@@ -70,6 +73,17 @@ class AnthropicAdapter(BaseAdapter):
                     content=msg.get("content", ""),
                 )
             )
+        try:
+            runtime = resolve_agent_runtime_request(request)
+            runtime = apply_skill_defaults(get_settings(), runtime)
+            internal_messages = prepend_bootstrap_message(
+                internal_messages,
+                get_settings(),
+                selector=extract_context_selector(request),
+                skill_names=runtime.skills,
+            )
+        except RuntimeError:
+            pass
 
         # Convert tools if provided
         tools = None

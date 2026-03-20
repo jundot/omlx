@@ -147,6 +147,9 @@ class ChatCompletionRequest(BaseModel):
     response_format: Optional[Union[ResponseFormat, dict]] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    # Request metadata/extensions
+    metadata: Optional[Dict[str, Any]] = None
+    omlx_context: Optional[Dict[str, str]] = None
 
 
 class AssistantMessage(BaseModel):

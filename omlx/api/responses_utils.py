@@ -445,6 +445,12 @@ class ResponseStore:
             return None
         return data.get("public_response")
 
+    def list_records(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Return recent stored records, newest first."""
+        items = list(self._store.values())[-max(1, limit):]
+        items.reverse()
+        return [copy.deepcopy(item) for item in items]
+
     def resolve_chain_messages(self, response_id: str) -> List[Dict[str, Any]]:
         """Resolve the full previous_response_id chain into message history."""
         if response_id not in self._store:

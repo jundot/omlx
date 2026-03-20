@@ -150,6 +150,7 @@ class MessagesRequest(BaseModel):
     thinking: ThinkingConfig | None = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: dict[str, Any] | None = None
+    omlx_context: dict[str, str] | None = None
 
 
 # =============================================================================

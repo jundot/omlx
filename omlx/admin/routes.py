@@ -35,6 +35,8 @@ from .auth import (
     verify_api_key,
 )
 from ..settings import SubKeyEntry
+from ..context.memory import load_agent_state
+from ..context.session_store import search_session_archives
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +154,10 @@ class GlobalSettingsRequest(BaseModel):
     integrations_opencode_model: Optional[str] = None
     integrations_openclaw_model: Optional[str] = None
     integrations_openclaw_tools_profile: Optional[str] = None
+    agent_memory_backend: Optional[str] = None
+    agent_memory_storage_dir: Optional[str] = None
+    agent_memory_obsidian_vault_dir: Optional[str] = None
+    agent_memory_obsidian_subdir: Optional[str] = None
 
     # UI settings
     ui_language: Optional[str] = None
@@ -876,6 +882,12 @@ async def chat_page(request: Request, is_admin: bool = Depends(require_admin)):
     return templates.TemplateResponse(
         "chat.html", {"request": request, "api_key": api_key or ""}
     )
+
+
+@router.get("/agents", response_class=HTMLResponse)
+async def agents_page(request: Request, is_admin: bool = Depends(require_admin)):
+    """Render the multi-agent session viewer."""
+    return templates.TemplateResponse("agents.html", {"request": request})
 
 
 @router.get("/static/{path:path}")
@@ -1664,6 +1676,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "openclaw_model": global_settings.integrations.openclaw_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
         },
+        "agent_memory": global_settings.agent_memory.to_dict(),
         "system": {
             "total_memory_bytes": memory_info["total_bytes"],
             "total_memory": memory_info["total_formatted"],
@@ -1823,6 +1836,17 @@ async def update_global_settings(
     # Apply MCP settings (restart required)
     if request.mcp_config is not None:
         global_settings.mcp.config_path = request.mcp_config if request.mcp_config else None
+
+    if request.agent_memory_backend is not None:
+        global_settings.agent_memory.backend = request.agent_memory_backend
+    if request.agent_memory_storage_dir is not None:
+        global_settings.agent_memory.storage_dir = request.agent_memory_storage_dir or None
+    if request.agent_memory_obsidian_vault_dir is not None:
+        global_settings.agent_memory.obsidian_vault_dir = (
+            request.agent_memory_obsidian_vault_dir or None
+        )
+    if request.agent_memory_obsidian_subdir is not None:
+        global_settings.agent_memory.obsidian_subdir = request.agent_memory_obsidian_subdir
 
     # Apply HuggingFace settings (Live - immediately applied via env var)
     if request.hf_endpoint is not None:
@@ -2002,6 +2026,124 @@ async def update_global_settings(
         "message": message,
         "runtime_applied": runtime_applied,
     }
+
+
+@router.get("/api/agent-sessions")
+async def list_agent_sessions(
+    limit: int = 100,
+    is_admin: bool = Depends(require_admin),
+):
+    """List recent stored sessions grouped by agent id."""
+    from ..server import _server_state
+
+    store = getattr(_server_state, "responses_store", None)
+    if store is None:
+        return {"groups": []}
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for record in store.list_records(limit=max(1, min(limit, 500))):
+        public = record.get("public_response", {})
+        metadata = public.get("metadata") or {}
+        agent_id = metadata.get("agent_id", "default")
+        input_messages = record.get("input_messages") or []
+        preview = ""
+        if input_messages:
+            preview = str(input_messages[-1].get("content", ""))[:160]
+        groups.setdefault(agent_id, []).append(
+            {
+                "response_id": record.get("response_id"),
+                "created_at": record.get("created_at"),
+                "model": public.get("model"),
+                "previous_response_id": record.get("previous_response_id"),
+                "status": public.get("status", "completed"),
+                "metadata": metadata,
+                "preview": preview,
+            }
+        )
+
+    return {
+        "groups": [
+            {"agent_id": agent_id, "sessions": sessions}
+            for agent_id, sessions in sorted(groups.items())
+        ]
+    }
+
+
+@router.get("/api/agent-sessions/{response_id}")
+async def get_agent_session(
+    response_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Return the full resolved conversation for one stored response chain."""
+    from ..server import _server_state
+
+    store = getattr(_server_state, "responses_store", None)
+    if store is None:
+        raise HTTPException(status_code=404, detail="Responses store unavailable")
+
+    record = store.get_record(response_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return {
+        "record": record,
+        "messages": store.resolve_chain_messages(response_id),
+    }
+
+
+def _selector_from_agent_id(agent_id: str) -> tuple[dict[str, str], dict[str, str]]:
+    """Convert agent_id into selector and session metadata."""
+    selector: dict[str, str] = {}
+    metadata: dict[str, str] = {"agent_id": agent_id or "default"}
+    if agent_id.startswith("profile:"):
+        selector["profile"] = agent_id.split(":", 1)[1]
+    elif agent_id.startswith("workspace:"):
+        selector["workspace"] = agent_id.split(":", 1)[1]
+    metadata["omlx_context"] = selector
+    return selector, metadata
+
+
+@router.get("/api/agent-state")
+async def get_admin_agent_state(
+    agent_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Return structured state for one agent id."""
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    selector, _metadata = _selector_from_agent_id(agent_id)
+    state = load_agent_state(global_settings, selector=selector)
+    return {
+        "selector": selector,
+        "mission": state.mission,
+        "facts": state.facts,
+        "decisions": state.decisions,
+        "todo": state.todo,
+    }
+
+
+@router.get("/api/agent-session-search")
+async def admin_agent_session_search(
+    agent_id: str,
+    query: str,
+    limit: int = 10,
+    is_admin: bool = Depends(require_admin),
+):
+    """Search archived session logs for one agent id."""
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    selector, metadata = _selector_from_agent_id(agent_id)
+    matches = search_session_archives(
+        global_settings,
+        metadata=metadata,
+        query=query,
+        limit=max(1, min(limit, 50)),
+    )
+    return {"selector": selector, "query": query, "matches": matches}
 
 
 # =============================================================================

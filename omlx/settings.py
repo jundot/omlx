@@ -416,6 +416,35 @@ class MCPSettings:
 
 
 @dataclass
+class BootstrapSettings:
+    """Agent bootstrap markdown context settings."""
+
+    enabled: bool = True
+    docs_dir: str | None = None  # None means {base_path}/agent
+    include_tool_catalog: bool = True
+    max_bytes_per_file: int = 16384
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "enabled": self.enabled,
+            "docs_dir": self.docs_dir,
+            "include_tool_catalog": self.include_tool_catalog,
+            "max_bytes_per_file": self.max_bytes_per_file,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "BootstrapSettings":
+        """Create from dictionary."""
+        return cls(
+            enabled=data.get("enabled", True),
+            docs_dir=data.get("docs_dir"),
+            include_tool_catalog=data.get("include_tool_catalog", True),
+            max_bytes_per_file=data.get("max_bytes_per_file", 16384),
+        )
+
+
+@dataclass
 class HuggingFaceSettings:
     """HuggingFace Hub configuration settings."""
 
@@ -573,6 +602,70 @@ class ClaudeCodeSettings:
 
 
 @dataclass
+class ExternalAgentDefinition:
+    """Configuration for one external agent endpoint."""
+
+    name: str
+    endpoint: str
+    enabled: bool = True
+    display_name: str = ""
+    description: str = ""
+    protocol: str = "agent_bridge"  # "agent_bridge" or "openai_responses"
+    api_key: str | None = None
+    model: str | None = None
+    timeout_seconds: float = 120.0
+    default_profile: str | None = None
+    default_workspace: str | None = None
+    default_skills: list[str] = field(default_factory=list)
+    default_session_mode: str = "continue"
+    default_metadata: dict[str, Any] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "name": self.name,
+            "endpoint": self.endpoint,
+            "enabled": self.enabled,
+            "display_name": self.display_name,
+            "description": self.description,
+            "protocol": self.protocol,
+            "api_key": self.api_key,
+            "model": self.model,
+            "timeout_seconds": self.timeout_seconds,
+            "default_profile": self.default_profile,
+            "default_workspace": self.default_workspace,
+            "default_skills": self.default_skills,
+            "default_session_mode": self.default_session_mode,
+            "default_metadata": self.default_metadata,
+            "headers": self.headers,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ExternalAgentDefinition":
+        """Create from dictionary."""
+        return cls(
+            name=data.get("name", ""),
+            endpoint=data.get("endpoint", ""),
+            enabled=data.get("enabled", True),
+            display_name=data.get("display_name", ""),
+            description=data.get("description", ""),
+            protocol=data.get("protocol", "agent_bridge"),
+            api_key=data.get("api_key"),
+            model=data.get("model"),
+            timeout_seconds=float(data.get("timeout_seconds", 120.0) or 120.0),
+            default_profile=data.get("default_profile"),
+            default_workspace=data.get("default_workspace"),
+            default_skills=[
+                skill for skill in data.get("default_skills", []) if isinstance(skill, str)
+            ],
+            default_session_mode=data.get("default_session_mode", "continue"),
+            default_metadata=data.get("default_metadata", {}) or {},
+            headers=data.get("headers", {}) or {},
+        )
+
+
+@dataclass
 class IntegrationSettings:
     """Other integrations settings (Codex, OpenCode, OpenClaw)."""
 
@@ -580,6 +673,7 @@ class IntegrationSettings:
     opencode_model: str | None = None
     openclaw_model: str | None = None
     openclaw_tools_profile: str = "coding"
+    external_agents: list[ExternalAgentDefinition] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -588,6 +682,7 @@ class IntegrationSettings:
             "opencode_model": self.opencode_model,
             "openclaw_model": self.openclaw_model,
             "openclaw_tools_profile": self.openclaw_tools_profile,
+            "external_agents": [agent.to_dict() for agent in self.external_agents],
         }
 
     @classmethod
@@ -598,6 +693,70 @@ class IntegrationSettings:
             opencode_model=data.get("opencode_model", None),
             openclaw_model=data.get("openclaw_model", None),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
+            external_agents=[
+                ExternalAgentDefinition.from_dict(agent)
+                for agent in data.get("external_agents", [])
+                if isinstance(agent, dict)
+            ],
+        )
+
+
+@dataclass
+class AgentMemorySettings:
+    """Persistent memory and gallery settings for agent runtime."""
+
+    enabled: bool = True
+    backend: str = "filesystem"  # "filesystem" or "obsidian"
+    storage_dir: str | None = None
+    obsidian_vault_dir: str | None = None
+    obsidian_subdir: str = "OMLX"
+    inject_recent_memories: bool = True
+    max_recent_memories: int = 6
+    max_chars_per_memory: int = 1200
+    retrieval_enabled: bool = True
+    retrieval_max_matches: int = 3
+    retrieval_preview_chars: int = 220
+    session_rollover_messages: int = 200
+    session_rollover_chars: int = 120000
+    gallery_dir: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "enabled": self.enabled,
+            "backend": self.backend,
+            "storage_dir": self.storage_dir,
+            "obsidian_vault_dir": self.obsidian_vault_dir,
+            "obsidian_subdir": self.obsidian_subdir,
+            "inject_recent_memories": self.inject_recent_memories,
+            "max_recent_memories": self.max_recent_memories,
+            "max_chars_per_memory": self.max_chars_per_memory,
+            "retrieval_enabled": self.retrieval_enabled,
+            "retrieval_max_matches": self.retrieval_max_matches,
+            "retrieval_preview_chars": self.retrieval_preview_chars,
+            "session_rollover_messages": self.session_rollover_messages,
+            "session_rollover_chars": self.session_rollover_chars,
+            "gallery_dir": self.gallery_dir,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AgentMemorySettings":
+        """Create from dictionary."""
+        return cls(
+            enabled=data.get("enabled", True),
+            backend=data.get("backend", "filesystem"),
+            storage_dir=data.get("storage_dir"),
+            obsidian_vault_dir=data.get("obsidian_vault_dir"),
+            obsidian_subdir=data.get("obsidian_subdir", "OMLX"),
+            inject_recent_memories=data.get("inject_recent_memories", True),
+            max_recent_memories=data.get("max_recent_memories", 6),
+            max_chars_per_memory=data.get("max_chars_per_memory", 1200),
+            retrieval_enabled=data.get("retrieval_enabled", True),
+            retrieval_max_matches=data.get("retrieval_max_matches", 3),
+            retrieval_preview_chars=data.get("retrieval_preview_chars", 220),
+            session_rollover_messages=data.get("session_rollover_messages", 200),
+            session_rollover_chars=data.get("session_rollover_chars", 120000),
+            gallery_dir=data.get("gallery_dir"),
         )
 
 
@@ -621,12 +780,14 @@ class GlobalSettings:
     cache: CacheSettings = field(default_factory=CacheSettings)
     auth: AuthSettings = field(default_factory=AuthSettings)
     mcp: MCPSettings = field(default_factory=MCPSettings)
+    bootstrap: BootstrapSettings = field(default_factory=BootstrapSettings)
     huggingface: HuggingFaceSettings = field(default_factory=HuggingFaceSettings)
     modelscope: ModelScopeSettings = field(default_factory=ModelScopeSettings)
     sampling: SamplingSettings = field(default_factory=SamplingSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
+    agent_memory: AgentMemorySettings = field(default_factory=AgentMemorySettings)
     ui: UISettings = field(default_factory=UISettings)
 
     @classmethod
@@ -703,6 +864,8 @@ class GlobalSettings:
                 self.auth = AuthSettings.from_dict(data["auth"])
             if "mcp" in data:
                 self.mcp = MCPSettings.from_dict(data["mcp"])
+            if "bootstrap" in data:
+                self.bootstrap = BootstrapSettings.from_dict(data["bootstrap"])
             if "huggingface" in data:
                 self.huggingface = HuggingFaceSettings.from_dict(data["huggingface"])
             if "modelscope" in data:
@@ -716,6 +879,10 @@ class GlobalSettings:
             if "integrations" in data:
                 self.integrations = IntegrationSettings.from_dict(
                     data["integrations"]
+                )
+            if "agent_memory" in data:
+                self.agent_memory = AgentMemorySettings.from_dict(
+                    data["agent_memory"]
                 )
             if "ui" in data:
                 self.ui = UISettings.from_dict(data["ui"])
@@ -787,6 +954,18 @@ class GlobalSettings:
         if mcp_config := os.getenv("OMLX_MCP_CONFIG"):
             self.mcp.config_path = mcp_config
 
+        # Bootstrap settings
+        if bootstrap_enabled := os.getenv("OMLX_BOOTSTRAP_ENABLED"):
+            self.bootstrap.enabled = bootstrap_enabled.lower() in ("true", "1", "yes")
+        if bootstrap_dir := os.getenv("OMLX_BOOTSTRAP_DIR"):
+            self.bootstrap.docs_dir = bootstrap_dir
+        if bootstrap_tool_catalog := os.getenv("OMLX_BOOTSTRAP_TOOL_CATALOG"):
+            self.bootstrap.include_tool_catalog = bootstrap_tool_catalog.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+
         # HuggingFace settings
         if hf_endpoint := os.getenv("OMLX_HF_ENDPOINT"):
             self.huggingface.endpoint = hf_endpoint
@@ -803,6 +982,12 @@ class GlobalSettings:
                 self.logging.retention_days = int(retention_days)
             except ValueError:
                 logger.warning(f"Invalid OMLX_LOG_RETENTION_DAYS: {retention_days}")
+        if agent_memory_backend := os.getenv("OMLX_AGENT_MEMORY_BACKEND"):
+            self.agent_memory.backend = agent_memory_backend
+        if obsidian_vault := os.getenv("OMLX_OBSIDIAN_VAULT_DIR"):
+            self.agent_memory.obsidian_vault_dir = obsidian_vault
+        if gallery_dir := os.getenv("OMLX_AGENT_GALLERY_DIR"):
+            self.agent_memory.gallery_dir = gallery_dir
 
     def _apply_cli_overrides(self, args: Any) -> None:
         """
@@ -886,12 +1071,14 @@ class GlobalSettings:
             "cache": self.cache.to_dict(),
             "auth": self.auth.to_dict(),
             "mcp": self.mcp.to_dict(),
+            "bootstrap": self.bootstrap.to_dict(),
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
             "integrations": self.integrations.to_dict(),
+            "agent_memory": self.agent_memory.to_dict(),
             "ui": self.ui.to_dict(),
         }
 
@@ -910,6 +1097,9 @@ class GlobalSettings:
             *self.model.get_model_dirs(self.base_path),
             self.cache.get_ssd_cache_dir(self.base_path),
             self.logging.get_log_dir(self.base_path),
+            self.base_path / "agent",
+            self.base_path / "memory",
+            self.base_path / "gallery",
         ]
 
         for directory in directories:
@@ -1030,6 +1220,9 @@ class GlobalSettings:
             )
 
         # HuggingFace validation
+        if self.bootstrap.max_bytes_per_file <= 0:
+            errors.append("bootstrap.max_bytes_per_file must be > 0")
+
         if self.huggingface.endpoint:
             endpoint = self.huggingface.endpoint.strip()
             if endpoint and not endpoint.startswith(("http://", "https://")):
@@ -1076,12 +1269,14 @@ class GlobalSettings:
             "cache": self.cache.to_dict(),
             "auth": self.auth.to_dict(),
             "mcp": self.mcp.to_dict(),
+            "bootstrap": self.bootstrap.to_dict(),
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
             "integrations": self.integrations.to_dict(),
+            "agent_memory": self.agent_memory.to_dict(),
             "ui": self.ui.to_dict(),
         }
 

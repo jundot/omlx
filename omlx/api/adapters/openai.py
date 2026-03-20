@@ -31,6 +31,9 @@ from ..openai_models import (
 from ..thinking import extract_thinking
 from ..utils import clean_special_tokens, extract_text_content
 from ..tool_calling import convert_tools_for_template
+from ...context.bootstrap import extract_context_selector, prepend_bootstrap_message
+from ...context.runtime import apply_skill_defaults, resolve_agent_runtime_request
+from ...settings import get_settings
 
 
 class OpenAIAdapter(BaseAdapter):
@@ -66,6 +69,17 @@ class OpenAIAdapter(BaseAdapter):
             )
             for msg in messages
         ]
+        try:
+            runtime = resolve_agent_runtime_request(request)
+            runtime = apply_skill_defaults(get_settings(), runtime)
+            internal_messages = prepend_bootstrap_message(
+                internal_messages,
+                get_settings(),
+                selector=extract_context_selector(request),
+                skill_names=runtime.skills,
+            )
+        except RuntimeError:
+            pass
 
         # Convert tools if provided
         tools = None

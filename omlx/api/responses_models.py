@@ -92,6 +92,7 @@ class ResponsesRequest(BaseModel):
     store: Optional[bool] = None
     truncation: Optional[str] = None  # "auto" or "disabled"
     metadata: Optional[Dict[str, str]] = None
+    omlx_context: Optional[Dict[str, Any]] = None
     reasoning: Optional[Dict[str, Any]] = None
     parallel_tool_calls: Optional[bool] = None
     # Fields that Codex CLI sends
