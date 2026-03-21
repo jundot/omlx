@@ -3,23 +3,13 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import time
 from pathlib import Path
 
 from omlx.integrations.base import Integration
 from omlx.utils.install import get_cli_prefix
-
-# Codex config.toml template with oMLX provider
-_CONFIG_TEMPLATE = """\
-model = "{model}"
-model_provider = "omlx"
-
-[model_providers.omlx]
-name = "oMLX"
-base_url = "http://{host}:{port}/v1"
-env_key = "OMLX_API_KEY"
-"""
 
 
 class CodexIntegration(Integration):
@@ -73,25 +63,29 @@ class CodexIntegration(Integration):
         }
         
         # If it is a reasoning model, add reasoning effort
-        import re
         is_reasoning = bool(re.search(r'\b(thinking|o1|o3|r1)\b', (model or "").lower()))
         if is_reasoning:
             top_level_overrides["model_reasoning_effort"] = '"high"'
 
+        # Keys managed by oMLX that should be removed when not applicable
+        managed_keys = {"model_reasoning_effort"} - set(top_level_overrides.keys())
+
         seen_keys = set()
-        
+
         for line in lines:
             stripped = line.strip()
             if stripped.startswith("[") and stripped.endswith("]"):
                 in_any_section = True
                 in_omlx_section = (stripped == "[model_providers.omlx]")
-            
+
             # Handle top-level keys
             if not in_any_section and "=" in stripped:
                 key = stripped.split("=")[0].strip()
                 if key in top_level_overrides:
                     new_lines.append(f"{key} = {top_level_overrides[key]}")
                     seen_keys.add(key)
+                    continue
+                if key in managed_keys:
                     continue
             
             # Skip old oMLX section

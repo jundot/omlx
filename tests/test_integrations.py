@@ -107,6 +107,42 @@ name = "old-omlx"
         assert 'name = "oMLX"' in content
         assert 'old-omlx' not in content
 
+    def test_configure_reasoning_model(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        codex = CodexIntegration()
+        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
+            codex.configure(port=8000, api_key="", model="deepseek-r1-distill")
+
+        content = config_path.read_text()
+        assert 'model_reasoning_effort = "high"' in content
+        assert 'model = "deepseek-r1-distill"' in content
+
+    def test_configure_non_reasoning_model(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        codex = CodexIntegration()
+        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
+            codex.configure(port=8000, api_key="", model="llama-3.1-8b")
+
+        content = config_path.read_text()
+        assert "model_reasoning_effort" not in content
+
+    def test_configure_clears_stale_reasoning_flag(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            'model = "old-thinking-model"\n'
+            'model_provider = "omlx"\n'
+            'model_reasoning_effort = "high"\n'
+        )
+
+        codex = CodexIntegration()
+        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
+            codex.configure(port=8000, api_key="", model="llama-3.1-8b")
+
+        content = config_path.read_text()
+        assert 'model = "llama-3.1-8b"' in content
+        assert "model_reasoning_effort" not in content
+
+
 class TestOpenCodeIntegration:
     def test_get_command(self):
         oc = OpenCodeIntegration()
