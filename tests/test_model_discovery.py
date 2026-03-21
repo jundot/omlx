@@ -95,8 +95,19 @@ class TestDetectModelType:
         (reranker_dir / "config.json").write_text(json.dumps(config))
         assert detect_model_type(reranker_dir) == "reranker"
 
-    def test_causal_lm_without_reranker_name_is_llm(self, tmp_path):
-        """Test that Qwen3ForCausalLM without 'reranker' in name is LLM."""
+    def test_detect_causal_lm_embedding(self, tmp_path):
+        """Test detection of CausalLM-based embedding (e.g., Qwen3-Embedding)."""
+        embed_dir = tmp_path / "Qwen3-Embedding-8B-mxfp8"
+        embed_dir.mkdir()
+        config = {
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForCausalLM"],
+        }
+        (embed_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(embed_dir) == "embedding"
+
+    def test_causal_lm_without_reranker_or_embedding_name_is_llm(self, tmp_path):
+        """Test that Qwen3ForCausalLM without 'reranker' or 'embedding' in name is LLM."""
         llm_dir = tmp_path / "Qwen3-0.6B"
         llm_dir.mkdir()
         config = {
