@@ -155,12 +155,17 @@ def universal_quant_predicate(
         if any(p in path for p in ("ssm_output", "ssm_out")):
             return bits(8)
 
-        # Attention: 6-bit (all attention projections)
+        # Full attention: 6-bit (critical for coherence)
         if any(p in path for p in (
             "v_proj", "v_a_proj", "v_b_proj", "q_proj", "k_proj", "o_proj",
-            "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b",
         )):
             return bits(6)
+
+        # Linear attention (GatedDeltaNet): base+2 (less critical, recurrent redundancy)
+        if any(p in path for p in (
+            "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b",
+        )):
+            return bits(base_bits + 2)
 
         # shared_expert: 6-bit (always active, SiLU risk)
         if "shared_expert" in path and not path.endswith("shared_expert_gate"):

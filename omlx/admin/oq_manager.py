@@ -349,6 +349,10 @@ class OQManager:
         # Clean up GPU state to prevent Metal errors on next task
         if HAS_MLX:
             try:
+                mx.synchronize()
+            except Exception:
+                pass
+            try:
                 mx.clear_cache()
             except Exception:
                 pass
@@ -373,6 +377,13 @@ class OQManager:
         """Return all tasks as serializable dicts."""
         return [t.to_dict() for t in self._tasks.values()]
 
+    @property
+    def is_quantizing(self) -> bool:
+        """Check if any quantization task is actively running."""
+        return any(
+            t.status in _ACTIVE_STATUSES for t in self._tasks.values()
+        )
+
     async def shutdown(self) -> None:
         """Cancel all active tasks."""
         for task_id in list(self._active_tasks):
@@ -387,10 +398,15 @@ class OQManager:
                     return
 
                 # Ensure GPU is clean before starting (previous task may have been cancelled)
+                # Metal needs time to fully release command buffers after cancellation
                 if HAS_MLX:
                     try:
+                        mx.synchronize()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2.0)
+                    try:
                         mx.clear_cache()
-                        await asyncio.sleep(0.5)
                     except Exception:
                         pass
 

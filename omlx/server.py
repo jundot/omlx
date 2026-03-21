@@ -1474,6 +1474,12 @@ async def create_embeddings(
     - float or base64 encoding format
     - Optional dimension reduction (with renormalization)
     """
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+
     engine = await get_embedding_engine(request.model)
 
     # Normalize input to list
@@ -1570,6 +1576,12 @@ async def create_rerank(
     - Optional top_n to limit results
     - Optional return_documents to include document text in response
     """
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+
     engine = await get_reranker_engine(request.model)
 
     # Normalize documents to list of strings
@@ -1624,6 +1636,11 @@ async def create_completion(
     _: bool = Depends(verify_api_key),
 ):
     """Create a text completion."""
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
@@ -1744,6 +1761,13 @@ async def create_chat_completion(
         for i, msg in enumerate(request.messages):
             content_preview = str(msg.content)[:200] if msg.content else "(empty)"
             logger.log(5, "  Message[%d]: role=%s, content=%s...", i, msg.role, content_preview)
+
+    # Block inference during quantization to prevent GPU Metal errors
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
 
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
@@ -2695,6 +2719,12 @@ async def create_anthropic_message(
         f"max_tokens={request.max_tokens}"
     )
 
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+
     engine = await get_engine_for_model(request.model)
 
     # Resolve alias to real model ID for settings lookups
@@ -2909,6 +2939,12 @@ async def count_anthropic_tokens(
 
     This is compatible with Anthropic's token counting API.
     """
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+
     engine = await get_engine_for_model(request.model)
 
     # Convert Anthropic format to internal format
@@ -3013,6 +3049,12 @@ async def create_response(
     _: bool = Depends(verify_api_key),
 ):
     """Create a response (OpenAI Responses API)."""
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+
     logger.debug(
         f"Responses API request: model={request.model}, stream={request.stream}"
     )
