@@ -299,11 +299,11 @@
             accBenchmarks: { mmlu: true, hellaswag: true, truthfulqa: true, gsm8k: false, livecodebench: false },
             accSampleSizes: { mmlu: 300, hellaswag: 200, truthfulqa: 200, gsm8k: 100, livecodebench: 100 },
             accBenchmarkList: [
-                { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects' },
-                { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning' },
-                { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness' },
-                { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning' },
-                { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation' },
+                { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects', fullSize: 14042 },
+                { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning', fullSize: 10042 },
+                { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness', fullSize: 817 },
+                { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning', fullSize: 1319 },
+                { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055 },
             ],
             accBatchSize: 1,
             accRunning: false,
@@ -1871,6 +1871,61 @@
                     const ta = document.getElementById('accTextarea');
                     if (ta) { ta.select(); document.execCommand('copy'); onSuccess(); }
                 }
+            },
+
+            accDownloadResult(r, format) {
+                const filename = `${r.model_id}_${r.benchmark}.${format}`;
+                let content, mime;
+                const qr = r.question_results || [];
+
+                if (format === 'json') {
+                    content = JSON.stringify({
+                        model_id: r.model_id,
+                        benchmark: r.benchmark,
+                        accuracy: r.accuracy,
+                        correct: r.correct,
+                        total: r.total,
+                        time_s: r.time_s,
+                        category_scores: r.category_scores || null,
+                        questions: qr,
+                    }, null, 2);
+                    mime = 'application/json';
+                } else if (format === 'csv') {
+                    const esc = s => '"' + (s || '').replace(/"/g, '""') + '"';
+                    const lines = ['id,correct,expected,predicted,question,raw_response,time_s'];
+                    for (const q of qr) {
+                        lines.push([q.id, q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                    }
+                    content = lines.join('\n');
+                    mime = 'text/csv';
+                } else {
+                    const lines = [
+                        `Model: ${r.model_id}`,
+                        `Benchmark: ${r.benchmark.toUpperCase()}`,
+                        `Accuracy: ${(r.accuracy * 100).toFixed(1)}% (${r.correct}/${r.total})`,
+                        `Time: ${r.time_s}s`,
+                        '',
+                    ];
+                    for (const q of qr) {
+                        lines.push(`--- Q${q.id} [${q.correct ? 'CORRECT' : 'WRONG'}] ---`);
+                        lines.push(`Question: ${q.question || ''}`);
+                        lines.push(`Expected: ${q.expected}`);
+                        lines.push(`Predicted: ${q.predicted}`);
+                        lines.push(`Raw response: ${q.raw_response || '(empty)'}`);
+                        lines.push(`Time: ${q.time_s}s`);
+                        lines.push('');
+                    }
+                    content = lines.join('\n');
+                    mime = 'text/plain';
+                }
+
+                const blob = new Blob([content], { type: mime });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                a.click();
+                URL.revokeObjectURL(url);
             },
 
             // Log viewer functions

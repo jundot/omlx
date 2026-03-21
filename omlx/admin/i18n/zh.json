@@ -515,6 +515,7 @@
   "acc_bench.config.cancel_button": "取消",
   "acc_bench.results.section_label": "结果",
   "acc_bench.results.clear": "清除结果",
+  "acc_bench.results.download": "Download",
   "acc_bench.results.show_categories": "显示分类详情",
   "acc_bench.results.hide_categories": "隐藏分类详情",
   "acc_bench.results.category": "分类",

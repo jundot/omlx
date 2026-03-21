@@ -538,6 +538,7 @@
   "acc_bench.config.cancel_button": "キャンセル",
   "acc_bench.results.section_label": "結果",
   "acc_bench.results.clear": "結果をクリア",
+  "acc_bench.results.download": "Download",
   "acc_bench.results.show_categories": "カテゴリ内訳を表示",
   "acc_bench.results.hide_categories": "カテゴリ内訳を非表示",
   "acc_bench.results.category": "カテゴリ",

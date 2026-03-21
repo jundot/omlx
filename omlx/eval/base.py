@@ -21,6 +21,8 @@ class QuestionResult:
     expected: str
     predicted: str
     time_seconds: float
+    question_text: str = ""
+    raw_response: str = ""
 
 
 @dataclass
@@ -75,11 +77,15 @@ class BaseBenchmark(ABC):
 
     def get_max_tokens(self) -> int:
         """Max tokens to generate per question. Override for longer answers."""
-        return 32
+        return 128
 
     def get_category(self, item: dict) -> Optional[str]:
         """Return category/subject for per-category scoring. None if N/A."""
         return None
+
+    def get_question_text(self, item: dict) -> str:
+        """Return a human-readable question text for result export."""
+        return item.get("question", item.get("description", item.get("context", "")))
 
     @staticmethod
     def _strip_think_tags(text: str) -> str:
@@ -87,21 +93,24 @@ class BaseBenchmark(ABC):
         return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
     async def _eval_single(
-        self, engine: Any, item: dict, index: int
-    ) -> tuple[int, dict, str]:
-        """Evaluate a single item. Returns (index, item, response_text)."""
+        self, engine: Any, item: dict, index: int,
+        sampling_kwargs: Optional[dict] = None,
+    ) -> tuple[int, dict, str, str]:
+        """Evaluate a single item. Returns (index, item, response_text, prompt_text)."""
         messages = self.format_prompt(item)
+        # Extract the full prompt text for logging
+        prompt_text = "\n".join(m.get("content", "") for m in messages)
+        kwargs = dict(sampling_kwargs or {})
+        # Force benchmark-controlled params (override model settings)
+        kwargs["max_tokens"] = self.get_max_tokens()
+        kwargs["temperature"] = 0.0
         try:
-            output = await engine.chat(
-                messages=messages,
-                max_tokens=self.get_max_tokens(),
-                temperature=0.0,
-            )
+            output = await engine.chat(messages=messages, **kwargs)
             text = self._strip_think_tags(output.text)
-            return index, item, text
+            return index, item, text, prompt_text
         except Exception as e:
             logger.warning(f"Engine error on question {index}: {e}")
-            return index, item, ""
+            return index, item, "", prompt_text
 
     async def run(
         self,
@@ -109,6 +118,7 @@ class BaseBenchmark(ABC):
         items: list[dict],
         on_progress: Optional[Callable[[int, int], Any]] = None,
         batch_size: int = 1,
+        sampling_kwargs: Optional[dict] = None,
     ) -> BenchmarkResult:
         """Run the benchmark on all items.
 
@@ -136,14 +146,14 @@ class BaseBenchmark(ABC):
 
             # Launch concurrent requests
             tasks = [
-                self._eval_single(engine, item, batch_start + j)
+                self._eval_single(engine, item, batch_start + j, sampling_kwargs)
                 for j, item in enumerate(batch)
             ]
             batch_results = await asyncio.gather(*tasks)
             batch_elapsed = time.time() - batch_start_time
 
             # Process results in order
-            for idx, item, response_text in sorted(batch_results, key=lambda x: x[0]):
+            for idx, item, response_text, prompt_text in sorted(batch_results, key=lambda x: x[0]):
                 predicted = self.extract_answer(response_text, item)
                 is_correct = self.check_answer(predicted, item)
 
@@ -165,6 +175,8 @@ class BaseBenchmark(ABC):
                         expected=str(expected),
                         predicted=predicted,
                         time_seconds=batch_elapsed / len(batch),
+                        question_text=prompt_text,
+                        raw_response=response_text,
                     )
                 )
 
