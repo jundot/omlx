@@ -121,46 +121,47 @@ class STTEngine(BaseNonStreamingEngine):
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
 
-        try:
-            from mlx_audio.stt.generate import (
-                generate_transcription,
-            )
-        except ImportError as exc:
-            raise ImportError(
-                "mlx-audio is required for STT inference. "
-                "Install it with: pip install mlx-audio"
-            ) from exc
-
         model = self._model
 
-        def _transcribe_sync():
-            # generate_transcription accepts model instance or path
-            # and returns an STTOutput dataclass
-            result = generate_transcription(
-                model=model,
-                audio=str(audio_path),
-                **kwargs,
-            )
-            # STTOutput has: text, segments, language,
-            # prompt_tokens, generation_tokens, total_time, etc.
-            if hasattr(result, "text"):
-                # Normalize language — mlx-audio may return a list,
-                # None, or the string "None"
-                raw_lang = getattr(result, "language", None)
-                if isinstance(raw_lang, list):
-                    raw_lang = raw_lang[0] if raw_lang else None
-                if raw_lang in (None, "None", "none"):
-                    raw_lang = language or None
+        def _normalize_segment(s) -> dict:
+            """Convert any segment type to a plain dict."""
+            if isinstance(s, dict):
+                return s
+            # dataclass → asdict
+            import dataclasses
+            if dataclasses.is_dataclass(s) and not isinstance(s, type):
+                return dataclasses.asdict(s)
+            # object with __dict__
+            if hasattr(s, "__dict__"):
+                return vars(s)
+            return {"text": str(s)}
 
-                # Normalize segments — mlx-audio may return
-                # dataclass objects or dicts
-                raw_segs = getattr(result, "segments", None) or []
-                segments = []
-                for s in raw_segs:
-                    if hasattr(s, "__dict__"):
-                        segments.append(vars(s))
-                    elif isinstance(s, dict):
-                        segments.append(s)
+        def _normalize_language(raw_lang):
+            """Normalize language field from mlx-audio."""
+            if isinstance(raw_lang, list):
+                raw_lang = raw_lang[0] if raw_lang else None
+            if isinstance(raw_lang, str) and raw_lang.lower() == "none":
+                return None
+            return raw_lang
+
+        def _transcribe_sync():
+            # Call model.generate() directly instead of
+            # generate_transcription() which writes files to disk.
+            result = model.generate(audio_path, **kwargs)
+
+            # result is typically an STTOutput dataclass with:
+            # text, segments, language, total_time, etc.
+            if hasattr(result, "text"):
+                raw_lang = _normalize_language(
+                    getattr(result, "language", None)
+                )
+                if raw_lang is None:
+                    raw_lang = language
+
+                raw_segs = getattr(result, "segments", None)
+                segments = [
+                    _normalize_segment(s) for s in raw_segs
+                ] if raw_segs else []
 
                 return {
                     "text": result.text or "",
