@@ -78,6 +78,19 @@ dev = [
     "mypy>=1.0.0",
     "mcp>=1.0.0",
 ]
+# PEP 735 dependency groups — consumed by `uv sync --dev`.
+# Keep in sync with [project.optional-dependencies] dev above
+# (pip/legacy toolchains use that section instead).
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "mcp>=1.0.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/jundot/omlx"
 Documentation = "https://github.com/jundot/omlx#readme"
