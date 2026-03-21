@@ -17,6 +17,8 @@ from .base import BaseEngine, BaseNonStreamingEngine, GenerationOutput
 from .batched import BatchedEngine
 from .embedding import EmbeddingEngine
 from .reranker import RerankerEngine
+from .stt import STTEngine
+from .tts import TTSEngine
 from .vlm import VLMBatchedEngine
 
 __all__ = [
@@ -27,6 +29,8 @@ __all__ = [
     "VLMBatchedEngine",
     "EmbeddingEngine",
     "RerankerEngine",
+    "STTEngine",
+    "TTSEngine",
     # Core engine components
     "EngineCore",
     "AsyncEngineCore",

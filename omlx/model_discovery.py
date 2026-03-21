@@ -10,6 +10,8 @@ Supports:
 - VLM models: Use VLMBatchedEngine for vision-language model inference
 - Embedding models: Use EmbeddingEngine for batch embedding generation
 - Reranker models: Use RerankerEngine for document reranking
+- Audio STT models: Use STTEngine for speech-to-text (Whisper, Qwen3-ASR, ...)
+- Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
 """
 
 import json
@@ -20,8 +22,8 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker"]
+ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -128,16 +130,40 @@ UNSUPPORTED_RERANKER_ARCHITECTURES = {
 RERANKER_ARCHITECTURES = SUPPORTED_RERANKER_ARCHITECTURES | UNSUPPORTED_RERANKER_ARCHITECTURES
 
 # Unsupported model types — detected and skipped during discovery.
-# These models require audio endpoints (/v1/audio/*) that oMLX doesn't implement.
 # Only top-level config fields are checked; nested audio_config/tts_config in
 # multimodal models (e.g., MiniCPM-o) won't trigger this.
-UNSUPPORTED_MODEL_TYPES = {
+# Note: "whisper" and "qwen3_tts" were previously listed here but are now
+# handled as audio types (audio_stt / audio_tts) — see AUDIO_* sets below.
+UNSUPPORTED_MODEL_TYPES: set[str] = set()
+
+UNSUPPORTED_ARCHITECTURES: set[str] = set()
+
+# Known STT (speech-to-text) model_type values
+AUDIO_STT_MODEL_TYPES = {
     "whisper",
-    "qwen3_tts",
+    "qwen3_asr",
+    "parakeet",
 }
 
-UNSUPPORTED_ARCHITECTURES = {
+# Known TTS (text-to-speech) model_type values
+AUDIO_TTS_MODEL_TYPES = {
+    "qwen3_tts",
+    "kokoro",
+    "chatterbox",
+}
+
+# Known STT architectures
+AUDIO_STT_ARCHITECTURES = {
     "WhisperForConditionalGeneration",
+    "Qwen3ASRForConditionalGeneration",
+    "ParakeetForCTC",
+}
+
+# Known TTS architectures
+AUDIO_TTS_ARCHITECTURES = {
+    "KokoroForConditionalGeneration",
+    "Qwen3TTSForConditionalGeneration",
+    "ChatterboxForConditionalGeneration",
 }
 
 
@@ -155,7 +181,11 @@ class DiscoveredModel:
 
 def _is_unsupported_model(model_path: Path) -> bool:
     """
-    Check if model is an unsupported type (TTS, ASR, etc.).
+    Check if model is an unsupported type that should be skipped during discovery.
+
+    Audio models (STT/TTS) are NOT unsupported — they are detected as
+    "audio_stt" or "audio_tts" by detect_model_type() and served via
+    their own engine types.
 
     Only checks top-level config fields. Multimodal models with nested
     audio_config/tts_config (e.g., MiniCPM-o) are not affected.
@@ -207,7 +237,7 @@ def detect_model_type(model_path: Path) -> ModelType:
         model_path: Path to model directory
 
     Returns:
-        Model type: "llm", "vlm", "embedding", or "reranker"
+        Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", or "audio_tts"
     """
     config_path = model_path / "config.json"
     if not config_path.exists():
@@ -280,6 +310,20 @@ def detect_model_type(model_path: Path) -> ModelType:
     if "vision_config" in config:
         return "vlm"
 
+    # Check for audio models — architectures take priority over model_type.
+    # Only top-level architectures/model_type are inspected; nested audio_config
+    # inside multimodal models (e.g., MiniCPM-o) does not trigger this path.
+    for arch in architectures:
+        if arch in AUDIO_STT_ARCHITECTURES:
+            return "audio_stt"
+    for arch in architectures:
+        if arch in AUDIO_TTS_ARCHITECTURES:
+            return "audio_tts"
+    if normalized_type in AUDIO_STT_MODEL_TYPES or model_type in AUDIO_STT_MODEL_TYPES:
+        return "audio_stt"
+    if normalized_type in AUDIO_TTS_MODEL_TYPES or model_type in AUDIO_TTS_MODEL_TYPES:
+        return "audio_tts"
+
     return "llm"
 
 
@@ -338,10 +382,7 @@ def _register_model(
     """Try to register a single model directory into the models dict."""
     try:
         if _is_unsupported_model(model_dir):
-            logger.info(
-                f"Skipping unsupported model: {model_id} "
-                "(TTS/ASR models require audio endpoints not implemented in oMLX)"
-            )
+            logger.info(f"Skipping unsupported model: {model_id}")
             return
 
         model_type = detect_model_type(model_dir)
@@ -351,6 +392,10 @@ def _register_model(
             engine_type = "reranker"
         elif model_type == "vlm":
             engine_type = "vlm"
+        elif model_type == "audio_stt":
+            engine_type = "audio_stt"
+        elif model_type == "audio_tts":
+            engine_type = "audio_tts"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)
