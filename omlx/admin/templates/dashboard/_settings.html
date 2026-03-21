@@ -891,10 +891,9 @@
                                             </template>
                                         </div>
 
-                                        <!-- Actions (icon only) - hidden for embedding/reranker models -->
+                                        <!-- Actions (icon only) -->
                                         <div class="w-10 flex justify-center flex-shrink-0">
                                             <button
-                                                x-show="!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm'"
                                                 @click="openModelSettings(model)"
                                                 class="p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all"
                                                 :title="window.t('settings.models.table.sampling_settings_tooltip')"
