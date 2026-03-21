@@ -158,18 +158,34 @@ def convert_responses_input_to_messages(
 
             content = item.content
             if isinstance(content, list):
-                # Convert content parts to text
+                # Convert content parts - preserve images for VLM processing
                 text_parts = []
+                has_image = False
+                converted_parts: List[Dict[str, Any]] = []
                 for part in content:
                     if isinstance(part, dict):
                         if part.get("type") in ("input_text", "text", "output_text"):
-                            text_parts.append(part.get("text", ""))
+                            text = part.get("text", "")
+                            text_parts.append(text)
+                            converted_parts.append({"type": "text", "text": text})
                         elif part.get("type") == "input_image":
-                            # Pass through image content for VLM
-                            text_parts.append("[image]")
+                            # Preserve image data for VLM engines
+                            has_image = True
+                            image_url = part.get("image_url", part.get("url", ""))
+                            detail = part.get("detail", "auto")
+                            converted_parts.append({
+                                "type": "input_image",
+                                "image_url": image_url,
+                                "detail": detail,
+                            })
                     elif isinstance(part, str):
                         text_parts.append(part)
-                content = "\n".join(text_parts) if text_parts else ""
+                        converted_parts.append({"type": "text", "text": part})
+                if has_image:
+                    # Keep as content list so VLM can extract images
+                    content = converted_parts
+                else:
+                    content = "\n".join(text_parts) if text_parts else ""
 
             # Merge system/developer messages into the single system block
             if role == "system":

@@ -332,6 +332,67 @@ class TestConvertResponsesInput:
         messages = convert_responses_input_to_messages(items)
         assert messages[0]["content"] == "Hello\nWorld"
 
+    def test_input_image_preserved_as_content_list(self):
+        """input_image parts should be preserved as list for VLM processing."""
+        items = [
+            InputItem(
+                type="message",
+                role="user",
+                content=[
+                    {"type": "input_text", "text": "What is in this image?"},
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,abc123",
+                        "detail": "high",
+                    },
+                ],
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        content = messages[0]["content"]
+        # Content should be a list (not flattened to string) when images present
+        assert isinstance(content, list)
+        assert content[0] == {"type": "text", "text": "What is in this image?"}
+        assert content[1] == {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,abc123",
+            "detail": "high",
+        }
+
+    def test_input_image_url_field_fallback(self):
+        """input_image with 'url' field instead of 'image_url' should also work."""
+        items = [
+            InputItem(
+                type="message",
+                role="user",
+                content=[
+                    {"type": "input_text", "text": "Describe"},
+                    {"type": "input_image", "url": "https://example.com/img.png"},
+                ],
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        content = messages[0]["content"]
+        assert isinstance(content, list)
+        assert content[1]["image_url"] == "https://example.com/img.png"
+        assert content[1]["detail"] == "auto"  # default
+
+    def test_text_only_content_parts_flattened(self):
+        """Content with only text parts should still be flattened to string."""
+        items = [
+            InputItem(
+                type="message",
+                role="user",
+                content=[
+                    {"type": "input_text", "text": "Hello"},
+                    {"type": "input_text", "text": "World"},
+                ],
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert isinstance(messages[0]["content"], str)
+        assert messages[0]["content"] == "Hello\nWorld"
+
     def test_previous_messages_prepended(self):
         prev = [{"role": "assistant", "content": "Previous answer"}]
         messages = convert_responses_input_to_messages(
