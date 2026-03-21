@@ -58,6 +58,8 @@ class SamplingParams:
     top_p: float = 0.9
     top_k: int = 0  # 0 means disabled
     min_p: float = 0.0
+    xtc_probability: float = 0.0
+    xtc_threshold: float = 0.1
     repetition_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0

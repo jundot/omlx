@@ -1163,6 +1163,11 @@ class Scheduler:
         # Step counter for periodic cleanup
         self._step_counter = 0
 
+        # Cache XTC special tokens (newline + EOS) — stable per tokenizer.
+        # Must be after _is_harmony_model / _generation_config_eos init
+        # since _get_xtc_special_tokens() delegates to _get_stop_tokens().
+        self._xtc_special_tokens: list[int] = self._get_xtc_special_tokens()
+
     def _calculate_max_blocks(self) -> int:
         """
         Calculate maximum cache blocks for paged SSD-only mode.
@@ -1527,6 +1532,16 @@ class Scheduler:
                 logger.debug(f"Error finalizing Harmony parser for {request_id}: {e}")
         self._request_detokenizers.pop(f"{request_id}_harmony", None)
 
+    def _get_xtc_special_tokens(self) -> list[int]:
+        """Get special tokens to exclude from XTC sampling (newline + EOS).
+
+        Reuses _get_stop_tokens() for EOS coverage (includes generation_config.json
+        tokens) so XTC exclusions stay consistent with stop-token logic.
+        """
+        tokens = self.tokenizer.encode("\n")
+        tokens.extend(self._get_stop_tokens())
+        return tokens
+
     def _create_batch_generator(self, sampling_params: SamplingParams) -> BatchGenerator:
         """Create a BatchGenerator with the given sampling parameters."""
         sampler = make_sampler(
@@ -1534,6 +1549,9 @@ class Scheduler:
             top_p=sampling_params.top_p,
             min_p=sampling_params.min_p,
             top_k=sampling_params.top_k,
+            xtc_probability=sampling_params.xtc_probability,
+            xtc_threshold=sampling_params.xtc_threshold,
+            xtc_special_tokens=self._xtc_special_tokens,
         )
 
         # Create logits processors for repetition/presence/frequency penalties
@@ -1613,6 +1631,9 @@ class Scheduler:
             top_p=sampling_params.top_p,
             min_p=sampling_params.min_p,
             top_k=sampling_params.top_k,
+            xtc_probability=sampling_params.xtc_probability,
+            xtc_threshold=sampling_params.xtc_threshold,
+            xtc_special_tokens=self._xtc_special_tokens,
         )
         logits_processors = make_logits_processors(
             repetition_penalty=sampling_params.repetition_penalty
