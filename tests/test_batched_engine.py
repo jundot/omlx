@@ -528,3 +528,147 @@ class TestBatchedEngineModelType:
         engine._model = mock_model
 
         assert engine.model_type is None
+
+
+class TestApplyChatTemplatePartialMode:
+    """Tests for partial mode support in _apply_chat_template()."""
+
+    def test_partial_mode_sets_continue_final_message(self):
+        """Final assistant message with partial=True sets continue_final_message."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.return_value = "<formatted>"
+        engine._tokenizer = mock_tokenizer
+
+        messages = [
+            {"role": "user", "content": "Generate JSON"},
+            {"role": "assistant", "content": "{", "partial": True},
+        ]
+
+        engine._apply_chat_template(messages)
+
+        call_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is False
+        assert call_kwargs["continue_final_message"] is True
+
+    def test_partial_non_assistant_ignored(self):
+        """partial=True on a non-assistant message does not trigger partial mode."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.return_value = "<formatted>"
+        engine._tokenizer = mock_tokenizer
+
+        messages = [
+            {"role": "user", "content": "Hello", "partial": True},
+        ]
+
+        engine._apply_chat_template(messages)
+
+        call_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is True
+        assert "continue_final_message" not in call_kwargs
+
+    def test_partial_field_stripped_before_template(self):
+        """partial field is removed from messages before calling apply_chat_template."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.return_value = "<formatted>"
+        engine._tokenizer = mock_tokenizer
+
+        messages = [
+            {"role": "user", "content": "Hello", "partial": False},
+            {"role": "assistant", "content": "{", "partial": True},
+        ]
+
+        engine._apply_chat_template(messages)
+
+        # Check the messages passed to apply_chat_template
+        call_args = mock_tokenizer.apply_chat_template.call_args[0][0]
+        for msg in call_args:
+            assert "partial" not in msg
+
+    def test_partial_true_continues_vs_new_turn(self):
+        """Verify the core partial toggle: partial=True continues, absent starts new turn.
+
+        With partial=True on the final assistant message, the engine must pass
+        add_generation_prompt=False and continue_final_message=True so the
+        model continues from the assistant's content rather than starting a
+        new turn.  Without partial, the default add_generation_prompt=True
+        appends the generation prompt (e.g. <|im_start|>assistant) for a
+        fresh response.
+
+        NOTE: The `name` field is not tested here because its rendering is
+        model-template-specific — many templates silently ignore it, so
+        assertions on template output would be fragile and model-dependent.
+        """
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+
+        mock_tokenizer = MagicMock()
+        engine._tokenizer = mock_tokenizer
+
+        base_messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Return JSON with keys: name, age"},
+        ]
+
+        # --- partial=True: continue from prefill ---
+        mock_tokenizer.apply_chat_template.return_value = "...assistant\n{"
+        partial_messages = base_messages + [
+            {"role": "assistant", "content": "{", "partial": True},
+        ]
+        engine._apply_chat_template(partial_messages)
+
+        partial_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
+        assert partial_kwargs["add_generation_prompt"] is False
+        assert partial_kwargs["continue_final_message"] is True
+
+        # --- no partial: new turn ---
+        mock_tokenizer.apply_chat_template.reset_mock()
+        mock_tokenizer.apply_chat_template.return_value = "...<|im_start|>assistant\n"
+        normal_messages = list(base_messages)  # no trailing assistant
+        engine._apply_chat_template(normal_messages)
+
+        normal_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
+        assert normal_kwargs["add_generation_prompt"] is True
+        assert "continue_final_message" not in normal_kwargs
+
+    def test_partial_with_streaming(self):
+        """partial mode kwargs are the same regardless of downstream streaming.
+
+        The engine's _apply_chat_template is called identically for streaming
+        and non-streaming — the partial toggle affects template kwargs only,
+        not the generation path.  This test confirms the kwargs are set
+        correctly when the messages would be used in a streaming context.
+        """
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.return_value = "...1."
+        engine._tokenizer = mock_tokenizer
+
+        messages = [
+            {"role": "user", "content": "List 3 colors"},
+            {"role": "assistant", "content": "1.", "partial": True},
+        ]
+
+        engine._apply_chat_template(messages)
+
+        call_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is False
+        assert call_kwargs["continue_final_message"] is True
+        # partial stripped from message dicts
+        call_msgs = mock_tokenizer.apply_chat_template.call_args[0][0]
+        assert "partial" not in call_msgs[-1]
