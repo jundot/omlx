@@ -1557,20 +1557,11 @@ def quantize_oq(
         if text_only and "vision_config" in config:
             logger.info(f"oQ{oq_level:g}: text-only mode, vision weights excluded")
 
-    # Normalize dtype (same as mlx-lm convert: FP8→float32→bfloat16)
-    tc = config.get("text_config", {})
-    model_dtype_str = config.get("torch_dtype") or tc.get("dtype")
-    if model_dtype_str in ("float16", "bfloat16", "float32"):
-        from mlx.utils import tree_map_with_path
-
-        target_dtype = getattr(mx, model_dtype_str)
-
-        def _set_dtype(k, v):
-            if mx.issubdtype(v.dtype, mx.floating) and v.dtype != target_dtype:
-                return v.astype(target_dtype)
-            return v
-
-        model.update(tree_map_with_path(_set_dtype, model.parameters()))
+    # Dtype normalization is NOT needed here:
+    # - mlx-lm/mlx-vlm load() already handles FP8→float via sanitize
+    # - bfloat16/float16 models are already in the correct dtype
+    # - Accessing all parameters would defeat lazy loading and OOM for large models
+    # - Streaming path handles dtype per-tensor via config.torch_dtype
 
     cb("loading", 25.0)
 
