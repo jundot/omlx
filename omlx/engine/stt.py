@@ -42,7 +42,6 @@ class STTEngine(BaseNonStreamingEngine):
         """
         self._model_name = model_name
         self._model = None
-        self._processor = None
         self._kwargs = kwargs
 
     @property
@@ -74,11 +73,11 @@ class STTEngine(BaseNonStreamingEngine):
         model_name = self._model_name
 
         def _load_sync():
-            model, processor = _load_model(model_name)
-            return model, processor
+            # load_model returns a single nn.Module, not a tuple
+            return _load_model(model_name)
 
         loop = asyncio.get_running_loop()
-        self._model, self._processor = await loop.run_in_executor(
+        self._model = await loop.run_in_executor(
             get_mlx_executor(), _load_sync
         )
         logger.info(f"STT engine started: {self._model_name}")
@@ -90,7 +89,6 @@ class STTEngine(BaseNonStreamingEngine):
 
         logger.info(f"Stopping STT engine: {self._model_name}")
         self._model = None
-        self._processor = None
 
         gc.collect()
         loop = asyncio.get_running_loop()
@@ -124,7 +122,9 @@ class STTEngine(BaseNonStreamingEngine):
             raise RuntimeError("Engine not started. Call start() first.")
 
         try:
-            from mlx_audio.stt.utils import transcribe as _transcribe
+            from mlx_audio.stt.generate import (
+                generate_transcription,
+            )
         except ImportError as exc:
             raise ImportError(
                 "mlx-audio is required for STT inference. "
@@ -132,25 +132,30 @@ class STTEngine(BaseNonStreamingEngine):
             ) from exc
 
         model = self._model
-        processor = self._processor
 
         def _transcribe_sync():
-            result = _transcribe(
+            # generate_transcription accepts model instance or path
+            # and returns an STTOutput dataclass
+            result = generate_transcription(
                 model=model,
-                processor=processor,
                 audio=str(audio_path),
-                language=language,
                 **kwargs,
             )
-            # Normalise result to a dict with our expected keys
-            if isinstance(result, dict):
+            # STTOutput has: text, segments, language,
+            # prompt_tokens, generation_tokens, total_time, etc.
+            if hasattr(result, "text"):
                 return {
-                    "text": result.get("text", ""),
-                    "language": result.get("language", language or ""),
-                    "segments": result.get("segments", []),
-                    "duration": result.get("duration", 0.0),
+                    "text": result.text or "",
+                    "language": getattr(
+                        result, "language", None
+                    ) or language or "",
+                    "segments": getattr(result, "segments", None)
+                    or [],
+                    "duration": getattr(
+                        result, "total_time", 0.0
+                    ),
                 }
-            # Some versions return a plain string
+            # Fallback for unexpected return types
             return {
                 "text": str(result),
                 "language": language or "",
@@ -159,7 +164,9 @@ class STTEngine(BaseNonStreamingEngine):
             }
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(get_mlx_executor(), _transcribe_sync)
+        return await loop.run_in_executor(
+            get_mlx_executor(), _transcribe_sync
+        )
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

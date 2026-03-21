@@ -152,41 +152,40 @@ class TTSEngine(BaseNonStreamingEngine):
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
 
-        try:
-            from mlx_audio.tts.utils import synthesize as _synthesize
-        except ImportError as exc:
-            raise ImportError(
-                "mlx-audio is required for TTS inference. "
-                "Install it with: pip install mlx-audio"
-            ) from exc
-
         model = self._model
 
         def _synthesize_sync():
-            synth_kwargs: Dict[str, Any] = dict(kwargs)
+            # model.generate() returns an iterable of results,
+            # each with .audio (array) and .sample_rate (int).
+            gen_kwargs: Dict[str, Any] = {
+                "text": text,
+                "verbose": False,
+            }
             if voice is not None:
-                synth_kwargs["voice"] = voice
+                gen_kwargs["voice"] = voice
             if speed != 1.0:
-                synth_kwargs["speed"] = speed
+                gen_kwargs["speed"] = speed
+            gen_kwargs.update(kwargs)
 
-            result = _synthesize(model=model, text=text, **synth_kwargs)
+            results = model.generate(**gen_kwargs)
+            audio_chunks = []
+            sample_rate = _DEFAULT_SAMPLE_RATE
 
-            # result may be (audio_array, sample_rate) or just an audio array
-            if isinstance(result, tuple):
-                audio_array, sample_rate = result[0], result[1]
-            else:
-                audio_array = result
-                # Try to get sample_rate from model config
-                sample_rate = getattr(
-                    getattr(model, "config", None),
-                    "sample_rate",
-                    _DEFAULT_SAMPLE_RATE,
-                )
+            for result in results:
+                audio_chunks.append(np.array(result.audio))
+                if hasattr(result, "sample_rate"):
+                    sample_rate = result.sample_rate
 
-            return _audio_to_wav_bytes(audio_array, int(sample_rate))
+            if not audio_chunks:
+                raise RuntimeError("TTS model produced no audio output")
+
+            audio = np.concatenate(audio_chunks, axis=0)
+            return _audio_to_wav_bytes(audio, int(sample_rate))
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(get_mlx_executor(), _synthesize_sync)
+        return await loop.run_in_executor(
+            get_mlx_executor(), _synthesize_sync
+        )
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
