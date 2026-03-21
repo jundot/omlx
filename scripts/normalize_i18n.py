@@ -22,13 +22,21 @@ def normalize():
         with open(file_path, "r", encoding="utf-8") as f:
             lang_data = json.load(f)
             
+        removed = set(lang_data.keys()) - set(en_data.keys())
+        if removed:
+            print(f"  Warning: removing {len(removed)} extra keys: {removed}")
+
+        added = set(en_data.keys()) - set(lang_data.keys())
+        if added:
+            print(f"  Warning: {len(added)} missing keys filled with English fallback: {added}")
+
         normalized_data = {}
         for key, value in en_data.items():
             if key in lang_data:
                 normalized_data[key] = lang_data[key]
             else:
                 normalized_data[key] = value
-                
+
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(normalized_data, f, indent=2, ensure_ascii=False)
             f.write("\n")
