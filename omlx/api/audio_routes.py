@@ -94,28 +94,14 @@ async def create_transcription(
             except OSError:
                 pass
 
-    # Build response from the dict returned by STTEngine.transcribe()
-    segments = result.get("segments") or []
-    # Convert raw segment dicts to AudioSegment objects if needed
-    from .audio_models import AudioSegment
-
-    parsed_segments = []
-    for i, seg in enumerate(segments):
-        if isinstance(seg, dict):
-            parsed_segments.append(
-                AudioSegment(
-                    id=seg.get("id", i),
-                    start=seg.get("start", 0.0),
-                    end=seg.get("end", 0.0),
-                    text=seg.get("text", ""),
-                )
-            )
+    # Build response directly from the dict returned by STTEngine
+    segments = result.get("segments") or None
 
     return AudioTranscriptionResponse(
         text=result.get("text", ""),
         language=result.get("language"),
         duration=result.get("duration"),
-        segments=parsed_segments if parsed_segments else None,
+        segments=segments,
     )
 
 
