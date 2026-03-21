@@ -1815,7 +1815,7 @@
                 const benchWidth = Math.max(14, ...benchmarks.map(b => b.length + 2));
 
                 let lines = [];
-                lines.push('Accuracy Benchmark Comparison');
+                lines.push('Intelligence Benchmark Comparison');
                 lines.push('');
 
                 // Header row

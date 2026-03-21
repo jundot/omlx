@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -74,11 +75,16 @@ class BaseBenchmark(ABC):
 
     def get_max_tokens(self) -> int:
         """Max tokens to generate per question. Override for longer answers."""
-        return 1
+        return 32
 
     def get_category(self, item: dict) -> Optional[str]:
         """Return category/subject for per-category scoring. None if N/A."""
         return None
+
+    @staticmethod
+    def _strip_think_tags(text: str) -> str:
+        """Remove <think>...</think> blocks from model output."""
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
     async def _eval_single(
         self, engine: Any, item: dict, index: int
@@ -91,7 +97,8 @@ class BaseBenchmark(ABC):
                 max_tokens=self.get_max_tokens(),
                 temperature=0.0,
             )
-            return index, item, output.text
+            text = self._strip_think_tags(output.text)
+            return index, item, text
         except Exception as e:
             logger.warning(f"Engine error on question {index}: {e}")
             return index, item, ""

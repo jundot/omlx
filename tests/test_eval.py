@@ -202,6 +202,29 @@ class TestLiveCodeBench:
         assert code == ""
 
 
+# --- Think Tag Stripping Tests ---
+
+
+class TestStripThinkTags:
+    def test_strip_think_block(self):
+        from omlx.eval.base import BaseBenchmark
+        text = "<think>\nLet me think about this...\nThe answer should be A.\n</think>\nA"
+        assert BaseBenchmark._strip_think_tags(text) == "A"
+
+    def test_strip_empty_think(self):
+        from omlx.eval.base import BaseBenchmark
+        assert BaseBenchmark._strip_think_tags("<think></think>B") == "B"
+
+    def test_no_think_tags(self):
+        from omlx.eval.base import BaseBenchmark
+        assert BaseBenchmark._strip_think_tags("A") == "A"
+
+    def test_incomplete_think_tag(self):
+        from omlx.eval.base import BaseBenchmark
+        # Incomplete think tag (no closing) — should be left as-is
+        assert BaseBenchmark._strip_think_tags("<think>still thinking") == "<think>still thinking"
+
+
 # --- Dataset Sampling Tests ---
 
 

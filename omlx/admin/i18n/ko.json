@@ -520,9 +520,9 @@
   "bench.metrics.pp_tps_req.description": "프롬프트 처리 처리량을 배치 크기로 나눈 값. 배칭 부하에서의 요청당 프리필 속도를 나타냅니다.",
 
   "navbar.dropdown.performance": "Performance",
-  "navbar.dropdown.accuracy": "Accuracy",
-  "acc_bench.section_label": "Accuracy",
-  "acc_bench.heading": "정확도 벤치마크",
+  "navbar.dropdown.accuracy": "Intelligence",
+  "acc_bench.section_label": "Intelligence",
+  "acc_bench.heading": "지능 벤치마크",
   "acc_bench.description": "지식, 추론, 수학, 코딩 벤치마크로 모델의 지능을 평가합니다. 벤치마크 전에 다른 모든 모델이 언로드됩니다.",
   "acc_bench.config.section_label": "설정",
   "acc_bench.config.model": "모델",

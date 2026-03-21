@@ -520,9 +520,9 @@
   "bench.metrics.pp_tps_req.description": "プロンプト処理スループットをバッチサイズで割った値。バッチング負荷下でのリクエストあたりのプリフィル速度を示します。",
 
   "navbar.dropdown.performance": "Performance",
-  "navbar.dropdown.accuracy": "Accuracy",
-  "acc_bench.section_label": "Accuracy",
-  "acc_bench.heading": "精度ベンチマーク",
+  "navbar.dropdown.accuracy": "Intelligence",
+  "acc_bench.section_label": "Intelligence",
+  "acc_bench.heading": "知能ベンチマーク",
   "acc_bench.description": "知識、推論、数学、コーディングのベンチマークでモデルの知能を評価します。ベンチマーク前に他のすべてのモデルがアンロードされます。",
   "acc_bench.config.section_label": "設定",
   "acc_bench.config.model": "モデル",

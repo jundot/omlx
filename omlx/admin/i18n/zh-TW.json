@@ -493,9 +493,9 @@
   "bench.metrics.pp_tps_req.description": "提示詞處理吞吐量除以批次大小。顯示批次負載下每個請求的預填充速度。",
 
   "navbar.dropdown.performance": "Performance",
-  "navbar.dropdown.accuracy": "Accuracy",
-  "acc_bench.section_label": "Accuracy",
-  "acc_bench.heading": "準確度基準測試",
+  "navbar.dropdown.accuracy": "Intelligence",
+  "acc_bench.section_label": "Intelligence",
+  "acc_bench.heading": "智能基準測試",
   "acc_bench.description": "透過知識、推理、數學和程式碼基準評估模型智慧。基準測試前將卸載所有其他模型。",
   "acc_bench.config.section_label": "設定",
   "acc_bench.config.model": "模型",

@@ -520,10 +520,10 @@
     "bench.metrics.pp_tps_req.description": "Prompt processing throughput divided by batch size. Shows per-request prefill speed under batching load.",
 
     "navbar.dropdown.performance": "Performance",
-    "navbar.dropdown.accuracy": "Accuracy",
+    "navbar.dropdown.accuracy": "Intelligence",
 
-    "acc_bench.section_label": "Accuracy",
-    "acc_bench.heading": "Accuracy Benchmark",
+    "acc_bench.section_label": "Intelligence",
+    "acc_bench.heading": "Intelligence Benchmark",
     "acc_bench.description": "Evaluate model intelligence across knowledge, reasoning, math, and coding benchmarks. All other models will be unloaded before benchmarking.",
     "acc_bench.config.section_label": "Configuration",
     "acc_bench.config.model": "Model",

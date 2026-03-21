@@ -497,9 +497,9 @@
   "bench.metrics.pp_tps_req.description": "提示词处理吞吐量除以批量大小。显示批量负载下每个请求的预填充速度。",
 
   "navbar.dropdown.performance": "Performance",
-  "navbar.dropdown.accuracy": "Accuracy",
-  "acc_bench.section_label": "Accuracy",
-  "acc_bench.heading": "准确度基准测试",
+  "navbar.dropdown.accuracy": "Intelligence",
+  "acc_bench.section_label": "Intelligence",
+  "acc_bench.heading": "智能基准测试",
   "acc_bench.description": "通过知识、推理、数学和编程基准评估模型智能。基准测试前将卸载所有其他模型。",
   "acc_bench.config.section_label": "配置",
   "acc_bench.config.model": "模型",
