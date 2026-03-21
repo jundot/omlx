@@ -144,13 +144,20 @@ class STTEngine(BaseNonStreamingEngine):
             # STTOutput has: text, segments, language,
             # prompt_tokens, generation_tokens, total_time, etc.
             if hasattr(result, "text"):
+                # Normalize language — mlx-audio may return a list,
+                # None, or the string "None"
+                raw_lang = getattr(result, "language", None)
+                if isinstance(raw_lang, list):
+                    raw_lang = raw_lang[0] if raw_lang else None
+                if raw_lang in (None, "None", "none"):
+                    raw_lang = language or None
+
                 return {
                     "text": result.text or "",
-                    "language": getattr(
-                        result, "language", None
-                    ) or language or "",
-                    "segments": getattr(result, "segments", None)
-                    or [],
+                    "language": raw_lang,
+                    "segments": getattr(
+                        result, "segments", None
+                    ) or [],
                     "duration": getattr(
                         result, "total_time", 0.0
                     ),
@@ -158,7 +165,7 @@ class STTEngine(BaseNonStreamingEngine):
             # Fallback for unexpected return types
             return {
                 "text": str(result),
-                "language": language or "",
+                "language": language,
                 "segments": [],
                 "duration": 0.0,
             }

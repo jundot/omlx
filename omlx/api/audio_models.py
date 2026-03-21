@@ -33,7 +33,7 @@ class AudioTranscriptionResponse(BaseModel):
     text: str
     language: Optional[str] = None
     duration: Optional[float] = None
-    segments: Optional[List[AudioSegment]] = None
+    segments: Optional[List[dict]] = None
 
 
 class AudioSpeechRequest(BaseModel):
