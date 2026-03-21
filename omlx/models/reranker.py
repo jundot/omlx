@@ -88,8 +88,9 @@ class MLXRerankerModel:
         self._is_causal_lm = False
         self._is_jina_reranker = False
         self._token_true_id: int | None = None
-        self._score_token_id: int | None = None
         self._token_false_id: int | None = None
+        self._score_token_id: int | None = None
+        self._rerank_token_id: int | None = None
         self._prefix_tokens: list[int] | None = None
         self._suffix_tokens: list[int] | None = None
         self._is_compiled = False
@@ -523,14 +524,16 @@ class MLXRerankerModel:
             instruct_tokens = tokenizer.encode(rerank_instruct, add_special_tokens=False)
 
         query_tokens = tokenizer.encode(query, add_special_tokens=False)
-        bos_token_id = getattr(tokenizer, "bos_token_id", None) or getattr(tokenizer, "added_tokens_decoder", {}).get(str(tokenizer.pad_token_id if tokenizer.pad_token_id else 151643), {}).get("id")
-
-        # Estimate tokens per document
-        def estimate_doc_tokens(doc: str) -> int:
-            return len(tokenizer.encode(doc, add_special_tokens=False))
+        bos_token_id = getattr(tokenizer, "bos_token_id", None)
+        eos_id = getattr(tokenizer, "eos_token_id", None)
 
         # Compute max content tokens per document
-        reserved = len(instruct_tokens) + len(query_tokens) + 4  # [BOS] + query + doc + [EOS]
+        # reserved = instruct + query + (BOS if present) + (EOS if present)
+        reserved = len(instruct_tokens) + len(query_tokens)
+        if bos_token_id is not None:
+            reserved += 1
+        if eos_id is not None:
+            reserved += 1
         max_doc_tokens = max_length - reserved
 
         scores = []
@@ -546,7 +549,6 @@ class MLXRerankerModel:
             input_ids.extend(query_tokens)
             input_ids.extend(doc_tokens)
             # Add eos if available
-            eos_id = getattr(tokenizer, "eos_token_id", None)
             if eos_id is not None:
                 input_ids.append(eos_id)
 
