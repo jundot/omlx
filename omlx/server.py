@@ -1660,6 +1660,7 @@ async def create_completion(
                 http_request=http_request,
             ),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
     # Non-streaming response with timing
@@ -1891,6 +1892,7 @@ async def create_chat_completion(
                 http_request=http_request,
             ),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
     # Non-streaming response with timing
@@ -2849,6 +2851,7 @@ async def create_anthropic_message(
                 http_request=http_request,
             ),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
     # Non-streaming response
@@ -3192,6 +3195,7 @@ async def create_response(
                 http_request=http_request,
             ),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
     # Non-streaming
