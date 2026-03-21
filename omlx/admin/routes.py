@@ -3594,10 +3594,10 @@ async def start_oq_quantization(
         raise HTTPException(
             status_code=503, detail="oQ quantizer not initialized"
         )
-    if request.oq_level not in (2, 3, 4, 5, 6, 7, 8):
+    if request.oq_level not in (2, 3, 4, 5, 6, 8):
         raise HTTPException(
             status_code=400,
-            detail="Invalid oQ level. Must be 2, 3, 4, 5, 6, 7, or 8",
+            detail="Invalid oQ level. Must be 2, 3, 4, 5, 6, or 8",
         )
     try:
         task = await _oq_manager.start_quantization(

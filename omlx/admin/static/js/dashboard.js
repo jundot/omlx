@@ -384,7 +384,7 @@
                     if (this.modelsTab === 'downloader' && !this.hfRecommendedLoaded) {
                         loads.push(this.loadRecommendedModels());
                     }
-                    if (this.modelsTab === 'quantizer' && !this.oqModelsLoaded) {
+                    if (this.modelsTab === 'quantizer') {
                         loads.push(this.loadOQModels());
                     }
                     if (this.msInitialized && this.msAvailable) {
@@ -469,7 +469,7 @@
                 this.modelsTab = tab;
                 this.mainTab = 'models';
                 this.syncTabStateToUrl();
-                if (tab === 'quantizer' && !this.oqModelsLoaded) {
+                if (tab === 'quantizer') {
                     this.loadOQModels();
                 }
             },

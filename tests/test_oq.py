@@ -416,20 +416,37 @@ class TestStreamingHelpers:
 
     def test_get_predicate_bits_lm_head(self):
         config = {"num_hidden_layers": 32}
-        bits, gs = _get_predicate_bits("lm_head", config, 4, 64)
+        bits, gs, mode = _get_predicate_bits("lm_head", config, 4, 64)
         assert bits == 6
-        assert gs == 64
+        # 6-bit → affine (no mxfp mode for 6-bit)
+        assert mode == "affine"
 
     def test_get_predicate_bits_router_skipped(self):
         config = {"num_hidden_layers": 32, "num_local_experts": 8}
-        bits, gs = _get_predicate_bits("model.layers.0.mlp.gate", config, 4, 64)
+        bits, gs, mode = _get_predicate_bits("model.layers.0.mlp.gate", config, 4, 64)
         assert bits is None  # Router → False → no quantization
 
-    def test_get_predicate_bits_default(self):
+    def test_get_predicate_bits_default_mxfp4(self):
         config = {"num_hidden_layers": 32}
-        bits, gs = _get_predicate_bits("model.layers.10.mlp.gate_proj.weight", config, 4, 64)
+        bits, gs, mode = _get_predicate_bits("model.layers.10.mlp.gate_proj.weight", config, 4, 64)
         assert bits == 4
-        assert gs == 64
+        assert gs == 32  # mxfp4 requires gs=32
+        assert mode == "mxfp4"
+
+    def test_get_predicate_bits_2bit_affine(self):
+        config = {"num_hidden_layers": 32}
+        bits, gs, mode = _get_predicate_bits("model.layers.10.mlp.gate_proj.weight", config, 3, 64)
+        # oQ3 → base 2-bit → affine
+        assert bits == 2
+        assert mode == "affine"
+
+    def test_get_predicate_bits_8bit_mxfp8(self):
+        config = {"num_hidden_layers": 32}
+        bits, gs, mode = _get_predicate_bits("model.layers.10.mlp.gate_proj.weight", config, 8, 64)
+        # oQ8 → base 8-bit → mxfp8
+        assert bits == 8
+        assert gs == 32
+        assert mode == "mxfp8"
 
     def test_format_size(self):
         assert "GB" in _format_size(5 * 1024**3)

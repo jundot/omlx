@@ -16,7 +16,7 @@ from typing import Callable, Optional, Union
 logger = logging.getLogger(__name__)
 
 # Allowed oQ quantization levels
-OQ_LEVELS = {2, 3, 4, 5, 6, 7, 8}
+OQ_LEVELS = {2, 3, 4, 5, 6, 8}
 
 # Bits-per-GB estimate for progress timing (seconds per GB of source weights)
 _QUANT_SECONDS_PER_GB = 3.0
@@ -67,8 +67,7 @@ def universal_quant_predicate(
         4: (4, "full"),
         5: (5, "full"),
         6: (6, "full"),
-        7: (8, "full"),
-        8: (8, "minimal"),
+        8: (8, "full"),
     }
     base_bits, protection = _LEVEL_MAP.get(oq_level, (oq_level, "full"))
     full_protection = protection == "full"
@@ -81,8 +80,17 @@ def universal_quant_predicate(
         return 64
 
     # Helper: never assign bits below base_bits
+    # Auto-select optimal mode per bit width:
+    #   4-bit → mxfp4 (Apple Silicon native, group_size=32)
+    #   8-bit → mxfp8 (Apple Silicon native, group_size=32)
+    #   other → affine (supports 2,3,5,6-bit with flexible group_size)
     def bits(n):
-        return {"bits": max(n, base_bits), "group_size": gs()}
+        effective = max(n, base_bits)
+        if effective == 4:
+            return {"bits": 4, "group_size": 32, "mode": "mxfp4"}
+        if effective == 8:
+            return {"bits": 8, "group_size": 32, "mode": "mxfp8"}
+        return {"bits": effective, "group_size": gs()}
 
     # ══════════════════════════════════════════════
     # Stage 0: Safety-critical non-quantization (ALWAYS applied)
@@ -141,6 +149,10 @@ def universal_quant_predicate(
 
         # shared_expert: +2 bits (always active, SiLU risk)
         if "shared_expert" in path and not path.endswith("shared_expert_gate"):
+            return bits(base_bits + 2)
+
+        # Embedding: +2 bits (error propagates to all layers, <0.6% of params)
+        if any(p in path for p in ("embed_tokens", "wte", "word_embeddings")):
             return bits(base_bits + 2)
 
         # 512+ expert MLP asymmetry safety (prevent NaN)
@@ -373,7 +385,7 @@ def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) 
             if _should_skip_tensor(name):
                 continue
 
-            bits, gs = _get_predicate_bits(name, config, oq_level, group_size)
+            bits, gs, _mode = _get_predicate_bits(name, config, oq_level, group_size)
             if bits is None:
                 # predicate = False → fp16
                 total_params += n_elements
@@ -582,23 +594,43 @@ def _build_model_sanitizer(config: dict):
 
 def _get_predicate_bits(tensor_name: str, config: dict, oq_level: int,
                         group_size: int) -> tuple:
-    """Get quantization bits and group_size for a tensor using the universal predicate.
+    """Get quantization bits, group_size, and mode for a tensor.
 
     Returns:
-        (bits, group_size) or (None, None) if tensor should not be quantized.
+        (bits, group_size, mode) or (None, None, None) if not quantized.
     """
     # Get base_bits from level map
-    _LEVEL_MAP = {2: 2, 3: 2, 4: 4, 5: 5, 6: 6, 7: 8, 8: 8}
+    _LEVEL_MAP = {2: 2, 3: 2, 4: 4, 5: 5, 6: 6, 8: 8}
     base_bits = _LEVEL_MAP.get(oq_level, oq_level)
 
     result = universal_quant_predicate(tensor_name, None, config, oq_level)
     if result is False:
-        return None, None
+        return None, None, None
     if isinstance(result, dict):
         bits = result.get("bits", base_bits)
         gs = result.get("group_size", group_size)
-        return bits, gs
-    return base_bits, group_size
+        mode = result.get("mode", _mode_for_bits(bits))
+        return bits, gs, mode
+    # True → base bits with auto mode
+    return base_bits, _gs_for_mode(base_bits, group_size), _mode_for_bits(base_bits)
+
+
+def _mode_for_bits(bits: int) -> str:
+    """Select optimal quantization mode for a given bit width."""
+    if bits == 4:
+        return "mxfp4"
+    if bits == 8:
+        return "mxfp8"
+    return "affine"
+
+
+def _gs_for_mode(bits: int, default_gs: int) -> int:
+    """Get required group_size for a mode."""
+    if bits == 4:
+        return 32  # mxfp4 requires gs=32
+    if bits == 8:
+        return 32  # mxfp8 requires gs=32
+    return default_gs
 
 
 def quantize_oq_streaming(
@@ -689,7 +721,11 @@ def quantize_oq_streaming(
     out_shard_data = {}
     out_shard_idx = 0
     weight_map = {}
-    quantization_config = {"group_size": group_size, "bits": oq_level, "mode": "affine"}
+    _LEVEL_MAP = {2: 2, 3: 2, 4: 4, 5: 5, 6: 6, 8: 8}
+    base_bits = _LEVEL_MAP.get(oq_level, oq_level)
+    base_mode = _mode_for_bits(base_bits)
+    base_gs = _gs_for_mode(base_bits, group_size)
+    quantization_config = {"group_size": base_gs, "bits": base_bits, "mode": base_mode}
     per_layer_config = {}
     start_time = _time.monotonic()
 
@@ -704,15 +740,16 @@ def quantize_oq_streaming(
         shape = w_mx.shape
 
         if _should_quantize_tensor(tensor_name, shape):
-            bits, gs = _get_predicate_bits(
+            bits, gs, qmode = _get_predicate_bits(
                 tensor_name, config, oq_level, group_size
             )
 
             if bits is not None and len(shape) >= 2 and shape[-1] % gs == 0:
                 w_f16 = w_mx.astype(mx.float16)
-                qw, scales, biases = mx.quantize(
-                    w_f16, group_size=gs, bits=bits
+                qw, scales, *rest = mx.quantize(
+                    w_f16, group_size=gs, bits=bits, mode=qmode
                 )
+                biases = rest[0] if rest else None
 
                 base = tensor_name
                 if base.endswith(".weight"):
@@ -722,15 +759,19 @@ def quantize_oq_streaming(
                 out_shard_data[f"{base}.scales"] = np.array(
                     scales
                 ).astype(np.float16)
-                out_shard_data[f"{base}.biases"] = np.array(
-                    biases
-                ).astype(np.float16)
+                if biases is not None:
+                    out_shard_data[f"{base}.biases"] = np.array(
+                        biases
+                    ).astype(np.float16)
 
-                if bits != oq_level or gs != group_size:
-                    per_layer_config[base] = {
-                        "bits": bits,
-                        "group_size": gs,
-                    }
+                # Track per-layer config for mixed precision/mode
+                _LEVEL_MAP = {2: 2, 3: 2, 4: 4, 5: 5, 6: 6, 8: 8}
+                base_bits = _LEVEL_MAP.get(oq_level, oq_level)
+                if bits != base_bits or gs != group_size or qmode != "affine":
+                    layer_cfg = {"bits": bits, "group_size": gs}
+                    if qmode != "affine":
+                        layer_cfg["mode"] = qmode
+                    per_layer_config[base] = layer_cfg
             else:
                 # Can't quantize or predicate=False → keep fp16
                 out_shard_data[tensor_name] = np.array(
@@ -1338,14 +1379,18 @@ def quantize_oq(
     logger.info(f"oQ{oq_level}: quantizing with universal predicate")
     predicate = make_predicate(config, oq_level)
     # oQ level → base bits
-    _LEVEL_MAP = {2: 2, 3: 2, 4: 4, 5: 5, 6: 6, 7: 8, 8: 8}
+    _LEVEL_MAP = {2: 2, 3: 2, 4: 4, 5: 5, 6: 6, 8: 8}
     base_bits = _LEVEL_MAP.get(oq_level, oq_level)
+
+    base_mode = _mode_for_bits(base_bits)
+    base_gs = _gs_for_mode(base_bits, 64)
 
     model, quantized_config = quantize_model(
         model,
         config,
-        group_size=64,
+        group_size=base_gs,
         bits=base_bits,
+        mode=base_mode,
         quant_predicate=predicate,
     )
     cb("quantizing", 90.0)

@@ -336,6 +336,14 @@ class OQManager:
 
             shutil.rmtree(output, ignore_errors=True)
 
+        # Clean up GPU state to prevent Metal errors on next task
+        try:
+            import mlx.core as mx
+
+            mx.clear_cache()
+        except Exception:
+            pass
+
         logger.info(
             f"oQ quantization cancelled: {task.model_name} (task_id={task_id})"
         )
@@ -368,6 +376,14 @@ class OQManager:
             async with self._quant_sem:
                 if task_id in self._cancelled:
                     return
+
+                # Ensure GPU is clean before starting (previous task may have been cancelled)
+                try:
+                    import mlx.core as mx
+                    mx.clear_cache()
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
 
                 # Phase 1: Loading
                 task.status = QuantStatus.LOADING
