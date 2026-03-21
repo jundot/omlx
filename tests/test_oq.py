@@ -289,6 +289,14 @@ class TestValidateQuantizable:
     def test_quantization_config(self):
         assert validate_quantizable({"quantization_config": {"bits": 4}}) is False
 
+    def test_fp8_native_is_quantizable(self):
+        # Native FP8 models (MiniMax, DeepSeek) should be quantizable
+        assert validate_quantizable({"quantization_config": {"quant_method": "fp8"}}) is True
+
+    def test_non_fp8_quantization_config(self):
+        # Other quant methods (gptq, awq) are already quantized
+        assert validate_quantizable({"quantization_config": {"quant_method": "gptq"}}) is False
+
 
 # =============================================================================
 # Test make_predicate

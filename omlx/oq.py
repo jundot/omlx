@@ -345,8 +345,21 @@ def resolve_output_name(model_name: str, oq_level: int,
 
 
 def validate_quantizable(config: dict) -> bool:
-    """Check if a model config indicates it is not yet quantized."""
-    return "quantization" not in config and "quantization_config" not in config
+    """Check if a model config indicates it can be quantized.
+
+    Models with 'quantization' key (mlx-lm quantized) are excluded.
+    Models with 'quantization_config' are excluded UNLESS they are native FP8
+    (e.g. MiniMax, DeepSeek) which are full-precision models stored in FP8 format.
+    """
+    if "quantization" in config:
+        return False
+    if "quantization_config" in config:
+        qc = config["quantization_config"]
+        # Native FP8 models are quantizable (mlx-lm sanitize handles FP8→float)
+        if isinstance(qc, dict) and qc.get("quant_method") == "fp8":
+            return True
+        return False
+    return True
 
 
 def make_predicate(config: dict, oq_level: int = 4) -> Callable:
