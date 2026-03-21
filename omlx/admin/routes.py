@@ -2558,18 +2558,28 @@ def _build_active_models_data() -> dict:
 
         # Get per-model active/waiting request counts.
         # Follow the same pattern as server.py /api/status endpoint.
+        active_request_ids: set = set()
         entry = engine_pool._entries.get(model_id)
         if entry and entry.engine is not None:
             async_core = getattr(entry.engine, "_engine", None)
             if async_core is not None:
                 core = getattr(async_core, "engine", None)
                 if core is not None:
-                    active_requests = len(getattr(core, "_output_collectors", {}))
+                    collectors = getattr(core, "_output_collectors", {})
+                    active_request_ids = set(collectors.keys())
+                    active_requests = len(collectors)
                     sched = getattr(core, "scheduler", None)
                     if sched is not None:
                         waiting_requests = len(getattr(sched, "waiting", []))
 
         prefilling = tracker.get_model_progress(model_id)
+        prefilling_ids = {p["request_id"] for p in prefilling}
+
+        # Generating = active requests that finished prefill
+        generating = [
+            {"request_id": rid}
+            for rid in sorted(active_request_ids - prefilling_ids)
+        ]
 
         models.append({
             "id": model_id,
@@ -2582,6 +2592,7 @@ def _build_active_models_data() -> dict:
             "active_requests": active_requests,
             "waiting_requests": waiting_requests,
             "prefilling": prefilling,
+            "generating": generating,
         })
 
         total_active += active_requests

@@ -202,6 +202,18 @@
                                             </template>
                                         </div>
                                     </template>
+                                    <!-- Generating sub-rows -->
+                                    <template x-if="m.generating && m.generating.length > 0">
+                                        <div class="mt-1.5 ml-5 space-y-1.5">
+                                            <template x-for="gen in m.generating" :key="gen.request_id">
+                                                <div class="flex items-center gap-2">
+                                                    <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="gen.request_id.substring(0, 8)"></span>
+                                                    <span class="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
+                                                    <span class="text-[10px] text-green-600 font-medium" x-text="window.t('status.active_models.generating')"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
                                 </div>
                             </template>
                         </div>

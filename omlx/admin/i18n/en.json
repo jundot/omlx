@@ -73,6 +73,7 @@
     "status.active_models.active": "Active",
     "status.active_models.waiting": "Waiting",
     "status.active_models.req": "req",
+    "status.active_models.generating": "Generating...",
     "status.active_models.unload": "Unload model",
     "status.api.section_label": "API Endpoints",
     "status.api.openai": "OpenAI API",
