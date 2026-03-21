@@ -4,7 +4,14 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
+
+try:
+    import mlx.core as mx
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
 
 from omlx.models.reranker import MLXRerankerModel, RerankOutput
 
@@ -37,6 +44,7 @@ class TestCausalLMReranker:
         with pytest.raises(ValueError, match="does not contain"):
             model._validate_architecture()
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_rerank_causal_lm_scoring(self, tmp_path):
         """Test _rerank_causal_lm produces correct scores from mocked logits."""
         model_dir = self._make_model_dir(tmp_path)
@@ -58,8 +66,6 @@ class TestCausalLMReranker:
 
         # Mock model forward pass: return logits where "yes" > "no" for doc 0,
         # and "no" > "yes" for doc 1
-        import mlx.core as mx
-        import numpy as np
 
         call_count = [0]
 
@@ -177,10 +183,9 @@ class TestRerankerCompileFallback:
         (model_dir / "config.json").write_text(json.dumps(config))
         return model_dir
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_compiled_path_fallback_on_failure(self, tmp_path):
         """Test that _rerank_seq_classification falls back to eager on compile failure."""
-        import mlx.core as mx
-
         model_dir = self._make_model_dir(tmp_path)
         model = MLXRerankerModel(str(model_dir))
         model._loaded = True
@@ -209,10 +214,9 @@ class TestRerankerCompileFallback:
         # Compiled path failed, eager path should have been used
         model.model.assert_called_once()
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_eager_path_when_not_compiled(self, tmp_path):
         """Test that _rerank_seq_classification uses eager path when not compiled."""
-        import mlx.core as mx
-
         model_dir = self._make_model_dir(tmp_path)
         model = MLXRerankerModel(str(model_dir))
         model._loaded = True

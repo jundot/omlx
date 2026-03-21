@@ -50,7 +50,7 @@ def get_optimization_status() -> dict:
         dict with hardware info and MLX configuration
     """
     hw = detect_hardware()
-    device_info = mx.metal.device_info()
+    device_info = mx.device_info()
     flash_available = hasattr(mx, "fast") and hasattr(
         mx.fast, "scaled_dot_product_attention"
     )

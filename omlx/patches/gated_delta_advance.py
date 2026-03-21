@@ -17,6 +17,13 @@ import inspect
 import logging
 from typing import Any, Optional
 
+try:
+    import mlx.core as mx
+
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
+
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_MODEL_TYPES = {"qwen3_5"}
@@ -46,8 +53,6 @@ def _make_patched_gdn_call(original_call):
     the pattern used by Qwen3NextGatedDeltaNet and all other hybrid
     models in mlx-lm.
     """
-    import mlx.core as mx
-
     def patched_call(
         self,
         inputs: mx.array,

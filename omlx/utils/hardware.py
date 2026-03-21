@@ -20,6 +20,13 @@ import sys
 from dataclasses import dataclass
 from typing import Optional
 
+try:
+    import mlx.core as mx
+
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
+
 logger = logging.getLogger(__name__)
 
 # Default fallback value for all memory functions (conservative)
@@ -85,15 +92,14 @@ def get_total_memory_bytes() -> int:
         pass
 
     # Fallback: MLX Metal
-    try:
-        import mlx.core as mx
-
-        if mx.metal.is_available():
-            device_info = mx.metal.device_info()
-            if "memory_size" in device_info:
-                return int(device_info["memory_size"])
-    except Exception:
-        pass
+    if HAS_MLX:
+        try:
+            if mx.metal.is_available():
+                device_info = mx.device_info()
+                if "memory_size" in device_info:
+                    return int(device_info["memory_size"])
+        except Exception:
+            pass
 
     # Last resort: default
     logger.warning(f"Using default memory size: {DEFAULT_MEMORY_BYTES // (1024**3)} GB")
@@ -118,16 +124,15 @@ def get_max_working_set_bytes() -> int:
         Maximum working set size in bytes.
     """
     # Primary: MLX Metal
-    try:
-        import mlx.core as mx
-
-        if mx.metal.is_available():
-            device_info = mx.metal.device_info()
-            max_working_set = device_info.get("max_recommended_working_set_size", 0)
-            if max_working_set > 0:
-                return max_working_set
-    except Exception:
-        pass
+    if HAS_MLX:
+        try:
+            if mx.metal.is_available():
+                device_info = mx.device_info()
+                max_working_set = device_info.get("max_recommended_working_set_size", 0)
+                if max_working_set > 0:
+                    return max_working_set
+        except Exception:
+            pass
 
     # Fallback: psutil with 75% heuristic
     try:
@@ -147,14 +152,13 @@ def get_max_working_set_bytes() -> int:
 
 def get_mlx_device_name() -> Optional[str]:
     """Get raw device name from MLX Metal API."""
-    try:
-        import mlx.core as mx
-
-        if mx.metal.is_available():
-            device_info = mx.metal.device_info()
-            return device_info.get("device_name")
-    except Exception:
-        pass
+    if HAS_MLX:
+        try:
+            if mx.metal.is_available():
+                device_info = mx.device_info()
+                return device_info.get("device_name")
+        except Exception:
+            pass
     return None
 
 
@@ -187,10 +191,10 @@ def is_mlx_available() -> bool:
     """Check if MLX is available and working."""
     if not is_apple_silicon():
         return False
+    if not HAS_MLX:
+        return False
 
     try:
-        import mlx.core as mx
-
         # Verify we can actually use MLX
         _ = mx.array([1.0, 2.0, 3.0])
         return True

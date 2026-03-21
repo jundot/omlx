@@ -14,25 +14,17 @@ from omlx.cache.paged_ssd_cache import (
 )
 
 
-def _has_mlx() -> bool:
-    """Check if MLX is available."""
-    try:
-        import mlx.core  # noqa: F401
+try:
+    import mlx.core as mx
 
-        return True
-    except ImportError:
-        return False
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
 
 
-@pytest.mark.skipif(not _has_mlx(), reason="MLX not available")
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestHotCacheDisabled:
     """Verify that hot_cache_max_bytes=0 preserves existing behaviour."""
-
-    @pytest.fixture
-    def mx(self):
-        import mlx.core as mx
-
-        return mx
 
     @pytest.fixture
     def manager(self, tmp_path):
@@ -49,7 +41,7 @@ class TestHotCacheDisabled:
         assert manager._hot_cache_enabled is False
         assert manager._hot_cache_max_bytes == 0
 
-    def test_save_load_works_without_hot_cache(self, manager, mx):
+    def test_save_load_works_without_hot_cache(self, manager):
         """Save/load should work even when hot cache is disabled."""
         block_hash = b"disabled_hot_cache_test"
         cache_data = [
@@ -81,15 +73,9 @@ class TestHotCacheDisabled:
         assert stats.hot_cache_promotions == 0
 
 
-@pytest.mark.skipif(not _has_mlx(), reason="MLX not available")
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestHotCacheEnabled:
     """Test hot cache with in-memory caching active."""
-
-    @pytest.fixture
-    def mx(self):
-        import mlx.core as mx
-
-        return mx
 
     @pytest.fixture
     def manager(self, tmp_path):
@@ -102,7 +88,7 @@ class TestHotCacheEnabled:
         yield mgr
         mgr.close()
 
-    def _make_cache_data(self, mx, num_layers=4, seq_len=32, heads=4, head_dim=32):
+    def _make_cache_data(self, num_layers=4, seq_len=32, heads=4, head_dim=32):
         """Create test cache data."""
         return [
             (
@@ -112,9 +98,9 @@ class TestHotCacheEnabled:
             for _ in range(num_layers)
         ]
 
-    def _save_block(self, manager, mx, block_hash, num_layers=4, model="test-model"):
+    def _save_block(self, manager, block_hash, num_layers=4, model="test-model"):
         """Save a test block and return True on success."""
-        cache_data = self._make_cache_data(mx, num_layers=num_layers)
+        cache_data = self._make_cache_data(num_layers=num_layers)
         return manager.save_block(
             block_hash=block_hash,
             cache_data=cache_data,
@@ -123,10 +109,10 @@ class TestHotCacheEnabled:
             layer_cache_types=["KVCache"] * num_layers,
         )
 
-    def test_save_stores_in_hot_cache(self, manager, mx):
+    def test_save_stores_in_hot_cache(self, manager):
         """After save_block(), the entry should be in hot cache."""
         block_hash = b"hot_cache_save_test1"
-        self._save_block(manager, mx, block_hash)
+        self._save_block(manager, block_hash)
 
         # Verify hot cache has the entry
         entry = manager._hot_cache_get(block_hash)
@@ -134,10 +120,10 @@ class TestHotCacheEnabled:
         assert 'tensors_raw' in entry
         assert entry['num_layers'] == 4
 
-    def test_load_from_hot_cache(self, manager, mx):
+    def test_load_from_hot_cache(self, manager):
         """load_block() should return data from hot cache without SSD I/O."""
         block_hash = b"hot_cache_load_test1"
-        self._save_block(manager, mx, block_hash)
+        self._save_block(manager, block_hash)
 
         loaded = manager.load_block(block_hash)
         assert loaded is not None
@@ -146,10 +132,10 @@ class TestHotCacheEnabled:
         stats = manager.get_stats()
         assert stats.hot_cache_hits >= 1
 
-    def test_hot_cache_hit_updates_stats(self, manager, mx):
+    def test_hot_cache_hit_updates_stats(self, manager):
         """Hot cache hit should increment hot_cache_hits counter."""
         block_hash = b"hot_cache_stats_test1"
-        self._save_block(manager, mx, block_hash)
+        self._save_block(manager, block_hash)
 
         initial_stats = manager.get_stats()
         initial_hits = initial_stats.hot_cache_hits
@@ -160,20 +146,20 @@ class TestHotCacheEnabled:
         stats = manager.get_stats()
         assert stats.hot_cache_hits >= initial_hits + 2
 
-    def test_hot_cache_size_tracking(self, manager, mx):
+    def test_hot_cache_size_tracking(self, manager):
         """Hot cache should track total size in bytes."""
         block_hash = b"hot_cache_size_test1"
-        self._save_block(manager, mx, block_hash)
+        self._save_block(manager, block_hash)
 
         stats = manager.get_stats()
         assert stats.hot_cache_entries == 1
         assert stats.hot_cache_size_bytes > 0
         assert stats.hot_cache_max_bytes == 10 * 1024**2
 
-    def test_delete_block_removes_from_hot_cache(self, manager, mx):
+    def test_delete_block_removes_from_hot_cache(self, manager):
         """delete_block() should remove entry from hot cache."""
         block_hash = b"hot_cache_delete_test"
-        self._save_block(manager, mx, block_hash)
+        self._save_block(manager, block_hash)
 
         # Verify it's in hot cache
         assert manager._hot_cache_get(block_hash) is not None
@@ -183,7 +169,7 @@ class TestHotCacheEnabled:
         # Verify it's gone from hot cache
         assert manager._hot_cache_get(block_hash) is None
 
-    def test_close_clears_hot_cache(self, tmp_path, mx):
+    def test_close_clears_hot_cache(self, tmp_path):
         """close() should clear all hot cache entries."""
         mgr = PagedSSDCacheManager(
             cache_dir=tmp_path / "close_test",
@@ -191,7 +177,7 @@ class TestHotCacheEnabled:
             hot_cache_max_bytes=10 * 1024**2,
         )
         block_hash = b"hot_cache_close_test1"
-        cache_data = self._make_cache_data(mx)
+        cache_data = self._make_cache_data()
         mgr.save_block(
             block_hash=block_hash,
             cache_data=cache_data,
@@ -207,17 +193,11 @@ class TestHotCacheEnabled:
         assert mgr._hot_cache_total_bytes == 0
 
 
-@pytest.mark.skipif(not _has_mlx(), reason="MLX not available")
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestHotCacheLRU:
     """Test LRU eviction behaviour of the hot cache."""
 
-    @pytest.fixture
-    def mx(self):
-        import mlx.core as mx
-
-        return mx
-
-    def _make_cache_data(self, mx, num_layers=2, seq_len=16, heads=2, head_dim=16):
+    def _make_cache_data(self, num_layers=2, seq_len=16, heads=2, head_dim=16):
         """Create small test cache data."""
         return [
             (
@@ -227,15 +207,15 @@ class TestHotCacheLRU:
             for _ in range(num_layers)
         ]
 
-    def _entry_size(self, mx, num_layers=2, seq_len=16, heads=2, head_dim=16):
+    def _entry_size(self, num_layers=2, seq_len=16, heads=2, head_dim=16):
         """Estimate the raw byte size of one entry."""
         # Each tensor: 1 * heads * seq_len * head_dim * 4 bytes (float32)
         # 2 tensors (keys + values) per layer, num_layers layers
         return num_layers * 2 * 1 * heads * seq_len * head_dim * 4
 
-    def test_lru_eviction(self, tmp_path, mx):
+    def test_lru_eviction(self, tmp_path):
         """Old entries should be evicted when capacity is exceeded."""
-        entry_size = self._entry_size(mx)
+        entry_size = self._entry_size()
         # Allow room for exactly 2 entries
         max_bytes = entry_size * 2 + 100
 
@@ -249,7 +229,7 @@ class TestHotCacheLRU:
             # Save 3 blocks — the first should be evicted
             for i in range(3):
                 block_hash = f"lru_block_{i}".encode()
-                cache_data = self._make_cache_data(mx)
+                cache_data = self._make_cache_data()
                 mgr.save_block(
                     block_hash=block_hash,
                     cache_data=cache_data,
@@ -269,9 +249,9 @@ class TestHotCacheLRU:
         finally:
             mgr.close()
 
-    def test_lru_access_refreshes_order(self, tmp_path, mx):
+    def test_lru_access_refreshes_order(self, tmp_path):
         """Accessing a block should move it to MRU position."""
-        entry_size = self._entry_size(mx)
+        entry_size = self._entry_size()
         max_bytes = entry_size * 2 + 100
 
         mgr = PagedSSDCacheManager(
@@ -284,7 +264,7 @@ class TestHotCacheLRU:
             # Save blocks 0 and 1
             for i in range(2):
                 block_hash = f"order_block_{i}".encode()
-                cache_data = self._make_cache_data(mx)
+                cache_data = self._make_cache_data()
                 mgr.save_block(
                     block_hash=block_hash,
                     cache_data=cache_data,
@@ -297,7 +277,7 @@ class TestHotCacheLRU:
             mgr.load_block(b"order_block_0")
 
             # Save block 2 — should evict block 1 (LRU), not block 0
-            cache_data = self._make_cache_data(mx)
+            cache_data = self._make_cache_data()
             mgr.save_block(
                 block_hash=b"order_block_2",
                 cache_data=cache_data,
@@ -316,17 +296,11 @@ class TestHotCacheLRU:
             mgr.close()
 
 
-@pytest.mark.skipif(not _has_mlx(), reason="MLX not available")
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestHotCachePromotion:
     """Test promotion from SSD to hot cache on load."""
 
-    @pytest.fixture
-    def mx(self):
-        import mlx.core as mx
-
-        return mx
-
-    def _make_cache_data(self, mx, num_layers=4, seq_len=32, heads=4, head_dim=32):
+    def _make_cache_data(self, num_layers=4, seq_len=32, heads=4, head_dim=32):
         return [
             (
                 mx.zeros((1, heads, seq_len, head_dim)),
@@ -335,7 +309,7 @@ class TestHotCachePromotion:
             for _ in range(num_layers)
         ]
 
-    def test_ssd_load_promotes_to_hot_cache(self, tmp_path, mx):
+    def test_ssd_load_promotes_to_hot_cache(self, tmp_path):
         """Loading a block from SSD should promote it to hot cache."""
         # Use hot_cache disabled to write directly to SSD first
         mgr_cold = PagedSSDCacheManager(
@@ -345,7 +319,7 @@ class TestHotCachePromotion:
         )
 
         block_hash = b"promote_test_block1"
-        cache_data = self._make_cache_data(mx)
+        cache_data = self._make_cache_data()
         mgr_cold.save_block(
             block_hash=block_hash,
             cache_data=cache_data,
@@ -379,7 +353,7 @@ class TestHotCachePromotion:
         finally:
             mgr.close()
 
-    def test_promotion_does_not_happen_when_disabled(self, tmp_path, mx):
+    def test_promotion_does_not_happen_when_disabled(self, tmp_path):
         """No promotion when hot cache is disabled."""
         mgr = PagedSSDCacheManager(
             cache_dir=tmp_path / "no_promote_test",
@@ -389,7 +363,7 @@ class TestHotCachePromotion:
 
         try:
             block_hash = b"no_promote_block1__"
-            cache_data = self._make_cache_data(mx)
+            cache_data = self._make_cache_data()
             mgr.save_block(
                 block_hash=block_hash,
                 cache_data=cache_data,
@@ -414,15 +388,9 @@ class TestHotCachePromotion:
             mgr.close()
 
 
-@pytest.mark.skipif(not _has_mlx(), reason="MLX not available")
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestHotCacheCacheTypes:
     """Test hot cache with various cache types (KVCache, CacheList)."""
-
-    @pytest.fixture
-    def mx(self):
-        import mlx.core as mx
-
-        return mx
 
     @pytest.fixture
     def manager(self, tmp_path):
@@ -434,7 +402,7 @@ class TestHotCacheCacheTypes:
         yield mgr
         mgr.close()
 
-    def test_cache_list_blocks(self, manager, mx):
+    def test_cache_list_blocks(self, manager):
         """Hot cache should handle CacheList blocks correctly."""
         block_hash = b"cache_list_hot_test"
 
@@ -525,17 +493,11 @@ class TestHotCacheConcurrency:
         assert len(errors) == 0, f"Concurrent errors: {errors}"
 
 
-@pytest.mark.skipif(not _has_mlx(), reason="MLX not available")
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestHotCacheStatsAccuracy:
     """Test that hot cache statistics are accurate."""
 
-    @pytest.fixture
-    def mx(self):
-        import mlx.core as mx
-
-        return mx
-
-    def test_all_stats_counters(self, tmp_path, mx):
+    def test_all_stats_counters(self, tmp_path):
         """Verify hot cache stats counters are correctly maintained."""
         entry_size = 2 * 2 * 1 * 2 * 16 * 16 * 4  # ~4096 bytes per entry
         # Room for 2 entries
@@ -588,17 +550,11 @@ class TestHotCacheStatsAccuracy:
             mgr.close()
 
 
-@pytest.mark.skipif(not _has_mlx(), reason="MLX not available")
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestHotCacheWriteBack:
     """Test write-back behavior: no SSD writes until eviction or shutdown."""
 
-    @pytest.fixture
-    def mx(self):
-        import mlx.core as mx
-
-        return mx
-
-    def _make_cache_data(self, mx, num_layers=2, seq_len=16, heads=2, head_dim=16):
+    def _make_cache_data(self, num_layers=2, seq_len=16, heads=2, head_dim=16):
         return [
             (
                 mx.zeros((1, heads, seq_len, head_dim)),
@@ -607,7 +563,7 @@ class TestHotCacheWriteBack:
             for _ in range(num_layers)
         ]
 
-    def test_save_does_not_write_to_ssd(self, tmp_path, mx):
+    def test_save_does_not_write_to_ssd(self, tmp_path):
         """With hot cache enabled, save_block should not create SSD files."""
         mgr = PagedSSDCacheManager(
             cache_dir=tmp_path / "wb_test",
@@ -617,7 +573,7 @@ class TestHotCacheWriteBack:
 
         try:
             block_hash = b"wb_no_ssd_write_t1"
-            cache_data = self._make_cache_data(mx)
+            cache_data = self._make_cache_data()
             mgr.save_block(
                 block_hash=block_hash,
                 cache_data=cache_data,
@@ -636,7 +592,7 @@ class TestHotCacheWriteBack:
         finally:
             mgr.close()
 
-    def test_eviction_writes_to_ssd(self, tmp_path, mx):
+    def test_eviction_writes_to_ssd(self, tmp_path):
         """When hot cache evicts, the evicted block should be written to SSD."""
         entry_size = 2 * 2 * 1 * 2 * 16 * 16 * 4
         max_bytes = entry_size * 2 + 100
@@ -651,7 +607,7 @@ class TestHotCacheWriteBack:
             # Save 2 blocks (fits in hot cache)
             for i in range(2):
                 block_hash = f"wb_evict_blk_{i}__".encode()
-                cache_data = self._make_cache_data(mx)
+                cache_data = self._make_cache_data()
                 mgr.save_block(
                     block_hash=block_hash,
                     cache_data=cache_data,
@@ -666,7 +622,7 @@ class TestHotCacheWriteBack:
             assert len(ssd_files) == 0
 
             # Save 3rd block → evicts block 0 → should trigger SSD write
-            cache_data = self._make_cache_data(mx)
+            cache_data = self._make_cache_data()
             mgr.save_block(
                 block_hash=b"wb_evict_blk_2__",
                 cache_data=cache_data,
@@ -682,7 +638,7 @@ class TestHotCacheWriteBack:
         finally:
             mgr.close()
 
-    def test_close_flushes_hot_cache_to_ssd(self, tmp_path, mx):
+    def test_close_flushes_hot_cache_to_ssd(self, tmp_path):
         """close() should flush all hot cache entries to SSD."""
         mgr = PagedSSDCacheManager(
             cache_dir=tmp_path / "wb_flush_test",
@@ -694,7 +650,7 @@ class TestHotCacheWriteBack:
         for i in range(3):
             block_hash = f"wb_flush_blk_{i}__".encode()
             block_hashes.append(block_hash)
-            cache_data = self._make_cache_data(mx)
+            cache_data = self._make_cache_data()
             mgr.save_block(
                 block_hash=block_hash,
                 cache_data=cache_data,

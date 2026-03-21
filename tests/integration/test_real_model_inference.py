@@ -401,7 +401,7 @@ class TestMemoryHandling:
         from omlx.models.llm import MLXLanguageModel
 
         # Get initial memory state
-        mx.metal.clear_cache()
+        mx.clear_cache()
         gc.collect()
 
         model = MLXLanguageModel(str(test_model_path))
@@ -427,7 +427,7 @@ class TestMemoryHandling:
         # Cleanup
         del model
         gc.collect()
-        mx.metal.clear_cache()
+        mx.clear_cache()
 
     def test_repeated_generation_no_leak(self, test_model_path: Path):
         """Test that repeated generations don't leak memory."""
@@ -448,7 +448,7 @@ class TestMemoryHandling:
             assert output.text is not None
 
             # Clear intermediate cache
-            mx.metal.clear_cache()
+            mx.clear_cache()
 
         # Final generation should still work
         final = model.generate(

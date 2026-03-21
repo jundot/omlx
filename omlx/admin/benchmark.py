@@ -18,6 +18,13 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, field_validator
 
+try:
+    import mlx.core as mx
+
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
+
 logger = logging.getLogger(__name__)
 
 # Module-level storage for active benchmark runs
@@ -185,8 +192,6 @@ async def _run_single_test(
     pp_len: int,
 ) -> dict:
     """Run a single request benchmark test and return metrics."""
-    import mlx.core as mx
-
     # Reset peak memory tracking
     try:
         mx.reset_peak_memory()

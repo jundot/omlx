@@ -127,8 +127,8 @@ class ProcessMemoryEnforcer:
         if hard_limit <= 0:
             return
         try:
-            mx.metal.set_memory_limit(hard_limit)
-            mx.metal.set_cache_limit(hard_limit // 2)
+            mx.set_memory_limit(hard_limit)
+            mx.set_cache_limit(hard_limit // 2)
             logger.info(
                 f"Metal memory limit set: {_format_gb(hard_limit)}, "
                 f"cache limit: {_format_gb(hard_limit // 2)}"

@@ -13,6 +13,17 @@ import re
 from pathlib import Path
 from typing import Callable, Optional, Union
 
+import numpy as np
+
+try:
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
+
 logger = logging.getLogger(__name__)
 
 # Allowed oQ quantization levels
@@ -132,43 +143,49 @@ def universal_quant_predicate(
     # ══════════════════════════════════════════════
 
     if not full_protection:
-        # lm_head: +2 bits above base
+        # Critical layers: 6-bit affine (64 levels, +2 GB for 5% of params)
+        # 6-bit chosen over mxfp4 4-bit for 4x precision (64 vs 16 levels)
+        # Cost: ~0.2 bpw overhead — negligible for significant quality gain
+
+        # lm_head: 6-bit
         if any(p in path for p in ("lm_head", "output.weight", "classifier")):
-            return bits(base_bits + 2)
+            return bits(6)
 
         # SSM output: at least 8-bit
         if any(p in path for p in ("ssm_output", "ssm_out")):
             return bits(8)
 
-        # Attention: +2 bits (all attention projections)
+        # Attention: 6-bit (all attention projections)
         if any(p in path for p in (
             "v_proj", "v_a_proj", "v_b_proj", "q_proj", "k_proj", "o_proj",
             "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b",
         )):
-            return bits(base_bits + 2)
+            return bits(6)
 
-        # shared_expert: +2 bits (always active, SiLU risk)
+        # shared_expert: 6-bit (always active, SiLU risk)
         if "shared_expert" in path and not path.endswith("shared_expert_gate"):
-            return bits(base_bits + 2)
+            return bits(6)
 
-        # Embedding: +2 bits (error propagates to all layers, <0.6% of params)
+        # Embedding: 6-bit (error propagates to all layers, <0.6% of params)
         if any(p in path for p in ("embed_tokens", "wte", "word_embeddings")):
-            return bits(base_bits + 2)
+            return bits(6)
 
         # 512+ expert MLP asymmetry safety (prevent NaN)
         if num_experts >= 512 and hidden_size >= 4096:
             if "gate_proj" in path and "shared_expert" not in path:
                 return bits(4)
 
-        # Expert MLP on sensitive layers (first/last 12.5%): +1 bit
-        # This is 25% of expert MLP = ~24% of total params → significant bpw boost
+        # Sensitive layers (first/last 12.5%): +1 bit for non-expert layers only
+        # Expert MLP is 94% of MoE params — applying +1 there costs too much bpw
+        # But non-expert layers (attention, shared_expert) benefit from protection
         layer_idx = _extract_layer_index(path)
         if layer_idx >= 0:
             sensitive = (
                 layer_idx < num_layers // 8
                 or layer_idx >= 7 * num_layers // 8
             )
-            if sensitive:
+            is_expert = "switch_mlp" in path or "experts" in path
+            if sensitive and not is_expert:
                 return bits(base_bits + 1)
 
         # Everything else: base_bits
@@ -350,8 +367,6 @@ def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) 
     Returns:
         Dict with effective_bpw, output_size_bytes, output_size_formatted.
     """
-    import mlx.core as mx
-
     source = Path(model_path)
     config_path = source / "config.json"
     with open(config_path) as f:
@@ -654,8 +669,6 @@ def quantize_oq_streaming(
     """
     import shutil
 
-    import mlx.core as mx
-    import numpy as np
     from safetensors.numpy import save_file
 
     if oq_level not in OQ_LEVELS:
@@ -948,8 +961,6 @@ def _load_calibration_data(tokenizer, dataset: str = "default",
     Returns:
         MLX array of shape (num_samples, seq_length) or None on failure.
     """
-    import mlx.core as mx
-
     if dataset == "default":
         try:
             from mlx_lm.quant.utils import load_data
@@ -975,9 +986,6 @@ def _load_calibration_data(tokenizer, dataset: str = "default",
 def _load_hf_calibration(tokenizer, dataset: str, num_samples: int,
                          seq_length: int):
     """Load calibration data from HuggingFace datasets."""
-    import mlx.core as mx
-    import numpy as np
-
     try:
         from datasets import load_dataset
     except ImportError:
@@ -1104,8 +1112,6 @@ def _search_best_clip(w, x, group_size: int, bits: int,
     Returns:
         Clipped weight tensor (same shape as w).
     """
-    import mlx.core as mx
-
     # Subsample activations
     x = x.reshape(-1, x.shape[-1])
     stride = max(1, (x.shape[0] + n_frames - 1) // n_frames)
@@ -1180,10 +1186,6 @@ def _run_clip_optimization(model, tokenizer, config, oq_level,
     Returns:
         Number of layers optimized.
     """
-    import mlx.core as mx
-    import mlx.nn as nn
-    from mlx.utils import tree_flatten
-
     cb = progress_callback or (lambda phase, pct: None)
 
     # Load calibration data

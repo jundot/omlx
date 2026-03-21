@@ -3,7 +3,15 @@
 
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
+
+try:
+    import mlx.core as mx
+
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
 
 from omlx.oq import (
     OQ_LEVELS,
@@ -287,12 +295,12 @@ class TestValidateQuantizable:
 # =============================================================================
 
 
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestClipOptimization:
     """Test AWQ-style output-MSE clip optimization."""
 
     def test_search_best_clip_returns_same_shape(self):
         """Clipped weights should have the same shape as input."""
-        import mlx.core as mx
 
         w = mx.random.normal((64, 128))
         x = mx.random.normal((32, 128))  # 32 activation samples
@@ -301,7 +309,6 @@ class TestClipOptimization:
 
     def test_search_best_clip_reduces_range(self):
         """Clipping should reduce the weight range (or keep it same)."""
-        import mlx.core as mx
 
         w = mx.random.normal((32, 64))
         x = mx.random.normal((16, 64))
@@ -313,7 +320,6 @@ class TestClipOptimization:
 
     def test_search_best_clip_2bit(self):
         """2-bit clip search should work."""
-        import mlx.core as mx
 
         w = mx.random.normal((16, 128))
         x = mx.random.normal((8, 128))
@@ -323,8 +329,6 @@ class TestClipOptimization:
 
     def test_output_mse_improves_with_clip(self):
         """Clipped + quantized should have lower output MSE than raw quantized."""
-        import mlx.core as mx
-        import numpy as np
 
         np.random.seed(42)
         # Weight with outliers

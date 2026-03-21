@@ -4085,7 +4085,6 @@ class Scheduler:
             # Determine dtype size
             dtype_size = 2  # Default float16
             if hasattr(self.model, 'dtype'):
-                import mlx.core as mx
                 if self.model.dtype == mx.float32:
                     dtype_size = 4
                 elif self.model.dtype == mx.bfloat16:

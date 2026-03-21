@@ -209,7 +209,7 @@ def serve_command(args):
     # and are only released via mx.clear_cache() (which we protect
     # with mx.synchronize()). See issue #300.
     import mlx.core as mx
-    total_mem = mx.metal.device_info().get("memory_size", 0)
+    total_mem = mx.device_info().get("memory_size", 0)
     if total_mem > 0:
         mx.set_cache_limit(total_mem)
 

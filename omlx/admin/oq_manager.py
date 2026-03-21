@@ -15,6 +15,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+try:
+    import mlx.core as mx
+
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -340,12 +347,11 @@ class OQManager:
             shutil.rmtree(output, ignore_errors=True)
 
         # Clean up GPU state to prevent Metal errors on next task
-        try:
-            import mlx.core as mx
-
-            mx.clear_cache()
-        except Exception:
-            pass
+        if HAS_MLX:
+            try:
+                mx.clear_cache()
+            except Exception:
+                pass
 
         logger.info(
             f"oQ quantization cancelled: {task.model_name} (task_id={task_id})"
@@ -381,12 +387,12 @@ class OQManager:
                     return
 
                 # Ensure GPU is clean before starting (previous task may have been cancelled)
-                try:
-                    import mlx.core as mx
-                    mx.clear_cache()
-                    await asyncio.sleep(0.5)
-                except Exception:
-                    pass
+                if HAS_MLX:
+                    try:
+                        mx.clear_cache()
+                        await asyncio.sleep(0.5)
+                    except Exception:
+                        pass
 
                 # Phase 1: Loading
                 task.status = QuantStatus.LOADING

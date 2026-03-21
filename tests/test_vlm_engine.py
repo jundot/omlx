@@ -14,6 +14,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+try:
+    import mlx.core as mx
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
+
 
 # ---------------------------------------------------------------------------
 # Mock helpers
@@ -544,12 +550,11 @@ class TestPrepareVisionInputs:
 
         return engine
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
     @patch("mlx_vlm.prompt_utils.apply_chat_template")
     def test_tools_added_to_template_kwargs(self, mock_vlm_act, mock_prepare):
         """When tools are provided, they appear in template_kwargs."""
-        import mlx.core as mx
-
         engine = self._setup_engine_for_vision()
 
         # Mock apply_chat_template (mlx-vlm) returning formatted messages
@@ -573,12 +578,11 @@ class TestPrepareVisionInputs:
         call_kwargs = proc_call.call_args[1]
         assert call_kwargs.get("tools") == tools
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
     @patch("mlx_vlm.prompt_utils.apply_chat_template")
     def test_tools_not_added_when_none(self, mock_vlm_act, mock_prepare):
         """When tools=None, 'tools' key not in template_kwargs."""
-        import mlx.core as mx
-
         engine = self._setup_engine_for_vision()
 
         mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]

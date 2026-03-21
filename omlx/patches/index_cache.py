@@ -15,6 +15,13 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+try:
+    import mlx.core as mx
+
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
+
 logger = logging.getLogger(__name__)
 
 # Sentinel for supported model types
@@ -58,8 +65,6 @@ def _update_indexer_cache_only(indexer: Any, x: Any, cache: Any) -> None:
     layers have correct keys.  Q projection, Q*K attention, and
     argpartition are all skipped.
     """
-    import mlx.core as mx
-
     b, s, _ = x.shape
     k = indexer.wk(x)
     k = indexer.k_norm(k)
@@ -81,8 +86,6 @@ def _make_patched_attention_call(original_call):
     - If absent or True: run the original indexer (Full layer)
     - If False: skip indexer, reuse cached topk_indices (Shared layer)
     """
-    import mlx.core as mx
-
     from mlx_lm.models.base import scaled_dot_product_attention
 
     def patched_call(
