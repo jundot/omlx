@@ -376,6 +376,10 @@ from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
 set_mcp_manager_getter(get_mcp_manager)
 app.include_router(mcp_router)
 
+# Include audio routes
+from .api.audio_routes import router as audio_router
+app.include_router(audio_router)
+
 # Include admin routes
 from .admin.routes import router as admin_router, set_admin_getters
 from .admin.auth import _RedirectToLogin
