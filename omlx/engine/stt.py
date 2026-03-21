@@ -10,9 +10,7 @@ when mlx-audio is not installed.
 
 import asyncio
 import gc
-import io
 import logging
-import wave
 from typing import Any, Dict, Optional
 
 import mlx.core as mx

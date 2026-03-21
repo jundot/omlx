@@ -20,7 +20,7 @@ import gc
 import io
 import logging
 import wave
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import mlx.core as mx
 import numpy as np
@@ -212,5 +212,5 @@ class STSEngine(BaseNonStreamingEngine):
         }
 
     def __repr__(self) -> str:
-        status = "running" if self._model is not None else "stopped"
-        return f"<STSEngine model={self._model_name} family={self._family} status={status}>"
+        s = "running" if self._model is not None else "stopped"
+        return f"<STSEngine model={self._model_name} family={self._family} {s}>"

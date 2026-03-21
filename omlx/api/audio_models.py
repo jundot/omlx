@@ -9,7 +9,7 @@ These models define the request and response schemas for:
 
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class AudioTranscriptionRequest(BaseModel):

@@ -16,7 +16,7 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
-from .audio_models import AudioProcessRequest, AudioSpeechRequest, AudioTranscriptionResponse
+from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
 
 logger = logging.getLogger(__name__)
 
