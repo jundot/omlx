@@ -152,12 +152,20 @@ class STTEngine(BaseNonStreamingEngine):
                 if raw_lang in (None, "None", "none"):
                     raw_lang = language or None
 
+                # Normalize segments — mlx-audio may return
+                # dataclass objects or dicts
+                raw_segs = getattr(result, "segments", None) or []
+                segments = []
+                for s in raw_segs:
+                    if hasattr(s, "__dict__"):
+                        segments.append(vars(s))
+                    elif isinstance(s, dict):
+                        segments.append(s)
+
                 return {
                     "text": result.text or "",
                     "language": raw_lang,
-                    "segments": getattr(
-                        result, "segments", None
-                    ) or [],
+                    "segments": segments,
                     "duration": getattr(
                         result, "total_time", 0.0
                     ),
