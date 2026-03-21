@@ -60,11 +60,9 @@
                                                     :class="accBenchmarks[b.key]
                                                         ? 'bg-white/20 border-white/30 text-white disabled:opacity-40 [&>option]:text-neutral-900'
                                                         : 'bg-neutral-50 border-neutral-200 text-neutral-600 disabled:opacity-40'">
-                                                <option value="30">30</option>
-                                                <option value="50">50</option>
-                                                <option value="100">100</option>
-                                                <option value="200">200</option>
-                                                <option value="300">300</option>
+                                                <template x-for="s in b.sizes" :key="s">
+                                                    <option :value="s" x-text="s"></option>
+                                                </template>
                                                 <option value="0" x-text="'Full (' + b.fullSize.toLocaleString() + ')'"></option>
                                             </select>
                                             <!-- Code exec warning badge -->
