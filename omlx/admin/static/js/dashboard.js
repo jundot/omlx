@@ -266,6 +266,7 @@
             oqClipSamples: 128,
             oqClipSeqLen: 512,
             oqCalibDataset: 'code_multilingual',
+            oqClipBatchSize: 1024,
 
             // Benchmark state
             benchModelId: '',
@@ -2583,6 +2584,7 @@
                             clip_num_samples: this.oqClipSamples,
                             clip_seq_length: this.oqClipSeqLen,
                             calib_dataset: this.oqCalibDataset,
+                            clip_batch_size: this.oqClipBatchSize,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));

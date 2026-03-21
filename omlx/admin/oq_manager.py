@@ -63,6 +63,7 @@ class QuantTask:
     clip_seq_length: int = 512
     clip_n_grid: int = 20
     calib_dataset: str = "default"
+    clip_batch_size: int = 1024
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -230,6 +231,7 @@ class OQManager:
         clip_seq_length: int = 512,
         clip_n_grid: int = 20,
         calib_dataset: str = "default",
+        clip_batch_size: int = 1024,
     ) -> QuantTask:
         """Start a quantization job.
 
@@ -297,6 +299,7 @@ class OQManager:
             clip_seq_length=clip_seq_length,
             clip_n_grid=clip_n_grid,
             calib_dataset=calib_dataset,
+            clip_batch_size=clip_batch_size,
         )
         self._tasks[task_id] = task
 
@@ -413,6 +416,7 @@ class OQManager:
                         task.oq_level,
                         True,
                         _progress_cb,
+                        task.clip_batch_size,
                     )
                 else:
                     # Tensor-by-tensor (low memory)

@@ -1146,6 +1146,18 @@
                                                 <option value="1024">1024</option>
                                             </select>
                                         </div>
+                                        <!-- Clip Batch Size (clip ON only) -->
+                                        <div x-show="oqEnableClip" x-cloak class="flex items-center justify-between">
+                                            <span class="text-sm text-neutral-600">GPU Batch Size</span>
+                                            <select x-model.number="oqClipBatchSize"
+                                                    class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                                <option value="256">256 (low memory)</option>
+                                                <option value="512">512</option>
+                                                <option value="1024" selected>1024 (default)</option>
+                                                <option value="2048">2048 (fast)</option>
+                                                <option value="4096">4096 (fastest, high memory)</option>
+                                            </select>
+                                        </div>
                                     </div>
                                 </div>
                                 <!-- Error -->

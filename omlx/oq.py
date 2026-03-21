@@ -1134,6 +1134,7 @@ def _search_best_clip(w, x, group_size: int, bits: int,
         init_max = w_grouped.abs().max(axis=-1, keepdims=True)
 
         # Grid search over clip ratios
+        # Defer mx.eval to end of grid search for better GPU pipelining
         for i in range(int(max_shrink * n_grid)):
             p = 1 - i / n_grid
             w_max = p * init_max
@@ -1149,8 +1150,9 @@ def _search_best_clip(w, x, group_size: int, bits: int,
             improved = loss < best_error
             best_error = mx.where(improved, loss, best_error)
             best_w_max = mx.where(improved[..., None], w_max, best_w_max)
-            mx.eval(best_w_max, best_error)
 
+        # Evaluate once at end of grid search (not per step)
+        mx.eval(best_w_max, best_error)
         w_max_all.append(best_w_max)
 
     best_w_max = mx.concatenate(w_max_all, axis=0)
@@ -1162,7 +1164,7 @@ def _search_best_clip(w, x, group_size: int, bits: int,
 
 
 def _run_clip_optimization(model, tokenizer, config, oq_level,
-                           progress_callback=None):
+                           progress_callback=None, clip_batch_size=1024):
     """Run AWQ-style clip optimization on the model before quantization.
 
     Layer-by-layer forward pass with calibration data, then per-layer
@@ -1264,30 +1266,53 @@ def _run_clip_optimization(model, tokenizer, config, oq_level,
             inputs = inputs  # Keep same input for next layer
             continue
 
-        # Check if any linear sublayers of this block need clipping
-        # Match by sublayer name suffix (e.g. "self_attn.v_proj")
-        # since full path varies by model structure
+        # Collect all sublayers that need clipping in this block
+        x_flat = inputs.reshape(-1, inputs.shape[-1])
+
+        # Group sublayers by (bits, input_dim) for batched processing
+        from collections import defaultdict
+        groups = defaultdict(list)
+
         for path, module in tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module):
             if not hasattr(module, "weight") or not hasattr(module, "to_quantized"):
                 continue
-
-            # Check predicate for this sublayer using its local path
             pred_result = predicate(path, module)
             if pred_result is False:
                 continue
             effective_bits = pred_result.get("bits", oq_level) if isinstance(pred_result, dict) else oq_level
             if effective_bits > _CLIP_MAX_BITS:
                 continue
-
             w = module.weight
-            x_flat = inputs.reshape(-1, inputs.shape[-1])
-
             if x_flat.shape[-1] == w.shape[-1]:
-                clipped_w = _search_best_clip(
-                    w, x_flat, group_size=group_size, bits=effective_bits
+                groups[(effective_bits, w.shape[-1], w.ndim)].append(module)
+
+        # Process each group: stack weights → single clip search → unstack
+        for (ebits, in_dim, ndim), modules in groups.items():
+            if len(modules) == 1:
+                # Single module — direct clip search
+                m = modules[0]
+                m.weight = _search_best_clip(
+                    m.weight, x_flat,
+                    group_size=group_size, bits=ebits,
+                    batch_size=clip_batch_size,
                 )
-                module.weight = clipped_w
                 optimized += 1
+            else:
+                # Multiple modules with same bits/dims — stack and batch
+                weights = [m.weight for m in modules]
+                stacked = mx.concatenate(weights, axis=0)
+                clipped = _search_best_clip(
+                    stacked, x_flat,
+                    group_size=group_size, bits=ebits,
+                    batch_size=clip_batch_size,
+                )
+                # Unstack and assign back
+                offset = 0
+                for m in modules:
+                    rows = m.weight.shape[0]
+                    m.weight = clipped[offset:offset + rows]
+                    offset += rows
+                    optimized += 1
 
         # Move to next layer
         inputs = outputs
@@ -1326,6 +1351,7 @@ def quantize_oq(
     oq_level: int,
     enable_clip_optimization: bool = True,
     progress_callback: Optional[Callable[[str, float], None]] = None,
+    clip_batch_size: int = 1024,
 ) -> None:
     """Run oQ quantization: load -> clip-optimize -> quantize -> save.
 
@@ -1371,7 +1397,7 @@ def quantize_oq(
     if enable_clip_optimization and oq_level <= _CLIP_MAX_BITS:
         cb("optimizing", 30.0)
         logger.info(f"oQ{oq_level}: running clip optimization")
-        _run_clip_optimization(model, tokenizer, config, oq_level, cb)
+        _run_clip_optimization(model, tokenizer, config, oq_level, cb, clip_batch_size)
 
     cb("quantizing", 60.0)
 

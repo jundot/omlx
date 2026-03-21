@@ -207,6 +207,7 @@ class OQStartRequest(BaseModel):
     clip_seq_length: int = 512
     clip_n_grid: int = 20
     calib_dataset: str = "default"
+    clip_batch_size: int = 1024
 
 
 # =============================================================================
@@ -3609,6 +3610,7 @@ async def start_oq_quantization(
             clip_seq_length=request.clip_seq_length,
             clip_n_grid=request.clip_n_grid,
             calib_dataset=request.calib_dataset,
+            clip_batch_size=request.clip_batch_size,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
