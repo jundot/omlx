@@ -262,6 +262,7 @@
             // oQ Advanced Settings
             oqAdvancedOpen: false,
             oqEnableClip: false,
+            oqTextOnly: false,
             oqGroupSize: 64,
             oqClipSamples: 128,
             oqClipSeqLen: 512,
@@ -2639,6 +2640,7 @@
                             clip_seq_length: this.oqClipSeqLen,
                             calib_dataset: this.oqCalibDataset,
                             clip_batch_size: this.oqClipBatchSize,
+                            text_only: this.oqTextOnly,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));
@@ -2730,6 +2732,11 @@
             oqSelectedModelSupportsClip() {
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 return model?.supports_clip || false;
+            },
+
+            oqSelectedModelIsVLM() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                return model?.is_vlm || false;
             },
 
             oqEstimatedMemory() {

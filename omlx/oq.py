@@ -10,10 +10,10 @@ Supported levels: oQ2, oQ3, oQ4, oQ6, oQ8 (base bits differ, same predicate).
 import json
 import logging
 import re
+import shutil
+import time as _time
 from pathlib import Path
 from typing import Callable, Optional, Union
-
-import numpy as np
 
 try:
     import mlx.core as mx
@@ -27,7 +27,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Allowed oQ quantization levels
-OQ_LEVELS = {2, 3, 4, 5, 6, 8}
+OQ_LEVELS = {2, 3, 3.5, 4, 5, 6, 8}
 
 # Bits-per-GB estimate for progress timing (seconds per GB of source weights)
 _QUANT_SECONDS_PER_GB = 3.0
@@ -61,20 +61,28 @@ def universal_quant_predicate(
         True to use default bits,
         dict with {"bits": N, "group_size": M} for per-layer override.
     """
-    num_layers = config.get("num_hidden_layers", 32)
-    num_experts = config.get("num_local_experts", 0)
-    hidden_size = config.get("hidden_size", 0)
+    # VLM models nest text model config under "text_config"
+    tc = config.get("text_config", {})
+    num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
+    num_experts = (
+        config.get("num_local_experts")
+        or tc.get("num_local_experts")
+        or config.get("num_experts")
+        or tc.get("num_experts", 0)
+    )
+    hidden_size = config.get("hidden_size") or tc.get("hidden_size", 0)
     is_moe = num_experts > 0
 
     # oQ level → base bits + protection mode
     # oQ2: base 2, minimal protection (only safety-critical)
-    # oQ3: base 2, full protection (attention/down_proj/shared_expert)
+    # oQ3: base 3, full protection
+    # oQ3.5: base 3, full protection + expert down_proj 4-bit (Super Weights)
     # oQ4-6: base = level, full protection
-    # oQ7: base 8, full protection
-    # oQ8: base 8, minimal protection (near-uniform)
+    # oQ8: base 8, full protection
     _LEVEL_MAP = {
         2: (2, "minimal"),
-        3: (2, "full"),
+        3: (3, "full"),
+        3.5: (3, "full"),
         4: (4, "full"),
         5: (5, "full"),
         6: (6, "full"),
@@ -92,11 +100,11 @@ def universal_quant_predicate(
 
     # Helper: never assign bits below base_bits
     # Auto-select optimal mode per bit width:
-    #   4-bit → mxfp4 (Apple Silicon native, group_size=32)
+    #   4-bit → mxfp4 (uint8 scales, 0.25 bpw overhead vs affine 0.50)
     #   8-bit → mxfp8 (Apple Silicon native, group_size=32)
     #   other → affine (supports 2,3,5,6-bit with flexible group_size)
     def bits(n):
-        effective = max(n, base_bits)
+        effective = int(max(n, base_bits))
         if effective == 4:
             return {"bits": 4, "group_size": 32, "mode": "mxfp4"}
         if effective == 8:
@@ -112,18 +120,13 @@ def universal_quant_predicate(
         return False
 
     # shared expert gate: fp16
-    if path.endswith("shared_expert_gate"):
+    # endswith check handles both module paths ("shared_expert_gate")
+    # and tensor names ("shared_expert_gate.weight")
+    if "shared_expert_gate" in path and "gate_proj" not in path:
         return False
 
     # VLM vision encoder + projector: fp16
-    if any(
-        p in path
-        for p in (
-            "visual.", "vision_", "patch_embed", "pos_embed",
-            "image_newline", "multi_modal_projector", "visual.merger",
-            "image_norm", "temporal_embed",
-        )
-    ):
+    if _is_vision_tensor(path):
         return False
 
     # SSM state parameters: F32
@@ -155,25 +158,9 @@ def universal_quant_predicate(
         if any(p in path for p in ("ssm_output", "ssm_out")):
             return bits(8)
 
-        # Full attention: 6-bit (critical for coherence)
-        if any(p in path for p in (
-            "v_proj", "v_a_proj", "v_b_proj", "q_proj", "k_proj", "o_proj",
-        )):
-            return bits(6)
-
-        # Linear attention (GatedDeltaNet): base+2 (less critical, recurrent redundancy)
-        if any(p in path for p in (
-            "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b",
-        )):
-            return bits(base_bits + 2)
-
-        # shared_expert: 6-bit (always active, SiLU risk)
-        if "shared_expert" in path and not path.endswith("shared_expert_gate"):
-            return bits(6)
-
-        # Embedding: 6-bit (error propagates to all layers, <0.6% of params)
+        # Embedding: base+2 (error propagates to all layers, <0.6% of params)
         if any(p in path for p in ("embed_tokens", "wte", "word_embeddings")):
-            return bits(6)
+            return bits(base_bits + 2)
 
         # 512+ expert MLP asymmetry safety (prevent NaN)
         if num_experts >= 512 and hidden_size >= 4096:
@@ -181,8 +168,6 @@ def universal_quant_predicate(
                 return bits(4)
 
         # Sensitive layers (first/last 12.5%): +1 bit for non-expert layers only
-        # Expert MLP is 94% of MoE params — applying +1 there costs too much bpw
-        # But non-expert layers (attention, shared_expert) benefit from protection
         layer_idx = _extract_layer_index(path)
         if layer_idx >= 0:
             sensitive = (
@@ -252,7 +237,6 @@ def universal_quant_predicate(
     sensitive = layer_idx >= 0 and (
         layer_idx < num_layers // 8
         or layer_idx >= 7 * num_layers // 8
-        or (layer_idx - num_layers // 8) % 3 == 2
     )
 
     # v_proj: Q6 (sensitive) / base (rest)
@@ -267,6 +251,9 @@ def universal_quant_predicate(
             "switch_mlp" in path or "experts" in path
         )
         if is_routed_expert:
+            # oQ3.5: boost expert down_proj to 4-bit (Super Weights protection)
+            if oq_level == 3.5:
+                return bits(4)
             return True  # base_bits
         if sensitive:
             return bits(6)
@@ -299,6 +286,18 @@ def universal_quant_predicate(
 # =============================================================================
 # Helper functions
 # =============================================================================
+
+
+def _is_vision_tensor(name: str) -> bool:
+    """Check if a tensor belongs to the vision encoder/projector."""
+    return any(
+        p in name
+        for p in (
+            "visual.", "vision_", "patch_embed", "pos_embed",
+            "image_newline", "multi_modal_projector", "visual.merger",
+            "image_norm", "temporal_embed",
+        )
+    )
 
 
 def _is_moe_router(path: str) -> bool:
@@ -335,12 +334,13 @@ def resolve_output_name(model_name: str, oq_level: int,
         "Qwen3.5-122B-A10B-oQ6" + 2 -> "Qwen3.5-122B-A10B-oQ2"
     """
     base = re.sub(
-        r"-(oQ\d+\+?|[0-9]+[_-]?bit|fp\d+|bf\d+)$",
+        r"-(oQ[\d.]+\+?|[0-9]+[_-]?bit|fp\d+|bf\d+)$",
         "",
         model_name,
         flags=re.IGNORECASE,
     )
-    suffix = f"oQ{oq_level}+" if enable_clip else f"oQ{oq_level}"
+    level_str = f"{oq_level:g}"  # 3.5 → "3.5", 4.0 → "4"
+    suffix = f"oQ{level_str}+" if enable_clip else f"oQ{level_str}"
     return f"{base}-{suffix}"
 
 
@@ -426,19 +426,31 @@ def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) 
                 total_output_bytes += n_elements * 2
             else:
                 total_params += n_elements
-                total_weighted_bits += n_elements * bits
                 # Quantized size: weight + scales + biases overhead
                 if len(shape) >= 2:
                     n_groups = (shape[-1] + gs - 1) // gs
                     rows = n_elements // max(shape[-1], 1)
                     weight_bytes = (n_elements * bits + 7) // 8
-                    overhead_bytes = rows * n_groups * 4  # scales(fp16) + biases(fp16)
-                    total_output_bytes += weight_bytes + overhead_bytes
+                    # mxfp4: uint8 scale (1 byte/group)
+                    # mxfp8: fp16 scale (2 bytes/group)
+                    # affine: fp16 scale + fp16 bias (4 bytes/group)
+                    if _mode == "mxfp4":
+                        bytes_per_group = 1
+                    elif _mode == "mxfp8":
+                        bytes_per_group = 2
+                    else:
+                        bytes_per_group = 4
+                    overhead_bytes = rows * n_groups * bytes_per_group
+                    tensor_bytes = weight_bytes + overhead_bytes
+                    total_output_bytes += tensor_bytes
+                    total_weighted_bits += tensor_bytes * 8
                 else:
                     total_output_bytes += n_elements * 2
+                    total_weighted_bits += n_elements * 16
 
         del shard
 
+    # bpw from actual output bytes (includes scale/bias overhead, matches GGUF convention)
     effective_bpw = total_weighted_bits / max(total_params, 1)
 
     # Precise memory estimation based on actual tensor sizes:
@@ -633,8 +645,8 @@ def _get_predicate_bits(tensor_name: str, config: dict, oq_level: int,
         (bits, group_size, mode) or (None, None, None) if not quantized.
     """
     # Get base_bits from level map
-    _LEVEL_MAP = {2: 2, 3: 2, 4: 4, 5: 5, 6: 6, 8: 8}
-    base_bits = _LEVEL_MAP.get(oq_level, oq_level)
+    _LEVEL_MAP = {2: 2, 3: 3, 3.5: 3, 4: 4, 5: 5, 6: 6, 8: 8}
+    base_bits = int(_LEVEL_MAP.get(oq_level, oq_level))
 
     result = universal_quant_predicate(tensor_name, None, config, oq_level)
     if result is False:
@@ -672,6 +684,7 @@ def quantize_oq_streaming(
     oq_level: int,
     group_size: int = 64,
     progress_callback: Optional[Callable[[str, float], None]] = None,
+    text_only: bool = False,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -685,10 +698,6 @@ def quantize_oq_streaming(
         group_size: Default quantization group size.
         progress_callback: Optional fn(phase_name, progress_pct) for updates.
     """
-    import shutil
-
-    from safetensors.numpy import save_file
-
     if oq_level not in OQ_LEVELS:
         raise ValueError(
             f"Invalid oQ level {oq_level}. Must be one of {sorted(OQ_LEVELS)}"
@@ -725,7 +734,7 @@ def quantize_oq_streaming(
         del shard
 
     logger.info(
-        f"oQ{oq_level} streaming: {len(all_weights)} tensors in "
+        f"oQ{oq_level:g} streaming: {len(all_weights)} tensors in "
         f"{len(weight_files)} shards"
     )
 
@@ -737,23 +746,29 @@ def quantize_oq_streaming(
     if sanitize_fn is not None:
         try:
             all_weights = sanitize_fn(all_weights)
-            logger.info(f"oQ{oq_level}: sanitize applied, {len(all_weights)} tensors")
+            logger.info(f"oQ{oq_level:g}: sanitize applied, {len(all_weights)} tensors")
         except Exception as e:
             logger.warning(f"Sanitize failed ({e}), using original names")
+
+    # Resolve model dtype (same as mlx-lm convert)
+    # FP8/float32 models need dtype normalization before quantization
+    tc = config.get("text_config", {})
+    model_dtype_str = config.get("torch_dtype") or tc.get("dtype")
+    model_dtype = getattr(mx, model_dtype_str) if model_dtype_str in (
+        "float16", "bfloat16", "float32",
+    ) else None
 
     cb("loading", 15.0)
 
     # Group sanitized weights into output shards for processing
     # Process in chunks to keep memory bounded
-    import time as _time
-
     tensor_names = list(all_weights.keys())
     total_tensors = len(tensor_names)
     out_shard_data = {}
     out_shard_idx = 0
     weight_map = {}
-    _LEVEL_MAP = {2: 2, 3: 2, 4: 4, 5: 5, 6: 6, 8: 8}
-    base_bits = _LEVEL_MAP.get(oq_level, oq_level)
+    _LEVEL_MAP = {2: 2, 3: 3, 3.5: 3, 4: 4, 5: 5, 6: 6, 8: 8}
+    base_bits = int(_LEVEL_MAP.get(oq_level, oq_level))
     base_mode = _mode_for_bits(base_bits)
     base_gs = _gs_for_mode(base_bits, group_size)
     quantization_config = {"group_size": base_gs, "bits": base_bits, "mode": base_mode}
@@ -770,15 +785,26 @@ def quantize_oq_streaming(
         tensor_bytes = w_mx.nbytes
         shape = w_mx.shape
 
+        # text_only: skip vision encoder weights entirely
+        if text_only and _is_vision_tensor(tensor_name):
+            del w_mx
+            processed_bytes += tensor_bytes
+            continue
+
+        # Normalize dtype to match mlx-lm convert behavior
+        # (e.g. FP8 models sanitized to float32, then cast to target dtype)
+        if model_dtype is not None and mx.issubdtype(w_mx.dtype, mx.floating):
+            w_mx = w_mx.astype(model_dtype)
+
         if _should_quantize_tensor(tensor_name, shape):
             bits, gs, qmode = _get_predicate_bits(
                 tensor_name, config, oq_level, group_size
             )
 
             if bits is not None and len(shape) >= 2 and shape[-1] % gs == 0:
-                w_f16 = w_mx.astype(mx.float16)
+                # Do NOT cast to float16 — bf16→f16 changes 41%+ of quantized values.
                 qw, scales, *rest = mx.quantize(
-                    w_f16, group_size=gs, bits=bits, mode=qmode
+                    w_mx, group_size=gs, bits=bits, mode=qmode
                 )
                 biases = rest[0] if rest else None
 
@@ -786,33 +812,28 @@ def quantize_oq_streaming(
                 if base.endswith(".weight"):
                     base = base[:-7]
 
-                out_shard_data[f"{base}.weight"] = np.array(qw)
-                out_shard_data[f"{base}.scales"] = np.array(
-                    scales
-                ).astype(np.float16)
+                out_shard_data[f"{base}.weight"] = qw
+                out_shard_data[f"{base}.scales"] = scales
                 if biases is not None:
-                    out_shard_data[f"{base}.biases"] = np.array(
-                        biases
-                    ).astype(np.float16)
+                    out_shard_data[f"{base}.biases"] = biases
 
                 # Track per-layer config for mixed precision/mode
-                _LEVEL_MAP = {2: 2, 3: 2, 4: 4, 5: 5, 6: 6, 8: 8}
-                base_bits = _LEVEL_MAP.get(oq_level, oq_level)
-                if bits != base_bits or gs != group_size or qmode != "affine":
+                _LEVEL_MAP = {2: 2, 3: 3, 3.5: 3, 4: 4, 5: 5, 6: 6, 8: 8}
+                base_bits = int(_LEVEL_MAP.get(oq_level, oq_level))
+                base_qmode = _mode_for_bits(base_bits)
+                base_gs = _gs_for_mode(base_bits, group_size)
+                if bits != base_bits or gs != base_gs or qmode != base_qmode:
                     layer_cfg = {"bits": bits, "group_size": gs}
-                    if qmode != "affine":
-                        layer_cfg["mode"] = qmode
+                    # Always include mode — nn.quantize defaults to affine
+                    # when mode is missing from per-layer config
+                    layer_cfg["mode"] = qmode
                     per_layer_config[base] = layer_cfg
             else:
                 # Can't quantize or predicate=False → keep fp16
-                out_shard_data[tensor_name] = np.array(
-                    w_mx.astype(mx.float16)
-                )
+                out_shard_data[tensor_name] = w_mx
         else:
-            # Non-quantizable → keep fp16
-            out_shard_data[tensor_name] = np.array(
-                w_mx.astype(mx.float16)
-            )
+            # Non-quantizable (1D norms, biases) → keep original dtype
+            out_shard_data[tensor_name] = w_mx
 
         # Free source tensor immediately
         del w_mx
@@ -822,13 +843,13 @@ def quantize_oq_streaming(
         if current_bytes >= _MAX_SHARD_BYTES:
             shard_name = f"model-{out_shard_idx + 1:05d}-of-PLACEHOLDER.safetensors"
             shard_path = output / shard_name
-            save_file(out_shard_data, str(shard_path), metadata={"format": "mlx"})
+            mx.save_safetensors(str(shard_path), out_shard_data, metadata={"format": "mlx"})
             for k in out_shard_data:
                 weight_map[k] = shard_name
             out_shard_idx += 1
             out_shard_data = {}
             mx.clear_cache()
-            logger.info(f"oQ{oq_level}: wrote output shard {out_shard_idx}")
+            logger.info(f"oQ{oq_level:g}: wrote output shard {out_shard_idx}")
 
         # Progress + ETA (bytes-based for accuracy with mixed tensor sizes)
         processed_bytes += tensor_bytes
@@ -859,7 +880,7 @@ def quantize_oq_streaming(
                 f"model-{out_shard_idx + 1:05d}-of-PLACEHOLDER.safetensors"
             )
         shard_path = output / shard_name
-        save_file(out_shard_data, str(shard_path), metadata={"format": "mlx"})
+        mx.save_safetensors(str(shard_path), out_shard_data, metadata={"format": "mlx"})
         for k in out_shard_data:
             weight_map[k] = shard_name
         out_shard_idx += 1
@@ -900,6 +921,11 @@ def quantize_oq_streaming(
     # For mixed-precision, we store per-layer overrides for layers with
     # different bits than the base config.
     output_config = dict(config)
+    # text_only: strip VLM-specific config keys
+    if text_only:
+        for key in ("vision_config", "image_token_id", "video_token_id",
+                     "vision_start_token_id", "vision_end_token_id"):
+            output_config.pop(key, None)
     quant_info = dict(quantization_config)
     # Only add per-layer entries that differ from base bits/group_size
     # and deduplicate (e.g. one entry per module, not per expert)
@@ -933,7 +959,7 @@ def quantize_oq_streaming(
 
     cb("saving", 100.0)
     logger.info(
-        f"oQ{oq_level} streaming: completed -> {output_path} "
+        f"oQ{oq_level:g} streaming: completed -> {output_path} "
         f"({total_shards} shards)"
     )
 
@@ -964,21 +990,37 @@ CALIB_DATASETS = {
 }
 
 
-def _load_calibration_data(tokenizer, dataset: str = "default",
+def _load_calibration_data(tokenizer, dataset: str = "code_multilingual",
                            num_samples: int = _CLIP_NUM_SAMPLES,
                            seq_length: int = _CLIP_SEQ_LENGTH):
     """Load calibration data for clip optimization.
 
+    Uses built-in calibration data by default (no download needed).
+    Built-in data includes English, code, Korean, Chinese, Japanese.
+
     Args:
         tokenizer: Model tokenizer.
-        dataset: Dataset name — "default", "wikitext", "c4", "code",
-                 "multilingual", or "code_multilingual".
+        dataset: "code_multilingual" (built-in default), "code", "multilingual",
+                 "default" (mlx-lm generic), or HuggingFace dataset names.
         num_samples: Number of calibration samples.
         seq_length: Sequence length per sample.
 
     Returns:
         MLX array of shape (num_samples, seq_length) or None on failure.
     """
+    import mlx.core as mx
+
+    # Built-in datasets (no download needed)
+    if dataset in ("code_multilingual", "code", "multilingual"):
+        try:
+            return _load_builtin_calibration(
+                tokenizer, dataset, num_samples, seq_length
+            )
+        except Exception as e:
+            logger.warning(f"Built-in calibration failed: {e}, "
+                           "falling back to mlx-lm default")
+
+    # mlx-lm default
     if dataset == "default":
         try:
             from mlx_lm.quant.utils import load_data
@@ -988,17 +1030,78 @@ def _load_calibration_data(tokenizer, dataset: str = "default",
             logger.warning("mlx_lm.quant.utils.load_data not available")
             return None
 
+    # HuggingFace datasets (requires download)
     try:
         return _load_hf_calibration(tokenizer, dataset, num_samples, seq_length)
     except Exception as e:
-        logger.warning(f"Failed to load {dataset} dataset: {e}, "
-                       "falling back to default")
-        try:
-            from mlx_lm.quant.utils import load_data
-            return load_data(tokenizer, num_samples=num_samples,
-                            sequence_length=seq_length)
-        except ImportError:
-            return None
+        logger.warning(f"Failed to load {dataset}: {e}, falling back to built-in")
+
+    # Final fallback: built-in
+    try:
+        return _load_builtin_calibration(
+            tokenizer, "code_multilingual", num_samples, seq_length
+        )
+    except Exception:
+        return None
+
+
+def _load_builtin_calibration(tokenizer, dataset: str, num_samples: int,
+                              seq_length: int):
+    """Load from built-in oq_calibration_data.json (shipped with package)."""
+    import mlx.core as mx
+
+    data_path = Path(__file__).parent / "oq_calibration_data.json"
+    if not data_path.exists():
+        raise FileNotFoundError(f"Built-in calibration data not found: {data_path}")
+
+    with open(data_path, encoding="utf-8") as f:
+        all_data = json.load(f)
+
+    # Select texts based on dataset type
+    if dataset == "code_multilingual":
+        texts = []
+        for key in ("code", "en", "ko", "zh", "ja", "tool_calling"):
+            texts.extend(all_data.get(key, []))
+    elif dataset == "code":
+        texts = all_data.get("code", []) + all_data.get("en", [])
+    elif dataset == "multilingual":
+        texts = []
+        for key in ("en", "ko", "zh", "ja"):
+            texts.extend(all_data.get(key, []))
+    else:
+        texts = []
+        for v in all_data.values():
+            texts.extend(v)
+
+    if not texts:
+        raise ValueError("No calibration text available")
+
+    combined = "\n".join(texts)
+    logger.info(f"Built-in calibration: {len(texts)} texts, "
+                f"{len(combined) // 1024} KB ({dataset})")
+
+    # Tokenize
+    tokens = tokenizer.encode(combined)
+    if hasattr(tokens, "input_ids"):
+        tokens = tokens.input_ids
+    if isinstance(tokens, list):
+        tokens = mx.array(tokens)
+    if tokens.ndim > 1:
+        tokens = tokens.reshape(-1)
+
+    # Chunk into sequences
+    usable = (tokens.size // seq_length) * seq_length
+    if usable == 0:
+        raise ValueError(f"Not enough tokens ({tokens.size} < {seq_length})")
+    tokens = tokens[:usable].reshape(-1, seq_length)
+
+    # Random sample
+    if num_samples > 0 and tokens.shape[0] > num_samples:
+        indices = mx.random.permutation(tokens.shape[0])[:num_samples]
+        tokens = tokens[indices]
+
+    logger.info(f"Calibration: {tokens.shape[0]} samples x {seq_length} tokens")
+    return tokens
 
 
 def _load_hf_calibration(tokenizer, dataset: str, num_samples: int,
@@ -1084,6 +1187,7 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int,
     if isinstance(tokens, list):
         tokens = mx.array(tokens)
     elif not isinstance(tokens, mx.array):
+        import numpy as np
         tokens = mx.array(np.array(tokens))
 
     if tokens.ndim > 1:
@@ -1136,6 +1240,7 @@ def _search_best_clip(w, x, group_size: int, bits: int,
     x = x[::stride]
     x = x.reshape(x.shape[0], -1, group_size)
 
+    bits = int(bits)
     def quantize_func(w_in):
         qw = mx.quantize(w_in, group_size=group_size, bits=bits)
         return mx.dequantize(*qw, group_size=group_size, bits=bits)
@@ -1188,7 +1293,10 @@ def _search_best_clip(w, x, group_size: int, bits: int,
 
 
 def _run_clip_optimization(model, tokenizer, config, oq_level,
-                           progress_callback=None, clip_batch_size=1024):
+                           progress_callback=None, clip_batch_size=1024,
+                           calib_dataset="code_multilingual",
+                           num_samples=_CLIP_NUM_SAMPLES,
+                           seq_length=_CLIP_SEQ_LENGTH):
     """Run AWQ-style clip optimization on the model before quantization.
 
     Layer-by-layer forward pass with calibration data, then per-layer
@@ -1207,7 +1315,10 @@ def _run_clip_optimization(model, tokenizer, config, oq_level,
     cb = progress_callback or (lambda phase, pct: None)
 
     # Load calibration data
-    calib_data = _load_calibration_data(tokenizer)
+    calib_data = _load_calibration_data(
+        tokenizer, dataset=calib_dataset,
+        num_samples=num_samples, seq_length=seq_length,
+    )
     if calib_data is None:
         return 0
 
@@ -1222,19 +1333,27 @@ def _run_clip_optimization(model, tokenizer, config, oq_level,
         pred_result = predicate(path, module)
         if pred_result is False:
             continue
-        effective_bits = pred_result.get("bits", oq_level) if isinstance(pred_result, dict) else oq_level
+        effective_bits = int(pred_result.get("bits", oq_level) if isinstance(pred_result, dict) else oq_level)
         if effective_bits <= _CLIP_MAX_BITS:
             clip_targets[path] = effective_bits
 
     if not clip_targets:
         return 0
 
-    logger.info(f"oQ{oq_level}: clip optimization for {len(clip_targets)} layers")
+    logger.info(f"oQ{oq_level:g}: clip optimization for {len(clip_targets)} layers")
 
     # Build attention mask for calib data
     seq_len = calib_data.shape[1]
     mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len)
-    mask = mask.astype(model.embed_tokens.weight.dtype if hasattr(model, 'embed_tokens') else mx.float16)
+    # Detect model dtype from embed_tokens (may be nested under language_model)
+    mask_dtype = mx.float16
+    if hasattr(model, 'embed_tokens'):
+        mask_dtype = model.embed_tokens.weight.dtype
+    elif hasattr(model, 'language_model') and hasattr(model.language_model, 'model'):
+        mask_dtype = model.language_model.model.embed_tokens.weight.dtype
+    elif hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+        mask_dtype = model.model.embed_tokens.weight.dtype
+    mask = mask.astype(mask_dtype)
 
     # Embed calibration tokens — search common model structures
     embed_fn = None
@@ -1261,23 +1380,29 @@ def _run_clip_optimization(model, tokenizer, config, oq_level,
 
     inputs = embed_fn(calib_data)
 
+    # Build position_ids for models that require it (e.g. Qwen3.5 VLM)
+    seq_len = calib_data.shape[1]
+    position_ids = mx.arange(seq_len)[None, :]  # (1, seq_len)
+
     optimized = 0
     total_layers = len(layers)
 
     for layer_idx, block in enumerate(layers):
         # Forward pass through this layer (unquantized)
-        # Try multiple signatures: (x, mask, cache), (x, mask), (x)
+        # Try multiple signatures until one works
         outputs = None
         for call_args in [
-            (inputs, mask, None),   # Standard: (x, mask, cache)
-            (inputs, mask),         # No cache
-            (inputs, None, None),   # No mask (GatedDeltaNet)
-            (inputs,),              # Minimal
+            (inputs, mask, None, position_ids),
+            (inputs, mask, None),
+            (inputs, mask),
+            (inputs, None, mask, None),
+            (inputs,),
         ]:
             try:
                 outputs = block(*call_args)
                 break
-            except (TypeError, ValueError, RuntimeError):
+            except (TypeError, ValueError, RuntimeError, AttributeError):
+                outputs = None
                 continue
         if outputs is None:
             logger.warning(
@@ -1299,7 +1424,7 @@ def _run_clip_optimization(model, tokenizer, config, oq_level,
             pred_result = predicate(path, module)
             if pred_result is False:
                 continue
-            effective_bits = pred_result.get("bits", oq_level) if isinstance(pred_result, dict) else oq_level
+            effective_bits = int(pred_result.get("bits", oq_level) if isinstance(pred_result, dict) else oq_level)
             if effective_bits > _CLIP_MAX_BITS:
                 continue
             w = module.weight
@@ -1356,7 +1481,7 @@ def _run_clip_optimization(model, tokenizer, config, oq_level,
         else:
             cb(f"optimizing ({layer_idx + 1}/{total_layers})", pct)
 
-    logger.info(f"oQ{oq_level}: clip-optimized {optimized} layers")
+    logger.info(f"oQ{oq_level:g}: clip-optimized {optimized} layers")
     return optimized
 
 
@@ -1372,6 +1497,10 @@ def quantize_oq(
     enable_clip_optimization: bool = True,
     progress_callback: Optional[Callable[[str, float], None]] = None,
     clip_batch_size: int = 1024,
+    calib_dataset: str = "code_multilingual",
+    text_only: bool = False,
+    clip_num_samples: int = _CLIP_NUM_SAMPLES,
+    clip_seq_length: int = _CLIP_SEQ_LENGTH,
 ) -> None:
     """Run oQ quantization: load -> clip-optimize -> quantize -> save.
 
@@ -1388,8 +1517,7 @@ def quantize_oq(
         enable_clip_optimization: Run AWQ-style clip search (requires calibration data).
         progress_callback: Optional fn(phase_name, progress_pct) for updates.
     """
-    from mlx_lm import load
-    from mlx_lm.utils import quantize_model, save
+    from mlx_lm.utils import quantize_model
 
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -1404,29 +1532,64 @@ def quantize_oq(
 
     # Phase 1: Load
     cb("loading", 5.0)
-    logger.info(f"oQ{oq_level}: loading {model_path}")
-    model, tokenizer = load(model_path)
+    logger.info(f"oQ{oq_level:g}: loading {model_path}")
 
     config_path = Path(model_path) / "config.json"
     with open(config_path) as f:
         config = json.load(f)
+
+    is_vlm = "vision_config" in config and not text_only
+
+    if is_vlm:
+        # VLM: use mlx-vlm to load full model (vision + text)
+        from mlx_vlm.utils import load_model as vlm_load_model
+
+        model = vlm_load_model(Path(model_path), lazy=True)
+        # Load tokenizer separately via mlx-lm (processor loading can fail)
+        from mlx_lm import load as lm_load
+
+        _, tokenizer = lm_load(model_path)
+        logger.info(f"oQ{oq_level:g}: loaded VLM with mlx-vlm (vision weights preserved)")
+    else:
+        from mlx_lm import load as lm_load
+
+        model, tokenizer = lm_load(model_path)
+        if text_only and "vision_config" in config:
+            logger.info(f"oQ{oq_level:g}: text-only mode, vision weights excluded")
+
+    # Normalize dtype (same as mlx-lm convert: FP8→float32→bfloat16)
+    tc = config.get("text_config", {})
+    model_dtype_str = config.get("torch_dtype") or tc.get("dtype")
+    if model_dtype_str in ("float16", "bfloat16", "float32"):
+        from mlx.utils import tree_map_with_path
+
+        target_dtype = getattr(mx, model_dtype_str)
+
+        def _set_dtype(k, v):
+            if mx.issubdtype(v.dtype, mx.floating) and v.dtype != target_dtype:
+                return v.astype(target_dtype)
+            return v
+
+        model.update(tree_map_with_path(_set_dtype, model.parameters()))
 
     cb("loading", 25.0)
 
     # Phase 2: Clip optimization (AWQ-style, output MSE based)
     if enable_clip_optimization and oq_level <= _CLIP_MAX_BITS:
         cb("optimizing", 30.0)
-        logger.info(f"oQ{oq_level}: running clip optimization")
-        _run_clip_optimization(model, tokenizer, config, oq_level, cb, clip_batch_size)
+        logger.info(f"oQ{oq_level:g}: running clip optimization")
+        _run_clip_optimization(model, tokenizer, config, oq_level, cb,
+                               clip_batch_size, calib_dataset,
+                               clip_num_samples, clip_seq_length)
 
     cb("quantizing", 60.0)
 
     # Phase 3: Quantize with universal predicate
-    logger.info(f"oQ{oq_level}: quantizing with universal predicate")
+    logger.info(f"oQ{oq_level:g}: quantizing with universal predicate")
     predicate = make_predicate(config, oq_level)
     # oQ level → base bits
-    _LEVEL_MAP = {2: 2, 3: 2, 4: 4, 5: 5, 6: 6, 8: 8}
-    base_bits = _LEVEL_MAP.get(oq_level, oq_level)
+    _LEVEL_MAP = {2: 2, 3: 3, 3.5: 3, 4: 4, 5: 5, 6: 6, 8: 8}
+    base_bits = int(_LEVEL_MAP.get(oq_level, oq_level))
 
     base_mode = _mode_for_bits(base_bits)
     base_gs = _gs_for_mode(base_bits, 64)
@@ -1443,8 +1606,30 @@ def quantize_oq(
 
     # Phase 4: Save
     cb("saving", 92.0)
-    logger.info(f"oQ{oq_level}: saving to {output_path}")
-    save(str(output), model_path, model, tokenizer, quantized_config)
+    logger.info(f"oQ{oq_level:g}: saving to {output_path}")
+
+    if is_vlm:
+        import glob
+        import shutil
+
+        from mlx_vlm.utils import save_config as vlm_save_config
+        from mlx_vlm.utils import save_weights as vlm_save_weights
+
+        # save_weights preserves vision + text weights
+        vlm_save_weights(output, model, donate_weights=True)
+        vlm_save_config(quantized_config, output / "config.json")
+        # Copy tokenizer and other files from source
+        tokenizer.save_pretrained(str(output))
+        src = Path(model_path)
+        for pattern in ["*.py", "generation_config.json", "preprocessor_config.json",
+                        "processor_config.json", "chat_template.json"]:
+            for f in glob.glob(str(src / pattern)):
+                shutil.copy(f, output)
+    else:
+        from mlx_lm.utils import save
+
+        save(str(output), model_path, model, tokenizer, quantized_config)
+
     cb("saving", 100.0)
 
-    logger.info(f"oQ{oq_level}: completed -> {output_path}")
+    logger.info(f"oQ{oq_level:g}: completed -> {output_path}")

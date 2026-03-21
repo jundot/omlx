@@ -1049,6 +1049,7 @@
                                                 class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <option value="2" x-text="'oQ2' + (oqEnableClip ? '+' : '') + ' — extreme compression'">oQ2 — extreme compression</option>
                                             <option value="3" x-text="'oQ3' + (oqEnableClip ? '+' : '') + ' — balanced'">oQ3 — balanced</option>
+                                            <option value="3.5" x-text="'oQ3.5' + (oqEnableClip ? '+' : '') + ' — quality balanced'">oQ3.5 — quality balanced</option>
                                             <option value="4" selected x-text="'oQ4' + (oqEnableClip ? '+' : '') + ' — recommended'">oQ4 — recommended</option>
                                             <option value="5" x-text="'oQ5' + (oqEnableClip ? '+' : '') + ' — high quality'">oQ5 — high quality</option>
                                             <option value="6" x-text="'oQ6' + (oqEnableClip ? '+' : '') + ' — near-lossless'">oQ6 — near-lossless</option>
@@ -1100,7 +1101,21 @@
                                             {{ t('models.oq.clip_description') }}
                                         </p>
                                         <p class="text-[11px] text-neutral-400 leading-relaxed">
-                                            Supported: Qwen3.5 MoE, Qwen3.5. More models coming soon.
+                                            Supported: Qwen3.5 MoE, Qwen3.5, MiniMax M2, GLM MoE, Ministral3.
+                                        </p>
+                                        <!-- Text Only (VLM only) -->
+                                        <div x-show="oqSelectedModelIsVLM()" x-cloak class="flex items-center justify-between">
+                                            <span class="text-sm text-neutral-600">Text Only</span>
+                                            <button type="button"
+                                                    @click="oqTextOnly = !oqTextOnly"
+                                                    :class="oqTextOnly ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="oqTextOnly ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                        <p x-show="oqTextOnly && oqSelectedModelIsVLM()" x-cloak class="text-xs text-amber-600 leading-relaxed">
+                                            Excludes vision encoder weights. Output is a text-only model (~2-3% smaller).
                                         </p>
                                         <!-- Group Size -->
                                         <div class="flex items-center justify-between">
@@ -1117,12 +1132,9 @@
                                             <span class="text-sm text-neutral-600">{{ t('models.oq.calib_dataset') }}</span>
                                             <select x-model="oqCalibDataset"
                                                     class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                                <option value="code_multilingual">Code + Multilingual</option>
-                                                <option value="default">Built-in (General)</option>
-                                                <option value="code">Code (StarCoder)</option>
-                                                <option value="multilingual">Multilingual (CulturaX)</option>
-                                                <option value="wikitext">WikiText-2</option>
-                                                <option value="c4">C4 (Web Crawl)</option>
+                                                <option value="code_multilingual">Code + Multilingual + Tool Calling</option>
+                                                <option value="code">Code + English</option>
+                                                <option value="multilingual">Multilingual (en/ko/zh/ja)</option>
                                             </select>
                                         </div>
                                         <!-- Calibration Samples (clip ON only) -->
@@ -1131,6 +1143,7 @@
                                             <select x-model.number="oqClipSamples"
                                                     class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                                                 <option value="32">32 (fast)</option>
+                                                <option value="64">64</option>
                                                 <option value="128" selected>128</option>
                                                 <option value="256">256</option>
                                                 <option value="512">512 (slow)</option>

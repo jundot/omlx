@@ -200,7 +200,7 @@ class OQStartRequest(BaseModel):
     """Request model for starting an oQ quantization task."""
 
     model_path: str
-    oq_level: int
+    oq_level: float
     enable_clip: bool = False
     group_size: int = 64
     clip_num_samples: int = 128
@@ -208,6 +208,7 @@ class OQStartRequest(BaseModel):
     clip_n_grid: int = 20
     calib_dataset: str = "default"
     clip_batch_size: int = 1024
+    text_only: bool = False
 
 
 # =============================================================================
@@ -3581,7 +3582,7 @@ async def list_oq_models(is_admin: bool = Depends(require_admin)):
 @router.get("/api/oq/estimate")
 async def estimate_oq(
     model_path: str,
-    oq_level: int,
+    oq_level: float,
     is_admin: bool = Depends(require_admin),
 ):
     """Estimate effective bpw and output size for a model at given oQ level."""
@@ -3606,7 +3607,7 @@ async def start_oq_quantization(
         raise HTTPException(
             status_code=503, detail="oQ quantizer not initialized"
         )
-    if request.oq_level not in (2, 3, 4, 5, 6, 8):
+    if request.oq_level not in (2, 3, 3.5, 4, 5, 6, 8):
         raise HTTPException(
             status_code=400,
             detail="Invalid oQ level. Must be 2, 3, 4, 5, 6, or 8",
@@ -3622,6 +3623,7 @@ async def start_oq_quantization(
             clip_n_grid=request.clip_n_grid,
             calib_dataset=request.calib_dataset,
             clip_batch_size=request.clip_batch_size,
+            text_only=request.text_only,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
