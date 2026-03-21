@@ -223,17 +223,49 @@ class MLXRerankerModel:
         # transformers tokenizer which supports __call__ for batch encoding.
         tokenizer = getattr(tokenizer_wrapper, "_tokenizer", tokenizer_wrapper)
 
-        # Resolve <|score_token|> ID from tokenizer added_tokens_decoder
+        # Resolve <|score_token|> and <|rerank_token|> IDs
         score_token_id = None
         rerank_token_id = None
+        
+        # Try multiple ways to get token IDs
+        # 1. Check added_tokens_decoder (keys are int IDs, values can be str or Token objects)
         added_tokens = getattr(tokenizer, "added_tokens_decoder", {}) or {}
         for tid, tinfo in added_tokens.items():
-            content = tinfo.get("content", "") if isinstance(tinfo, dict) else ""
+            content = ""
+            if isinstance(tinfo, str):
+                content = tinfo
+            elif hasattr(tinfo, "content"):
+                content = tinfo.content
+            elif isinstance(tinfo, dict):
+                content = tinfo.get("content", "")
+            
             if content == "<|score_token|>":
                 score_token_id = int(tid)
             elif content == "<|rerank_token|>":
                 rerank_token_id = int(tid)
-
+        
+        # 2. Fallback to convert_tokens_to_ids
+        if score_token_id is None:
+            try:
+                score_token_id = tokenizer.convert_tokens_to_ids("<|score_token|>")
+            except:
+                pass
+        
+        if rerank_token_id is None:
+            try:
+                rerank_token_id = tokenizer.convert_tokens_to_ids("<|rerank_token|>")
+            except:
+                pass
+        
+        # 3. Fallback to get_added_vocab
+        if score_token_id is None:
+            added_vocab = getattr(tokenizer, "get_added_vocab", lambda: {})()
+            score_token_id = added_vocab.get("<|score_token|>")
+        
+        if rerank_token_id is None:
+            added_vocab = getattr(tokenizer, "get_added_vocab", lambda: {})()
+            rerank_token_id = added_vocab.get("<|rerank_token|>")
+        
         if score_token_id is None:
             raise ValueError(
                 "Could not find '<|score_token|>' in tokenizer added_tokens_decoder. "
