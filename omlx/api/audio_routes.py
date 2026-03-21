@@ -5,6 +5,7 @@ Audio API routes for oMLX.
 This module provides OpenAI-compatible audio endpoints:
 - POST /v1/audio/transcriptions  - Speech-to-Text
 - POST /v1/audio/speech          - Text-to-Speech
+- POST /v1/audio/process         - Speech-to-Speech / audio processing
 """
 
 import logging
@@ -15,7 +16,7 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
-from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
+from .audio_models import AudioProcessRequest, AudioSpeechRequest, AudioTranscriptionResponse
 
 logger = logging.getLogger(__name__)
 
@@ -151,5 +152,56 @@ async def create_speech(request: AudioSpeechRequest):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return Response(content=wav_bytes, media_type="audio/wav")
+
+
+@router.post("/v1/audio/process")
+async def process_audio(
+    file: UploadFile = File(...),
+    model: str = Form(...),
+):
+    """Audio processing endpoint (speech enhancement, STS).
+
+    Accepts a multipart audio file upload and a model identifier, processes
+    the audio through an STS engine (e.g. DeepFilterNet, MossFormer2, Moshi),
+    and returns WAV bytes of the processed audio.
+    """
+    from omlx.exceptions import ModelNotFoundError
+
+    pool = _get_engine_pool()
+
+    # Load the engine via pool (handles model loading and LRU eviction)
+    try:
+        engine = await pool.get_engine(model)
+    except ModelNotFoundError as exc:
+        avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{model}' not found. Available: {avail}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    # Save uploaded file to a temp path so the engine can open it by path
+    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            content = await file.read()
+            tmp.write(content)
+
+        wav_bytes = await engine.process(tmp_path)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     return Response(content=wav_bytes, media_type="audio/wav")

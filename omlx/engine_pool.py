@@ -29,6 +29,7 @@ from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.stt import STTEngine
+from .engine.sts import STSEngine
 from .engine.tts import TTSEngine
 from .engine.vlm import VLMBatchedEngine
 from .exceptions import (
@@ -51,11 +52,11 @@ class EngineEntry:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts"]  # Engine type to use
+    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
+    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
-    engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | TTSEngine | None = None  # Loaded engine instance
+    engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
     is_pinned: bool = False  # Never evict if True
@@ -189,6 +190,7 @@ class EnginePool:
         "reranker": "reranker",
         "audio_stt": "audio_stt",
         "audio_tts": "audio_tts",
+        "audio_sts": "audio_sts",
     }
 
     def apply_settings_overrides(
@@ -285,7 +287,7 @@ class EnginePool:
 
         return model_id_or_alias
 
-    async def get_engine(self, model_id: str) -> BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | TTSEngine:
+    async def get_engine(self, model_id: str) -> BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine:
         """
         Get or load engine for the specified model.
 
@@ -334,7 +336,7 @@ class EnginePool:
             # Skip entirely when model memory limit is disabled (None).
             # Audio engines (STT/TTS) don't use KV cache, so headroom is 0.
             if self._max_model_memory is not None:
-                if entry.engine_type in ("audio_stt", "audio_tts"):
+                if entry.engine_type in ("audio_stt", "audio_tts", "audio_sts"):
                     kv_headroom = 0
                 else:
                     kv_headroom = int(entry.estimated_size * 0.25)
@@ -522,6 +524,8 @@ class EnginePool:
                 engine = STTEngine(model_name=entry.model_path)
             elif entry.engine_type == "audio_tts":
                 engine = TTSEngine(model_name=entry.model_path)
+            elif entry.engine_type == "audio_sts":
+                engine = STSEngine(model_name=entry.model_path)
             else:
                 # BatchedEngine with continuous batching (default)
                 engine = BatchedEngine(

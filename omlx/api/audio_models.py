@@ -42,3 +42,13 @@ class AudioSpeechRequest(BaseModel):
     voice: Optional[str] = "default"
     speed: Optional[float] = 1.0
     response_format: Optional[str] = "wav"
+
+
+class AudioProcessRequest(BaseModel):
+    """Request model for audio processing (speech enhancement / STS).
+
+    Used by POST /v1/audio/process — the audio file is submitted as a
+    multipart upload alongside this model field.
+    """
+
+    model: str

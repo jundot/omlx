@@ -1417,7 +1417,7 @@ async def update_model_settings(
                     )
         current_settings.model_alias = alias_value
     if "model_type_override" in sent:
-        valid_types = {"llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts"}
+        valid_types = {"llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"}
         # Treat empty string as None (auto-detect)
         override_value = request.model_type_override or None
         if override_value is not None and override_value not in valid_types:
@@ -1434,6 +1434,7 @@ async def update_model_settings(
             "reranker": "reranker",
             "audio_stt": "audio_stt",
             "audio_tts": "audio_tts",
+            "audio_sts": "audio_sts",
         }
         if override_value:
             entry.model_type = override_value

@@ -22,8 +22,8 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts"]
+ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -166,6 +166,21 @@ AUDIO_TTS_ARCHITECTURES = {
     "ChatterboxForConditionalGeneration",
 }
 
+# Known STS (speech-to-speech) model_type values
+AUDIO_STS_MODEL_TYPES = {
+    "moshi",
+    "deepfilternet",
+    "mossformer2",
+}
+
+# Known STS architectures
+AUDIO_STS_ARCHITECTURES = {
+    "MoshiSTSModel",
+    "MossFormer2SEModel",
+    "DeepFilterNetModel",
+    "LFM2AudioModel",
+}
+
 
 @dataclass
 class DiscoveredModel:
@@ -237,7 +252,7 @@ def detect_model_type(model_path: Path) -> ModelType:
         model_path: Path to model directory
 
     Returns:
-        Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", or "audio_tts"
+        Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", or "audio_sts"
     """
     config_path = model_path / "config.json"
     if not config_path.exists():
@@ -324,6 +339,17 @@ def detect_model_type(model_path: Path) -> ModelType:
     if normalized_type in AUDIO_TTS_MODEL_TYPES or model_type in AUDIO_TTS_MODEL_TYPES:
         return "audio_tts"
 
+    # Check for STS (speech-to-speech): architectures first, then model_type.
+    # Also detect LFM2 audio models by architecture or "lfm" model_type prefix.
+    for arch in architectures:
+        if arch in AUDIO_STS_ARCHITECTURES:
+            return "audio_sts"
+    if normalized_type in AUDIO_STS_MODEL_TYPES or model_type in AUDIO_STS_MODEL_TYPES:
+        return "audio_sts"
+    # LFM2 audio: model_type contains "lfm" prefix and not already an embedding
+    if normalized_type.startswith("lfm") and normalized_type not in EMBEDDING_MODEL_TYPES:
+        return "audio_sts"
+
     return "llm"
 
 
@@ -396,6 +422,8 @@ def _register_model(
             engine_type = "audio_stt"
         elif model_type == "audio_tts":
             engine_type = "audio_tts"
+        elif model_type == "audio_sts":
+            engine_type = "audio_sts"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)

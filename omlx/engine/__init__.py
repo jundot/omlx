@@ -18,6 +18,7 @@ from .batched import BatchedEngine
 from .embedding import EmbeddingEngine
 from .reranker import RerankerEngine
 from .stt import STTEngine
+from .sts import STSEngine
 from .tts import TTSEngine
 from .vlm import VLMBatchedEngine
 
@@ -30,6 +31,7 @@ __all__ = [
     "EmbeddingEngine",
     "RerankerEngine",
     "STTEngine",
+    "STSEngine",
     "TTSEngine",
     # Core engine components
     "EngineCore",
