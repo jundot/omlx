@@ -116,6 +116,7 @@ SUPPORTED_RERANKER_ARCHITECTURES = {
 # Detected by architecture + heuristic (model name or tokenizer hints).
 CAUSAL_LM_RERANKER_ARCHITECTURES = {
     "Qwen3ForCausalLM",
+    "JinaForRanking",  # Jina v3 reranker: uses <|score_token|> logits
 }
 
 # Unsupported reranker architectures (future support)
