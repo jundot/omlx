@@ -248,13 +248,13 @@ class MLXRerankerModel:
         if score_token_id is None:
             try:
                 score_token_id = tokenizer.convert_tokens_to_ids("<|score_token|>")
-            except:
+            except Exception:
                 pass
         
         if rerank_token_id is None:
             try:
                 rerank_token_id = tokenizer.convert_tokens_to_ids("<|rerank_token|>")
-            except:
+            except Exception:
                 pass
         
         # 3. Fallback to get_added_vocab
