@@ -1810,8 +1810,14 @@
                     lookup[r.model_id][r.benchmark] = r;
                 }
 
+                // Full sizes lookup
+                const fullSizes = {};
+                for (const bl of this.accBenchmarkList) fullSizes[bl.key] = bl.fullSize;
+
                 // Determine column widths
                 const modelWidth = Math.max(12, ...models.map(m => m.length + 2));
+                const modeW = 8;
+                const sampledW = 14;
                 const benchWidth = Math.max(14, ...benchmarks.map(b => b.length + 2));
 
                 let lines = [];
@@ -1819,14 +1825,22 @@
                 lines.push('');
 
                 // Header row
-                let header = rpad('', benchWidth);
+                let header = rpad('', benchWidth) + rpad('Mode', modeW) + rpad('Sampled', sampledW);
                 for (const m of models) header += pad(m, modelWidth);
                 lines.push(header);
-                lines.push('-'.repeat(benchWidth + models.length * modelWidth));
+                lines.push('-'.repeat(benchWidth + modeW + sampledW + models.length * modelWidth));
 
                 // Data rows
                 for (const b of benchmarks) {
-                    let row = rpad(b.toUpperCase(), benchWidth);
+                    // Get sample info from first available result for this benchmark
+                    const sample = models.map(m => lookup[m]?.[b]).find(r => r);
+                    const total = sample?.total || 0;
+                    const full = fullSizes[b] || 0;
+                    const isFull = total >= full;
+                    const mode = isFull ? 'Full' : 'Sample';
+                    const sampledStr = isFull ? String(full) : (total + '/' + full);
+
+                    let row = rpad(b.toUpperCase(), benchWidth) + rpad(mode, modeW) + rpad(sampledStr, sampledW);
                     for (const m of models) {
                         const r = lookup[m]?.[b];
                         row += pad(r ? (r.accuracy * 100).toFixed(1) + '%' : '-', modelWidth);
