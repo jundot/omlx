@@ -427,13 +427,21 @@ def _openai_error_body(message, status_code: int, param=None, code=None) -> dict
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
     """Log all HTTP errors (4xx/5xx) before returning the response."""
-    logger.warning(
-        "%s %s → %d: %s",
-        request.method,
-        request.url.path,
-        exc.status_code,
-        exc.detail,
+    # Admin session expiry from dashboard polling — not worth logging.
+    # But keep /admin/api/login 401s visible (possible brute force attempts).
+    _is_admin_session_expiry = (
+        request.url.path.startswith("/admin/")
+        and request.url.path != "/admin/api/login"
+        and exc.status_code == 401
     )
+    if not _is_admin_session_expiry:
+        logger.warning(
+            "%s %s → %d: %s",
+            request.method,
+            request.url.path,
+            exc.status_code,
+            exc.detail,
+        )
     if _is_api_route(request):
         content = _openai_error_body(exc.detail, exc.status_code)
     else:
