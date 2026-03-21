@@ -1074,7 +1074,7 @@
                                 </div>
                                 <!-- Advanced Settings -->
                                 <div class="mt-4 border-t border-neutral-100 pt-3">
-                                    <button @click="oqAdvancedOpen = !oqAdvancedOpen; $nextTick(() => lucide.createIcons())"
+                                    <button @click="oqAdvancedOpen = !oqAdvancedOpen"
                                             class="flex items-center gap-1.5 text-sm text-neutral-500 hover:text-neutral-700 transition-colors">
                                         <i :data-lucide="oqAdvancedOpen ? 'chevron-down' : 'chevron-right'" class="w-3.5 h-3.5"></i>
                                         {{ t('models.oq.advanced_settings') }}

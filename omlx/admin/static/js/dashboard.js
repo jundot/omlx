@@ -327,9 +327,6 @@
                     this.loadModels(),
                     this.checkForUpdate()
                 ]);
-                this.$nextTick(() => {
-                    lucide.createIcons();
-                });
 
                 this.startUpdateCheckTimer();
 
@@ -410,7 +407,6 @@
                     if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
                     await this.loadAccState();
                 }
-                this.$nextTick(() => lucide.createIcons());
             },
 
             applyTabStateFromUrl() {
@@ -648,7 +644,6 @@
                         const data = await response.json();
                         this.saveSuccess = true;
                         this.saveMessage = data.message || 'Settings saved successfully';
-                        this.$nextTick(() => lucide.createIcons());
                         // Refresh stats and model list (cache changes unload models)
                         await this.loadStats();
                         await this.loadModels();
@@ -660,14 +655,12 @@
                         this.saveError = Array.isArray(data.detail) ? data.detail.join(', ') : (data.detail || window.t('js.error.save_settings_failed'));
                         // Reload settings to revert to server values
                         await this.loadGlobalSettings();
-                        this.$nextTick(() => lucide.createIcons());
                     }
                 } catch (err) {
                     console.error('Failed to save global settings:', err);
                     this.saveError = window.t('js.error.save_settings_failed');
                     // Reload settings to revert to server values
                     await this.loadGlobalSettings();
-                    this.$nextTick(() => lucide.createIcons());
                 } finally {
                     this.saving = false;
                 }
@@ -740,7 +733,6 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.models = data.models || [];
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -890,7 +882,6 @@
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
-                this.$nextTick(() => lucide.createIcons());
             },
 
             async saveModelSettings() {
@@ -1185,7 +1176,6 @@
                         const alltimeData = await alltimeResponse.json();
                         this.alltimeStats = { ...this.alltimeStats, ...alltimeData };
                     }
-                    this.$nextTick(() => lucide.createIcons());
                 } catch (err) {
                     console.error('Failed to load stats:', err);
                 }
@@ -1418,7 +1408,6 @@
                             this.loadModels();
                         }
 
-                        this.$nextTick(() => lucide.createIcons());
                     } catch (err) {
                         console.error('Failed to parse SSE event:', err);
                     }
@@ -2396,7 +2385,6 @@
                 this.theme = this.theme === 'light' ? 'dark' : 'light';
                 localStorage.setItem('omlx-chat-theme', this.theme);
                 this.applyTheme();
-                this.$nextTick(() => lucide.createIcons());
             },
 
             applyTheme() {
@@ -2483,7 +2471,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfDownloading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2506,7 +2493,6 @@
                             }
                         }
 
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -2522,7 +2508,6 @@
                         const data = await response.json();
                         this.hfModels = data.models || [];
                         this.hfModelsLoaded = true;
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -2671,7 +2656,6 @@
                     this.oqError = 'Connection error. Server may be unavailable.';
                 } finally {
                     this.oqStarting = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2691,7 +2675,6 @@
                                 await this.loadOQModels();
                             }
                         }
-                        this.$nextTick(() => lucide.createIcons());
                     }
                 } catch (err) {
                     console.error('Failed to load oQ tasks:', err);
@@ -2833,7 +2816,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfRecommendedLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2879,7 +2861,6 @@
 
             setPage(tab, page) {
                 this.hfPage[tab] = page;
-                this.$nextTick(() => lucide.createIcons());
             },
 
             // Search
@@ -2922,7 +2903,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfSearchLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2993,7 +2973,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfModelDetailLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -3034,7 +3013,6 @@
                 if (this.msAvailable) {
                     await this.loadMSTasks();
                 }
-                this.$nextTick(() => lucide.createIcons());
             },
 
             async startMSDownload() {
@@ -3085,7 +3063,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msDownloading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -3106,7 +3083,6 @@
                             }
                         }
 
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -3211,7 +3187,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msRecommendedLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -3237,7 +3212,6 @@
 
             setMsPage(tab, page) {
                 this.msPage[tab] = page;
-                this.$nextTick(() => lucide.createIcons());
             },
 
             // MS Search
@@ -3278,7 +3252,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msSearchLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -3341,7 +3314,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msModelDetailLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
         }

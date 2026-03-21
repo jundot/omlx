@@ -220,14 +220,14 @@
                                              class="absolute right-0 mt-1 w-44 bg-white border border-neutral-200 rounded-lg shadow-lg z-10 py-1">
                                             <button type="button"
                                                     x-show="!modelSettings.ctKwargEntries.some(e => e.type === 'enable_thinking')"
-                                                    @click="modelSettings.ctKwargEntries.push({type: 'enable_thinking', value: 'true', force: false}); addOpen = false; $nextTick(() => lucide.createIcons())"
+                                                    @click="modelSettings.ctKwargEntries.push({type: 'enable_thinking', value: 'true', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_enable_thinking') }}</button>
                                             <button type="button"
                                                     x-show="!modelSettings.ctKwargEntries.some(e => e.type === 'reasoning_effort')"
-                                                    @click="modelSettings.ctKwargEntries.push({type: 'reasoning_effort', value: 'low', force: false}); addOpen = false; $nextTick(() => lucide.createIcons())"
+                                                    @click="modelSettings.ctKwargEntries.push({type: 'reasoning_effort', value: 'low', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_reasoning_effort') }}</button>
                                             <button type="button"
-                                                    @click="modelSettings.ctKwargEntries.push({type: 'custom', key: '', value: '', force: false}); addOpen = false; $nextTick(() => lucide.createIcons())"
+                                                    @click="modelSettings.ctKwargEntries.push({type: 'custom', key: '', value: '', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_custom') }}</button>
                                         </div>
                                     </div>
