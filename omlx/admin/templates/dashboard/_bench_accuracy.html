@@ -87,7 +87,7 @@
                             <div>
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.batch_size') }}</label>
                                 <div class="flex items-center gap-4">
-                                    <template x-for="bs in [1, 2, 4, 8]" :key="bs">
+                                    <template x-for="bs in [1, 2, 4, 8, 16, 32]" :key="bs">
                                         <label class="flex items-center gap-2 cursor-pointer">
                                             <input type="radio" name="accBatchSize"
                                                    :value="bs" x-model.number="accBatchSize"

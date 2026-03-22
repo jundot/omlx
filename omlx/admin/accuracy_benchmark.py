@@ -48,8 +48,8 @@ class AccuracyBenchmarkRequest(BaseModel):
     @field_validator("batch_size")
     @classmethod
     def validate_batch_size(cls, v: int) -> int:
-        if v not in (1, 2, 4, 8):
-            raise ValueError("batch_size must be 1, 2, 4, or 8")
+        if v not in (1, 2, 4, 8, 16, 32):
+            raise ValueError("batch_size must be 1, 2, 4, 8, 16, or 32")
         return v
 
     @field_validator("benchmarks")
