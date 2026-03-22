@@ -67,7 +67,7 @@
                                                 <option value="0" x-text="'Full (' + b.fullSize.toLocaleString() + ')'"></option>
                                             </select>
                                             <!-- Code exec warning badge -->
-                                            <template x-if="b.key === 'livecodebench' || b.key === 'humaneval'">
+                                            <template x-if="b.key === 'livecodebench' || b.key === 'humaneval' || b.key === 'mbpp'">
                                                 <div class="mt-2">
                                                     <span class="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium rounded"
                                                           :class="accBenchmarks[b.key] ? 'bg-amber-400/20 text-amber-200' : 'bg-amber-50 text-amber-500'"

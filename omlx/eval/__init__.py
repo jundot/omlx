@@ -5,20 +5,26 @@ Provides MMLU, HellaSwag, TruthfulQA, GSM8K, and LiveCodeBench
 evaluators with deterministic sampling for fair model comparison.
 """
 
+from .arc import ARCChallengeBenchmark
 from .base import BaseBenchmark, BenchmarkResult, QuestionResult
 from .gsm8k import GSM8KBenchmark
 from .hellaswag import HellaSwagBenchmark
 from .humaneval import HumanEvalBenchmark
 from .livecodebench import LiveCodeBenchBenchmark
+from .mbpp import MBPPBenchmark
 from .mmlu import MMLUBenchmark
 from .truthfulqa import TruthfulQABenchmark
+from .winogrande import WinograndeBenchmark
 
 BENCHMARKS: dict[str, type[BaseBenchmark]] = {
     "mmlu": MMLUBenchmark,
     "hellaswag": HellaSwagBenchmark,
     "truthfulqa": TruthfulQABenchmark,
+    "arc_challenge": ARCChallengeBenchmark,
+    "winogrande": WinograndeBenchmark,
     "gsm8k": GSM8KBenchmark,
     "humaneval": HumanEvalBenchmark,
+    "mbpp": MBPPBenchmark,
     "livecodebench": LiveCodeBenchBenchmark,
 }
 
@@ -30,7 +36,10 @@ __all__ = [
     "MMLUBenchmark",
     "HellaSwagBenchmark",
     "TruthfulQABenchmark",
+    "ARCChallengeBenchmark",
+    "WinograndeBenchmark",
     "GSM8KBenchmark",
     "HumanEvalBenchmark",
+    "MBPPBenchmark",
     "LiveCodeBenchBenchmark",
 ]

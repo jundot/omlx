@@ -297,14 +297,17 @@
 
             // Accuracy benchmark state
             accModelId: '',
-            accBenchmarks: { mmlu: true, hellaswag: false, truthfulqa: true, gsm8k: false, humaneval: true, livecodebench: false },
-            accSampleSizes: { mmlu: 1000, hellaswag: 200, truthfulqa: 0, gsm8k: 100, humaneval: 0, livecodebench: 100 },
+            accBenchmarks: { mmlu: true, hellaswag: false, truthfulqa: true, arc_challenge: false, winogrande: false, gsm8k: false, humaneval: true, mbpp: false, livecodebench: false },
+            accSampleSizes: { mmlu: 1000, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, humaneval: 0, mbpp: 200, livecodebench: 100 },
             accBenchmarkList: [
                 { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects', fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                 { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning', fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                 { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness', fullSize: 817, sizes: [30, 50, 100, 200, 300] },
+                { key: 'arc_challenge', label: 'ARC-C', desc: 'Science reasoning', fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
+                { key: 'winogrande', label: 'Winogrande', desc: 'Coreference resolution', fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
                 { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning', fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
                 { key: 'humaneval', label: 'HumanEval', desc: 'Function completion', fullSize: 164, sizes: [30, 50, 100] },
+                { key: 'mbpp', label: 'MBPP', desc: 'Python problems', fullSize: 500, sizes: [30, 50, 100, 200, 300] },
                 { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
             ],
             accBatchSize: 1,
