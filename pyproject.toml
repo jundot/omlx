@@ -52,7 +52,7 @@ dependencies = [
     # Resource monitoring
     "psutil>=5.9.0",
     # Server
-    "fastapi>=0.100.0",
+    "fastapi>=0.108.0",
     "uvicorn>=0.23.0",
     # JSON Schema validation for structured output
     "jsonschema>=4.0.0",

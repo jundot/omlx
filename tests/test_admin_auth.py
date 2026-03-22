@@ -148,9 +148,9 @@ class TestLoginPage:
                 with patch.object(admin_routes, "templates") as mock_templates:
                     mock_templates.TemplateResponse.return_value = MagicMock()
                     asyncio.run(admin_routes.login_page(request=mock_request))
-                    call_args = mock_templates.TemplateResponse.call_args
-                    assert call_args[0][0] is mock_request
-                    assert call_args[0][1] == "login.html"
+                    mock_templates.TemplateResponse.assert_called_once_with(
+                        mock_request, "login.html", {"api_key_configured": True}
+                    )
         finally:
             _restore_getter(original)
 
