@@ -37,9 +37,18 @@ class TestMMLU:
     def test_extract_answer_no_match(self):
         assert self.bench.extract_answer("I don't know", {}) == ""
 
-    def test_extract_answer_lowercase_ignored(self):
-        # Only uppercase A-D are valid
-        assert self.bench.extract_answer("a", {}) == ""
+    def test_extract_answer_lowercase(self):
+        assert self.bench.extract_answer("a", {}) == "A"
+        assert self.bench.extract_answer("the answer is b", {}) == "B"
+
+    def test_extract_answer_explanation_before_answer(self):
+        """Model explains with wrong letters first, then gives correct answer."""
+        assert self.bench.extract_answer("B is wrong because... The answer is A", {}) == "A"
+        assert self.bench.extract_answer("I initially thought C but answer is D", {}) == "D"
+
+    def test_extract_answer_last_letter(self):
+        """When no 'answer is' pattern, use last valid letter."""
+        assert self.bench.extract_answer("Looking at A and B, B is correct", {}) == "B"
 
     def test_check_answer_correct(self):
         assert self.bench.check_answer("A", {"answer": "A"}) is True
@@ -200,6 +209,49 @@ class TestLiveCodeBench:
     def test_extract_code_empty(self):
         code = _extract_code("")
         assert code == ""
+
+
+# --- HumanEval Tests ---
+
+
+class TestHumanEval:
+    def test_extract_code_with_block(self):
+        from omlx.eval.humaneval import _extract_code
+        prompt = "def add(a, b):\n    "
+        response = "```python\ndef add(a, b):\n    return a + b\n```"
+        code = _extract_code(response, prompt)
+        assert "return a + b" in code
+
+    def test_extract_code_body_only(self):
+        from omlx.eval.humaneval import _extract_code
+        prompt = "def add(a, b):\n    "
+        response = "return a + b"
+        code = _extract_code(response, prompt)
+        assert "def add(a, b):" in code
+        assert "return a + b" in code
+
+    def test_extract_code_preserves_imports(self):
+        """Model returns def only — imports from prompt must be prepended."""
+        from omlx.eval.humaneval import _extract_code
+        prompt = "from typing import List\n\ndef foo(x: List[int]) -> int:\n    "
+        response = "def foo(x: List[int]) -> int:\n    return sum(x)"
+        code = _extract_code(response, prompt)
+        assert "from typing import List" in code
+        assert "return sum(x)" in code
+
+    def test_execute_with_tests(self):
+        from omlx.eval.humaneval import _execute_with_tests
+        code = "def add(a, b):\n    return a + b"
+        test = "def check(candidate):\n    assert candidate(1, 2) == 3\n    assert candidate(0, 0) == 0"
+        passed, error = _execute_with_tests(code, test, "add")
+        assert passed is True
+
+    def test_execute_with_tests_fail(self):
+        from omlx.eval.humaneval import _execute_with_tests
+        code = "def add(a, b):\n    return a - b"  # wrong
+        test = "def check(candidate):\n    assert candidate(1, 2) == 3"
+        passed, error = _execute_with_tests(code, test, "add")
+        assert passed is False
 
 
 # --- Think Tag Stripping Tests ---

@@ -1,17 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""LiveCodeBench benchmark.
+"""MBPP (Mostly Basic Python Problems) benchmark.
 
-Tests code generation ability using competitive programming problems.
-Generates code, executes it in a sandboxed subprocess, and checks output.
-Dataset bundled from livecodebench/code_generation_lite on HuggingFace.
+Tests code generation with natural language descriptions and assertion tests.
+Dataset bundled from google-research-datasets/mbpp (full test) on HuggingFace.
+500 problems with assert-based test cases.
 
 SECURITY NOTE: This benchmark executes model-generated code on the local
-machine. Mitigations: subprocess with timeout, memory limits via resource
-module, temp file cleanup. Users are warned in the UI before running.
+machine. Mitigations: subprocess with timeout, memory limits, temp file cleanup.
 """
 
 import asyncio
-import json
 import logging
 import os
 import re
@@ -29,17 +27,12 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent / "data"
 
-# Execution limits
-EXEC_TIMEOUT_SECONDS = 30
-EXEC_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024  # 256 MB
+EXEC_TIMEOUT_SECONDS = 15
+EXEC_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024
 
 
 def _extract_code(response: str) -> str:
-    """Extract Python code from model response.
-
-    Looks for ```python...``` blocks first, then ```...``` blocks,
-    then falls back to the entire response.
-    """
+    """Extract Python code from model response."""
     match = re.search(r"```python\s*\n(.*?)```", response, re.DOTALL)
     if match:
         return match.group(1).strip()
@@ -67,7 +60,6 @@ def _extract_code(response: str) -> str:
 
 
 def _set_resource_limits():
-    """Set resource limits for subprocess. Called via preexec_fn."""
     try:
         resource.setrlimit(resource.RLIMIT_AS, (EXEC_MEMORY_LIMIT_BYTES, EXEC_MEMORY_LIMIT_BYTES))
     except (ValueError, resource.error):
@@ -78,22 +70,18 @@ def _set_resource_limits():
         pass
 
 
-def _execute_code(code: str, stdin_input: str = "") -> tuple[str, bool, str]:
-    """Execute Python code in a subprocess with safety limits.
+def _execute_with_tests(code: str, test_list: list[str], setup_code: str = "") -> tuple[bool, str]:
+    """Execute generated code with assertion-based test cases."""
+    test_code = "\n".join(test_list)
+    script = f"{setup_code}\n{code}\n{test_code}\n"
 
-    Returns:
-        (stdout, success, error_message)
-    """
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False
-    ) as f:
-        f.write(code)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(script)
         tmp_path = f.name
 
     try:
         result = subprocess.run(
             ["python3", tmp_path],
-            input=stdin_input,
             capture_output=True,
             text=True,
             timeout=EXEC_TIMEOUT_SECONDS,
@@ -105,13 +93,13 @@ def _execute_code(code: str, stdin_input: str = "") -> tuple[str, bool, str]:
             },
         )
         if result.returncode == 0:
-            return result.stdout, True, ""
+            return True, ""
         else:
-            return result.stdout, False, result.stderr[:500]
+            return False, result.stderr[:500]
     except subprocess.TimeoutExpired:
-        return "", False, "Execution timed out"
+        return False, "Execution timed out"
     except Exception as e:
-        return "", False, str(e)[:500]
+        return False, str(e)[:500]
     finally:
         try:
             os.unlink(tmp_path)
@@ -119,47 +107,30 @@ def _execute_code(code: str, stdin_input: str = "") -> tuple[str, bool, str]:
             pass
 
 
-class LiveCodeBenchBenchmark(BaseBenchmark):
-    """LiveCodeBench: code generation with sandboxed execution."""
+class MBPPBenchmark(BaseBenchmark):
+    """MBPP: code generation with assertion-based test verification."""
 
-    name = "livecodebench"
-    quick_size = 100
+    name = "mbpp"
+    quick_size = 200
 
     async def load_dataset(self, sample_size: int = 0) -> list[dict]:
-        """Load LiveCodeBench from bundled data."""
-        items = load_jsonl(DATA_DIR / "livecodebench.jsonl")
+        """Load MBPP from bundled data."""
+        items = load_jsonl(DATA_DIR / "mbpp.jsonl")
 
         normalized = []
-        for i, item in enumerate(items):
-            test_cases_str = item.get("public_test_cases", "[]")
-            if isinstance(test_cases_str, str):
-                try:
-                    test_cases = json.loads(test_cases_str)
-                except (json.JSONDecodeError, TypeError):
-                    test_cases = []
-            else:
-                test_cases = test_cases_str
-
-            if not isinstance(test_cases, list) or not test_cases:
+        for item in items:
+            test_list = item.get("test_list", [])
+            if not test_list:
                 continue
-
-            inputs = [tc.get("input", "") for tc in test_cases]
-            outputs = [tc.get("output", "") for tc in test_cases]
-
-            if not inputs or not outputs:
-                continue
-
             normalized.append({
-                "id": item.get("question_id", str(i)),
-                "title": item.get("question_title", f"Problem {i}"),
-                "description": item.get("question_content", ""),
-                "inputs": inputs,
-                "outputs": outputs,
-                "difficulty": item.get("difficulty", ""),
-                "starter_code": item.get("starter_code", ""),
+                "id": str(item["task_id"]),
+                "prompt": item["prompt"],
+                "test_list": test_list,
+                "test_setup_code": item.get("test_setup_code", ""),
+                "question": item["prompt"],
             })
 
-        logger.info(f"LiveCodeBench: loaded {len(normalized)} problems")
+        logger.info(f"MBPP: loaded {len(normalized)} problems")
 
         if sample_size == 0:
             return normalized
@@ -167,48 +138,35 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
         return deterministic_sample(normalized, sample_size)
 
     def get_max_tokens(self) -> int:
-        return 2048
+        return 512
 
     def format_prompt(self, item: dict) -> list[dict[str, str]]:
-        """Format as a coding problem prompt."""
-        description = item["description"]
-        prompt = (
-            "Solve the following programming problem in Python. "
-            "Read input from stdin and print the output to stdout. "
-            "Provide only the complete Python code, no explanations.\n\n"
-            f"Problem:\n{description}\n\n"
+        """Format as a code generation prompt with test cases for function name."""
+        prompt = item["prompt"]
+        tests = item.get("test_list", [])
+        test_str = "\n".join(tests[:3])
+        content = (
+            "Write a Python function to solve the following problem. "
+            "Provide only the complete function implementation, no explanations.\n\n"
+            f"Problem: {prompt}\n\n"
+            f"Test cases:\n{test_str}\n\n"
             "Solution:"
         )
-        return [{"role": "user", "content": prompt}]
+        return [{"role": "user", "content": content}]
 
     def extract_answer(self, response: str, item: dict) -> str:
-        """Extract code from the response (last code block to skip drafts)."""
         return self._extract_last_code_block(response)
 
     def check_answer(self, predicted: str, item: dict) -> bool:
-        """Execute code and check against test cases.
-
-        Runs the first 3 test cases to keep execution time reasonable.
-        """
         if not predicted.strip():
             return False
 
-        inputs = item["inputs"][:3]
-        outputs = item["outputs"][:3]
-
-        for inp, expected_out in zip(inputs, outputs):
-            stdin_input = inp if isinstance(inp, str) else str(inp)
-            expected = expected_out.strip() if isinstance(expected_out, str) else str(expected_out).strip()
-
-            stdout, success, error = _execute_code(predicted, stdin_input)
-            if not success:
-                return False
-
-            actual = stdout.strip()
-            if actual != expected:
-                return False
-
-        return True
+        passed, error = _execute_with_tests(
+            predicted,
+            item["test_list"],
+            item.get("test_setup_code", ""),
+        )
+        return passed
 
     async def run(
         self,
@@ -229,7 +187,6 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
             batch = items[batch_start:batch_end]
             batch_time = time.time()
 
-            # Batch the generation phase
             gen_tasks = [
                 self._eval_single(engine, item, batch_start + j, sampling_kwargs)
                 for j, item in enumerate(batch)
@@ -237,7 +194,6 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
             gen_results = await asyncio.gather(*gen_tasks)
             gen_elapsed = time.time() - batch_time
 
-            # Code execution is sequential (subprocess safety)
             for idx, item, response_text, prompt_text in sorted(gen_results, key=lambda x: x[0]):
                 code = self.extract_answer(response_text, item)
                 is_correct = self.check_answer(code, item)

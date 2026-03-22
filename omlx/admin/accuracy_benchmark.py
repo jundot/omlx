@@ -32,7 +32,11 @@ _current_run_id: Optional[str] = None
 _current_model: Optional[str] = None
 _engine_pool_ref: Any = None
 
-VALID_BENCHMARKS = ["mmlu", "hellaswag", "truthfulqa", "gsm8k", "livecodebench"]
+VALID_BENCHMARKS = [
+    "mmlu", "kmmlu", "cmmlu", "jmmlu",
+    "hellaswag", "truthfulqa", "arc_challenge", "winogrande",
+    "gsm8k", "humaneval", "mbpp", "livecodebench",
+]
 
 
 class AccuracyBenchmarkRequest(BaseModel):
@@ -45,8 +49,8 @@ class AccuracyBenchmarkRequest(BaseModel):
     @field_validator("batch_size")
     @classmethod
     def validate_batch_size(cls, v: int) -> int:
-        if v not in (1, 2, 4, 8):
-            raise ValueError("batch_size must be 1, 2, 4, or 8")
+        if v not in (1, 2, 4, 8, 16, 32):
+            raise ValueError("batch_size must be 1, 2, 4, 8, 16, or 32")
         return v
 
     @field_validator("benchmarks")
@@ -272,6 +276,9 @@ async def run_accuracy_benchmark(
     from ..eval import BENCHMARKS
 
     request = run.request
+
+    # Suppress TTL auto-unload during benchmark
+    engine_pool._suppress_ttl = True
     start_time = time.time()
 
     try:
@@ -482,3 +489,6 @@ async def run_accuracy_benchmark(
             "type": "error",
             "message": str(e),
         })
+    finally:
+        # Re-enable TTL auto-unload
+        engine_pool._suppress_ttl = False

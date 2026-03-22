@@ -58,7 +58,7 @@ class TestAccuracyBenchmarkRequest:
             model_id="test-model",
             benchmarks={b: 100 for b in VALID_BENCHMARKS},
         )
-        assert len(req.benchmarks) == 5
+        assert len(req.benchmarks) == 12
 
 
 class TestQueueAndResults:

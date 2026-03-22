@@ -2241,15 +2241,10 @@ async def stream_chat_completion(
                         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
     except Exception as e:
         logger.error(f"Error during chat streaming: {e}")
-        error_chunk = ChatCompletionChunk(
-            id=response_id,
-            model=request.model,
-            choices=[ChatCompletionChunkChoice(
-                delta=ChatCompletionChunkDelta(),
-                finish_reason="stop",
-            )],
-        )
-        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
+        error_data = {
+            "error": {"message": str(e), "type": "server_error"}
+        }
+        yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
 
