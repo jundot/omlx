@@ -8,6 +8,7 @@ evaluators with deterministic sampling for fair model comparison.
 from .base import BaseBenchmark, BenchmarkResult, QuestionResult
 from .gsm8k import GSM8KBenchmark
 from .hellaswag import HellaSwagBenchmark
+from .humaneval import HumanEvalBenchmark
 from .livecodebench import LiveCodeBenchBenchmark
 from .mmlu import MMLUBenchmark
 from .truthfulqa import TruthfulQABenchmark
@@ -17,6 +18,7 @@ BENCHMARKS: dict[str, type[BaseBenchmark]] = {
     "hellaswag": HellaSwagBenchmark,
     "truthfulqa": TruthfulQABenchmark,
     "gsm8k": GSM8KBenchmark,
+    "humaneval": HumanEvalBenchmark,
     "livecodebench": LiveCodeBenchBenchmark,
 }
 
@@ -29,5 +31,6 @@ __all__ = [
     "HellaSwagBenchmark",
     "TruthfulQABenchmark",
     "GSM8KBenchmark",
+    "HumanEvalBenchmark",
     "LiveCodeBenchBenchmark",
 ]

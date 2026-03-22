@@ -32,7 +32,7 @@ _current_run_id: Optional[str] = None
 _current_model: Optional[str] = None
 _engine_pool_ref: Any = None
 
-VALID_BENCHMARKS = ["mmlu", "hellaswag", "truthfulqa", "gsm8k", "livecodebench"]
+VALID_BENCHMARKS = ["mmlu", "hellaswag", "truthfulqa", "gsm8k", "humaneval", "livecodebench"]
 
 
 class AccuracyBenchmarkRequest(BaseModel):
