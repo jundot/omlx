@@ -152,7 +152,7 @@ class MBPPBenchmark(BaseBenchmark):
         return [{"role": "user", "content": content}]
 
     def extract_answer(self, response: str, item: dict) -> str:
-        return _extract_code(response)
+        return self._extract_last_code_block(response)
 
     def check_answer(self, predicted: str, item: dict) -> bool:
         if not predicted.strip():

@@ -187,7 +187,20 @@ class HumanEvalBenchmark(BaseBenchmark):
 
     def extract_answer(self, response: str, item: dict) -> str:
         """Extract the complete function from model response."""
-        return _extract_code(response, item["prompt"])
+        # Use last code block to avoid picking drafts/examples
+        code = self._extract_last_code_block(response)
+        imports = _get_imports(item["prompt"])
+
+        # If extracted code has function def but no imports, prepend from prompt
+        if "def " in code and imports:
+            if not any(line.strip().startswith(("import ", "from ")) for line in code.split("\n")):
+                return imports + "\n\n" + code
+
+        # If no function def found, combine prompt + response body
+        if "def " not in code:
+            return item["prompt"] + code
+
+        return code
 
     def check_answer(self, predicted: str, item: dict) -> bool:
         """Execute the generated code with test cases."""

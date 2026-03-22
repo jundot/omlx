@@ -65,13 +65,7 @@ class WinograndeBenchmark(BaseBenchmark):
         return [{"role": "user", "content": "\n".join(parts)}]
 
     def extract_answer(self, response: str, item: dict) -> str:
-        response = response.strip()
-        match = re.search(r"\b([12])\b", response)
-        if match:
-            return match.group(1)
-        if response and response[0] in "12":
-            return response[0]
-        return ""
+        return self._extract_mc_answer(response, ["1", "2"])
 
     def check_answer(self, predicted: str, item: dict) -> bool:
         return predicted == item["answer"]

@@ -37,9 +37,18 @@ class TestMMLU:
     def test_extract_answer_no_match(self):
         assert self.bench.extract_answer("I don't know", {}) == ""
 
-    def test_extract_answer_lowercase_ignored(self):
-        # Only uppercase A-D are valid
-        assert self.bench.extract_answer("a", {}) == ""
+    def test_extract_answer_lowercase(self):
+        assert self.bench.extract_answer("a", {}) == "A"
+        assert self.bench.extract_answer("the answer is b", {}) == "B"
+
+    def test_extract_answer_explanation_before_answer(self):
+        """Model explains with wrong letters first, then gives correct answer."""
+        assert self.bench.extract_answer("B is wrong because... The answer is A", {}) == "A"
+        assert self.bench.extract_answer("I initially thought C but answer is D", {}) == "D"
+
+    def test_extract_answer_last_letter(self):
+        """When no 'answer is' pattern, use last valid letter."""
+        assert self.bench.extract_answer("Looking at A and B, B is correct", {}) == "B"
 
     def test_check_answer_correct(self):
         assert self.bench.check_answer("A", {"answer": "A"}) is True

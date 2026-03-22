@@ -182,8 +182,8 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
         return [{"role": "user", "content": prompt}]
 
     def extract_answer(self, response: str, item: dict) -> str:
-        """Extract code from the response."""
-        return _extract_code(response)
+        """Extract code from the response (last code block to skip drafts)."""
+        return self._extract_last_code_block(response)
 
     def check_answer(self, predicted: str, item: dict) -> bool:
         """Execute code and check against test cases.
