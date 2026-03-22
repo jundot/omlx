@@ -1372,72 +1372,91 @@ def _get_scale_pairs(block):
     """
     pairs = []
 
-    # 1. input_layernorm → attention projections
-    if hasattr(block, 'input_layernorm'):
-        norm = block.input_layernorm
+    # 1. norm → attention/mixer projections
+    # Standard: input_layernorm → self_attn.q/k/v_proj
+    # Nemotron: norm → mixer.q/k/v_proj (or mixer.in_proj for Mamba)
+    norm = getattr(block, 'input_layernorm', None) or getattr(block, 'norm', None)
+    if norm is not None and hasattr(norm, 'weight'):
         attn_layers = []
-        # Full attention
-        if hasattr(block, 'self_attn'):
-            attn = block.self_attn
+        # Search in self_attn, linear_attn, and mixer (Nemotron hybrid)
+        for attn_attr in ('self_attn', 'linear_attn', 'mixer'):
+            attn = getattr(block, attn_attr, None)
+            if attn is None:
+                continue
+            # Standard attention projections
             for name in ('q_proj', 'k_proj', 'v_proj'):
                 if hasattr(attn, name):
                     attn_layers.append(getattr(attn, name))
-        # Linear attention (GatedDeltaNet)
-        if hasattr(block, 'linear_attn'):
-            la = block.linear_attn
-            for name in ('in_proj_qkv', 'in_proj_z'):
-                if hasattr(la, name):
-                    attn_layers.append(getattr(la, name))
+            # GatedDeltaNet / Mamba projections
+            for name in ('in_proj_qkv', 'in_proj_z', 'in_proj'):
+                if hasattr(attn, name):
+                    attn_layers.append(getattr(attn, name))
         if attn_layers:
             pairs.append((norm, attn_layers))
 
     # 2. v_proj → o_proj (attention output, AutoAWQ pair)
-    if hasattr(block, 'self_attn'):
-        attn = block.self_attn
+    for attn_attr in ('self_attn', 'mixer'):
+        attn = getattr(block, attn_attr, None)
+        if attn is None:
+            continue
         if hasattr(attn, 'v_proj') and hasattr(attn, 'o_proj'):
             if attn.v_proj.weight.shape[0] == attn.o_proj.weight.shape[-1]:
                 pairs.append((attn.v_proj, [attn.o_proj]))
+            break
 
-    # 3. post_attention_layernorm → MLP projections
-    if hasattr(block, 'post_attention_layernorm') and hasattr(block, 'mlp'):
-        norm = block.post_attention_layernorm
+    # 3. norm → MLP/MoE projections
+    # Standard: post_attention_layernorm → mlp
+    # Nemotron: norm → mixer (when mixer is MoE)
+    post_norm = getattr(block, 'post_attention_layernorm', None)
+    mlp = getattr(block, 'mlp', None)
+    # Nemotron hybrid: single norm, mixer can be MoE
+    if post_norm is None and norm is not None:
+        mixer = getattr(block, 'mixer', None)
+        if mixer is not None and hasattr(mixer, 'switch_mlp'):
+            post_norm = norm
+            mlp = mixer
+
+    if post_norm is not None and mlp is not None:
         mlp_layers = []
-        mlp = block.mlp
-        # MoE: switch_mlp + shared_expert
+        # MoE: switch_mlp + shared_expert(s)
         if hasattr(mlp, 'switch_mlp'):
             sm = mlp.switch_mlp
             for name in ('gate_proj', 'up_proj'):
                 if hasattr(sm, name):
                     mlp_layers.append(getattr(sm, name))
-        if hasattr(mlp, 'shared_expert'):
-            se = mlp.shared_expert
-            for name in ('gate_proj', 'up_proj'):
-                if hasattr(se, name):
-                    mlp_layers.append(getattr(se, name))
+        for se_attr in ('shared_expert', 'shared_experts'):
+            se = getattr(mlp, se_attr, None)
+            if se is not None:
+                for name in ('gate_proj', 'up_proj'):
+                    if hasattr(se, name):
+                        mlp_layers.append(getattr(se, name))
         # Dense MLP
         if not mlp_layers:
             for name in ('gate_proj', 'up_proj'):
                 if hasattr(mlp, name):
                     mlp_layers.append(getattr(mlp, name))
         if mlp_layers:
-            pairs.append((norm, mlp_layers))
+            pairs.append((post_norm, mlp_layers))
 
-    # 3. up_proj → down_proj (within MLP, scales intermediate dim)
-    # MoE experts
-    if hasattr(block, 'mlp') and hasattr(block.mlp, 'switch_mlp'):
-        sm = block.mlp.switch_mlp
-        if hasattr(sm, 'up_proj') and hasattr(sm, 'down_proj'):
-            pairs.append((sm.up_proj, [sm.down_proj]))
-    # Shared expert
-    if hasattr(block, 'mlp') and hasattr(block.mlp, 'shared_expert'):
-        se = block.mlp.shared_expert
-        if hasattr(se, 'up_proj') and hasattr(se, 'down_proj'):
-            pairs.append((se.up_proj, [se.down_proj]))
-    # Dense MLP
-    if hasattr(block, 'mlp') and hasattr(block.mlp, 'up_proj'):
-        mlp = block.mlp
-        if hasattr(mlp, 'down_proj'):
-            pairs.append((mlp.up_proj, [mlp.down_proj]))
+    # 4. up_proj → down_proj (within MLP, scales intermediate dim)
+    # Search in mlp and mixer (Nemotron uses mixer for MoE)
+    for parent_attr in ('mlp', 'mixer', 'block_sparse_moe'):
+        parent = getattr(block, parent_attr, None)
+        if parent is None:
+            continue
+        # MoE experts
+        if hasattr(parent, 'switch_mlp'):
+            sm = parent.switch_mlp
+            if hasattr(sm, 'up_proj') and hasattr(sm, 'down_proj'):
+                pairs.append((sm.up_proj, [sm.down_proj]))
+        # Shared expert(s)
+        for se_attr in ('shared_expert', 'shared_experts'):
+            se = getattr(parent, se_attr, None)
+            if se is not None and hasattr(se, 'up_proj') and hasattr(se, 'down_proj'):
+                pairs.append((se.up_proj, [se.down_proj]))
+        # Dense MLP
+        if hasattr(parent, 'up_proj') and hasattr(parent, 'down_proj'):
+            pairs.append((parent.up_proj, [parent.down_proj]))
 
     return pairs
 
@@ -1823,9 +1842,11 @@ def _run_equalization_and_sensitivity(
                 gate_mod = m
         if hasattr(block, 'post_attention_layernorm'):
             post_norm = block.post_attention_layernorm
+        elif hasattr(block, 'norm'):
+            post_norm = block.norm  # Nemotron uses single norm
         # Also check common MoE structures
         if switch_mlp is None:
-            for attr in ('mlp', 'block_sparse_moe'):
+            for attr in ('mlp', 'block_sparse_moe', 'mixer'):
                 parent = getattr(block, attr, None)
                 if parent is None:
                     continue
