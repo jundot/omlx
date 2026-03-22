@@ -281,6 +281,55 @@ class TestDisabledWhenMaxBytesZero:
         assert bg._memory_hard_limit_bytes == 0
 
 
+class TestPrefillMemoryGuardToggle:
+    """Tests for prefill_memory_guard setter and Metal limit management."""
+
+    def test_enable_guard_sets_metal_limit(self, enforcer):
+        """Enabling guard sets Metal memory/cache limits."""
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.set_memory_limit.return_value = 0
+            mock_mx.set_cache_limit.return_value = 0
+            enforcer._running = True
+
+            enforcer.prefill_memory_guard = True
+            mock_mx.set_memory_limit.assert_called()
+            mock_mx.set_cache_limit.assert_called()
+
+    def test_disable_guard_clears_metal_limit(self, enforcer):
+        """Disabling guard restores previous Metal limits."""
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            prev_mem = 100 * 1024**3
+            prev_cache = 50 * 1024**3
+            mock_mx.set_memory_limit.return_value = prev_mem
+            mock_mx.set_cache_limit.return_value = prev_cache
+            enforcer._running = True
+
+            # Enable guard first (stores previous limits)
+            enforcer.prefill_memory_guard = True
+            assert enforcer._prev_memory_limit == prev_mem
+            assert enforcer._prev_cache_limit == prev_cache
+
+            mock_mx.set_memory_limit.reset_mock()
+            mock_mx.set_cache_limit.reset_mock()
+
+            # Disable guard (should restore previous limits)
+            enforcer.prefill_memory_guard = False
+            mock_mx.set_memory_limit.assert_called_once_with(prev_mem)
+            mock_mx.set_cache_limit.assert_called_once_with(prev_cache)
+            assert enforcer._prev_memory_limit is None
+            assert enforcer._prev_cache_limit is None
+
+    def test_disable_guard_noop_without_prior_limits(self, enforcer):
+        """Disabling guard when no limits were set does not call mx."""
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            enforcer._running = True
+
+            # Disable without enabling first
+            enforcer.prefill_memory_guard = False
+            mock_mx.set_memory_limit.assert_not_called()
+            mock_mx.set_cache_limit.assert_not_called()
+
+
 class TestHardLimitCalculation:
     """Tests for _get_hard_limit_bytes calculation."""
 
