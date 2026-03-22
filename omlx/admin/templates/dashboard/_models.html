@@ -1275,8 +1275,9 @@
                                 <!-- Intro -->
                                 <div>
                                     <p class="mt-1.5 text-sm text-neutral-500">
-                                        oQ combines GGUF K-quant layer-position strategy, unsloth Dynamic 2.0 selective protection,
-                                        and AWQ output-MSE optimization — with hybrid mxfp4/mxfp8/affine modes auto-selected per tensor.
+                                        oQ combines data-driven per-layer sensitivity, AutoAWQ-style weight equalization with per-expert
+                                        activation-aware scaling, MSE-optimal clip optimization — with hybrid mxfp4/mxfp8/affine modes
+                                        auto-selected per tensor. Built-in calibration data (512 samples, code + multilingual + tool calling).
                                     </p>
                                 </div>
 
@@ -1286,7 +1287,7 @@
                                     <div class="mt-3 space-y-3">
                                         <div class="flex gap-3">
                                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Mixed precision</strong> <span class="text-neutral-500">34 tensor rules. Critical layers at 6-bit, expert MLP at base bits, MoE routers at fp16.</span></div>
+                                            <div class="text-sm"><strong class="text-neutral-700">Mixed precision + Data-driven sensitivity</strong> <span class="text-neutral-500">Per-layer quantization sensitivity measured via calibration. Top 25% sensitive layers get higher bit protection. Replaces position-based heuristics.</span></div>
                                         </div>
                                         <div class="flex gap-3">
                                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>
@@ -1298,7 +1299,7 @@
                                         </div>
                                         <div class="flex gap-3">
                                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Enhanced (+)</strong> <span class="text-neutral-500">AWQ-style clip optimization with calibration data for better quality at 2-4 bit.</span></div>
+                                            <div class="text-sm"><strong class="text-neutral-700">Enhanced (+)</strong> <span class="text-neutral-500">AutoAWQ-style weight equalization (grid search with MSE validation), per-expert activation-aware scaling for MoE, and clip optimization.</span></div>
                                         </div>
                                     </div>
                                 </div>
@@ -1329,7 +1330,7 @@
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Mixed precision</td>
-                                                    <td class="py-1.5 px-3">34 tensor rules</td>
+                                                    <td class="py-1.5 px-3">Sensitivity-driven + AWQ equalization</td>
                                                     <td class="py-1.5 px-3">~15 type rules</td>
                                                     <td class="py-1.5 px-3">imatrix per-weight</td>
                                                     <td class="py-1.5 px-3">Per-layer (proprietary)</td>
@@ -1345,7 +1346,7 @@
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">MoE support</td>
-                                                    <td class="py-1.5 px-3">Router fp16, MLP asymmetry</td>
+                                                    <td class="py-1.5 px-3">Router fp16, per-expert AWQ scaling</td>
                                                     <td class="py-1.5 px-3">Basic</td>
                                                     <td class="py-1.5 px-3">Basic</td>
                                                     <td class="py-1.5 px-3">Router fp16</td>
@@ -1361,7 +1362,7 @@
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Calibration</td>
-                                                    <td class="py-1.5 px-3">Optional (Enhanced+)</td>
+                                                    <td class="py-1.5 px-3">Built-in 512 samples (code + multilingual)</td>
                                                     <td class="py-1.5 px-3">None</td>
                                                     <td class="py-1.5 px-3">imatrix required</td>
                                                     <td class="py-1.5 px-3">Proprietary data</td>

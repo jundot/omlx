@@ -231,13 +231,23 @@ def universal_quant_predicate(
         if "down_proj" in path and "shared_expert" not in path:
             return bits(3)
 
-    # ── Layer position strategy ──
+    # ── Layer sensitivity strategy ──
 
     layer_idx = _extract_layer_index(path)
-    sensitive = layer_idx >= 0 and (
-        layer_idx < num_layers // 8
-        or layer_idx >= 7 * num_layers // 8
-    )
+
+    # Data-driven sensitivity (from calibration measurement)
+    sensitivity_map = config.get("_oq_sensitivity_map")
+    if sensitivity_map and layer_idx >= 0:
+        scores = list(sensitivity_map.values())
+        scores.sort(reverse=True)
+        threshold = scores[max(0, len(scores) // 4 - 1)] if scores else 0
+        sensitive = sensitivity_map.get(str(layer_idx), 0) >= threshold
+    else:
+        # Fallback: position-based (streaming without precompute)
+        sensitive = layer_idx >= 0 and (
+            layer_idx < num_layers // 8
+            or layer_idx >= 7 * num_layers // 8
+        )
 
     # v_proj: Q6 (sensitive) / base (rest)
     if any(p in path for p in ("v_proj", "v_a_proj", "v_b_proj")):
@@ -760,6 +770,20 @@ def quantize_oq_streaming(
 
     cb("loading", 15.0)
 
+    # Measure per-layer sensitivity (loads model temporarily, then frees)
+    logger.info(f"oQ{oq_level:g}: measuring layer sensitivity for streaming path")
+    sensitivity_map = _measure_sensitivity(
+        model_path, config, oq_level,
+        num_samples=128, seq_length=256,
+    )
+    if sensitivity_map:
+        config["_oq_sensitivity_map"] = {
+            str(k): v for k, v in sensitivity_map.items()
+        }
+        logger.info(f"oQ{oq_level:g}: sensitivity applied ({len(sensitivity_map)} layers)")
+
+    cb("loading", 20.0)
+
     # Group sanitized weights into output shards for processing
     # Process in chunks to keep memory bounded
     tensor_names = list(all_weights.keys())
@@ -921,6 +945,8 @@ def quantize_oq_streaming(
     # For mixed-precision, we store per-layer overrides for layers with
     # different bits than the base config.
     output_config = dict(config)
+    # Clean up temp sensitivity key
+    output_config.pop("_oq_sensitivity_map", None)
     # text_only: strip VLM-specific config keys
     if text_only:
         for key in ("vision_config", "image_token_id", "video_token_id",
@@ -1292,6 +1318,677 @@ def _search_best_clip(w, x, group_size: int, bits: int,
     return best_w
 
 
+# =============================================================================
+# Weight Equalization + Per-layer Sensitivity (AWQ-style)
+# =============================================================================
+
+
+def _find_model_layers(model):
+    """Find embedding function and transformer layers in the model.
+
+    Searches common model structures: standard, VLM, and direct.
+    Returns (embed_fn, layers) or (None, None).
+    """
+    embed_fn = None
+    layers = None
+
+    if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+        embed_fn = model.model.embed_tokens
+        layers = model.model.layers
+    elif hasattr(model, 'language_model') and hasattr(model.language_model, 'model'):
+        lm = model.language_model.model
+        if hasattr(lm, 'embed_tokens'):
+            embed_fn = lm.embed_tokens
+            layers = lm.layers
+    elif hasattr(model, 'embed_tokens'):
+        embed_fn = model.embed_tokens
+        layers = model.layers
+
+    return embed_fn, layers
+
+
+def _forward_layer(block, inputs, mask, position_ids):
+    """Forward pass through a transformer layer with flexible signature."""
+    for call_args in [
+        (inputs, mask, None, position_ids),
+        (inputs, mask, None),
+        (inputs, mask),
+        (inputs, None, mask, None),
+        (inputs,),
+    ]:
+        try:
+            return block(*call_args)
+        except (TypeError, ValueError, RuntimeError, AttributeError):
+            continue
+    return None
+
+
+def _get_scale_pairs(block):
+    """Find adjacent (prev_op, next_layers) pairs in a transformer block
+    for AWQ-style weight equalization.
+
+    Returns list of (prev_module, [next_modules], scale_dim) tuples.
+    scale_dim: the channel dimension to scale.
+    """
+    pairs = []
+
+    # 1. input_layernorm → attention projections
+    if hasattr(block, 'input_layernorm'):
+        norm = block.input_layernorm
+        attn_layers = []
+        # Full attention
+        if hasattr(block, 'self_attn'):
+            attn = block.self_attn
+            for name in ('q_proj', 'k_proj', 'v_proj'):
+                if hasattr(attn, name):
+                    attn_layers.append(getattr(attn, name))
+        # Linear attention (GatedDeltaNet)
+        if hasattr(block, 'linear_attn'):
+            la = block.linear_attn
+            for name in ('in_proj_qkv', 'in_proj_z'):
+                if hasattr(la, name):
+                    attn_layers.append(getattr(la, name))
+        if attn_layers:
+            pairs.append((norm, attn_layers))
+
+    # 2. v_proj → o_proj (attention output, AutoAWQ pair)
+    if hasattr(block, 'self_attn'):
+        attn = block.self_attn
+        if hasattr(attn, 'v_proj') and hasattr(attn, 'o_proj'):
+            if attn.v_proj.weight.shape[0] == attn.o_proj.weight.shape[-1]:
+                pairs.append((attn.v_proj, [attn.o_proj]))
+
+    # 3. post_attention_layernorm → MLP projections
+    if hasattr(block, 'post_attention_layernorm') and hasattr(block, 'mlp'):
+        norm = block.post_attention_layernorm
+        mlp_layers = []
+        mlp = block.mlp
+        # MoE: switch_mlp + shared_expert
+        if hasattr(mlp, 'switch_mlp'):
+            sm = mlp.switch_mlp
+            for name in ('gate_proj', 'up_proj'):
+                if hasattr(sm, name):
+                    mlp_layers.append(getattr(sm, name))
+        if hasattr(mlp, 'shared_expert'):
+            se = mlp.shared_expert
+            for name in ('gate_proj', 'up_proj'):
+                if hasattr(se, name):
+                    mlp_layers.append(getattr(se, name))
+        # Dense MLP
+        if not mlp_layers:
+            for name in ('gate_proj', 'up_proj'):
+                if hasattr(mlp, name):
+                    mlp_layers.append(getattr(mlp, name))
+        if mlp_layers:
+            pairs.append((norm, mlp_layers))
+
+    # 3. up_proj → down_proj (within MLP, scales intermediate dim)
+    # MoE experts
+    if hasattr(block, 'mlp') and hasattr(block.mlp, 'switch_mlp'):
+        sm = block.mlp.switch_mlp
+        if hasattr(sm, 'up_proj') and hasattr(sm, 'down_proj'):
+            pairs.append((sm.up_proj, [sm.down_proj]))
+    # Shared expert
+    if hasattr(block, 'mlp') and hasattr(block.mlp, 'shared_expert'):
+        se = block.mlp.shared_expert
+        if hasattr(se, 'up_proj') and hasattr(se, 'down_proj'):
+            pairs.append((se.up_proj, [se.down_proj]))
+    # Dense MLP
+    if hasattr(block, 'mlp') and hasattr(block.mlp, 'up_proj'):
+        mlp = block.mlp
+        if hasattr(mlp, 'down_proj'):
+            pairs.append((mlp.up_proj, [mlp.down_proj]))
+
+    return pairs
+
+
+def _apply_scale(prev_op, next_layers, scales):
+    """Apply per-channel scaling: prev_op /= scales, next_layers *= scales.
+
+    Handles RMSNorm, LayerNorm, Linear, and fused MoE (SwitchLinear) modules.
+    Math: output is unchanged because scaling cancels out between layers.
+    """
+    is_norm = isinstance(prev_op, (nn.RMSNorm, nn.LayerNorm)) or (
+        hasattr(prev_op, 'weight') and 'norm' in prev_op.__class__.__name__.lower()
+    )
+    if is_norm:
+        prev_op.weight = prev_op.weight / scales
+        if hasattr(prev_op, 'bias') and prev_op.bias is not None:
+            prev_op.bias = prev_op.bias / scales
+        for layer in next_layers:
+            if layer.weight.ndim == 2:
+                # (out, in) * (in,) → scale input channels
+                layer.weight = layer.weight * scales
+            elif layer.weight.ndim == 3:
+                # Fused MoE: (experts, out, in) * (1, 1, in)
+                layer.weight = layer.weight * scales[None, None, :]
+    elif hasattr(prev_op, 'weight'):
+        # Linear → Linear (e.g. up_proj → down_proj)
+        if prev_op.weight.ndim == 2:
+            # (out, in): scale output channels
+            prev_op.weight = prev_op.weight / scales[:, None]
+        elif prev_op.weight.ndim == 3:
+            # Fused MoE: (experts, out, in): scale output channels
+            prev_op.weight = prev_op.weight / scales[None, :, None]
+        if hasattr(prev_op, 'bias') and prev_op.bias is not None:
+            prev_op.bias = prev_op.bias / scales
+        for layer in next_layers:
+            if layer.weight.ndim == 2:
+                layer.weight = layer.weight * scales
+            elif layer.weight.ndim == 3:
+                layer.weight = layer.weight * scales[None, None, :]
+
+
+def _weight_mean(next_layers):
+    """Compute per-input-channel weight magnitude across next layers."""
+    w_scales = []
+    for layer in next_layers:
+        w = layer.weight
+        if w.ndim == 2:
+            # (out, in) → normalize per row, then mean over output
+            w_norm = w.abs() / (w.abs().max(axis=1, keepdims=True) + 1e-6)
+            w_scales.append(w_norm.mean(axis=0))
+        elif w.ndim == 3:
+            # Fused MoE: (experts, out, in)
+            w_norm = w.abs() / (w.abs().max(axis=2, keepdims=True) + 1e-6)
+            w_scales.append(w_norm.mean(axis=(0, 1)))
+    if not w_scales:
+        return None
+    result = w_scales[0]
+    for ws in w_scales[1:]:
+        result = mx.maximum(result, ws)
+    return result
+
+
+def _measure_sensitivity(
+    model_path: str, config: dict, oq_level,
+    calib_dataset="code_multilingual",
+    num_samples=32, seq_length=256,
+):
+    """Measure per-layer quantization sensitivity without weight modification.
+
+    Loads model lazily, runs calibration forward per layer, measures relative
+    MSE of quantize→dequantize. Then frees the model.
+
+    Used by streaming path to get data-driven sensitivity without full model load.
+
+    Returns:
+        Dict of {layer_idx: relative_mse_score}.
+    """
+    is_vlm = "vision_config" in config
+
+    try:
+        if is_vlm:
+            from mlx_vlm.utils import load_model as vlm_load_model
+
+            model = vlm_load_model(Path(model_path), lazy=True)
+        else:
+            from mlx_lm import load as lm_load
+
+            model, _ = lm_load(model_path)
+    except Exception as e:
+        logger.warning(f"Sensitivity measurement: model load failed ({e}), using position-based")
+        return {}
+
+    # Load tokenizer
+    try:
+        from mlx_lm import load as lm_load
+
+        _, tokenizer = lm_load(model_path)
+    except Exception:
+        logger.warning("Sensitivity measurement: tokenizer load failed")
+        del model
+        mx.clear_cache()
+        return {}
+
+    calib_data = _load_calibration_data(
+        tokenizer, dataset=calib_dataset,
+        num_samples=num_samples, seq_length=seq_length,
+    )
+    if calib_data is None:
+        del model, tokenizer
+        mx.clear_cache()
+        return {}
+
+    embed_fn, layers = _find_model_layers(model)
+    if embed_fn is None or layers is None:
+        del model, tokenizer
+        mx.clear_cache()
+        return {}
+
+    _LEVEL_MAP = {2: 2, 3: 3, 3.5: 3, 4: 4, 5: 5, 6: 6, 8: 8}
+    base_bits = int(_LEVEL_MAP.get(oq_level, oq_level))
+    base_mode = _mode_for_bits(base_bits)
+    base_gs = _gs_for_mode(base_bits, 64)
+
+    seq_len = calib_data.shape[1]
+    mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len)
+    mask_dtype = embed_fn.weight.dtype if hasattr(embed_fn, 'weight') else mx.float16
+    mask = mask.astype(mask_dtype)
+    position_ids = mx.arange(seq_len)[None, :]
+
+    inputs = embed_fn(calib_data)
+    sensitivity = {}
+
+    for layer_idx, block in enumerate(layers):
+        out_float = _forward_layer(block, inputs, mask, position_ids)
+        if out_float is None:
+            continue
+
+        # Temporarily quantize→dequantize all linear weights
+        saved = {}
+        for p, m in tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module):
+            if hasattr(m, 'weight') and hasattr(m, 'to_quantized') and m.weight.ndim >= 2:
+                gs = base_gs if m.weight.shape[-1] % base_gs == 0 else 64
+                if m.weight.shape[-1] % gs != 0:
+                    continue
+                saved[p] = m.weight
+                qw, sc, *rest = mx.quantize(
+                    m.weight, group_size=gs, bits=base_bits, mode=base_mode
+                )
+                m.weight = mx.dequantize(
+                    qw, sc, rest[0] if rest else None,
+                    group_size=gs, bits=base_bits, mode=base_mode,
+                )
+
+        out_quant = _forward_layer(block, inputs, mask, position_ids)
+        if out_quant is not None:
+            raw_mse = ((out_float - out_quant) ** 2).mean()
+            out_magnitude = (out_float ** 2).mean()
+            mse_val = raw_mse / mx.maximum(out_magnitude, 1e-10)
+            mx.eval(mse_val)
+            sensitivity[layer_idx] = mse_val.item()
+
+        # Restore weights
+        modules_by_path = dict(tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module))
+        for p, w in saved.items():
+            if p in modules_by_path:
+                modules_by_path[p].weight = w
+
+        inputs = out_float
+        mx.synchronize()
+        mx.clear_cache()
+
+    # Free model
+    del model, tokenizer
+    mx.synchronize()
+    mx.clear_cache()
+
+    if sensitivity:
+        ranked = sorted(sensitivity.items(), key=lambda x: -x[1])
+        logger.info(
+            f"oQ{oq_level:g}: layer sensitivity (descending): "
+            + ", ".join(f"L{i}={s:.4f}" for i, s in ranked)
+        )
+
+    return sensitivity
+
+
+def _run_equalization_and_sensitivity(
+    model, tokenizer, config, oq_level,
+    progress_callback=None,
+    calib_dataset="code_multilingual",
+    num_samples=32, seq_length=256,
+    n_grid=10,
+):
+    """Run AutoAWQ-style weight equalization + per-layer sensitivity measurement.
+
+    For each layer:
+    1. Float forward (baseline output)
+    2. Grid search over scaling ratios (duo_scaling formula)
+       - For each ratio: scale weights → quantize → forward → MSE
+       - Pick ratio that minimizes output MSE
+       - Only apply if MSE improves over no scaling
+    3. Measure quantization sensitivity (quantize→dequantize→MSE)
+
+    Args:
+        model: Loaded model (float weights).
+        tokenizer: Tokenizer for calibration.
+        config: Model config dict.
+        oq_level: Target oQ level.
+        n_grid: Number of grid search steps per scale pair.
+
+    Returns:
+        Dict of {layer_idx: sensitivity_score}.
+    """
+    cb = progress_callback or (lambda phase, pct: None)
+
+    calib_data = _load_calibration_data(
+        tokenizer, dataset=calib_dataset,
+        num_samples=num_samples, seq_length=seq_length,
+    )
+    if calib_data is None:
+        return {}
+
+    embed_fn, layers = _find_model_layers(model)
+    if embed_fn is None or layers is None:
+        logger.warning("Cannot find model layers, skipping equalization")
+        return {}
+
+    _LEVEL_MAP = {2: 2, 3: 3, 3.5: 3, 4: 4, 5: 5, 6: 6, 8: 8}
+    base_bits = int(_LEVEL_MAP.get(oq_level, oq_level))
+    base_mode = _mode_for_bits(base_bits)
+    base_gs = _gs_for_mode(base_bits, 64)
+
+    # Build mask and position_ids
+    seq_len = calib_data.shape[1]
+    mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len)
+    mask_dtype = embed_fn.weight.dtype if hasattr(embed_fn, 'weight') else mx.float16
+    mask = mask.astype(mask_dtype)
+    position_ids = mx.arange(seq_len)[None, :]
+
+    inputs = embed_fn(calib_data)
+    sensitivity = {}
+    total_layers = len(layers)
+    equalized_count = 0
+    expert_equalized_count = 0
+    tc = config.get("text_config", {})
+    num_experts_per_tok = (
+        config.get("num_experts_per_tok")
+        or tc.get("num_experts_per_tok", 8)
+    )
+    start_time = _time.monotonic()
+
+    def _temp_quantize_block(block):
+        """Temporarily quantize→dequantize all linear weights in block."""
+        saved = {}
+        for p, m in tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module):
+            if hasattr(m, 'weight') and hasattr(m, 'to_quantized') and m.weight.ndim >= 2:
+                gs = base_gs if m.weight.shape[-1] % base_gs == 0 else 64
+                if m.weight.shape[-1] % gs != 0:
+                    continue
+                saved[p] = m.weight
+                qw, sc, *rest = mx.quantize(
+                    m.weight, group_size=gs, bits=base_bits, mode=base_mode
+                )
+                m.weight = mx.dequantize(
+                    qw, sc, rest[0] if rest else None,
+                    group_size=gs, bits=base_bits, mode=base_mode,
+                )
+        return saved
+
+    for layer_idx, block in enumerate(layers):
+        # ── Float forward (baseline) ──
+        out_float = _forward_layer(block, inputs, mask, position_ids)
+        if out_float is None:
+            logger.warning(f"Equalization: layer {layer_idx} forward failed, skipping")
+            continue
+
+        # ── AutoAWQ grid search equalization ──
+        scale_pairs = _get_scale_pairs(block)
+        for prev_op, next_layers in scale_pairs:
+            # Only equalize Norm→Linear and Linear→Linear pairs
+            is_norm = hasattr(prev_op, 'weight') and (
+                isinstance(prev_op, (nn.RMSNorm, nn.LayerNorm))
+                or 'norm' in prev_op.__class__.__name__.lower()
+            )
+            is_linear = hasattr(prev_op, 'weight') and hasattr(prev_op, 'to_quantized')
+            if not (is_norm or is_linear):
+                continue
+
+            # Activation stats
+            x_mean = inputs.abs().mean(axis=(0, 1))
+
+            # Weight stats (AutoAWQ duo_scaling)
+            w_mean = _weight_mean(next_layers)
+            if w_mean is None:
+                continue
+
+            # Dimension check
+            if x_mean.shape[0] != w_mean.shape[0]:
+                continue
+
+            # Save original block weights for grid search restoration
+            orig_weights = list(tree_flatten(block.parameters()))
+
+            # Baseline: quantize without scaling
+            _temp_quantize_block(block)
+            out_baseline = _forward_layer(block, inputs, mask, position_ids)
+            if out_baseline is None:
+                block.load_weights(orig_weights)
+                continue
+            baseline_loss = ((out_float - out_baseline) ** 2).mean()
+            mx.eval(baseline_loss)
+            best_error = baseline_loss.item()
+            best_scales = None
+
+            # Restore for grid search
+            block.load_weights(orig_weights)
+
+            # Grid search over ratios (AutoAWQ duo_scaling formula)
+            for ratio_i in range(1, n_grid):  # skip 0 (= no scaling, already measured)
+                r = ratio_i / n_grid
+                scales = mx.maximum(
+                    x_mean ** r / (w_mean ** (1 - r) + 1e-4), 1e-4
+                )
+                scales = scales / (scales.max() * scales.min()).sqrt()
+                # Guard against inf/nan
+                scales = mx.where(mx.isinf(scales) | mx.isnan(scales), 1.0, scales)
+                scales = mx.maximum(scales, 1e-5)
+
+                _apply_scale(prev_op, next_layers, scales)
+                _temp_quantize_block(block)
+
+                out_q = _forward_layer(block, inputs, mask, position_ids)
+                if out_q is not None:
+                    loss = ((out_float - out_q) ** 2).mean()
+                    mx.eval(loss)
+                    if loss.item() < best_error:
+                        best_error = loss.item()
+                        best_scales = scales
+
+                block.load_weights(orig_weights)
+
+            # Apply best scales permanently (only if better than no scaling)
+            if best_scales is not None:
+                _apply_scale(prev_op, next_layers, best_scales)
+                equalized_count += 1
+                mx.eval(block.parameters())
+
+        # ── Sensitivity measurement ──
+        # Re-compute float forward with equalized weights
+        out_eq_float = _forward_layer(block, inputs, mask, position_ids)
+        if out_eq_float is None:
+            out_eq_float = out_float
+
+        saved_weights = _temp_quantize_block(block)
+        out_quant = _forward_layer(block, inputs, mask, position_ids)
+        if out_quant is not None:
+            # Relative MSE: normalize by output magnitude to avoid
+            # later layers appearing more sensitive just because hidden
+            # states grow larger through residual connections
+            raw_mse = ((out_eq_float - out_quant) ** 2).mean()
+            out_magnitude = (out_eq_float ** 2).mean()
+            mse_val = raw_mse / mx.maximum(out_magnitude, 1e-10)
+            mx.eval(mse_val)
+            sensitivity[layer_idx] = mse_val.item()
+
+        # Restore equalized float weights
+        modules_by_path = dict(tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module))
+        for p, w in saved_weights.items():
+            if p in modules_by_path:
+                modules_by_path[p].weight = w
+
+        # ── Per-expert activation-aware scaling (MoE only) ──
+        # Find MoE switch_mlp with fused expert weights
+        switch_mlp = None
+        gate_mod = None
+        post_norm = None
+        for p, m in tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module):
+            if m.__class__.__name__ in ('SwitchGLU', 'SwitchMLPBlock'):
+                if hasattr(m, 'up_proj') and hasattr(m, 'down_proj'):
+                    switch_mlp = m
+            if p.endswith('.gate') and hasattr(m, 'weight') and not hasattr(m, 'to_quantized'):
+                # Router gate (not gate_proj)
+                gate_mod = m
+        if hasattr(block, 'post_attention_layernorm'):
+            post_norm = block.post_attention_layernorm
+        # Also check common MoE structures
+        if switch_mlp is None:
+            for attr in ('mlp', 'block_sparse_moe'):
+                parent = getattr(block, attr, None)
+                if parent is None:
+                    continue
+                sm = getattr(parent, 'switch_mlp', None)
+                if sm and hasattr(sm, 'up_proj') and hasattr(sm, 'down_proj'):
+                    switch_mlp = sm
+                    gate_mod = getattr(parent, 'gate', gate_mod)
+                    break
+
+        if switch_mlp is not None and gate_mod is not None and post_norm is not None:
+            up_w = switch_mlp.up_proj.weight    # (num_experts, intermediate, hidden)
+            down_w = switch_mlp.down_proj.weight  # (num_experts, hidden, intermediate)
+            gate_proj_w = switch_mlp.gate_proj.weight  # (num_experts, intermediate, hidden)
+            mx.eval(up_w, down_w, gate_proj_w)
+            num_experts = up_w.shape[0]
+
+            logger.debug(
+                f"L{layer_idx}: per-expert scaling — {num_experts} experts, "
+                f"routing top-{num_experts_per_tok}"
+            )
+
+            # Get hidden states after norm (MLP input)
+            h_flat = inputs.reshape(-1, inputs.shape[-1])
+            h_normed = post_norm(h_flat)
+
+            # Router forward → expert assignments
+            router_logits = gate_mod(h_normed)
+            topk = mx.argpartition(
+                -router_logits, kth=num_experts_per_tok, axis=-1
+            )[:, :num_experts_per_tok]
+            mx.eval(topk, h_normed)
+
+            # Quantize gate_proj once (shared across ratio search)
+            gate_q = mx.dequantize(
+                *mx.quantize(gate_proj_w, group_size=base_gs, bits=base_bits, mode=base_mode),
+                group_size=base_gs, bits=base_bits, mode=base_mode,
+            )
+
+            layer_expert_helped = 0
+            layer_expert_skipped = 0
+            layer_expert_tested = 0
+
+            for expert_i in range(num_experts):
+                # Find tokens routed to this expert
+                routed = (topk == expert_i).any(axis=-1)
+                mx.eval(routed)
+                n_valid = routed.astype(mx.int32).sum()
+                mx.eval(n_valid)
+                n_val = n_valid.item()
+                if n_val < 3:
+                    layer_expert_skipped += 1
+                    continue  # too few tokens
+
+                layer_expert_tested += 1
+
+                # Gather routed tokens
+                idx = mx.arange(routed.shape[0]) * routed.astype(mx.int32) + \
+                      (1 - routed.astype(mx.int32)) * -1
+                idx = mx.sort(idx)
+                expert_input = h_normed[idx[-n_val:]]
+
+                # Float expert output
+                g_out = expert_input @ gate_proj_w[expert_i].T
+                u_out = expert_input @ up_w[expert_i].T
+                inter = nn.silu(g_out) * u_out
+                float_res = inter @ down_w[expert_i].T
+                mx.eval(float_res)
+
+                # Baseline quantized output
+                up_q = mx.dequantize(
+                    *mx.quantize(up_w[expert_i], group_size=base_gs, bits=base_bits, mode=base_mode),
+                    group_size=base_gs, bits=base_bits, mode=base_mode,
+                )
+                down_q = mx.dequantize(
+                    *mx.quantize(down_w[expert_i], group_size=base_gs, bits=base_bits, mode=base_mode),
+                    group_size=base_gs, bits=base_bits, mode=base_mode,
+                )
+                q_res = nn.silu(expert_input @ gate_q[expert_i].T) * (expert_input @ up_q.T)
+                q_res = q_res @ down_q.T
+                base_mse = ((float_res - q_res) ** 2).mean()
+                mx.eval(base_mse)
+                best_err = base_mse.item()
+
+                # Grid search for this expert's up→down scaling
+                x_mean_e = inter.abs().mean(axis=0)  # (intermediate,)
+                w_mean_e = down_w[expert_i].abs().mean(axis=0)  # (intermediate,)
+                mx.eval(x_mean_e, w_mean_e)
+
+                best_scales_e = None
+                for ri in range(1, n_grid):
+                    r = ri / n_grid
+                    scales_e = mx.maximum(
+                        x_mean_e ** r / (w_mean_e ** (1 - r) + 1e-4), 1e-4
+                    )
+                    scales_e = scales_e / mx.sqrt(scales_e.max() * scales_e.min())
+                    scales_e = mx.maximum(scales_e, 1e-5)
+
+                    up_s = mx.dequantize(
+                        *mx.quantize(up_w[expert_i] / scales_e[:, None],
+                                     group_size=base_gs, bits=base_bits, mode=base_mode),
+                        group_size=base_gs, bits=base_bits, mode=base_mode,
+                    )
+                    down_s = mx.dequantize(
+                        *mx.quantize(down_w[expert_i] * scales_e[None, :],
+                                     group_size=base_gs, bits=base_bits, mode=base_mode),
+                        group_size=base_gs, bits=base_bits, mode=base_mode,
+                    )
+                    s_res = nn.silu(expert_input @ gate_q[expert_i].T) * (expert_input @ up_s.T)
+                    s_res = s_res @ down_s.T
+                    loss = ((float_res - s_res) ** 2).mean()
+                    mx.eval(loss)
+                    if loss.item() < best_err:
+                        best_err = loss.item()
+                        best_scales_e = scales_e
+
+                # Apply if helped
+                if best_scales_e is not None:
+                    switch_mlp.up_proj.weight[expert_i] = up_w[expert_i] / best_scales_e[:, None]
+                    switch_mlp.down_proj.weight[expert_i] = down_w[expert_i] * best_scales_e[None, :]
+                    expert_equalized_count += 1
+                    layer_expert_helped += 1
+
+                # Free intermediate tensors every 32 experts
+                if (expert_i + 1) % 32 == 0:
+                    mx.synchronize()
+                    mx.clear_cache()
+
+            mx.eval(switch_mlp.up_proj.weight, switch_mlp.down_proj.weight)
+            logger.debug(
+                f"L{layer_idx}: per-expert results — "
+                f"tested={layer_expert_tested} helped={layer_expert_helped} "
+                f"skipped={layer_expert_skipped} (no tokens)"
+            )
+
+        inputs = out_float
+        mx.synchronize()
+        mx.clear_cache()
+
+        # Progress
+        elapsed = _time.monotonic() - start_time
+        pct = 5.0 + ((layer_idx + 1) / total_layers) * 20.0
+        if layer_idx > 0 and elapsed > 0:
+            rate = (layer_idx + 1) / elapsed
+            remaining = (total_layers - layer_idx - 1) / rate
+            mins = int(remaining // 60)
+            secs = int(remaining % 60)
+            cb(f"equalizing ({layer_idx + 1}/{total_layers}, {mins}:{secs:02d} remaining)", pct)
+        else:
+            cb(f"equalizing ({layer_idx + 1}/{total_layers})", pct)
+
+    logger.info(
+        f"oQ{oq_level:g}: equalized {equalized_count} scale pairs, "
+        f"{expert_equalized_count} expert pairs, "
+        f"measured sensitivity for {len(sensitivity)} layers"
+    )
+    if sensitivity:
+        ranked = sorted(sensitivity.items(), key=lambda x: -x[1])
+        logger.info(f"oQ{oq_level:g}: layer sensitivity (descending): "
+                     + ", ".join(f"L{i}={s:.4f}" for i, s in ranked))
+
+    return sensitivity
+
+
 def _run_clip_optimization(model, tokenizer, config, oq_level,
                            progress_callback=None, clip_batch_size=1024,
                            calib_dataset="code_multilingual",
@@ -1342,38 +2039,14 @@ def _run_clip_optimization(model, tokenizer, config, oq_level,
 
     logger.info(f"oQ{oq_level:g}: clip optimization for {len(clip_targets)} layers")
 
+    # Embed calibration tokens
+    embed_fn, layers = _find_model_layers(model)
+
     # Build attention mask for calib data
     seq_len = calib_data.shape[1]
     mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len)
-    # Detect model dtype from embed_tokens (may be nested under language_model)
-    mask_dtype = mx.float16
-    if hasattr(model, 'embed_tokens'):
-        mask_dtype = model.embed_tokens.weight.dtype
-    elif hasattr(model, 'language_model') and hasattr(model.language_model, 'model'):
-        mask_dtype = model.language_model.model.embed_tokens.weight.dtype
-    elif hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
-        mask_dtype = model.model.embed_tokens.weight.dtype
+    mask_dtype = embed_fn.weight.dtype if hasattr(embed_fn, 'weight') else mx.float16
     mask = mask.astype(mask_dtype)
-
-    # Embed calibration tokens — search common model structures
-    embed_fn = None
-    layers = None
-
-    # Standard: model.model.embed_tokens (Llama, Qwen dense)
-    if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
-        embed_fn = model.model.embed_tokens
-        layers = model.model.layers
-    # VLM: model.language_model.model.embed_tokens (Qwen3.5 VLM)
-    elif hasattr(model, 'language_model') and hasattr(model.language_model, 'model'):
-        lm = model.language_model.model
-        if hasattr(lm, 'embed_tokens'):
-            embed_fn = lm.embed_tokens
-            layers = lm.layers
-    # Direct: model.embed_tokens
-    elif hasattr(model, 'embed_tokens'):
-        embed_fn = model.embed_tokens
-        layers = model.layers
-
     if embed_fn is None or layers is None:
         logger.warning("Cannot find embedding layer, skipping clip optimization")
         return 0
@@ -1388,22 +2061,7 @@ def _run_clip_optimization(model, tokenizer, config, oq_level,
     total_layers = len(layers)
 
     for layer_idx, block in enumerate(layers):
-        # Forward pass through this layer (unquantized)
-        # Try multiple signatures until one works
-        outputs = None
-        for call_args in [
-            (inputs, mask, None, position_ids),
-            (inputs, mask, None),
-            (inputs, mask),
-            (inputs, None, mask, None),
-            (inputs,),
-        ]:
-            try:
-                outputs = block(*call_args)
-                break
-            except (TypeError, ValueError, RuntimeError, AttributeError):
-                outputs = None
-                continue
+        outputs = _forward_layer(block, inputs, mask, position_ids)
         if outputs is None:
             logger.warning(
                 f"Clip optimization: layer {layer_idx} forward failed, skipping"
@@ -1565,6 +2223,21 @@ def quantize_oq(
 
     cb("loading", 25.0)
 
+    # Phase 1.5: Weight equalization + sensitivity measurement
+    if enable_clip_optimization:
+        cb("equalizing", 5.0)
+        logger.info(f"oQ{oq_level:g}: running weight equalization + sensitivity measurement")
+        sensitivity_map = _run_equalization_and_sensitivity(
+            model, tokenizer, config, oq_level, cb,
+            calib_dataset, num_samples=clip_num_samples,
+            seq_length=clip_seq_length,
+        )
+        if sensitivity_map:
+            # Store in config for predicate to use (str keys for JSON compat)
+            config["_oq_sensitivity_map"] = {
+                str(k): v for k, v in sensitivity_map.items()
+            }
+
     # Phase 2: Clip optimization (AWQ-style, output MSE based)
     if enable_clip_optimization and oq_level <= _CLIP_MAX_BITS:
         cb("optimizing", 30.0)
@@ -1575,7 +2248,7 @@ def quantize_oq(
 
     cb("quantizing", 60.0)
 
-    # Phase 3: Quantize with universal predicate
+    # Phase 3: Quantize with sensitivity-aware predicate
     logger.info(f"oQ{oq_level:g}: quantizing with universal predicate")
     predicate = make_predicate(config, oq_level)
     # oQ level → base bits
@@ -1594,6 +2267,9 @@ def quantize_oq(
         quant_predicate=predicate,
     )
     cb("quantizing", 90.0)
+
+    # Clean up temp sensitivity key before saving config
+    config.pop("_oq_sensitivity_map", None)
 
     # Phase 4: Save
     cb("saving", 92.0)
