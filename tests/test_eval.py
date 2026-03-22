@@ -221,6 +221,15 @@ class TestHumanEval:
         assert "def add(a, b):" in code
         assert "return a + b" in code
 
+    def test_extract_code_preserves_imports(self):
+        """Model returns def only — imports from prompt must be prepended."""
+        from omlx.eval.humaneval import _extract_code
+        prompt = "from typing import List\n\ndef foo(x: List[int]) -> int:\n    "
+        response = "def foo(x: List[int]) -> int:\n    return sum(x)"
+        code = _extract_code(response, prompt)
+        assert "from typing import List" in code
+        assert "return sum(x)" in code
+
     def test_execute_with_tests(self):
         from omlx.eval.humaneval import _execute_with_tests
         code = "def add(a, b):\n    return a + b"

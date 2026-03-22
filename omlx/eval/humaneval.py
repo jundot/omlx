@@ -33,34 +33,53 @@ EXEC_TIMEOUT_SECONDS = 15
 EXEC_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024  # 256 MB
 
 
+def _get_imports(prompt: str) -> str:
+    """Extract import lines from the prompt."""
+    lines = []
+    for line in prompt.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("import ") or stripped.startswith("from "):
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def _extract_code(response: str, prompt: str) -> str:
     """Extract the function body from model response.
 
     The model may return the full function (including signature) or just the body.
     We need to combine it with the original prompt to form a complete function.
+    Always prepends imports from the prompt to avoid NameError.
     """
     response = response.strip()
+    imports = _get_imports(prompt)
 
     # If response contains a code block, extract it
     match = re.search(r"```python\s*\n(.*?)```", response, re.DOTALL)
     if match:
         code = match.group(1).strip()
-        # If the code block contains the function def, use it standalone
         if "def " in code:
+            # Model included full function — prepend imports if missing
+            if imports and not any(line.strip().startswith(("import ", "from ")) for line in code.split("\n")):
+                return imports + "\n\n" + code
             return code
-        # Otherwise it's just the body, combine with prompt
         return prompt + code
 
     match = re.search(r"```\s*\n(.*?)```", response, re.DOTALL)
     if match:
         code = match.group(1).strip()
         if "def " in code:
+            if imports and not any(line.strip().startswith(("import ", "from ")) for line in code.split("\n")):
+                return imports + "\n\n" + code
             return code
         return prompt + code
 
     # No code block — response is the continuation of the prompt
-    # Check if response starts with the function def (model repeated the signature)
-    if response.startswith("def ") or response.startswith("from ") or response.startswith("import "):
+    if response.startswith("def "):
+        # Model repeated the function def — prepend imports
+        if imports:
+            return imports + "\n\n" + response
+        return response
+    if response.startswith("from ") or response.startswith("import "):
         return response
 
     # Response is just the function body — combine with prompt
