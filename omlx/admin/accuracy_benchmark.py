@@ -272,6 +272,9 @@ async def run_accuracy_benchmark(
     from ..eval import BENCHMARKS
 
     request = run.request
+
+    # Suppress TTL auto-unload during benchmark
+    engine_pool._suppress_ttl = True
     start_time = time.time()
 
     try:
@@ -482,3 +485,6 @@ async def run_accuracy_benchmark(
             "type": "error",
             "message": str(e),
         })
+    finally:
+        # Re-enable TTL auto-unload
+        engine_pool._suppress_ttl = False
