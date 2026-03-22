@@ -104,6 +104,8 @@ class BaseBenchmark(ABC):
         # Force benchmark-controlled params (override model settings)
         kwargs["max_tokens"] = self.get_max_tokens()
         kwargs["temperature"] = 0.0
+        kwargs["presence_penalty"] = 0.0
+        kwargs["repetition_penalty"] = 1.0
         try:
             output = await engine.chat(messages=messages, **kwargs)
             text = self._strip_think_tags(output.text)
