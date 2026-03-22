@@ -33,7 +33,8 @@ _current_model: Optional[str] = None
 _engine_pool_ref: Any = None
 
 VALID_BENCHMARKS = [
-    "mmlu", "hellaswag", "truthfulqa", "arc_challenge", "winogrande",
+    "mmlu", "kmmlu", "cmmlu", "jmmlu",
+    "hellaswag", "truthfulqa", "arc_challenge", "winogrande",
     "gsm8k", "humaneval", "mbpp", "livecodebench",
 ]
 

@@ -7,9 +7,12 @@ evaluators with deterministic sampling for fair model comparison.
 
 from .arc import ARCChallengeBenchmark
 from .base import BaseBenchmark, BenchmarkResult, QuestionResult
+from .cmmlu import CMMLUBenchmark
 from .gsm8k import GSM8KBenchmark
 from .hellaswag import HellaSwagBenchmark
 from .humaneval import HumanEvalBenchmark
+from .jmmlu import JMMLUBenchmark
+from .kmmlu import KMMLUBenchmark
 from .livecodebench import LiveCodeBenchBenchmark
 from .mbpp import MBPPBenchmark
 from .mmlu import MMLUBenchmark
@@ -18,6 +21,9 @@ from .winogrande import WinograndeBenchmark
 
 BENCHMARKS: dict[str, type[BaseBenchmark]] = {
     "mmlu": MMLUBenchmark,
+    "kmmlu": KMMLUBenchmark,
+    "cmmlu": CMMLUBenchmark,
+    "jmmlu": JMMLUBenchmark,
     "hellaswag": HellaSwagBenchmark,
     "truthfulqa": TruthfulQABenchmark,
     "arc_challenge": ARCChallengeBenchmark,
