@@ -141,12 +141,15 @@ class MBPPBenchmark(BaseBenchmark):
         return 512
 
     def format_prompt(self, item: dict) -> list[dict[str, str]]:
-        """Format as a code generation prompt."""
+        """Format as a code generation prompt with test cases for function name."""
         prompt = item["prompt"]
+        tests = item.get("test_list", [])
+        test_str = "\n".join(tests[:3])
         content = (
             "Write a Python function to solve the following problem. "
             "Provide only the complete function implementation, no explanations.\n\n"
             f"Problem: {prompt}\n\n"
+            f"Test cases:\n{test_str}\n\n"
             "Solution:"
         )
         return [{"role": "user", "content": content}]
