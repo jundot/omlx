@@ -99,6 +99,8 @@ class MCPClient:
                     await self._connect_stdio()
                 elif self.config.transport == MCPTransport.SSE:
                     await self._connect_sse()
+                elif self.config.transport == MCPTransport.STREAMABLE_HTTP:
+                    await self._connect_streamable_http()
                 else:
                     raise ValueError(f"Unknown transport: {self.config.transport}")
 
@@ -164,6 +166,33 @@ class MCPClient:
         self._session = ClientSession(self._read, self._write)
         await self._session.__aenter__()
 
+    async def _connect_streamable_http(self):
+        """Connect via streamable_http transport."""
+        try:
+            from mcp import ClientSession
+            from mcp.client.streamable_http import streamable_http_client
+            import httpx
+        except ImportError:
+            raise ImportError(
+                "MCP SDK required for MCP support. Install with: pip install mcp"
+            )
+
+        # Create streamable_http client context
+
+        headers = self.config.headers or {}
+        self._http_client = httpx.AsyncClient(headers=headers)
+        await self._http_client.__aenter__()
+
+        self._streamable_http_client = streamable_http_client(
+            url=self.config.url, http_client=self._http_client
+        )
+
+        self._read, self._write, _ = await self._streamable_http_client.__aenter__()
+
+        # Create session
+        self._session = ClientSession(self._read, self._write)
+        await self._session.__aenter__()
+
     async def _initialize_session(self):
         """Initialize the MCP session."""
         if self._session is None:
@@ -218,6 +247,17 @@ class MCPClient:
                 if hasattr(self, '_sse_client') and self._sse_client:
                     await self._sse_client.__aexit__(None, None, None)
                     self._sse_client = None
+
+                if (
+                    hasattr(self, "_streamable_http_client")
+                    and self._streamable_http_client
+                ):
+                    await self._streamable_http_client.__aexit__(None, None, None)
+                    self._streamable_http_client = None
+
+                if hasattr(self, "_http_client") and self._http_client:
+                    await self._http_client.__aexit__(None, None, None)
+                    self._http_client = None
 
             except Exception as e:
                 logger.warning(f"Error disconnecting from '{self.name}': {e}")
