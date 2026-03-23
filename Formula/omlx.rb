@@ -5,6 +5,8 @@ class Omlx < Formula
   sha256 "c9a557568ad4a62bbb9a9a2324d84e0687259b77ab84eb2f85e92b273e7a9456"
   license "Apache-2.0"
 
+  head "https://github.com/jundot/omlx.git", branch: "main"
+
   depends_on "rust" => :build
   depends_on "python@3.11"
   depends_on :macos
