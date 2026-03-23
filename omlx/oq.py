@@ -1505,6 +1505,9 @@ def _find_model_layers(model):
     elif hasattr(model, 'embed_tokens'):
         embed_fn = model.embed_tokens
         layers = model.layers
+    elif hasattr(model, 'backbone') and hasattr(model.backbone, 'embeddings'):
+        embed_fn = model.backbone.embeddings
+        layers = model.layers
 
     return embed_fn, layers
 
