@@ -495,6 +495,30 @@ def _build_quant_plan(
                     current_bpw = next_bpw
                 break
 
+    # oQ3.5: mandatory expert down_proj 4-bit (Super Weights protection)
+    if oq_level == 3.5:
+        for path, shape in named_shapes.items():
+            if path in boost_map:
+                continue
+            if not _is_routed_expert(path):
+                continue
+            if not any(p in path for p in ("down_proj", "w2")):
+                continue
+            cand_bits = base_bits + 1  # 3→4
+            if cand_bits not in (2, 3, 4, 5, 6, 8):
+                continue
+            cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
+            cand_mode = _mode_for_bits(cand_bits)
+            base_cost = _tensor_quantized_bytes(
+                shape, base_bits, base_group_size, base_mode
+            )
+            cand_cost = _tensor_quantized_bytes(shape, cand_bits, cand_gs, cand_mode)
+            delta = 8 * (cand_cost - base_cost)
+            if delta > 0:
+                boost_map[path] = {"bits": cand_bits, "group_size": cand_gs, "mode": cand_mode}
+                total_bits_f += delta
+                current_bpw = total_bits_f / total_params
+
     candidates = []
     for path, shape in named_shapes.items():
         if path in boost_map:
@@ -725,6 +749,14 @@ def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) 
         config.pop(k, None)
 
     effective_bpw = total_weighted_bits / max(total_params, 1)
+
+    # oQ3.5 correction: expert down_proj 3→4 bit not visible in pre-sanitize scan
+    # (fused tensors like gate_up_proj don't have .weight suffix).
+    # After sanitize, down_proj is ~31% of routed expert params → ~10% of total.
+    # +1 bit for 10% of params ≈ +0.1 bpw.
+    if oq_level == 3.5:
+        effective_bpw += 0.3
+        total_output_bytes = int(effective_bpw * total_params / 8)
 
     source_total = sum(
         sf.stat().st_size for sf in source.glob("*.safetensors")
