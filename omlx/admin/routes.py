@@ -213,6 +213,23 @@ class OQStartRequest(BaseModel):
     text_only: bool = False
 
 
+class HFUploadRequest(BaseModel):
+    """Request model for starting a HuggingFace upload task."""
+
+    model_path: str
+    repo_id: str
+    hf_token: str
+    readme_source_path: str = ""
+    auto_readme: bool = True
+    private: bool = False
+
+
+class HFValidateTokenRequest(BaseModel):
+    """Request model for validating a HuggingFace token."""
+
+    hf_token: str
+
+
 # =============================================================================
 # Runtime Settings Application Functions
 # =============================================================================
@@ -703,6 +720,7 @@ _get_global_settings = None
 _hf_downloader = None
 _ms_downloader = None
 _oq_manager = None
+_hf_uploader = None
 
 
 def set_admin_getters(
@@ -759,6 +777,16 @@ def set_oq_manager(manager):
     """
     global _oq_manager
     _oq_manager = manager
+
+
+def set_hf_uploader(uploader):
+    """Set the HFUploader instance for admin routes.
+
+    Args:
+        uploader: HFUploader instance created during server initialization.
+    """
+    global _hf_uploader
+    _hf_uploader = uploader
 
 
 # =============================================================================
@@ -3671,6 +3699,108 @@ async def remove_oq_task(
             status_code=503, detail="oQ quantizer not initialized"
         )
     success = _oq_manager.remove_task(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=404, detail="Task not found or still active"
+        )
+    return {"success": True}
+
+
+# =============================================================================
+# HuggingFace Upload Endpoints
+# =============================================================================
+
+
+@router.post("/api/upload/validate-token")
+async def validate_upload_token(
+    request: HFValidateTokenRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Validate a HuggingFace token and return user info."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    try:
+        result = await _hf_uploader.validate_token(request.hf_token)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/api/upload/oq-models")
+async def list_upload_oq_models(is_admin: bool = Depends(require_admin)):
+    """List local oQ models available for upload."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    oq_models = await _hf_uploader.list_oq_models()
+    all_models = await _hf_uploader.list_all_models()
+    return {"oq_models": oq_models, "all_models": all_models}
+
+
+@router.post("/api/upload/start")
+async def start_upload(
+    request: HFUploadRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Start an upload task to HuggingFace Hub."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    try:
+        task = await _hf_uploader.start_upload(
+            model_path=request.model_path,
+            repo_id=request.repo_id,
+            token=request.hf_token,
+            readme_source_path=request.readme_source_path,
+            auto_readme=request.auto_readme,
+            private=request.private,
+        )
+        return {"success": True, "task": task.to_dict()}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/api/upload/tasks")
+async def list_upload_tasks(is_admin: bool = Depends(require_admin)):
+    """List all upload tasks."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    return {"tasks": _hf_uploader.get_tasks()}
+
+
+@router.post("/api/upload/cancel/{task_id}")
+async def cancel_upload_task(
+    task_id: str, is_admin: bool = Depends(require_admin)
+):
+    """Cancel an active or pending upload task."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    success = await _hf_uploader.cancel_upload(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=404, detail="Task not found or not cancellable"
+        )
+    return {"success": True}
+
+
+@router.delete("/api/upload/task/{task_id}")
+async def remove_upload_task(
+    task_id: str, is_admin: bool = Depends(require_admin)
+):
+    """Remove a completed/failed/cancelled upload task."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    success = _hf_uploader.remove_task(task_id)
     if not success:
         raise HTTPException(
             status_code=404, detail="Task not found or still active"

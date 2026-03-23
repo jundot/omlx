@@ -1167,6 +1167,16 @@ def init_server(
     set_oq_manager(_server_state.oq_manager)
     logger.info("oQ Quantizer initialized")
 
+    # Initialize HuggingFace uploader
+    from .admin.hf_uploader import HFUploader
+    from .admin.routes import set_hf_uploader
+
+    _server_state.hf_uploader = HFUploader(
+        model_dirs=[str(d) for d in dir_list],
+    )
+    set_hf_uploader(_server_state.hf_uploader)
+    logger.info("HF Uploader initialized")
+
 
 _KEEPALIVE_SENTINEL = object()
 
