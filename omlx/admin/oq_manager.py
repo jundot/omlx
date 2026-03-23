@@ -360,7 +360,15 @@ class OQManager:
 
             shutil.rmtree(output, ignore_errors=True)
 
-        # Clean up GPU state to prevent Metal errors on next task
+        # Clean up GPU state to prevent Metal errors on next task.
+        # asyncio.Task.cancel() doesn't stop the to_thread immediately —
+        # the thread may still have in-flight Metal commands. Wait for the
+        # thread to actually finish before touching Metal state.
+        if active_task:
+            try:
+                await asyncio.wait_for(asyncio.shield(active_task), timeout=10.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
         if HAS_MLX:
             try:
                 mx.synchronize()
@@ -412,17 +420,15 @@ class OQManager:
                     return
 
                 # Ensure GPU is clean before starting (previous task may have been cancelled)
-                # Metal needs time to fully release command buffers after cancellation
+                # Metal command buffers need full sync + cache clear after cancellation
                 if HAS_MLX:
-                    try:
-                        mx.synchronize()
-                    except Exception:
-                        pass
-                    await asyncio.sleep(2.0)
-                    try:
-                        mx.clear_cache()
-                    except Exception:
-                        pass
+                    for _ in range(3):
+                        try:
+                            mx.synchronize()
+                            mx.clear_cache()
+                            break
+                        except Exception:
+                            await asyncio.sleep(1.0)
 
                 # Phase 1: Loading
                 task.status = QuantStatus.LOADING
