@@ -6,12 +6,23 @@ Quantization should not be exclusive to any particular inference server. oQ prod
 
 ### Benchmarks (Qwen3.5-35B-A3B)
 
-| Benchmark | Samples | oQ2 | mlx-lm 2-bit | oQ3 | mlx-lm 3-bit | oQ4 | mlx-lm 4-bit |
-|-----------|---------|-----|-------------|-----|-------------|-----|-------------|
-| MMLU | 300 | **64.0%** | 14.0% | **85.0%** | 76.3% | **83.3%** | 79.7% |
-| TRUTHFULQA | 300 | **80.0%** | 17.0% | **86.7%** | 81.7% | **88.0%** | 87.7% |
-| HUMANEVAL | 164 (full) | **78.0%** | 0.0% | **86.6%** | 84.8% | 85.4% | **87.2%** |
-| MBPP | 300 | **63.3%** | 0.3% | **72.0%** | 69.0% | **74.3%** | 71.7% |
+<table>
+<tr>
+<th rowspan="2">Benchmark</th><th rowspan="2">Samples</th>
+<th colspan="2" align="center">2-bit</th>
+<th colspan="2" align="center">3-bit</th>
+<th colspan="2" align="center">4-bit</th>
+</tr>
+<tr>
+<th>mlx-lm</th><th>oQ</th>
+<th>mlx-lm</th><th>oQ</th>
+<th>mlx-lm</th><th>oQ</th>
+</tr>
+<tr><td>MMLU</td><td>300</td><td>14.0%</td><td><b>64.0%</b></td><td>76.3%</td><td><b>85.0%</b></td><td>79.7%</td><td><b>83.3%</b></td></tr>
+<tr><td>TRUTHFULQA</td><td>300</td><td>17.0%</td><td><b>80.0%</b></td><td>81.7%</td><td><b>86.7%</b></td><td>87.7%</td><td><b>88.0%</b></td></tr>
+<tr><td>HUMANEVAL</td><td>164 (full)</td><td>0.0%</td><td><b>78.0%</b></td><td>84.8%</td><td><b>86.6%</b></td><td><b>87.2%</b></td><td>85.4%</td></tr>
+<tr><td>MBPP</td><td>300</td><td>0.3%</td><td><b>63.3%</b></td><td>69.0%</td><td><b>72.0%</b></td><td>71.7%</td><td><b>74.3%</b></td></tr>
+</table>
 
 ## Quantization Levels
 

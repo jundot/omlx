@@ -639,6 +639,40 @@ def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) 
         return {"effective_bpw": float(oq_level), "output_size_bytes": 0,
                 "output_size_formatted": "?"}
 
+    # Build budget plan for accurate estimate (position-based sensitivity)
+    _level_targets = _bpw_targets_for_level(oq_level)
+    if _level_targets is not None:
+        config["_oq_use_budget_plan"] = True
+        tc = config.get("text_config", {})
+        num_layers = (
+            config.get("num_hidden_layers")
+            or tc.get("num_hidden_layers", 32)
+        )
+        pos_sens = {}
+        for i in range(num_layers):
+            if i < num_layers // 8 or i >= 7 * num_layers // 8:
+                pos_sens[str(i)] = 0.05
+            elif i < num_layers // 4 or i >= 3 * num_layers // 4:
+                pos_sens[str(i)] = 0.02
+            else:
+                pos_sens[str(i)] = 0.01
+        config["_oq_sensitivity_map"] = pos_sens
+
+        named_shapes = {}
+        for sf_path in weight_files:
+            shard = mx.load(str(sf_path), return_metadata=False)
+            for name, tensor in shard.items():
+                ns = _collect_named_weight_shapes_from_weights({name: tensor})
+                named_shapes.update(ns)
+            del shard
+        plan = _build_quant_plan(
+            named_shapes, config, oq_level,
+            target_bpw=_level_targets[0], hard_cap_bpw=_level_targets[1],
+        )
+        config["_oq_boost_map"] = plan.boost_map
+    else:
+        config["_oq_boost_map"] = {}
+
     total_params = 0
     total_weighted_bits = 0
     total_output_bytes = 0
@@ -686,6 +720,9 @@ def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) 
                     total_weighted_bits += n_elements * 16
 
         del shard
+
+    for k in ("_oq_use_budget_plan", "_oq_boost_map", "_oq_sensitivity_map"):
+        config.pop(k, None)
 
     effective_bpw = total_weighted_bits / max(total_params, 1)
 
