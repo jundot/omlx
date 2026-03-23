@@ -63,59 +63,64 @@
                                 </div>
                             </div>
 
-                            <!-- Row 2: Ctx Window / Max Tokens / Temperature -->
-                            <div class="grid grid-cols-3 gap-4">
-                                <div>
-                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_context_window') }}</label>
-                                    <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
-                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                </div>
-                                <div>
-                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_tokens') }}</label>
-                                    <input type="number" x-model.number="modelSettings.max_tokens" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                </div>
-                                <div>
-                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.temperature') }}</label>
-                                    <input type="number" x-model.number="modelSettings.temperature" step="0.1" min="0" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                </div>
-                            </div>
+                            <!-- Sampling settings (LLM/VLM only) -->
+                            <template x-if="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
+                                <div class="space-y-5">
+                                    <!-- Row 2: Ctx Window / Max Tokens / Temperature -->
+                                    <div class="grid grid-cols-3 gap-4">
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_context_window') }}</label>
+                                            <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_tokens') }}</label>
+                                            <input type="number" x-model.number="modelSettings.max_tokens" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.temperature') }}</label>
+                                            <input type="number" x-model.number="modelSettings.temperature" step="0.1" min="0" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                    </div>
 
-                            <!-- Row 3: Top P / Top K / Min P -->
-                            <div class="grid grid-cols-3 gap-4">
-                                <div>
-                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.top_p') }}</label>
-                                    <input type="number" x-model.number="modelSettings.top_p" step="0.05" min="0" max="1" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                </div>
-                                <div>
-                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.top_k') }}</label>
-                                    <input type="number" x-model.number="modelSettings.top_k" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                </div>
-                                <div>
-                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.min_p') }}</label>
-                                    <input type="number" x-model.number="modelSettings.min_p" step="0.01" min="0" max="1" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                </div>
-                            </div>
+                                    <!-- Row 3: Top P / Top K / Min P -->
+                                    <div class="grid grid-cols-3 gap-4">
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.top_p') }}</label>
+                                            <input type="number" x-model.number="modelSettings.top_p" step="0.05" min="0" max="1" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.top_k') }}</label>
+                                            <input type="number" x-model.number="modelSettings.top_k" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.min_p') }}</label>
+                                            <input type="number" x-model.number="modelSettings.min_p" step="0.01" min="0" max="1" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                    </div>
 
-                            <!-- Row 4: Repetition Penalty / Presence Penalty -->
-                            <div class="grid grid-cols-2 gap-4">
-                                <div>
-                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.repetition_penalty') }}</label>
-                                    <input type="number" x-model.number="modelSettings.repetition_penalty" step="0.05" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                    <!-- Row 4: Repetition Penalty / Presence Penalty -->
+                                    <div class="grid grid-cols-2 gap-4">
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.repetition_penalty') }}</label>
+                                            <input type="number" x-model.number="modelSettings.repetition_penalty" step="0.05" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.presence_penalty') }}</label>
+                                            <input type="number" x-model.number="modelSettings.presence_penalty" step="0.05" min="-2" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                    </div>
                                 </div>
-                                <div>
-                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.presence_penalty') }}</label>
-                                    <input type="number" x-model.number="modelSettings.presence_penalty" step="0.05" min="-2" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                </div>
-                            </div>
+                            </template>
 
-                            <!-- Row 5: TTL / Load Defaults -->
+                            <!-- TTL (all model types) -->
                             <div class="grid grid-cols-2 gap-4">
                                 <div>
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.ttl_seconds') }}</label>
@@ -126,7 +131,8 @@
                                            :class="selectedModel?.pinned ? 'bg-neutral-100 text-neutral-400 cursor-not-allowed' : ''"
                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
-                                <div class="flex items-end">
+                                <div class="flex items-end"
+                                     x-show="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
                                     <button type="button" @click="loadGenerationDefaults"
                                             :disabled="loadingGenDefaults"
                                             class="w-full px-4 py-2.5 text-sm font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-xl border border-neutral-200 transition-all disabled:opacity-50">
@@ -136,14 +142,16 @@
                                 </div>
                             </div>
 
-                            <p class="text-xs text-neutral-400 text-center">{{ t('modal.model_settings.empty_hint') }}</p>
+                            <p class="text-xs text-neutral-400 text-center"
+                               x-show="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">{{ t('modal.model_settings.empty_hint') }}</p>
                         </div>
                     </div>
 
                     <!-- Right: Advanced Settings -->
                     <div class="w-2/5 pl-6">
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-5">{{ t('modal.model_settings.advanced_label') }}</h3>
-                        <div class="overflow-y-auto max-h-[28rem] space-y-4 pr-1">
+                        <div class="overflow-y-auto max-h-[28rem] space-y-4 pr-1"
+                             x-show="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
                             <!-- Thinking Budget -->
                             <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
                                 <div class="flex items-start justify-between gap-3">
@@ -215,14 +223,14 @@
                                              class="absolute right-0 mt-1 w-44 bg-white border border-neutral-200 rounded-lg shadow-lg z-10 py-1">
                                             <button type="button"
                                                     x-show="!modelSettings.ctKwargEntries.some(e => e.type === 'enable_thinking')"
-                                                    @click="modelSettings.ctKwargEntries.push({type: 'enable_thinking', value: 'true', force: false}); addOpen = false; $nextTick(() => lucide.createIcons())"
+                                                    @click="modelSettings.ctKwargEntries.push({type: 'enable_thinking', value: 'true', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_enable_thinking') }}</button>
                                             <button type="button"
                                                     x-show="!modelSettings.ctKwargEntries.some(e => e.type === 'reasoning_effort')"
-                                                    @click="modelSettings.ctKwargEntries.push({type: 'reasoning_effort', value: 'low', force: false}); addOpen = false; $nextTick(() => lucide.createIcons())"
+                                                    @click="modelSettings.ctKwargEntries.push({type: 'reasoning_effort', value: 'low', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_reasoning_effort') }}</button>
                                             <button type="button"
-                                                    @click="modelSettings.ctKwargEntries.push({type: 'custom', key: '', value: '', force: false}); addOpen = false; $nextTick(() => lucide.createIcons())"
+                                                    @click="modelSettings.ctKwargEntries.push({type: 'custom', key: '', value: '', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_custom') }}</button>
                                         </div>
                                     </div>

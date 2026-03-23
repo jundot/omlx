@@ -96,16 +96,9 @@ class TruthfulQABenchmark(BaseBenchmark):
         return [{"role": "user", "content": "\n".join(parts)}]
 
     def extract_answer(self, response: str, item: dict) -> str:
-        response = response.strip()
         num_choices = len(item["choices"])
         valid_letters = [_index_to_letter(i) for i in range(num_choices)]
-        pattern = r"\b([" + "".join(valid_letters) + r"])\b"
-        match = re.search(pattern, response)
-        if match:
-            return match.group(1)
-        if response and response[0] in valid_letters:
-            return response[0]
-        return ""
+        return self._extract_mc_answer(response, valid_letters)
 
     def check_answer(self, predicted: str, item: dict) -> bool:
         expected = _index_to_letter(item["answer"])

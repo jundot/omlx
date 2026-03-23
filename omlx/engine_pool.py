@@ -94,6 +94,7 @@ class EnginePool:
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
+        self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
 
     @property
     def max_model_memory(self) -> int | None:
@@ -675,6 +676,7 @@ class EnginePool:
 
         Pinned models are skipped (TTL is ignored for pinned models).
         Models with active requests are skipped and their last_access is refreshed.
+        Suppressed during benchmark runs via _suppress_ttl flag.
 
         Args:
             settings_manager: The settings manager to read TTL values from.
@@ -682,6 +684,9 @@ class EnginePool:
         Returns:
             List of model IDs that were unloaded.
         """
+        if self._suppress_ttl:
+            return []
+
         now = time.time()
         expired: list[str] = []
 

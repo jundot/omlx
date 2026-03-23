@@ -101,8 +101,8 @@
                     </div>
 
                     <!-- Active Models -->
-                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
-                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                    <div class="bg-white rounded-2xl border border-neutral-200 mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.active_models.section_label') }}</span>
@@ -198,6 +198,18 @@
                                                     <span class="text-[10px] text-neutral-400" x-text="formatTokenCount(pp.processed) + ' / ' + formatTokenCount(pp.total) + ' tok'"></span>
                                                     <span x-show="pp.speed > 0" class="text-[10px] text-neutral-400"
                                                           x-text="'(' + pp.speed.toFixed(0) + ' tok/s' + (pp.eta != null ? ', ' + (pp.eta >= 60 ? Math.floor(pp.eta / 60) + 'm ' + Math.round(pp.eta % 60) + 's' : Math.round(pp.eta) + 's') + ' left' : '') + ')'"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+                                    <!-- Generating sub-rows -->
+                                    <template x-if="m.generating && m.generating.length > 0">
+                                        <div class="mt-1.5 ml-5 space-y-1.5">
+                                            <template x-for="gen in m.generating" :key="gen.request_id">
+                                                <div class="flex items-center gap-2">
+                                                    <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="gen.request_id.substring(0, 8)"></span>
+                                                    <span class="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
+                                                    <span class="text-[10px] text-green-600 font-medium" x-text="window.t('status.active_models.generating')"></span>
                                                 </div>
                                             </template>
                                         </div>

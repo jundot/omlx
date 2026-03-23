@@ -1049,6 +1049,7 @@
                                                 class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <option value="2" x-text="'oQ2' + (oqEnableClip ? '+' : '') + ' — extreme compression'">oQ2 — extreme compression</option>
                                             <option value="3" x-text="'oQ3' + (oqEnableClip ? '+' : '') + ' — balanced'">oQ3 — balanced</option>
+                                            <option value="3.5" x-text="'oQ3.5' + (oqEnableClip ? '+' : '') + ' — quality balanced'">oQ3.5 — quality balanced</option>
                                             <option value="4" selected x-text="'oQ4' + (oqEnableClip ? '+' : '') + ' — recommended'">oQ4 — recommended</option>
                                             <option value="5" x-text="'oQ5' + (oqEnableClip ? '+' : '') + ' — high quality'">oQ5 — high quality</option>
                                             <option value="6" x-text="'oQ6' + (oqEnableClip ? '+' : '') + ' — near-lossless'">oQ6 — near-lossless</option>
@@ -1074,7 +1075,7 @@
                                 </div>
                                 <!-- Advanced Settings -->
                                 <div class="mt-4 border-t border-neutral-100 pt-3">
-                                    <button @click="oqAdvancedOpen = !oqAdvancedOpen; $nextTick(() => lucide.createIcons())"
+                                    <button @click="oqAdvancedOpen = !oqAdvancedOpen"
                                             class="flex items-center gap-1.5 text-sm text-neutral-500 hover:text-neutral-700 transition-colors">
                                         <i :data-lucide="oqAdvancedOpen ? 'chevron-down' : 'chevron-right'" class="w-3.5 h-3.5"></i>
                                         {{ t('models.oq.advanced_settings') }}
@@ -1100,7 +1101,21 @@
                                             {{ t('models.oq.clip_description') }}
                                         </p>
                                         <p class="text-[11px] text-neutral-400 leading-relaxed">
-                                            Supported: Qwen3.5 MoE, Qwen3.5. More models coming soon.
+                                            Supported: Qwen3.5 MoE, Qwen3.5, MiniMax M2, GLM MoE, Ministral3.
+                                        </p>
+                                        <!-- Text Only (VLM only) -->
+                                        <div x-show="oqSelectedModelIsVLM()" x-cloak class="flex items-center justify-between">
+                                            <span class="text-sm text-neutral-600">Text Only</span>
+                                            <button type="button"
+                                                    @click="oqTextOnly = !oqTextOnly"
+                                                    :class="oqTextOnly ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="oqTextOnly ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                        <p x-show="oqTextOnly && oqSelectedModelIsVLM()" x-cloak class="text-xs text-amber-600 leading-relaxed">
+                                            Excludes vision encoder weights. Output is a text-only model (~2-3% smaller).
                                         </p>
                                         <!-- Group Size -->
                                         <div class="flex items-center justify-between">
@@ -1117,12 +1132,9 @@
                                             <span class="text-sm text-neutral-600">{{ t('models.oq.calib_dataset') }}</span>
                                             <select x-model="oqCalibDataset"
                                                     class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                                <option value="code_multilingual">Code + Multilingual</option>
-                                                <option value="default">Built-in (General)</option>
-                                                <option value="code">Code (StarCoder)</option>
-                                                <option value="multilingual">Multilingual (CulturaX)</option>
-                                                <option value="wikitext">WikiText-2</option>
-                                                <option value="c4">C4 (Web Crawl)</option>
+                                                <option value="code_multilingual">Code + Multilingual + Tool Calling</option>
+                                                <option value="code">Code + English</option>
+                                                <option value="multilingual">Multilingual (en/ko/zh/ja)</option>
                                             </select>
                                         </div>
                                         <!-- Calibration Samples (clip ON only) -->
@@ -1131,6 +1143,7 @@
                                             <select x-model.number="oqClipSamples"
                                                     class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                                                 <option value="32">32 (fast)</option>
+                                                <option value="64">64</option>
                                                 <option value="128" selected>128</option>
                                                 <option value="256">256</option>
                                                 <option value="512">512 (slow)</option>
@@ -1247,7 +1260,11 @@
                             <div class="px-6 py-4 border-b border-neutral-200">
                                 <h4 class="text-sm font-semibold text-neutral-700">About oQ Quantization</h4>
                             </div>
-                            <div class="px-6 py-5 text-sm text-neutral-500 leading-relaxed space-y-4">
+                            <div class="px-6 py-5 text-sm text-neutral-500 leading-relaxed space-y-5">
+                                <!-- Title -->
+                                <h4 class="text-lg font-bold text-neutral-800">oQ: oMLX Universal Dynamic Quantization</h4>
+
+                                <!-- Philosophy -->
                                 <blockquote class="border-l-2 border-neutral-300 pl-4 text-neutral-600 italic font-semibold">
                                     <p>Quantization should not be exclusive to any particular inference server.</p>
                                     <p class="mt-1">oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm, LM Studio, and any app
@@ -1255,28 +1272,41 @@
                                     <p class="mt-1">No custom loader required.</p>
                                 </blockquote>
 
-                                <p>
-                                    <strong class="text-neutral-600">oQ</strong> (oMLX Quantization) is a mixed-precision quantization method
-                                    that combines GGUF K-quant layer-position strategy, unsloth Dynamic 2.0 selective protection, and
-                                    AWQ output-MSE clip optimization. It assigns different bit widths per tensor based on sensitivity,
-                                    protecting critical layers (attention, routers, shared experts) while aggressively compressing
-                                    redundant parameters (expert MLP).
-                                </p>
-
+                                <!-- Intro -->
                                 <div>
-                                    <strong class="text-neutral-600">How it works</strong>
-                                    <ul class="mt-1.5 ml-4 list-disc space-y-1">
-                                        <li><strong>Rule-based tier classification</strong> — 34 tensor patterns from GGUF/unsloth research.
-                                            MoE routers kept at fp16, attention protected at higher bits, expert MLP at base bits.</li>
-                                        <li><strong>Layer position weighting</strong> — First/last 12.5% of layers get +1 bit (GGUF Q4_K_M strategy).</li>
-                                        <li><strong>MLP asymmetry</strong> — For 512+ expert models, gate_proj ≥ 4-bit to prevent SiLU overflow (unsloth/GGUF Q2_K).</li>
-                                        <li><strong>Streaming quantization</strong> — Processes tensors via mmap without loading the full model. ~15-20 GB memory for any model size.</li>
-                                        <li><strong>Enhanced mode (+)</strong> — Optional AWQ-style clip optimization using calibration data for better quality at 2-4 bit. Requires full model load.</li>
-                                    </ul>
+                                    <p class="mt-1.5 text-sm text-neutral-500">
+                                        oQ combines data-driven per-layer sensitivity, AutoAWQ-style weight equalization with per-expert
+                                        activation-aware scaling, MSE-optimal clip optimization — with hybrid mxfp4/mxfp8/affine modes
+                                        auto-selected per tensor. Built-in calibration data (512 samples, code + multilingual + tool calling).
+                                    </p>
                                 </div>
 
+                                <!-- Key features -->
                                 <div>
-                                    <strong class="text-neutral-600">Comparison with other methods</strong>
+                                    <h5 class="text-base font-bold text-neutral-700">Key features</h5>
+                                    <div class="mt-3 space-y-3">
+                                        <div class="flex gap-3">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/></svg>
+                                            <div class="text-sm"><strong class="text-neutral-700">Mixed precision + Data-driven sensitivity</strong> <span class="text-neutral-500">Per-layer quantization sensitivity measured via calibration. Top 25% sensitive layers get higher bit protection. Replaces position-based heuristics.</span></div>
+                                        </div>
+                                        <div class="flex gap-3">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>
+                                            <div class="text-sm"><strong class="text-neutral-700">Hybrid modes</strong> <span class="text-neutral-500">4-bit uses mxfp4, 8-bit uses mxfp8 (Apple Silicon native). 2/3/5/6-bit use affine. Auto-selected per tensor.</span></div>
+                                        </div>
+                                        <div class="flex gap-3">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg>
+                                            <div class="text-sm"><strong class="text-neutral-700">Streaming</strong> <span class="text-neutral-500">Processes tensors via mmap without loading the full model. Quantize 400B+ models with ~15-20 GB memory.</span></div>
+                                        </div>
+                                        <div class="flex gap-3">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>
+                                            <div class="text-sm"><strong class="text-neutral-700">Enhanced (+)</strong> <span class="text-neutral-500">AutoAWQ-style weight equalization (grid search with MSE validation), per-expert activation-aware scaling for MoE, and clip optimization.</span></div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Comparison table -->
+                                <div>
+                                    <h5 class="text-base font-bold text-neutral-700">Comparison with other methods</h5>
                                     <div class="mt-2 overflow-x-auto">
                                         <table class="w-full text-xs">
                                             <thead>
@@ -1300,46 +1330,46 @@
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Mixed precision</td>
-                                                    <td class="py-1.5 px-3">34 tensor rules</td>
+                                                    <td class="py-1.5 px-3">Sensitivity-driven + AWQ equalization</td>
                                                     <td class="py-1.5 px-3">~15 type rules</td>
                                                     <td class="py-1.5 px-3">imatrix per-weight</td>
-                                                    <td class="py-1.5 px-3">per-layer (proprietary)</td>
-                                                    <td class="py-1.5 px-3">per-channel scaling</td>
+                                                    <td class="py-1.5 px-3">Per-layer (proprietary)</td>
+                                                    <td class="py-1.5 px-3">Per-channel scaling</td>
+                                                </tr>
+                                                <tr class="border-b border-neutral-100">
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Hybrid modes</td>
+                                                    <td class="py-1.5 px-3">mxfp4 + mxfp8 + affine</td>
+                                                    <td class="py-1.5 px-3">K-quant types</td>
+                                                    <td class="py-1.5 px-3">E8 lattice</td>
+                                                    <td class="py-1.5 px-3">Proprietary</td>
+                                                    <td class="py-1.5 px-3">Affine only</td>
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">MoE support</td>
-                                                    <td class="py-1.5 px-3">router fp16, MLP asymmetry</td>
-                                                    <td class="py-1.5 px-3">basic</td>
-                                                    <td class="py-1.5 px-3">basic</td>
-                                                    <td class="py-1.5 px-3">router fp16</td>
-                                                    <td class="py-1.5 px-3">limited</td>
+                                                    <td class="py-1.5 px-3">Router fp16, per-expert AWQ scaling</td>
+                                                    <td class="py-1.5 px-3">Basic</td>
+                                                    <td class="py-1.5 px-3">Basic</td>
+                                                    <td class="py-1.5 px-3">Router fp16</td>
+                                                    <td class="py-1.5 px-3">Limited</td>
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">VLM vision</td>
-                                                    <td class="py-1.5 px-3">Preserved (fp16)</td>
-                                                    <td class="py-1.5 px-3">Separate mmproj</td>
-                                                    <td class="py-1.5 px-3">Separate mmproj</td>
-                                                    <td class="py-1.5 px-3">Preserved</td>
-                                                    <td class="py-1.5 px-3">Not supported</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">SSM/GatedDeltaNet</td>
-                                                    <td class="py-1.5 px-3">F32 state + 5-bit proj</td>
-                                                    <td class="py-1.5 px-3">F32 state</td>
-                                                    <td class="py-1.5 px-3">F32 state</td>
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">VLM / SSM</td>
+                                                    <td class="py-1.5 px-3">Vision fp16, SSM F32 state</td>
+                                                    <td class="py-1.5 px-3">Separate mmproj, F32 state</td>
+                                                    <td class="py-1.5 px-3">Separate mmproj, F32 state</td>
                                                     <td class="py-1.5 px-3">Supported</td>
                                                     <td class="py-1.5 px-3">Not tested</td>
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Calibration</td>
-                                                    <td class="py-1.5 px-3">Optional (Enhanced+)</td>
+                                                    <td class="py-1.5 px-3">Built-in 512 samples (code + multilingual)</td>
                                                     <td class="py-1.5 px-3">None</td>
                                                     <td class="py-1.5 px-3">imatrix required</td>
                                                     <td class="py-1.5 px-3">Proprietary data</td>
                                                     <td class="py-1.5 px-3">Activation data</td>
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Memory usage</td>
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Memory</td>
                                                     <td class="py-1.5 px-3">~15-20 GB (streaming)</td>
                                                     <td class="py-1.5 px-3">1× model</td>
                                                     <td class="py-1.5 px-3">1× model</td>
@@ -1347,12 +1377,12 @@
                                                     <td class="py-1.5 px-3">1.5× model</td>
                                                 </tr>
                                                 <tr>
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Apple Silicon native</td>
-                                                    <td class="py-1.5 px-3">Yes (MLX)</td>
+                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Apple Silicon</td>
+                                                    <td class="py-1.5 px-3">Native (MLX mxfp4/mxfp8)</td>
                                                     <td class="py-1.5 px-3">Via llama.cpp</td>
                                                     <td class="py-1.5 px-3">Via llama.cpp</td>
                                                     <td class="py-1.5 px-3">GGUF only</td>
-                                                    <td class="py-1.5 px-3">Yes (MLX)</td>
+                                                    <td class="py-1.5 px-3">MLX (affine)</td>
                                                 </tr>
                                             </tbody>
                                         </table>

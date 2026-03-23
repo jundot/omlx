@@ -44,6 +44,10 @@ class AdminStatsAccessFilter(logging.Filter):
             return False
         if "/admin/api/login" in msg:
             return False
+        if "/admin/api/hf/tasks" in msg:
+            return False
+        if "/admin/api/oq/tasks" in msg:
+            return False
         return True
 
 

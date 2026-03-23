@@ -764,15 +764,6 @@
                 // Apply theme
                 this.applyTheme();
 
-                // Watch messages array and reinitialize Lucide icons when it changes
-                this.$watch('messages', () => {
-                    this.$nextTick(() => lucide.createIcons());
-                });
-
-                // Watch chatHistory for sidebar icons
-                this.$watch('chatHistory', () => {
-                    this.$nextTick(() => lucide.createIcons());
-                });
 
                 // Setup scroll listener for auto-scroll management
                 this.$nextTick(() => {
@@ -809,7 +800,6 @@
             openImageModal(url) {
                 if (!url) return;
                 this.imageModal = { show: true, src: url };
-                this.$nextTick(() => lucide.createIcons());
             },
 
             closeImageModal() {
@@ -853,7 +843,6 @@
                         id: Date.now() + '_' + Math.random().toString(36).substr(2, 5),
                         base64: e.target.result
                     });
-                    this.$nextTick(() => lucide.createIcons());
                 };
                 reader.onerror = () => {
                     alert(window.t('chat.error.image_load_failed'));
@@ -1258,7 +1247,6 @@
                     this.streamingContent = '';
                     this.abortController = null;
                     this.thinkingAutoScroll = true; // Reset thinking scroll state
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -1323,14 +1311,12 @@
                 this.editContent = this.getTextContent(this.messages[index].content);
                 // Preserve images from the original message
                 this.editImages = this.getImageUrls(this.messages[index].content);
-                this.$nextTick(() => lucide.createIcons());
             },
 
             cancelEdit() {
                 this.editingIndex = null;
                 this.editContent = '';
                 this.editImages = [];
-                this.$nextTick(() => lucide.createIcons());
             },
 
             async saveEdit(index) {
@@ -1381,7 +1367,6 @@
                     this.startNewChat();
                 }
 
-                this.$nextTick(() => lucide.createIcons());
             },
 
             // Clear all history
@@ -1392,7 +1377,6 @@
                 this.saveChatHistory();
                 this.startNewChat();
 
-                this.$nextTick(() => lucide.createIcons());
             },
 
             // Thinking/Reasoning tag processing
@@ -1729,7 +1713,6 @@
                 this.theme = this.theme === 'light' ? 'dark' : 'light';
                 localStorage.setItem('omlx-chat-theme', this.theme);
                 this.applyTheme();
-                this.$nextTick(() => lucide.createIcons());
             },
 
             applyTheme() {

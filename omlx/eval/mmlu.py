@@ -119,14 +119,7 @@ class MMLUBenchmark(BaseBenchmark):
         return [{"role": "user", "content": "\n".join(parts)}]
 
     def extract_answer(self, response: str, item: dict) -> str:
-        """Extract the first A/B/C/D from the response."""
-        response = response.strip()
-        match = re.search(r"\b([ABCD])\b", response)
-        if match:
-            return match.group(1)
-        if response and response[0] in "ABCD":
-            return response[0]
-        return ""
+        return self._extract_mc_answer(response, ["A", "B", "C", "D"])
 
     def check_answer(self, predicted: str, item: dict) -> bool:
         return predicted == item["answer"]

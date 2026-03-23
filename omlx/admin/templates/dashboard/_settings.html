@@ -86,7 +86,7 @@
                                                x-model="globalSettings.auth.api_key"
                                                placeholder="{{ t('settings.auth.api_key_placeholder') }}"
                                                class="w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
-                                        <button type="button" @click="showApiKey = !showApiKey; $nextTick(() => lucide.createIcons())"
+                                        <button type="button" @click="showApiKey = !showApiKey"
                                                 class="p-2 rounded-lg hover:bg-neutral-100 transition-colors text-neutral-400 hover:text-neutral-600"
                                                 title="{{ t('settings.auth.toggle_visibility_tooltip') }}">
                                             <template x-if="!showApiKey">
@@ -283,7 +283,7 @@
                                         <div class="flex items-center gap-2">
                                             <label class="text-sm text-neutral-700">{{ t('settings.model.model_directories') }}</label>
                                         </div>
-                                        <button @click="globalSettings.model.model_dirs.push(''); $nextTick(() => lucide.createIcons())"
+                                        <button @click="globalSettings.model.model_dirs.push('')"
                                                 class="flex items-center gap-1 text-xs px-2 py-1 text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-colors">
                                             <i data-lucide="plus" class="w-3.5 h-3.5"></i>
                                             <span>{{ t('settings.model.add') }}</span>
@@ -891,10 +891,9 @@
                                             </template>
                                         </div>
 
-                                        <!-- Actions (icon only) - hidden for embedding/reranker models -->
+                                        <!-- Actions (icon only) -->
                                         <div class="w-10 flex justify-center flex-shrink-0">
                                             <button
-                                                x-show="!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm'"
                                                 @click="openModelSettings(model)"
                                                 class="p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all"
                                                 :title="window.t('settings.models.table.sampling_settings_tooltip')"

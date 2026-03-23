@@ -213,6 +213,54 @@ class TestUniversalQuantPredicate:
         # gate_proj is in stage 6, returns True, so no dict to check
         assert result is True
 
+    # VLM nested config support
+
+    def test_vlm_nested_config_moe_detection(self, module):
+        """VLM models have text model config nested under text_config."""
+        vlm_config = {
+            "model_type": "qwen3_5_moe",
+            "text_config": {
+                "num_hidden_layers": 40,
+                "num_experts": 256,
+                "hidden_size": 2048,
+            },
+            "vision_config": {"hidden_size": 1152},
+        }
+        # Expert down_proj should be base bits (routed expert in MoE)
+        result = universal_quant_predicate(
+            "model.layers.10.mlp.experts.0.down_proj", module, vlm_config
+        )
+        assert result is True  # base bits, NOT 5-bit
+
+    def test_vlm_nested_config_sensitive_layers(self, module):
+        """Sensitive layer calculation uses correct num_hidden_layers from text_config."""
+        vlm_config = {
+            "text_config": {
+                "num_hidden_layers": 40,
+                "num_experts": 256,
+                "hidden_size": 2048,
+            },
+        }
+        # Layer 10 should NOT be sensitive (40 layers: first 5 and last 5)
+        result = universal_quant_predicate(
+            "model.layers.10.self_attn.v_proj", module, vlm_config
+        )
+        assert result is True  # base bits (not sensitive)
+
+    def test_vlm_nested_config_num_local_experts(self, module):
+        """Also handles num_local_experts in text_config."""
+        vlm_config = {
+            "text_config": {
+                "num_hidden_layers": 32,
+                "num_local_experts": 64,
+                "hidden_size": 4096,
+            },
+        }
+        result = universal_quant_predicate(
+            "model.layers.10.mlp.experts.0.down_proj", module, vlm_config
+        )
+        assert result is True  # routed expert → base bits
+
 
 # =============================================================================
 # Test helper functions
@@ -288,6 +336,14 @@ class TestValidateQuantizable:
 
     def test_quantization_config(self):
         assert validate_quantizable({"quantization_config": {"bits": 4}}) is False
+
+    def test_fp8_native_is_quantizable(self):
+        # Native FP8 models (MiniMax, DeepSeek) should be quantizable
+        assert validate_quantizable({"quantization_config": {"quant_method": "fp8"}}) is True
+
+    def test_non_fp8_quantization_config(self):
+        # Other quant methods (gptq, awq) are already quantized
+        assert validate_quantizable({"quantization_config": {"quant_method": "gptq"}}) is False
 
 
 # =============================================================================
@@ -437,11 +493,11 @@ class TestStreamingHelpers:
         assert gs == 32  # mxfp4 requires gs=32
         assert mode == "mxfp4"
 
-    def test_get_predicate_bits_2bit_affine(self):
+    def test_get_predicate_bits_3bit_affine(self):
         config = {"num_hidden_layers": 32}
         bits, gs, mode = _get_predicate_bits("model.layers.10.mlp.gate_proj.weight", config, 3, 64)
-        # oQ3 → base 2-bit → affine
-        assert bits == 2
+        # oQ3 → base 3-bit → affine
+        assert bits == 3
         assert mode == "affine"
 
     def test_get_predicate_bits_8bit_mxfp8(self):

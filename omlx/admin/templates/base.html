@@ -44,6 +44,13 @@
     </script>
 
     <style>
+        /* Lucide icon fallback: ensure unprocessed <i data-lucide> elements
+           are inline-block so Tailwind w-*/h-* classes apply even if
+           lucide.min.js fails to load or createIcons() hasn't run yet. */
+        [data-lucide] {
+            display: inline-block;
+        }
+
         /* Language-specific font stack */
         :root {
             {% if current_lang == 'ko' %}
@@ -112,30 +119,60 @@
     {% block content %}{% endblock %}
 
     <script>
-        // Debug: Check Lucide loading
-        console.log('[Debug] Lucide loaded:', typeof lucide, lucide);
+        // Auto-initialize Lucide icons via MutationObserver.
+        // Replaces all manual $nextTick(() => lucide.createIcons()) calls.
+        (function() {
+            if (typeof lucide === 'undefined') return;
 
-        document.addEventListener('DOMContentLoaded', () => {
-            console.log('[Debug] DOMContentLoaded - icons found:', document.querySelectorAll('[data-lucide]').length);
-            console.log('[Debug] Calling lucide.createIcons()');
-            lucide.createIcons();
-            console.log('[Debug] After createIcons - icons remaining:', document.querySelectorAll('[data-lucide]').length);
-            console.log('[Debug] SVGs created:', document.querySelectorAll('svg.lucide').length);
-        });
+            var pending = false;
+            function processIcons() {
+                if (pending) return;
+                pending = true;
+                requestAnimationFrame(function() {
+                    lucide.createIcons();
+                    pending = false;
+                });
+            }
 
-        document.addEventListener('alpine:initialized', () => {
-            console.log('[Debug] alpine:initialized');
-            setTimeout(() => {
-                console.log('[Debug] setTimeout after alpine:initialized - icons found:', document.querySelectorAll('[data-lucide]').length);
-                lucide.createIcons();
-                console.log('[Debug] After createIcons - SVGs:', document.querySelectorAll('svg.lucide').length);
-            }, 0);
-        });
+            // Initial pass
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', processIcons);
+            } else {
+                processIcons();
+            }
 
-        window.addEventListener('load', () => {
-            console.log('[Debug] window.load');
-            lucide.createIcons();
-        });
+            // Watch for dynamically added icons and attribute changes.
+            // Lucide keeps data-lucide on output <svg>, so we must only match
+            // unprocessed <i> tags to avoid an infinite replace loop.
+            function hasUnprocessedIcons(node) {
+                if (node.tagName === 'I' && node.hasAttribute('data-lucide')) return true;
+                return node.querySelector && !!node.querySelector('i[data-lucide]');
+            }
+
+            new MutationObserver(function(mutations) {
+                for (var i = 0; i < mutations.length; i++) {
+                    var m = mutations[i];
+                    // Attribute change on <i data-lucide> (Alpine :data-lucide binding)
+                    if (m.type === 'attributes' && m.target.tagName === 'I') {
+                        processIcons();
+                        return;
+                    }
+                    // New nodes added (Alpine x-for, x-if rendering)
+                    var nodes = m.addedNodes;
+                    for (var j = 0; j < nodes.length; j++) {
+                        if (nodes[j].nodeType === 1 && hasUnprocessedIcons(nodes[j])) {
+                            processIcons();
+                            return;
+                        }
+                    }
+                }
+            }).observe(document.body || document.documentElement, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['data-lucide']
+            });
+        })();
     </script>
 
     {% block scripts %}{% endblock %}

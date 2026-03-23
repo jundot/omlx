@@ -600,3 +600,146 @@ class TestEmbeddingIntegration:
 
         except Exception as e:
             pytest.skip(f"Could not load model: {e}")
+
+
+class TestNativeEmbeddingLoading:
+    """Tests for native embedding model loading (without mlx-embeddings)."""
+
+    def test_load_native_bert_model(self, tmp_path):
+        """Test native loading of BERT embedding model."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+
+        # Create minimal BERT model structure
+        config = {
+            "model_type": "bert",
+            "architectures": ["BertModel"],
+            "hidden_size": 384,
+            "num_hidden_layers": 6,
+            "vocab_size": 30522,
+            "num_attention_heads": 12,
+            "intermediate_size": 1536,
+            "max_position_embeddings": 512,
+            "hidden_dropout_prob": 0.1,
+            "attention_probs_dropout_prob": 0.1,
+            "pad_token_id": 0,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+
+        # Create minimal safetensors file
+        import struct
+        import numpy as np
+        from safetensors.numpy import save_file
+
+        # Create minimal embeddings weight
+        vocab_size, hidden_size = 30522, 384
+        embeddings = np.random.randn(vocab_size, hidden_size).astype(np.float32)
+        save_file({"embeddings.word_embeddings.weight": embeddings}, str(tmp_path / "model.safetensors"))
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        result = model._load_native()
+        assert result is True
+        assert model._loaded is True
+        assert model._using_native is True
+
+    def test_load_native_xlm_roberta_model(self, tmp_path):
+        """Test native loading of XLMRoBERTa embedding model."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+
+        config = {
+            "model_type": "xlm-roberta",
+            "architectures": ["XLMRobertaModel"],
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "vocab_size": 250002,
+            "num_attention_heads": 12,
+            "intermediate_size": 3072,
+            "max_position_embeddings": 514,
+            "attention_probs_dropout_prob": 0.1,
+            "hidden_dropout_prob": 0.1,
+            "pad_token_id": 1,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+
+        import numpy as np
+        from safetensors.numpy import save_file
+
+        vocab_size, hidden_size = 250002, 768
+        embeddings = np.random.randn(vocab_size, hidden_size).astype(np.float32)
+        save_file({"embeddings.word_embeddings.weight": embeddings}, str(tmp_path / "model.safetensors"))
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        result = model._load_native()
+        assert result is True
+        assert model._loaded is True
+        assert model._using_native is True
+
+    def test_load_native_falls_back_for_unknown_arch(self, tmp_path):
+        """Test that native loading returns False for unsupported architectures."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+
+        # Create config with unknown embedding architecture
+        config = {
+            "model_type": "custom-embedding",
+            "architectures": ["CustomEmbeddingModel"],
+            "hidden_size": 512,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        result = model._load_native()
+        assert result is False
+        assert model._loaded is False
+
+    def test_embed_produces_normalized_vectors(self, tmp_path):
+        """Test that embed produces L2-normalized embedding vectors."""
+        import sys, math
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+
+        config = {
+            "model_type": "bert",
+            "architectures": ["BertModel"],
+            "hidden_size": 128,
+            "num_hidden_layers": 2,
+            "vocab_size": 1000,
+            "num_attention_heads": 4,
+            "intermediate_size": 512,
+            "max_position_embeddings": 512,
+            "attention_probs_dropout_prob": 0.0,
+            "hidden_dropout_prob": 0.0,
+            "pad_token_id": 0,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+
+        import numpy as np
+        from safetensors.numpy import save_file
+
+        # Create small model weights
+        vocab_size, hidden_size = 1000, 128
+        weights = {
+            "embeddings.word_embeddings.weight": np.random.randn(vocab_size, hidden_size).astype(np.float32) * 0.02,
+            "embeddings.position_embeddings.weight": np.random.randn(512, hidden_size).astype(np.float32) * 0.02,
+            "embeddings.token_type_embeddings.weight": np.zeros((1, hidden_size), dtype=np.float32),
+            "embeddings.LayerNorm.weight": np.ones(hidden_size, dtype=np.float32),
+            "embeddings.LayerNorm.bias": np.zeros(hidden_size, dtype=np.float32),
+        }
+        save_file(weights, str(tmp_path / "model.safetensors"))
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        model.load()
+        output = model.embed(["hello world"])
+
+        # Check normalization
+        emb = output.embeddings[0]
+        norm = math.sqrt(sum(x * x for x in emb))
+        assert abs(norm - 1.0) < 0.01, f"Embedding not normalized: norm={norm}"

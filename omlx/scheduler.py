@@ -1760,6 +1760,39 @@ class Scheduler:
 
         return None
 
+    def _detect_needs_think_prefix(self, request: "Request") -> bool:
+        """Detect if prompt ends with an open <think> tag (thinking enabled).
+
+        Returns False for disabled-thinking patterns like <think></think>
+        where </think> immediately follows <think> in the prompt tail.
+        """
+        think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+        if think_start_id is None:
+            try:
+                think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
+                if think_start_id == getattr(self.tokenizer, 'unk_token_id', None):
+                    return False
+            except (AttributeError, KeyError, TypeError):
+                return False
+
+        if not think_start_id or not request.prompt_token_ids:
+            return False
+
+        last_tokens = list(request.prompt_token_ids[-3:])
+        if think_start_id not in last_tokens:
+            return False
+
+        # <think> found. Check if </think> follows it (disabled thinking pattern).
+        last_idx = len(last_tokens) - 1 - last_tokens[::-1].index(think_start_id)
+        after_start = last_tokens[last_idx + 1:]
+
+        if after_start:
+            think_end_ids = self._resolve_think_end_token_ids()
+            if think_end_ids and think_end_ids[0] in after_start:
+                return False
+
+        return True
+
     def _ensure_batch_generator(self, sampling_params: SamplingParams) -> None:
         """Ensure BatchGenerator exists with compatible settings."""
         # Only create once; per-request samplers are passed at insert time.
@@ -3121,21 +3154,8 @@ class Scheduler:
             # Check if prompt ends with <think> token for reasoning models.
             # Must happen before _build_sampler_and_processors so the thinking
             # budget processor can check needs_think_prefix.
-            think_start_id = getattr(self.tokenizer, 'think_start_id', None)
-            if think_start_id is None:
-                # VLM tokenizers loaded via mlx-vlm may not have think_start_id.
-                # Try to resolve it from the vocabulary directly.
-                try:
-                    think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
-                    if think_start_id == self.tokenizer.unk_token_id:
-                        think_start_id = None
-                except (AttributeError, KeyError, TypeError):
-                    pass
-            if think_start_id and request.prompt_token_ids:
-                # Check last 3 tokens (covers "<think>\n" case)
-                last_tokens = request.prompt_token_ids[-3:]
-                if think_start_id in last_tokens:
-                    request.needs_think_prefix = True
+            if self._detect_needs_think_prefix(request):
+                request.needs_think_prefix = True
 
             # Per-request sampler/logits processors to avoid BatchGenerator recreation.
             sampler, logits_processors = self._build_sampler_and_processors(

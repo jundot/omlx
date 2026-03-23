@@ -118,6 +118,14 @@ SUPPORTED_RERANKER_ARCHITECTURES = {
 # Detected by architecture + heuristic (model name or tokenizer hints).
 CAUSAL_LM_RERANKER_ARCHITECTURES = {
     "Qwen3ForCausalLM",
+    "JinaForRanking",  # Jina v3 reranker: uses <|score_token|> logits
+}
+
+# CausalLM-based embedding architectures.
+# These use a standard CausalLM architecture but are fine-tuned for embeddings
+# (no lm_head weights). Detected by architecture + directory name heuristic.
+CAUSAL_LM_EMBEDDING_ARCHITECTURES = {
+    "Qwen3ForCausalLM",  # Qwen3-Embedding uses CausalLM arch without lm_head
 }
 
 # Unsupported reranker architectures (future support)
@@ -238,6 +246,19 @@ def _is_causal_lm_reranker(model_path: Path) -> bool:
     return "reranker" in name_lower or "rerank" in name_lower
 
 
+def _is_causal_lm_embedding(model_path: Path) -> bool:
+    """
+    Heuristic check for CausalLM models fine-tuned as embedding models.
+
+    CausalLM embeddings (e.g., Qwen3-Embedding) use the same architecture as
+    their base LLMs but are fine-tuned for embeddings and ship without lm_head
+    weights. We detect them by checking the model directory name for "embedding"
+    or "embed" keywords, since config.json is identical to a standard LLM.
+    """
+    name_lower = model_path.name.lower()
+    return "embedding" in name_lower or "embed" in name_lower
+
+
 def detect_model_type(model_path: Path) -> ModelType:
     """
     Detect model type from config.json.
@@ -277,6 +298,14 @@ def detect_model_type(model_path: Path) -> ModelType:
         if arch in CAUSAL_LM_RERANKER_ARCHITECTURES:
             if _is_causal_lm_reranker(model_path):
                 return "reranker"
+
+    # Check for CausalLM-based embeddings (e.g., Qwen3-Embedding).
+    # These use a standard CausalLM architecture but are fine-tuned for embeddings
+    # and ship without lm_head weights. Detected by architecture + directory name hint.
+    for arch in architectures:
+        if arch in CAUSAL_LM_EMBEDDING_ARCHITECTURES:
+            if _is_causal_lm_embedding(model_path):
+                return "embedding"
 
     # Check architectures field for embedding (before model_type to avoid
     # false positives from ambiguous model types like qwen3, gemma3-text)

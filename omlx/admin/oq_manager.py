@@ -52,7 +52,7 @@ class QuantTask:
     task_id: str
     model_name: str
     model_path: str
-    oq_level: int
+    oq_level: float
     output_name: str
     output_path: str
     status: QuantStatus = QuantStatus.PENDING
@@ -71,6 +71,7 @@ class QuantTask:
     clip_n_grid: int = 20
     calib_dataset: str = "default"
     clip_batch_size: int = 1024
+    text_only: bool = False
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -116,6 +117,9 @@ def _format_size(size_bytes: int) -> str:
 _CLIP_SUPPORTED_MODEL_TYPES = {
     "qwen3_5_moe",
     "qwen3_5",
+    "minimax_m2",
+    "glm_moe_dsa",
+    "ministral3",
     # Add more as they are tested
 }
 
@@ -214,6 +218,7 @@ class OQManager:
                                     ),
                                     "model_type": config.get("model_type", ""),
                                     "supports_clip": _supports_clip(config),
+                                    "is_vlm": "vision_config" in config,
                                     "memory_streaming": estimate_memory(
                                         size, enable_clip=False
                                     ),
@@ -231,7 +236,7 @@ class OQManager:
     async def start_quantization(
         self,
         model_path: str,
-        oq_level: int,
+        oq_level: float,
         enable_clip: bool = False,
         group_size: int = 64,
         clip_num_samples: int = 128,
@@ -239,6 +244,7 @@ class OQManager:
         clip_n_grid: int = 20,
         calib_dataset: str = "default",
         clip_batch_size: int = 1024,
+        text_only: bool = False,
     ) -> QuantTask:
         """Start a quantization job.
 
@@ -281,7 +287,7 @@ class OQManager:
                 and task.status in _ACTIVE_STATUSES
             ):
                 raise ValueError(
-                    f"Quantization for '{model_name}' at oQ{oq_level} "
+                    f"Quantization for '{model_name}' at oQ{oq_level:g} "
                     "is already in progress"
                 )
 
@@ -307,6 +313,7 @@ class OQManager:
             clip_n_grid=clip_n_grid,
             calib_dataset=calib_dataset,
             clip_batch_size=clip_batch_size,
+            text_only=text_only,
         )
         self._tasks[task_id] = task
 
@@ -315,7 +322,7 @@ class OQManager:
         )
 
         logger.info(
-            f"oQ quantization queued: {model_name} -> oQ{oq_level} "
+            f"oQ quantization queued: {model_name} -> oQ{oq_level:g} "
             f"(task_id={task_id})"
         )
         return task
@@ -439,6 +446,10 @@ class OQManager:
                         True,
                         _progress_cb,
                         task.clip_batch_size,
+                        task.calib_dataset,
+                        task.text_only,
+                        task.clip_num_samples,
+                        task.clip_seq_length,
                     )
                 else:
                     # Tensor-by-tensor (low memory)
@@ -451,6 +462,7 @@ class OQManager:
                         task.oq_level,
                         task.group_size,
                         _progress_cb,
+                        task.text_only,
                     )
 
                 if task_id in self._cancelled:
@@ -533,12 +545,12 @@ class OQManager:
             pass
 
     @staticmethod
-    def _phase_label(phase: str, oq_level: int) -> str:
+    def _phase_label(phase: str, oq_level: float) -> str:
         """Human-readable phase label."""
         labels = {
             "loading": "Loading model...",
-            "quantizing": f"Quantizing to oQ{oq_level}...",
-            "optimizing": f"Clip optimization oQ{oq_level}...",
+            "quantizing": f"Quantizing to oQ{oq_level:g}...",
+            "optimizing": f"Clip optimization oQ{oq_level:g}...",
             "saving": "Saving quantized model...",
         }
         # Handle progress: "quantizing_eta|792|879|0:02"
@@ -548,7 +560,7 @@ class OQManager:
             total = parts[2] if len(parts) > 2 else "?"
             eta = parts[3] if len(parts) > 3 and parts[3] else ""
             pct = int(int(current) / max(int(total), 1) * 100) if current.isdigit() and total.isdigit() else 0
-            label = f"oQ{oq_level}: {pct}%"
+            label = f"oQ{oq_level:g}: {pct}%"
             if eta:
                 label += f" ({eta} remaining)"
             return label

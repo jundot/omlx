@@ -182,8 +182,8 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
         return [{"role": "user", "content": prompt}]
 
     def extract_answer(self, response: str, item: dict) -> str:
-        """Extract code from the response."""
-        return _extract_code(response)
+        """Extract code from the response (last code block to skip drafts)."""
+        return self._extract_last_code_block(response)
 
     def check_answer(self, predicted: str, item: dict) -> bool:
         """Execute code and check against test cases.
@@ -216,6 +216,7 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
         items: list[dict],
         on_progress: Optional[Callable[[int, int], Any]] = None,
         batch_size: int = 1,
+        sampling_kwargs: Optional[dict] = None,
     ) -> BenchmarkResult:
         """Override run: generation is batched, code execution is sequential."""
         results: list[QuestionResult] = []
@@ -230,14 +231,14 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
 
             # Batch the generation phase
             gen_tasks = [
-                self._eval_single(engine, item, batch_start + j)
+                self._eval_single(engine, item, batch_start + j, sampling_kwargs)
                 for j, item in enumerate(batch)
             ]
             gen_results = await asyncio.gather(*gen_tasks)
             gen_elapsed = time.time() - batch_time
 
             # Code execution is sequential (subprocess safety)
-            for idx, item, response_text in sorted(gen_results, key=lambda x: x[0]):
+            for idx, item, response_text, prompt_text in sorted(gen_results, key=lambda x: x[0]):
                 code = self.extract_answer(response_text, item)
                 is_correct = self.check_answer(code, item)
 
@@ -251,6 +252,8 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
                         expected="(test cases)",
                         predicted=code[:200] + "..." if len(code) > 200 else code,
                         time_seconds=gen_elapsed / len(batch),
+                        question_text=prompt_text,
+                        raw_response=response_text,
                     )
                 )
 

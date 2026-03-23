@@ -262,6 +262,7 @@
             // oQ Advanced Settings
             oqAdvancedOpen: false,
             oqEnableClip: false,
+            oqTextOnly: false,
             oqGroupSize: 64,
             oqClipSamples: 128,
             oqClipSeqLen: 512,
@@ -296,14 +297,21 @@
 
             // Accuracy benchmark state
             accModelId: '',
-            accBenchmarks: { mmlu: true, hellaswag: true, truthfulqa: true, gsm8k: false, livecodebench: false },
-            accSampleSizes: { mmlu: 300, hellaswag: 200, truthfulqa: 200, gsm8k: 100, livecodebench: 100 },
+            accBenchmarks: { mmlu: true, kmmlu: false, cmmlu: false, jmmlu: false, hellaswag: false, truthfulqa: true, arc_challenge: false, winogrande: false, gsm8k: false, humaneval: true, mbpp: false, livecodebench: false },
+            accSampleSizes: { mmlu: 1000, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, humaneval: 0, mbpp: 200, livecodebench: 100 },
             accBenchmarkList: [
-                { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects' },
-                { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning' },
-                { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness' },
-                { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning' },
-                { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation' },
+                { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects', fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'kmmlu', label: 'KMMLU', desc: '한국어 지식 · 45 과목', fullSize: 35030, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'cmmlu', label: 'CMMLU', desc: '中文知识 · 67 科目', fullSize: 11582, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'jmmlu', label: 'JMMLU', desc: '日本語知識 · 112 科目', fullSize: 7536, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning', fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness', fullSize: 817, sizes: [30, 50, 100, 200, 300] },
+                { key: 'arc_challenge', label: 'ARC-C', desc: 'Science reasoning', fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
+                { key: 'winogrande', label: 'Winogrande', desc: 'Coreference resolution', fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
+                { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning', fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
+                { key: 'humaneval', label: 'HumanEval', desc: 'Function completion', fullSize: 164, sizes: [30, 50, 100] },
+                { key: 'mbpp', label: 'MBPP', desc: 'Python problems', fullSize: 500, sizes: [30, 50, 100, 200, 300] },
+                { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
             ],
             accBatchSize: 1,
             accRunning: false,
@@ -327,9 +335,6 @@
                     this.loadModels(),
                     this.checkForUpdate()
                 ]);
-                this.$nextTick(() => {
-                    lucide.createIcons();
-                });
 
                 this.startUpdateCheckTimer();
 
@@ -410,7 +415,6 @@
                     if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
                     await this.loadAccState();
                 }
-                this.$nextTick(() => lucide.createIcons());
             },
 
             applyTabStateFromUrl() {
@@ -648,7 +652,6 @@
                         const data = await response.json();
                         this.saveSuccess = true;
                         this.saveMessage = data.message || 'Settings saved successfully';
-                        this.$nextTick(() => lucide.createIcons());
                         // Refresh stats and model list (cache changes unload models)
                         await this.loadStats();
                         await this.loadModels();
@@ -660,14 +663,12 @@
                         this.saveError = Array.isArray(data.detail) ? data.detail.join(', ') : (data.detail || window.t('js.error.save_settings_failed'));
                         // Reload settings to revert to server values
                         await this.loadGlobalSettings();
-                        this.$nextTick(() => lucide.createIcons());
                     }
                 } catch (err) {
                     console.error('Failed to save global settings:', err);
                     this.saveError = window.t('js.error.save_settings_failed');
                     // Reload settings to revert to server values
                     await this.loadGlobalSettings();
-                    this.$nextTick(() => lucide.createIcons());
                 } finally {
                     this.saving = false;
                 }
@@ -740,7 +741,6 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.models = data.models || [];
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -890,7 +890,6 @@
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
-                this.$nextTick(() => lucide.createIcons());
             },
 
             async saveModelSettings() {
@@ -1185,7 +1184,6 @@
                         const alltimeData = await alltimeResponse.json();
                         this.alltimeStats = { ...this.alltimeStats, ...alltimeData };
                     }
-                    this.$nextTick(() => lucide.createIcons());
                 } catch (err) {
                     console.error('Failed to load stats:', err);
                 }
@@ -1418,7 +1416,6 @@
                             this.loadModels();
                         }
 
-                        this.$nextTick(() => lucide.createIcons());
                     } catch (err) {
                         console.error('Failed to parse SSE event:', err);
                     }
@@ -1810,23 +1807,37 @@
                     lookup[r.model_id][r.benchmark] = r;
                 }
 
+                // Full sizes lookup
+                const fullSizes = {};
+                for (const bl of this.accBenchmarkList) fullSizes[bl.key] = bl.fullSize;
+
                 // Determine column widths
                 const modelWidth = Math.max(12, ...models.map(m => m.length + 2));
+                const modeW = 8;
+                const sampledW = 14;
                 const benchWidth = Math.max(14, ...benchmarks.map(b => b.length + 2));
 
                 let lines = [];
-                lines.push('Accuracy Benchmark Comparison');
+                lines.push('Intelligence Benchmark Comparison');
                 lines.push('');
 
                 // Header row
-                let header = rpad('', benchWidth);
+                let header = rpad('', benchWidth) + rpad('Mode', modeW) + rpad('Sampled', sampledW);
                 for (const m of models) header += pad(m, modelWidth);
                 lines.push(header);
-                lines.push('-'.repeat(benchWidth + models.length * modelWidth));
+                lines.push('-'.repeat(benchWidth + modeW + sampledW + models.length * modelWidth));
 
                 // Data rows
                 for (const b of benchmarks) {
-                    let row = rpad(b.toUpperCase(), benchWidth);
+                    // Get sample info from first available result for this benchmark
+                    const sample = models.map(m => lookup[m]?.[b]).find(r => r);
+                    const total = sample?.total || 0;
+                    const full = fullSizes[b] || 0;
+                    const isFull = total >= full;
+                    const mode = isFull ? 'Full' : 'Sample';
+                    const sampledStr = isFull ? String(full) : (total + '/' + full);
+
+                    let row = rpad(b.toUpperCase(), benchWidth) + rpad(mode, modeW) + rpad(sampledStr, sampledW);
                     for (const m of models) {
                         const r = lookup[m]?.[b];
                         row += pad(r ? (r.accuracy * 100).toFixed(1) + '%' : '-', modelWidth);
@@ -1871,6 +1882,61 @@
                     const ta = document.getElementById('accTextarea');
                     if (ta) { ta.select(); document.execCommand('copy'); onSuccess(); }
                 }
+            },
+
+            accDownloadResult(r, format) {
+                const filename = `${r.model_id}_${r.benchmark}.${format}`;
+                let content, mime;
+                const qr = r.question_results || [];
+
+                if (format === 'json') {
+                    content = JSON.stringify({
+                        model_id: r.model_id,
+                        benchmark: r.benchmark,
+                        accuracy: r.accuracy,
+                        correct: r.correct,
+                        total: r.total,
+                        time_s: r.time_s,
+                        category_scores: r.category_scores || null,
+                        questions: qr,
+                    }, null, 2);
+                    mime = 'application/json';
+                } else if (format === 'csv') {
+                    const esc = s => '"' + (s || '').replace(/"/g, '""') + '"';
+                    const lines = ['id,correct,expected,predicted,question,raw_response,time_s'];
+                    for (const q of qr) {
+                        lines.push([q.id, q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                    }
+                    content = lines.join('\n');
+                    mime = 'text/csv';
+                } else {
+                    const lines = [
+                        `Model: ${r.model_id}`,
+                        `Benchmark: ${r.benchmark.toUpperCase()}`,
+                        `Accuracy: ${(r.accuracy * 100).toFixed(1)}% (${r.correct}/${r.total})`,
+                        `Time: ${r.time_s}s`,
+                        '',
+                    ];
+                    for (const q of qr) {
+                        lines.push(`--- Q${q.id} [${q.correct ? 'CORRECT' : 'WRONG'}] ---`);
+                        lines.push(`Question: ${q.question || ''}`);
+                        lines.push(`Expected: ${q.expected}`);
+                        lines.push(`Predicted: ${q.predicted}`);
+                        lines.push(`Raw response: ${q.raw_response || '(empty)'}`);
+                        lines.push(`Time: ${q.time_s}s`);
+                        lines.push('');
+                    }
+                    content = lines.join('\n');
+                    mime = 'text/plain';
+                }
+
+                const blob = new Blob([content], { type: mime });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                a.click();
+                URL.revokeObjectURL(url);
             },
 
             // Log viewer functions
@@ -2327,7 +2393,6 @@
                 this.theme = this.theme === 'light' ? 'dark' : 'light';
                 localStorage.setItem('omlx-chat-theme', this.theme);
                 this.applyTheme();
-                this.$nextTick(() => lucide.createIcons());
             },
 
             applyTheme() {
@@ -2414,7 +2479,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfDownloading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2437,7 +2501,6 @@
                             }
                         }
 
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -2453,7 +2516,6 @@
                         const data = await response.json();
                         this.hfModels = data.models || [];
                         this.hfModelsLoaded = true;
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -2585,6 +2647,7 @@
                             clip_seq_length: this.oqClipSeqLen,
                             calib_dataset: this.oqCalibDataset,
                             clip_batch_size: this.oqClipBatchSize,
+                            text_only: this.oqTextOnly,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));
@@ -2602,7 +2665,6 @@
                     this.oqError = 'Connection error. Server may be unavailable.';
                 } finally {
                     this.oqStarting = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2622,7 +2684,6 @@
                                 await this.loadOQModels();
                             }
                         }
-                        this.$nextTick(() => lucide.createIcons());
                     }
                 } catch (err) {
                     console.error('Failed to load oQ tasks:', err);
@@ -2678,6 +2739,11 @@
             oqSelectedModelSupportsClip() {
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 return model?.supports_clip || false;
+            },
+
+            oqSelectedModelIsVLM() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                return model?.is_vlm || false;
             },
 
             oqEstimatedMemory() {
@@ -2764,7 +2830,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfRecommendedLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2810,7 +2875,6 @@
 
             setPage(tab, page) {
                 this.hfPage[tab] = page;
-                this.$nextTick(() => lucide.createIcons());
             },
 
             // Search
@@ -2853,7 +2917,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfSearchLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2924,7 +2987,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfModelDetailLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2965,7 +3027,6 @@
                 if (this.msAvailable) {
                     await this.loadMSTasks();
                 }
-                this.$nextTick(() => lucide.createIcons());
             },
 
             async startMSDownload() {
@@ -3016,7 +3077,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msDownloading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -3037,7 +3097,6 @@
                             }
                         }
 
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -3142,7 +3201,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msRecommendedLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -3168,7 +3226,6 @@
 
             setMsPage(tab, page) {
                 this.msPage[tab] = page;
-                this.$nextTick(() => lucide.createIcons());
             },
 
             // MS Search
@@ -3209,7 +3266,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msSearchLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -3272,7 +3328,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msModelDetailLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
         }

@@ -431,13 +431,21 @@ def _openai_error_body(message, status_code: int, param=None, code=None) -> dict
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
     """Log all HTTP errors (4xx/5xx) before returning the response."""
-    logger.warning(
-        "%s %s → %d: %s",
-        request.method,
-        request.url.path,
-        exc.status_code,
-        exc.detail,
+    # Admin session expiry from dashboard polling — not worth logging.
+    # But keep /admin/api/login 401s visible (possible brute force attempts).
+    _is_admin_session_expiry = (
+        request.url.path.startswith("/admin/")
+        and request.url.path != "/admin/api/login"
+        and exc.status_code == 401
     )
+    if not _is_admin_session_expiry:
+        logger.warning(
+            "%s %s → %d: %s",
+            request.method,
+            request.url.path,
+            exc.status_code,
+            exc.detail,
+        )
     if _is_api_route(request):
         content = _openai_error_body(exc.detail, exc.status_code)
     else:
@@ -1664,6 +1672,7 @@ async def create_completion(
                 http_request=http_request,
             ),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
     # Non-streaming response with timing
@@ -1726,8 +1735,9 @@ async def create_completion(
         model=request.model,
         choices=choices,
         usage=Usage(
+            prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
-            total_tokens=total_completion_tokens,
+            total_tokens=total_prompt_tokens + total_completion_tokens,
         ),
     )
 
@@ -1895,6 +1905,7 @@ async def create_chat_completion(
                 http_request=http_request,
             ),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
     # Non-streaming response with timing
@@ -2213,15 +2224,10 @@ async def stream_chat_completion(
                         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
     except Exception as e:
         logger.error(f"Error during chat streaming: {e}")
-        error_chunk = ChatCompletionChunk(
-            id=response_id,
-            model=request.model,
-            choices=[ChatCompletionChunkChoice(
-                delta=ChatCompletionChunkDelta(),
-                finish_reason="stop",
-            )],
-        )
-        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
+        error_data = {
+            "error": {"message": str(e), "type": "server_error"}
+        }
+        yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
 
@@ -2853,6 +2859,7 @@ async def create_anthropic_message(
                 http_request=http_request,
             ),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
     # Non-streaming response
@@ -3196,6 +3203,7 @@ async def create_response(
                 http_request=http_request,
             ),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
     # Non-streaming

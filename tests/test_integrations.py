@@ -78,6 +78,70 @@ class TestCodexIntegration:
         assert codex.type == "config_file"
         assert codex.display_name == "Codex"
 
+    def test_configure_preserves_existing(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        existing = """\
+model = "old-model"
+other_key = "value"
+
+[model_providers.custom]
+name = "Custom"
+model = "should-not-override"
+
+[model_providers.omlx]
+name = "old-omlx"
+"""
+        config_path.write_text(existing)
+
+        codex = CodexIntegration()
+        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
+            codex.configure(port=8000, api_key="", model="new-model")
+
+        content = config_path.read_text()
+        assert 'model = "new-model"' in content
+        assert 'model_provider = "omlx"' in content
+        assert 'other_key = "value"' in content
+        assert '[model_providers.custom]' in content
+        assert 'model = "should-not-override"' in content
+        assert '[model_providers.omlx]' in content
+        assert 'name = "oMLX"' in content
+        assert 'old-omlx' not in content
+
+    def test_configure_reasoning_model(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        codex = CodexIntegration()
+        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
+            codex.configure(port=8000, api_key="", model="deepseek-r1-distill")
+
+        content = config_path.read_text()
+        assert 'model_reasoning_effort = "high"' in content
+        assert 'model = "deepseek-r1-distill"' in content
+
+    def test_configure_non_reasoning_model(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        codex = CodexIntegration()
+        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
+            codex.configure(port=8000, api_key="", model="llama-3.1-8b")
+
+        content = config_path.read_text()
+        assert "model_reasoning_effort" not in content
+
+    def test_configure_clears_stale_reasoning_flag(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            'model = "old-thinking-model"\n'
+            'model_provider = "omlx"\n'
+            'model_reasoning_effort = "high"\n'
+        )
+
+        codex = CodexIntegration()
+        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
+            codex.configure(port=8000, api_key="", model="llama-3.1-8b")
+
+        content = config_path.read_text()
+        assert 'model = "llama-3.1-8b"' in content
+        assert "model_reasoning_effort" not in content
+
 
 class TestOpenCodeIntegration:
     def test_get_command(self):

@@ -1383,3 +1383,82 @@ class TestCacheCorruptionRecovery:
         assert scheduler._current_sampler_params is None
         # Cache should NOT be cleared (not a corruption error)
         scheduler.block_aware_cache.clear.assert_not_called()
+
+
+class TestDetectNeedsThinkPrefix:
+    """Tests for _detect_needs_think_prefix() method.
+
+    Verifies that <think></think> (disabled thinking) patterns are correctly
+    distinguished from <think>\\n (enabled thinking) patterns.
+    """
+
+    def _make_scheduler(self, mock_model, think_start_id, think_end_id=None):
+        """Create scheduler with think token IDs on the tokenizer."""
+        from conftest import MockTokenizer
+
+        tokenizer = MockTokenizer()
+        tokenizer.think_start_id = think_start_id
+        if think_end_id is not None:
+            tokenizer.think_end_id = think_end_id
+        return Scheduler(model=mock_model, tokenizer=tokenizer)
+
+    def _make_request(self, prompt_token_ids):
+        """Create a request with given prompt token IDs."""
+        return Request(
+            request_id="test-think",
+            prompt="test",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=list(prompt_token_ids),
+            num_prompt_tokens=len(prompt_token_ids),
+        )
+
+    def test_enabled_thinking_with_newline(self, mock_model):
+        """<think> + \\n at end -> True (enabled thinking, e.g. DeepSeek)."""
+        scheduler = self._make_scheduler(mock_model, think_start_id=100, think_end_id=101)
+        request = self._make_request([1, 2, 3, 100, 198])  # 198 = \n
+        assert scheduler._detect_needs_think_prefix(request) is True
+
+    def test_enabled_thinking_last_token(self, mock_model):
+        """<think> as last token -> True."""
+        scheduler = self._make_scheduler(mock_model, think_start_id=100, think_end_id=101)
+        request = self._make_request([1, 2, 3, 100])
+        assert scheduler._detect_needs_think_prefix(request) is True
+
+    def test_disabled_thinking_adjacent(self, mock_model):
+        """<think></think> adjacent -> False (disabled, e.g. Nemotron)."""
+        scheduler = self._make_scheduler(mock_model, think_start_id=100, think_end_id=101)
+        request = self._make_request([1, 2, 3, 100, 101])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+    def test_disabled_thinking_with_prefix(self, mock_model):
+        """X <think></think> -> False (disabled with preceding token)."""
+        scheduler = self._make_scheduler(mock_model, think_start_id=100, think_end_id=101)
+        request = self._make_request([1, 2, 50, 100, 101])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+    def test_no_think_token_in_tail(self, mock_model):
+        """No <think> in last 3 tokens -> False."""
+        scheduler = self._make_scheduler(mock_model, think_start_id=100, think_end_id=101)
+        request = self._make_request([1, 2, 3, 4, 5])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+    def test_no_think_start_id_on_tokenizer(self, mock_model):
+        """Tokenizer without think_start_id -> False."""
+        from conftest import MockTokenizer
+
+        tokenizer = MockTokenizer()
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        request = self._make_request([1, 2, 3])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+    def test_empty_prompt(self, mock_model):
+        """Empty prompt -> False."""
+        scheduler = self._make_scheduler(mock_model, think_start_id=100, think_end_id=101)
+        request = self._make_request([])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+    def test_no_think_end_id_still_sets_true(self, mock_model):
+        """<think> found but no think_end_id resolvable -> True (safe fallback)."""
+        scheduler = self._make_scheduler(mock_model, think_start_id=100)
+        request = self._make_request([1, 2, 100, 101])
+        assert scheduler._detect_needs_think_prefix(request) is True

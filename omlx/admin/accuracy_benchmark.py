@@ -32,7 +32,11 @@ _current_run_id: Optional[str] = None
 _current_model: Optional[str] = None
 _engine_pool_ref: Any = None
 
-VALID_BENCHMARKS = ["mmlu", "hellaswag", "truthfulqa", "gsm8k", "livecodebench"]
+VALID_BENCHMARKS = [
+    "mmlu", "kmmlu", "cmmlu", "jmmlu",
+    "hellaswag", "truthfulqa", "arc_challenge", "winogrande",
+    "gsm8k", "humaneval", "mbpp", "livecodebench",
+]
 
 
 class AccuracyBenchmarkRequest(BaseModel):
@@ -45,8 +49,8 @@ class AccuracyBenchmarkRequest(BaseModel):
     @field_validator("batch_size")
     @classmethod
     def validate_batch_size(cls, v: int) -> int:
-        if v not in (1, 2, 4, 8):
-            raise ValueError("batch_size must be 1, 2, 4, or 8")
+        if v not in (1, 2, 4, 8, 16, 32):
+            raise ValueError("batch_size must be 1, 2, 4, 8, 16, or 32")
         return v
 
     @field_validator("benchmarks")
@@ -272,6 +276,9 @@ async def run_accuracy_benchmark(
     from ..eval import BENCHMARKS
 
     request = run.request
+
+    # Suppress TTL auto-unload during benchmark
+    engine_pool._suppress_ttl = True
     start_time = time.time()
 
     try:
@@ -305,6 +312,23 @@ async def run_accuracy_benchmark(
         })
 
         engine = await engine_pool.get_engine(request.model_id)
+
+        # Load model sampling settings
+        sampling_kwargs = {}
+        if engine_pool._settings_manager is not None:
+            ms = engine_pool._settings_manager.get_settings(request.model_id)
+            if ms.top_p is not None:
+                sampling_kwargs["top_p"] = ms.top_p
+            if ms.top_k is not None:
+                sampling_kwargs["top_k"] = ms.top_k
+            if ms.min_p is not None:
+                sampling_kwargs["min_p"] = ms.min_p
+            if ms.repetition_penalty is not None:
+                sampling_kwargs["repetition_penalty"] = ms.repetition_penalty
+            if ms.presence_penalty is not None:
+                sampling_kwargs["presence_penalty"] = ms.presence_penalty
+            if ms.chat_template_kwargs:
+                sampling_kwargs["chat_template_kwargs"] = ms.chat_template_kwargs
 
         # Phase 3: Run each benchmark
         completed = 0
@@ -376,6 +400,7 @@ async def run_accuracy_benchmark(
                 result = await evaluator.run(
                     engine, items, on_progress,
                     batch_size=request.batch_size,
+                    sampling_kwargs=sampling_kwargs,
                 )
             except asyncio.CancelledError:
                 run.status = "cancelled"
@@ -402,6 +427,18 @@ async def run_accuracy_benchmark(
                 "total": result.total_questions,
                 "correct": result.correct_count,
                 "time_s": round(result.time_seconds, 1),
+                "question_results": [
+                    {
+                        "id": qr.question_id,
+                        "correct": qr.correct,
+                        "expected": qr.expected,
+                        "predicted": qr.predicted,
+                        "question": qr.question_text,
+                        "raw_response": qr.raw_response,
+                        "time_s": round(qr.time_seconds, 3),
+                    }
+                    for qr in result.question_results
+                ],
             }
             if result.category_scores:
                 result_data["category_scores"] = {
@@ -452,3 +489,6 @@ async def run_accuracy_benchmark(
             "type": "error",
             "message": str(e),
         })
+    finally:
+        # Re-enable TTL auto-unload
+        engine_pool._suppress_ttl = False
