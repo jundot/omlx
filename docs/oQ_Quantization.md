@@ -4,11 +4,20 @@ Quantization should not be exclusive to any particular inference server. oQ prod
 
 **oQ is a data-driven mixed-precision quantization system for Apple Silicon.** Instead of assigning bits by fixed rules or tensor type, oQ measures each layer's actual quantization sensitivity through calibration and allocates bits where the data says they matter most.
 
+### Benchmarks (Qwen3.5-35B-A3B)
+
+| Benchmark | Samples | oQ2 | mlx-lm 2-bit | oQ3 | mlx-lm 3-bit | oQ4 | mlx-lm 4-bit |
+|-----------|---------|-----|-------------|-----|-------------|-----|-------------|
+| MMLU | 300 | **64.0%** | 14.0% | **85.0%** | 76.3% | **83.3%** | 79.7% |
+| TRUTHFULQA | 300 | **80.0%** | 17.0% | **86.7%** | 81.7% | **88.0%** | 87.7% |
+| HUMANEVAL | 164 (full) | **78.0%** | 0.0% | **86.6%** | 84.8% | 85.4% | **87.2%** |
+| MBPP | 300 | **63.3%** | 0.3% | **72.0%** | 69.0% | **74.3%** | 71.7% |
+
 ## Quantization Levels
 
 | Level | Base Bits | Target bpw | Description |
 |-------|-----------|------------|-------------|
-| oQ2 | 2 | ~2.8 | Extreme compression |
+| oQ2 | 2 | ~2.9 | Extreme compression |
 | oQ3 | 3 | ~3.5 | Balanced |
 | oQ3.5 | 3 | ~3.8 | Quality balanced |
 | oQ4 | 4 | ~4.6 | Recommended |
@@ -58,7 +67,7 @@ Sensitivity is measured before AWQ so the budget plan knows the true per-layer i
 | Vision encoder | fp16 |
 | SSM state params | fp32 |
 
-### Sensitivity-Driven Allocation (oQ3-oQ6)
+### Sensitivity-Driven Allocation (oQ2-oQ6)
 
 This is the core differentiator of oQ. Instead of fixed tier systems that assign bits by tensor type, oQ runs actual calibration inference through the model and measures where quantization error hurts the most:
 
@@ -80,7 +89,7 @@ Boosts apply only to non-expert tensors. Routed experts (93-98% of MoE params) s
 
 The budget plan ensures total bpw stays within the target and hard cap for each level. The result is that every model gets a different bit allocation tailored to its specific layer sensitivities, rather than a one-size-fits-all profile.
 
-### Minimal Protection (oQ2, oQ8)
+### Minimal Protection (oQ8)
 
 No budget plan. Position-based heuristics only:
 

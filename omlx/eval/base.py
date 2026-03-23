@@ -178,7 +178,11 @@ class BaseBenchmark(ABC):
         kwargs["presence_penalty"] = 0.0
         kwargs["repetition_penalty"] = 1.0
         try:
-            output = await engine.chat(messages=messages, **kwargs)
+            output = await engine.chat(
+                messages=messages,
+                chat_template_kwargs={"enable_thinking": False},
+                **kwargs,
+            )
             text = self._strip_think_tags(output.text)
             return index, item, text, prompt_text
         except Exception as e:
