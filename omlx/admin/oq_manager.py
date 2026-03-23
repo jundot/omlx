@@ -71,6 +71,8 @@ class QuantTask:
     clip_n_grid: int = 20
     calib_dataset: str = "default"
     clip_batch_size: int = 1024
+    n_grid: int = 10
+    sensitivity_model_path: str = ""
     text_only: bool = False
 
     def to_dict(self) -> dict:
@@ -119,8 +121,10 @@ _CLIP_SUPPORTED_MODEL_TYPES = {
     "qwen3_5",
     "minimax_m2",
     "glm_moe_dsa",
+    "deepseek_v32",
     "ministral3",
-    # Add more as they are tested
+    # TODO: MLA attention AWQ pairs not yet implemented for DeepSeek/GLM.
+    # AWQ works for their MLP layers; attention layers skip gracefully.
 }
 
 
@@ -157,13 +161,14 @@ class OQManager:
         if self._model_dirs:
             self._output_dir = self._model_dirs[0]
 
-    async def list_quantizable_models(self) -> list[dict]:
-        """Scan all model dirs for non-quantized models."""
+    async def list_quantizable_models(self) -> tuple[list[dict], list[dict]]:
+        """Scan all model dirs. Returns (source_models, all_models)."""
 
-        def _scan() -> list[dict]:
-            from ..oq import validate_quantizable
+        def _scan() -> tuple[list[dict], list[dict]]:
+            from ..oq import validate_quantizable, estimate_memory
 
-            models = []
+            source_models = []
+            all_models = []
             seen: set[str] = set()
 
             for model_dir in self._model_dirs:
@@ -172,7 +177,6 @@ class OQManager:
                 for subdir in sorted(model_dir.iterdir()):
                     if not subdir.is_dir():
                         continue
-                    # Two-level scan: direct children or nested (org/model)
                     candidates = []
                     if (subdir / "config.json").exists():
                         candidates.append(subdir)
@@ -188,48 +192,47 @@ class OQManager:
                         try:
                             with open(path / "config.json") as f:
                                 config = json.load(f)
-                            if not validate_quantizable(config):
-                                continue
                             size = sum(
                                 f.stat().st_size
                                 for f in path.glob("*.safetensors")
                             )
                             if size == 0:
-                                # Try .bin files
                                 size = sum(
                                     f.stat().st_size
                                     for f in path.glob("*.bin")
                                 )
                             if size == 0:
                                 continue
-                            from ..oq import estimate_memory
-
-                            models.append(
-                                {
-                                    "name": path.name,
-                                    "path": str(path),
-                                    "size": size,
-                                    "size_formatted": _format_size(size),
-                                    "num_layers": config.get(
-                                        "num_hidden_layers", 0
-                                    ),
-                                    "num_experts": config.get(
-                                        "num_local_experts", 0
-                                    ),
-                                    "model_type": config.get("model_type", ""),
-                                    "supports_clip": _supports_clip(config),
-                                    "is_vlm": "vision_config" in config,
-                                    "memory_streaming": estimate_memory(
-                                        size, enable_clip=False
-                                    ),
-                                    "memory_clip": estimate_memory(
-                                        size, enable_clip=True
-                                    ),
-                                }
-                            )
+                            tc = config.get("text_config", {})
+                            info = {
+                                "name": path.name,
+                                "path": str(path),
+                                "size": size,
+                                "size_formatted": _format_size(size),
+                                "model_type": config.get("model_type", "") or tc.get("model_type", ""),
+                                "is_quantized": "quantization" in config,
+                                "supports_clip": _supports_clip(config),
+                                "is_vlm": "vision_config" in config,
+                            }
+                            all_models.append(info)
+                            if validate_quantizable(config):
+                                info_full = dict(info)
+                                info_full["num_layers"] = config.get(
+                                    "num_hidden_layers", 0
+                                ) or tc.get("num_hidden_layers", 0)
+                                info_full["num_experts"] = config.get(
+                                    "num_local_experts", 0
+                                )
+                                info_full["memory_streaming"] = estimate_memory(
+                                    size, enable_clip=False
+                                )
+                                info_full["memory_clip"] = estimate_memory(
+                                    size, enable_clip=True
+                                )
+                                source_models.append(info_full)
                         except Exception:
                             continue
-            return models
+            return source_models, all_models
 
         return await asyncio.to_thread(_scan)
 
@@ -244,6 +247,8 @@ class OQManager:
         clip_n_grid: int = 20,
         calib_dataset: str = "default",
         clip_batch_size: int = 1024,
+        n_grid: int = 10,
+        sensitivity_model_path: str = "",
         text_only: bool = False,
     ) -> QuantTask:
         """Start a quantization job.
@@ -313,6 +318,8 @@ class OQManager:
             clip_n_grid=clip_n_grid,
             calib_dataset=calib_dataset,
             clip_batch_size=clip_batch_size,
+            n_grid=n_grid,
+            sensitivity_model_path=sensitivity_model_path,
             text_only=text_only,
         )
         self._tasks[task_id] = task
@@ -450,6 +457,10 @@ class OQManager:
                         task.text_only,
                         task.clip_num_samples,
                         task.clip_seq_length,
+                        None,  # target_bpw
+                        None,  # hard_cap_bpw
+                        task.n_grid,
+                        task.sensitivity_model_path,
                     )
                 else:
                     # Tensor-by-tensor (low memory)
@@ -463,6 +474,9 @@ class OQManager:
                         task.group_size,
                         _progress_cb,
                         task.text_only,
+                        None,  # target_bpw
+                        None,  # hard_cap_bpw
+                        task.sensitivity_model_path,
                     )
 
                 if task_id in self._cancelled:

@@ -251,6 +251,7 @@
 
             // oQ Quantizer state
             oqModels: [],
+            oqAllModels: [],
             oqModelsLoaded: false,
             oqSelectedModelPath: '',
             oqLevel: 4,
@@ -268,6 +269,8 @@
             oqClipSeqLen: 512,
             oqCalibDataset: 'code_multilingual',
             oqClipBatchSize: 1024,
+            oqNGrid: 10,
+            oqSensitivityModelPath: '',
 
             // Benchmark state
             benchModelId: '',
@@ -2622,6 +2625,7 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.oqModels = data.models || [];
+                        this.oqAllModels = data.all_models || [];
                         this.oqModelsLoaded = true;
                     }
                 } catch (err) {
@@ -2647,6 +2651,8 @@
                             clip_seq_length: this.oqClipSeqLen,
                             calib_dataset: this.oqCalibDataset,
                             clip_batch_size: this.oqClipBatchSize,
+                            n_grid: this.oqNGrid,
+                            sensitivity_model_path: this.oqSensitivityModelPath,
                             text_only: this.oqTextOnly,
                         }),
                     });
@@ -2736,6 +2742,17 @@
                 return `${mins}:${String(secs).padStart(2, '0')}`;
             },
 
+            oqSensitivityModelCandidates() {
+                if (!this.oqSelectedModelPath) return [];
+                const source = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!source) return [];
+                return this.oqAllModels.filter(m =>
+                    m.path !== this.oqSelectedModelPath &&
+                    m.is_quantized &&
+                    m.model_type === source.model_type
+                );
+            },
+
             oqSelectedModelSupportsClip() {
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 return model?.supports_clip || false;
@@ -2751,6 +2768,15 @@
                 if (this.oqEstimate) {
                     if (this.oqEnableClip) {
                         return this.oqEstimate.memory_clip_formatted || '';
+                    }
+                    // If sensitivity model selected, memory ≈ sensitivity model size × 1.5
+                    if (this.oqSensitivityModelPath) {
+                        const sensModel = this.oqAllModels.find(m => m.path === this.oqSensitivityModelPath);
+                        if (sensModel) {
+                            const bytes = Math.round(sensModel.size * 1.5) + 5 * 1024 * 1024 * 1024;
+                            if (bytes > 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+                            return (bytes / (1024 * 1024)).toFixed(0) + ' MB';
+                        }
                     }
                     return this.oqEstimate.memory_streaming_formatted || '';
                 }

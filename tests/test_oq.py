@@ -15,10 +15,15 @@ except ImportError:
 
 from omlx.oq import (
     OQ_LEVELS,
+    _LEVEL_BITS,
+    _OQ_BPW_TARGETS,
+    _bpw_targets_for_level,
+    _build_quant_plan,
     _extract_layer_index,
     _format_size,
     _get_predicate_bits,
     _is_moe_router,
+    _normalize_quant_path,
     _search_best_clip,
     _should_quantize_tensor,
     estimate_memory,
@@ -289,6 +294,14 @@ class TestHelpers:
     def test_extract_layer_index_large(self):
         assert _extract_layer_index("model.layers.47.mlp.gate_proj") == 47
 
+    def test_normalize_quant_path_weight(self):
+        assert _normalize_quant_path("model.layers.0.self_attn.q_proj.weight") == (
+            "model.layers.0.self_attn.q_proj"
+        )
+
+    def test_normalize_quant_path_scales(self):
+        assert _normalize_quant_path("lm_head.scales") == "lm_head"
+
 
 # =============================================================================
 # Test resolve_output_name
@@ -430,6 +443,25 @@ class TestMakePredicate:
         assert isinstance(result, dict)
         assert result["bits"] == 6
 
+    @pytest.mark.parametrize("oq_level", [3, 4, 5])
+    def test_budget_plan_disables_static_lm_head_boost_without_override(self, oq_level):
+        config = {"num_hidden_layers": 32, "_oq_use_budget_plan": True}
+        pred = make_predicate(config, oq_level=oq_level)
+        module = MagicMock(spec=[])
+        assert pred("lm_head", module) is True
+
+    def test_budget_plan_uses_boost_override(self):
+        config = {
+            "num_hidden_layers": 32,
+            "_oq_use_budget_plan": True,
+            "_oq_boost_map": {"lm_head": {"bits": 6, "group_size": 64, "mode": "affine"}},
+        }
+        pred = make_predicate(config, oq_level=4)
+        module = MagicMock(spec=[])
+        result = pred("lm_head.weight", module)
+        assert isinstance(result, dict)
+        assert result["bits"] == 6
+
 
 # =============================================================================
 # Test estimate_memory
@@ -486,12 +518,12 @@ class TestStreamingHelpers:
         bits, gs, mode = _get_predicate_bits("model.layers.0.mlp.gate", config, 4, 64)
         assert bits is None  # Router → False → no quantization
 
-    def test_get_predicate_bits_default_mxfp4(self):
+    def test_get_predicate_bits_default_affine4(self):
         config = {"num_hidden_layers": 32}
         bits, gs, mode = _get_predicate_bits("model.layers.10.mlp.gate_proj.weight", config, 4, 64)
         assert bits == 4
-        assert gs == 32  # mxfp4 requires gs=32
-        assert mode == "mxfp4"
+        assert gs == 64
+        assert mode == "affine"
 
     def test_get_predicate_bits_3bit_affine(self):
         config = {"num_hidden_layers": 32}
@@ -508,7 +540,170 @@ class TestStreamingHelpers:
         assert gs == 32
         assert mode == "mxfp8"
 
+    def test_build_quant_plan_respects_hard_cap(self):
+        named_shapes = {
+            "lm_head": (4096, 4096),
+            "model.layers.0.self_attn.v_proj": (4096, 4096),
+            "model.layers.0.self_attn.o_proj": (4096, 4096),
+            "model.layers.1.mlp.down_proj": (4096, 14336),
+            "model.layers.1.mlp.gate_proj": (14336, 4096),
+            "model.layers.1.mlp.up_proj": (14336, 4096),
+        }
+        config = {"num_hidden_layers": 32, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(named_shapes, config, 4, target_bpw=4.6, hard_cap_bpw=4.7)
+        assert plan.effective_bpw <= 4.7
+        assert plan.boost_map
+
     def test_format_size(self):
         assert "GB" in _format_size(5 * 1024**3)
         assert "MB" in _format_size(500 * 1024**2)
         assert "KB" in _format_size(500 * 1024)
+
+
+# =============================================================================
+# Test level-specific budget plan
+# =============================================================================
+
+
+class TestLevelBudgetPlan:
+    """Tests for per-level target_bpw and budget plan activation."""
+
+    def test_bpw_targets_for_level_returns_correct_values(self):
+        assert _bpw_targets_for_level(3) == (3.5, 3.7)
+        assert _bpw_targets_for_level(3.5) == (3.8, 4.0)
+        assert _bpw_targets_for_level(4) == (4.6, 4.7)
+        assert _bpw_targets_for_level(5) == (5.5, 5.7)
+        assert _bpw_targets_for_level(6) == (6.5, 6.7)
+
+    def test_bpw_targets_for_level_returns_none_for_minimal(self):
+        assert _bpw_targets_for_level(8) is None
+
+    def test_level_bits_covers_all_oq_levels(self):
+        for level in OQ_LEVELS:
+            assert level in _LEVEL_BITS
+
+    def test_budget_plan_oq2_enabled(self):
+        assert 2 in _OQ_BPW_TARGETS
+        assert _bpw_targets_for_level(2) == (2.8, 3.0)
+
+    def test_budget_plan_oq8_not_enabled(self):
+        assert 8 not in _OQ_BPW_TARGETS
+
+    def test_budget_plan_oq3_respects_cap(self):
+        named_shapes = {
+            "lm_head": (4096, 4096),
+            "model.layers.0.self_attn.v_proj": (4096, 4096),
+            "model.layers.0.self_attn.o_proj": (4096, 4096),
+            "model.layers.1.mlp.down_proj": (4096, 14336),
+            "model.layers.1.mlp.gate_proj": (14336, 4096),
+            "model.layers.1.mlp.up_proj": (14336, 4096),
+        }
+        config = {"num_hidden_layers": 32, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(
+            named_shapes, config, 3, target_bpw=3.5, hard_cap_bpw=3.7
+        )
+        assert plan.effective_bpw <= 3.7
+
+    @pytest.mark.parametrize(
+        "oq_level,target,cap",
+        [(3, 3.5, 3.7), (4, 4.6, 4.7), (5, 5.5, 5.7)],
+    )
+    def test_budget_plan_respects_level_cap(self, oq_level, target, cap):
+        named_shapes = {
+            "lm_head": (4096, 4096),
+            "model.layers.0.self_attn.v_proj": (4096, 4096),
+            "model.layers.0.self_attn.o_proj": (4096, 4096),
+            "model.layers.1.mlp.down_proj": (4096, 14336),
+            "model.layers.1.mlp.gate_proj": (14336, 4096),
+            "model.layers.1.mlp.up_proj": (14336, 4096),
+        }
+        config = {"num_hidden_layers": 32, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(
+            named_shapes, config, oq_level,
+            target_bpw=target, hard_cap_bpw=cap,
+        )
+        assert plan.effective_bpw <= cap
+
+    def test_build_quant_plan_mandatory_lm_head(self):
+        # lm_head gets mandatory 8-bit boost (consensus-critical)
+        named_shapes = {"lm_head": (4096, 32000)}
+        for i in range(32):
+            named_shapes[f"model.layers.{i}.self_attn.v_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.q_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.mlp.gate_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.up_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.down_proj"] = (4096, 14336)
+        config = {"num_hidden_layers": 32, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(
+            named_shapes, config, 4, target_bpw=4.6, hard_cap_bpw=4.7
+        )
+        assert "lm_head" in plan.boost_map
+        assert plan.boost_map["lm_head"]["bits"] == 8
+
+    def test_build_quant_plan_sensitivity_driven(self):
+        # Sensitive layers get more bits, insensitive get fewer
+        named_shapes = {"lm_head": (4096, 32000)}
+        for i in range(32):
+            named_shapes[f"model.layers.{i}.self_attn.v_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.q_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.mlp.gate_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.up_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.down_proj"] = (4096, 14336)
+        sensitivity = {"0": 0.05, "1": 0.003, "31": 0.002}
+        config = {
+            "num_hidden_layers": 32,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": sensitivity,
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 4, target_bpw=4.6, hard_cap_bpw=4.7
+        )
+        # L0 (highest sensitivity) should get boosted
+        l0_boosts = [k for k in plan.boost_map if "layers.0." in k]
+        assert len(l0_boosts) > 0
+        # L0 should get more bits than L1 (if L1 boosted at all)
+        l0_bits = max(plan.boost_map[k]["bits"] for k in l0_boosts)
+        l1_boosts = [k for k in plan.boost_map if "layers.1." in k]
+        if l1_boosts:
+            l1_bits = max(plan.boost_map[k]["bits"] for k in l1_boosts)
+            assert l0_bits >= l1_bits
+
+    def test_build_quant_plan_skips_routed_experts(self):
+        # Routed experts should never be boosted
+        named_shapes = {
+            "lm_head": (4096, 32000),
+            "model.layers.0.self_attn.v_proj": (4096, 4096),
+            "model.layers.0.mlp.switch_mlp.gate_proj": (256, 512, 4096),
+            "model.layers.0.mlp.switch_mlp.up_proj": (256, 512, 4096),
+        }
+        config = {
+            "num_hidden_layers": 32,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 0.05},
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 4, target_bpw=4.6, hard_cap_bpw=4.7
+        )
+        for k in plan.boost_map:
+            assert "switch_mlp" not in k
+
+    def test_oq2_budget_plan_respects_cap(self):
+        """oQ2 with budget plan should stay within hard cap."""
+        named_shapes = {"lm_head": (4096, 32000)}
+        for i in range(32):
+            named_shapes[f"model.layers.{i}.self_attn.v_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.q_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.mlp.gate_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.up_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.down_proj"] = (4096, 14336)
+        sensitivity = {str(i): 0.1 / (i + 1) for i in range(32)}
+        config = {
+            "num_hidden_layers": 32,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": sensitivity,
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 2, target_bpw=2.8, hard_cap_bpw=3.0
+        )
+        assert plan.effective_bpw <= 3.0
+        assert plan.boost_map

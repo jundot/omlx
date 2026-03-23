@@ -1042,18 +1042,39 @@
                                             </template>
                                         </select>
                                     </div>
+                                    <!-- Sensitivity Model (optional, all models) -->
+                                    <div class="flex-1" x-show="oqSelectedModelPath && oqSensitivityModelCandidates().length > 0" x-cloak>
+                                        <div class="flex items-center gap-1.5 mb-1.5">
+                                            <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider">Sensitivity Model</label>
+                                            <span class="cursor-help" @mouseenter="$refs.sensTip.style.display='block'" @mouseleave="$refs.sensTip.style.display='none'">
+                                                <svg class="w-4 h-4 text-neutral-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                                </svg>
+                                            </span>
+                                            <div x-ref="sensTip" style="display:none" class="absolute mt-6 w-64 px-3 py-2 bg-neutral-800 text-white text-xs leading-relaxed rounded-lg z-50 shadow-lg pointer-events-none">
+                                                Use a quantized version of the source model to analyze layer sensitivity with ~4x less memory.
+                                            </div>
+                                        </div>
+                                        <select x-model="oqSensitivityModelPath"
+                                                class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <option value="">None (use source model)</option>
+                                            <template x-for="m in oqSensitivityModelCandidates()" :key="m.path">
+                                                <option :value="m.path" x-text="m.name + ' (' + m.size_formatted + ')'"></option>
+                                            </template>
+                                        </select>
+                                    </div>
                                     <!-- oQ Level Selector -->
-                                    <div class="w-96 shrink-0">
+                                    <div class="w-40 shrink-0">
                                         <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.oq.level') }}</label>
                                         <select x-model.number="oqLevel"
                                                 class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <option value="2" x-text="'oQ2' + (oqEnableClip ? '+' : '') + ' — extreme compression'">oQ2 — extreme compression</option>
-                                            <option value="3" x-text="'oQ3' + (oqEnableClip ? '+' : '') + ' — balanced'">oQ3 — balanced</option>
-                                            <option value="3.5" x-text="'oQ3.5' + (oqEnableClip ? '+' : '') + ' — quality balanced'">oQ3.5 — quality balanced</option>
-                                            <option value="4" selected x-text="'oQ4' + (oqEnableClip ? '+' : '') + ' — recommended'">oQ4 — recommended</option>
-                                            <option value="5" x-text="'oQ5' + (oqEnableClip ? '+' : '') + ' — high quality'">oQ5 — high quality</option>
-                                            <option value="6" x-text="'oQ6' + (oqEnableClip ? '+' : '') + ' — near-lossless'">oQ6 — near-lossless</option>
-                                            <option value="8" x-text="'oQ8' + (oqEnableClip ? '+' : '') + ' — near-lossless'">oQ8 — near-lossless</option>
+                                            <option value="2" x-text="'oQ2' + (oqEnableClip ? '+' : '')">oQ2</option>
+                                            <option value="3" x-text="'oQ3' + (oqEnableClip ? '+' : '')">oQ3</option>
+                                            <option value="3.5" x-text="'oQ3.5' + (oqEnableClip ? '+' : '')">oQ3.5</option>
+                                            <option value="4" selected x-text="'oQ4' + (oqEnableClip ? '+' : '')">oQ4</option>
+                                            <option value="5" x-text="'oQ5' + (oqEnableClip ? '+' : '')">oQ5</option>
+                                            <option value="6" x-text="'oQ6' + (oqEnableClip ? '+' : '')">oQ6</option>
+                                            <option value="8" x-text="'oQ8' + (oqEnableClip ? '+' : '')">oQ8</option>
                                         </select>
                                     </div>
                                     <!-- Start Button -->
@@ -1159,16 +1180,13 @@
                                                 <option value="1024">1024</option>
                                             </select>
                                         </div>
-                                        <!-- Clip Batch Size (clip ON only) -->
+                                        <!-- AWQ Grid Size (clip ON only) -->
                                         <div x-show="oqEnableClip" x-cloak class="flex items-center justify-between">
-                                            <span class="text-sm text-neutral-600">GPU Batch Size</span>
-                                            <select x-model.number="oqClipBatchSize"
+                                            <span class="text-sm text-neutral-600">AWQ Grid Size</span>
+                                            <select x-model.number="oqNGrid"
                                                     class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                                <option value="256">256 (low memory)</option>
-                                                <option value="512">512</option>
-                                                <option value="1024" selected>1024 (default)</option>
-                                                <option value="2048">2048 (fast)</option>
-                                                <option value="4096">4096 (fastest, high memory)</option>
+                                                <option value="10" selected>10 (fast)</option>
+                                                <option value="20">20 (recommended, slow)</option>
                                             </select>
                                         </div>
                                     </div>
@@ -1275,9 +1293,10 @@
                                 <!-- Intro -->
                                 <div>
                                     <p class="mt-1.5 text-sm text-neutral-500">
-                                        oQ combines data-driven per-layer sensitivity, AutoAWQ-style weight equalization with per-expert
-                                        activation-aware scaling, MSE-optimal clip optimization — with hybrid mxfp4/mxfp8/affine modes
-                                        auto-selected per tensor. Built-in calibration data (512 samples, code + multilingual + tool calling).
+                                        oQ measures each layer's actual quantization sensitivity through calibration and allocates bits
+                                        where the data says they matter most. Combined with AWQ weight equalization, built-in calibration
+                                        data (600 samples across code, multilingual, reasoning, and tool calling), and budget-constrained
+                                        mixed-precision allocation.
                                     </p>
                                 </div>
 
@@ -1287,19 +1306,19 @@
                                     <div class="mt-3 space-y-3">
                                         <div class="flex gap-3">
                                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Mixed precision + Data-driven sensitivity</strong> <span class="text-neutral-500">Per-layer quantization sensitivity measured via calibration. Top 25% sensitive layers get higher bit protection. Replaces position-based heuristics.</span></div>
+                                            <div class="text-sm"><strong class="text-neutral-700">Data-driven sensitivity</strong> <span class="text-neutral-500">Per-layer quantization sensitivity measured via calibration. Sensitive layers get more bits, insensitive layers stay at base. Every model gets a unique bit allocation.</span></div>
                                         </div>
                                         <div class="flex gap-3">
                                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Hybrid modes</strong> <span class="text-neutral-500">4-bit uses mxfp4, 8-bit uses mxfp8 (Apple Silicon native). 2/3/5/6-bit use affine. Auto-selected per tensor.</span></div>
+                                            <div class="text-sm"><strong class="text-neutral-700">Budget-constrained allocation</strong> <span class="text-neutral-500">Affine base (group_size=64), 8-bit uses mxfp8. Greedy budget plan allocates boost bits within target bpw. Routed experts stay at base; non-expert tensors compete by sensitivity.</span></div>
                                         </div>
                                         <div class="flex gap-3">
                                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Streaming</strong> <span class="text-neutral-500">Processes tensors via mmap without loading the full model. Quantize 400B+ models with ~15-20 GB memory.</span></div>
+                                            <div class="text-sm"><strong class="text-neutral-700">Streaming</strong> <span class="text-neutral-500">Tensor-by-tensor quantization with sensitivity-driven mixed precision. Use a Sensitivity Model to reduce memory.</span></div>
                                         </div>
                                         <div class="flex gap-3">
                                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Enhanced (+)</strong> <span class="text-neutral-500">AutoAWQ-style weight equalization (grid search with MSE validation), per-expert activation-aware scaling for MoE, and clip optimization.</span></div>
+                                            <div class="text-sm"><strong class="text-neutral-700">Enhanced (+)</strong> <span class="text-neutral-500">AWQ weight equalization with 20-point grid search. Sensitivity measured before AWQ, budget plan before AWQ, so equalization uses actual target bits.</span></div>
                                         </div>
                                     </div>
                                 </div>
@@ -1330,7 +1349,7 @@
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Mixed precision</td>
-                                                    <td class="py-1.5 px-3">Sensitivity-driven + AWQ equalization</td>
+                                                    <td class="py-1.5 px-3">Data-driven sensitivity + AWQ equalization</td>
                                                     <td class="py-1.5 px-3">~15 type rules</td>
                                                     <td class="py-1.5 px-3">imatrix per-weight</td>
                                                     <td class="py-1.5 px-3">Per-layer (proprietary)</td>
@@ -1338,7 +1357,7 @@
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Hybrid modes</td>
-                                                    <td class="py-1.5 px-3">mxfp4 + mxfp8 + affine</td>
+                                                    <td class="py-1.5 px-3">Affine + mxfp8</td>
                                                     <td class="py-1.5 px-3">K-quant types</td>
                                                     <td class="py-1.5 px-3">E8 lattice</td>
                                                     <td class="py-1.5 px-3">Proprietary</td>
@@ -1346,7 +1365,7 @@
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">MoE support</td>
-                                                    <td class="py-1.5 px-3">Router fp16, per-expert AWQ scaling</td>
+                                                    <td class="py-1.5 px-3">Router fp16, fused-expert AWQ</td>
                                                     <td class="py-1.5 px-3">Basic</td>
                                                     <td class="py-1.5 px-3">Basic</td>
                                                     <td class="py-1.5 px-3">Router fp16</td>
@@ -1362,7 +1381,7 @@
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Calibration</td>
-                                                    <td class="py-1.5 px-3">Built-in 512 samples (code + multilingual)</td>
+                                                    <td class="py-1.5 px-3">Built-in 600 samples (code + multilingual + reasoning)</td>
                                                     <td class="py-1.5 px-3">None</td>
                                                     <td class="py-1.5 px-3">imatrix required</td>
                                                     <td class="py-1.5 px-3">Proprietary data</td>
@@ -1370,7 +1389,7 @@
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Memory</td>
-                                                    <td class="py-1.5 px-3">~15-20 GB (streaming)</td>
+                                                    <td class="py-1.5 px-3">~1.5× model</td>
                                                     <td class="py-1.5 px-3">1× model</td>
                                                     <td class="py-1.5 px-3">1× model</td>
                                                     <td class="py-1.5 px-3">Proprietary</td>
@@ -1378,7 +1397,7 @@
                                                 </tr>
                                                 <tr>
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Apple Silicon</td>
-                                                    <td class="py-1.5 px-3">Native (MLX mxfp4/mxfp8)</td>
+                                                    <td class="py-1.5 px-3">Native (MLX affine/mxfp8)</td>
                                                     <td class="py-1.5 px-3">Via llama.cpp</td>
                                                     <td class="py-1.5 px-3">Via llama.cpp</td>
                                                     <td class="py-1.5 px-3">GGUF only</td>

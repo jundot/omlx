@@ -208,6 +208,8 @@ class OQStartRequest(BaseModel):
     clip_n_grid: int = 20
     calib_dataset: str = "default"
     clip_batch_size: int = 1024
+    n_grid: int = 10
+    sensitivity_model_path: str = ""
     text_only: bool = False
 
 
@@ -3575,8 +3577,8 @@ async def list_oq_models(is_admin: bool = Depends(require_admin)):
         raise HTTPException(
             status_code=503, detail="oQ quantizer not initialized"
         )
-    models = await _oq_manager.list_quantizable_models()
-    return {"models": models}
+    source_models, all_models = await _oq_manager.list_quantizable_models()
+    return {"models": source_models, "all_models": all_models}
 
 
 @router.get("/api/oq/estimate")
@@ -3623,6 +3625,8 @@ async def start_oq_quantization(
             clip_n_grid=request.clip_n_grid,
             calib_dataset=request.calib_dataset,
             clip_batch_size=request.clip_batch_size,
+            n_grid=request.n_grid,
+            sensitivity_model_path=request.sensitivity_model_path,
             text_only=request.text_only,
         )
         return {"success": True, "task": task.to_dict()}
