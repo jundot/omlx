@@ -135,6 +135,42 @@ class TestAutoLogin:
             _restore_getter(original)
 
 
+class TestLoginPage:
+    """Tests for GET /admin login page TemplateResponse signature."""
+
+    def test_login_page_uses_new_template_signature(self):
+        """login_page should pass request as first arg to TemplateResponse."""
+        mock_settings = _mock_global_settings(api_key="test-key")
+        original = _patch_getter(mock_settings)
+        try:
+            mock_request = MagicMock()
+            with patch("omlx.admin.auth.verify_session", return_value=False):
+                with patch.object(admin_routes, "templates") as mock_templates:
+                    mock_templates.TemplateResponse.return_value = MagicMock()
+                    asyncio.run(admin_routes.login_page(request=mock_request))
+                    mock_templates.TemplateResponse.assert_called_once_with(
+                        mock_request, "login.html", {"api_key_configured": True}
+                    )
+        finally:
+            _restore_getter(original)
+
+
+class TestDashboardPage:
+    """Tests for GET /admin/dashboard TemplateResponse signature."""
+
+    def test_dashboard_page_uses_new_template_signature(self):
+        """dashboard_page should pass request as first arg to TemplateResponse."""
+        mock_request = MagicMock()
+        with patch.object(admin_routes, "templates") as mock_templates:
+            mock_templates.TemplateResponse.return_value = MagicMock()
+            asyncio.run(
+                admin_routes.dashboard_page(request=mock_request, is_admin=True)
+            )
+            mock_templates.TemplateResponse.assert_called_once_with(
+                mock_request, "dashboard.html", {}
+            )
+
+
 class TestChatPageApiKeyInjection:
     """Tests for GET /admin/chat API key template injection."""
 
@@ -150,8 +186,9 @@ class TestChatPageApiKeyInjection:
                     admin_routes.chat_page(request=mock_request, is_admin=True)
                 )
                 mock_templates.TemplateResponse.assert_called_once_with(
+                    mock_request,
                     "chat.html",
-                    {"request": mock_request, "api_key": "test-chat-key"},
+                    {"api_key": "test-chat-key"},
                 )
         finally:
             _restore_getter(original)
@@ -168,7 +205,7 @@ class TestChatPageApiKeyInjection:
                     admin_routes.chat_page(request=mock_request, is_admin=True)
                 )
                 call_args = mock_templates.TemplateResponse.call_args
-                context = call_args[0][1]
+                context = call_args[0][2]
                 assert context["api_key"] == ""
         finally:
             _restore_getter(original)
@@ -185,7 +222,7 @@ class TestChatPageApiKeyInjection:
                     admin_routes.chat_page(request=mock_request, is_admin=True)
                 )
                 call_args = mock_templates.TemplateResponse.call_args
-                context = call_args[0][1]
+                context = call_args[0][2]
                 assert context["api_key"] == ""
         finally:
             admin_routes._get_global_settings = original

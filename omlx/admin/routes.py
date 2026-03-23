@@ -902,11 +902,9 @@ async def login_page(request: Request):
     global_settings = _get_global_settings()
     api_key_configured = bool(global_settings and global_settings.auth.api_key)
     return templates.TemplateResponse(
+        request,
         "login.html",
-        {
-            "request": request,
-            "api_key_configured": api_key_configured,
-        },
+        {"api_key_configured": api_key_configured},
     )
 
 
@@ -920,7 +918,7 @@ async def dashboard_page(request: Request, is_admin: bool = Depends(require_admi
     Returns:
         HTML dashboard page with server status and model list.
     """
-    return templates.TemplateResponse("dashboard.html", {"request": request})
+    return templates.TemplateResponse(request, "dashboard.html", {})
 
 
 @router.get("/chat", response_class=HTMLResponse)
@@ -939,7 +937,7 @@ async def chat_page(request: Request, is_admin: bool = Depends(require_admin)):
     global_settings = _get_global_settings()
     api_key = global_settings.auth.api_key if global_settings else ""
     return templates.TemplateResponse(
-        "chat.html", {"request": request, "api_key": api_key or ""}
+        request, "chat.html", {"api_key": api_key or ""}
     )
 
 
