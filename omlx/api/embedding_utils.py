@@ -10,8 +10,11 @@ Provides:
 
 import base64
 import math
+import os
 import struct
-from typing import Any, List, Union
+from typing import Any, Dict, List, Union
+
+from .embedding_models import EmbeddingInputItem
 
 
 def encode_embedding_base64(embedding: List[float]) -> str:
@@ -112,3 +115,46 @@ def normalize_input(input_data: Union[str, List[str]]) -> List[str]:
     if isinstance(input_data, str):
         return [input_data]
     return list(input_data)
+
+
+def normalize_embedding_items(
+    items: List[Union[EmbeddingInputItem, Dict[str, Any]]]
+) -> List[Dict[str, str]]:
+    """
+    Normalize structured embedding items into plain dicts.
+
+    Args:
+        items: Structured embedding input items
+
+    Returns:
+        List of normalized item dicts with only supported keys
+    """
+    normalized: List[Dict[str, str]] = []
+
+    for item in items:
+        if hasattr(item, "model_dump"):
+            payload = item.model_dump(exclude_none=True)
+        else:
+            payload = {
+                key: value for key, value in dict(item).items() if value is not None
+            }
+
+        text = payload.get("text")
+        image = payload.get("image")
+
+        normalized_item: Dict[str, str] = {}
+        if text is not None:
+            normalized_item["text"] = text
+        if image is not None:
+            normalized_item["image"] = image
+
+        normalized.append(normalized_item)
+
+    return normalized
+
+
+def is_likely_local_image_path(image: str) -> bool:
+    """Return True when the image string looks like a local filesystem path."""
+    if image.startswith(("http://", "https://", "data:")):
+        return False
+    return os.path.exists(image)

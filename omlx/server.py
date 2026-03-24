@@ -107,6 +107,7 @@ from .api.embedding_models import (
 )
 from .api.embedding_utils import (
     encode_embedding_base64,
+    normalize_embedding_items,
     truncate_embedding,
     normalize_input,
 )
@@ -1517,7 +1518,8 @@ async def create_embeddings(
     - float or base64 encoding format
     - Optional dimension reduction (with renormalization)
     """
-    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+    oq_manager = getattr(_server_state, "oq_manager", None)
+    if oq_manager and oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
@@ -1525,20 +1527,28 @@ async def create_embeddings(
 
     engine = await get_embedding_engine(request.model)
 
-    # Normalize input to list
-    texts = normalize_input(request.input)
+    if request.items is not None:
+        embedding_inputs = normalize_embedding_items(request.items)
+    elif request.input is not None:
+        embedding_inputs = normalize_input(request.input)
+    else:
+        embedding_inputs = []
 
-    if not texts:
+    if not embedding_inputs:
         raise HTTPException(status_code=400, detail="Input cannot be empty")
 
     # Generate embeddings
     start_time = time.perf_counter()
-
-    output = await engine.embed(texts)
+    try:
+        output = await engine.embed(embedding_inputs)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except TypeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     elapsed = time.perf_counter() - start_time
     logger.info(
-        f"Embedding: {len(texts)} texts, {output.dimensions} dims, "
+        f"Embedding: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
         f"{output.total_tokens} tokens in {elapsed:.3f}s"
     )
 
