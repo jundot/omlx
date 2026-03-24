@@ -107,6 +107,7 @@ where = ["."]
 include = ["omlx*"]
 
 [tool.setuptools.package-data]
+"omlx" = ["oq_calibration_data.json"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
 
