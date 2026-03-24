@@ -109,7 +109,11 @@ class TTSEngine(BaseNonStreamingEngine):
         model_name = self._model_name
 
         def _load_sync():
-            return _load_model(model_name)
+            # Use strict=False to work around mlx-audio bug where sanitize()
+            # merges quantization scales into weights before apply_quantization()
+            # can detect them, causing shape mismatches with strict=True for
+            # quantized models (e.g. VibeVoice-Realtime-0.5B-8bit).
+            return _load_model(model_name, strict=False)
 
         loop = asyncio.get_running_loop()
         self._model = await loop.run_in_executor(get_mlx_executor(), _load_sync)
