@@ -231,6 +231,7 @@
   "models.detail.view_on_hf": "在 HuggingFace 上檢視",
   "models.detail.view_on_ms": "在魔搭社區檢視",
   "models.detail.close": "關閉",
+  "models.detail.lora_warning": "LoRA adapter — not supported",
   "settings.tab.global": "全域設定",
   "settings.tab.models": "模型設定",
   "settings.global.section_label": "全域設定",

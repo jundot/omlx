@@ -1795,13 +1795,21 @@
                                                 class="px-4 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
                                             {{ t('models.detail.close') }}
                                         </button>
-                                        <button @click="downloadRecommended(hfModelDetail.repo_id); closeModelDetail();"
-                                                :disabled="hfDownloading"
-                                                class="px-5 py-2 text-xs font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-all
-                                                       disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
-                                            <i data-lucide="download" class="w-3.5 h-3.5"></i>
-                                            {{ t('models.downloader.download_button') }}
-                                        </button>
+                                        <template x-if="hfModelDetail.is_adapter">
+                                            <span class="px-4 py-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg flex items-center gap-1.5">
+                                                <i data-lucide="alert-triangle" class="w-3.5 h-3.5"></i>
+                                                {{ t('models.detail.lora_warning') }}
+                                            </span>
+                                        </template>
+                                        <template x-if="!hfModelDetail.is_adapter">
+                                            <button @click="downloadRecommended(hfModelDetail.repo_id); closeModelDetail();"
+                                                    :disabled="hfDownloading"
+                                                    class="px-5 py-2 text-xs font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-all
+                                                           disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
+                                                <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                                                {{ t('models.downloader.download_button') }}
+                                            </button>
+                                        </template>
                                     </div>
                                 </div>
                             </div>

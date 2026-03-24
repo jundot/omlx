@@ -231,6 +231,7 @@
   "models.detail.view_on_hf": "HuggingFace에서 보기",
   "models.detail.view_on_ms": "ModelScope에서 보기",
   "models.detail.close": "닫기",
+  "models.detail.lora_warning": "LoRA adapter — not supported",
   "settings.tab.global": "기본 설정",
   "settings.tab.models": "모델 설정",
   "settings.global.section_label": "기본 설정",

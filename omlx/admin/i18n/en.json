@@ -231,6 +231,7 @@
   "models.detail.view_on_hf": "View on HuggingFace",
   "models.detail.view_on_ms": "View on ModelScope",
   "models.detail.close": "Close",
+  "models.detail.lora_warning": "LoRA adapter — not supported",
   "settings.tab.global": "Global Settings",
   "settings.tab.models": "Model Settings",
   "settings.global.section_label": "Global Settings",

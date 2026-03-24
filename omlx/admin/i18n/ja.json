@@ -231,6 +231,7 @@
   "models.detail.view_on_hf": "HuggingFaceで表示",
   "models.detail.view_on_ms": "ModelScopeで表示",
   "models.detail.close": "閉じる",
+  "models.detail.lora_warning": "LoRA adapter — not supported",
   "settings.tab.global": "グローバル設定",
   "settings.tab.models": "モデル設定",
   "settings.global.section_label": "グローバル設定",
