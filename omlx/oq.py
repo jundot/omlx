@@ -130,10 +130,10 @@ def universal_quant_predicate(
         }
 
     if _is_moe_router(path):
-        return False
+        return {"bits": 8, "group_size": 64, "mode": "affine"}
 
     if "shared_expert_gate" in path and "gate_proj" not in path:
-        return False
+        return {"bits": 8, "group_size": 64, "mode": "affine"}
 
     if _is_vision_tensor(path):
         return False
@@ -549,8 +549,9 @@ def _build_quant_plan(
             cand_bits = min(base_bits + extra, 8)
             if cand_bits <= base_bits:
                 continue
-            while cand_bits not in _VALID_BITS and cand_bits > base_bits:
-                cand_bits -= 1
+            # Round UP to next valid bit width (e.g. 7 -> 8, not 7 -> 6)
+            while cand_bits not in _VALID_BITS and cand_bits < 8:
+                cand_bits += 1
             if cand_bits <= base_bits:
                 continue
             cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
@@ -2080,32 +2081,74 @@ def _run_awq_pair_search(
     group_size: int,
     mode: str,
     n_grid: int,
+    block_inputs=None,
 ):
-    """Search the best AutoAWQ scale for a single pair."""
+    """Search the best AutoAWQ scale for a single pair.
+
+    When block_inputs is provided, loss is measured at parent (block) level
+    (llm-compressor style) instead of sub-module level. This preserves
+    residual path quality at the cost of weaker MSE signal.
+    """
+    _pair_desc = f"{pair.get('prev_path', '?')} -> [{','.join(p.split('.')[-1] for p in pair['next_paths'])}]"
+    _skip_metric = lambda reason: (None, {
+        "pair": _pair_desc, "baseline_mse": 0.0, "best_mse": 0.0,
+        "reduction": 1.0, "applied": False, "skipped": reason,
+    })
+
     stats_input = captured.get(pair["stats_input_path"])
     if stats_input is None:
-        return None
+        return _skip_metric("no_stats_input")
 
     next_layers = [_resolve_submodule(block, path) for path in pair["next_paths"]]
     if any(layer.weight.shape[-1] % group_size != 0 for layer in next_layers):
-        return None
+        return _skip_metric("group_size_mismatch")
     prev_op = _resolve_submodule(block, pair["prev_path"])
-    orig_next_weights = [layer.weight for layer in next_layers]
+    orig_next_weights = [mx.array(layer.weight) for layer in next_layers]
 
-    float_out = _run_awq_pair_output(
-        block, pair, captured, layer_mask, position_ids=position_ids
-    )
+    # Get expert_usage for w_mean weighting (still from sub-module level)
     expert_usage = None
     if pair["inspect_kind"] == "routed_moe":
-        float_out, expert_usage = float_out
+        sub_out = _run_awq_pair_output(
+            block, pair, captured, layer_mask, position_ids=position_ids
+        )
+        _, expert_usage = sub_out
+        del sub_out
 
+    # Parent forward (block-level) for loss — llm-compressor style
+    use_parent = block_inputs is not None
+    if use_parent:
+        float_ref = _forward_layer(block, block_inputs, layer_mask, position_ids)
+        if float_ref is None:
+            use_parent = False
+
+    if not use_parent:
+        # Fallback to sub-module forward
+        float_ref = _run_awq_pair_output(
+            block, pair, captured, layer_mask, position_ids=position_ids
+        )
+        if pair["inspect_kind"] == "routed_moe":
+            float_ref, _ = float_ref
+            if float_ref.size == 0 or float_ref.abs().max().item() == 0:
+                return None, {
+                    "pair": _pair_desc, "baseline_mse": 0.0, "best_mse": 0.0,
+                    "reduction": 1.0, "applied": False, "skipped": "empty_expert",
+                }
+    mx.eval(float_ref)
+
+    def _measure_loss():
+        if use_parent:
+            out = _forward_layer(block, block_inputs, layer_mask, position_ids)
+        else:
+            out = _run_awq_pair_output(
+                block, pair, captured, layer_mask, position_ids=position_ids
+            )
+            if pair["inspect_kind"] == "routed_moe":
+                out, _ = out
+        return ((float_ref - out) ** 2).mean()
+
+    # Baseline: qdq without scaling
     _qdq_layers(next_layers, bits=bits, group_size=group_size, mode=mode)
-    quant_out = _run_awq_pair_output(
-        block, pair, captured, layer_mask, position_ids=position_ids
-    )
-    if pair["inspect_kind"] == "routed_moe":
-        quant_out, _ = quant_out
-    baseline_loss = ((float_out - quant_out) ** 2).mean()
+    baseline_loss = _measure_loss()
     mx.eval(baseline_loss)
     best_error = baseline_loss.item()
     best_scales = None
@@ -2115,46 +2158,56 @@ def _run_awq_pair_search(
     x_mean = _captured_mean_abs(stats_input.value)
     w_mean = _weight_mean(next_layers, expert_usage=expert_usage)
     if w_mean is None or x_mean.shape[0] != w_mean.shape[0]:
-        return None
+        return _skip_metric("shape_mismatch")
 
+    # duo_scaling="both": first half x_mean only, second half with w_mean
+    half = n_grid // 2
     for ratio_i in range(n_grid):
         r = ratio_i / n_grid
-        scales = mx.maximum(x_mean**r / (w_mean ** (1 - r) + 1e-4), 1e-4)
+        if ratio_i < half:
+            # x_mean only (no weight scaling)
+            scales = mx.maximum(x_mean**r, 1e-4)
+        else:
+            # duo_scaling (original AWQ formula)
+            scales = mx.maximum(x_mean**r / (w_mean ** (1 - r) + 1e-4), 1e-4)
         scales = scales / mx.sqrt(scales.max() * scales.min())
         scales = mx.where(mx.isinf(scales) | mx.isnan(scales), 1.0, scales)
         scales = mx.maximum(scales, 1e-5)
 
         _awq_apply_scaled_qdq(next_layers, scales, bits=bits, group_size=group_size, mode=mode)
-        scaled_out = _run_awq_pair_output(
-            block, pair, captured, layer_mask, position_ids=position_ids
-        )
-        if pair["inspect_kind"] == "routed_moe":
-            scaled_out, _ = scaled_out
-        loss = ((float_out - scaled_out) ** 2).mean()
+        loss = _measure_loss()
         mx.eval(loss)
         if loss.item() < best_error:
             best_error = loss.item()
             best_scales = scales
-        del scaled_out, loss
+        del loss
         for layer, ow in zip(next_layers, orig_next_weights):
             layer.weight = ow
 
     prev_path = pair.get("prev_path", "?")
     next_desc = ",".join(p.split(".")[-1] for p in pair["next_paths"])
+    baseline_val = baseline_loss.item()
+    metric = {
+        "pair": f"{prev_path} -> [{next_desc}]",
+        "baseline_mse": baseline_val,
+        "best_mse": best_error,
+        "reduction": best_error / max(baseline_val, 1e-10),
+        "applied": best_scales is not None,
+    }
     if best_scales is not None:
-        improvement = (1 - best_error / max(baseline_loss.item(), 1e-10)) * 100
+        improvement = (1 - best_error / max(baseline_val, 1e-10)) * 100
         logger.debug(
             f"  AWQ {prev_path} -> [{next_desc}]: "
-            f"MSE {baseline_loss.item():.6f} -> {best_error:.6f} ({improvement:+.1f}%)"
+            f"MSE {baseline_val:.6f} -> {best_error:.6f} ({improvement:+.1f}%)"
         )
         _apply_scale(prev_op, next_layers, best_scales)
         mx.eval(block.parameters())
     else:
         logger.debug(
-            f"  AWQ {prev_path} -> [{next_desc}]: no improvement (baseline {baseline_loss.item():.6f})"
+            f"  AWQ {prev_path} -> [{next_desc}]: no improvement (baseline {baseline_val:.6f})"
         )
 
-    return best_scales
+    return best_scales, metric
 
 
 def _temporary_quantize_block(block, config, oq_level, group_size: int):
@@ -2441,6 +2494,7 @@ def _run_equalization_and_sensitivity(
     layer_masks = _layer_masks_for_model(model, layers, inputs)
     position_ids = mx.arange(calib_data.shape[1])[None, :]
     sensitivity = {}
+    awq_metrics: list[dict] = []
     total_layers = len(layers)
     equalized_count = 0
     start_time = _time.monotonic()
@@ -2456,13 +2510,26 @@ def _run_equalization_and_sensitivity(
 
         awq_pairs = _build_awq_pairs(block)
         layer_eq = 0
+        # Resolve full tensor paths for boost_map lookup
+        boost_map = config.get("_oq_boost_map") or {}
         for pair in awq_pairs:
-            bits, gs, mode = _get_predicate_bits(
-                pair["next_paths"][0], config, oq_level, _OQ_DEFAULT_GROUP_SIZE
-            )
+            # Match block-local path to full boost_map key via layer_idx
+            local_path = pair["next_paths"][0]
+            full_candidates = [
+                k for k in boost_map
+                if f"layers.{layer_idx}.{local_path}" in k
+            ]
+            if full_candidates:
+                bits, gs, mode = _get_predicate_bits(
+                    full_candidates[0], config, oq_level, _OQ_DEFAULT_GROUP_SIZE
+                )
+            else:
+                bits, gs, mode = _get_predicate_bits(
+                    local_path, config, oq_level, _OQ_DEFAULT_GROUP_SIZE
+                )
             if bits is None or bits < 4:
                 continue
-            scales = _run_awq_pair_search(
+            scales, metric = _run_awq_pair_search(
                 block,
                 pair,
                 captured,
@@ -2472,7 +2539,10 @@ def _run_equalization_and_sensitivity(
                 group_size=gs,
                 mode=mode,
                 n_grid=n_grid,
+                block_inputs=inputs,
             )
+            metric["layer_idx"] = layer_idx
+            awq_metrics.append(metric)
             if scales is not None:
                 equalized_count += 1
                 layer_eq += 1
@@ -2541,6 +2611,20 @@ def _run_equalization_and_sensitivity(
         ranked = sorted(sensitivity.items(), key=lambda x: -x[1])
         logger.info(f"oQ{oq_level:g}: layer sensitivity (descending): "
                      + ", ".join(f"L{i}={s:.4f}" for i, s in ranked))
+
+    if awq_metrics:
+        applied = [m for m in awq_metrics if m["applied"]]
+        if applied:
+            reductions = [m["reduction"] for m in applied]
+            avg_red = sum(reductions) / len(reductions)
+            min_red = min(reductions)
+            max_red = max(reductions)
+            logger.info(
+                f"oQ{oq_level:g}: AWQ metrics — {len(applied)}/{len(awq_metrics)} pairs applied, "
+                f"avg reduction={avg_red:.3f}, best={min_red:.3f}, worst={max_red:.3f}"
+            )
+        else:
+            logger.info(f"oQ{oq_level:g}: AWQ metrics — 0/{len(awq_metrics)} pairs applied")
 
     return sensitivity
 
