@@ -336,6 +336,24 @@ class TestIntOffsetCacheProxy:
         # Must return _idx (625), NOT offset[0] (500)
         assert proxy.offset == 625
 
+    def test_rotating_cache_returns_offset_not_idx(self):
+        """BatchRotatingKVCache proxy returns _offset (monotonic), not _idx (wraps).
+
+        BatchRotatingKVCache._idx wraps at max_size (e.g. 1024 → 0),
+        which breaks RoPE positions for sliding-window layers (Issue #353).
+        _offset is a monotonically increasing int that never wraps.
+        """
+        import mlx.core as mx
+        from omlx.models.vlm import _IntOffsetCacheProxy
+
+        cache = MagicMock(spec=[])
+        cache.offset = mx.array([1025])  # real per-request offset
+        cache._idx = 1  # wrapped buffer write position (1025 % 1024)
+        cache._offset = 1025  # monotonic counter (correct for RoPE)
+        proxy = _IntOffsetCacheProxy(cache)
+        # Must return _offset (1025), NOT _idx (1)
+        assert proxy.offset == 1025
+
     def test_batched_offset_without_idx_falls_back(self):
         """Non-BatchKVCache with mx.array offset uses [0] fallback."""
         import mlx.core as mx

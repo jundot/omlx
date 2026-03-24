@@ -47,6 +47,11 @@ class _IntOffsetCacheProxy:
     def offset(self):
         raw = self._cache.offset
         if isinstance(raw, mx.array):
+            # BatchRotatingKVCache: use _offset (monotonic int counter)
+            # instead of _idx which wraps at max_size and breaks RoPE
+            # positions for sliding-window layers (e.g. Gemma3).
+            if hasattr(self._cache, "_offset"):
+                return self._cache._offset
             # BatchKVCache: return _idx (buffer write index) instead of
             # per-element offset[0].  _idx matches the value used by
             # make_mask() to compute the attention mask's kv dimension.
