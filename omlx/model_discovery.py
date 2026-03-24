@@ -176,16 +176,16 @@ AUDIO_TTS_ARCHITECTURES = {
 
 # Known STS (speech-to-speech) model_type values
 AUDIO_STS_MODEL_TYPES = {
-    "moshi",
     "deepfilternet",
     "mossformer2",
+    "sam_audio",
 }
 
 # Known STS architectures
 AUDIO_STS_ARCHITECTURES = {
-    "MoshiSTSModel",
-    "MossFormer2SEModel",
     "DeepFilterNetModel",
+    "MossFormer2SEModel",
+    "SAMAudio",
     "LFM2AudioModel",
 }
 

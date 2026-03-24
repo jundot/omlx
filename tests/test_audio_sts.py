@@ -182,7 +182,7 @@ class TestSTSEndpointBasic:
     def test_different_model_names_accepted(self, server_sts_client):
         """Various STS model names are forwarded to the pool correctly."""
         client, mock_pool = server_sts_client
-        for model_name in ("moshi-v0.1", "mossformer2-se", "deepfilternet3"):
+        for model_name in ("mossformer2-se", "deepfilternet3", "sam-audio-base"):
             mock_pool.get_engine = AsyncMock(return_value=_make_mock_sts_engine())
             response = client.post(
                 "/v1/audio/process",
@@ -263,8 +263,8 @@ class TestSTSEngineUnit:
     def test_init(self):
         """STSEngine can be instantiated."""
         from omlx.engine.sts import STSEngine
-        engine = STSEngine("deepfilternet-model")
-        assert engine.model_name == "deepfilternet-model"
+        engine = STSEngine("mlx-community/DeepFilterNet-mlx")
+        assert engine.model_name == "mlx-community/DeepFilterNet-mlx"
 
     def test_get_stats_not_loaded(self):
         """get_stats() returns loaded=False when not started."""
@@ -284,24 +284,26 @@ class TestSTSEngineUnit:
 
     def test_family_detection_deepfilternet(self):
         """Family is detected as deepfilternet for matching model name."""
-        from omlx.engine.sts import STSEngine, _detect_sts_family
+        from omlx.engine.sts import _detect_sts_family
         assert _detect_sts_family("deepfilternet3") == "deepfilternet"
-        assert _detect_sts_family("mlx-community/DeepFilterNet3") == "deepfilternet"
+        assert _detect_sts_family("mlx-community/DeepFilterNet-mlx") == "deepfilternet"
 
     def test_family_detection_mossformer2(self):
         """Family is detected as mossformer2."""
         from omlx.engine.sts import _detect_sts_family
         assert _detect_sts_family("MossFormer2-SE-48K") == "mossformer2"
+        assert _detect_sts_family("starkdmi/MossFormer2-SE") == "mossformer2"
 
-    def test_family_detection_moshi(self):
-        """Family is detected as moshi."""
+    def test_family_detection_sam_audio(self):
+        """Family is detected as sam_audio."""
         from omlx.engine.sts import _detect_sts_family
-        assert _detect_sts_family("kyutai/moshiko-mlx-q8") == "moshi"
+        assert _detect_sts_family("mlx-community/sam-audio-base-fp16") == "sam_audio"
 
     def test_family_detection_lfm2(self):
         """Family is detected as lfm2."""
         from omlx.engine.sts import _detect_sts_family
         assert _detect_sts_family("mlx-community/LFM2.5-Audio-1B") == "lfm2"
+        assert _detect_sts_family("mlx-community/LFM2.5-Audio-1.5B-6bit") == "lfm2"
 
     def test_family_detection_generic(self):
         """Unknown model name returns 'generic'."""
@@ -319,10 +321,18 @@ class TestSTSEngineUnit:
     def test_get_stats_has_family(self):
         """get_stats() includes 'family' key."""
         from omlx.engine.sts import STSEngine
-        engine = STSEngine("kyutai/moshiko-mlx-q4")
+        engine = STSEngine("mlx-community/sam-audio-base-fp16")
         stats = engine.get_stats()
         assert "family" in stats
-        assert stats["family"] == "moshi"
+        assert stats["family"] == "sam_audio"
+
+    def test_start_rejects_generic_family(self):
+        """start() raises ValueError for unsupported 'generic' family."""
+        import asyncio
+        from omlx.engine.sts import STSEngine
+        engine = STSEngine("unknown-model-xyz")
+        with pytest.raises(ValueError, match="Unsupported STS model family"):
+            asyncio.run(engine.start())
 
 
 # ---------------------------------------------------------------------------
@@ -347,32 +357,111 @@ class TestSTSModelRequest:
 
 
 # ---------------------------------------------------------------------------
-# Integration test (slow, requires mlx-audio)
+# Integration tests (slow, requires mlx-audio + downloaded models)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.slow
-class TestSTSIntegration:
-    """Integration tests requiring a real mlx-audio STS model.
+class TestSTSIntegrationDeepFilterNet:
+    """Integration test for DeepFilterNet speech enhancement."""
 
-    Skip if mlx-audio is not installed or models are unavailable.
-    """
-
-    def test_real_processing_produces_wav(self, tmp_path):
-        """Real STS processing with small WAV and actual mlx-audio model."""
+    def test_enhance_produces_wav(self, tmp_path):
+        """DeepFilterNet enhancement returns valid WAV bytes."""
         pytest.importorskip("mlx_audio")
 
         from omlx.engine.sts import STSEngine
+        import asyncio
 
-        model_name = "mlx-community/DeepFilterNet3"
+        model_name = "mlx-community/DeepFilterNet-mlx"
         wav_path = tmp_path / "test.wav"
         wav_path.write_bytes(TINY_WAV)
 
         try:
-            import asyncio
             engine = STSEngine(model_name)
             asyncio.run(engine.start())
             result = asyncio.run(engine.process(str(wav_path)))
+            assert isinstance(result, bytes)
+            assert result[:4] == RIFF_MAGIC
+            asyncio.run(engine.stop())
+        except Exception as e:
+            pytest.skip(f"Could not run integration test: {e}")
+
+
+@pytest.mark.slow
+class TestSTSIntegrationMossFormer2:
+    """Integration test for MossFormer2 speech enhancement."""
+
+    def test_enhance_produces_wav(self, tmp_path):
+        """MossFormer2 enhancement returns valid WAV bytes."""
+        pytest.importorskip("mlx_audio")
+
+        from omlx.engine.sts import STSEngine
+        import asyncio
+
+        model_name = "starkdmi/MossFormer2-SE"
+        wav_path = tmp_path / "test.wav"
+        wav_path.write_bytes(TINY_WAV)
+
+        try:
+            engine = STSEngine(model_name)
+            asyncio.run(engine.start())
+            result = asyncio.run(engine.process(str(wav_path)))
+            assert isinstance(result, bytes)
+            assert result[:4] == RIFF_MAGIC
+            asyncio.run(engine.stop())
+        except Exception as e:
+            pytest.skip(f"Could not run integration test: {e}")
+
+
+@pytest.mark.slow
+class TestSTSIntegrationSAMAudio:
+    """Integration test for SAMAudio separation."""
+
+    def test_separate_produces_wav(self, tmp_path):
+        """SAMAudio separation returns valid WAV bytes."""
+        pytest.importorskip("mlx_audio")
+
+        from omlx.engine.sts import STSEngine
+        import asyncio
+
+        model_name = "mlx-community/sam-audio-base-fp16"
+        wav_path = tmp_path / "test.wav"
+        wav_path.write_bytes(TINY_WAV)
+
+        try:
+            engine = STSEngine(model_name)
+            asyncio.run(engine.start())
+            result = asyncio.run(engine.process(
+                str(wav_path), descriptions=["speech"]
+            ))
+            assert isinstance(result, bytes)
+            assert result[:4] == RIFF_MAGIC
+            asyncio.run(engine.stop())
+        except Exception as e:
+            pytest.skip(f"Could not run integration test: {e}")
+
+
+@pytest.mark.slow
+class TestSTSIntegrationLFM2:
+    """Integration test for LFM2.5-Audio speech-to-speech."""
+
+    def test_sts_produces_wav(self, tmp_path):
+        """LFM2 STS generation returns valid WAV bytes."""
+        pytest.importorskip("mlx_audio")
+
+        from omlx.engine.sts import STSEngine
+        import asyncio
+
+        model_name = "mlx-community/LFM2.5-Audio-1.5B-6bit"
+        wav_path = tmp_path / "test.wav"
+        wav_path.write_bytes(TINY_WAV)
+
+        try:
+            engine = STSEngine(model_name)
+            asyncio.run(engine.start())
+            result = asyncio.run(engine.process(
+                str(wav_path), max_new_tokens=64
+            ))
             assert isinstance(result, bytes)
             assert result[:4] == RIFF_MAGIC
             asyncio.run(engine.stop())

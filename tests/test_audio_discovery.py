@@ -297,16 +297,16 @@ class TestEstimateModelSizeAudio:
 class TestDetectSTSModelType:
     """Tests that STS model types are detected correctly."""
 
-    def test_moshi_model_type_returns_audio_sts(self, tmp_path):
-        """model_type='moshi' -> audio_sts."""
-        _write_config(tmp_path, {"model_type": "moshi"})
+    def test_sam_audio_model_type_returns_audio_sts(self, tmp_path):
+        """model_type='sam_audio' -> audio_sts."""
+        _write_config(tmp_path, {"model_type": "sam_audio"})
         assert detect_model_type(tmp_path) == "audio_sts"
 
-    def test_moshi_architecture_returns_audio_sts(self, tmp_path):
-        """MoshiSTSModel architecture -> audio_sts."""
+    def test_sam_audio_architecture_returns_audio_sts(self, tmp_path):
+        """SAMAudio architecture -> audio_sts."""
         _write_config(tmp_path, {
-            "model_type": "moshi",
-            "architectures": ["MoshiSTSModel"],
+            "model_type": "sam_audio",
+            "architectures": ["SAMAudio"],
         })
         assert detect_model_type(tmp_path) == "audio_sts"
 
@@ -346,15 +346,15 @@ class TestDetectSTSModelType:
 
     def test_sts_model_types_set_contains_expected_entries(self):
         """AUDIO_STS_MODEL_TYPES contains the three expected STS model families."""
-        assert "moshi" in AUDIO_STS_MODEL_TYPES
         assert "deepfilternet" in AUDIO_STS_MODEL_TYPES
         assert "mossformer2" in AUDIO_STS_MODEL_TYPES
+        assert "sam_audio" in AUDIO_STS_MODEL_TYPES
 
     def test_sts_architectures_set_contains_expected_entries(self):
         """AUDIO_STS_ARCHITECTURES contains the key architecture names."""
-        assert "MoshiSTSModel" in AUDIO_STS_ARCHITECTURES
         assert "DeepFilterNetModel" in AUDIO_STS_ARCHITECTURES
         assert "MossFormer2SEModel" in AUDIO_STS_ARCHITECTURES
+        assert "SAMAudio" in AUDIO_STS_ARCHITECTURES
         assert "LFM2AudioModel" in AUDIO_STS_ARCHITECTURES
 
 
@@ -366,17 +366,17 @@ class TestDetectSTSModelType:
 class TestDiscoverModelsIncludesSTS:
     """discover_models() must return STS models with correct engine_type."""
 
-    def test_discover_sts_moshi_model(self, tmp_path):
-        """Moshi STS model included in discover_models results."""
-        sts_dir = tmp_path / "moshiko-mlx-q8"
+    def test_discover_sts_sam_audio_model(self, tmp_path):
+        """SAMAudio STS model included in discover_models results."""
+        sts_dir = tmp_path / "sam-audio-base"
         _make_model(sts_dir, {
-            "model_type": "moshi",
-            "architectures": ["MoshiSTSModel"],
+            "model_type": "sam_audio",
+            "architectures": ["SAMAudio"],
         })
 
         models = discover_models(tmp_path)
-        assert "moshiko-mlx-q8" in models
-        assert models["moshiko-mlx-q8"].model_type == "audio_sts"
+        assert "sam-audio-base" in models
+        assert models["sam-audio-base"].model_type == "audio_sts"
 
     def test_discover_sts_engine_type(self, tmp_path):
         """STS model has engine_type='audio_sts'."""
@@ -439,13 +439,13 @@ class TestDiscoverModelsIncludesSTS:
 
     def test_discover_sts_has_correct_fields(self, tmp_path):
         """DiscoveredModel fields are populated correctly for an STS model."""
-        sts_dir = tmp_path / "moshi-base"
-        _make_model(sts_dir, {"model_type": "moshi"}, size=2048)
+        sts_dir = tmp_path / "sam-audio-fp16"
+        _make_model(sts_dir, {"model_type": "sam_audio"}, size=2048)
 
         models = discover_models(tmp_path)
-        model = models["moshi-base"]
+        model = models["sam-audio-fp16"]
 
-        assert model.model_id == "moshi-base"
+        assert model.model_id == "sam-audio-fp16"
         assert model.model_path == str(sts_dir)
         assert model.model_type == "audio_sts"
         assert model.engine_type == "audio_sts"
