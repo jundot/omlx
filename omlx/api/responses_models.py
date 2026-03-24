@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pydantic models for the OpenAI Responses API (/v1/responses)."""
 
+import json
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .shared_models import IDPrefix, generate_id, get_unix_timestamp
 
@@ -31,11 +32,26 @@ class InputItem(BaseModel):
     name: Optional[str] = None
     arguments: Optional[str] = None
     # function_call_output fields
-    output: Optional[str] = None
+    output: Optional[Union[str, List[Any], Dict[str, Any]]] = None
     # status field (present on many item types)
     status: Optional[str] = None
 
     model_config = {"extra": "allow"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _serialize_complex_output(cls, data: Any) -> Any:
+        """Serialize list/dict output to JSON string for compatibility.
+
+        Agent frameworks may send multimodal tool outputs (e.g. images) as
+        lists or dicts. Convert them to JSON strings so downstream code that
+        expects ``str`` keeps working.
+        """
+        if isinstance(data, dict):
+            output = data.get("output")
+            if isinstance(output, (list, dict)):
+                data = {**data, "output": json.dumps(output)}
+        return data
 
 
 class ResponsesTool(BaseModel):
