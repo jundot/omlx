@@ -361,16 +361,24 @@ class TestEmbeddingCompileFallback:
         import mlx.core as mx
         from omlx.models.embedding import MLXEmbeddingModel
 
+        class StandardTokenizer:
+            def encode(self, text, add_special_tokens=True):
+                del text, add_special_tokens
+                return [1, 2, 3]
+
+        class StandardProcessor:
+            def __init__(self):
+                self._tokenizer = StandardTokenizer()
+
         model = MLXEmbeddingModel("test-model")
         model._loaded = True
         model._is_compiled = True
         model._compiled_embed = MagicMock(side_effect=RuntimeError("compile fail"))
         model.model = MagicMock()
-        model.processor = MagicMock(spec=[])
-        model.processor._tokenizer = MagicMock()
+        model.processor = StandardProcessor()
 
         # Mock generate to return outputs with text_embeds
-        mock_outputs = MagicMock(spec=[])
+        mock_outputs = MagicMock()
         mock_outputs.text_embeds = mx.array([[0.1, 0.2, 0.3]])
         mock_outputs.pooler_output = None
         mock_outputs.last_hidden_state = None
@@ -403,6 +411,70 @@ class TestEmbeddingCompileFallback:
             result = model.embed(["test"])
 
         assert len(result.embeddings) == 1
+
+    def test_custom_processor_compiled_path_uses_prepare_embedding_inputs(self):
+        """Custom embedding processors should use their own prepare API."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = True
+        model._compiled_embed = MagicMock(return_value=mx.array([[0.1, 0.2]]))
+        model.model = MagicMock()
+
+        processor = MagicMock(spec=[])
+        processor.prepare_embedding_inputs = MagicMock(
+            return_value={
+                "input_ids": mx.array([[1, 2, 3]]),
+                "attention_mask": mx.array([[1, 1, 1]]),
+            }
+        )
+        model.processor = processor
+
+        with patch("mlx_embeddings.generate") as mock_generate:
+            result = model.embed(["hello world"])
+
+        processor.prepare_embedding_inputs.assert_called_once_with(
+            [{"text": "hello world"}], return_tensors="mlx"
+        )
+        mock_generate.assert_not_called()
+        assert result.embeddings[0] == pytest.approx([0.1, 0.2], abs=1e-5)
+
+    def test_custom_processor_eager_path_bypasses_generate(self):
+        """Custom embedding processors should bypass mlx_embeddings.generate()."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.3, 0.4, 0.5]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+        model.model = MagicMock(return_value=mock_outputs)
+
+        processor = MagicMock(spec=[])
+        processor.prepare_embedding_inputs = MagicMock(
+            return_value={
+                "input_ids": mx.array([[4, 5, 6]]),
+                "attention_mask": mx.array([[1, 1, 1]]),
+            }
+        )
+        model.processor = processor
+
+        with patch("mlx_embeddings.generate") as mock_generate:
+            result = model.embed(["hello world"])
+
+        processor.prepare_embedding_inputs.assert_called_once_with(
+            [{"text": "hello world"}], return_tensors="mlx"
+        )
+        mock_generate.assert_not_called()
+        model.model.assert_called_once()
+        assert result.embeddings[0] == pytest.approx([0.3, 0.4, 0.5], abs=1e-5)
 
 
 class TestEmbeddingEngine:
