@@ -2983,6 +2983,10 @@ class Scheduler:
         # Reset batch generator only (cache is not corrupted)
         self.batch_generator = None
         self._current_sampler_params = None
+        # Reclaim fragmented Metal buffers after generation failure.
+        # Without this, subsequent requests may hit the same resource
+        # limit even though Python references have been cleared.
+        _sync_and_clear_cache()
         return failed_ids
 
     def get_num_waiting(self) -> int:
@@ -3067,6 +3071,24 @@ class Scheduler:
         batch_specprefill_status: Optional[bool] = None
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
+            # Generation memory guard: when requests are already running,
+            # defer scheduling if memory pressure is high to prevent
+            # Metal allocation failures during batch_generator.next().
+            # First request always passes (self.running is empty).
+            if (
+                self._prefill_memory_guard
+                and self._memory_limit_bytes > 0
+                and self.running
+            ):
+                active = mx.get_active_memory()
+                if active > self._memory_limit_bytes:
+                    logger.debug(
+                        "Generation memory guard: deferring scheduling "
+                        "(%s > %s), %d running",
+                        active, self._memory_limit_bytes, len(self.running),
+                    )
+                    break
+
             request = self.waiting.popleft()
 
             # Ensure we have a batch generator

@@ -298,7 +298,7 @@ class MemorySettings:
     """Process-level memory enforcement settings."""
 
     max_process_memory: str = "auto"  # "auto" (RAM - 8GB), "disabled", or "XX%"
-    prefill_memory_guard: bool = True  # Estimate memory before prefill, reject if OOM
+    prefill_memory_guard: bool = True  # Memory guard: prefill estimation + generation scheduling defer
 
     def get_max_process_memory_bytes(self) -> int | None:
         """
