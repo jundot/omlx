@@ -484,7 +484,7 @@
             <!-- Messages -->
             <div x-show="messages.length > 0" class="max-w-4xl mx-auto px-4 py-6 space-y-4">
                 <template x-for="(msg, index) in messages" :key="index">
-                    <div class="message-fade-in">
+                    <div class="message-fade-in" x-show="msg._ui !== false">
                         <!-- User Message -->
                         <div x-show="msg.role === 'user'" class="flex justify-end">
                             <div class="user-message">
@@ -561,6 +561,15 @@
                                 </div>
                             </div>
                             <div class="message-body markdown-content" x-html="renderMarkdown(msg.content)"></div>
+                        </div>
+                        <!-- Tool call indicator (shown while model is fetching tool results) -->
+                        <div x-show="msg.role === 'tool_call'" class="assistant-message" style="border-left: 2px solid var(--border-normal); opacity: 0.8;">
+                            <div class="message-header">
+                                <div class="flex items-center gap-2 text-sm" style="color: var(--text-tertiary);">
+                                    <i data-lucide="wrench" class="w-3.5 h-3.5"></i>
+                                    <span x-text="msg.content"></span>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </template>
@@ -1120,11 +1129,15 @@
                 this.abortController = new AbortController();
                 this.autoScrollEnabled = true; // Enable auto-scroll at start of streaming
 
-                // Build messages for API - strip metadata, keep content as-is (already OpenAI format)
-                const messagesForApi = this.messages.map(msg => ({
-                    role: msg.role,
-                    content: msg.content
-                }));
+                // Build messages for API - pass through tool_calls/tool_call_id for MCP loop
+                const messagesForApi = this.messages
+                    .filter(msg => ['user', 'assistant', 'tool', 'system'].includes(msg.role))
+                    .map(msg => {
+                        const m = { role: msg.role, content: msg.content ?? null };
+                        if (msg.tool_calls) m.tool_calls = msg.tool_calls;
+                        if (msg.tool_call_id) m.tool_call_id = msg.tool_call_id;
+                        return m;
+                    });
 
                 try {
                     const response = await fetch('/v1/chat/completions', {
@@ -1149,6 +1162,8 @@
                     const reader = response.body.getReader();
                     const decoder = new TextDecoder();
                     let buffer = '';
+                    const toolCallsMap = {}; // accumulate streaming tool_call chunks by index
+                    let finishReason = null;
 
                     while (true) {
                         const { done, value } = await reader.read();
@@ -1164,7 +1179,21 @@
                             if (line.startsWith('data: ')) {
                                 try {
                                     const data = JSON.parse(line.slice(6));
-                                    const delta = data.choices?.[0]?.delta;
+                                    const choice = data.choices?.[0];
+                                    const delta = choice?.delta;
+                                    if (choice?.finish_reason) finishReason = choice.finish_reason;
+
+                                    // Accumulate tool_call argument chunks
+                                    if (delta?.tool_calls) {
+                                        for (const tc of delta.tool_calls) {
+                                            const i = tc.index ?? 0;
+                                            if (!toolCallsMap[i]) toolCallsMap[i] = { id: '', type: 'function', function: { name: '', arguments: '' } };
+                                            if (tc.id) toolCallsMap[i].id = tc.id;
+                                            if (tc.function?.name) toolCallsMap[i].function.name += tc.function.name;
+                                            if (tc.function?.arguments) toolCallsMap[i].function.arguments += tc.function.arguments;
+                                        }
+                                    }
+
                                     if (delta?.reasoning_content) {
                                         // Wrap reasoning in <think> tags for UI rendering
                                         if (!this.thinkingState.isInThinking) {
@@ -1198,6 +1227,58 @@
                         this.streamingContent += `</think data-elapsed="${elapsed}">`;
                         this.thinkingState.isInThinking = false;
                     }
+
+                    // --- MCP tool call loop ---
+                    const toolCalls = Object.values(toolCallsMap);
+                    if (finishReason === 'tool_calls' && toolCalls.length > 0) {
+                        // Store the assistant tool_calls message (hidden from UI)
+                        this.messages.push({
+                            role: 'assistant',
+                            content: this.streamingContent || null,
+                            tool_calls: toolCalls,
+                            _ui: false,
+                        });
+
+                        // Execute all tools in parallel, show indicators while waiting
+                        const indicatorIndices = toolCalls.map(() => {
+                            const idx = this.messages.length;
+                            this.messages.push({ role: 'tool_call', content: '', _ui: true });
+                            return idx;
+                        });
+
+                        const results = await Promise.all(toolCalls.map(async (tc, i) => {
+                            const toolName = tc.function.name;
+                            let args = {};
+                            try { args = JSON.parse(tc.function.arguments || '{}'); } catch(e) {}
+                            this.messages[indicatorIndices[i]].content = `${toolName}…`;
+
+                            try {
+                                const execResp = await fetch('/v1/mcp/execute', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.getApiKey()}` },
+                                    body: JSON.stringify({ tool_name: toolName, arguments: args }),
+                                    signal: this.abortController?.signal,
+                                });
+                                const execData = await execResp.json();
+                                return typeof execData.content === 'string' ? execData.content : JSON.stringify(execData.content ?? execData);
+                            } catch(e) {
+                                return `Error: ${e.message}`;
+                            }
+                        }));
+
+                        // Remove all indicators, push hidden tool result messages in order
+                        indicatorIndices.slice().reverse().forEach(idx => this.messages.splice(idx, 1));
+                        toolCalls.forEach((tc, i) => {
+                            this.messages.push({ role: 'tool', tool_call_id: tc.id, content: results[i], _ui: false });
+                        });
+
+                        this.saveCurrentChat();
+                        this.streamingContent = '';
+                        // Loop back — model will now synthesize a final answer
+                        await this.streamResponse();
+                        return;
+                    }
+                    // --- end MCP tool call loop ---
 
                     // Add completed message
                     if (this.streamingContent) {
