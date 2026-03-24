@@ -105,6 +105,19 @@ class TestDetectAudioModelType:
         })
         assert detect_model_type(tmp_path) == "audio_tts"
 
+    def test_vibevoice_model_type_returns_audio_tts(self, tmp_path):
+        """model_type='vibevoice' (no architecture) -> audio_tts."""
+        _write_config(tmp_path, {"model_type": "vibevoice"})
+        assert detect_model_type(tmp_path) == "audio_tts"
+
+    def test_vibevoice_streaming_architecture_returns_audio_tts(self, tmp_path):
+        """VibeVoice streaming architecture -> audio_tts."""
+        _write_config(tmp_path, {
+            "model_type": "vibevoice_streaming",
+            "architectures": ["VibeVoiceStreamingForConditionalGenerationInference"],
+        })
+        assert detect_model_type(tmp_path) == "audio_tts"
+
 
 # ---------------------------------------------------------------------------
 # TestAudioNotUnsupported
@@ -323,13 +336,13 @@ class TestDetectSTSModelType:
         })
         assert detect_model_type(tmp_path) == "audio_sts"
 
-    def test_mossformer2_model_type_returns_audio_sts(self, tmp_path):
-        """model_type='mossformer2' -> audio_sts."""
-        _write_config(tmp_path, {"model_type": "mossformer2"})
+    def test_mossformer2_se_model_type_returns_audio_sts(self, tmp_path):
+        """model_type='mossformer2_se' (mlx-audio dir name) -> audio_sts."""
+        _write_config(tmp_path, {"model_type": "mossformer2_se"})
         assert detect_model_type(tmp_path) == "audio_sts"
 
     def test_mossformer2_architecture_returns_audio_sts(self, tmp_path):
-        """MossFormer2SEModel architecture -> audio_sts."""
+        """MossFormer2SEModel architecture -> audio_sts (regardless of model_type)."""
         _write_config(tmp_path, {
             "model_type": "mossformer2",
             "architectures": ["MossFormer2SEModel"],
@@ -345,9 +358,10 @@ class TestDetectSTSModelType:
         assert detect_model_type(tmp_path) == "audio_sts"
 
     def test_sts_model_types_set_contains_expected_entries(self):
-        """AUDIO_STS_MODEL_TYPES contains the three expected STS model families."""
+        """AUDIO_STS_MODEL_TYPES contains the expected STS model families."""
+        # When mlx-audio is installed these come from directory scanning;
+        # names use underscores matching the mlx-audio module dirs.
         assert "deepfilternet" in AUDIO_STS_MODEL_TYPES
-        assert "mossformer2" in AUDIO_STS_MODEL_TYPES
         assert "sam_audio" in AUDIO_STS_MODEL_TYPES
 
     def test_sts_architectures_set_contains_expected_entries(self):

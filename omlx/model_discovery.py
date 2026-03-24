@@ -146,42 +146,93 @@ UNSUPPORTED_MODEL_TYPES: set[str] = set()
 
 UNSUPPORTED_ARCHITECTURES: set[str] = set()
 
-# Known STT (speech-to-text) model_type values
-AUDIO_STT_MODEL_TYPES = {
-    "whisper",
-    "qwen3_asr",
-    "parakeet",
-}
+# ---------------------------------------------------------------------------
+# Audio model detection — dynamically loaded from mlx-audio when available
+# ---------------------------------------------------------------------------
+#
+# mlx-audio maintains MODEL_REMAPPING dicts (model_type → module directory)
+# and model directories under mlx_audio/{stt,tts,sts}/models/. We read these
+# at import time so oMLX automatically recognises new audio model families
+# when mlx-audio is updated.  Falls back to static sets when mlx-audio is
+# not installed.
+#
+# Some base LLM model_types (qwen3, llama, …) collide with mlx-audio TTS
+# model directory names because mlx-audio extends these architectures for
+# audio.  We exclude them so a plain Qwen3 LLM is not misdetected as TTS.
 
-# Known TTS (text-to-speech) model_type values
-AUDIO_TTS_MODEL_TYPES = {
-    "qwen3_tts",
-    "kokoro",
-    "chatterbox",
-}
+_LLM_TYPE_COLLISIONS = {"qwen3", "llama", "dense"}
 
-# Known STT architectures
+
+def _build_audio_detection_sets():
+    """Build STT/TTS/STS model-type sets from mlx-audio at import time.
+
+    Returns (stt_types, tts_types, sts_types) where each is a set of
+    model_type strings that should trigger audio detection.
+    """
+    try:
+        from pathlib import Path as _P
+
+        import mlx_audio as _mla
+
+        _base = _P(_mla.__file__).parent
+
+        def _dir_names(subdir: str) -> set:
+            d = _base / subdir / "models"
+            if d.is_dir():
+                return {p.name for p in d.iterdir()
+                        if p.is_dir() and not p.name.startswith("__")}
+            return set()
+
+        # TTS: MODEL_REMAPPING keys + model dir names
+        from mlx_audio.tts.utils import MODEL_REMAPPING as _tts_remap
+        tts = set(_tts_remap.keys()) | _dir_names("tts")
+
+        # STT: MODEL_REMAPPING keys + model dir names
+        from mlx_audio.stt.utils import MODEL_REMAPPING as _stt_remap
+        stt = set(_stt_remap.keys()) | _dir_names("stt")
+
+        # STS: model dir names only (no unified utils/remapping)
+        sts = _dir_names("sts")
+
+        # Strip base-LLM names that collide with audio model dirs
+        tts -= _LLM_TYPE_COLLISIONS
+        stt -= _LLM_TYPE_COLLISIONS
+
+        logger.debug(
+            "Audio detection sets loaded from mlx-audio: "
+            "STT=%d, TTS=%d, STS=%d", len(stt), len(tts), len(sts),
+        )
+        return stt, tts, sts
+
+    except ImportError:
+        logger.debug("mlx-audio not installed — using static audio detection sets")
+        # Static fallback so model discovery still works without mlx-audio
+        _stt = {"whisper", "qwen3_asr", "parakeet"}
+        _tts = {"qwen3_tts", "kokoro", "chatterbox"}
+        _sts = {"deepfilternet", "mossformer2_se", "sam_audio", "lfm_audio"}
+        return _stt, _tts, _sts
+
+
+AUDIO_STT_MODEL_TYPES, AUDIO_TTS_MODEL_TYPES, AUDIO_STS_MODEL_TYPES = (
+    _build_audio_detection_sets()
+)
+
+# Architecture-based detection — these are checked before model_type and
+# are always static because architecture strings are stable identifiers.
 AUDIO_STT_ARCHITECTURES = {
     "WhisperForConditionalGeneration",
     "Qwen3ASRForConditionalGeneration",
     "ParakeetForCTC",
 }
 
-# Known TTS architectures
 AUDIO_TTS_ARCHITECTURES = {
     "KokoroForConditionalGeneration",
     "Qwen3TTSForConditionalGeneration",
     "ChatterboxForConditionalGeneration",
+    "VibeVoiceForConditionalGeneration",
+    "VibeVoiceStreamingForConditionalGenerationInference",
 }
 
-# Known STS (speech-to-speech) model_type values
-AUDIO_STS_MODEL_TYPES = {
-    "deepfilternet",
-    "mossformer2",
-    "sam_audio",
-}
-
-# Known STS architectures
 AUDIO_STS_ARCHITECTURES = {
     "DeepFilterNetModel",
     "MossFormer2SEModel",
@@ -357,25 +408,28 @@ def detect_model_type(model_path: Path) -> ModelType:
     # Check for audio models — architectures take priority over model_type.
     # Only top-level architectures/model_type are inspected; nested audio_config
     # inside multimodal models (e.g., MiniCPM-o) does not trigger this path.
+    #
+    # Architecture check first (unambiguous):
     for arch in architectures:
         if arch in AUDIO_STT_ARCHITECTURES:
             return "audio_stt"
     for arch in architectures:
         if arch in AUDIO_TTS_ARCHITECTURES:
             return "audio_tts"
-    if normalized_type in AUDIO_STT_MODEL_TYPES or model_type in AUDIO_STT_MODEL_TYPES:
-        return "audio_stt"
-    if normalized_type in AUDIO_TTS_MODEL_TYPES or model_type in AUDIO_TTS_MODEL_TYPES:
-        return "audio_tts"
-
-    # Check for STS (speech-to-speech): architectures first, then model_type.
-    # Also detect LFM2 audio models by architecture or "lfm" model_type prefix.
     for arch in architectures:
         if arch in AUDIO_STS_ARCHITECTURES:
             return "audio_sts"
+
+    # model_type check (dynamically loaded from mlx-audio when available).
+    # Check TTS before STT because some model_type values (e.g. "vibevoice")
+    # appear in both sets — TTS is the more common category for these.
+    if normalized_type in AUDIO_TTS_MODEL_TYPES or model_type in AUDIO_TTS_MODEL_TYPES:
+        return "audio_tts"
+    if normalized_type in AUDIO_STT_MODEL_TYPES or model_type in AUDIO_STT_MODEL_TYPES:
+        return "audio_stt"
     if normalized_type in AUDIO_STS_MODEL_TYPES or model_type in AUDIO_STS_MODEL_TYPES:
         return "audio_sts"
-    # LFM2 audio: model_type contains "lfm" prefix and not already an embedding
+    # LFM2 audio: model_type starts with "lfm" and is not an embedding
     if normalized_type.startswith("lfm") and normalized_type not in EMBEDDING_MODEL_TYPES:
         return "audio_sts"
 
