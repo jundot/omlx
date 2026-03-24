@@ -55,6 +55,11 @@ MODELS = {
         "desc": "RotatingKVCache+KVCache hybrid (gpt-oss-120b)",
         "expect_on_off_match": False,  # chunk size differs, quality-only check
     },
+    "rotating_vlm": {
+        "path": "/Users/cryingneko/Workspace/models/gemma-3-12b-it-qat-4bit",
+        "desc": "RotatingKVCache+KVCache VLM hybrid (Gemma3-12B-QAT)",
+        "expect_on_off_match": False,  # chunk size differs for RotatingKVCache
+    },
 }
 
 
