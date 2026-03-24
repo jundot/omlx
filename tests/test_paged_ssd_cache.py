@@ -6,7 +6,9 @@ This module tests SSD-based storage for paged KV cache blocks,
 enabling larger effective cache sizes than GPU memory allows.
 """
 
+import errno
 import json
+import logging
 import shutil
 import time
 from pathlib import Path
@@ -1130,6 +1132,37 @@ class TestAsyncWriteAndTimeoutLoad:
         with ssd_cache._pending_write_hashes_lock:
             assert block_hash not in ssd_cache._pending_write_hashes
 
+    def test_writer_enospc_logs_disk_full(self, ssd_cache, mx, caplog):
+        """ENOSPC errors should log 'disk full' warning, not generic error."""
+        block_hash = b"enospc_test_hash_123"
+        cache_data = [
+            (mx.zeros((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))
+        ]
+
+        enospc = OSError("No space left on device")
+        enospc.errno = errno.ENOSPC
+
+        import time as time_mod
+        with (
+            patch(
+                "omlx.cache.paged_ssd_cache._write_safetensors_no_mx",
+                side_effect=enospc,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            ssd_cache.save_block(
+                block_hash=block_hash,
+                cache_data=cache_data,
+                token_count=16,
+            )
+            for _ in range(50):
+                if ssd_cache._write_queue.empty():
+                    break
+                time_mod.sleep(0.05)
+            time_mod.sleep(0.1)
+
+        assert "SSD cache disk full" in caplog.text
+
     def test_graceful_shutdown(self, tmp_path, mx):
         """Verify close() stops the writer thread."""
         manager = PagedSSDCacheManager(
@@ -1544,3 +1577,41 @@ class TestEffectiveMaxSize:
         with patch("shutil.disk_usage", return_value=mock_usage):
             assert manager.max_size < 200 * 1024**3
             assert manager.configured_max_size == 200 * 1024**3
+
+    def test_oserror_fallback_logs_warning(self, tmp_path: Path, caplog):
+        """disk_usage failure should log a warning, not fail silently."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=50 * 1024**3,
+        )
+        # Expire cache so next call hits disk_usage
+        manager._disk_usage_cache_time -= 31.0
+
+        with (
+            patch("shutil.disk_usage", side_effect=OSError("mount gone")),
+            caplog.at_level(logging.WARNING),
+        ):
+            effective = manager._get_effective_max_size()
+
+        assert effective == 50 * 1024**3
+        assert "Failed to check disk usage" in caplog.text
+
+    def test_disk_pressure_warning(self, tmp_path: Path, caplog):
+        """Warn when effective max drops below 10% of configured max."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=100 * 1024**3,
+        )
+
+        # Simulate nearly full disk: only 5GB free, cache has 0 bytes
+        mock_usage = self._make_disk_usage(
+            total=500 * 1024**3, used=495 * 1024**3, free=5 * 1024**3
+        )
+        with (
+            patch("shutil.disk_usage", return_value=mock_usage),
+            caplog.at_level(logging.WARNING),
+        ):
+            manager._enforce_size_limit_for_new_block()
+
+        assert "disk pressure" in caplog.text
+        assert "disk nearly full" in caplog.text

@@ -16,6 +16,7 @@ Reference: mlx-lm/mlx_lm/models/cache.py (save_prompt_cache, load_prompt_cache)
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -548,6 +549,7 @@ class PagedSSDCacheManager(CacheManager):
         # Disk usage cache for dynamic effective max size (30s TTL)
         self._disk_usage_cache = None  # type: shutil._ntuple_diskusage | None
         self._disk_usage_cache_time: float = 0.0
+        self._last_disk_pressure_warn: float = 0.0
 
         # Statistics
         self._stats = {
@@ -589,10 +591,19 @@ class PagedSSDCacheManager(CacheManager):
         hot_info = ""
         if self._hot_cache_enabled:
             hot_info = f", hot_cache={format_bytes(hot_cache_max_bytes)}"
+        # Log initialization with disk space info
+        try:
+            du = shutil.disk_usage(self._cache_dir)
+            disk_info = (
+                f", disk_free={format_bytes(du.free)}, "
+                f"cache_used={format_bytes(self._index.total_size)}"
+            )
+        except OSError:
+            disk_info = ""
         logger.info(
             f"PagedSSDCacheManager initialized: dir={self._cache_dir}, "
             f"max_size={format_bytes(max_size_bytes)}{hot_info}, "
-            f"existing_files={self._index.count}"
+            f"existing_files={self._index.count}{disk_info}"
         )
 
     # --- Hot cache helpers ---
@@ -881,9 +892,19 @@ class PagedSSDCacheManager(CacheManager):
                         pass
 
             except Exception as e:
-                logger.error(
-                    f"Background write failed for {block_hash.hex()[:16]}: {e}"
-                )
+                if isinstance(e, OSError) and e.errno in (
+                    errno.ENOSPC,
+                    errno.EDQUOT,
+                ):
+                    logger.warning(
+                        f"SSD cache disk full, cannot write block "
+                        f"{block_hash.hex()[:16]}: {e}"
+                    )
+                else:
+                    logger.error(
+                        f"Background write failed for "
+                        f"{block_hash.hex()[:16]}: {e}"
+                    )
                 self._stats["errors"] += 1
                 # Remove from index since file wasn't written
                 self._index.remove(block_hash)
@@ -1537,7 +1558,11 @@ class PagedSSDCacheManager(CacheManager):
         ):
             try:
                 self._disk_usage_cache = shutil.disk_usage(self._cache_dir)
-            except OSError:
+            except OSError as e:
+                logger.warning(
+                    f"Failed to check disk usage for SSD cache dir "
+                    f"{self._cache_dir}: {e}"
+                )
                 return self._max_size
             self._disk_usage_cache_time = now
 
@@ -1551,6 +1576,19 @@ class PagedSSDCacheManager(CacheManager):
         estimated_new_size = 1 * 1024 * 1024
 
         effective_max = self._get_effective_max_size()
+
+        # Warn when disk pressure shrinks effective limit well below configured
+        # (throttled to once per 60s to avoid log spam)
+        if effective_max < self._max_size * 0.1:
+            now = time.monotonic()
+            if now - self._last_disk_pressure_warn > 60.0:
+                self._last_disk_pressure_warn = now
+                logger.warning(
+                    f"SSD cache disk pressure: effective limit "
+                    f"{format_bytes(effective_max)} "
+                    f"(configured {format_bytes(self._max_size)}), "
+                    f"disk nearly full"
+                )
         target_size = effective_max - estimated_new_size
         if target_size < 0:
             target_size = int(effective_max * 0.9)
