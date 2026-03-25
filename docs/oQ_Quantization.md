@@ -38,22 +38,22 @@ Quantization should not be exclusive to any particular inference server. oQ prod
 
 Base format is affine quantization (group_size=64) for all levels except 8-bit, which uses mxfp8 (group_size=32).
 
-oQ and oQ+ share the same levels. oQ+ adds AWQ weight equalization before quantization.
+oQ and oQ+ share the same levels. oQ+ adds GPTQ-based weight optimization before quantization.
 
 ## Pipeline
 
 ### oQ+ (Enhanced)
 
 ```
-1. Load model
-2. Measure per-layer sensitivity (relative MSE on original weights)
+1. Load model (full)
+2. Measure per-layer sensitivity (relative MSE)
 3. Build budget plan (sensitivity-driven bit allocation)
-4. AWQ weight equalization (uses actual target bits from plan)
+4. GPTQ weight optimization (all quantizable weights)
 5. Quantize with mixed-precision predicate
 6. Save
 ```
 
-Sensitivity is measured before AWQ so the budget plan knows the true per-layer importance. AWQ then uses the plan's assigned bits for each tensor during its grid search, ensuring the equalization is optimized for the actual quantization configuration.
+The GPTQ step uses Hessian-based error compensation to optimize rounding decisions for every quantizable weight in the model. For MoE models, this includes all routed expert weights (typically 90%+ of total parameters), which are processed using a batched algorithm that handles all experts in a layer simultaneously.
 
 ### oQ (Streaming)
 
@@ -73,8 +73,8 @@ Sensitivity is measured before AWQ so the budget plan knows the true per-layer i
 | Tensor | Treatment |
 |--------|-----------|
 | lm_head | 8-bit (within budget) |
-| MoE router | fp16 |
-| shared_expert_gate | fp16 |
+| MoE router | 8-bit |
+| shared_expert_gate | 8-bit |
 | Vision encoder | fp16 |
 | SSM state params | fp32 |
 
@@ -110,39 +110,38 @@ No budget plan. Position-based heuristics only:
 - Sensitive layers (first/last 12.5%): base+1
 - Everything else: base
 
-## AWQ Weight Equalization
+## GPTQ Weight Optimization
 
-AWQ inserts per-channel scaling factors between adjacent layers. The math cancels out so the model output is unchanged:
+oQ+ uses an optimized implementation of GPTQ (Frantar et al., [arXiv:2210.17323](https://arxiv.org/abs/2210.17323)) to improve quantization quality without changing the output format or inference speed.
 
-```
-Y = (LayerNorm(X) / s) @ (W * s) = LayerNorm(X) @ W
-```
+### How It Works
 
-Scale is computed using the duo_scaling formula with grid search over 20 ratios:
+Standard quantization rounds each weight to the nearest quantization grid point. GPTQ takes a smarter approach: it processes weights column by column, and when rounding one column introduces error, it adjusts the remaining columns to compensate. The adjustment direction is guided by the inverse Hessian of the calibration inputs, which captures how each weight column affects the layer's output.
 
 ```
-scales = x_mean^r / (w_mean^(1-r) + 1e-4)
-scales = scales / sqrt(max(scales) * min(scales))
+For each column i:
+    q[i] = round_to_grid(w[i])
+    error = (w[i] - q[i]) / H_inv[i, i]
+    w[i+1:] -= error * H_inv[i, i+1:]    # compensate remaining columns
 ```
 
-Scaling is only applied when it measurably reduces quantization error.
+The result is the same 4-bit quantized format — identical structure, identical inference speed — but with rounding decisions that minimize actual output error rather than per-element error.
 
-### AWQ Pairs
+### MoE Batched Processing
 
-Each smooth layer appears in exactly one pair to prevent double-scaling:
+In MoE models, routed experts make up 90%+ of all parameters. Processing them one at a time would take hours. oQ solves this with batched expert GPTQ: all experts in a layer share the same Hessian (since they receive the same input hidden states), so the column-by-column optimization can run on all experts simultaneously as a single batched operation.
 
-| Pair | Smooth Layer | Balance Layers |
-|------|-------------|---------------|
-| 1 | input_layernorm | q/k/v_proj (self_attn) OR in_proj_* (linear_attn) |
-| 2 | v_proj | o_proj (skipped for GQA mismatch) |
-| 3 | post_attention_layernorm | All gate/up_proj (shared + routed, single pair) |
-| 4 | up_proj | down_proj (per component: shared expert, routed expert, dense) |
+For Qwen3.5-35B-A3B (256 experts × 40 layers):
+- Per-expert sequential: ~90 minutes
+- Batched: **~6 minutes** (15x speedup, identical results)
 
-For hybrid attention models (Qwen3.5), `is_linear` determines which attention pair to generate per block. Norm is never scaled twice.
+### Calibration-Aware Bits
 
-### Dtype Preservation
+The GPTQ optimization uses the actual target bits assigned by the sensitivity budget plan. If a tensor is boosted to 6-bit, the error compensation optimizes for 6-bit quantization boundaries — not the base 4-bit. This eliminates the mismatch between optimization and final quantization.
 
-AWQ scales are computed in float32 but applied back in the original weight dtype (typically bfloat16). This prevents float32 promotion that would double the scale/bias overhead in the output.
+### Weight Integrity
+
+Unlike smoothing-based methods that modify normalization weights to redistribute quantization difficulty, oQ's GPTQ implementation only adjusts the rounding of weights that will be quantized. Non-quantized weights (norms, biases) remain untouched, preserving the model's original computation graph.
 
 ## Streaming Quantization
 
@@ -150,7 +149,7 @@ For large models (70B+), the streaming path processes tensors one at a time via 
 
 - No full model instantiation.
 - Shards flushed at 5 GB boundary.
-- All tensors saved in original dtype.
+- Non-quantized float32 weights cast to bfloat16 for inference parity.
 - Sensitivity measurement requires temporary model load (peak memory ≈ model size).
 
 ## Calibration Data
@@ -175,29 +174,21 @@ Code samples include real-world patterns (class definitions, import chains, mult
 
 ### Enhanced Path (oQ+)
 
-| Architecture | AWQ Equalization | Notes |
-|-------------|-----------------|-------|
-| Qwen3.5 MoE (hybrid attn) | Full | is_linear-aware pair generation |
+| Architecture | GPTQ Optimization | Notes |
+|-------------|-------------------|-------|
+| Qwen3.5 MoE (hybrid attn) | Full (batched experts) | Validated with benchmarks |
 | Qwen3.5 dense (hybrid attn) | Full | Same hybrid handling |
-| MiniMax-M2.5 MoE | Full | block_sparse_moe support |
-| DeepSeek V3.2 MoE (MLA) | MLP only | MLA attention pairs not yet implemented |
-| GLM MoE (MLA) | MLP only | Same MLA limitation |
-| Llama, Mistral, dense models | Full | Standard pair structure |
-| Devstral-2 (Ministral3) | Full | Standard dense transformer |
+| MiniMax-M2.5 MoE | Full | Per-expert dense GPTQ |
+| GLM MoE | Full | Fused expert support |
+| Step-3.5 MoE | Full | `moe.*_proj` fused support |
+| Nemotron-Cascade MoE | Full | Per-expert dense GPTQ |
+| Llama, Mistral, dense models | Full | Standard layer structure |
 | VLM models | Full (text) | Vision weights kept fp16 |
 
 ### Streaming Path (oQ)
 
 All models supported by mlx-lm/mlx-vlm. No architecture restrictions.
 
-### AWQ Not Yet Supported
-
-These models can be quantized with oQ (streaming) but AWQ equalization is not available:
-
-| Architecture | Reason |
-|-------------|--------|
-| Nemotron-H | Non-standard structure (single `mixer` module, no layernorm split) |
-
 ## Acknowledgments
 
-oQ's AWQ weight equalization is based on the [AutoAWQ](https://github.com/casper-hansen/AutoAWQ) duo_scaling formula. The MoE pair structure and single-smooth-layer constraint were validated against [llm-compressor](https://github.com/vllm-project/llm-compressor) by the vLLM project.
+oQ's weight optimization is based on the GPTQ algorithm by Frantar et al. The batched expert processing and MoE-aware Hessian sharing are oQ-specific optimizations. Sensitivity-driven budget allocation was inspired by approaches in [llm-compressor](https://github.com/vllm-project/llm-compressor) and [GGUF K-quants](https://github.com/ggml-org/llama.cpp).

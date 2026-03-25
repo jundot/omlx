@@ -269,7 +269,6 @@
             oqClipSeqLen: 512,
             oqCalibDataset: 'code_multilingual',
             oqClipBatchSize: 1024,
-            oqNGrid: 10,
             oqSensitivityModelPath: '',
 
             // oQ Uploader state
@@ -2679,7 +2678,6 @@
                             clip_seq_length: this.oqClipSeqLen,
                             calib_dataset: this.oqCalibDataset,
                             clip_batch_size: this.oqClipBatchSize,
-                            n_grid: this.oqNGrid,
                             sensitivity_model_path: this.oqSensitivityModelPath,
                             text_only: this.oqTextOnly,
                         }),

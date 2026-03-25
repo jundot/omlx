@@ -205,10 +205,8 @@ class OQStartRequest(BaseModel):
     group_size: int = 64
     clip_num_samples: int = 128
     clip_seq_length: int = 512
-    clip_n_grid: int = 20
     calib_dataset: str = "default"
     clip_batch_size: int = 1024
-    n_grid: int = 10
     sensitivity_model_path: str = ""
     text_only: bool = False
 
@@ -3648,10 +3646,8 @@ async def start_oq_quantization(
             group_size=request.group_size,
             clip_num_samples=request.clip_num_samples,
             clip_seq_length=request.clip_seq_length,
-            clip_n_grid=request.clip_n_grid,
             calib_dataset=request.calib_dataset,
             clip_batch_size=request.clip_batch_size,
-            n_grid=request.n_grid,
             sensitivity_model_path=request.sensitivity_model_path,
             text_only=request.text_only,
         )

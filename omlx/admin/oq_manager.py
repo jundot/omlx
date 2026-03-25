@@ -68,10 +68,8 @@ class QuantTask:
     group_size: int = 64
     clip_num_samples: int = 128
     clip_seq_length: int = 512
-    clip_n_grid: int = 20
     calib_dataset: str = "default"
     clip_batch_size: int = 1024
-    n_grid: int = 10
     sensitivity_model_path: str = ""
     text_only: bool = False
 
@@ -244,10 +242,8 @@ class OQManager:
         group_size: int = 64,
         clip_num_samples: int = 128,
         clip_seq_length: int = 512,
-        clip_n_grid: int = 20,
         calib_dataset: str = "default",
         clip_batch_size: int = 1024,
-        n_grid: int = 10,
         sensitivity_model_path: str = "",
         text_only: bool = False,
     ) -> QuantTask:
@@ -315,10 +311,8 @@ class OQManager:
             group_size=group_size,
             clip_num_samples=clip_num_samples,
             clip_seq_length=clip_seq_length,
-            clip_n_grid=clip_n_grid,
             calib_dataset=calib_dataset,
             clip_batch_size=clip_batch_size,
-            n_grid=n_grid,
             sensitivity_model_path=sensitivity_model_path,
             text_only=text_only,
         )
@@ -448,7 +442,7 @@ class OQManager:
                 )
 
                 if task.enable_clip:
-                    # Full model load + clip optimization
+                    # Full model load + GPTQ optimization
                     from ..oq import quantize_oq
 
                     await asyncio.to_thread(
@@ -465,7 +459,6 @@ class OQManager:
                         task.clip_seq_length,
                         None,  # target_bpw
                         None,  # hard_cap_bpw
-                        task.n_grid,
                         task.sensitivity_model_path,
                     )
                 else:
@@ -570,7 +563,7 @@ class OQManager:
         labels = {
             "loading": "Loading model...",
             "quantizing": f"Quantizing to oQ{oq_level:g}...",
-            "optimizing": f"Clip optimization oQ{oq_level:g}...",
+            "optimizing": f"GPTQ optimization oQ{oq_level:g}...",
             "saving": "Saving quantized model...",
         }
         # Handle progress: "quantizing_eta|792|879|0:02"

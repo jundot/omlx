@@ -1110,10 +1110,10 @@
                                         {{ t('models.oq.advanced_settings') }}
                                     </button>
                                     <div x-show="oqAdvancedOpen" x-cloak class="mt-3 space-y-3 pl-1">
-                                        <!-- Clip Optimization -->
+                                        <!-- Enhanced Quantization(+) -->
                                         <div class="flex items-center justify-between">
                                             <div class="flex items-center gap-2">
-                                                <span class="text-sm text-neutral-600">{{ t('models.oq.clip_optimization') }}</span>
+                                                <span class="text-sm text-neutral-600">Enhanced Quantization(+)</span>
                                                 <span x-show="!oqSelectedModelSupportsClip()" x-cloak
                                                       class="text-[10px] text-neutral-400">(not available for this model)</span>
                                             </div>
@@ -1127,10 +1127,10 @@
                                             </button>
                                         </div>
                                         <p x-show="oqEnableClip" x-cloak class="text-xs text-amber-600 leading-relaxed">
-                                            {{ t('models.oq.clip_description') }}
+                                            Uses oQ's MoE-optimized <a href="https://arxiv.org/abs/2210.17323" target="_blank" class="underline">GPTQ(arXiv)</a> with batched expert processing and sensitivity-aware bit allocation. Requires full model load.
                                         </p>
                                         <p class="text-[11px] text-neutral-400 leading-relaxed">
-                                            Supported: Qwen3.5 MoE, Qwen3.5, MiniMax M2, GLM MoE, Ministral3.
+                                            Supported: Qwen3.5 MoE, Qwen3.5, MiniMax M2, GLM MoE, Nemotron, Step-3.5.
                                         </p>
                                         <!-- Text Only (VLM only) -->
                                         <div x-show="oqSelectedModelIsVLM()" x-cloak class="flex items-center justify-between">
@@ -1186,15 +1186,6 @@
                                                 <option value="256">256</option>
                                                 <option value="512" selected>512</option>
                                                 <option value="1024">1024</option>
-                                            </select>
-                                        </div>
-                                        <!-- AWQ Grid Size (clip ON only) -->
-                                        <div x-show="oqEnableClip" x-cloak class="flex items-center justify-between">
-                                            <span class="text-sm text-neutral-600">AWQ Grid Size</span>
-                                            <select x-model.number="oqNGrid"
-                                                    class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                                <option value="10" selected>10 (fast)</option>
-                                                <option value="20">20 (recommended, slow)</option>
                                             </select>
                                         </div>
                                     </div>
