@@ -47,13 +47,12 @@ class _IntOffsetCacheProxy:
     def offset(self):
         raw = self._cache.offset
         if isinstance(raw, mx.array):
-            # BatchKVCache: return _idx (buffer write index) instead of
-            # per-element offset[0].  _idx matches the value used by
-            # make_mask() to compute the attention mask's kv dimension.
-            # Using offset[0] causes mask truncation when left_padding[0] > 0
-            # because offset[i] = _idx - left_padding[i].
-            if hasattr(self._cache, "_idx"):
-                return self._cache._idx
+            # Extract per-request offset from the authoritative mx.array.
+            # _idx/_offset are unreliable shortcuts: _idx wraps at max_size
+            # (BatchRotatingKVCache), _offset diverges after merge() which
+            # sets it to buffer size instead of actual token offset.
+            # Mask computation uses make_mask() on the real cache (via
+            # __getattr__), so this value is only used for RoPE/position_ids.
             if raw.ndim == 0:
                 return int(raw.item())
             return int(raw.reshape(-1)[0].item())

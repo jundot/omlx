@@ -361,7 +361,11 @@ class BlockAwarePrefixCache(CacheManager):
         elif is_tensor_data:
             # Try to extract type info from cache_data itself
             layer_cache_types = [
-                layer_state.get('cache_type', 'KVCache')
+                # Prefer class_name for TurboQuant (cache_type maps to 'KVCache'),
+                # fall back to cache_type for all standard mlx-lm types.
+                layer_state.get('class_name', layer_state.get('cache_type', 'KVCache'))
+                if layer_state.get('class_name', '') in ('TurboQuantKVCache', 'BatchTurboQuantKVCache')
+                else layer_state.get('cache_type', 'KVCache')
                 for layer_state in cache_data
             ]
             layer_meta_states = [
@@ -606,7 +610,16 @@ class BlockAwarePrefixCache(CacheManager):
                 if cache_type in non_sliceable_types or class_name in non_sliceable_types:
                     continue
 
-                keys, _ = layer_state['state']
+                state = layer_state['state']
+                keys = state[0] if isinstance(state, (list, tuple)) else state
+                # TurboQuant: keys = (k_norms, k_packed) tuple
+                if isinstance(keys, tuple) and len(keys) == 2 and hasattr(keys[0], 'shape'):
+                    k_norms = keys[0]
+                    seq_len = k_norms.shape[2] if len(k_norms.shape) >= 3 else k_norms.shape[1]
+                    logger.debug(
+                        f"Found TurboQuantKVCache at layer {layer_idx} with seq_len={seq_len}"
+                    )
+                    return seq_len
                 if not hasattr(keys, 'shape'):
                     continue
 
@@ -723,7 +736,47 @@ class BlockAwarePrefixCache(CacheManager):
 
                 handler = CacheTypeRegistry.get_handler_by_class_name(cache_type_name)
 
-                if handler.supports_block_slicing:
+                if cache_type_name in ('TurboQuantKVCache', 'BatchTurboQuantKVCache'):
+                    # TurboQuant: state = ((k_norms, k_packed), (v_norms, v_packed))
+                    state = layer_state['state']
+                    if not isinstance(state, (list, tuple)) or len(state) < 2:
+                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
+                        continue
+                    k_state, v_state = state
+                    if not isinstance(k_state, (list, tuple)) or len(k_state) < 2:
+                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
+                        continue
+                    k_norms, k_packed = k_state
+                    v_norms, v_packed = v_state
+                    # Slice along axis 2 (sequence dimension)
+                    # k_norms: (B, H, T), k_packed: (B, H, T, pw)
+                    seq_len = k_norms.shape[2] if len(k_norms.shape) >= 3 else k_norms.shape[1]
+                    actual_end = min(end_idx, seq_len)
+                    if start_idx >= actual_end:
+                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
+                        continue
+                    if len(k_norms.shape) >= 3:
+                        kn_s = k_norms[:, :, start_idx:actual_end]
+                        kp_s = k_packed[:, :, start_idx:actual_end, :]
+                        vn_s = v_norms[:, :, start_idx:actual_end]
+                        vp_s = v_packed[:, :, start_idx:actual_end, :]
+                    else:
+                        kn_s = k_norms[:, start_idx:actual_end]
+                        kp_s = k_packed[:, start_idx:actual_end, :]
+                        vn_s = v_norms[:, start_idx:actual_end]
+                        vp_s = v_packed[:, start_idx:actual_end, :]
+                    # Store with extra metadata for reconstruction
+                    bits = layer_state.get('meta_state', (0,))
+                    block_slices.append((
+                        '__turboquant__',
+                        (
+                            self._clone_tensor(kn_s),
+                            self._clone_tensor(kp_s),
+                            self._clone_tensor(vn_s),
+                            self._clone_tensor(vp_s),
+                        ),
+                    ))
+                elif handler.supports_block_slicing:
                     # Standard 4D KV cache slicing
                     state = layer_state['state']
                     if not isinstance(state, (list, tuple)) or len(state) < 2:
@@ -1455,6 +1508,60 @@ class BlockAwarePrefixCache(CacheManager):
                         logger.error(f"CacheList layer {layer_idx}: reconstruction failed")
                         return None
                     reconstructed_caches.append(cache)
+                    continue
+
+                # === TurboQuantKVCache: concat 4 tensors, reconstruct directly ===
+                if cache_type_name in ('TurboQuantKVCache', 'BatchTurboQuantKVCache'):
+                    kn_list, kp_list, vn_list, vp_list = [], [], [], []
+                    for block_data in all_block_data:
+                        if layer_idx >= len(block_data):
+                            continue
+                        bd = block_data[layer_idx]
+                        # From SSD: ((kn, kp), (vn, vp)) nested tuple
+                        if isinstance(bd, tuple) and len(bd) == 2:
+                            if isinstance(bd[0], str) and bd[0] == '__turboquant__':
+                                kn, kp, vn, vp = bd[1]
+                            elif isinstance(bd[0], tuple):
+                                (kn, kp), (vn, vp) = bd
+                            else:
+                                continue
+                            kn_list.append(kn)
+                            kp_list.append(kp)
+                            vn_list.append(vn)
+                            vp_list.append(vp)
+                    if not kn_list:
+                        logger.debug(f"TQ layer {layer_idx}: no block data")
+                        return None
+                    cat_kn = mx.concatenate(kn_list, axis=2) if len(kn_list[0].shape) >= 3 else mx.concatenate(kn_list, axis=1)
+                    cat_kp = mx.concatenate(kp_list, axis=2) if len(kp_list[0].shape) >= 4 else mx.concatenate(kp_list, axis=1)
+                    cat_vn = mx.concatenate(vn_list, axis=2) if len(vn_list[0].shape) >= 3 else mx.concatenate(vn_list, axis=1)
+                    cat_vp = mx.concatenate(vp_list, axis=2) if len(vp_list[0].shape) >= 4 else mx.concatenate(vp_list, axis=1)
+                    try:
+                        from ..turboquant_kv import TurboQuantKVCache
+                        from mlx_lm.models.cache import KVCache
+                        # Get bits from meta_state: (offset, bits, seed)
+                        tq_bits = 4
+                        tq_seed = 0
+                        ms = None
+                        if first_block_meta_states and layer_idx < len(first_block_meta_states):
+                            ms = first_block_meta_states[layer_idx]
+                        if isinstance(ms, (list, tuple)) and len(ms) >= 3:
+                            tq_bits = int(ms[1])
+                            tq_seed = int(ms[2])
+                        # Dequantize back to fp16 KVCache for merge compatibility.
+                        # TQ will be re-applied at decode start (lazy quantization).
+                        tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
+                        tq.state = ((cat_kn, cat_kp), (cat_vn, cat_vp))
+                        tq._quantized = True
+                        keys, values = tq.dequantize()
+                        cache = KVCache()
+                        cache.keys = keys
+                        cache.values = values
+                        cache.offset = keys.shape[2]
+                        reconstructed_caches.append(cache)
+                    except Exception as e:
+                        logger.error(f"TQ layer {layer_idx}: reconstruction failed: {e}")
+                        return None
                     continue
 
                 # Collect layer data from all blocks

@@ -347,6 +347,9 @@ class HFDownloader:
                     }
                 )
 
+        # Detect LoRA/adapter repos (adapter_config.json is peft standard)
+        is_adapter = any(f["name"] == "adapter_config.json" for f in files)
+
         # Extract params and size from safetensors
         params = None
         params_formatted = None
@@ -400,6 +403,7 @@ class HFDownloader:
             "updated_at": (
                 info.last_modified.isoformat() if info.last_modified else ""
             ),
+            "is_adapter": is_adapter,
         }
 
     def __init__(

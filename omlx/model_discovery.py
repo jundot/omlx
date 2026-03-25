@@ -354,9 +354,14 @@ def estimate_model_size(model_path: Path) -> int:
     return int(total_size * overhead_factor)
 
 
+def _is_adapter_dir(path: Path) -> bool:
+    """Check if a directory contains a LoRA/PEFT adapter (has adapter_config.json)."""
+    return (path / "adapter_config.json").exists()
+
+
 def _is_model_dir(path: Path) -> bool:
     """Check if a directory contains a valid model (has config.json)."""
-    return (path / "config.json").exists()
+    return (path / "config.json").exists() and not _is_adapter_dir(path)
 
 
 def _register_model(
@@ -453,7 +458,12 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
         if not subdir.is_dir() or subdir.name.startswith("."):
             continue
 
-        if _is_model_dir(subdir):
+        if _is_adapter_dir(subdir):
+            logger.info(
+                f"Skipping LoRA adapter: {subdir.name} "
+                "(oMLX does not support LoRA/PEFT adapters)"
+            )
+        elif _is_model_dir(subdir):
             # Level 1: direct model folder
             _register_model(models, subdir, subdir.name)
         else:
@@ -462,7 +472,12 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
             for child in sorted(subdir.iterdir()):
                 if not child.is_dir() or child.name.startswith("."):
                     continue
-                if _is_model_dir(child):
+                if _is_adapter_dir(child):
+                    logger.info(
+                        f"Skipping LoRA adapter: {child.name} "
+                        "(oMLX does not support LoRA/PEFT adapters)"
+                    )
+                elif _is_model_dir(child):
                     has_children = True
                     _register_model(models, child, child.name)
 

@@ -48,6 +48,11 @@ class CacheTypeRegistry:
         "ArraysCache": CacheType.ARRAYS_CACHE,
         "QuantizedKVCache": CacheType.QUANTIZED_KVCACHE,
         "CacheList": CacheType.CACHE_LIST,
+        # TurboQuant: handled specially in prefix_cache/paged_ssd_cache,
+        # mapped to KVCACHE so supports_block_slicing = True (but prefix_cache
+        # checks the class name first and routes to TQ-specific handling)
+        "TurboQuantKVCache": CacheType.KVCACHE,
+        "BatchTurboQuantKVCache": CacheType.KVCACHE,
     }
 
     # Default handler instance

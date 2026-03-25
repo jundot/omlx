@@ -177,8 +177,15 @@ class BaseBenchmark(ABC):
         kwargs["temperature"] = 0.0
         kwargs["presence_penalty"] = 0.0
         kwargs["repetition_penalty"] = 1.0
+        # Merge enable_thinking=False into any existing chat_template_kwargs
+        ct_kwargs = kwargs.pop("chat_template_kwargs", {}) or {}
+        ct_kwargs["enable_thinking"] = False
+        kwargs["chat_template_kwargs"] = ct_kwargs
         try:
-            output = await engine.chat(messages=messages, **kwargs)
+            output = await engine.chat(
+                messages=messages,
+                **kwargs,
+            )
             text = self._strip_think_tags(output.text)
             return index, item, text, prompt_text
         except Exception as e:
