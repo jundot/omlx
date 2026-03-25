@@ -160,6 +160,15 @@ class BatchedEngine(BaseEngine):
             self._model, self._model_settings
         )
 
+        # TurboQuant KV cache: patch attention and set kv_bits on scheduler
+        if self._model_settings is not None:
+            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            if tq_enabled:
+                from ..patches.turboquant_attention import apply_turboquant_attention_patch
+                apply_turboquant_attention_patch()
+                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
+
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()
         scheduler_config.model_name = self._model_name  # Ensure cache isolation per model
@@ -177,6 +186,13 @@ class BatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
+
+        # TurboQuant KV cache: propagate bits to scheduler
+        if self._model_settings is not None:
+            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            if tq_enabled:
+                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:

@@ -126,6 +126,7 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         self._boundary_block_size = max(0, int(boundary_block_size))
         self._prefill_boundary_callback = prefill_boundary_callback
         self._abort_check_callback = abort_check_callback
+        self._turboquant_kv_bits: Optional[float] = None  # Set by Scheduler if enabled
         # Memory limits for inline prefill checking (set by Scheduler).
         # mx.get_active_memory() is ~20ns, negligible vs ~5s prefill chunks.
         self._memory_limit_bytes: int = 0  # soft limit, 0 = disabled
@@ -135,7 +136,44 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         self._vlm_pending: Dict[int, Tuple[mx.array, Dict[str, Any], int]] = {}
 
     # Cache class names known to be sliceable (no boundary snapshots needed).
-    _KNOWN_SLICEABLE = frozenset({"KVCache", "BatchKVCache", "QuantizedKVCache"})
+    _KNOWN_SLICEABLE = frozenset({
+        "KVCache", "BatchKVCache", "QuantizedKVCache",
+        "TurboQuantKVCache", "BatchTurboQuantKVCache",
+    })
+
+    def _apply_turboquant_kv(self, prompt_cache: List[Any]) -> None:
+        """Convert BatchKVCache layers to BatchTurboQuantKVCache."""
+        from .turboquant_kv import BatchTurboQuantKVCache, TurboQuantKVCache
+        from mlx_lm.models.cache import KVCache, CacheList
+
+        converted = 0
+
+        bits = int(self._turboquant_kv_bits)
+        for i, cache_obj in enumerate(prompt_cache):
+            cls_name = type(cache_obj).__name__
+            if cls_name == "BatchKVCache":
+                left_padding = cache_obj.left_padding.tolist()
+                prompt_cache[i] = BatchTurboQuantKVCache(left_padding, bits=bits)
+                converted += 1
+            elif isinstance(cache_obj, KVCache):
+                prompt_cache[i] = TurboQuantKVCache(bits=bits)
+                converted += 1
+            elif isinstance(cache_obj, CacheList):
+                new_caches = []
+                for c in cache_obj.caches:
+                    c_name = type(c).__name__
+                    if c_name == "BatchKVCache":
+                        left_padding = c.left_padding.tolist()
+                        new_caches.append(BatchTurboQuantKVCache(left_padding, bits=bits))
+                        converted += 1
+                    elif isinstance(c, KVCache):
+                        new_caches.append(TurboQuantKVCache(bits=bits))
+                        converted += 1
+                    else:
+                        new_caches.append(c)
+                cache_obj.caches = tuple(new_caches)
+        if converted > 0:
+            logger.info(f"TurboQuant: converted {converted}/{len(prompt_cache)} cache layers to {bits}-bit")
 
     def _boundary_capture_enabled(self) -> bool:
         return (
@@ -413,6 +451,10 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         if all(c[0].empty() for c in caches):
             inputs = _left_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _make_cache(self.model, padding, self.max_kv_size)
+
+            # TurboQuant KV cache: convert KVCache layers to TurboQuantKVCache
+            if self._turboquant_kv_bits is not None:
+                self._apply_turboquant_kv(prompt_cache)
 
             # Build left-padded VLM embeddings batch (matching token padding).
             batched_embeds, batched_extra = self._build_left_padded_vlm_batch(
@@ -1025,6 +1067,9 @@ class Scheduler:
         # size to reduce boundary snapshot overhead during prefill.
         self._enlarge_block_size_for_arrays_cache()
 
+        # TurboQuant KV cache (set by engine if model_settings has it enabled)
+        self._turboquant_kv_bits: Optional[float] = None
+
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
         self.running: Dict[str, Request] = {}  # Running requests by ID
@@ -1574,6 +1619,11 @@ class Scheduler:
         )
         bg._memory_limit_bytes = self._memory_limit_bytes
         bg._memory_hard_limit_bytes = self._memory_hard_limit_bytes
+
+        # TurboQuant KV cache: propagate bits setting from Scheduler config
+        if hasattr(self, "_turboquant_kv_bits") and self._turboquant_kv_bits is not None:
+            bg._turboquant_kv_bits = self._turboquant_kv_bits
+
         return bg
 
     def _on_prompt_progress(

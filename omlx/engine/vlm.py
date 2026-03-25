@@ -266,6 +266,16 @@ class VLMBatchedEngine(BaseEngine):
 
         await self._engine.engine.start()
 
+        # TurboQuant KV cache
+        if self._model_settings is not None:
+            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            if tq_enabled:
+                from ..patches.turboquant_attention import apply_turboquant_attention_patch
+                apply_turboquant_attention_patch()
+                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
+                logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
             specprefill_draft = getattr(self._model_settings, "specprefill_draft_model", None)

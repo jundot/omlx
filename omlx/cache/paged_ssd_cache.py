@@ -1011,6 +1011,16 @@ class PagedSSDCacheManager(CacheManager):
                         else:
                             arrays[f"layer_{i}_sub_{j}_values"] = sub_values
                     cache_list_meta[f"layer_{i}_sub_count"] = str(len(sub_tensors))
+                elif (isinstance(layer_data, tuple) and len(layer_data) == 2
+                        and isinstance(layer_data[0], str)
+                        and layer_data[0] == '__turboquant__'):
+                    # TurboQuant: 4 tensors (k_norms, k_packed, v_norms, v_packed)
+                    k_norms, k_packed, v_norms, v_packed = layer_data[1]
+                    arrays[f"layer_{i}_k_norms"] = k_norms
+                    arrays[f"layer_{i}_k_packed"] = k_packed
+                    arrays[f"layer_{i}_v_norms"] = v_norms
+                    arrays[f"layer_{i}_v_packed"] = v_packed
+                    cache_list_meta[f"layer_{i}_turboquant"] = "1"
                 else:
                     keys, values = layer_data
                     if _has_zero_dim(keys):
@@ -1205,6 +1215,20 @@ class PagedSSDCacheManager(CacheManager):
                         logger.error(f"Missing keys/values for layer {i}")
                         return None
                     cache_data.append((arrays[keys_key], arrays[values_key]))
+            elif (file_metadata and f"layer_{i}_turboquant" in file_metadata) or (
+                cache_type in ('TurboQuantKVCache', 'BatchTurboQuantKVCache')
+                and f"layer_{i}_k_norms" in arrays
+            ):
+                # TurboQuant: 4 tensors
+                kn = arrays.get(f"layer_{i}_k_norms")
+                kp = arrays.get(f"layer_{i}_k_packed")
+                vn = arrays.get(f"layer_{i}_v_norms")
+                vp = arrays.get(f"layer_{i}_v_packed")
+                if kn is None or kp is None or vn is None or vp is None:
+                    logger.error(f"Missing TurboQuant tensors for layer {i}")
+                    return None
+                # Return as nested tuple matching TurboQuantKVCache state format
+                cache_data.append(((kn, kp), (vn, vp)))
             else:
                 keys_key = f"layer_{i}_keys"
                 values_key = f"layer_{i}_values"

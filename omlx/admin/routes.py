@@ -93,6 +93,9 @@ class ModelSettingsRequest(BaseModel):
     index_cache_freq: Optional[int] = None
     thinking_budget_enabled: Optional[bool] = None
     thinking_budget_tokens: Optional[int] = None
+    # TurboQuant KV cache (experimental)
+    turboquant_kv_enabled: Optional[bool] = None
+    turboquant_kv_bits: Optional[int] = None
     # SpecPrefill (experimental)
     specprefill_enabled: Optional[bool] = None
     specprefill_draft_model: Optional[str] = None
@@ -1310,6 +1313,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "forced_ct_kwargs": settings.forced_ct_kwargs,
                 "ttl_seconds": settings.ttl_seconds,
                 "index_cache_freq": settings.index_cache_freq,
+                "turboquant_kv_enabled": settings.turboquant_kv_enabled,
+                "turboquant_kv_bits": settings.turboquant_kv_bits,
                 "specprefill_enabled": settings.specprefill_enabled,
                 "specprefill_draft_model": settings.specprefill_draft_model,
                 "specprefill_keep_pct": settings.specprefill_keep_pct,
@@ -1514,6 +1519,11 @@ async def update_model_settings(
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
         )
+    # TurboQuant KV cache settings
+    if "turboquant_kv_enabled" in sent:
+        current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
+    if "turboquant_kv_bits" in sent:
+        current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
