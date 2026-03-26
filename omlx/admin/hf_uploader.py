@@ -34,7 +34,7 @@ def _is_oq_model(name: str) -> bool:
     """Check if a model name indicates an oQ-quantized model.
 
     oQ models have 'oQ' in the last 5 characters of their name,
-    e.g. 'Qwen3.5-122B-oQ4', 'Llama-3B-oQ4+'.
+    e.g. 'Qwen3.5-122B-oQ4', 'Llama-3B-oQ4e'.
     """
     return "oQ" in name[-5:]
 

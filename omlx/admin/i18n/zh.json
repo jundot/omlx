@@ -194,7 +194,6 @@
   "models.oq.advanced_settings": "高级设置",
   "models.oq.clip_optimization": "增强量化 (+)",
   "models.oq.clip_description": "需要约1.5倍模型大小的内存。使用校准数据提升2-4位量化质量。",
-  "models.oq.group_size": "分组大小",
   "models.oq.calib_dataset": "校准数据集",
   "models.oq.calib_samples": "校准样本数",
   "models.oq.calib_seq_length": "序列长度",

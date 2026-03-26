@@ -56,6 +56,18 @@ def _append_anthropic_image_part(image_parts: list[dict], block_dict: dict[str, 
         })
 
 
+def _extract_images_from_tool_result_content(
+    content: Any, image_parts: list[dict]
+) -> None:
+    """Extract image blocks from tool result content for VLM processing."""
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "image":
+                _append_anthropic_image_part(image_parts, item)
+    elif isinstance(content, dict) and content.get("type") == "image":
+        _append_anthropic_image_part(image_parts, content)
+
+
 def _build_message_from_parts(
     role: str,
     text_parts: list[str],
@@ -191,6 +203,10 @@ def convert_anthropic_to_internal(
                                     tokenizer=tokenizer,
                                 ),
                             })
+                            if preserve_images:
+                                _extract_images_from_tool_result_content(
+                                    block_dict.get("content", ""), image_parts
+                                )
                         elif block_type == "thinking":
                             continue
                     msg_dict = _build_message_from_parts(role, text_parts, image_parts)
@@ -238,6 +254,10 @@ def convert_anthropic_to_internal(
                     prefix = "[Tool Error" if is_error else "[Tool Result"
                     text_parts.append(f"{prefix} ({tool_use_id})]: {result_content}")
                     saw_tool_markup = True
+                    if preserve_images:
+                        _extract_images_from_tool_result_content(
+                            block_dict.get("content", ""), image_parts
+                        )
 
                 elif block_type == "thinking":
                     # Thinking blocks are ignored (reasoning content is not passed to model)

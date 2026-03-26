@@ -581,6 +581,154 @@ class TestConvertAnthropicToInternal:
         assert result[1]["tool_call_id"] == "toolu_123"
         assert result[1]["content"] == "The weather is sunny"
 
+    def test_tool_result_with_image_preserve_images_nonnative(self):
+        """Images in tool_result content are preserved when preserve_images=True (non-native path)."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBOR",
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "screenshot.png",
+                                },
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, preserve_images=True)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        image_parts = [p for p in content if p.get("type") == "image_url"]
+        text_parts = [p for p in content if p.get("type") == "text"]
+        assert len(image_parts) == 1
+        assert "iVBOR" in image_parts[0]["image_url"]["url"]
+        assert len(text_parts) == 1
+        assert "toolu_img" in text_parts[0]["text"]
+
+    def test_tool_result_with_image_no_preserve(self):
+        """Images in tool_result content are NOT preserved when preserve_images=False."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBOR",
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "screenshot.png",
+                                },
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, preserve_images=False)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, str)
+        assert "screenshot.png" in content
+        assert "iVBOR" not in content
+
+    def test_tool_result_with_image_native_path(self):
+        """Images in tool_result are preserved in native tool calling path."""
+        class NativeToolTokenizer:
+            has_tool_calling = True
+
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockToolUse(
+                            id="toolu_img",
+                            name="read_file",
+                            input={"path": "/tmp/screenshot.png"},
+                        ),
+                    ],
+                ),
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBOR",
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "screenshot.png",
+                                },
+                            ],
+                        }
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(
+            request,
+            tokenizer=NativeToolTokenizer(),
+            preserve_images=True,
+        )
+
+        # assistant message with tool_calls
+        assert result[0]["role"] == "assistant"
+        # tool result (text only)
+        assert result[1]["role"] == "tool"
+        assert result[1]["content"] == "screenshot.png"
+        # user message with extracted image
+        assert result[2]["role"] == "user"
+        content = result[2]["content"]
+        assert isinstance(content, list)
+        image_parts = [p for p in content if p.get("type") == "image_url"]
+        assert len(image_parts) == 1
+        assert "iVBOR" in image_parts[0]["image_url"]["url"]
+
 
 class TestConvertAnthropicToolsToInternal:
     """Tests for convert_anthropic_tools_to_internal function."""

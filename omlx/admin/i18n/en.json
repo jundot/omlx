@@ -194,7 +194,6 @@
   "models.oq.advanced_settings": "Advanced Settings",
   "models.oq.clip_optimization": "Enhanced Quantization (+)",
   "models.oq.clip_description": "Requires ~1.5× model size memory. Uses calibration data for better quality at 2-4 bit.",
-  "models.oq.group_size": "Group Size",
   "models.oq.calib_dataset": "Calibration Dataset",
   "models.oq.calib_samples": "Calibration Samples",
   "models.oq.calib_seq_length": "Sequence Length",

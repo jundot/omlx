@@ -3,8 +3,16 @@
 
 import pytest
 from fastapi.testclient import TestClient
+from unittest.mock import MagicMock
 
 # Note: These tests need a mock server setup since the actual server requires models
+
+
+def _mock_request(headers=None):
+    """Create a mock FastAPI request with given headers."""
+    req = MagicMock()
+    req.headers = headers or {}
+    return req
 
 
 class TestVerifyApiKey:
@@ -20,7 +28,7 @@ class TestVerifyApiKey:
 
         try:
             # Should return True without any credentials
-            result = asyncio.run(verify_api_key(credentials=None))
+            result = asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
             assert result is True
         finally:
             _server_state.api_key = original_key
@@ -36,7 +44,7 @@ class TestVerifyApiKey:
 
         try:
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(verify_api_key(credentials=None))
+                asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
             assert exc_info.value.status_code == 401
             assert "required" in exc_info.value.detail.lower()
         finally:
@@ -55,7 +63,7 @@ class TestVerifyApiKey:
         try:
             credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="wrong-key")
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(verify_api_key(credentials=credentials))
+                asyncio.run(verify_api_key(request=_mock_request(), credentials=credentials))
             assert exc_info.value.status_code == 401
             assert "invalid" in exc_info.value.detail.lower()
         finally:
@@ -72,10 +80,91 @@ class TestVerifyApiKey:
 
         try:
             credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="correct-key")
-            result = asyncio.run(verify_api_key(credentials=credentials))
+            result = asyncio.run(verify_api_key(request=_mock_request(), credentials=credentials))
             assert result is True
         finally:
             _server_state.api_key = original_key
+
+
+class TestXApiKeyHeader:
+    """Tests for x-api-key header authentication (Anthropic SDK compatibility)."""
+
+    def test_x_api_key_header_accepted(self):
+        """Test that x-api-key header is accepted when no Bearer token."""
+        from omlx.server import verify_api_key, _server_state
+        import asyncio
+
+        original_key = _server_state.api_key
+        _server_state.api_key = "correct-key"
+
+        try:
+            request = _mock_request(headers={"x-api-key": "correct-key"})
+            result = asyncio.run(verify_api_key(request=request, credentials=None))
+            assert result is True
+        finally:
+            _server_state.api_key = original_key
+
+    def test_x_api_key_header_invalid(self):
+        """Test that invalid x-api-key raises 401."""
+        from omlx.server import verify_api_key, _server_state
+        from fastapi import HTTPException
+        import asyncio
+
+        original_key = _server_state.api_key
+        _server_state.api_key = "correct-key"
+
+        try:
+            request = _mock_request(headers={"x-api-key": "wrong-key"})
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(verify_api_key(request=request, credentials=None))
+            assert exc_info.value.status_code == 401
+            assert "invalid" in exc_info.value.detail.lower()
+        finally:
+            _server_state.api_key = original_key
+
+    def test_bearer_takes_priority_over_x_api_key(self):
+        """Test that Bearer token takes priority when both are present."""
+        from omlx.server import verify_api_key, _server_state
+        from fastapi.security import HTTPAuthorizationCredentials
+        import asyncio
+
+        original_key = _server_state.api_key
+        _server_state.api_key = "bearer-key"
+
+        try:
+            # Bearer has correct key, x-api-key has wrong key
+            request = _mock_request(headers={"x-api-key": "wrong-key"})
+            credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="bearer-key")
+            result = asyncio.run(verify_api_key(request=request, credentials=credentials))
+            assert result is True
+        finally:
+            _server_state.api_key = original_key
+
+    def test_x_api_key_with_sub_keys(self):
+        """Test that x-api-key works with sub keys."""
+        from omlx.server import verify_api_key, _server_state
+        from omlx.settings import SubKeyEntry
+        import asyncio
+
+        original_key = _server_state.api_key
+        original_gs = _server_state.global_settings
+        _server_state.api_key = "main-key"
+
+        mock_gs = MagicMock()
+        mock_gs.auth.sub_keys = [
+            SubKeyEntry(key="sub-key-1", name="Test Sub Key"),
+        ]
+        mock_gs.auth.skip_api_key_verification = False
+        mock_gs.server.host = "0.0.0.0"
+        _server_state.global_settings = mock_gs
+
+        try:
+            request = _mock_request(headers={"x-api-key": "sub-key-1"})
+            result = asyncio.run(verify_api_key(request=request, credentials=None))
+            assert result is True
+        finally:
+            _server_state.api_key = original_key
+            _server_state.global_settings = original_gs
 
 
 class TestSubKeyVerification:
@@ -93,7 +182,6 @@ class TestSubKeyVerification:
         _server_state.api_key = "main-key"
 
         # Create mock global_settings with sub keys
-        from unittest.mock import MagicMock
         mock_gs = MagicMock()
         mock_gs.auth.sub_keys = [
             SubKeyEntry(key="sub-key-1", name="Test Sub Key"),
@@ -104,7 +192,7 @@ class TestSubKeyVerification:
 
         try:
             credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="sub-key-1")
-            result = asyncio.run(verify_api_key(credentials=credentials))
+            result = asyncio.run(verify_api_key(request=_mock_request(), credentials=credentials))
             assert result is True
         finally:
             _server_state.api_key = original_key
@@ -122,7 +210,6 @@ class TestSubKeyVerification:
         original_gs = _server_state.global_settings
         _server_state.api_key = "main-key"
 
-        from unittest.mock import MagicMock
         mock_gs = MagicMock()
         mock_gs.auth.sub_keys = [
             SubKeyEntry(key="sub-key-1", name="Test Sub Key"),
@@ -134,7 +221,7 @@ class TestSubKeyVerification:
         try:
             credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="wrong-key")
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(verify_api_key(credentials=credentials))
+                asyncio.run(verify_api_key(request=_mock_request(), credentials=credentials))
             assert exc_info.value.status_code == 401
         finally:
             _server_state.api_key = original_key
@@ -151,7 +238,6 @@ class TestSubKeyVerification:
         original_gs = _server_state.global_settings
         _server_state.api_key = "main-key"
 
-        from unittest.mock import MagicMock
         mock_gs = MagicMock()
         mock_gs.auth.sub_keys = [
             SubKeyEntry(key="sub-key-1", name="Test Sub Key"),
@@ -162,7 +248,7 @@ class TestSubKeyVerification:
 
         try:
             credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="main-key")
-            result = asyncio.run(verify_api_key(credentials=credentials))
+            result = asyncio.run(verify_api_key(request=_mock_request(), credentials=credentials))
             assert result is True
         finally:
             _server_state.api_key = original_key
@@ -193,7 +279,7 @@ class TestSkipApiKeyVerification:
         )
 
         try:
-            result = asyncio.run(verify_api_key(credentials=None))
+            result = asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
             assert result is True
         finally:
             _server_state.api_key = original_key
@@ -214,7 +300,7 @@ class TestSkipApiKeyVerification:
 
         try:
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(verify_api_key(credentials=None))
+                asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
             assert exc_info.value.status_code == 401
         finally:
             _server_state.api_key = original_key

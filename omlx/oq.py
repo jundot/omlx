@@ -456,11 +456,15 @@ def _build_quant_plan(
     max_layer_score = max(layer_scores.values(), default=0.0)
 
     total_params = 0
-    for shape in named_shapes.values():
+    expert_params = 0
+    for path, shape in named_shapes.items():
         n = 1
         for dim in shape:
             n *= dim
         total_params += n
+        if _is_routed_expert(path):
+            expert_params += n
+    is_dense = expert_params / max(total_params, 1) < 0.5
 
     current_bpw = _estimate_effective_bpw(
         named_shapes, base_bits, base_group_size, base_mode
@@ -519,6 +523,74 @@ def _build_quant_plan(
                 total_bits_f += delta
                 current_bpw = total_bits_f / total_params
 
+    # Dense model MLP asymmetry: gate/down → base+1, up → base-1
+    # Inspired by unsloth Dynamic 2.0: SiLU gate and residual down_proj need
+    # protection, while up_proj (linear multiplicand) tolerates lower bits.
+    # Budget-approximately-neutral: 2 tensors boosted, 1 reduced.
+    _VALID_BITS_SET = {2, 3, 4, 5, 6, 8}
+    if is_dense and base_bits >= 3:
+        reduce_bits = max(base_bits - 1, 2)
+        boost_bits = base_bits + 1
+        while boost_bits not in _VALID_BITS_SET and boost_bits < 8:
+            boost_bits += 1
+        can_asymmetry = (
+            reduce_bits in _VALID_BITS_SET
+            and reduce_bits < base_bits
+            and boost_bits in _VALID_BITS_SET
+            and boost_bits > base_bits
+        )
+        if can_asymmetry:
+            # Pass 1: reduce up_proj → free budget
+            for path, shape in named_shapes.items():
+                if path in boost_map:
+                    continue
+                if "up_proj" not in path or "gate" in path:
+                    continue
+                if _extract_layer_index(path) < 0:
+                    continue
+                pred = universal_quant_predicate(
+                    path, module, {**config, "_oq_boost_map": {}}, oq_level
+                )
+                if pred is False:
+                    continue
+                cand_gs = _gs_for_mode(reduce_bits, _OQ_DEFAULT_GROUP_SIZE)
+                cand_mode = _mode_for_bits(reduce_bits)
+                old_cost = _tensor_quantized_bytes(
+                    shape, base_bits, base_group_size, base_mode
+                )
+                new_cost = _tensor_quantized_bytes(shape, reduce_bits, cand_gs, cand_mode)
+                delta = 8 * (new_cost - old_cost)  # negative
+                boost_map[path] = {"bits": reduce_bits, "group_size": cand_gs, "mode": cand_mode}
+                total_bits_f += delta
+                current_bpw = total_bits_f / total_params
+
+            # Pass 2: boost gate/down_proj → use freed budget (with cap check)
+            for path, shape in named_shapes.items():
+                if path in boost_map:
+                    continue
+                if not any(p in path for p in ("gate_proj", "down_proj", "wo")):
+                    continue
+                if _extract_layer_index(path) < 0:
+                    continue
+                pred = universal_quant_predicate(
+                    path, module, {**config, "_oq_boost_map": {}}, oq_level
+                )
+                if pred is False:
+                    continue
+                cand_gs = _gs_for_mode(boost_bits, _OQ_DEFAULT_GROUP_SIZE)
+                cand_mode = _mode_for_bits(boost_bits)
+                old_cost = _tensor_quantized_bytes(
+                    shape, base_bits, base_group_size, base_mode
+                )
+                new_cost = _tensor_quantized_bytes(shape, boost_bits, cand_gs, cand_mode)
+                delta = 8 * (new_cost - old_cost)
+                next_bpw = (total_bits_f + delta) / total_params
+                if next_bpw > hard_cap_bpw:
+                    continue
+                boost_map[path] = {"bits": boost_bits, "group_size": cand_gs, "mode": cand_mode}
+                total_bits_f += delta
+                current_bpw = next_bpw
+
     candidates = []
     for path, shape in named_shapes.items():
         if path in boost_map:
@@ -532,6 +604,9 @@ def _build_quant_plan(
             continue
         layer_idx = _extract_layer_index(path)
         if layer_idx < 0:
+            continue
+        # Dense: skip MLP tensors (already handled by asymmetry)
+        if is_dense and any(p in path for p in ("gate_proj", "up_proj", "down_proj", "wo")):
             continue
         layer_score = float(layer_scores.get(str(layer_idx), 0.0))
         max_extra = _sensitivity_tier(layer_score, max_layer_score)
@@ -599,18 +674,18 @@ def resolve_output_name(model_name: str, oq_level: int,
 
     Examples:
         "Qwen3.5-122B-A10B" + 4 -> "Qwen3.5-122B-A10B-oQ4"
-        "Qwen3.5-122B-A10B" + 4 + clip -> "Qwen3.5-122B-A10B-oQ4+"
+        "Qwen3.5-122B-A10B" + 4 + clip -> "Qwen3.5-122B-A10B-oQ4e"
         "Qwen3.5-122B-A10B-8bit" + 4 -> "Qwen3.5-122B-A10B-oQ4"
         "Qwen3.5-122B-A10B-oQ6" + 2 -> "Qwen3.5-122B-A10B-oQ2"
     """
     base = re.sub(
-        r"-(oQ[\d.]+\+?|[0-9]+[_-]?bit|fp\d+|bf\d+)$",
+        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+)$",
         "",
         model_name,
         flags=re.IGNORECASE,
     )
     level_str = f"{oq_level:g}"
-    suffix = f"oQ{level_str}+" if enable_clip else f"oQ{level_str}"
+    suffix = f"oQ{level_str}e" if enable_clip else f"oQ{level_str}"
     return f"{base}-{suffix}"
 
 
@@ -1653,11 +1728,13 @@ def _layer_masks_for_model(model, layers, inputs):
             except TypeError:
                 ssm_mask = None
             if fa_mask is not None or ssm_mask is not None:
-                fallback = nn.MultiHeadAttention.create_additive_causal_mask(
-                    inputs.shape[1]
-                ).astype(inputs.dtype if hasattr(inputs, "dtype") else mx.float16)
-                fa_mask = fa_mask if fa_mask is not None else fallback
-                ssm_mask = ssm_mask if ssm_mask is not None else fallback
+                if fa_mask is None:
+                    fa_mask = nn.MultiHeadAttention.create_additive_causal_mask(
+                        inputs.shape[1]
+                    ).astype(inputs.dtype if hasattr(inputs, "dtype") else mx.float16)
+                # SSM layers (GatedDeltaNet) expect (B, S) boolean mask, not
+                # (S, S) causal mask.  During calibration there is no padding,
+                # so None is the correct mask for SSM layers.
                 return [ssm_mask if getattr(layer, "is_linear", False) else fa_mask for layer in layers]
         except (ImportError, AttributeError):
             pass
@@ -1740,6 +1817,9 @@ def _capture_block_module_inputs(block, block_inputs, mask, position_ids):
 def _gptq_compute_hessian(X: Any, damp: float = 0.01) -> tuple:
     """Compute Hessian H = X^T X and its inverse via Cholesky.
 
+    For large in_dim (e.g. 17408 for down_proj), the final matmul
+    Linv.T @ Linv is split into column blocks to avoid Metal GPU timeout.
+
     Args:
         X: Calibration inputs (n_tokens, in_dim), float32.
         damp: Dampening factor for diagonal.
@@ -1747,16 +1827,59 @@ def _gptq_compute_hessian(X: Any, damp: float = 0.01) -> tuple:
     Returns:
         (H, Hinv) both (in_dim, in_dim) float32.
     """
+    n = X.shape[1]
     H = (X.T @ X).astype(mx.float32)
     diag_mean = mx.diag(H).mean()
-    H = H + damp * diag_mean * mx.eye(H.shape[0])
+    H = H + damp * diag_mean * mx.eye(n)
     mx.eval(H)
     L = mx.linalg.cholesky(H, stream=mx.cpu)
-    I = mx.eye(H.shape[0])
+    I = mx.eye(n)
     Linv = mx.linalg.solve_triangular(L, I, upper=False, stream=mx.cpu)
-    Hinv = Linv.T @ Linv
-    mx.eval(Hinv)
+    mx.eval(Linv)
+
+    # Chunked matmul to prevent Metal GPU timeout on large matrices.
+    # (17408, 17408) @ (17408, 17408) = 5.3T ops → single dispatch timeout.
+    _CHUNK = 4096
+    if n <= _CHUNK:
+        Hinv = Linv.T @ Linv
+        mx.eval(Hinv)
+    else:
+        chunks = []
+        for i in range(0, n, _CHUNK):
+            j = min(i + _CHUNK, n)
+            chunk = Linv.T @ Linv[:, i:j]
+            mx.eval(chunk)
+            chunks.append(chunk)
+        Hinv = mx.concatenate(chunks, axis=1)
+        mx.eval(Hinv)
+
     return H, Hinv
+
+
+def _compute_group_params(group_slice: Any, bits: int, group_size: int):
+    """Compute affine quantization scale/bias for a group slice.
+
+    Handles partial last group by padding to group_size so mx.quantize
+    accepts the tensor.
+
+    Args:
+        group_slice: Weight group (..., g_size) where g_size <= group_size.
+        bits: Quantization bits.
+        group_size: Target group size for mx.quantize.
+
+    Returns:
+        (scales, biases) each with shape (..., 1).
+    """
+    actual_width = group_slice.shape[-1]
+    if actual_width < group_size:
+        pad_width = group_size - actual_width
+        pad_spec = [(0, 0)] * (group_slice.ndim - 1) + [(0, pad_width)]
+        group_slice = mx.pad(group_slice, pad_spec)
+    _, scales, *rest = mx.quantize(
+        group_slice, bits=bits, group_size=group_size
+    )
+    biases = rest[0] if rest else mx.zeros_like(scales)
+    return scales, biases
 
 
 def _gptq_quantize_weight(
@@ -1765,61 +1888,84 @@ def _gptq_quantize_weight(
 ) -> Any:
     """GPTQ column-by-column quantization with error compensation.
 
-    Modifies weight rounding to minimize output MSE using Hessian information.
-    Returns optimally-rounded weight (still float, ready for mx.quantize).
+    Processes columns in group_size-aligned blocks so that the simulated
+    quantization matches mx.quantize's row-wise grouping (groups along
+    the last axis / in_dim).  Scale and bias are computed once per group
+    from the current weight state, then each column is analytically
+    quantize-dequantized using the fixed group parameters.
 
     Args:
         w: Weight tensor (out_dim, in_dim) float32.
         Hinv: Inverse Hessian (in_dim, in_dim) float32.
         bits: Target quantization bits.
         group_size: Quantization group size.
-        mode: Quantization mode.
-        block_size: GPTQ block size (32 optimal for speed).
+        mode: Quantization mode (only "affine" fully supported).
+        block_size: Ignored (kept for API compatibility).
 
     Returns:
         GPTQ-optimized weight (out_dim, in_dim).
     """
     out_dim, in_dim = w.shape
     W = mx.array(w)
+    n_bins = 2**bits - 1
 
-    def _qdq_col(col):
-        n = col.shape[0]
-        # Find a valid group size that divides the column
-        gs_col = group_size
-        while gs_col > 1 and n % gs_col != 0:
-            gs_col //= 2
-        if gs_col < 1:
-            return col  # can't quantize
-        cr = col.reshape(-1, gs_col)
-        return mx.dequantize(
-            *mx.quantize(cr, group_size=gs_col, bits=bits, mode=mode),
-            group_size=gs_col, bits=bits, mode=mode,
-        ).reshape(-1)
+    for g_start in range(0, in_dim, group_size):
+        g_end = min(g_start + group_size, in_dim)
+        g_size = g_end - g_start
 
-    for cs in range(0, in_dim, block_size):
-        ce = min(cs + block_size, in_dim)
-        bs = ce - cs
-        bh = Hinv[cs:ce, cs:ce]
+        # Compute scale/bias from current W group (groups along last axis)
+        group_slice = W[:, g_start:g_end]  # (out_dim, g_size)
+        scales, biases = _compute_group_params(group_slice, bits, group_size)
+        # scales: (out_dim, 1), biases: (out_dim, 1)
 
-        block_cols = [W[:, cs + i] for i in range(bs)]
+        # Work with column list for efficient in-loop updates
+        group_cols = [W[:, g_start + i] for i in range(g_size)]
         err_list = []
-        for i in range(bs):
-            col = block_cols[i]
-            d = mx.maximum(bh[i, i], mx.array(1e-6))
-            qc = _qdq_col(col)
-            err = (col - qc) / d
+
+        # Safe divisor: preserve sign, avoid division by zero
+        safe_scales = mx.where(
+            mx.abs(scales) < 1e-10, mx.array(1e-10), scales,
+        )
+
+        for i in range(g_size):
+            col = group_cols[i]  # (out_dim,)
+            k = g_start + i
+            d = mx.maximum(Hinv[k, k], mx.array(1e-6))
+
+            # Analytical qdq matching mx.quantize affine mode
+            col_2d = col[:, None]  # (out_dim, 1) for broadcasting
+            q = mx.clip(
+                mx.round((col_2d - biases) / safe_scales),
+                0.0, n_bins,
+            )
+            qc = (scales * q + biases).squeeze(-1)  # (out_dim,)
+
+            err = (col - qc) / d  # (out_dim,)
             err_list.append(err)
-            for j in range(i + 1, bs):
-                block_cols[j] = block_cols[j] - err * bh[i, j]
-            block_cols[i] = qc
 
-        block_result = mx.stack(block_cols, axis=1)
-        W = mx.concatenate([W[:, :cs], block_result, W[:, ce:]], axis=1)
+            # Compensate remaining columns in this group
+            for j in range(i + 1, g_size):
+                group_cols[j] = group_cols[j] - err * Hinv[k, g_start + j]
 
-        if ce < in_dim:
-            err_mat = mx.stack(err_list, axis=1)
-            cross = err_mat @ Hinv[cs:ce, ce:]
-            W = mx.concatenate([W[:, :ce], W[:, ce:] - cross], axis=1)
+            group_cols[i] = qc
+
+            # Periodic eval to prevent Metal GPU timeout on large tensors
+            if (i + 1) % 16 == 0:
+                mx.eval(*group_cols)
+
+        # Reassemble the group into W
+        group_result = mx.stack(group_cols, axis=1)  # (out_dim, g_size)
+        W = mx.concatenate(
+            [W[:, :g_start], group_result, W[:, g_end:]], axis=1,
+        )
+
+        # Cross-group compensation
+        if g_end < in_dim:
+            err_mat = mx.stack(err_list, axis=1)  # (out_dim, g_size)
+            cross = err_mat @ Hinv[g_start:g_end, g_end:]
+            W = mx.concatenate(
+                [W[:, :g_end], W[:, g_end:] - cross], axis=1,
+            )
 
         mx.eval(W)
 
@@ -1832,69 +1978,82 @@ def _gptq_quantize_experts_batched(
 ) -> Any:
     """Batched GPTQ across all experts simultaneously.
 
-    Instead of looping 256 experts × N columns, processes all experts
-    in parallel for each column. Same Hessian shared across experts.
+    Group-aligned version: processes columns in group_size blocks matching
+    mx.quantize's row-wise grouping.  Scale/bias computed once per group
+    from current weight state; analytical qdq applied per column.
 
     Args:
         w_3d: Fused expert weights (num_experts, out_dim, in_dim) float32.
         Hinv: Inverse Hessian (in_dim, in_dim) float32.
+        bits: Target quantization bits.
+        group_size: Quantization group size.
+        mode: Quantization mode (only "affine" fully supported).
+        block_size: Ignored (kept for API compatibility).
 
     Returns:
         GPTQ-optimized weights (num_experts, out_dim, in_dim).
     """
     num_experts, out_dim, in_dim = w_3d.shape
     W = mx.array(w_3d)  # (E, O, I)
+    n_bins = 2**bits - 1
 
-    # Find valid group size for column quantization
-    gs_col = group_size
-    while gs_col > 1 and out_dim % gs_col != 0:
-        gs_col //= 2
-    if gs_col < 1:
-        return W
+    for g_start in range(0, in_dim, group_size):
+        g_end = min(g_start + group_size, in_dim)
+        g_size = g_end - g_start
 
-    def _qdq_batch_col(cols):
-        # cols: (E, O) — one column from each expert
-        # Reshape to (E * O/gs, gs) for batch quantization
-        cr = cols.reshape(-1, gs_col)
-        return mx.dequantize(
-            *mx.quantize(cr, group_size=gs_col, bits=bits, mode=mode),
-            group_size=gs_col, bits=bits, mode=mode,
-        ).reshape(num_experts, out_dim)
+        # Compute scale/bias from current W group (groups along last axis)
+        group_slice = W[:, :, g_start:g_end]  # (E, O, g_size)
+        scales, biases = _compute_group_params(group_slice, bits, group_size)
+        # scales: (E, O, 1), biases: (E, O, 1)
 
-    for cs in range(0, in_dim, block_size):
-        ce = min(cs + block_size, in_dim)
-        bs = ce - cs
-        bh = Hinv[cs:ce, cs:ce]
-
-        # Extract block: (E, O, bs)
-        block = W[:, :, cs:ce]
+        # Work with column list for efficient in-loop updates
+        group_cols = [W[:, :, g_start + i] for i in range(g_size)]  # list of (E, O)
         err_list = []
 
-        # Work with list of columns for easy update
-        block_cols = [block[:, :, i] for i in range(bs)]  # list of (E, O)
-        err_list = []
+        # Safe divisor: preserve sign, avoid division by zero
+        safe_scales = mx.where(
+            mx.abs(scales) < 1e-10, mx.array(1e-10), scales,
+        )
 
-        for i in range(bs):
-            col = block_cols[i]  # (E, O)
-            d = mx.maximum(bh[i, i], mx.array(1e-6))
-            qc = _qdq_batch_col(col)  # (E, O) — all experts at once
+        for i in range(g_size):
+            col = group_cols[i]  # (E, O)
+            k = g_start + i
+            d = mx.maximum(Hinv[k, k], mx.array(1e-6))
+
+            # Analytical qdq matching mx.quantize affine mode
+            col_3d = col[:, :, None]  # (E, O, 1) for broadcasting
+            q = mx.clip(
+                mx.round((col_3d - biases) / safe_scales),
+                0.0, n_bins,
+            )
+            qc = (scales * q + biases).squeeze(-1)  # (E, O)
+
             err = (col - qc) / d  # (E, O)
             err_list.append(err)
 
-            # Compensate remaining columns in block
-            for j in range(i + 1, bs):
-                block_cols[j] = block_cols[j] - err * bh[i, j]
+            # Compensate remaining columns in this group
+            for j in range(i + 1, g_size):
+                group_cols[j] = group_cols[j] - err * Hinv[k, g_start + j]
 
-            block_cols[i] = qc
+            group_cols[i] = qc
 
-        block_result = mx.stack(block_cols, axis=2)  # (E, O, bs)
-        W = mx.concatenate([W[:, :, :cs], block_result, W[:, :, ce:]], axis=2)
+            # Periodic eval to prevent Metal GPU timeout on large tensors
+            if (i + 1) % 16 == 0:
+                mx.eval(*group_cols)
 
-        # Cross-block compensation
-        if ce < in_dim:
-            err_mat = mx.stack(err_list, axis=2)  # (E, O, bs)
-            cross = err_mat @ Hinv[cs:ce, ce:]  # (E, O, remaining)
-            W = mx.concatenate([W[:, :, :ce], W[:, :, ce:] - cross], axis=2)
+        # Reassemble the group into W
+        group_result = mx.stack(group_cols, axis=2)  # (E, O, g_size)
+        W = mx.concatenate(
+            [W[:, :, :g_start], group_result, W[:, :, g_end:]], axis=2,
+        )
+
+        # Cross-group compensation
+        if g_end < in_dim:
+            err_mat = mx.stack(err_list, axis=2)  # (E, O, g_size)
+            cross = err_mat @ Hinv[g_start:g_end, g_end:]  # (E, O, remaining)
+            W = mx.concatenate(
+                [W[:, :, :g_end], W[:, :, g_end:] - cross], axis=2,
+            )
 
         mx.eval(W)
 
@@ -1953,6 +2112,12 @@ def _run_gptq(
         layer_opt = 0
 
         # --- Dense (2D) weights: attention, shared_expert, dense MLP ---
+        # Cache Hessian per input source — tensors sharing the same input
+        # (e.g. gate_proj and up_proj both fed by layernorm output) get
+        # identical Hessians, so compute once and reuse.
+        _hinv_cache: dict[int, Any] = {}
+        boost_map = config.get("_oq_boost_map") or {}
+
         for path, module in tree_flatten(
             block.leaf_modules(), is_leaf=nn.Module.is_module
         ):
@@ -1987,16 +2152,20 @@ def _run_gptq(
             if module_input is None:
                 continue
 
-            x_flat = module_input.value.astype(mx.float32).reshape(-1, in_dim)
-            if x_flat.shape[0] == 0:
-                continue
-            mx.eval(x_flat)
-            _, Hinv = _gptq_compute_hessian(x_flat)
-            del x_flat
+            # Reuse Hessian for shared input sources
+            inp_id = id(module_input)
+            if inp_id in _hinv_cache and _hinv_cache[inp_id].shape[0] == in_dim:
+                Hinv = _hinv_cache[inp_id]
+            else:
+                x_flat = module_input.value.astype(mx.float32).reshape(-1, in_dim)
+                if x_flat.shape[0] == 0:
+                    continue
+                mx.eval(x_flat)
+                _, Hinv = _gptq_compute_hessian(x_flat)
+                del x_flat
+                _hinv_cache[inp_id] = Hinv
 
             bits = base_bits
-            # Check boost map for this tensor
-            boost_map = config.get("_oq_boost_map") or {}
             for bkey in boost_map:
                 if f"layers.{layer_idx}.{path}" in bkey:
                     bits = boost_map[bkey].get("bits", base_bits)
@@ -2006,24 +2175,16 @@ def _run_gptq(
 
             logger.debug(f"  L{layer_idx}: GPTQ {path} ({out_dim}x{in_dim}) @ {bits}bit")
             w_f32 = w.astype(mx.float32)
-            x_cal = module_input.value.astype(mx.float32).reshape(-1, in_dim)
-            float_out_d = x_cal @ w_f32.T
-            plain_q = mx.dequantize(*mx.quantize(w_f32, group_size=gs, bits=bits, mode=mode),
-                                     group_size=gs, bits=bits, mode=mode)
-            mse_plain_d = ((float_out_d - x_cal @ plain_q.T) ** 2).mean()
             w_opt = _gptq_quantize_weight(
                 w_f32, Hinv, bits, gs, mode, block_size=32,
             )
-            mse_gptq_d = ((float_out_d - x_cal @ w_opt.T) ** 2).mean()
-            mx.eval(mse_plain_d, mse_gptq_d)
-            imp = (1 - mse_gptq_d.item() / max(mse_plain_d.item(), 1e-20)) * 100
-            logger.debug(f"    -> plain={mse_plain_d.item():.6f} gptq={mse_gptq_d.item():.6f} ({imp:+.1f}%)")
             module.weight = w_opt.astype(w.dtype)
             mx.eval(module.weight)
-            del w_f32, x_cal, float_out_d, plain_q
+            del w_f32, w_opt
             layer_opt += 1
             dense_count += 1
-            del Hinv
+
+        del _hinv_cache
 
         # --- Fused 3D expert weights ---
         for attr in ("mlp", "block_sparse_moe", "moe"):
@@ -2508,11 +2669,16 @@ def quantize_oq(
                 seq_length=clip_seq_length,
             )
         else:
+            # Sensitivity only needs layer ranking — short sequences with
+            # more samples give diverse activation coverage and run faster
+            # (embedding computed once, each layer forward is shorter).
+            _sens_samples = min(clip_num_samples * 2, 256)
+            _sens_seqlen = min(clip_seq_length, 128)
             logger.info(f"oQ{oq_level:g}: measuring layer sensitivity")
             sensitivity_map = _measure_sensitivity_from_model(
                 model, tokenizer, config, oq_level,
-                calib_dataset, num_samples=clip_num_samples,
-                seq_length=clip_seq_length,
+                calib_dataset, num_samples=_sens_samples,
+                seq_length=_sens_seqlen,
             )
         if sensitivity_map:
             config["_oq_sensitivity_map"] = {

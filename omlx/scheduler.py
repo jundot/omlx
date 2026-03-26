@@ -514,7 +514,6 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     emitted=emitted_boundaries,
                     processed_tokens=processed_tokens,
                 )
-                _sync_and_clear_cache()
 
                 if self._memory_limit_bytes > 0:
                     active = mx.get_active_memory()
@@ -629,7 +628,6 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     emitted=emitted_boundaries,
                     processed_tokens=processed_tokens,
                 )
-                _sync_and_clear_cache()
 
                 if self._memory_limit_bytes > 0:
                     active = mx.get_active_memory()
@@ -957,7 +955,7 @@ class SchedulerConfig:
 
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
-    mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
+    mlx_cache_cleanup_interval: int = 0  # Steps between mx.clear_cache() calls (0=disabled)
 
 
 @dataclass
@@ -2955,6 +2953,13 @@ class Scheduler:
             # Clean up pending VLM embeddings not yet consumed by prefill.
             if self.batch_generator is not None:
                 self.batch_generator._vlm_pending.pop(uid, None)
+            # Synchronize in-flight GPU work before modifying batch state.
+            # batch_generator.remove() triggers lazy KV cache array slicing
+            # (BatchKVCache.filter) that replaces references to arrays still
+            # used by in-flight Metal command buffers from the previous
+            # batch_generator.next() call.  Without this barrier the Metal
+            # driver can hit 'completeMemory() prepare count underflow'.
+            mx.synchronize(generation_stream)
             self._remove_uid_from_active_batch(uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]

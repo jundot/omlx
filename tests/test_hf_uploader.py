@@ -30,7 +30,7 @@ class TestIsOqModel:
 
     def test_standard_oq_names(self):
         assert _is_oq_model("Qwen3.5-122B-oQ4") is True
-        assert _is_oq_model("Llama-3B-oQ4+") is True
+        assert _is_oq_model("Llama-3B-oQ4e") is True
         assert _is_oq_model("Model-oQ3") is True
         assert _is_oq_model("Model-oQ8") is True
 

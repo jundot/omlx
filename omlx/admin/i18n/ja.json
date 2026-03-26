@@ -194,7 +194,6 @@
   "models.oq.advanced_settings": "詳細設定",
   "models.oq.clip_optimization": "強化量子化 (+)",
   "models.oq.clip_description": "モデルサイズの約1.5倍のメモリが必要です。キャリブレーションデータを使用して2-4ビットの品質を向上させます。",
-  "models.oq.group_size": "グループサイズ",
   "models.oq.calib_dataset": "キャリブレーションデータセット",
   "models.oq.calib_samples": "キャリブレーションサンプル",
   "models.oq.calib_seq_length": "シーケンス長",
