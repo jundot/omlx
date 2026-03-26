@@ -20,7 +20,12 @@ def _get_crash_log_path() -> Path:
 
 def _write_crash_log(exc_text: str) -> Path:
     """Append crash info to the crash log file."""
-    crash_log = _get_crash_log_path()
+    crash_log = Path("/tmp/omlx-crash.log")
+    try:
+        crash_log = _get_crash_log_path()
+    except Exception:
+        pass
+
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(crash_log, "a") as f:
