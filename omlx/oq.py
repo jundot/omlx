@@ -674,18 +674,18 @@ def resolve_output_name(model_name: str, oq_level: int,
 
     Examples:
         "Qwen3.5-122B-A10B" + 4 -> "Qwen3.5-122B-A10B-oQ4"
-        "Qwen3.5-122B-A10B" + 4 + clip -> "Qwen3.5-122B-A10B-oQ4+"
+        "Qwen3.5-122B-A10B" + 4 + clip -> "Qwen3.5-122B-A10B-oQ4e"
         "Qwen3.5-122B-A10B-8bit" + 4 -> "Qwen3.5-122B-A10B-oQ4"
         "Qwen3.5-122B-A10B-oQ6" + 2 -> "Qwen3.5-122B-A10B-oQ2"
     """
     base = re.sub(
-        r"-(oQ[\d.]+\+?|[0-9]+[_-]?bit|fp\d+|bf\d+)$",
+        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+)$",
         "",
         model_name,
         flags=re.IGNORECASE,
     )
     level_str = f"{oq_level:g}"
-    suffix = f"oQ{level_str}+" if enable_clip else f"oQ{level_str}"
+    suffix = f"oQ{level_str}e" if enable_clip else f"oQ{level_str}"
     return f"{base}-{suffix}"
 
 
@@ -1817,6 +1817,9 @@ def _capture_block_module_inputs(block, block_inputs, mask, position_ids):
 def _gptq_compute_hessian(X: Any, damp: float = 0.01) -> tuple:
     """Compute Hessian H = X^T X and its inverse via Cholesky.
 
+    For large in_dim (e.g. 17408 for down_proj), the final matmul
+    Linv.T @ Linv is split into column blocks to avoid Metal GPU timeout.
+
     Args:
         X: Calibration inputs (n_tokens, in_dim), float32.
         damp: Dampening factor for diagonal.
@@ -1824,15 +1827,32 @@ def _gptq_compute_hessian(X: Any, damp: float = 0.01) -> tuple:
     Returns:
         (H, Hinv) both (in_dim, in_dim) float32.
     """
+    n = X.shape[1]
     H = (X.T @ X).astype(mx.float32)
     diag_mean = mx.diag(H).mean()
-    H = H + damp * diag_mean * mx.eye(H.shape[0])
+    H = H + damp * diag_mean * mx.eye(n)
     mx.eval(H)
     L = mx.linalg.cholesky(H, stream=mx.cpu)
-    I = mx.eye(H.shape[0])
+    I = mx.eye(n)
     Linv = mx.linalg.solve_triangular(L, I, upper=False, stream=mx.cpu)
-    Hinv = Linv.T @ Linv
-    mx.eval(Hinv)
+    mx.eval(Linv)
+
+    # Chunked matmul to prevent Metal GPU timeout on large matrices.
+    # (17408, 17408) @ (17408, 17408) = 5.3T ops → single dispatch timeout.
+    _CHUNK = 4096
+    if n <= _CHUNK:
+        Hinv = Linv.T @ Linv
+        mx.eval(Hinv)
+    else:
+        chunks = []
+        for i in range(0, n, _CHUNK):
+            j = min(i + _CHUNK, n)
+            chunk = Linv.T @ Linv[:, i:j]
+            mx.eval(chunk)
+            chunks.append(chunk)
+        Hinv = mx.concatenate(chunks, axis=1)
+        mx.eval(Hinv)
+
     return H, Hinv
 
 
@@ -1929,6 +1949,10 @@ def _gptq_quantize_weight(
 
             group_cols[i] = qc
 
+            # Periodic eval to prevent Metal GPU timeout on large tensors
+            if (i + 1) % 16 == 0:
+                mx.eval(*group_cols)
+
         # Reassemble the group into W
         group_result = mx.stack(group_cols, axis=1)  # (out_dim, g_size)
         W = mx.concatenate(
@@ -2013,6 +2037,10 @@ def _gptq_quantize_experts_batched(
 
             group_cols[i] = qc
 
+            # Periodic eval to prevent Metal GPU timeout on large tensors
+            if (i + 1) % 16 == 0:
+                mx.eval(*group_cols)
+
         # Reassemble the group into W
         group_result = mx.stack(group_cols, axis=2)  # (E, O, g_size)
         W = mx.concatenate(
@@ -2084,6 +2112,12 @@ def _run_gptq(
         layer_opt = 0
 
         # --- Dense (2D) weights: attention, shared_expert, dense MLP ---
+        # Cache Hessian per input source — tensors sharing the same input
+        # (e.g. gate_proj and up_proj both fed by layernorm output) get
+        # identical Hessians, so compute once and reuse.
+        _hinv_cache: dict[int, Any] = {}
+        boost_map = config.get("_oq_boost_map") or {}
+
         for path, module in tree_flatten(
             block.leaf_modules(), is_leaf=nn.Module.is_module
         ):
@@ -2118,16 +2152,20 @@ def _run_gptq(
             if module_input is None:
                 continue
 
-            x_flat = module_input.value.astype(mx.float32).reshape(-1, in_dim)
-            if x_flat.shape[0] == 0:
-                continue
-            mx.eval(x_flat)
-            _, Hinv = _gptq_compute_hessian(x_flat)
-            del x_flat
+            # Reuse Hessian for shared input sources
+            inp_id = id(module_input)
+            if inp_id in _hinv_cache and _hinv_cache[inp_id].shape[0] == in_dim:
+                Hinv = _hinv_cache[inp_id]
+            else:
+                x_flat = module_input.value.astype(mx.float32).reshape(-1, in_dim)
+                if x_flat.shape[0] == 0:
+                    continue
+                mx.eval(x_flat)
+                _, Hinv = _gptq_compute_hessian(x_flat)
+                del x_flat
+                _hinv_cache[inp_id] = Hinv
 
             bits = base_bits
-            # Check boost map for this tensor
-            boost_map = config.get("_oq_boost_map") or {}
             for bkey in boost_map:
                 if f"layers.{layer_idx}.{path}" in bkey:
                     bits = boost_map[bkey].get("bits", base_bits)
@@ -2137,24 +2175,16 @@ def _run_gptq(
 
             logger.debug(f"  L{layer_idx}: GPTQ {path} ({out_dim}x{in_dim}) @ {bits}bit")
             w_f32 = w.astype(mx.float32)
-            x_cal = module_input.value.astype(mx.float32).reshape(-1, in_dim)
-            float_out_d = x_cal @ w_f32.T
-            plain_q = mx.dequantize(*mx.quantize(w_f32, group_size=gs, bits=bits, mode=mode),
-                                     group_size=gs, bits=bits, mode=mode)
-            mse_plain_d = ((float_out_d - x_cal @ plain_q.T) ** 2).mean()
             w_opt = _gptq_quantize_weight(
                 w_f32, Hinv, bits, gs, mode, block_size=32,
             )
-            mse_gptq_d = ((float_out_d - x_cal @ w_opt.T) ** 2).mean()
-            mx.eval(mse_plain_d, mse_gptq_d)
-            imp = (1 - mse_gptq_d.item() / max(mse_plain_d.item(), 1e-20)) * 100
-            logger.debug(f"    -> plain={mse_plain_d.item():.6f} gptq={mse_gptq_d.item():.6f} ({imp:+.1f}%)")
             module.weight = w_opt.astype(w.dtype)
             mx.eval(module.weight)
-            del w_f32, x_cal, float_out_d, plain_q
+            del w_f32, w_opt
             layer_opt += 1
             dense_count += 1
-            del Hinv
+
+        del _hinv_cache
 
         # --- Fused 3D expert weights ---
         for attr in ("mlp", "block_sparse_moe", "moe"):
@@ -2639,11 +2669,16 @@ def quantize_oq(
                 seq_length=clip_seq_length,
             )
         else:
+            # Sensitivity only needs layer ranking — short sequences with
+            # more samples give diverse activation coverage and run faster
+            # (embedding computed once, each layer forward is shorter).
+            _sens_samples = min(clip_num_samples * 2, 256)
+            _sens_seqlen = min(clip_seq_length, 128)
             logger.info(f"oQ{oq_level:g}: measuring layer sensitivity")
             sensitivity_map = _measure_sensitivity_from_model(
                 model, tokenizer, config, oq_level,
-                calib_dataset, num_samples=clip_num_samples,
-                seq_length=clip_seq_length,
+                calib_dataset, num_samples=_sens_samples,
+                seq_length=_sens_seqlen,
             )
         if sensitivity_map:
             config["_oq_sensitivity_map"] = {

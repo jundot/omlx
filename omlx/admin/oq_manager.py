@@ -25,6 +25,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+class _QuantCancelled(Exception):
+    """Raised by progress callback when task is cancelled."""
+
+    pass
+
+
 class QuantStatus(str, enum.Enum):
     """Status of a quantization task."""
 
@@ -285,10 +291,12 @@ class OQManager:
             if (
                 task.model_path == model_path
                 and task.oq_level == oq_level
+                and task.enable_clip == enable_clip
                 and task.status in _ACTIVE_STATUSES
             ):
+                suffix = "e" if enable_clip else ""
                 raise ValueError(
-                    f"Quantization for '{model_name}' at oQ{oq_level:g} "
+                    f"Quantization for '{model_name}' at oQ{oq_level:g}{suffix} "
                     "is already in progress"
                 )
 
@@ -344,8 +352,6 @@ class OQManager:
             progress_task.cancel()
 
         active_task = self._active_tasks.pop(task_id, None)
-        if active_task and not active_task.done():
-            active_task.cancel()
 
         # Clean up partial output
         output = Path(task.output_path)
@@ -354,24 +360,42 @@ class OQManager:
 
             shutil.rmtree(output, ignore_errors=True)
 
-        # Clean up GPU state to prevent Metal errors on next task.
-        # asyncio.Task.cancel() doesn't stop the to_thread immediately —
-        # the thread may still have in-flight Metal commands. Wait for the
-        # thread to actually finish before touching Metal state.
-        if active_task:
+        # Wait for the quantization thread to actually finish.
+        # Do NOT call active_task.cancel() first — that only cancels the
+        # asyncio wrapper and causes the await to return immediately while
+        # the OS thread continues running Metal commands. Instead, rely on
+        # cooperative cancellation: the progress callback raises
+        # _QuantCancelled when it sees the flag, terminating quantize_oq
+        # at the next callback point (per-layer in GPTQ, per-tensor in
+        # streaming).
+        if active_task and not active_task.done():
             try:
-                await asyncio.wait_for(asyncio.shield(active_task), timeout=10.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(
+                    asyncio.shield(active_task), timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                # Thread didn't exit cooperatively (e.g. stuck in long GPTQ
+                # block). Force-cancel as last resort and wait a bit for
+                # Metal to settle.
+                logger.warning("oQ cancel: cooperative exit timed out, force-cancelling")
+                active_task.cancel()
+                try:
+                    await active_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                await asyncio.sleep(2.0)
+            except (asyncio.CancelledError, Exception):
                 pass
+
+        # GPU cleanup after thread is done
         if HAS_MLX:
-            try:
-                mx.synchronize()
-            except Exception:
-                pass
-            try:
-                mx.clear_cache()
-            except Exception:
-                pass
+            for _attempt in range(3):
+                try:
+                    mx.synchronize()
+                    mx.clear_cache()
+                    break
+                except Exception:
+                    await asyncio.sleep(1.0)
 
         logger.info(
             f"oQ quantization cancelled: {task.model_name} (task_id={task_id})"
@@ -432,7 +456,7 @@ class OQManager:
 
                 def _progress_cb(phase: str, pct: float) -> None:
                     if task_id in self._cancelled:
-                        return
+                        raise _QuantCancelled(f"Task {task_id} cancelled")
                     task.phase = self._phase_label(phase, task.oq_level)
                     task.progress = pct
 
@@ -504,6 +528,9 @@ class OQManager:
 
         except asyncio.CancelledError:
             if task.status not in (QuantStatus.CANCELLED, QuantStatus.FAILED):
+                task.status = QuantStatus.CANCELLED
+        except _QuantCancelled:
+            if task.status != QuantStatus.CANCELLED:
                 task.status = QuantStatus.CANCELLED
         except Exception as e:
             if task_id not in self._cancelled:

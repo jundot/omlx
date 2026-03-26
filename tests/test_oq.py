@@ -325,10 +325,10 @@ class TestResolveOutputName:
         assert resolve_output_name("Qwen3.5-122B-A10B-oQ6", 2) == "Qwen3.5-122B-A10B-oQ2"
 
     def test_clip_suffix(self):
-        assert resolve_output_name("Qwen3.5-122B-A10B", 4, enable_clip=True) == "Qwen3.5-122B-A10B-oQ4+"
+        assert resolve_output_name("Qwen3.5-122B-A10B", 4, enable_clip=True) == "Qwen3.5-122B-A10B-oQ4e"
 
     def test_strip_existing_clip_suffix(self):
-        assert resolve_output_name("Qwen3.5-122B-A10B-oQ4+", 2) == "Qwen3.5-122B-A10B-oQ2"
+        assert resolve_output_name("Qwen3.5-122B-A10B-oQ4e", 2) == "Qwen3.5-122B-A10B-oQ2"
 
     def test_all_levels(self):
         for level in OQ_LEVELS:
@@ -338,7 +338,7 @@ class TestResolveOutputName:
     def test_all_levels_clip(self):
         for level in OQ_LEVELS:
             result = resolve_output_name("Model-7B", level, enable_clip=True)
-            assert result == f"Model-7B-oQ{level}+"
+            assert result == f"Model-7B-oQ{level}e"
 
 
 # =============================================================================
