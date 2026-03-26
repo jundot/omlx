@@ -56,6 +56,10 @@ class ModelSettings:
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
 
+    # TurboQuant KV cache (experimental: vector quantization for KV cache compression)
+    turboquant_kv_enabled: bool = False
+    turboquant_kv_bits: int = 4  # 3 or 4
+
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
     specprefill_draft_model: Optional[str] = None  # Path to draft model (must share tokenizer)

@@ -52,7 +52,7 @@ dependencies = [
     # Resource monitoring
     "psutil>=5.9.0",
     # Server
-    "fastapi>=0.100.0",
+    "fastapi>=0.108.0",
     "uvicorn>=0.23.0",
     # JSON Schema validation for structured output
     "jsonschema>=4.0.0",
@@ -110,6 +110,7 @@ where = ["."]
 include = ["omlx*"]
 
 [tool.setuptools.package-data]
+"omlx" = ["oq_calibration_data.json"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
 

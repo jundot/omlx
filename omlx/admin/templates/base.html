@@ -128,10 +128,14 @@
             function processIcons() {
                 if (pending) return;
                 pending = true;
-                requestAnimationFrame(function() {
-                    lucide.createIcons();
-                    pending = false;
-                });
+                // setTimeout defers past Alpine's microtask rendering,
+                // then rAF ensures icons are ready before paint.
+                setTimeout(function() {
+                    requestAnimationFrame(function() {
+                        lucide.createIcons();
+                        pending = false;
+                    });
+                }, 0);
             }
 
             // Initial pass

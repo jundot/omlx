@@ -7,7 +7,7 @@
     ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
-    const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer']);
+    const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy']);
 
     function dashboard() {
@@ -251,6 +251,7 @@
 
             // oQ Quantizer state
             oqModels: [],
+            oqAllModels: [],
             oqModelsLoaded: false,
             oqSelectedModelPath: '',
             oqLevel: 4,
@@ -263,11 +264,35 @@
             oqAdvancedOpen: false,
             oqEnableClip: false,
             oqTextOnly: false,
-            oqGroupSize: 64,
             oqClipSamples: 128,
             oqClipSeqLen: 512,
             oqCalibDataset: 'code_multilingual',
             oqClipBatchSize: 1024,
+            oqSensitivityModelPath: '',
+
+            // oQ Uploader state
+            uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
+            uploadHfUsername: '',
+            uploadHfOrgs: [],
+            uploadHfNamespace: '',
+            uploadTokenValidated: false,
+            uploadTokenValidating: false,
+            uploadOqModels: [],
+            uploadAllModels: [],
+            uploadOqModelsLoaded: false,
+            uploadTasks: [],
+            uploadError: '',
+            uploadSuccess: '',
+            _uploadRefreshTimer: null,
+            // Upload modal
+            uploadModalOpen: false,
+            uploadModalModelPath: '',
+            uploadModalModelName: '',
+            uploadModalRepoId: '',
+            uploadReadmeSource: '',
+            uploadAutoReadme: true,
+            uploadPrivate: false,
+            uploadStarting: false,
 
             // Benchmark state
             benchModelId: '',
@@ -476,6 +501,10 @@
                 this.syncTabStateToUrl();
                 if (tab === 'quantizer') {
                     this.loadOQModels();
+                }
+                if (tab === 'uploader') {
+                    if (!this.uploadOqModelsLoaded) this.loadUploadOqModels();
+                    this.loadUploadTasks();
                 }
             },
 
@@ -883,6 +912,8 @@
                     ttl_seconds: settings.ttl_seconds ?? null,
                     enableIndexCache: !!(settings.index_cache_freq),
                     index_cache_freq: settings.index_cache_freq || null,
+                    turboquant_kv_enabled: settings.turboquant_kv_enabled || false,
+                    turboquant_kv_bits: settings.turboquant_kv_bits || 4,
                     specprefill_enabled: settings.specprefill_enabled || false,
                     specprefill_draft_model: settings.specprefill_draft_model || '',
                     specprefill_keep_pct: settings.specprefill_keep_pct ? String(settings.specprefill_keep_pct) : '0.2',
@@ -948,6 +979,10 @@
                                     ? chatTemplateKwargs : null,
                                 forced_ct_kwargs: forcedCtKwargs.length > 0
                                     ? forcedCtKwargs : null,
+                                turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
+                                turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
+                                    ? (this.modelSettings.turboquant_kv_bits || 4)
+                                    : 4,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
                                 specprefill_keep_pct: this.modelSettings.specprefill_enabled
@@ -2622,6 +2657,7 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.oqModels = data.models || [];
+                        this.oqAllModels = data.all_models || [];
                         this.oqModelsLoaded = true;
                     }
                 } catch (err) {
@@ -2642,11 +2678,12 @@
                             model_path: this.oqSelectedModelPath,
                             oq_level: this.oqLevel,
                             enable_clip: this.oqEnableClip,
-                            group_size: this.oqGroupSize,
+                            group_size: 64,
                             clip_num_samples: this.oqClipSamples,
                             clip_seq_length: this.oqClipSeqLen,
                             calib_dataset: this.oqCalibDataset,
                             clip_batch_size: this.oqClipBatchSize,
+                            sensitivity_model_path: this.oqSensitivityModelPath,
                             text_only: this.oqTextOnly,
                         }),
                     });
@@ -2736,6 +2773,17 @@
                 return `${mins}:${String(secs).padStart(2, '0')}`;
             },
 
+            oqSensitivityModelCandidates() {
+                if (!this.oqSelectedModelPath) return [];
+                const source = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!source) return [];
+                return this.oqAllModels.filter(m =>
+                    m.path !== this.oqSelectedModelPath &&
+                    m.is_quantized &&
+                    m.model_type === source.model_type
+                );
+            },
+
             oqSelectedModelSupportsClip() {
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 return model?.supports_clip || false;
@@ -2751,6 +2799,15 @@
                 if (this.oqEstimate) {
                     if (this.oqEnableClip) {
                         return this.oqEstimate.memory_clip_formatted || '';
+                    }
+                    // If sensitivity model selected, memory ≈ sensitivity model size × 1.5
+                    if (this.oqSensitivityModelPath) {
+                        const sensModel = this.oqAllModels.find(m => m.path === this.oqSensitivityModelPath);
+                        if (sensModel) {
+                            const bytes = Math.round(sensModel.size * 1.5) + 5 * 1024 * 1024 * 1024;
+                            if (bytes > 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+                            return (bytes / (1024 * 1024)).toFixed(0) + ' MB';
+                        }
                     }
                     return this.oqEstimate.memory_streaming_formatted || '';
                 }
@@ -2795,6 +2852,156 @@
                         console.error('Failed to estimate oQ:', e);
                     }
                 }, 300);
+            },
+
+            // =================================================================
+            // oQ Uploader Functions
+            // =================================================================
+
+            async validateUploadToken() {
+                if (!this.uploadHfToken || this.uploadTokenValidating) return;
+                this.uploadTokenValidating = true;
+                this.uploadError = '';
+                try {
+                    const response = await fetch('/admin/api/upload/validate-token', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ hf_token: this.uploadHfToken }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.ok) {
+                        this.uploadHfUsername = data.username || '';
+                        this.uploadHfOrgs = data.orgs || [];
+                        this.uploadHfNamespace = this.uploadHfUsername;
+                        this.uploadTokenValidated = true;
+                        localStorage.setItem('omlx-hf-upload-token', this.uploadHfToken);
+                        this.loadUploadOqModels();
+                    } else {
+                        this.uploadError = data.detail || window.t('models.uploader.invalid_token');
+                        this.uploadTokenValidated = false;
+                    }
+                } catch (err) {
+                    this.uploadError = 'Connection error. Server may be unavailable.';
+                } finally {
+                    this.uploadTokenValidating = false;
+                }
+            },
+
+            async loadUploadOqModels() {
+                try {
+                    const response = await fetch('/admin/api/upload/oq-models');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.uploadOqModels = data.oq_models || [];
+                        this.uploadAllModels = data.all_models || [];
+                        this.uploadOqModelsLoaded = true;
+                    }
+                } catch (err) {
+                    console.error('Failed to load oQ models for upload:', err);
+                }
+            },
+
+            openUploadModal(model) {
+                this.uploadModalModelPath = model.path;
+                this.uploadModalModelName = model.name;
+                this.uploadModalRepoId = (this.uploadHfNamespace || this.uploadHfUsername) + '/' + model.name;
+                this.uploadReadmeSource = '';
+                this.uploadAutoReadme = true;
+                this.uploadPrivate = false;
+                this.uploadStarting = false;
+                this.uploadModalOpen = true;
+            },
+
+            async startUpload() {
+                if (!this.uploadModalRepoId || this.uploadStarting) return;
+                this.uploadStarting = true;
+                this.uploadError = '';
+                try {
+                    const response = await fetch('/admin/api/upload/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_path: this.uploadModalModelPath,
+                            repo_id: this.uploadModalRepoId,
+                            hf_token: this.uploadHfToken,
+                            readme_source_path: this.uploadReadmeSource,
+                            auto_readme: this.uploadAutoReadme,
+                            private: this.uploadPrivate,
+                        }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.ok) {
+                        this.uploadModalOpen = false;
+                        this.uploadSuccess = `Upload queued: ${this.uploadModalModelName}`;
+                        await this.loadUploadTasks();
+                        this.startUploadRefresh();
+                        setTimeout(() => { this.uploadSuccess = ''; }, 5000);
+                    } else {
+                        this.uploadError = data.detail || 'Failed to start upload';
+                    }
+                } catch (err) {
+                    this.uploadError = 'Connection error. Server may be unavailable.';
+                } finally {
+                    this.uploadStarting = false;
+                }
+            },
+
+            async loadUploadTasks() {
+                try {
+                    const response = await fetch('/admin/api/upload/tasks');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.uploadTasks = data.tasks || [];
+                        const hasActive = this.uploadTasks.some(t =>
+                            ['pending', 'uploading'].includes(t.status));
+                        if (!hasActive) {
+                            this.stopUploadRefresh();
+                        }
+                    }
+                } catch (err) {
+                    console.error('Failed to load upload tasks:', err);
+                }
+            },
+
+            async cancelUploadTask(taskId) {
+                try {
+                    await fetch(`/admin/api/upload/cancel/${taskId}`, { method: 'POST' });
+                    await this.loadUploadTasks();
+                } catch (err) {
+                    console.error('Failed to cancel upload task:', err);
+                }
+            },
+
+            async removeUploadTask(taskId) {
+                try {
+                    await fetch(`/admin/api/upload/task/${taskId}`, { method: 'DELETE' });
+                    await this.loadUploadTasks();
+                } catch (err) {
+                    console.error('Failed to remove upload task:', err);
+                }
+            },
+
+            startUploadRefresh() {
+                this.stopUploadRefresh();
+                this._uploadRefreshTimer = setInterval(() => {
+                    this.loadUploadTasks();
+                }, 2000);
+            },
+
+            stopUploadRefresh() {
+                if (this._uploadRefreshTimer) {
+                    clearInterval(this._uploadRefreshTimer);
+                    this._uploadRefreshTimer = null;
+                }
+            },
+
+            formatUploadElapsed(task) {
+                if (!task.started_at) return '';
+                const now = task.completed_at || (Date.now() / 1000);
+                const elapsed = now - task.started_at;
+                const mins = Math.floor(elapsed / 60);
+                const secs = Math.floor(elapsed % 60);
+                return `${mins}:${String(secs).padStart(2, '0')}`;
             },
 
             // =================================================================

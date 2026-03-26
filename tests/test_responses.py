@@ -503,6 +503,49 @@ class TestConvertResponsesTools:
 
 
 # =============================================================================
+# InputItem Validation Tests
+# =============================================================================
+
+
+class TestInputItemOutputSerialization:
+    """InputItem should accept list/dict in output and serialize to JSON string."""
+
+    def test_list_output_serialized_to_json(self):
+        item = InputItem(
+            type="function_call_output",
+            call_id="call_123",
+            output=[
+                {"type": "input_image", "image_url": "data:image/jpeg;base64,abc"}
+            ],
+        )
+        assert isinstance(item.output, str)
+        parsed = json.loads(item.output)
+        assert parsed[0]["type"] == "input_image"
+
+    def test_dict_output_serialized_to_json(self):
+        item = InputItem(
+            type="function_call_output",
+            call_id="call_456",
+            output={"result": "success", "data": [1, 2, 3]},
+        )
+        assert isinstance(item.output, str)
+        parsed = json.loads(item.output)
+        assert parsed["result"] == "success"
+
+    def test_string_output_unchanged(self):
+        item = InputItem(
+            type="function_call_output",
+            call_id="call_789",
+            output="plain text result",
+        )
+        assert item.output == "plain text result"
+
+    def test_none_output_unchanged(self):
+        item = InputItem(type="function_call_output", call_id="call_000")
+        assert item.output is None
+
+
+# =============================================================================
 # Response Building Tests
 # =============================================================================
 

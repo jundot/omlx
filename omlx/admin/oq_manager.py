@@ -25,6 +25,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+class _QuantCancelled(Exception):
+    """Raised by progress callback when task is cancelled."""
+
+    pass
+
+
 class QuantStatus(str, enum.Enum):
     """Status of a quantization task."""
 
@@ -68,9 +74,9 @@ class QuantTask:
     group_size: int = 64
     clip_num_samples: int = 128
     clip_seq_length: int = 512
-    clip_n_grid: int = 20
     calib_dataset: str = "default"
     clip_batch_size: int = 1024
+    sensitivity_model_path: str = ""
     text_only: bool = False
 
     def to_dict(self) -> dict:
@@ -119,8 +125,10 @@ _CLIP_SUPPORTED_MODEL_TYPES = {
     "qwen3_5",
     "minimax_m2",
     "glm_moe_dsa",
+    "deepseek_v32",
     "ministral3",
-    # Add more as they are tested
+    # TODO: MLA attention AWQ pairs not yet implemented for DeepSeek/GLM.
+    # AWQ works for their MLP layers; attention layers skip gracefully.
 }
 
 
@@ -157,13 +165,14 @@ class OQManager:
         if self._model_dirs:
             self._output_dir = self._model_dirs[0]
 
-    async def list_quantizable_models(self) -> list[dict]:
-        """Scan all model dirs for non-quantized models."""
+    async def list_quantizable_models(self) -> tuple[list[dict], list[dict]]:
+        """Scan all model dirs. Returns (source_models, all_models)."""
 
-        def _scan() -> list[dict]:
-            from ..oq import validate_quantizable
+        def _scan() -> tuple[list[dict], list[dict]]:
+            from ..oq import validate_quantizable, estimate_memory
 
-            models = []
+            source_models = []
+            all_models = []
             seen: set[str] = set()
 
             for model_dir in self._model_dirs:
@@ -172,7 +181,6 @@ class OQManager:
                 for subdir in sorted(model_dir.iterdir()):
                     if not subdir.is_dir():
                         continue
-                    # Two-level scan: direct children or nested (org/model)
                     candidates = []
                     if (subdir / "config.json").exists():
                         candidates.append(subdir)
@@ -188,48 +196,47 @@ class OQManager:
                         try:
                             with open(path / "config.json") as f:
                                 config = json.load(f)
-                            if not validate_quantizable(config):
-                                continue
                             size = sum(
                                 f.stat().st_size
                                 for f in path.glob("*.safetensors")
                             )
                             if size == 0:
-                                # Try .bin files
                                 size = sum(
                                     f.stat().st_size
                                     for f in path.glob("*.bin")
                                 )
                             if size == 0:
                                 continue
-                            from ..oq import estimate_memory
-
-                            models.append(
-                                {
-                                    "name": path.name,
-                                    "path": str(path),
-                                    "size": size,
-                                    "size_formatted": _format_size(size),
-                                    "num_layers": config.get(
-                                        "num_hidden_layers", 0
-                                    ),
-                                    "num_experts": config.get(
-                                        "num_local_experts", 0
-                                    ),
-                                    "model_type": config.get("model_type", ""),
-                                    "supports_clip": _supports_clip(config),
-                                    "is_vlm": "vision_config" in config,
-                                    "memory_streaming": estimate_memory(
-                                        size, enable_clip=False
-                                    ),
-                                    "memory_clip": estimate_memory(
-                                        size, enable_clip=True
-                                    ),
-                                }
-                            )
+                            tc = config.get("text_config", {})
+                            info = {
+                                "name": path.name,
+                                "path": str(path),
+                                "size": size,
+                                "size_formatted": _format_size(size),
+                                "model_type": config.get("model_type", "") or tc.get("model_type", ""),
+                                "is_quantized": "quantization" in config,
+                                "supports_clip": _supports_clip(config),
+                                "is_vlm": "vision_config" in config,
+                            }
+                            all_models.append(info)
+                            if validate_quantizable(config):
+                                info_full = dict(info)
+                                info_full["num_layers"] = config.get(
+                                    "num_hidden_layers", 0
+                                ) or tc.get("num_hidden_layers", 0)
+                                info_full["num_experts"] = config.get(
+                                    "num_local_experts", 0
+                                )
+                                info_full["memory_streaming"] = estimate_memory(
+                                    size, enable_clip=False
+                                )
+                                info_full["memory_clip"] = estimate_memory(
+                                    size, enable_clip=True
+                                )
+                                source_models.append(info_full)
                         except Exception:
                             continue
-            return models
+            return source_models, all_models
 
         return await asyncio.to_thread(_scan)
 
@@ -241,9 +248,9 @@ class OQManager:
         group_size: int = 64,
         clip_num_samples: int = 128,
         clip_seq_length: int = 512,
-        clip_n_grid: int = 20,
         calib_dataset: str = "default",
         clip_batch_size: int = 1024,
+        sensitivity_model_path: str = "",
         text_only: bool = False,
     ) -> QuantTask:
         """Start a quantization job.
@@ -284,10 +291,12 @@ class OQManager:
             if (
                 task.model_path == model_path
                 and task.oq_level == oq_level
+                and task.enable_clip == enable_clip
                 and task.status in _ACTIVE_STATUSES
             ):
+                suffix = "e" if enable_clip else ""
                 raise ValueError(
-                    f"Quantization for '{model_name}' at oQ{oq_level:g} "
+                    f"Quantization for '{model_name}' at oQ{oq_level:g}{suffix} "
                     "is already in progress"
                 )
 
@@ -310,9 +319,9 @@ class OQManager:
             group_size=group_size,
             clip_num_samples=clip_num_samples,
             clip_seq_length=clip_seq_length,
-            clip_n_grid=clip_n_grid,
             calib_dataset=calib_dataset,
             clip_batch_size=clip_batch_size,
+            sensitivity_model_path=sensitivity_model_path,
             text_only=text_only,
         )
         self._tasks[task_id] = task
@@ -343,8 +352,6 @@ class OQManager:
             progress_task.cancel()
 
         active_task = self._active_tasks.pop(task_id, None)
-        if active_task and not active_task.done():
-            active_task.cancel()
 
         # Clean up partial output
         output = Path(task.output_path)
@@ -353,16 +360,42 @@ class OQManager:
 
             shutil.rmtree(output, ignore_errors=True)
 
-        # Clean up GPU state to prevent Metal errors on next task
+        # Wait for the quantization thread to actually finish.
+        # Do NOT call active_task.cancel() first — that only cancels the
+        # asyncio wrapper and causes the await to return immediately while
+        # the OS thread continues running Metal commands. Instead, rely on
+        # cooperative cancellation: the progress callback raises
+        # _QuantCancelled when it sees the flag, terminating quantize_oq
+        # at the next callback point (per-layer in GPTQ, per-tensor in
+        # streaming).
+        if active_task and not active_task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(active_task), timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                # Thread didn't exit cooperatively (e.g. stuck in long GPTQ
+                # block). Force-cancel as last resort and wait a bit for
+                # Metal to settle.
+                logger.warning("oQ cancel: cooperative exit timed out, force-cancelling")
+                active_task.cancel()
+                try:
+                    await active_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                await asyncio.sleep(2.0)
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # GPU cleanup after thread is done
         if HAS_MLX:
-            try:
-                mx.synchronize()
-            except Exception:
-                pass
-            try:
-                mx.clear_cache()
-            except Exception:
-                pass
+            for _attempt in range(3):
+                try:
+                    mx.synchronize()
+                    mx.clear_cache()
+                    break
+                except Exception:
+                    await asyncio.sleep(1.0)
 
         logger.info(
             f"oQ quantization cancelled: {task.model_name} (task_id={task_id})"
@@ -405,17 +438,15 @@ class OQManager:
                     return
 
                 # Ensure GPU is clean before starting (previous task may have been cancelled)
-                # Metal needs time to fully release command buffers after cancellation
+                # Metal command buffers need full sync + cache clear after cancellation
                 if HAS_MLX:
-                    try:
-                        mx.synchronize()
-                    except Exception:
-                        pass
-                    await asyncio.sleep(2.0)
-                    try:
-                        mx.clear_cache()
-                    except Exception:
-                        pass
+                    for _ in range(3):
+                        try:
+                            mx.synchronize()
+                            mx.clear_cache()
+                            break
+                        except Exception:
+                            await asyncio.sleep(1.0)
 
                 # Phase 1: Loading
                 task.status = QuantStatus.LOADING
@@ -425,7 +456,7 @@ class OQManager:
 
                 def _progress_cb(phase: str, pct: float) -> None:
                     if task_id in self._cancelled:
-                        return
+                        raise _QuantCancelled(f"Task {task_id} cancelled")
                     task.phase = self._phase_label(phase, task.oq_level)
                     task.progress = pct
 
@@ -435,7 +466,7 @@ class OQManager:
                 )
 
                 if task.enable_clip:
-                    # Full model load + clip optimization
+                    # Full model load + GPTQ optimization
                     from ..oq import quantize_oq
 
                     await asyncio.to_thread(
@@ -450,6 +481,9 @@ class OQManager:
                         task.text_only,
                         task.clip_num_samples,
                         task.clip_seq_length,
+                        None,  # target_bpw
+                        None,  # hard_cap_bpw
+                        task.sensitivity_model_path,
                     )
                 else:
                     # Tensor-by-tensor (low memory)
@@ -463,6 +497,9 @@ class OQManager:
                         task.group_size,
                         _progress_cb,
                         task.text_only,
+                        None,  # target_bpw
+                        None,  # hard_cap_bpw
+                        task.sensitivity_model_path,
                     )
 
                 if task_id in self._cancelled:
@@ -491,6 +528,9 @@ class OQManager:
 
         except asyncio.CancelledError:
             if task.status not in (QuantStatus.CANCELLED, QuantStatus.FAILED):
+                task.status = QuantStatus.CANCELLED
+        except _QuantCancelled:
+            if task.status != QuantStatus.CANCELLED:
                 task.status = QuantStatus.CANCELLED
         except Exception as e:
             if task_id not in self._cancelled:
@@ -550,7 +590,7 @@ class OQManager:
         labels = {
             "loading": "Loading model...",
             "quantizing": f"Quantizing to oQ{oq_level:g}...",
-            "optimizing": f"Clip optimization oQ{oq_level:g}...",
+            "optimizing": f"GPTQ optimization oQ{oq_level:g}...",
             "saving": "Saving quantized model...",
         }
         # Handle progress: "quantizing_eta|792|879|0:02"

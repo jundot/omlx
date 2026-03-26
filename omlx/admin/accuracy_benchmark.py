@@ -311,7 +311,9 @@ async def run_accuracy_benchmark(
             "total": len(request.benchmarks),
         })
 
-        engine = await engine_pool.get_engine(request.model_id)
+        # Force LM engine for accuracy benchmarks — text-only tasks
+        # don't need VLM and the VLM adapter can produce empty responses.
+        engine = await engine_pool.get_engine(request.model_id, force_lm=True)
 
         # Load model sampling settings
         sampling_kwargs = {}

@@ -93,6 +93,16 @@
                             <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>
                             {{ t('navbar.dropdown.quantizer') }}
                         </button>
+                        <button
+                            @click="setModelsTab('uploader'); modelsDropdown = false;"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'models' && modelsTab === 'uploader'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="cloud-upload" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.dropdown.uploader') }}
+                        </button>
                     </div>
                 </div>
                 <div class="relative" @mouseenter="settingsDropdown = true" @mouseleave="settingsDropdown = false">

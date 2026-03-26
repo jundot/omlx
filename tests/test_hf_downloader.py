@@ -1245,6 +1245,39 @@ class TestGetModelInfo:
         assert result["files"][0]["name"] == "model.safetensors"
         assert "text-generation" in result["tags"]
         assert result["model_card"] == ""  # No README available
+        assert result["is_adapter"] is False
+
+    @pytest.mark.asyncio
+    async def test_detects_lora_adapter(self):
+        """Verify is_adapter=True when adapter_config.json is in file list."""
+        mock_info = MagicMock()
+        mock_info.id = "user/lora-adapter"
+        mock_info.downloads = 50
+        mock_info.likes = 5
+        mock_info.tags = ["lora", "mlx"]
+        mock_info.pipeline_tag = "text-generation"
+        mock_info.created_at = None
+        mock_info.last_modified = None
+        mock_info.safetensors = None
+        mock_info.card_data = None
+
+        siblings = []
+        for name in ["adapter_config.json", "adapters.safetensors", "config.json"]:
+            s = MagicMock()
+            s.rfilename = name
+            s.size = 1000
+            siblings.append(s)
+        mock_info.siblings = siblings
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls, \
+             patch("omlx.admin.hf_downloader.hf_hub_download", side_effect=Exception("no readme")):
+            mock_api = MagicMock()
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_model_info("user/lora-adapter")
+
+        assert result["is_adapter"] is True
 
     @pytest.mark.asyncio
     async def test_returns_model_card(self, tmp_path):

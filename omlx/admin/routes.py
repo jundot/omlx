@@ -93,6 +93,9 @@ class ModelSettingsRequest(BaseModel):
     index_cache_freq: Optional[int] = None
     thinking_budget_enabled: Optional[bool] = None
     thinking_budget_tokens: Optional[int] = None
+    # TurboQuant KV cache (experimental)
+    turboquant_kv_enabled: Optional[bool] = None
+    turboquant_kv_bits: Optional[int] = None
     # SpecPrefill (experimental)
     specprefill_enabled: Optional[bool] = None
     specprefill_draft_model: Optional[str] = None
@@ -205,10 +208,27 @@ class OQStartRequest(BaseModel):
     group_size: int = 64
     clip_num_samples: int = 128
     clip_seq_length: int = 512
-    clip_n_grid: int = 20
     calib_dataset: str = "default"
     clip_batch_size: int = 1024
+    sensitivity_model_path: str = ""
     text_only: bool = False
+
+
+class HFUploadRequest(BaseModel):
+    """Request model for starting a HuggingFace upload task."""
+
+    model_path: str
+    repo_id: str
+    hf_token: str
+    readme_source_path: str = ""
+    auto_readme: bool = True
+    private: bool = False
+
+
+class HFValidateTokenRequest(BaseModel):
+    """Request model for validating a HuggingFace token."""
+
+    hf_token: str
 
 
 # =============================================================================
@@ -701,6 +721,7 @@ _get_global_settings = None
 _hf_downloader = None
 _ms_downloader = None
 _oq_manager = None
+_hf_uploader = None
 
 
 def set_admin_getters(
@@ -757,6 +778,16 @@ def set_oq_manager(manager):
     """
     global _oq_manager
     _oq_manager = manager
+
+
+def set_hf_uploader(uploader):
+    """Set the HFUploader instance for admin routes.
+
+    Args:
+        uploader: HFUploader instance created during server initialization.
+    """
+    global _hf_uploader
+    _hf_uploader = uploader
 
 
 # =============================================================================
@@ -872,11 +903,9 @@ async def login_page(request: Request):
     global_settings = _get_global_settings()
     api_key_configured = bool(global_settings and global_settings.auth.api_key)
     return templates.TemplateResponse(
+        request,
         "login.html",
-        {
-            "request": request,
-            "api_key_configured": api_key_configured,
-        },
+        {"api_key_configured": api_key_configured},
     )
 
 
@@ -890,7 +919,7 @@ async def dashboard_page(request: Request, is_admin: bool = Depends(require_admi
     Returns:
         HTML dashboard page with server status and model list.
     """
-    return templates.TemplateResponse("dashboard.html", {"request": request})
+    return templates.TemplateResponse(request, "dashboard.html", {})
 
 
 @router.get("/chat", response_class=HTMLResponse)
@@ -909,7 +938,7 @@ async def chat_page(request: Request, is_admin: bool = Depends(require_admin)):
     global_settings = _get_global_settings()
     api_key = global_settings.auth.api_key if global_settings else ""
     return templates.TemplateResponse(
-        "chat.html", {"request": request, "api_key": api_key or ""}
+        request, "chat.html", {"api_key": api_key or ""}
     )
 
 
@@ -1284,6 +1313,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "forced_ct_kwargs": settings.forced_ct_kwargs,
                 "ttl_seconds": settings.ttl_seconds,
                 "index_cache_freq": settings.index_cache_freq,
+                "turboquant_kv_enabled": settings.turboquant_kv_enabled,
+                "turboquant_kv_bits": settings.turboquant_kv_bits,
                 "specprefill_enabled": settings.specprefill_enabled,
                 "specprefill_draft_model": settings.specprefill_draft_model,
                 "specprefill_keep_pct": settings.specprefill_keep_pct,
@@ -1491,6 +1522,11 @@ async def update_model_settings(
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
         )
+    # TurboQuant KV cache settings
+    if "turboquant_kv_enabled" in sent:
+        current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
+    if "turboquant_kv_bits" in sent:
+        current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
@@ -3579,8 +3615,8 @@ async def list_oq_models(is_admin: bool = Depends(require_admin)):
         raise HTTPException(
             status_code=503, detail="oQ quantizer not initialized"
         )
-    models = await _oq_manager.list_quantizable_models()
-    return {"models": models}
+    source_models, all_models = await _oq_manager.list_quantizable_models()
+    return {"models": source_models, "all_models": all_models}
 
 
 @router.get("/api/oq/estimate")
@@ -3624,9 +3660,9 @@ async def start_oq_quantization(
             group_size=request.group_size,
             clip_num_samples=request.clip_num_samples,
             clip_seq_length=request.clip_seq_length,
-            clip_n_grid=request.clip_n_grid,
             calib_dataset=request.calib_dataset,
             clip_batch_size=request.clip_batch_size,
+            sensitivity_model_path=request.sensitivity_model_path,
             text_only=request.text_only,
         )
         return {"success": True, "task": task.to_dict()}
@@ -3671,6 +3707,108 @@ async def remove_oq_task(
             status_code=503, detail="oQ quantizer not initialized"
         )
     success = _oq_manager.remove_task(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=404, detail="Task not found or still active"
+        )
+    return {"success": True}
+
+
+# =============================================================================
+# HuggingFace Upload Endpoints
+# =============================================================================
+
+
+@router.post("/api/upload/validate-token")
+async def validate_upload_token(
+    request: HFValidateTokenRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Validate a HuggingFace token and return user info."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    try:
+        result = await _hf_uploader.validate_token(request.hf_token)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/api/upload/oq-models")
+async def list_upload_oq_models(is_admin: bool = Depends(require_admin)):
+    """List local oQ models available for upload."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    oq_models = await _hf_uploader.list_oq_models()
+    all_models = await _hf_uploader.list_all_models()
+    return {"oq_models": oq_models, "all_models": all_models}
+
+
+@router.post("/api/upload/start")
+async def start_upload(
+    request: HFUploadRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Start an upload task to HuggingFace Hub."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    try:
+        task = await _hf_uploader.start_upload(
+            model_path=request.model_path,
+            repo_id=request.repo_id,
+            token=request.hf_token,
+            readme_source_path=request.readme_source_path,
+            auto_readme=request.auto_readme,
+            private=request.private,
+        )
+        return {"success": True, "task": task.to_dict()}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/api/upload/tasks")
+async def list_upload_tasks(is_admin: bool = Depends(require_admin)):
+    """List all upload tasks."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    return {"tasks": _hf_uploader.get_tasks()}
+
+
+@router.post("/api/upload/cancel/{task_id}")
+async def cancel_upload_task(
+    task_id: str, is_admin: bool = Depends(require_admin)
+):
+    """Cancel an active or pending upload task."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    success = await _hf_uploader.cancel_upload(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=404, detail="Task not found or not cancellable"
+        )
+    return {"success": True}
+
+
+@router.delete("/api/upload/task/{task_id}")
+async def remove_upload_task(
+    task_id: str, is_admin: bool = Depends(require_admin)
+):
+    """Remove a completed/failed/cancelled upload task."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    success = _hf_uploader.remove_task(task_id)
     if not success:
         raise HTTPException(
             status_code=404, detail="Task not found or still active"
