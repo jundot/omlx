@@ -504,6 +504,32 @@ class TestPrefixIndexOperations:
         prefix_len, matched_ids, num_blocks = result
         assert prefix_len == 4
 
+    def test_prefix_index_immutable_after_store(self, prefix_cache, paged_cache):
+        """Test that _prefix_index entries are not affected by later mutations
+        of the original block_ids list (e.g., from CoW or block reallocation).
+
+        Regression test for: storing a mutable list reference in _prefix_index
+        allows CoW operations to silently corrupt the index.
+        """
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]  # 2 blocks (block_size=4)
+
+        # Allocate blocks
+        blocks = paged_cache.get_new_blocks(2)
+        block_ids = [b.block_id for b in blocks]
+        original_ids = list(block_ids)  # snapshot for assertion
+
+        # Store into prefix index
+        prefix_cache._update_prefix_index(tokens, block_ids)
+
+        # Simulate CoW: mutate the original list in-place
+        block_ids[0] = 9999
+
+        # Verify: prefix_index must still contain the original block IDs
+        result = prefix_cache._find_best_prefix_match(tokens)
+        assert result is not None
+        _, matched_ids, num_blocks = result
+        assert list(matched_ids[:num_blocks]) == original_ids[:num_blocks]
+
 
 class TestValidateBlockCacheData:
     """Tests for _validate_block_cache_data method."""
