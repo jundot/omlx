@@ -194,7 +194,6 @@
   "models.oq.advanced_settings": "進階設定",
   "models.oq.clip_optimization": "增強量化 (+)",
   "models.oq.clip_description": "需要約1.5倍模型大小的記憶體。使用校準資料提升2-4位元量化品質。",
-  "models.oq.group_size": "分組大小",
   "models.oq.calib_dataset": "校準資料集",
   "models.oq.calib_samples": "校準樣本數",
   "models.oq.calib_seq_length": "序列長度",

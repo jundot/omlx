@@ -1785,11 +1785,12 @@ def _gptq_quantize_weight(
     def _qdq_col(col):
         n = col.shape[0]
         # Find a valid group size that divides the column
+        # MLX only supports group_size in {32, 64, 128}
         gs_col = group_size
-        while gs_col > 1 and n % gs_col != 0:
+        while gs_col > 32 and n % gs_col != 0:
             gs_col //= 2
-        if gs_col < 1:
-            return col  # can't quantize
+        if n % gs_col != 0:
+            return col  # no valid group_size divides out_dim, skip qdq
         cr = col.reshape(-1, gs_col)
         return mx.dequantize(
             *mx.quantize(cr, group_size=gs_col, bits=bits, mode=mode),

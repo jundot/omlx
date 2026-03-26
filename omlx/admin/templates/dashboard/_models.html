@@ -1146,16 +1146,6 @@
                                         <p x-show="oqTextOnly && oqSelectedModelIsVLM()" x-cloak class="text-xs text-amber-600 leading-relaxed">
                                             Excludes vision encoder weights. Output is a text-only model (~2-3% smaller).
                                         </p>
-                                        <!-- Group Size -->
-                                        <div class="flex items-center justify-between">
-                                            <span class="text-sm text-neutral-600">{{ t('models.oq.group_size') }}</span>
-                                            <select x-model.number="oqGroupSize"
-                                                    class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                                <option value="32">32</option>
-                                                <option value="64" selected>64</option>
-                                                <option value="128">128</option>
-                                            </select>
-                                        </div>
                                         <!-- Calibration Dataset (clip ON only) -->
                                         <div x-show="oqEnableClip" x-cloak class="flex items-center justify-between">
                                             <span class="text-sm text-neutral-600">{{ t('models.oq.calib_dataset') }}</span>
