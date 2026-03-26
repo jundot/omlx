@@ -514,7 +514,6 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     emitted=emitted_boundaries,
                     processed_tokens=processed_tokens,
                 )
-                _sync_and_clear_cache()
 
                 if self._memory_limit_bytes > 0:
                     active = mx.get_active_memory()
@@ -629,7 +628,6 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     emitted=emitted_boundaries,
                     processed_tokens=processed_tokens,
                 )
-                _sync_and_clear_cache()
 
                 if self._memory_limit_bytes > 0:
                     active = mx.get_active_memory()
@@ -957,7 +955,7 @@ class SchedulerConfig:
 
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
-    mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
+    mlx_cache_cleanup_interval: int = 0  # Steps between mx.clear_cache() calls (0=disabled)
 
 
 @dataclass
