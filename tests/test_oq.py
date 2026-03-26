@@ -68,11 +68,13 @@ class TestUniversalQuantPredicate:
 
     # Stage 0: Non-quantization (should return False)
 
-    def test_moe_router_not_quantized(self, moe_config, module):
-        assert universal_quant_predicate("model.layers.0.mlp.gate", module, moe_config) is False
+    def test_moe_router_8bit(self, moe_config, module):
+        result = universal_quant_predicate("model.layers.0.mlp.gate", module, moe_config)
+        assert isinstance(result, dict) and result["bits"] == 8
 
-    def test_shared_expert_gate_not_quantized(self, moe_config, module):
-        assert universal_quant_predicate("model.layers.0.shared_expert_gate", module, moe_config) is False
+    def test_shared_expert_gate_8bit(self, moe_config, module):
+        result = universal_quant_predicate("model.layers.0.shared_expert_gate", module, moe_config)
+        assert isinstance(result, dict) and result["bits"] == 8
 
     def test_vision_encoder_not_quantized(self, dense_config, module):
         assert universal_quant_predicate("visual.encoder.layers.0.self_attn.q_proj", module, dense_config) is False
@@ -204,9 +206,9 @@ class TestUniversalQuantPredicate:
 
     # Group size
 
-    def test_moe_router_group_size_not_applicable(self, moe_config, module):
-        # Router returns False, so group_size is not relevant
-        assert universal_quant_predicate("model.layers.0.mlp.gate", module, moe_config) is False
+    def test_moe_router_8bit_group_size(self, moe_config, module):
+        result = universal_quant_predicate("model.layers.0.mlp.gate", module, moe_config)
+        assert isinstance(result, dict) and result["bits"] == 8
 
     def test_150_expert_group_size_128(self, module):
         config = {"num_hidden_layers": 32, "num_local_experts": 200, "hidden_size": 2048}
@@ -513,10 +515,10 @@ class TestStreamingHelpers:
         # 6-bit → affine (no mxfp mode for 6-bit)
         assert mode == "affine"
 
-    def test_get_predicate_bits_router_skipped(self):
+    def test_get_predicate_bits_router_8bit(self):
         config = {"num_hidden_layers": 32, "num_local_experts": 8}
         bits, gs, mode = _get_predicate_bits("model.layers.0.mlp.gate", config, 4, 64)
-        assert bits is None  # Router → False → no quantization
+        assert bits == 8  # Router → 8-bit quantization
 
     def test_get_predicate_bits_default_affine4(self):
         config = {"num_hidden_layers": 32}

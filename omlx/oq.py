@@ -456,11 +456,15 @@ def _build_quant_plan(
     max_layer_score = max(layer_scores.values(), default=0.0)
 
     total_params = 0
-    for shape in named_shapes.values():
+    expert_params = 0
+    for path, shape in named_shapes.items():
         n = 1
         for dim in shape:
             n *= dim
         total_params += n
+        if _is_routed_expert(path):
+            expert_params += n
+    is_dense = expert_params / max(total_params, 1) < 0.5
 
     current_bpw = _estimate_effective_bpw(
         named_shapes, base_bits, base_group_size, base_mode
@@ -519,6 +523,74 @@ def _build_quant_plan(
                 total_bits_f += delta
                 current_bpw = total_bits_f / total_params
 
+    # Dense model MLP asymmetry: gate/down → base+1, up → base-1
+    # Inspired by unsloth Dynamic 2.0: SiLU gate and residual down_proj need
+    # protection, while up_proj (linear multiplicand) tolerates lower bits.
+    # Budget-approximately-neutral: 2 tensors boosted, 1 reduced.
+    _VALID_BITS_SET = {2, 3, 4, 5, 6, 8}
+    if is_dense and base_bits >= 3:
+        reduce_bits = max(base_bits - 1, 2)
+        boost_bits = base_bits + 1
+        while boost_bits not in _VALID_BITS_SET and boost_bits < 8:
+            boost_bits += 1
+        can_asymmetry = (
+            reduce_bits in _VALID_BITS_SET
+            and reduce_bits < base_bits
+            and boost_bits in _VALID_BITS_SET
+            and boost_bits > base_bits
+        )
+        if can_asymmetry:
+            # Pass 1: reduce up_proj → free budget
+            for path, shape in named_shapes.items():
+                if path in boost_map:
+                    continue
+                if "up_proj" not in path or "gate" in path:
+                    continue
+                if _extract_layer_index(path) < 0:
+                    continue
+                pred = universal_quant_predicate(
+                    path, module, {**config, "_oq_boost_map": {}}, oq_level
+                )
+                if pred is False:
+                    continue
+                cand_gs = _gs_for_mode(reduce_bits, _OQ_DEFAULT_GROUP_SIZE)
+                cand_mode = _mode_for_bits(reduce_bits)
+                old_cost = _tensor_quantized_bytes(
+                    shape, base_bits, base_group_size, base_mode
+                )
+                new_cost = _tensor_quantized_bytes(shape, reduce_bits, cand_gs, cand_mode)
+                delta = 8 * (new_cost - old_cost)  # negative
+                boost_map[path] = {"bits": reduce_bits, "group_size": cand_gs, "mode": cand_mode}
+                total_bits_f += delta
+                current_bpw = total_bits_f / total_params
+
+            # Pass 2: boost gate/down_proj → use freed budget (with cap check)
+            for path, shape in named_shapes.items():
+                if path in boost_map:
+                    continue
+                if not any(p in path for p in ("gate_proj", "down_proj", "wo")):
+                    continue
+                if _extract_layer_index(path) < 0:
+                    continue
+                pred = universal_quant_predicate(
+                    path, module, {**config, "_oq_boost_map": {}}, oq_level
+                )
+                if pred is False:
+                    continue
+                cand_gs = _gs_for_mode(boost_bits, _OQ_DEFAULT_GROUP_SIZE)
+                cand_mode = _mode_for_bits(boost_bits)
+                old_cost = _tensor_quantized_bytes(
+                    shape, base_bits, base_group_size, base_mode
+                )
+                new_cost = _tensor_quantized_bytes(shape, boost_bits, cand_gs, cand_mode)
+                delta = 8 * (new_cost - old_cost)
+                next_bpw = (total_bits_f + delta) / total_params
+                if next_bpw > hard_cap_bpw:
+                    continue
+                boost_map[path] = {"bits": boost_bits, "group_size": cand_gs, "mode": cand_mode}
+                total_bits_f += delta
+                current_bpw = next_bpw
+
     candidates = []
     for path, shape in named_shapes.items():
         if path in boost_map:
@@ -532,6 +604,9 @@ def _build_quant_plan(
             continue
         layer_idx = _extract_layer_index(path)
         if layer_idx < 0:
+            continue
+        # Dense: skip MLP tensors (already handled by asymmetry)
+        if is_dense and any(p in path for p in ("gate_proj", "up_proj", "down_proj", "wo")):
             continue
         layer_score = float(layer_scores.get(str(layer_idx), 0.0))
         max_extra = _sensitivity_tier(layer_score, max_layer_score)
@@ -1653,11 +1728,13 @@ def _layer_masks_for_model(model, layers, inputs):
             except TypeError:
                 ssm_mask = None
             if fa_mask is not None or ssm_mask is not None:
-                fallback = nn.MultiHeadAttention.create_additive_causal_mask(
-                    inputs.shape[1]
-                ).astype(inputs.dtype if hasattr(inputs, "dtype") else mx.float16)
-                fa_mask = fa_mask if fa_mask is not None else fallback
-                ssm_mask = ssm_mask if ssm_mask is not None else fallback
+                if fa_mask is None:
+                    fa_mask = nn.MultiHeadAttention.create_additive_causal_mask(
+                        inputs.shape[1]
+                    ).astype(inputs.dtype if hasattr(inputs, "dtype") else mx.float16)
+                # SSM layers (GatedDeltaNet) expect (B, S) boolean mask, not
+                # (S, S) causal mask.  During calibration there is no padding,
+                # so None is the correct mask for SSM layers.
                 return [ssm_mask if getattr(layer, "is_linear", False) else fa_mask for layer in layers]
         except (ImportError, AttributeError):
             pass
