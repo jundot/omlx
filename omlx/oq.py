@@ -1836,68 +1836,112 @@ def _gptq_compute_hessian(X: Any, damp: float = 0.01) -> tuple:
     return H, Hinv
 
 
+def _compute_group_params(group_slice: Any, bits: int, group_size: int):
+    """Compute affine quantization scale/bias for a group slice.
+
+    Handles partial last group by padding to group_size so mx.quantize
+    accepts the tensor.
+
+    Args:
+        group_slice: Weight group (..., g_size) where g_size <= group_size.
+        bits: Quantization bits.
+        group_size: Target group size for mx.quantize.
+
+    Returns:
+        (scales, biases) each with shape (..., 1).
+    """
+    actual_width = group_slice.shape[-1]
+    if actual_width < group_size:
+        pad_width = group_size - actual_width
+        pad_spec = [(0, 0)] * (group_slice.ndim - 1) + [(0, pad_width)]
+        group_slice = mx.pad(group_slice, pad_spec)
+    _, scales, *rest = mx.quantize(
+        group_slice, bits=bits, group_size=group_size
+    )
+    biases = rest[0] if rest else mx.zeros_like(scales)
+    return scales, biases
+
+
 def _gptq_quantize_weight(
     w: Any, Hinv: Any, bits: int, group_size: int, mode: str = "affine",
     block_size: int = 32,
 ) -> Any:
     """GPTQ column-by-column quantization with error compensation.
 
-    Modifies weight rounding to minimize output MSE using Hessian information.
-    Returns optimally-rounded weight (still float, ready for mx.quantize).
+    Processes columns in group_size-aligned blocks so that the simulated
+    quantization matches mx.quantize's row-wise grouping (groups along
+    the last axis / in_dim).  Scale and bias are computed once per group
+    from the current weight state, then each column is analytically
+    quantize-dequantized using the fixed group parameters.
 
     Args:
         w: Weight tensor (out_dim, in_dim) float32.
         Hinv: Inverse Hessian (in_dim, in_dim) float32.
         bits: Target quantization bits.
         group_size: Quantization group size.
-        mode: Quantization mode.
-        block_size: GPTQ block size (32 optimal for speed).
+        mode: Quantization mode (only "affine" fully supported).
+        block_size: Ignored (kept for API compatibility).
 
     Returns:
         GPTQ-optimized weight (out_dim, in_dim).
     """
     out_dim, in_dim = w.shape
     W = mx.array(w)
+    n_bins = 2**bits - 1
 
-    def _qdq_col(col):
-        n = col.shape[0]
-        # Find a valid group size that divides the column
-        # MLX only supports group_size in {32, 64, 128}
-        gs_col = group_size
-        while gs_col > 32 and n % gs_col != 0:
-            gs_col //= 2
-        if n % gs_col != 0:
-            return col  # no valid group_size divides out_dim, skip qdq
-        cr = col.reshape(-1, gs_col)
-        return mx.dequantize(
-            *mx.quantize(cr, group_size=gs_col, bits=bits, mode=mode),
-            group_size=gs_col, bits=bits, mode=mode,
-        ).reshape(-1)
+    for g_start in range(0, in_dim, group_size):
+        g_end = min(g_start + group_size, in_dim)
+        g_size = g_end - g_start
 
-    for cs in range(0, in_dim, block_size):
-        ce = min(cs + block_size, in_dim)
-        bs = ce - cs
-        bh = Hinv[cs:ce, cs:ce]
+        # Compute scale/bias from current W group (groups along last axis)
+        group_slice = W[:, g_start:g_end]  # (out_dim, g_size)
+        scales, biases = _compute_group_params(group_slice, bits, group_size)
+        # scales: (out_dim, 1), biases: (out_dim, 1)
 
-        block_cols = [W[:, cs + i] for i in range(bs)]
+        # Work with column list for efficient in-loop updates
+        group_cols = [W[:, g_start + i] for i in range(g_size)]
         err_list = []
-        for i in range(bs):
-            col = block_cols[i]
-            d = mx.maximum(bh[i, i], mx.array(1e-6))
-            qc = _qdq_col(col)
-            err = (col - qc) / d
+
+        # Safe divisor: preserve sign, avoid division by zero
+        safe_scales = mx.where(
+            mx.abs(scales) < 1e-10, mx.array(1e-10), scales,
+        )
+
+        for i in range(g_size):
+            col = group_cols[i]  # (out_dim,)
+            k = g_start + i
+            d = mx.maximum(Hinv[k, k], mx.array(1e-6))
+
+            # Analytical qdq matching mx.quantize affine mode
+            col_2d = col[:, None]  # (out_dim, 1) for broadcasting
+            q = mx.clip(
+                mx.round((col_2d - biases) / safe_scales),
+                0.0, n_bins,
+            )
+            qc = (scales * q + biases).squeeze(-1)  # (out_dim,)
+
+            err = (col - qc) / d  # (out_dim,)
             err_list.append(err)
-            for j in range(i + 1, bs):
-                block_cols[j] = block_cols[j] - err * bh[i, j]
-            block_cols[i] = qc
 
-        block_result = mx.stack(block_cols, axis=1)
-        W = mx.concatenate([W[:, :cs], block_result, W[:, ce:]], axis=1)
+            # Compensate remaining columns in this group
+            for j in range(i + 1, g_size):
+                group_cols[j] = group_cols[j] - err * Hinv[k, g_start + j]
 
-        if ce < in_dim:
-            err_mat = mx.stack(err_list, axis=1)
-            cross = err_mat @ Hinv[cs:ce, ce:]
-            W = mx.concatenate([W[:, :ce], W[:, ce:] - cross], axis=1)
+            group_cols[i] = qc
+
+        # Reassemble the group into W
+        group_result = mx.stack(group_cols, axis=1)  # (out_dim, g_size)
+        W = mx.concatenate(
+            [W[:, :g_start], group_result, W[:, g_end:]], axis=1,
+        )
+
+        # Cross-group compensation
+        if g_end < in_dim:
+            err_mat = mx.stack(err_list, axis=1)  # (out_dim, g_size)
+            cross = err_mat @ Hinv[g_start:g_end, g_end:]
+            W = mx.concatenate(
+                [W[:, :g_end], W[:, g_end:] - cross], axis=1,
+            )
 
         mx.eval(W)
 
@@ -1910,69 +1954,78 @@ def _gptq_quantize_experts_batched(
 ) -> Any:
     """Batched GPTQ across all experts simultaneously.
 
-    Instead of looping 256 experts × N columns, processes all experts
-    in parallel for each column. Same Hessian shared across experts.
+    Group-aligned version: processes columns in group_size blocks matching
+    mx.quantize's row-wise grouping.  Scale/bias computed once per group
+    from current weight state; analytical qdq applied per column.
 
     Args:
         w_3d: Fused expert weights (num_experts, out_dim, in_dim) float32.
         Hinv: Inverse Hessian (in_dim, in_dim) float32.
+        bits: Target quantization bits.
+        group_size: Quantization group size.
+        mode: Quantization mode (only "affine" fully supported).
+        block_size: Ignored (kept for API compatibility).
 
     Returns:
         GPTQ-optimized weights (num_experts, out_dim, in_dim).
     """
     num_experts, out_dim, in_dim = w_3d.shape
     W = mx.array(w_3d)  # (E, O, I)
+    n_bins = 2**bits - 1
 
-    # Find valid group size for column quantization
-    gs_col = group_size
-    while gs_col > 1 and out_dim % gs_col != 0:
-        gs_col //= 2
-    if gs_col < 1:
-        return W
+    for g_start in range(0, in_dim, group_size):
+        g_end = min(g_start + group_size, in_dim)
+        g_size = g_end - g_start
 
-    def _qdq_batch_col(cols):
-        # cols: (E, O) — one column from each expert
-        # Reshape to (E * O/gs, gs) for batch quantization
-        cr = cols.reshape(-1, gs_col)
-        return mx.dequantize(
-            *mx.quantize(cr, group_size=gs_col, bits=bits, mode=mode),
-            group_size=gs_col, bits=bits, mode=mode,
-        ).reshape(num_experts, out_dim)
+        # Compute scale/bias from current W group (groups along last axis)
+        group_slice = W[:, :, g_start:g_end]  # (E, O, g_size)
+        scales, biases = _compute_group_params(group_slice, bits, group_size)
+        # scales: (E, O, 1), biases: (E, O, 1)
 
-    for cs in range(0, in_dim, block_size):
-        ce = min(cs + block_size, in_dim)
-        bs = ce - cs
-        bh = Hinv[cs:ce, cs:ce]
-
-        # Extract block: (E, O, bs)
-        block = W[:, :, cs:ce]
+        # Work with column list for efficient in-loop updates
+        group_cols = [W[:, :, g_start + i] for i in range(g_size)]  # list of (E, O)
         err_list = []
 
-        # Work with list of columns for easy update
-        block_cols = [block[:, :, i] for i in range(bs)]  # list of (E, O)
-        err_list = []
+        # Safe divisor: preserve sign, avoid division by zero
+        safe_scales = mx.where(
+            mx.abs(scales) < 1e-10, mx.array(1e-10), scales,
+        )
 
-        for i in range(bs):
-            col = block_cols[i]  # (E, O)
-            d = mx.maximum(bh[i, i], mx.array(1e-6))
-            qc = _qdq_batch_col(col)  # (E, O) — all experts at once
+        for i in range(g_size):
+            col = group_cols[i]  # (E, O)
+            k = g_start + i
+            d = mx.maximum(Hinv[k, k], mx.array(1e-6))
+
+            # Analytical qdq matching mx.quantize affine mode
+            col_3d = col[:, :, None]  # (E, O, 1) for broadcasting
+            q = mx.clip(
+                mx.round((col_3d - biases) / safe_scales),
+                0.0, n_bins,
+            )
+            qc = (scales * q + biases).squeeze(-1)  # (E, O)
+
             err = (col - qc) / d  # (E, O)
             err_list.append(err)
 
-            # Compensate remaining columns in block
-            for j in range(i + 1, bs):
-                block_cols[j] = block_cols[j] - err * bh[i, j]
+            # Compensate remaining columns in this group
+            for j in range(i + 1, g_size):
+                group_cols[j] = group_cols[j] - err * Hinv[k, g_start + j]
 
-            block_cols[i] = qc
+            group_cols[i] = qc
 
-        block_result = mx.stack(block_cols, axis=2)  # (E, O, bs)
-        W = mx.concatenate([W[:, :, :cs], block_result, W[:, :, ce:]], axis=2)
+        # Reassemble the group into W
+        group_result = mx.stack(group_cols, axis=2)  # (E, O, g_size)
+        W = mx.concatenate(
+            [W[:, :, :g_start], group_result, W[:, :, g_end:]], axis=2,
+        )
 
-        # Cross-block compensation
-        if ce < in_dim:
-            err_mat = mx.stack(err_list, axis=2)  # (E, O, bs)
-            cross = err_mat @ Hinv[cs:ce, ce:]  # (E, O, remaining)
-            W = mx.concatenate([W[:, :, :ce], W[:, :, ce:] - cross], axis=2)
+        # Cross-group compensation
+        if g_end < in_dim:
+            err_mat = mx.stack(err_list, axis=2)  # (E, O, g_size)
+            cross = err_mat @ Hinv[g_start:g_end, g_end:]  # (E, O, remaining)
+            W = mx.concatenate(
+                [W[:, :, :g_end], W[:, :, g_end:] - cross], axis=2,
+            )
 
         mx.eval(W)
 
