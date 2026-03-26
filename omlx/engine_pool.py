@@ -282,7 +282,9 @@ class EnginePool:
 
         return model_id_or_alias
 
-    async def get_engine(self, model_id: str) -> BaseEngine | EmbeddingEngine | RerankerEngine:
+    async def get_engine(
+        self, model_id: str, force_lm: bool = False,
+    ) -> BaseEngine | EmbeddingEngine | RerankerEngine:
         """
         Get or load engine for the specified model.
 
@@ -295,6 +297,8 @@ class EnginePool:
 
         Args:
             model_id: The model ID to get engine for
+            force_lm: Force loading as LM (BatchedEngine) even for VLM models.
+                Useful for text-only tasks like accuracy benchmarks.
 
         Returns:
             The loaded engine (BaseEngine for LLM, EmbeddingEngine for embeddings)
@@ -312,8 +316,16 @@ class EnginePool:
 
             # Already loaded - just update access time
             if entry.engine is not None:
-                entry.last_access = time.time()
-                return entry.engine
+                # If force_lm requested but current engine is VLM, unload and reload
+                if force_lm and isinstance(entry.engine, VLMBatchedEngine):
+                    logger.info(
+                        f"Unloading VLM engine for {model_id} "
+                        f"(force_lm=True, reloading as LM)"
+                    )
+                    await self._unload_engine(model_id)
+                else:
+                    entry.last_access = time.time()
+                    return entry.engine
 
             # Check if model is too large for memory limit
             if (
@@ -382,7 +394,7 @@ class EnginePool:
                         )
 
             # Now load the model
-            await self._load_engine(model_id)
+            await self._load_engine(model_id, force_lm=force_lm)
 
             return self._entries[model_id].engine
 
@@ -473,12 +485,13 @@ class EnginePool:
             f"memory usage: {format_size(self._current_model_memory)}"
         )
 
-    async def _load_engine(self, model_id: str) -> None:
+    async def _load_engine(self, model_id: str, force_lm: bool = False) -> None:
         """
         Load an engine for the specified model.
 
         Args:
             model_id: The model ID to load
+            force_lm: Force loading as BatchedEngine even for VLM models.
 
         Raises:
             ModelLoadingError: If model is already being loaded
@@ -490,7 +503,12 @@ class EnginePool:
         entry.is_loading = True
         entry.abort_loading = False
         try:
-            logger.info(f"Loading model: {model_id}")
+            effective_type = entry.engine_type
+            if force_lm and effective_type == "vlm":
+                effective_type = "batched"
+                logger.info(f"Loading model as LM (force_lm=True): {model_id}")
+            else:
+                logger.info(f"Loading model: {model_id}")
 
             # Retrieve per-model settings for post-load transforms
             model_settings = None
@@ -498,13 +516,13 @@ class EnginePool:
                 model_settings = self._settings_manager.get_settings(model_id)
 
             # Create engine based on engine type
-            if entry.engine_type == "embedding":
+            if effective_type == "embedding":
                 # EmbeddingEngine for embedding models
                 engine = EmbeddingEngine(model_name=entry.model_path)
-            elif entry.engine_type == "reranker":
+            elif effective_type == "reranker":
                 # RerankerEngine for reranker models
                 engine = RerankerEngine(model_name=entry.model_path)
-            elif entry.engine_type == "vlm":
+            elif effective_type == "vlm":
                 # VLMBatchedEngine for vision-language models
                 engine = VLMBatchedEngine(
                     model_name=entry.model_path,
