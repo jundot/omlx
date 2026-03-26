@@ -40,7 +40,8 @@ RIFF_MAGIC = b"RIFF"
 
 def _make_mock_tts_engine(wav_bytes: bytes = None) -> MagicMock:
     """Build a mock TTSEngine that returns the given WAV bytes."""
-    engine = MagicMock()
+    from omlx.engine.tts import TTSEngine
+    engine = MagicMock(spec=TTSEngine)
     engine.synthesize = AsyncMock(return_value=wav_bytes or DUMMY_WAV)
     return engine
 

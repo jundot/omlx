@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Maximum upload size for audio files (100 MB).
+MAX_AUDIO_UPLOAD_BYTES = 100 * 1024 * 1024
+
 
 # ---------------------------------------------------------------------------
 # Engine pool accessor — patched in tests via omlx.api.audio_routes._get_engine_pool
@@ -43,6 +46,20 @@ def _get_engine_pool():
     return pool
 
 
+async def _read_upload(file: UploadFile) -> bytes:
+    """Read an uploaded file with size limit enforcement."""
+    content = await file.read()
+    if len(content) > MAX_AUDIO_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Audio file too large ({len(content)} bytes). "
+                f"Maximum allowed: {MAX_AUDIO_UPLOAD_BYTES} bytes"
+            ),
+        )
+    return content
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -56,7 +73,12 @@ async def create_transcription(
     response_format: str = Form("json"),
     temperature: float = Form(0.0),
 ):
-    """OpenAI-compatible audio transcription endpoint (Speech-to-Text)."""
+    """OpenAI-compatible audio transcription endpoint (Speech-to-Text).
+
+    Note: ``response_format`` and ``temperature`` are accepted for OpenAI API
+    compatibility but are not yet implemented — they are silently ignored.
+    """
+    from omlx.engine.stt import STTEngine
     from omlx.exceptions import ModelNotFoundError
 
     pool = _get_engine_pool()
@@ -73,13 +95,19 @@ async def create_transcription(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    if not isinstance(engine, STTEngine):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{model}' is not a speech-to-text model",
+        )
+
     # Save uploaded file to a temp path so the engine can open it by path
     suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
     tmp_path = None
     try:
+        content = await _read_upload(file)
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp_path = tmp.name
-            content = await file.read()
             tmp.write(content)
 
         result = await engine.transcribe(tmp_path, language=language)
@@ -108,6 +136,7 @@ async def create_transcription(
 @router.post("/v1/audio/speech")
 async def create_speech(request: AudioSpeechRequest):
     """OpenAI-compatible text-to-speech endpoint."""
+    from omlx.engine.tts import TTSEngine
     from omlx.exceptions import ModelNotFoundError
 
     # Validate input is non-empty
@@ -128,6 +157,12 @@ async def create_speech(request: AudioSpeechRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    if not isinstance(engine, TTSEngine):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{request.model}' is not a text-to-speech model",
+        )
+
     try:
         wav_bytes = await engine.synthesize(
             request.input,
@@ -147,12 +182,13 @@ async def process_audio(
     file: UploadFile = File(...),
     model: str = Form(...),
 ):
-    """Audio processing endpoint (speech enhancement, STS).
+    """Audio processing endpoint (speech enhancement, source separation, STS).
 
     Accepts a multipart audio file upload and a model identifier, processes
-    the audio through an STS engine (e.g. DeepFilterNet, MossFormer2, Moshi),
-    and returns WAV bytes of the processed audio.
+    the audio through an STS engine (e.g. DeepFilterNet, MossFormer2,
+    SAMAudio, LFM2.5-Audio), and returns WAV bytes of the processed audio.
     """
+    from omlx.engine.sts import STSEngine
     from omlx.exceptions import ModelNotFoundError
 
     pool = _get_engine_pool()
@@ -169,13 +205,19 @@ async def process_audio(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    if not isinstance(engine, STSEngine):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{model}' is not a speech-to-speech / audio processing model",
+        )
+
     # Save uploaded file to a temp path so the engine can open it by path
     suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
     tmp_path = None
     try:
+        content = await _read_upload(file)
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp_path = tmp.name
-            content = await file.read()
             tmp.write(content)
 
         wav_bytes = await engine.process(tmp_path)

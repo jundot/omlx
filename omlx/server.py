@@ -376,9 +376,13 @@ from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
 set_mcp_manager_getter(get_mcp_manager)
 app.include_router(mcp_router)
 
-# Include audio routes
-from .api.audio_routes import router as audio_router
-app.include_router(audio_router)
+# Include audio routes (requires python-multipart for File/Form params).
+# Registered conditionally so oMLX works without the audio optional dependency.
+try:
+    from .api.audio_routes import router as audio_router
+    app.include_router(audio_router)
+except ImportError:
+    pass
 
 # Include admin routes
 from .admin.routes import router as admin_router, set_admin_getters

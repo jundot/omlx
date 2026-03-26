@@ -44,7 +44,8 @@ RIFF_MAGIC = b"RIFF"
 
 def _make_mock_sts_engine(output_wav: bytes = None) -> MagicMock:
     """Build a mock STSEngine that returns the given WAV bytes."""
-    engine = MagicMock()
+    from omlx.engine.sts import STSEngine
+    engine = MagicMock(spec=STSEngine)
     engine.process = AsyncMock(return_value=output_wav or TINY_WAV)
     return engine
 

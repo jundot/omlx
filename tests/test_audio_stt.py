@@ -44,7 +44,8 @@ TINY_WAV = _make_wav_bytes()
 
 def _make_mock_stt_engine(transcript: str = "hello world") -> MagicMock:
     """Build a mock STTEngine that returns the given transcript."""
-    engine = MagicMock()
+    from omlx.engine.stt import STTEngine
+    engine = MagicMock(spec=STTEngine)
     engine.transcribe = AsyncMock(return_value={
         "text": transcript,
         "language": "en",

@@ -10,51 +10,18 @@ when mlx-audio is not installed.
 
 import asyncio
 import gc
-import io
 import logging
-import wave
 from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
+from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
+from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
 
 logger = logging.getLogger(__name__)
-
-# Default sample rate used when the model does not report one.
-_DEFAULT_SAMPLE_RATE = 22050
-
-
-def _audio_to_wav_bytes(audio_array, sample_rate: int) -> bytes:
-    """Convert a float32 audio array to 16-bit PCM WAV bytes.
-
-    Args:
-        audio_array: numpy or mlx array of float32 samples in [-1, 1]
-        sample_rate: audio sample rate in Hz
-
-    Returns:
-        WAV-encoded bytes (RIFF header + PCM data)
-    """
-    # Ensure we have a numpy array for the wave module
-    if not isinstance(audio_array, np.ndarray):
-        audio_array = np.array(audio_array)
-
-    # Flatten to 1-D (mono)
-    audio_array = audio_array.flatten()
-
-    # Clip to [-1, 1] then convert to int16
-    audio_array = np.clip(audio_array, -1.0, 1.0)
-    audio_int16 = (audio_array * 32767).astype(np.int16)
-
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16-bit
-        wf.setframerate(sample_rate)
-        wf.writeframes(audio_int16.tobytes())
-    return buf.getvalue()
 
 
 class TTSEngine(BaseNonStreamingEngine):
@@ -109,11 +76,21 @@ class TTSEngine(BaseNonStreamingEngine):
         model_name = self._model_name
 
         def _load_sync():
-            # Use strict=False to work around mlx-audio bug where sanitize()
-            # merges quantization scales into weights before apply_quantization()
-            # can detect them, causing shape mismatches with strict=True for
-            # quantized models (e.g. VibeVoice-Realtime-0.5B-8bit).
-            return _load_model(model_name, strict=False)
+            try:
+                return _load_model(model_name, strict=True)
+            except ValueError as exc:
+                if "Expected shape" not in str(exc):
+                    raise
+                # mlx-audio bug: sanitize() merges quantization scales into
+                # weights before apply_quantization() can detect them, causing
+                # shape mismatches for quantized models (e.g. VibeVoice 8-bit).
+                # Retry with strict=False so mismatched layers are skipped.
+                logger.warning(
+                    "Strict weight loading failed for %s (likely quantized "
+                    "model with mlx-audio compatibility issue), retrying "
+                    "with strict=False: %s", model_name, exc,
+                )
+                return _load_model(model_name, strict=False)
 
         loop = asyncio.get_running_loop()
         self._model = await loop.run_in_executor(get_mlx_executor(), _load_sync)
