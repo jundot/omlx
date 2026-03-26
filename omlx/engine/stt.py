@@ -121,7 +121,17 @@ class STTEngine(BaseNonStreamingEngine):
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
 
+        import os
+        import time
+
+        file_size = os.path.getsize(audio_path) if os.path.exists(audio_path) else 0
+        logger.info(
+            "STT transcribe: model=%s, file=%s (%d bytes), language=%s",
+            self._model_name, os.path.basename(audio_path), file_size, language,
+        )
+
         model = self._model
+        t0 = time.monotonic()
 
         def _normalize_segment(s) -> dict:
             """Convert any segment type to a plain dict."""
@@ -180,9 +190,17 @@ class STTEngine(BaseNonStreamingEngine):
             }
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
+        result = await loop.run_in_executor(
             get_mlx_executor(), _transcribe_sync
         )
+
+        elapsed = time.monotonic() - t0
+        text_len = len(result.get("text", ""))
+        logger.info(
+            "STT transcribe done: model=%s, %.2fs, %d chars output",
+            self._model_name, elapsed, text_len,
+        )
+        return result
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

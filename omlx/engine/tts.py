@@ -133,7 +133,15 @@ class TTSEngine(BaseNonStreamingEngine):
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
 
+        import time
+
+        logger.info(
+            "TTS synthesize: model=%s, text_len=%d, voice=%s, speed=%.1f",
+            self._model_name, len(text), voice, speed,
+        )
+
         model = self._model
+        t0 = time.monotonic()
 
         def _synthesize_sync():
             # model.generate() returns an iterable of results,
@@ -164,9 +172,16 @@ class TTSEngine(BaseNonStreamingEngine):
             return _audio_to_wav_bytes(audio, int(sample_rate))
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
+        result = await loop.run_in_executor(
             get_mlx_executor(), _synthesize_sync
         )
+
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "TTS synthesize done: model=%s, %.2fs, %d bytes output",
+            self._model_name, elapsed, len(result),
+        )
+        return result
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

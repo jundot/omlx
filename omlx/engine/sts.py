@@ -304,6 +304,15 @@ class STSEngine(BaseNonStreamingEngine):
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
 
+        import time
+
+        file_size = os.path.getsize(audio_path) if os.path.exists(audio_path) else 0
+        logger.info(
+            "STS process: model=%s, family=%s, file=%s (%d bytes)",
+            self._model_name, self._family,
+            os.path.basename(audio_path), file_size,
+        )
+
         family = self._family
         processor_fn = _FAMILY_PROCESSORS.get(family)
         if processor_fn is None:
@@ -313,12 +322,20 @@ class STSEngine(BaseNonStreamingEngine):
             )
 
         model = self._model
+        t0 = time.monotonic()
 
         def _process_sync():
             return processor_fn(model, str(audio_path), **kwargs)
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(get_mlx_executor(), _process_sync)
+        result = await loop.run_in_executor(get_mlx_executor(), _process_sync)
+
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "STS process done: model=%s, %.2fs, %d bytes output",
+            self._model_name, elapsed, len(result),
+        )
+        return result
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
