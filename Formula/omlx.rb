@@ -25,9 +25,6 @@ class Omlx < Formula
     # Create venv with pip so dependency resolution works properly
     system "python3.11", "-m", "venv", libexec
 
-    # Upgrade pip to ensure modern resolver (handles git deps, etc.)
-    system libexec/"bin/pip", "install", "--upgrade", "pip"
-
     # Build Rust-based packages from source with headerpad to prevent
     # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths)
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
