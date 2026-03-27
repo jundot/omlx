@@ -127,6 +127,7 @@ _CLIP_SUPPORTED_MODEL_TYPES = {
     "glm_moe_dsa",
     "deepseek_v32",
     "ministral3",
+    "nemotron_h",
     # TODO: MLA attention AWQ pairs not yet implemented for DeepSeek/GLM.
     # AWQ works for their MLP layers; attention layers skip gracefully.
 }
