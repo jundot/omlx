@@ -36,7 +36,7 @@ _OQ_DEFAULT_GROUP_SIZE = 64
 _LEVEL_BITS: dict[float, int] = {2: 2, 3: 3, 3.5: 3, 4: 4, 5: 5, 6: 6, 8: 8}
 
 _LEVEL_PROTECTION: dict[float, str] = {
-    2: "minimal", 3: "full", 3.5: "full",
+    2: "full", 3: "full", 3.5: "full",
     4: "full", 5: "full", 6: "full", 8: "full",
 }
 
@@ -413,6 +413,9 @@ def _is_routed_expert(path: str) -> bool:
 
 _MANDATORY_BOOST_PATTERNS = {
     "lm_head": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+    "embeddings": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+    "embed_tokens": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+    "wte": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
 }
 
 
@@ -523,6 +526,36 @@ def _build_quant_plan(
                 total_bits_f += delta
                 current_bpw = total_bits_f / total_params
 
+    # Protection floor: apply full protection rules as minimum bits for
+    # non-expert tensors. This ensures attention, shared experts, etc. get
+    # adequate precision even at aggressive base bits (e.g. oQ2 base=2).
+    # Each floor boost is checked against hard_cap to avoid overshooting.
+    floor_config = {**config, "_oq_use_budget_plan": False, "_oq_boost_map": {}}
+    for path, shape in named_shapes.items():
+        if path in boost_map:
+            continue
+        if _is_routed_expert(path):
+            continue
+        floor_pred = universal_quant_predicate(path, module, floor_config, oq_level)
+        if not isinstance(floor_pred, dict):
+            continue
+        floor_bits = int(floor_pred["bits"])
+        if floor_bits <= base_bits:
+            continue
+        floor_gs = int(floor_pred.get("group_size", _gs_for_mode(floor_bits, _OQ_DEFAULT_GROUP_SIZE)))
+        floor_mode = floor_pred.get("mode", _mode_for_bits(floor_bits))
+        old_cost = _tensor_quantized_bytes(shape, base_bits, base_group_size, base_mode)
+        new_cost = _tensor_quantized_bytes(shape, floor_bits, floor_gs, floor_mode)
+        delta = 8 * (new_cost - old_cost)
+        if delta <= 0:
+            continue
+        next_bpw = (total_bits_f + delta) / total_params
+        if next_bpw > hard_cap_bpw:
+            continue
+        boost_map[path] = {"bits": floor_bits, "group_size": floor_gs, "mode": floor_mode}
+        total_bits_f += delta
+        current_bpw = next_bpw
+
     # Dense model MLP asymmetry: gate/down → base+1, up → base-1
     # Inspired by unsloth Dynamic 2.0: SiLU gate and residual down_proj need
     # protection, while up_proj (linear multiplicand) tolerates lower bits.
@@ -591,10 +624,11 @@ def _build_quant_plan(
                 total_bits_f += delta
                 current_bpw = next_bpw
 
+    # Sensitivity-based greedy boost: boost tensors from their current bits
+    # (which may already be elevated by the protection floor) using remaining
+    # budget up to hard_cap_bpw.
     candidates = []
     for path, shape in named_shapes.items():
-        if path in boost_map:
-            continue
         if _is_routed_expert(path):
             continue
         pred = universal_quant_predicate(
@@ -609,37 +643,40 @@ def _build_quant_plan(
         if is_dense and any(p in path for p in ("gate_proj", "up_proj", "down_proj", "wo")):
             continue
         layer_score = float(layer_scores.get(str(layer_idx), 0.0))
-        max_extra = _sensitivity_tier(layer_score, max_layer_score)
-        base_cost = _tensor_quantized_bytes(
-            shape, base_bits, base_group_size, base_mode
-        )
-        score = layer_score
-        candidates.append((score, path, shape, base_cost, max_extra))
+        # Current bits (floor or base)
+        cur_bits = boost_map[path]["bits"] if path in boost_map else base_bits
+        cur_gs = _gs_for_mode(cur_bits, _OQ_DEFAULT_GROUP_SIZE)
+        cur_mode = _mode_for_bits(cur_bits)
+        cur_cost = _tensor_quantized_bytes(shape, cur_bits, cur_gs, cur_mode)
+        # Max target based on sensitivity
+        ratio = layer_score / max_layer_score if max_layer_score > 0 else 0
+        if ratio >= 0.5:
+            max_target = 8
+        elif ratio >= 0.2:
+            max_target = min(cur_bits + 2, 8)
+        else:
+            max_target = min(cur_bits + 1, 8)
+        if max_target <= cur_bits:
+            continue
+        candidates.append((layer_score, path, shape, cur_bits, cur_cost, max_target))
 
-    for _score, path, shape, base_cost, max_extra in sorted(
+    _VALID_BITS = (2, 3, 4, 5, 6, 8)
+    for _score, path, shape, cur_bits, cur_cost, max_target in sorted(
         candidates, key=lambda x: x[0], reverse=True
     ):
-        _VALID_BITS = (2, 3, 4, 5, 6, 8)
-        for extra in range(max_extra, 0, -1):
-            cand_bits = min(base_bits + extra, 8)
-            if cand_bits <= base_bits:
-                continue
-            # Round UP to next valid bit width (e.g. 7 -> 8, not 7 -> 6)
-            while cand_bits not in _VALID_BITS and cand_bits < 8:
-                cand_bits += 1
-            if cand_bits <= base_bits:
+        for cand_bits in range(max_target, cur_bits, -1):
+            if cand_bits not in _VALID_BITS or cand_bits <= cur_bits:
                 continue
             cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
             cand_mode = _mode_for_bits(cand_bits)
             cand_cost = _tensor_quantized_bytes(shape, cand_bits, cand_gs, cand_mode)
-            delta = 8 * (cand_cost - base_cost)
+            delta = 8 * (cand_cost - cur_cost)
             if delta <= 0:
                 continue
             next_bpw = (total_bits_f + delta) / total_params
             if next_bpw > hard_cap_bpw:
                 continue
-            candidate = {"bits": cand_bits, "group_size": cand_gs, "mode": cand_mode}
-            boost_map[path] = candidate
+            boost_map[path] = {"bits": cand_bits, "group_size": cand_gs, "mode": cand_mode}
             total_bits_f += delta
             current_bpw = next_bpw
             break

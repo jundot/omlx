@@ -714,6 +714,73 @@ class TestLevelBudgetPlan:
         assert plan.effective_bpw <= 3.0
         assert plan.boost_map
 
+    def test_oq2_moe_protection_floor(self):
+        """oQ2 MoE: protection floor boosts attention, experts stay 2bit."""
+        named_shapes = {"lm_head": (4096, 32000)}
+        n_layers = 52
+        n_experts = 64
+        for i in range(n_layers):
+            named_shapes[f"model.layers.{i}.self_attn.v_proj"] = (1024, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.q_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.k_proj"] = (1024, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.o_proj"] = (4096, 1024)
+        for i in range(n_layers):
+            for e in range(n_experts):
+                named_shapes[f"model.layers.{i}.mlp.experts.{e}.down_proj"] = (4096, 1024)
+                named_shapes[f"model.layers.{i}.mlp.experts.{e}.up_proj"] = (1024, 4096)
+                named_shapes[f"model.layers.{i}.mlp.experts.{e}.gate_proj"] = (1024, 4096)
+        sensitivity = {str(i): 0.1 / (i + 1) for i in range(n_layers)}
+        config = {
+            "num_hidden_layers": n_layers,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": sensitivity,
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 2, target_bpw=2.8, hard_cap_bpw=3.0
+        )
+        assert plan.effective_bpw <= 3.0
+        # Attention tensors should be boosted via protection floor
+        attn_boosts = [k for k in plan.boost_map if "self_attn" in k]
+        assert len(attn_boosts) > 0, "Expected attention protection floor boosts"
+        # Routed experts should NOT be boosted
+        expert_boosts = [k for k in plan.boost_map if "experts" in k]
+        assert len(expert_boosts) == 0, "Routed experts should stay at base bits"
+
+    def test_oq2_moe_protection_floor_switch_mlp(self):
+        """oQ2 MoE with switch_mlp naming: experts stay 2bit, attention boosted."""
+        named_shapes = {"lm_head": (4096, 32000)}
+        n_layers = 52
+        for i in range(n_layers):
+            named_shapes[f"backbone.layers.{i}.mixer.q_proj"] = (4096, 2688)
+            named_shapes[f"backbone.layers.{i}.mixer.k_proj"] = (1024, 2688)
+            named_shapes[f"backbone.layers.{i}.mixer.v_proj"] = (1024, 2688)
+            named_shapes[f"backbone.layers.{i}.mixer.in_proj"] = (10304, 2688)
+            named_shapes[f"backbone.layers.{i}.mixer.out_proj"] = (2688, 4096)
+            named_shapes[f"backbone.layers.{i}.mixer.shared_experts.up_proj"] = (3712, 2688)
+            named_shapes[f"backbone.layers.{i}.mixer.shared_experts.down_proj"] = (2688, 3712)
+        for i in range(n_layers):
+            named_shapes[f"backbone.layers.{i}.mixer.switch_mlp.fc1"] = (128, 1856, 2688)
+            named_shapes[f"backbone.layers.{i}.mixer.switch_mlp.fc2"] = (128, 2688, 1856)
+        sensitivity = {str(i): 0.1 / (i + 1) for i in range(n_layers)}
+        config = {
+            "num_hidden_layers": n_layers,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": sensitivity,
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 2, target_bpw=2.8, hard_cap_bpw=3.0
+        )
+        assert plan.effective_bpw >= 2.7, (
+            f"Expected bpw >= 2.7, got {plan.effective_bpw:.2f}"
+        )
+        assert plan.effective_bpw <= 3.0
+        # Attention should be boosted via protection floor
+        attn_boosts = [k for k in plan.boost_map if "q_proj" in k or "v_proj" in k]
+        assert len(attn_boosts) > 0, "Expected attention protection floor boosts"
+        # switch_mlp experts should NOT be boosted
+        expert_boosts = [k for k in plan.boost_map if "switch_mlp" in k]
+        assert len(expert_boosts) == 0, "Routed experts should stay at base bits"
+
 
 # =============================================================================
 # Test GPTQ quantization
