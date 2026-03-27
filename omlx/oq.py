@@ -2685,7 +2685,7 @@ def quantize_oq(
         model = vlm_load_model(Path(model_path), lazy=True)
         from mlx_lm import load as lm_load
 
-        _, tokenizer = lm_load(model_path)
+        _, tokenizer = lm_load(model_path, lazy=True)
         logger.info(f"oQ{oq_level:g}: loaded VLM with mlx-vlm (vision weights preserved)")
     else:
         from mlx_lm import load as lm_load
