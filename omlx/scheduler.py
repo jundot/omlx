@@ -571,6 +571,13 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             inputs = _right_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _merge_caches(caches)
 
+            # TurboQuant KV cache: convert merged BatchKVCache to
+            # BatchTurboQuantKVCache so cache types stay consistent with
+            # the active batch (prevents _quantized AttributeError in
+            # BatchTurboQuantKVCache.extend()).
+            if self._turboquant_kv_bits is not None:
+                self._apply_turboquant_kv(prompt_cache)
+
             # Build right-padded VLM embeddings batch (matching token padding).
             batched_embeds, batched_extra = self._build_right_padded_vlm_batch(
                 vlm_embeds_map, list(uids), lengths, max_length
