@@ -1046,9 +1046,21 @@ class Scheduler:
     3. BatchGenerator processes all running requests together
     4. Finished requests are removed and outputs returned
 
+    .. note::
+
+       ``_DEFERRED_CLEAR_DELAY`` controls how many generation steps to wait
+       after the last request completion before calling ``mx.clear_cache()``.
+       Immediate clearing races with IOKit's asynchronous ``completeMemory()``
+       callbacks, causing 'prepare count underflow' kernel panics (#435).
+       8 steps (~10-40 ms at typical generation speeds) gives IOKit ample
+       time to process those callbacks while still reclaiming Metal buffers
+       fast enough to prevent TTFT spikes (#411).
+
     The key insight is that mlx-lm's BatchGenerator already implements
     continuous batching at the token level, so we use it as the backend.
     """
+
+    _DEFERRED_CLEAR_DELAY: int = 8
 
     def __init__(
         self,
@@ -1220,6 +1232,13 @@ class Scheduler:
 
         # Step counter for periodic cleanup
         self._step_counter = 0
+        # Deferred Metal cache cleanup after request completion.
+        # Immediate mx.clear_cache() after request completion races with
+        # IOKit's asynchronous completeMemory() callbacks, causing
+        # 'prepare count underflow' kernel panics. Deferring the clear
+        # by a few generation steps gives IOKit time to process callbacks.
+        # None = no deferred clear pending; int = steps since last finish.
+        self._deferred_clear_steps: Optional[int] = None
 
     def _calculate_max_blocks(self) -> int:
         """
@@ -3019,8 +3038,15 @@ class Scheduler:
         return True
 
     def has_requests(self) -> bool:
-        """Check if there are any pending or running requests."""
-        return bool(self.waiting or self.running)
+        """Check if there are any pending or running requests.
+
+        Also returns True when a deferred Metal cache clear is pending,
+        so that the engine loop keeps calling step() until the clear fires.
+        Without this, an idle server would never increment the deferred
+        counter and stale buffers would accumulate indefinitely.
+        """
+        return bool(self.waiting or self.running
+                     or self._deferred_clear_steps is not None)
 
     def fail_all_requests(self) -> List[str]:
         """Remove all running and waiting requests after unrecoverable error.
@@ -3799,6 +3825,14 @@ class Scheduler:
             # Remove from BatchGenerator to free internal KV cache
             if request_id in self.request_id_to_uid:
                 uid = self.request_id_to_uid[request_id]
+                # Synchronize in-flight GPU work before modifying batch state.
+                # batch_generator.remove() triggers lazy KV cache array slicing
+                # (BatchKVCache.filter) that replaces references to arrays still
+                # used by in-flight Metal command buffers from the previous
+                # batch_generator.next() call.  Without this barrier the Metal
+                # driver can hit 'completeMemory() prepare count underflow'.
+                # (Mirrors the fix in _do_abort_request, commit 634603f)
+                mx.synchronize(generation_stream)
                 self._remove_uid_from_active_batch(uid)
                 if uid in self.uid_to_request_id:
                     del self.uid_to_request_id[uid]
@@ -3834,12 +3868,18 @@ class Scheduler:
         # Update stop tokens after cleaning up finished requests
         if finished_ids:
             self._update_stop_tokens()
-            # Reclaim stale Metal buffers from generation/cache-store intermediates.
-            # Without this, freed buffers accumulate in the Metal buffer pool across
-            # requests (since set_cache_limit(total_mem) prevents automatic release).
-            # The pool bloat forces expensive emergency GC during the next prefill,
-            # causing periodic TTFT spikes. See issue #411.
-            _sync_and_clear_cache()
+            # Schedule deferred Metal cache cleanup instead of clearing immediately.
+            # Immediate mx.clear_cache() after request completion races with IOKit's
+            # asynchronous completeMemory() callbacks — the kernel-level GPU memory
+            # reference counting can still be in-flight even after mx.synchronize()
+            # returns, causing 'prepare count underflow' kernel panics (#435).
+            # Deferring by _DEFERRED_CLEAR_DELAY generation steps (~10-40 ms) gives
+            # IOKit time to process callbacks while still reclaiming buffers fast
+            # enough to prevent TTFT spikes from pool bloat (#411).
+            # Only set if not already pending — otherwise burst completions
+            # would keep resetting the counter and indefinitely postpone clearing.
+            if self._deferred_clear_steps is None:
+                self._deferred_clear_steps = 0
 
     def _is_cache_corruption_error(self, error: Exception) -> bool:
         """Check if an error indicates cache corruption."""
@@ -3870,6 +3910,9 @@ class Scheduler:
         # Clear UID mappings
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+
+        # Cancel any pending deferred Metal cache clear
+        self._deferred_clear_steps = None
 
         # Clear detokenizer state to prevent contamination after recovery
         self._request_detokenizers.clear()
@@ -4043,10 +4086,21 @@ class Scheduler:
 
         # Periodic Metal cache cleanup
         self._step_counter += 1
+        should_clear = False
         if (
             self.config.mlx_cache_cleanup_interval > 0
             and self._step_counter % self.config.mlx_cache_cleanup_interval == 0
         ):
+            should_clear = True
+        # Deferred post-completion cleanup: wait _DEFERRED_CLEAR_DELAY steps
+        # after the last request completion to give IOKit time to process
+        # completeMemory() callbacks before releasing Metal buffers (#435).
+        if self._deferred_clear_steps is not None:
+            self._deferred_clear_steps += 1
+            if self._deferred_clear_steps >= self._DEFERRED_CLEAR_DELAY:
+                should_clear = True
+                self._deferred_clear_steps = None
+        if should_clear:
             _sync_and_clear_cache()
         if (
             self.config.gc_cleanup_interval > 0
@@ -4115,6 +4169,9 @@ class Scheduler:
 
         # Clear Harmony parsers
         self._harmony_parsers.clear()
+
+        # Cancel any pending deferred Metal cache clear
+        self._deferred_clear_steps = None
 
     def deep_reset(self) -> None:
         """
