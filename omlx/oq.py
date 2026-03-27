@@ -130,7 +130,7 @@ def universal_quant_predicate(
         }
 
     if _is_moe_router(path):
-        return {"bits": 8, "group_size": 64, "mode": "affine"}
+        return False  # fp16 — tiny weights, some models (MoEGate) lack to_quantized()
 
     if "shared_expert_gate" in path and "gate_proj" not in path:
         return {"bits": 8, "group_size": 64, "mode": "affine"}
