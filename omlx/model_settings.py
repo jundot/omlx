@@ -56,7 +56,7 @@ class ModelSettings:
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
 
-    # TurboQuant KV cache (experimental: vector quantization for KV cache compression)
+    # TurboQuant KV cache (temporarily disabled - performance issues)
     turboquant_kv_enabled: bool = False
     turboquant_kv_bits: int = 4  # 3 or 4
 
@@ -73,6 +73,10 @@ class ModelSettings:
     # Metadata
     display_name: Optional[str] = None
     description: Optional[str] = None
+
+    def __post_init__(self):
+        # TurboQuant is temporarily disabled due to performance issues
+        self.turboquant_kv_enabled = False
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

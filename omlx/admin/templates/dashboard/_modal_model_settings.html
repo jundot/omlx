@@ -303,29 +303,7 @@
                             <!-- Experimental Features -->
                             <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h4>
 
-                                <!-- TurboQuant KV Cache -->
-                                <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
-                                    <div class="flex items-start justify-between gap-3">
-                                        <div class="min-w-0">
-                                            <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.turboquant_kv') }}</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.turboquant_kv_hint') }} (<a href="https://arxiv.org/abs/2504.19874" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">Paper</a>)</p>
-                                        </div>
-                                        <button type="button" @click="modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
-                                                :class="modelSettings.turboquant_kv_enabled ? 'bg-black' : 'bg-neutral-200'"
-                                                class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                            <span :class="modelSettings.turboquant_kv_enabled ? 'translate-x-5' : 'translate-x-0'"
-                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
-                                        </button>
-                                    </div>
-                                    <div x-show="modelSettings.turboquant_kv_enabled" x-transition class="pt-1">
-                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.turboquant_kv_bits_label') }}</label>
-                                        <select x-model.number="modelSettings.turboquant_kv_bits"
-                                                class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                            <option value="3">3-bit — Max compression (~75%)</option>
-                                            <option value="4" selected>4-bit — Balanced (recommended)</option>
-                                        </select>
-                                    </div>
-                                </div>
+                                <!-- TurboQuant KV Cache (temporarily disabled) -->
 
                                 <!-- IndexCache (DSA models only) -->
                                 <template x-if="DSA_MODEL_TYPES.has(selectedModel?.config_model_type || '')">
