@@ -43,7 +43,7 @@ class TestSchedulerConfig:
         assert config.paged_ssd_cache_max_size == 100 * 1024 * 1024 * 1024  # 100GB
         assert config.model_name == ""
         assert config.gc_cleanup_interval == 0
-        assert config.mlx_cache_cleanup_interval == 0
+        assert config.mlx_cache_cleanup_interval == 512
 
     def test_custom_values(self):
         """Test SchedulerConfig with custom values."""

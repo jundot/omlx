@@ -555,6 +555,12 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                             abort_uids, processed_tokens
                         )
 
+                # Reclaim Metal intermediates between prefill chunks.
+                # Placed after memory check so mx.get_active_memory()
+                # reads pre-clear values, avoiding fragmentation-inflated
+                # readings that caused false model eviction (#396).
+                _sync_and_clear_cache()
+
         # Further prompt processing so we need to
         #   1. Merge the KV caches and prepare for right padded prompts
         #   2. Right pad the inputs
@@ -666,6 +672,8 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                         raise _PrefillAbortedError(
                             abort_uids, processed_tokens
                         )
+
+                _sync_and_clear_cache()
 
             mx.eval([c.state for c in prompt_cache])
             inputs = last_inputs
@@ -955,7 +963,7 @@ class SchedulerConfig:
 
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
-    mlx_cache_cleanup_interval: int = 0  # Steps between mx.clear_cache() calls (0=disabled)
+    mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
 
 
 @dataclass
