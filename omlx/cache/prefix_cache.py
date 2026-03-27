@@ -1678,6 +1678,31 @@ class BlockAwarePrefixCache(CacheManager):
                 )
                 return None
 
+            # Verify KVCache offset consistency across KVCache-typed layers.
+            # All KVCache layers must have the same offset (they process
+            # the same tokens). A mismatch causes broadcast_shapes errors
+            # when the model creates a single attention mask from one layer
+            # and applies it to all attention layers.
+            # NOTE: only check layers explicitly typed as 'KVCache'.
+            # RotatingKVCache also has 'offset' but its meaning differs
+            # (total tokens ever processed, not buffer size), so mixing
+            # them would produce false positives.
+            if layer_cache_types:
+                kv_offsets = set()
+                for idx, c in enumerate(reconstructed_caches):
+                    if (idx < len(layer_cache_types)
+                            and layer_cache_types[idx] == 'KVCache'
+                            and hasattr(c, 'offset')
+                            and isinstance(getattr(c, 'offset', None), int)):
+                        kv_offsets.add(c.offset)
+                if len(kv_offsets) > 1:
+                    logger.warning(
+                        f"KVCache offset inconsistency after reconstruction: "
+                        f"{kv_offsets}. Rejecting cache to prevent "
+                        f"broadcast_shapes errors."
+                    )
+                    return None
+
             logger.debug(
                 f"Reconstructed cache from tiered cache: {len(reconstructed_caches)} layers, "
                 f"{block_table.num_tokens} tokens from {len(block_table.block_ids)} blocks"

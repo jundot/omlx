@@ -270,11 +270,11 @@ class KVCacheHandler(CacheTypeHandler):
         cache.keys = keys
         cache.values = values
 
-        # Set offset from meta_state or infer from tensor shape
-        if meta_state and len(meta_state) > 0:
-            cache.offset = int(meta_state[0])
-        else:
-            cache.offset = state.get("offset", keys.shape[2])
+        # Always use tensor shape for offset. meta_state stores the offset
+        # from the full cache at storage time, which can exceed the actual
+        # tensor length after partial prefix match or walk-back truncation
+        # (all blocks are stored with the same layer_meta_states).
+        cache.offset = keys.shape[2]
 
         return cache
 
