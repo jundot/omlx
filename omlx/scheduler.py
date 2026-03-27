@@ -3819,6 +3819,12 @@ class Scheduler:
         # Update stop tokens after cleaning up finished requests
         if finished_ids:
             self._update_stop_tokens()
+            # Reclaim stale Metal buffers from generation/cache-store intermediates.
+            # Without this, freed buffers accumulate in the Metal buffer pool across
+            # requests (since set_cache_limit(total_mem) prevents automatic release).
+            # The pool bloat forces expensive emergency GC during the next prefill,
+            # causing periodic TTFT spikes. See issue #411.
+            _sync_and_clear_cache()
 
     def _is_cache_corruption_error(self, error: Exception) -> bool:
         """Check if an error indicates cache corruption."""
