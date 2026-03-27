@@ -98,12 +98,19 @@ def _extract_text_from_content_list(content: list) -> str:
     """
     text_parts = []
     for item in content:
+        # Convert Pydantic models to dict
         if hasattr(item, 'model_dump'):
             item = item.model_dump()
         elif hasattr(item, 'dict'):
             item = item.dict()
-        if isinstance(item, dict) and item.get("type") == "text":
-            text_parts.append(item.get("text", ""))
+        
+        if isinstance(item, dict):
+            if item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+        elif isinstance(item, str):
+            # Direct string in content list
+            text_parts.append(item)
+    
     return "\n".join(text_parts) if text_parts else ""
 
 
@@ -257,7 +264,11 @@ def extract_text_content(
         # Handle tool response messages (role="tool")
         if role == "tool":
             tool_call_id = getattr(msg, 'tool_call_id', None) or ''
-            tool_content = content if content else ""
+            # Convert list content to string if needed
+            if isinstance(content, list):
+                tool_content = _extract_text_from_content_list(content)
+            else:
+                tool_content = content if content else ""
             # Apply truncation if configured
             if max_tool_result_tokens and tokenizer and tool_content:
                 from .anthropic_utils import truncate_tool_result
@@ -363,6 +374,11 @@ def extract_text_content(
             # Unknown format, try to convert
             processed_messages.append({"role": role, "content": str(content), **_extra})
 
+    # Final safety check: ensure all content is string type
+    for msg in processed_messages:
+        if not isinstance(msg.get("content"), str):
+            msg["content"] = str(msg.get("content", ""))
+
     return _merge_consecutive_roles(
         _consolidate_system_messages(processed_messages)
     )
@@ -399,7 +415,11 @@ def extract_multimodal_content(
         # Tool response messages - same as extract_text_content
         if role == "tool":
             tool_call_id = getattr(msg, 'tool_call_id', None) or ''
-            tool_content = content if content else ""
+            # Convert list content to string if needed
+            if isinstance(content, list):
+                tool_content = _extract_text_from_content_list(content)
+            else:
+                tool_content = content if content else ""
             if max_tool_result_tokens and tokenizer and tool_content:
                 from .anthropic_utils import truncate_tool_result
                 tool_content = truncate_tool_result(
@@ -604,7 +624,11 @@ def extract_harmony_messages(
         # Tool response messages - preserve role and tool_call_id
         # Parse content as JSON if possible (chat_template applies |tojson)
         if role == "tool":
-            tool_content = content if content else ""
+            # Convert list content to string if needed
+            if isinstance(content, list):
+                tool_content = _extract_text_from_content_list(content)
+            else:
+                tool_content = content if content else ""
             if max_tool_result_tokens and tokenizer and tool_content:
                 from .anthropic_utils import truncate_tool_result
 
@@ -652,15 +676,7 @@ def extract_harmony_messages(
                 msg_dict["content"] = content
             elif isinstance(content, list):
                 # Extract text parts from content array
-                text_parts = []
-                for item in content:
-                    if hasattr(item, 'model_dump'):
-                        item = item.model_dump()
-                    elif hasattr(item, 'dict'):
-                        item = item.dict()
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        text_parts.append(item.get("text", ""))
-                msg_dict["content"] = "\n".join(text_parts)
+                msg_dict["content"] = _extract_text_from_content_list(content)
             else:
                 msg_dict["content"] = str(content)
 
