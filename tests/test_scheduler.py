@@ -1001,6 +1001,8 @@ class TestSchedulerBoundarySnapshots:
             scheduler._cleanup_finished({"req-cleanup-sync"})
             mock_mx.synchronize.assert_called()
             mock_mx.stream.assert_called()
+            # Must clear Metal buffer cache to prevent pool bloat (issue #411)
+            mock_mx.clear_cache.assert_called()
 
     def test_prefill_boundary_snapshot_records_rotating_cache(
         self, mock_model, mock_tokenizer
@@ -1169,6 +1171,38 @@ class TestSchedulerRotatingBlockAlignment:
         scheduler._cleanup_finished({"req-remove-active"})
 
         scheduler.batch_generator.remove.assert_called_once_with([uid])
+
+    def test_cleanup_finished_clears_metal_buffer_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        """_cleanup_finished must clear Metal buffer cache after teardown (#411)."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="req-clear-cache",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2]
+        request.num_prompt_tokens = 2
+        request.output_token_ids = [3]
+
+        scheduler.running["req-clear-cache"] = request
+        scheduler.requests["req-clear-cache"] = request
+
+        with patch("omlx.scheduler.mx") as mock_mx:
+            scheduler._cleanup_finished({"req-clear-cache"})
+            mock_mx.clear_cache.assert_called()
+
+    def test_cleanup_finished_skips_clear_cache_when_no_finished(
+        self, mock_model, mock_tokenizer
+    ):
+        """_cleanup_finished must not clear cache when no requests finished."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        with patch("omlx.scheduler.mx") as mock_mx:
+            scheduler._cleanup_finished(set())
+            mock_mx.clear_cache.assert_not_called()
 
 
 class TestExtractCacheStatesCacheList:
