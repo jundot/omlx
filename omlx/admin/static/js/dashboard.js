@@ -269,6 +269,7 @@
             oqCalibDataset: 'code_multilingual',
             oqClipBatchSize: 1024,
             oqSensitivityModelPath: '',
+            oqExpertBatchSize: 32,
 
             // oQ Uploader state
             uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
@@ -2685,6 +2686,7 @@
                             clip_batch_size: this.oqClipBatchSize,
                             sensitivity_model_path: this.oqSensitivityModelPath,
                             text_only: this.oqTextOnly,
+                            expert_batch_size: this.oqExpertBatchSize,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));

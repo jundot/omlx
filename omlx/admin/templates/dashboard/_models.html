@@ -1178,6 +1178,21 @@
                                                 <option value="1024">1024</option>
                                             </select>
                                         </div>
+                                        <!-- Expert GPTQ Batch (clip ON only) -->
+                                        <div x-show="oqEnableClip" x-cloak class="space-y-1">
+                                            <div class="flex items-center justify-between">
+                                                <span class="text-sm text-neutral-600">{{ t('models.oq.expert_batch_size') }}</span>
+                                                <select x-model.number="oqExpertBatchSize"
+                                                        class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                                    <option value="0">{{ t('models.oq.expert_batch_none') }}</option>
+                                                    <option value="32" selected>32 ({{ t('models.oq.expert_batch_default') }})</option>
+                                                    <option value="16">16 ({{ t('models.oq.expert_batch_slow') }})</option>
+                                                </select>
+                                            </div>
+                                            <p class="text-[11px] text-neutral-400 leading-relaxed">
+                                                {{ t('models.oq.expert_batch_desc') }}
+                                            </p>
+                                        </div>
                                     </div>
                                 </div>
                                 <!-- Error -->

@@ -212,6 +212,7 @@ class OQStartRequest(BaseModel):
     clip_batch_size: int = 1024
     sensitivity_model_path: str = ""
     text_only: bool = False
+    expert_batch_size: int = 32
 
 
 class HFUploadRequest(BaseModel):
@@ -3660,6 +3661,7 @@ async def start_oq_quantization(
             clip_batch_size=request.clip_batch_size,
             sensitivity_model_path=request.sensitivity_model_path,
             text_only=request.text_only,
+            expert_batch_size=request.expert_batch_size,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

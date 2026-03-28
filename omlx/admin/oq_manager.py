@@ -78,6 +78,7 @@ class QuantTask:
     clip_batch_size: int = 1024
     sensitivity_model_path: str = ""
     text_only: bool = False
+    expert_batch_size: int = 32
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -253,6 +254,7 @@ class OQManager:
         clip_batch_size: int = 1024,
         sensitivity_model_path: str = "",
         text_only: bool = False,
+        expert_batch_size: int = 32,
     ) -> QuantTask:
         """Start a quantization job.
 
@@ -324,6 +326,7 @@ class OQManager:
             clip_batch_size=clip_batch_size,
             sensitivity_model_path=sensitivity_model_path,
             text_only=text_only,
+            expert_batch_size=expert_batch_size,
         )
         self._tasks[task_id] = task
 
@@ -485,6 +488,7 @@ class OQManager:
                         None,  # target_bpw
                         None,  # hard_cap_bpw
                         task.sensitivity_model_path,
+                        expert_batch_size=task.expert_batch_size,
                     )
                 else:
                     # Tensor-by-tensor (low memory)

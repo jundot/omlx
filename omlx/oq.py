@@ -681,6 +681,49 @@ def _build_quant_plan(
             current_bpw = next_bpw
             break
 
+    # Fallback: if still under target, boost non-expert tensors toward 8-bit
+    # regardless of sensitivity tier. On large MoE models, non-expert weights
+    # are <6% of params so every bit counts to reach the target bpw.
+    if current_bpw < target_bpw:
+        fallback_candidates = []
+        for path, shape in named_shapes.items():
+            if _is_routed_expert(path):
+                continue
+            cur = boost_map.get(path)
+            if cur is None:
+                continue
+            cur_bits = cur["bits"]
+            if cur_bits >= 8:
+                continue
+            cur_gs = _gs_for_mode(cur_bits, _OQ_DEFAULT_GROUP_SIZE)
+            cur_mode = _mode_for_bits(cur_bits)
+            cur_cost = _tensor_quantized_bytes(shape, cur_bits, cur_gs, cur_mode)
+            layer_idx = _extract_layer_index(path)
+            layer_score = float(layer_scores.get(str(layer_idx), 0.0))
+            fallback_candidates.append((layer_score, path, shape, cur_bits, cur_cost))
+
+        for _score, path, shape, cur_bits, cur_cost in sorted(
+            fallback_candidates, key=lambda x: x[0], reverse=True
+        ):
+            for cand_bits in (8, 6, 5, 4, 3):
+                if cand_bits <= cur_bits:
+                    continue
+                cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
+                cand_mode = _mode_for_bits(cand_bits)
+                cand_cost = _tensor_quantized_bytes(shape, cand_bits, cand_gs, cand_mode)
+                delta = 8 * (cand_cost - cur_cost)
+                if delta <= 0:
+                    continue
+                next_bpw = (total_bits_f + delta) / total_params
+                if next_bpw > hard_cap_bpw:
+                    continue
+                boost_map[path] = {"bits": cand_bits, "group_size": cand_gs, "mode": cand_mode}
+                total_bits_f += delta
+                current_bpw = next_bpw
+                break
+            if current_bpw >= target_bpw:
+                break
+
     if boost_map:
         from collections import Counter
         bits_dist = Counter(v["bits"] for v in boost_map.values())
@@ -1921,7 +1964,7 @@ def _compute_group_params(group_slice: Any, bits: int, group_size: int):
 
 def _gptq_quantize_weight(
     w: Any, Hinv: Any, bits: int, group_size: int, mode: str = "affine",
-    block_size: int = 32,
+    block_size: int = 8,
 ) -> Any:
     """GPTQ column-by-column quantization with error compensation.
 
@@ -1931,13 +1974,16 @@ def _gptq_quantize_weight(
     from the current weight state, then each column is analytically
     quantize-dequantized using the fixed group parameters.
 
+    Uses chunked error compensation: columns within each chunk (block_size)
+    compensate locally, then cross-chunk compensation is a single matmul.
+
     Args:
         w: Weight tensor (out_dim, in_dim) float32.
         Hinv: Inverse Hessian (in_dim, in_dim) float32.
         bits: Target quantization bits.
         group_size: Quantization group size.
         mode: Quantization mode (only "affine" fully supported).
-        block_size: Ignored (kept for API compatibility).
+        block_size: Columns per GPTQ chunk (default 8).
 
     Returns:
         GPTQ-optimized weight (out_dim, in_dim).
@@ -1955,7 +2001,6 @@ def _gptq_quantize_weight(
         scales, biases = _compute_group_params(group_slice, bits, group_size)
         # scales: (out_dim, 1), biases: (out_dim, 1)
 
-        # Work with column list for efficient in-loop updates
         group_cols = [W[:, g_start + i] for i in range(g_size)]
         err_list = []
 
@@ -1964,31 +2009,54 @@ def _gptq_quantize_weight(
             mx.abs(scales) < 1e-10, mx.array(1e-10), scales,
         )
 
-        for i in range(g_size):
-            col = group_cols[i]  # (out_dim,)
-            k = g_start + i
-            d = mx.maximum(Hinv[k, k], mx.array(1e-6))
+        for c_start in range(0, g_size, block_size):
+            c_end = min(c_start + block_size, g_size)
+            chunk_errs = []
 
-            # Analytical qdq matching mx.quantize affine mode
-            col_2d = col[:, None]  # (out_dim, 1) for broadcasting
-            q = mx.clip(
-                mx.round((col_2d - biases) / safe_scales),
-                0.0, n_bins,
-            )
-            qc = (scales * q + biases).squeeze(-1)  # (out_dim,)
+            for i in range(c_start, c_end):
+                col = group_cols[i]  # (out_dim,)
+                k = g_start + i
+                d = mx.maximum(Hinv[k, k], mx.array(1e-6))
 
-            err = (col - qc) / d  # (out_dim,)
-            err_list.append(err)
+                # Analytical qdq matching mx.quantize affine mode
+                col_2d = col[:, None]  # (out_dim, 1) for broadcasting
+                q = mx.clip(
+                    mx.round((col_2d - biases) / safe_scales),
+                    0.0, n_bins,
+                )
+                qc = (scales * q + biases).squeeze(-1)  # (out_dim,)
 
-            # Compensate remaining columns in this group
-            for j in range(i + 1, g_size):
-                group_cols[j] = group_cols[j] - err * Hinv[k, g_start + j]
+                err = (col - qc) / d  # (out_dim,)
+                chunk_errs.append(err)
+                err_list.append(err)
 
-            group_cols[i] = qc
+                # Intra-chunk compensation (small: max block_size-1 columns)
+                remaining_in_chunk = c_end - i - 1
+                if remaining_in_chunk > 0:
+                    remaining = mx.stack(group_cols[i + 1:c_end], axis=1)
+                    hinv_row = Hinv[k, g_start + i + 1:g_start + c_end]
+                    remaining = remaining - err[:, None] * hinv_row[None, :]
+                    group_cols[i + 1:c_end] = [
+                        remaining[:, j] for j in range(remaining_in_chunk)
+                    ]
 
-            # Periodic eval to prevent Metal GPU timeout on large tensors
-            if (i + 1) % 16 == 0:
-                mx.eval(*group_cols)
+                group_cols[i] = qc
+
+            # Cross-chunk compensation via matmul
+            remaining_in_group = g_size - c_end
+            if remaining_in_group > 0 and chunk_errs:
+                E_chunk = mx.stack(chunk_errs, axis=1)  # (O, chunk)
+                H_cross = Hinv[
+                    g_start + c_start:g_start + c_end,
+                    g_start + c_end:g_end,
+                ]  # (chunk, remaining)
+                remaining_stack = mx.stack(group_cols[c_end:], axis=1)
+                remaining_stack = remaining_stack - E_chunk @ H_cross
+                group_cols[c_end:] = [
+                    remaining_stack[:, j] for j in range(remaining_in_group)
+                ]
+
+            mx.eval(*group_cols)
 
         # Reassemble the group into W
         group_result = mx.stack(group_cols, axis=1)  # (out_dim, g_size)
@@ -2011,7 +2079,7 @@ def _gptq_quantize_weight(
 
 def _gptq_quantize_experts_batched(
     w_3d: Any, Hinv: Any, bits: int, group_size: int, mode: str = "affine",
-    block_size: int = 32,
+    block_size: int = 8,
 ) -> Any:
     """Batched GPTQ across all experts simultaneously.
 
@@ -2019,13 +2087,17 @@ def _gptq_quantize_experts_batched(
     mx.quantize's row-wise grouping.  Scale/bias computed once per group
     from current weight state; analytical qdq applied per column.
 
+    Uses chunked error compensation: columns within each chunk (block_size)
+    compensate locally, then cross-chunk compensation is a single matmul.
+    Mathematically identical to column-by-column, but ~5x less memory traffic.
+
     Args:
         w_3d: Fused expert weights (num_experts, out_dim, in_dim) float32.
         Hinv: Inverse Hessian (in_dim, in_dim) float32.
         bits: Target quantization bits.
         group_size: Quantization group size.
         mode: Quantization mode (only "affine" fully supported).
-        block_size: Ignored (kept for API compatibility).
+        block_size: Columns per GPTQ chunk (default 8).
 
     Returns:
         GPTQ-optimized weights (num_experts, out_dim, in_dim).
@@ -2043,8 +2115,7 @@ def _gptq_quantize_experts_batched(
         scales, biases = _compute_group_params(group_slice, bits, group_size)
         # scales: (E, O, 1), biases: (E, O, 1)
 
-        # Work with column list for efficient in-loop updates
-        group_cols = [W[:, :, g_start + i] for i in range(g_size)]  # list of (E, O)
+        group_cols = [W[:, :, g_start + i] for i in range(g_size)]
         err_list = []
 
         # Safe divisor: preserve sign, avoid division by zero
@@ -2052,31 +2123,54 @@ def _gptq_quantize_experts_batched(
             mx.abs(scales) < 1e-10, mx.array(1e-10), scales,
         )
 
-        for i in range(g_size):
-            col = group_cols[i]  # (E, O)
-            k = g_start + i
-            d = mx.maximum(Hinv[k, k], mx.array(1e-6))
+        for c_start in range(0, g_size, block_size):
+            c_end = min(c_start + block_size, g_size)
+            chunk_errs = []
 
-            # Analytical qdq matching mx.quantize affine mode
-            col_3d = col[:, :, None]  # (E, O, 1) for broadcasting
-            q = mx.clip(
-                mx.round((col_3d - biases) / safe_scales),
-                0.0, n_bins,
-            )
-            qc = (scales * q + biases).squeeze(-1)  # (E, O)
+            for i in range(c_start, c_end):
+                col = group_cols[i]  # (E, O)
+                k = g_start + i
+                d = mx.maximum(Hinv[k, k], mx.array(1e-6))
 
-            err = (col - qc) / d  # (E, O)
-            err_list.append(err)
+                # Analytical qdq matching mx.quantize affine mode
+                col_3d = col[:, :, None]  # (E, O, 1) for broadcasting
+                q = mx.clip(
+                    mx.round((col_3d - biases) / safe_scales),
+                    0.0, n_bins,
+                )
+                qc = (scales * q + biases).squeeze(-1)  # (E, O)
 
-            # Compensate remaining columns in this group
-            for j in range(i + 1, g_size):
-                group_cols[j] = group_cols[j] - err * Hinv[k, g_start + j]
+                err = (col - qc) / d  # (E, O)
+                chunk_errs.append(err)
+                err_list.append(err)
 
-            group_cols[i] = qc
+                # Intra-chunk compensation (small: max block_size-1 columns)
+                remaining_in_chunk = c_end - i - 1
+                if remaining_in_chunk > 0:
+                    remaining = mx.stack(group_cols[i + 1:c_end], axis=2)
+                    hinv_row = Hinv[k, g_start + i + 1:g_start + c_end]
+                    remaining = remaining - err[:, :, None] * hinv_row[None, None, :]
+                    group_cols[i + 1:c_end] = [
+                        remaining[:, :, j] for j in range(remaining_in_chunk)
+                    ]
 
-            # Periodic eval to prevent Metal GPU timeout on large tensors
-            if (i + 1) % 16 == 0:
-                mx.eval(*group_cols)
+                group_cols[i] = qc
+
+            # Cross-chunk compensation via matmul (replaces per-column broadcast)
+            remaining_in_group = g_size - c_end
+            if remaining_in_group > 0 and chunk_errs:
+                E_chunk = mx.stack(chunk_errs, axis=2)  # (E, O, chunk)
+                H_cross = Hinv[
+                    g_start + c_start:g_start + c_end,
+                    g_start + c_end:g_end,
+                ]  # (chunk, remaining)
+                remaining_stack = mx.stack(group_cols[c_end:], axis=2)
+                remaining_stack = remaining_stack - E_chunk @ H_cross
+                group_cols[c_end:] = [
+                    remaining_stack[:, :, j] for j in range(remaining_in_group)
+                ]
+
+            mx.eval(*group_cols)
 
         # Reassemble the group into W
         group_result = mx.stack(group_cols, axis=2)  # (E, O, g_size)
@@ -2102,6 +2196,7 @@ def _run_gptq(
     progress_callback=None,
     calib_dataset="code_multilingual",
     num_samples=128, seq_length=256,
+    expert_batch_size: int = 32,
 ):
     """Run GPTQ optimization on all quantizable weights (experts + attention + MLP).
 
@@ -2289,19 +2384,46 @@ def _run_gptq(
                 else:
                     Hinv_exp = Hinv_mlp
 
+                _batch_info = (
+                    f", batch={expert_batch_size}"
+                    if expert_batch_size > 0 and num_experts > expert_batch_size
+                    else ""
+                )
                 logger.debug(
                     f"  L{layer_idx}: GPTQ {proj_name} ({num_experts} experts, "
-                    f"{w_3d.shape[1]}x{expert_in_dim}) @ {base_bits}bit"
+                    f"{w_3d.shape[1]}x{expert_in_dim}) @ {base_bits}bit{_batch_info}"
                 )
 
-                # Batched GPTQ: all experts processed simultaneously
+                # Sub-batched GPTQ: split large expert tensors to reduce
+                # peak memory (e.g. 256 experts → 8 batches of 32).
+                # Each sub-batch uses the same shared Hessian; results are
+                # identical to processing all experts at once.
                 _t0 = _time.time()
-                new_3d = _gptq_quantize_experts_batched(
-                    w_3d.astype(mx.float32), Hinv_exp,
-                    base_bits, base_gs, base_mode, block_size=32,
-                )
-                new_3d = new_3d.astype(w_3d.dtype)
-                mx.eval(new_3d)
+                _SUB_BATCH = expert_batch_size
+                if _SUB_BATCH > 0 and num_experts > _SUB_BATCH:
+                    sub_results = []
+                    for sb_start in range(0, num_experts, _SUB_BATCH):
+                        sb_end = min(sb_start + _SUB_BATCH, num_experts)
+                        sub_w = w_3d[sb_start:sb_end].astype(mx.float32)
+                        sub_opt = _gptq_quantize_experts_batched(
+                            sub_w, Hinv_exp,
+                            base_bits, base_gs, base_mode,
+                        )
+                        sub_results.append(sub_opt.astype(w_3d.dtype))
+                        mx.eval(sub_results[-1])
+                        del sub_w, sub_opt
+                        mx.synchronize()
+                        mx.clear_cache()
+                    new_3d = mx.concatenate(sub_results, axis=0)
+                    mx.eval(new_3d)
+                    del sub_results
+                else:
+                    new_3d = _gptq_quantize_experts_batched(
+                        w_3d.astype(mx.float32), Hinv_exp,
+                        base_bits, base_gs, base_mode,
+                    )
+                    new_3d = new_3d.astype(w_3d.dtype)
+                    mx.eval(new_3d)
                 _elapsed = _time.time() - _t0
 
                 # Measure MSE improvement (sample 4 experts)
@@ -2639,6 +2761,7 @@ def quantize_oq(
     target_bpw: float | None = None,
     hard_cap_bpw: float | None = None,
     sensitivity_model_path: str = "",
+    expert_batch_size: int = 32,
     **kwargs,
 ) -> None:
     """Run oQ quantization: load -> GPTQ optimize -> quantize -> save.
@@ -2749,6 +2872,7 @@ def quantize_oq(
             model, tokenizer, config, oq_level, cb,
             calib_dataset, num_samples=clip_num_samples,
             seq_length=clip_seq_length,
+            expert_batch_size=expert_batch_size,
         )
 
     cb("quantizing", 60.0)
