@@ -603,6 +603,18 @@ class EnginePool:
             if self._process_memory_enforcer is not None:
                 self._process_memory_enforcer._propagate_memory_limit()
 
+            # Release intermediate Metal buffers from model loading.
+            # mlx_lm.load() creates large temporaries (weight transforms,
+            # quantization intermediates) that stay in the Metal buffer pool
+            # because mx.set_cache_limit(total_mem) prevents automatic release.
+            # Without this, memory stays at ~2x model size until the first
+            # inference request triggers a clear. (#429)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                lambda: (mx.synchronize(), mx.clear_cache()),
+            )
+
             logger.info(
                 f"Loaded model: {model_id} "
                 f"(estimated: {format_size(entry.estimated_size)}, "

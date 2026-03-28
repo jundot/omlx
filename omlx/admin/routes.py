@@ -1707,6 +1707,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "memory": {
             "max_process_memory": global_settings.memory.max_process_memory,
+            "prefill_memory_guard": global_settings.memory.prefill_memory_guard,
         },
         "scheduler": {
             "max_num_seqs": global_settings.scheduler.max_num_seqs,

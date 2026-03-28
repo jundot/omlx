@@ -3082,7 +3082,13 @@ class Scheduler:
         # Reclaim fragmented Metal buffers after generation failure.
         # Without this, subsequent requests may hit the same resource
         # limit even though Python references have been cleared.
-        _sync_and_clear_cache()
+        # Wrapped in try-except because Metal may already be in an error
+        # state — mx.synchronize() or mx.clear_cache() can throw a C++
+        # exception that causes SIGABRT if uncaught (#435).
+        try:
+            _sync_and_clear_cache()
+        except Exception as e:
+            logger.warning(f"Metal cache clear failed during error recovery: {e}")
         return failed_ids
 
     def get_num_waiting(self) -> int:
