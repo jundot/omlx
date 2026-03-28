@@ -40,6 +40,14 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     if apply_gated_delta_advance_patch(model):
         logger.info("GatedDeltaNet advance() patch applied")
 
+    # VLM attention mask patch: remove mask truncation in mlx-vlm
+    # Qwen3_5Attention that breaks batched inference with different
+    # prompt lengths (auto-detected by model type)
+    from ..patches.vlm_attention_mask import apply_vlm_attention_mask_patch
+
+    if apply_vlm_attention_mask_patch(model):
+        logger.info("VLM attention mask truncation patch applied")
+
     if model_settings is None:
         return model
 

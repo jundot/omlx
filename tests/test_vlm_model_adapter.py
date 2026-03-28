@@ -320,21 +320,25 @@ class TestIntOffsetCacheProxy:
         proxy = _IntOffsetCacheProxy(cache)
         assert proxy.offset == 7
 
-    def test_batched_offset_returns_first_element(self):
-        """Proxy extracts offset[0] from mx.array — the authoritative source.
+    def test_batch_kv_cache_returns_idx(self):
+        """BatchKVCache proxy returns _idx (shared buffer write index).
 
-        _idx/_offset are unreliable: _idx wraps at max_size for
-        BatchRotatingKVCache, _offset diverges after merge().
-        The mx.array offset is always correct per-request.
+        Per-element offset[i] = _idx - left_padding[i], so offset[0] is
+        wrong when left_padding[0] > 0 (shorter prompt in batch). _idx
+        matches make_mask() and is the correct scalar for RoPE position.
+        BatchKVCache has _idx but NOT _offset (which distinguishes it
+        from BatchRotatingKVCache).
         """
         import mlx.core as mx
         from omlx.models.vlm import _IntOffsetCacheProxy
 
         cache = MagicMock(spec=[])
-        cache.offset = mx.array([625])
-        cache._idx = 42  # irrelevant, should not be used
+        # Simulate BatchKVCache: 2 prompts, lengths 3 and 5
+        # left_padding = [2, 0], _idx = 5, offset = [3, 5]
+        cache.offset = mx.array([3, 5])
+        cache._idx = 5  # shared buffer write index
         proxy = _IntOffsetCacheProxy(cache)
-        assert proxy.offset == 625
+        assert proxy.offset == 5
 
     def test_rotating_cache_wrap_returns_real_offset(self):
         """After RotatingKVCache wraps, proxy returns real offset, not _idx.

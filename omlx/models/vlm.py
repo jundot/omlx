@@ -47,12 +47,15 @@ class _IntOffsetCacheProxy:
     def offset(self):
         raw = self._cache.offset
         if isinstance(raw, mx.array):
-            # Extract per-request offset from the authoritative mx.array.
-            # _idx/_offset are unreliable shortcuts: _idx wraps at max_size
-            # (BatchRotatingKVCache), _offset diverges after merge() which
-            # sets it to buffer size instead of actual token offset.
-            # Mask computation uses make_mask() on the real cache (via
-            # __getattr__), so this value is only used for RoPE/position_ids.
+            # BatchKVCache: _idx is the shared buffer write index.
+            # Per-element offset[i] = _idx - left_padding[i], so offset[0]
+            # is wrong when left_padding[0] > 0 (shorter prompt in batch).
+            # _idx matches make_mask() and is correct for all batch sizes.
+            # Guard: only when _offset is absent — BatchRotatingKVCache has
+            # both _idx (wraps at max_size) and _offset (diverges after
+            # merge()), so it must fall through to the mx.array path.
+            if hasattr(self._cache, "_idx") and not hasattr(self._cache, "_offset"):
+                return self._cache._idx
             if raw.ndim == 0:
                 return int(raw.item())
             return int(raw.reshape(-1)[0].item())
