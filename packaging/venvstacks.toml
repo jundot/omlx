@@ -23,7 +23,8 @@ requirements = [
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
     # Tokenizers and transformers (aligned with pyproject.toml)
-    "transformers>=5.0.0",
+    # 5.4.0 broke VLM: Qwen2VLImageProcessor now hard-requires torch (#431)
+    "transformers>=5.0.0,<5.4.0",
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
     # Other dependencies

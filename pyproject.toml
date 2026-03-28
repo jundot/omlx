@@ -34,7 +34,8 @@ dependencies = [
     # mlx-embeddings from latest commit (6e2ef52)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@6e2ef5256faadf1d79c3bf339686d43f8db17cdd",
     # transformers version aligned with mlx-lm requirement
-    "transformers>=5.0.0",
+    # 5.4.0 broke VLM: Qwen2VLImageProcessor now hard-requires torch (#431)
+    "transformers>=5.0.0,<5.4.0",
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
     "numpy>=1.24.0",
