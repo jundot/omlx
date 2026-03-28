@@ -30,6 +30,33 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / 1024**3:.1f} GB"
 
 
+def _has_meaningful_readme(path: Path) -> bool:
+    """Check if a README.md exists and has content beyond YAML frontmatter.
+
+    Returns False if the file doesn't exist, is empty, or contains only
+    YAML frontmatter (e.g. mlx-lm's default stub).
+    """
+    readme = path / "README.md"
+    if not readme.exists():
+        return False
+    try:
+        text = readme.read_text(encoding="utf-8").strip()
+    except Exception:
+        return False
+    if not text:
+        return False
+    # Strip YAML frontmatter and check if anything remains
+    if text.startswith("---"):
+        parts = text.split("---", 2)
+        # parts[0] is empty (before first ---), parts[1] is frontmatter
+        if len(parts) >= 3:
+            body = parts[2].strip()
+            return len(body) > 0
+        # Only opening --- or unclosed frontmatter
+        return False
+    return True
+
+
 def _is_oq_model(name: str) -> bool:
     """Check if a model name indicates an oQ-quantized model.
 
@@ -251,7 +278,7 @@ class HFUploader:
                         if path.name in seen:
                             continue
                         seen.add(path.name)
-                        has_readme = (path / "README.md").exists()
+                        has_readme = _has_meaningful_readme(path)
                         models.append({
                             "name": path.name,
                             "path": str(path),
@@ -437,7 +464,7 @@ class HFUploader:
                     if source_readme.exists():
                         shutil.copy2(source_readme, readme_in_model)
                         tmp_readme = readme_in_model
-                elif auto_readme and not readme_in_model.exists():
+                elif auto_readme and not _has_meaningful_readme(model_path):
                     try:
                         with open(model_path / "config.json") as f:
                             config = json.load(f)

@@ -16,6 +16,7 @@ from omlx.admin.hf_uploader import (
     UploadTask,
     _format_size,
     _generate_model_card,
+    _has_meaningful_readme,
     _is_oq_model,
 )
 
@@ -44,6 +45,33 @@ class TestIsOqModel:
         assert _is_oq_model("oQ4") is True  # short name, still has oQ in last 5
         assert _is_oq_model("12oQ4") is True  # exactly 5 chars, oQ at pos 2
         assert _is_oq_model("ABCDE") is False
+
+
+class TestHasMeaningfulReadme:
+    """Test README content detection."""
+
+    def test_no_readme(self, tmp_path):
+        assert _has_meaningful_readme(tmp_path) is False
+
+    def test_empty_readme(self, tmp_path):
+        (tmp_path / "README.md").write_text("")
+        assert _has_meaningful_readme(tmp_path) is False
+
+    def test_frontmatter_only(self, tmp_path):
+        (tmp_path / "README.md").write_text(
+            "---\nlanguage: en\nlibrary_name: mlx\ntags:\n- mlx\n---\n"
+        )
+        assert _has_meaningful_readme(tmp_path) is False
+
+    def test_frontmatter_with_body(self, tmp_path):
+        (tmp_path / "README.md").write_text(
+            "---\nlibrary_name: mlx\n---\n\n# My Model\nSome description.\n"
+        )
+        assert _has_meaningful_readme(tmp_path) is True
+
+    def test_no_frontmatter(self, tmp_path):
+        (tmp_path / "README.md").write_text("# My Model\nA great model.\n")
+        assert _has_meaningful_readme(tmp_path) is True
 
 
 class TestFormatSize:
@@ -491,3 +519,39 @@ class TestHFUploaderReadme:
             assert "Llama 3B Instruct" in readme_contents[0]
             # Cleaned up
             assert not (oq_path / "README.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_auto_readme_overwrites_frontmatter_only(self, model_dirs):
+        """Frontmatter-only README should be treated as empty and auto-generated."""
+        oq_path = Path(model_dirs[0]) / "Llama-3B-oQ4"
+        # Write a frontmatter-only stub (like mlx-lm default)
+        (oq_path / "README.md").write_text(
+            "---\nlanguage: en\nlibrary_name: mlx\ntags:\n- mlx\n---\n"
+        )
+        uploader = HFUploader(model_dirs=model_dirs)
+
+        with patch("huggingface_hub.HfApi") as MockApi:
+            mock_api = MockApi.return_value
+            mock_api.create_repo.return_value = None
+
+            readme_contents = []
+            def fake_upload(**kwargs):
+                folder = Path(kwargs["folder_path"])
+                readme = folder / "README.md"
+                if readme.exists():
+                    readme_contents.append(readme.read_text())
+
+            mock_api.upload_folder.side_effect = fake_upload
+
+            await uploader.start_upload(
+                model_path=str(oq_path),
+                repo_id="user/Llama-3B-oQ4",
+                token="hf_token",
+                auto_readme=True,
+            )
+            await asyncio.sleep(0.5)
+
+            assert len(readme_contents) == 1
+            # Should contain auto-generated content, not the stub
+            assert "# Llama-3B-oQ4" in readme_contents[0]
+            assert "oQ" in readme_contents[0]
