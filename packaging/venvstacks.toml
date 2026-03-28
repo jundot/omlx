@@ -51,6 +51,8 @@ requirements = [
     "Pillow>=9.0.0",
     # ModelScope SDK for downloading models from ModelScope Hub
     "modelscope>=1.10.0",
+    # JANG model support (mixed-precision quantization)
+    "jang[mlx]>=0.1.0",
 ]
 platforms = [
     "macosx_arm64",

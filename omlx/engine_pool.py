@@ -27,6 +27,7 @@ import mlx.core as mx
 
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
+from .engine.jang import JANGLoader
 from .engine.reranker import RerankerEngine
 from .engine.vlm import VLMBatchedEngine
 from .exceptions import (
@@ -522,7 +523,16 @@ class EnginePool:
             elif effective_type == "reranker":
                 # RerankerEngine for reranker models
                 engine = RerankerEngine(model_name=entry.model_path)
-            elif effective_type == "vlm":
+            elif entry.engine_type == "jang":
+                # JANGLoader for JANG quantized models
+                from .engine.jang import JANGLoader
+
+                engine = JANGLoader(
+                    model_name=entry.model_path,
+                    scheduler_config=self._scheduler_config,
+                    model_settings=model_settings,
+                )
+            elif entry.engine_type == "vlm":
                 # VLMBatchedEngine for vision-language models
                 engine = VLMBatchedEngine(
                     model_name=entry.model_path,

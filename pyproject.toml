@@ -62,6 +62,8 @@ dependencies = [
     # mlx-vlm from commit (b7f853a)
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@b7f853a26a0bdcb60a307b1deb01ba5be9ac9ffc",
     "Pillow>=9.0.0",
+    # JANG model support
+    "jang[mlx]>=0.1.0",
 ]
 
 [project.optional-dependencies]

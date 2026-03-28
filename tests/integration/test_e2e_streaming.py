@@ -144,6 +144,7 @@ class MockEnginePool:
         self._models = [
             {"id": "test-model", "loaded": True, "pinned": False, "size": 1000000}
         ]
+        self._entries: Dict[str, Any] = {}
 
     @property
     def model_count(self) -> int:
@@ -172,6 +173,10 @@ class MockEnginePool:
 
     async def get_engine(self, model_id: str):
         return self._engine
+
+    def get_entry(self, model_id: str):
+        """Get entry for a specific model."""
+        return self._entries.get(model_id)
 
 
 def parse_sse_events(response_text: str) -> List[Dict]:

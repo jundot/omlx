@@ -211,6 +211,7 @@ class ServerState:
     default_model: Optional[str] = None
     mcp_manager: Optional[object] = None
     mcp_executor: Optional[object] = None
+    oq_manager: Optional[object] = None  # OQManager
     sampling: SamplingDefaults = field(default_factory=SamplingDefaults)
     api_key: Optional[str] = None
     settings_manager: Optional[object] = None  # ModelSettingsManager
@@ -1037,7 +1038,7 @@ def init_server(
     logger.info(f"CORS origins: {cors_origins}")
 
     # Initialize model settings manager
-    base_path = Path(global_settings.base_path) if global_settings else Path(model_dir)
+    base_path = Path(global_settings.base_path) if global_settings else Path(model_dirs if isinstance(model_dirs, str) else model_dirs[0])
     _server_state.settings_manager = ModelSettingsManager(base_path)
 
     # Get pinned models from settings file only (managed via admin page)
@@ -3809,11 +3810,8 @@ Note: Use the omlx CLI for full feature support.
 
     # Initialize server
     init_server(
-        model_dir=args.model_dir,
+        model_dirs=args.model_dir,
         max_model_memory=parse_size(args.max_model_memory),
-        pinned_models=pinned_models,
-        default_model=args.default_model,
-        max_tokens=args.max_tokens,
     )
 
     # Start server

@@ -217,6 +217,18 @@ class TokenizerError(ModelError):
     pass
 
 
+class JANGDependencyError(ModelLoadError):
+    """JANG dependency (jang-tools) is not installed."""
+
+    pass
+
+
+class JANGLoadError(ModelLoadError):
+    """Failed to load a JANG model."""
+
+    pass
+
+
 # =============================================================================
 # API-related Exceptions
 # =============================================================================

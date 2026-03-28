@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 ModelType = Literal["llm", "vlm", "embedding", "reranker"]
 EngineType = Literal["batched", "vlm", "embedding", "reranker"]
 
+# JANG model config file names
+JANG_CONFIG_FILES = ("jang_config.json", "jjqf_config.json", "jang_cfg.json")
+
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
     "qwen2_vl",
@@ -219,10 +222,12 @@ def detect_model_type(model_path: Path) -> ModelType:
     Detect model type from config.json.
 
     Checks:
-    1. architectures field for reranker-specific classes (SequenceClassification)
-    2. architectures field for embedding-specific classes
-    3. model_type field against known embedding types (unambiguous only)
-    4. VLM detection via architectures, model_type, or vision_config presence
+    1. JANG VLM indicators: jang_config.json.architecture.has_vision, preprocessor_config.json
+    2. JANG models with JANG config files take priority (mixed-precision)
+    3. architectures field for reranker-specific classes (SequenceClassification)
+    4. architectures field for embedding-specific classes
+    5. model_type field against known embedding types (unambiguous only)
+    6. VLM detection via architectures, model_type, or vision_config presence
 
     Args:
         model_path: Path to model directory
@@ -230,6 +235,27 @@ def detect_model_type(model_path: Path) -> ModelType:
     Returns:
         Model type: "llm", "vlm", "embedding", or "reranker"
     """
+    # JANG models with config files should use the JANG loader for mixed-precision
+    # Check for JANG config files first
+    jang_config_path = model_path / "jang_config.json"
+    if jang_config_path.exists():
+        try:
+            with open(jang_config_path) as f:
+                jang_config = json.load(f)
+            architecture = jang_config.get("architecture", {})
+            # JANG models use mixed-precision; use jang engine type
+            # Determine model type based on has_vision, but return type used for engine selection
+            has_vision = isinstance(architecture, dict) and architecture.get("has_vision") is True
+            return "vlm" if has_vision else "llm"
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    # Check 2: preprocessor_config.json existence (VLM indicator)
+    preprocessor_path = model_path / "preprocessor_config.json"
+    if preprocessor_path.exists():
+        return "vlm"
+
+    # Check 3: config.json.vision_config (existing MLX pattern, fallback)
     config_path = model_path / "config.json"
     if not config_path.exists():
         return "llm"
@@ -239,6 +265,10 @@ def detect_model_type(model_path: Path) -> ModelType:
             config = json.load(f)
     except (json.JSONDecodeError, IOError):
         return "llm"
+
+    # Check for vision_config in config.json
+    if "vision_config" in config:
+        return "vlm"
 
     # Check architectures field for reranker first (more specific)
     architectures = config.get("architectures", [])
@@ -306,8 +336,15 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     # Check for VLM: presence of vision_config (fallback heuristic)
     # Catch-all for VLMs that aren't yet listed in VLM_MODEL_TYPES.
+    # Note: This was already checked earlier, but we keep it here for non-JANG models
+    # that may have config.json without vision_config in the early path.
     if "vision_config" in config:
         return "vlm"
+
+    # Check for VLM: architectures field (for VLM architectures not in VLM_ARCHITECTURES)
+    for arch in architectures:
+        if "VLM" in arch or "VL" in arch or "Vision" in arch:
+            return "vlm"
 
     return "llm"
 
@@ -360,8 +397,18 @@ def _is_adapter_dir(path: Path) -> bool:
 
 
 def _is_model_dir(path: Path) -> bool:
-    """Check if a directory contains a valid model (has config.json)."""
-    return (path / "config.json").exists() and not _is_adapter_dir(path)
+    """Check if a directory contains a valid model (has config.json or jang_config.json)."""
+    if _is_adapter_dir(path):
+        return False
+    if (path / "config.json").exists():
+        return True
+    # JANG models use jang_config.json, jjqf_config.json, or jang_cfg.json
+    return any((path / f).exists() for f in JANG_CONFIG_FILES)
+
+
+def _is_jang_model(model_path: Path) -> bool:
+    """Check if directory contains a JANG model config file."""
+    return any((model_path / f).exists() for f in JANG_CONFIG_FILES)
 
 
 def _register_model(
@@ -379,10 +426,19 @@ def _register_model(
             return
 
         model_type = detect_model_type(model_dir)
+
+        # JANG models with config files should use the JANG loader for mixed-precision
+        # Check if this is a JANG model first (takes priority over vlm/batched)
+        is_jang = _is_jang_model(model_dir)
+
         if model_type == "embedding":
             engine_type: EngineType = "embedding"
         elif model_type == "reranker":
             engine_type = "reranker"
+        elif is_jang:
+            # JANG models use the JANGLoader for mixed-precision quantization
+            # This takes priority over vlm/batched for JANG models
+            engine_type = "jang"
         elif model_type == "vlm":
             engine_type = "vlm"
         else:

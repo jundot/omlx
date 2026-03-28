@@ -10,6 +10,7 @@ import pytest
 from omlx.model_discovery import (
     DiscoveredModel,
     _is_adapter_dir,
+    _is_jang_model,
     _is_unsupported_model,
     detect_model_type,
     discover_models,
@@ -234,6 +235,57 @@ class TestDetectModelType:
         assert detect_model_type(tmp_path) == "llm"
 
 
+class TestIsJangModel:
+    """Tests for _is_jang_model helper function."""
+
+    def test_jang_model_with_jang_config_json(self, tmp_path):
+        """Test detection of JANG model with jang_config.json."""
+        model_dir = tmp_path / "qwen3.5-35b-jang"
+        model_dir.mkdir()
+        (model_dir / "jang_config.json").write_text(json.dumps({
+            "format": "jang",
+            "format_version": "2.0",
+        }))
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+
+        assert _is_jang_model(model_dir) is True
+
+    def test_jang_model_with_jjqf_config_json(self, tmp_path):
+        """Test detection of JANG model with jjqf_config.json."""
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "jjqf_config.json").write_text(json.dumps({
+            "quantization": {"bits": 2},
+        }))
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+
+        assert _is_jang_model(model_dir) is True
+
+    def test_jang_model_with_jang_cfg_json(self, tmp_path):
+        """Test detection of JANG model with jang_cfg.json."""
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "jang_cfg.json").write_text(json.dumps({
+            "quantization": {"profile": "JANG_2L"},
+        }))
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+
+        assert _is_jang_model(model_dir) is True
+
+    def test_standard_model_not_jang(self, tmp_path):
+        """Test that standard MLX models return False."""
+        model_dir = tmp_path / "llama-3b"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "model.safetensors").write_bytes(b"0" * 1000)
+
+        assert _is_jang_model(model_dir) is False
+
+    def test_empty_directory_not_jang(self, tmp_path):
+        """Test that empty directory returns False."""
+        assert _is_jang_model(tmp_path) is False
+
+
 class TestEstimateModelSize:
     """Tests for estimate_model_size function."""
 
@@ -401,6 +453,75 @@ class TestDiscoverModels:
         assert len(models) == 1
         assert models["bge-reranker"].model_type == "reranker"
         assert models["bge-reranker"].engine_type == "reranker"
+
+    def test_discover_jang_model(self, tmp_path):
+        """Test discovery of JANG model with correct engine type."""
+        jang_dir = tmp_path / "qwen3.5-35b-jang"
+        jang_dir.mkdir()
+        (jang_dir / "jang_config.json").write_text(json.dumps({
+            "format": "jang",
+            "format_version": "2.0",
+            "quantization": {
+                "method": "jang-importance",
+                "profile": "JANG_2L",
+                "target_bits": 2.0,
+                "actual_bits": 2.31,
+            }
+        }))
+        (jang_dir / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+        (jang_dir / "model.safetensors").write_bytes(b"0" * 1000)
+
+        models = discover_models(tmp_path)
+        assert len(models) == 1
+        assert models["qwen3.5-35b-jang"].model_type == "llm"
+        assert models["qwen3.5-35b-jang"].engine_type == "jang"
+
+    def test_discover_jang_vlm_model(self, tmp_path):
+        """Test discovery of JANG VLM model with correct types."""
+        jang_vlm_dir = tmp_path / "qwen3.5-vlm-jang"
+        jang_vlm_dir.mkdir()
+        (jang_vlm_dir / "jang_config.json").write_text(json.dumps({
+            "format": "jang",
+            "format_version": "2.0",
+            "quantization": {
+                "method": "jang-importance",
+                "profile": "JANG_2L",
+            },
+            "architecture": {
+                "has_vision": True,
+            }
+        }))
+        (jang_vlm_dir / "config.json").write_text(json.dumps({
+            "model_type": "qwen3_vl",
+        }))
+        (jang_vlm_dir / "model.safetensors").write_bytes(b"0" * 1000)
+
+        models = discover_models(tmp_path)
+        assert len(models) == 1
+        assert models["qwen3.5-vlm-jang"].model_type == "vlm"
+        assert models["qwen3.5-vlm-jang"].engine_type == "jang"
+
+    def test_discover_jang_vlm_via_preprocessor(self, tmp_path):
+        """Test discovery of JANG VLM via preprocessor_config.json."""
+        jang_vlm_dir = tmp_path / "qwen3.5-vlm-jang"
+        jang_vlm_dir.mkdir()
+        (jang_vlm_dir / "jang_config.json").write_text(json.dumps({
+            "format": "jang",
+            "format_version": "2.0",
+            "architecture": {
+                "has_vision": True,
+            }
+        }))
+        (jang_vlm_dir / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+        (jang_vlm_dir / "preprocessor_config.json").write_text(json.dumps({
+            "image_processor_type": "Qwen2VLImageProcessor",
+        }))
+        (jang_vlm_dir / "model.safetensors").write_bytes(b"0" * 1000)
+
+        models = discover_models(tmp_path)
+        assert len(models) == 1
+        assert models["qwen3.5-vlm-jang"].model_type == "vlm"
+        assert models["qwen3.5-vlm-jang"].engine_type == "jang"
 
     def test_skip_invalid_directories(self, tmp_path):
         """Test that directories without config.json are skipped."""
