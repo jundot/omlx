@@ -369,12 +369,17 @@ class TestIntOffsetCacheProxy:
         proxy = _IntOffsetCacheProxy(cache)
         assert proxy.offset == 7168
 
-    def test_multi_request_batch_returns_first_offset(self):
-        """Multi-request batch returns first request's offset."""
+    def test_multi_request_batch_returns_max_offset(self):
+        """Multi-request batch returns max offset (== _idx).
+
+        max(offset) equals _idx because the longest request has zero
+        left_padding.  This is correct for mask sizing in mlx-vlm
+        attention (kv_seq_len uses cache.offset before update_and_fetch).
+        """
         import mlx.core as mx
         from omlx.models.vlm import _IntOffsetCacheProxy
 
         cache = MagicMock(spec=[])
         cache.offset = mx.array([500, 625])
         proxy = _IntOffsetCacheProxy(cache)
-        assert proxy.offset == 500
+        assert proxy.offset == 625
