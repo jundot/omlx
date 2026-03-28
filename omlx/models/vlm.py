@@ -47,15 +47,19 @@ class _IntOffsetCacheProxy:
     def offset(self):
         raw = self._cache.offset
         if isinstance(raw, mx.array):
-            # Extract per-request offset from the authoritative mx.array.
-            # _idx/_offset are unreliable shortcuts: _idx wraps at max_size
-            # (BatchRotatingKVCache), _offset diverges after merge() which
-            # sets it to buffer size instead of actual token offset.
-            # Mask computation uses make_mask() on the real cache (via
-            # __getattr__), so this value is only used for RoPE/position_ids.
+            # Return the maximum offset across batch elements.
+            # For BatchKVCache: max(offset) == _idx (the shared buffer
+            # write position), because the longest request has zero
+            # left_padding.  This is correct for mask sizing — mlx-vlm
+            # computes kv_seq_len from this value before update_and_fetch.
+            # For BatchRotatingKVCache: the mx.array offset never wraps
+            # (unlike _idx which resets at max_size) and is authoritative
+            # even after merge() (unlike _offset which gets set to buffer
+            # size).  max() is safe for both cache types with no
+            # duck-typing on internal attributes.
             if raw.ndim == 0:
                 return int(raw.item())
-            return int(raw.reshape(-1)[0].item())
+            return int(raw.max().item())
         return raw
 
     def __getattr__(self, name: str):
