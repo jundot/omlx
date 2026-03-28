@@ -47,17 +47,24 @@ def _get_engine_pool():
 
 
 async def _read_upload(file: UploadFile) -> bytes:
-    """Read an uploaded file with size limit enforcement."""
-    content = await file.read()
-    if len(content) > MAX_AUDIO_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"Audio file too large ({len(content)} bytes). "
-                f"Maximum allowed: {MAX_AUDIO_UPLOAD_BYTES} bytes"
-            ),
-        )
-    return content
+    """Read an uploaded file in chunks, bailing early if it exceeds the limit."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)  # 1 MB chunks
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_AUDIO_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Audio file exceeds maximum allowed size "
+                    f"({MAX_AUDIO_UPLOAD_BYTES} bytes)"
+                ),
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 # ---------------------------------------------------------------------------

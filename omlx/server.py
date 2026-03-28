@@ -376,11 +376,14 @@ from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
 set_mcp_manager_getter(get_mcp_manager)
 app.include_router(mcp_router)
 
-# Include audio routes (requires python-multipart for File/Form params).
-# Registered conditionally so oMLX works without the audio optional dependency.
+# Include audio routes only when mlx-audio is installed.
+# audio_routes.py itself only imports fastapi/stdlib at module level, so it
+# would always import successfully — we need an explicit mlx-audio check.
 try:
+    import mlx_audio as _  # noqa: F401
     from .api.audio_routes import router as audio_router
     app.include_router(audio_router)
+    del _
 except ImportError:
     pass
 

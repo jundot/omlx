@@ -544,7 +544,10 @@ class EnginePool:
             elif entry.engine_type == "audio_tts":
                 engine = TTSEngine(model_name=entry.model_path)
             elif entry.engine_type == "audio_sts":
-                engine = STSEngine(model_name=entry.model_path)
+                engine = STSEngine(
+                    model_name=entry.model_path,
+                    config_model_type=entry.config_model_type,
+                )
             else:
                 # BatchedEngine with continuous batching (default)
                 engine = BatchedEngine(

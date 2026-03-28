@@ -33,19 +33,68 @@ from .base import BaseNonStreamingEngine
 logger = logging.getLogger(__name__)
 
 
-def _detect_sts_family(model_name: str) -> str:
-    """Detect STS model family from model name/path.
+# Maps config.json model_type / architecture values to STS engine families.
+# This is the authoritative source — name-based matching is only a fallback.
+_CONFIG_TYPE_TO_FAMILY: Dict[str, str] = {
+    # model_type values (from config.json or mlx-audio dir names)
+    "deepfilternet": "deepfilternet",
+    "mossformer2_se": "mossformer2",
+    "sam_audio": "sam_audio",
+    "lfm_audio": "lfm2",
+    "lfm2_audio": "lfm2",
+    "lfm2": "lfm2",
+    # architecture values
+    "DeepFilterNetModel": "deepfilternet",
+    "MossFormer2SEModel": "mossformer2",
+    "SAMAudio": "sam_audio",
+    "LFM2AudioModel": "lfm2",
+}
+
+
+def _detect_sts_family(model_name: str, config_model_type: str = "") -> str:
+    """Detect STS model family, preferring config.json over name guessing.
+
+    Args:
+        model_name: HuggingFace repo name or local path
+        config_model_type: Raw model_type from config.json (passed via EngineEntry)
 
     Returns one of: "deepfilternet", "mossformer2", "sam_audio", "lfm2", "generic"
     """
+    # 1) config.json model_type — most reliable signal
+    if config_model_type:
+        family = _CONFIG_TYPE_TO_FAMILY.get(config_model_type.lower())
+        if family:
+            return family
+
+    # 2) Try to read architectures from config.json on disk
+    config_path = os.path.join(model_name, "config.json")
+    if os.path.isfile(config_path):
+        try:
+            import json
+            with open(config_path) as f:
+                cfg = json.load(f)
+            for arch in cfg.get("architectures", []):
+                family = _CONFIG_TYPE_TO_FAMILY.get(arch)
+                if family:
+                    return family
+            mt = cfg.get("model_type", "")
+            family = _CONFIG_TYPE_TO_FAMILY.get(mt.lower())
+            if family:
+                return family
+        except (OSError, ValueError):
+            pass
+
+    # 3) Fallback: name-based heuristic (tightened patterns)
     name_lower = model_name.lower()
     if "deepfilter" in name_lower:
         return "deepfilternet"
     if "mossformer" in name_lower:
         return "mossformer2"
-    if "sam" in name_lower and "audio" in name_lower:
+    # Require "sam-audio" or "sam_audio" (not bare "sam")
+    if "sam-audio" in name_lower or "sam_audio" in name_lower:
         return "sam_audio"
-    if "lfm" in name_lower:
+    # Require "lfm2" or "lfm-audio" or "lfm_audio" (not bare "lfm")
+    if "lfm2" in name_lower or "lfm-audio" in name_lower or "lfm_audio" in name_lower:
         return "lfm2"
     return "generic"
 
@@ -212,17 +261,19 @@ class STSEngine(BaseNonStreamingEngine):
     - lfm2: multimodal speech-to-speech generation
     """
 
-    def __init__(self, model_name: str, **kwargs):
+    def __init__(self, model_name: str, config_model_type: str = "", **kwargs):
         """
         Initialize the STS engine.
 
         Args:
             model_name: HuggingFace model name or local path
+            config_model_type: Raw model_type from config.json (passed by
+                EnginePool for reliable family detection)
             **kwargs: Additional model-specific parameters
         """
         self._model_name = model_name
         self._model = None  # For lfm2, this is (model, processor) tuple
-        self._family = _detect_sts_family(model_name)
+        self._family = _detect_sts_family(model_name, config_model_type)
         self._kwargs = kwargs
 
     @property
