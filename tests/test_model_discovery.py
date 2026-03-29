@@ -862,8 +862,6 @@ class TestHfCacheDiscovery:
         (snapshot / "config.json").write_text(json.dumps({"model_type": model_type}))
         (snapshot / "model.safetensors").write_bytes(b"0" * 1000)
 
-    # --- _resolve_hf_cache_entry unit tests ---
-
     def test_resolve_valid_entry(self, tmp_path):
         """Valid HF cache entry resolves to snapshot path and model name."""
         entry = tmp_path / "models--mlx-community--Qwen3-8B-4bit"
@@ -916,8 +914,6 @@ class TestHfCacheDiscovery:
         result = _resolve_hf_cache_entry(entry)
         assert result is not None
         assert result[0] == snapshot
-
-    # --- discover_models integration tests ---
 
     def test_discover_hf_cache_model(self, tmp_path):
         """HF cache entries are discovered as models."""
