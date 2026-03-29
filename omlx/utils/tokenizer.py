@@ -12,6 +12,63 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def unwrap_tokenizer(tokenizer):
+    """Unwrap mlx-lm TokenizerWrapper to a HuggingFace PreTrainedTokenizer.
+
+    xgrammar accepts HuggingFace ``PreTrainedTokenizer`` /
+    ``PreTrainedTokenizerFast`` but NOT the raw ``tokenizers.Tokenizer``
+    nor the mlx-lm ``TokenizerWrapper``.  This helper peels exactly one
+    layer of mlx-lm wrapping while keeping the HuggingFace object intact.
+    """
+    try:
+        from transformers import PreTrainedTokenizerBase
+        if isinstance(tokenizer, PreTrainedTokenizerBase):
+            return tokenizer
+    except ImportError:
+        pass
+    if hasattr(tokenizer, '_tokenizer'):
+        inner = tokenizer._tokenizer
+        try:
+            from transformers import PreTrainedTokenizerBase
+            if isinstance(inner, PreTrainedTokenizerBase):
+                return inner
+        except ImportError:
+            pass
+        return inner
+    return tokenizer
+
+
+def resolve_vocab_size(model: Any) -> int | None:
+    """Extract vocab_size from a model's config/args, handling nested configs.
+
+    Tries ``model.config.vocab_size``, then ``model.args.vocab_size``,
+    then ``text_config.vocab_size`` for VLM composite models (e.g. Qwen3.5).
+
+    Args:
+        model: An MLX model object (LLM, VLM, or any object with config/args).
+
+    Returns:
+        The vocabulary size, or None if it cannot be determined.
+    """
+    if model is None:
+        return None
+    for attr in ('config', 'args'):
+        config = getattr(model, attr, None)
+        if config is None:
+            continue
+        vs = getattr(config, 'vocab_size', None)
+        if isinstance(vs, int):
+            return vs
+        text_cfg = getattr(config, 'text_config', None)
+        if isinstance(text_cfg, dict):
+            vs = text_cfg.get('vocab_size')
+        elif text_cfg is not None:
+            vs = getattr(text_cfg, 'vocab_size', None)
+        if isinstance(vs, int):
+            return vs
+    return None
+
+
 def is_harmony_model(model_name: str, config: dict[str, Any] | None = None) -> bool:
     """
     Check if the model uses Harmony format.

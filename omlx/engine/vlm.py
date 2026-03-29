@@ -40,7 +40,6 @@ from ..utils.image import (
 )
 from ..utils.tokenizer import get_tokenizer_config
 from .base import BaseEngine, GenerationOutput
-from .batched import _unwrap_tokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -194,44 +193,13 @@ class VLMBatchedEngine(BaseEngine):
             return None
         self._grammar_compiler_init_attempted = True
         try:
-            import xgrammar as xgr
+            from ..api.grammar import create_grammar_compiler
 
-            hf_tokenizer = _unwrap_tokenizer(self._tokenizer)
-
-            vocab_size = self._resolve_vocab_size()
-            kwargs = {}
-            if vocab_size is not None:
-                kwargs["vocab_size"] = vocab_size
-
-            tokenizer_info = xgr.TokenizerInfo.from_huggingface(hf_tokenizer, **kwargs)
-            self._grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+            self._grammar_compiler = create_grammar_compiler(self._tokenizer, self._vlm_model)
             logger.info("GrammarCompiler initialized for %s", self._model_name)
-        except ImportError:
-            logger.debug("xgrammar not installed; grammar features unavailable")
         except Exception as e:
             logger.warning("Failed to initialize GrammarCompiler: %s", e)
         return self._grammar_compiler
-
-    def _resolve_vocab_size(self) -> int | None:
-        """Extract vocab_size from model config/args, handling nested configs."""
-        model = self._vlm_model
-        if model is None:
-            return None
-        for attr in ('config', 'args'):
-            config = getattr(model, attr, None)
-            if config is None:
-                continue
-            vs = getattr(config, 'vocab_size', None)
-            if isinstance(vs, int):
-                return vs
-            text_cfg = getattr(config, 'text_config', None)
-            if isinstance(text_cfg, dict):
-                vs = text_cfg.get('vocab_size')
-            elif text_cfg is not None:
-                vs = getattr(text_cfg, 'vocab_size', None)
-            if isinstance(vs, int):
-                return vs
-        return None
 
     def _resolve_ocr_stop_token_ids(self) -> list[int]:
         """Convert OCR stop sequences to token IDs via the tokenizer.

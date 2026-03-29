@@ -33,6 +33,25 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def create_grammar_compiler(tokenizer, model):
+    """Create an xgrammar GrammarCompiler for the given tokenizer and model.
+
+    Returns None if vocab_size cannot be determined.
+    """
+    import xgrammar as xgr
+
+    from ..utils.tokenizer import resolve_vocab_size, unwrap_tokenizer
+
+    hf_tokenizer = unwrap_tokenizer(tokenizer)
+    vocab_size = resolve_vocab_size(model)
+    kwargs = {}
+    if vocab_size is not None:
+        kwargs["vocab_size"] = vocab_size
+
+    tokenizer_info = xgr.TokenizerInfo.from_huggingface(hf_tokenizer, **kwargs)
+    return xgr.GrammarCompiler(tokenizer_info)
+
+
 class GrammarConstraintProcessor:
     """Logits processor that enforces grammar constraints via xgrammar bitmask.
 

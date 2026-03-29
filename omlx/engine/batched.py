@@ -19,32 +19,6 @@ from .base import BaseEngine, GenerationOutput
 logger = logging.getLogger(__name__)
 
 
-def _unwrap_tokenizer(tokenizer):
-    """Unwrap mlx-lm TokenizerWrapper to a HuggingFace PreTrainedTokenizer.
-
-    xgrammar accepts HuggingFace ``PreTrainedTokenizer`` /
-    ``PreTrainedTokenizerFast`` but NOT the raw ``tokenizers.Tokenizer``
-    nor the mlx-lm ``TokenizerWrapper``.  This helper peels exactly one
-    layer of mlx-lm wrapping while keeping the HuggingFace object intact.
-    """
-    try:
-        from transformers import PreTrainedTokenizerBase
-        if isinstance(tokenizer, PreTrainedTokenizerBase):
-            return tokenizer
-    except ImportError:
-        pass
-    if hasattr(tokenizer, '_tokenizer'):
-        inner = tokenizer._tokenizer
-        try:
-            from transformers import PreTrainedTokenizerBase
-            if isinstance(inner, PreTrainedTokenizerBase):
-                return inner
-        except ImportError:
-            pass
-        return inner
-    return tokenizer
-
-
 # Optional Harmony adapter import
 try:
     from ..adapter.harmony import preprocess_harmony_messages
@@ -135,8 +109,7 @@ class BatchedEngine(BaseEngine):
     def grammar_compiler(self):
         """Lazily create and return a GrammarCompiler for this model.
 
-        Returns ``None`` when xgrammar is not installed or tokenizer
-        initialization fails.
+        Returns ``None`` when xgrammar is not installed or initialization fails.
         """
         if self._grammar_compiler is not None:
             return self._grammar_compiler
@@ -144,42 +117,13 @@ class BatchedEngine(BaseEngine):
             return None
         self._grammar_compiler_init_attempted = True
         try:
-            import xgrammar as xgr
+            from ..api.grammar import create_grammar_compiler
 
-            hf_tokenizer = _unwrap_tokenizer(self._tokenizer)
-
-            vocab_size = self._resolve_vocab_size()
-            kwargs = {}
-            if vocab_size is not None:
-                kwargs["vocab_size"] = vocab_size
-
-            tokenizer_info = xgr.TokenizerInfo.from_huggingface(hf_tokenizer, **kwargs)
-            self._grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+            self._grammar_compiler = create_grammar_compiler(self._tokenizer, self._model)
             logger.info("GrammarCompiler initialized for %s", self._model_name)
-        except ImportError:
-            logger.debug("xgrammar not installed; grammar features unavailable")
         except Exception as e:
             logger.warning("Failed to initialize GrammarCompiler: %s", e)
         return self._grammar_compiler
-
-    def _resolve_vocab_size(self) -> int | None:
-        """Extract vocab_size from model config/args, handling nested configs."""
-        for attr in ('config', 'args'):
-            config = getattr(self._model, attr, None)
-            if config is None:
-                continue
-            vs = getattr(config, 'vocab_size', None)
-            if isinstance(vs, int):
-                return vs
-            # Some models (e.g. Qwen3.5) nest vocab_size inside text_config
-            text_cfg = getattr(config, 'text_config', None)
-            if isinstance(text_cfg, dict):
-                vs = text_cfg.get('vocab_size')
-            elif text_cfg is not None:
-                vs = getattr(text_cfg, 'vocab_size', None)
-            if isinstance(vs, int):
-                return vs
-        return None
 
     def _preprocess_messages(
         self, messages: list[dict[str, Any]]

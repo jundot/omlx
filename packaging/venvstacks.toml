@@ -49,6 +49,8 @@ requirements = [
     # mlx-vlm from commit (7f7a04c) - aligned with pyproject.toml
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@7f7a04ce20337996da335ab17cdfee0ba51d6610",
     "Pillow>=9.0.0",
+    # Grammar-constrained decoding for structured output
+    "xgrammar>=0.1.32",
     # ModelScope SDK for downloading models from ModelScope Hub
     "modelscope>=1.10.0",
 ]

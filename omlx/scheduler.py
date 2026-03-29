@@ -1864,22 +1864,9 @@ class Scheduler:
 
     def _get_model_vocab_size(self) -> int | None:
         """Return vocab_size from model config, or None if unavailable."""
-        for attr in ('config', 'args'):
-            config = getattr(self.model, attr, None)
-            if config is None:
-                continue
-            vs = getattr(config, 'vocab_size', None)
-            if isinstance(vs, int):
-                return vs
-            # Some models (e.g. Qwen3.5) nest vocab_size inside text_config
-            text_cfg = getattr(config, 'text_config', None)
-            if isinstance(text_cfg, dict):
-                vs = text_cfg.get('vocab_size')
-            elif text_cfg is not None:
-                vs = getattr(text_cfg, 'vocab_size', None)
-            if isinstance(vs, int):
-                return vs
-        return None
+        from .utils.tokenizer import resolve_vocab_size
+
+        return resolve_vocab_size(self.model)
 
     def _resolve_think_end_token_ids(self) -> list[int] | None:
         """Resolve token ID(s) for the close-think tag.
