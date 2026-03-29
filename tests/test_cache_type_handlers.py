@@ -229,7 +229,10 @@ class TestKVCacheHandlerWithMLX:
         cache = handler.reconstruct_cache(state, meta_state)
 
         assert cache is not None
-        assert cache.offset == 100
+        # reconstruct_cache intentionally uses tensor shape for offset,
+        # not meta_state (meta_state offset can exceed tensor length
+        # after partial prefix match or walk-back truncation)
+        assert cache.offset == 32  # keys.shape[2]
 
 
 class TestRotatingKVCacheHandler:

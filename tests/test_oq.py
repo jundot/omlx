@@ -538,13 +538,13 @@ class TestStreamingHelpers:
         assert bits == 3
         assert mode == "affine"
 
-    def test_get_predicate_bits_8bit_mxfp8(self):
+    def test_get_predicate_bits_8bit(self):
         config = {"num_hidden_layers": 32}
         bits, gs, mode = _get_predicate_bits("model.layers.10.mlp.gate_proj.weight", config, 8, 64)
-        # oQ8 → base 8-bit → mxfp8
+        # oQ8 → base 8-bit, always affine mode to minimize kernel combos
         assert bits == 8
-        assert gs == 32
-        assert mode == "mxfp8"
+        assert gs == 64
+        assert mode == "affine"
 
     def test_build_quant_plan_respects_hard_cap(self):
         named_shapes = {

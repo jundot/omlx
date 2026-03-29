@@ -220,6 +220,8 @@ class ServerState:
     ms_downloader: Optional[object] = None  # MSDownloader
     process_memory_enforcer: Optional[object] = None  # ProcessMemoryEnforcer
     responses_store: ResponseStore = field(default_factory=ResponseStore)
+    oq_manager: Optional[object] = None  # OQManager
+    hf_uploader: Optional[object] = None  # HFUploader
 
 
 # Global server state instance

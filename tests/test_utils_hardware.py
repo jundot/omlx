@@ -108,8 +108,8 @@ class TestGetTotalMemoryBytes:
         """Test get_total_memory_bytes default fallback."""
         with patch("subprocess.run") as mock_run:
             mock_run.side_effect = Exception("sysctl failed")
-            # Also mock MLX to fail
-            with patch.dict("sys.modules", {"mlx.core": None}):
+            # Mock HAS_MLX to False so MLX fallback is skipped
+            with patch("omlx.utils.hardware.HAS_MLX", False):
                 result = get_total_memory_bytes()
                 assert result == DEFAULT_MEMORY_BYTES
 
