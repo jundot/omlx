@@ -412,10 +412,10 @@ def _is_routed_expert(path: str) -> bool:
 
 
 _MANDATORY_BOOST_PATTERNS = {
-    "lm_head": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
-    "embeddings": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
-    "embed_tokens": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
-    "wte": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+    "lm_head": {"bits": 8, "group_size": 64, "mode": "affine"},
+    "embeddings": {"bits": 8, "group_size": 64, "mode": "affine"},
+    "embed_tokens": {"bits": 8, "group_size": 64, "mode": "affine"},
+    "wte": {"bits": 8, "group_size": 64, "mode": "affine"},
 }
 
 
@@ -1091,16 +1091,12 @@ def _get_predicate_bits(tensor_name: str, config: dict, oq_level: int,
 
 
 def _mode_for_bits(bits: int) -> str:
-    """Select optimal quantization mode for a given bit width."""
-    if bits == 8:
-        return "mxfp8"
+    """Select quantization mode. Always affine to minimize kernel combos."""
     return "affine"
 
 
 def _gs_for_mode(bits: int, default_gs: int) -> int:
-    """Get required group_size for a mode."""
-    if bits == 8:
-        return 32
+    """Get group_size. Always default to minimize kernel combos."""
     return default_gs
 
 
