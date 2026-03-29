@@ -420,6 +420,68 @@ class TestMCPClientDisconnect:
         assert client._streamable_http_client is None
         assert client._http_client is None
 
+    @pytest.mark.asyncio
+    async def test_connect_failure_cleans_up_resources(self):
+        """Test that connect() cleans up partial resources on failure."""
+        config = MCPServerConfig(
+            name="cleanup-test",
+            transport=MCPTransport.STDIO,
+            command="python",
+        )
+        client = MCPClient(config)
+
+        mock_stdio = AsyncMock()
+
+        with (
+            patch.object(client, "_connect_stdio", new_callable=AsyncMock) as mock_connect,
+            patch.object(client, "_initialize_session", new_callable=AsyncMock) as mock_init,
+        ):
+            async def setup_partial_resources():
+                client._stdio_client = mock_stdio
+                client._session = AsyncMock()
+
+            mock_connect.side_effect = setup_partial_resources
+            mock_init.side_effect = RuntimeError("Init failed")
+
+            result = await client.connect()
+
+        assert result is False
+        assert client.state == MCPServerState.ERROR
+        # Partial resources should be cleaned up
+        assert client._session is None
+
+    @pytest.mark.asyncio
+    async def test_streamable_http_partial_connect_cleanup(self):
+        """Test streamable-http cleans up http_client on session failure."""
+        config = MCPServerConfig(
+            name="partial-cleanup",
+            transport=MCPTransport.STREAMABLE_HTTP,
+            url="http://localhost:3000/mcp",
+        )
+        client = MCPClient(config)
+
+        mock_http_client = AsyncMock()
+        mock_streamable = AsyncMock()
+
+        with (
+            patch("omlx.mcp.client.MCPClient._connect_streamable_http") as mock_connect,
+            patch.object(client, "_initialize_session", new_callable=AsyncMock) as mock_init,
+        ):
+            async def setup_and_fail():
+                client._http_client = mock_http_client
+                client._streamable_http_client = mock_streamable
+                client._session = AsyncMock()
+                raise RuntimeError("Connection failed midway")
+
+            mock_connect.side_effect = setup_and_fail
+
+            result = await client.connect()
+
+        assert result is False
+        # Resources should be cleaned up via _cleanup_resources
+        assert client._http_client is None
+        assert client._streamable_http_client is None
+
 
 class TestMCPClientCallTool:
     """Tests for MCPClient.call_tool()."""

@@ -59,7 +59,7 @@ class MCPServerConfig:
                 raise ValueError(f"MCP server '{self.name}': sse transport requires 'url'")
         elif self.transport == MCPTransport.STREAMABLE_HTTP:
             if not self.url:
-                raise ValueError(f"MCP server '{self.name}': streamable-http transport requires 'url''")
+                raise ValueError(f"MCP server '{self.name}': streamable-http transport requires 'url'")
 
 
 @dataclass

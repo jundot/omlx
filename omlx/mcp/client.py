@@ -122,6 +122,7 @@ class MCPClient:
                 self._state = MCPServerState.ERROR
                 self._error = str(e)
                 logger.error(f"Failed to connect to MCP server '{self.name}': {e}")
+                await self._cleanup_resources()
                 return False
 
     async def _connect_stdio(self):
@@ -144,9 +145,13 @@ class MCPClient:
         self._stdio_client = stdio_client(server_params)
         self._read, self._write = await self._stdio_client.__aenter__()
 
-        # Create session
-        self._session = ClientSession(self._read, self._write)
-        await self._session.__aenter__()
+        try:
+            self._session = ClientSession(self._read, self._write)
+            await self._session.__aenter__()
+        except Exception:
+            await self._stdio_client.__aexit__(None, None, None)
+            self._stdio_client = None
+            raise
 
     async def _connect_sse(self):
         """Connect via SSE transport."""
@@ -162,9 +167,13 @@ class MCPClient:
         self._sse_client = sse_client(self.config.url)
         self._read, self._write = await self._sse_client.__aenter__()
 
-        # Create session
-        self._session = ClientSession(self._read, self._write)
-        await self._session.__aenter__()
+        try:
+            self._session = ClientSession(self._read, self._write)
+            await self._session.__aenter__()
+        except Exception:
+            await self._sse_client.__aexit__(None, None, None)
+            self._sse_client = None
+            raise
 
     async def _connect_streamable_http(self):
         """Connect via streamable_http transport."""
@@ -177,21 +186,24 @@ class MCPClient:
                 "MCP SDK required for MCP support. Install with: pip install mcp"
             )
 
-        # Create streamable_http client context
-
         headers = self.config.headers or {}
         self._http_client = httpx.AsyncClient(headers=headers)
         await self._http_client.__aenter__()
 
-        self._streamable_http_client = streamable_http_client(
-            url=self.config.url, http_client=self._http_client
-        )
-
-        self._read, self._write, _ = await self._streamable_http_client.__aenter__()
-
-        # Create session
-        self._session = ClientSession(self._read, self._write)
-        await self._session.__aenter__()
+        try:
+            self._streamable_http_client = streamable_http_client(
+                url=self.config.url, http_client=self._http_client
+            )
+            self._read, self._write, _ = await self._streamable_http_client.__aenter__()
+            self._session = ClientSession(self._read, self._write)
+            await self._session.__aenter__()
+        except Exception:
+            if hasattr(self, '_streamable_http_client') and self._streamable_http_client:
+                await self._streamable_http_client.__aexit__(None, None, None)
+                self._streamable_http_client = None
+            await self._http_client.__aexit__(None, None, None)
+            self._http_client = None
+            raise
 
     async def _initialize_session(self):
         """Initialize the MCP session."""
@@ -229,6 +241,35 @@ class MCPClient:
             logger.warning(f"Failed to discover tools from '{self.name}': {e}")
             self._tools = []
 
+    async def _cleanup_resources(self):
+        """Clean up connection resources without acquiring lock."""
+        try:
+            if self._session:
+                await self._session.__aexit__(None, None, None)
+                self._session = None
+
+            if hasattr(self, '_stdio_client') and self._stdio_client:
+                await self._stdio_client.__aexit__(None, None, None)
+                self._stdio_client = None
+
+            if hasattr(self, '_sse_client') and self._sse_client:
+                await self._sse_client.__aexit__(None, None, None)
+                self._sse_client = None
+
+            if (
+                hasattr(self, "_streamable_http_client")
+                and self._streamable_http_client
+            ):
+                await self._streamable_http_client.__aexit__(None, None, None)
+                self._streamable_http_client = None
+
+            if hasattr(self, "_http_client") and self._http_client:
+                await self._http_client.__aexit__(None, None, None)
+                self._http_client = None
+
+        except Exception as e:
+            logger.warning(f"Error cleaning up resources for '{self.name}': {e}")
+
     async def disconnect(self):
         """Disconnect from the MCP server."""
         async with self._lock:
@@ -236,32 +277,7 @@ class MCPClient:
                 return
 
             try:
-                if self._session:
-                    await self._session.__aexit__(None, None, None)
-                    self._session = None
-
-                if hasattr(self, '_stdio_client') and self._stdio_client:
-                    await self._stdio_client.__aexit__(None, None, None)
-                    self._stdio_client = None
-
-                if hasattr(self, '_sse_client') and self._sse_client:
-                    await self._sse_client.__aexit__(None, None, None)
-                    self._sse_client = None
-
-                if (
-                    hasattr(self, "_streamable_http_client")
-                    and self._streamable_http_client
-                ):
-                    await self._streamable_http_client.__aexit__(None, None, None)
-                    self._streamable_http_client = None
-
-                if hasattr(self, "_http_client") and self._http_client:
-                    await self._http_client.__aexit__(None, None, None)
-                    self._http_client = None
-
-            except Exception as e:
-                logger.warning(f"Error disconnecting from '{self.name}': {e}")
-
+                await self._cleanup_resources()
             finally:
                 self._state = MCPServerState.DISCONNECTED
                 self._tools = []
