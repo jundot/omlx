@@ -24,15 +24,15 @@ class TestGetSamplingParams:
             self._state = state
             yield
 
-    def test_returns_8_tuple(self):
-        """Test that get_sampling_params returns an 8-tuple."""
+    def test_returns_10_tuple(self):
+        """Test that get_sampling_params returns a 10-tuple."""
         result = get_sampling_params(None, None)
         assert isinstance(result, tuple)
-        assert len(result) == 8
+        assert len(result) == 10
 
     def test_defaults(self):
         """Test default values with no request or model params."""
-        temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(None, None)
+        temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_prob, xtc_thresh = get_sampling_params(None, None)
         assert temp == 1.0
         assert top_p == 0.95
         assert top_k == 0
@@ -44,7 +44,7 @@ class TestGetSamplingParams:
 
     def test_request_overrides(self):
         """Test request params override global defaults."""
-        temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
+        temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_prob, xtc_thresh = get_sampling_params(
             0.5, 0.8, req_min_p=0.1, req_presence_penalty=0.5, req_frequency_penalty=0.3,
             req_max_tokens=1024,
         )
@@ -56,6 +56,28 @@ class TestGetSamplingParams:
         assert presence_penalty == 0.5
         assert frequency_penalty == 0.3
         assert max_tokens == 1024
+
+    def test_xtc_defaults_when_none(self):
+        """Test XTC params default when not specified."""
+        *_, xtc_prob, xtc_thresh = get_sampling_params(None, None)
+        assert xtc_prob == 0.0
+        assert xtc_thresh == 0.1
+
+    def test_xtc_request_passthrough(self):
+        """Test XTC params pass through from request values."""
+        *_, xtc_prob, xtc_thresh = get_sampling_params(
+            None, None, req_xtc_probability=0.5, req_xtc_threshold=0.1,
+        )
+        assert xtc_prob == 0.5
+        assert xtc_thresh == 0.1
+
+    def test_xtc_partial_override(self):
+        """Test setting only xtc_probability uses safe default threshold."""
+        *_, xtc_prob, xtc_thresh = get_sampling_params(
+            None, None, req_xtc_probability=0.3,
+        )
+        assert xtc_prob == 0.3
+        assert xtc_thresh == 0.1
 
     def test_model_settings_override(self):
         """Test model settings override global defaults."""
@@ -71,7 +93,7 @@ class TestGetSamplingParams:
             manager.set_settings("test-model", settings)
             self._state.settings_manager = manager
 
-            temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
+            temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_prob, xtc_thresh = get_sampling_params(
                 None, None, "test-model"
             )
             assert temp == 0.3
@@ -94,7 +116,7 @@ class TestGetSamplingParams:
             manager.set_settings("test-model", settings)
             self._state.settings_manager = manager
 
-            temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
+            temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_prob, xtc_thresh = get_sampling_params(
                 0.7, None, "test-model", req_min_p=0.1, req_max_tokens=4096,
             )
             assert temp == 0.7  # request wins
@@ -112,14 +134,14 @@ class TestGetSamplingParams:
             manager.set_settings("test-model", settings)
             self._state.settings_manager = manager
 
-            _, _, _, rep_penalty, _, _, _, _ = get_sampling_params(None, None, "test-model")
+            _, _, _, rep_penalty, _, _, _, _, _, _ = get_sampling_params(None, None, "test-model")
             assert rep_penalty == 1.5
 
     def test_global_repetition_penalty(self):
         """Test global repetition_penalty is used when no model override."""
         self._state.sampling = SamplingDefaults(repetition_penalty=1.3)
 
-        _, _, _, rep_penalty, _, _, _, _ = get_sampling_params(None, None)
+        _, _, _, rep_penalty, _, _, _, _, _, _ = get_sampling_params(None, None)
         assert rep_penalty == 1.3
 
     def test_force_sampling(self):
@@ -128,7 +150,7 @@ class TestGetSamplingParams:
             temperature=0.5, top_p=0.8, max_tokens=4096, force_sampling=True
         )
 
-        temp, top_p, _, _, _, _, _, max_tokens = get_sampling_params(
+        temp, top_p, _, _, _, _, _, max_tokens, _, _ = get_sampling_params(
             0.9, 0.99, req_max_tokens=8192
         )
         assert temp == 0.5  # forced, not request
@@ -146,7 +168,7 @@ class TestGetSamplingParams:
             manager.set_settings("test-model", settings)
             self._state.settings_manager = manager
 
-            _, _, _, _, _, _, _, max_tokens = get_sampling_params(
+            _, _, _, _, _, _, _, max_tokens, _, _ = get_sampling_params(
                 None, None, "test-model", req_max_tokens=1024
             )
             assert max_tokens == 8192  # model setting wins in force mode
@@ -163,7 +185,7 @@ class TestGetSamplingParams:
             self._state.settings_manager = manager
             self._state.sampling = SamplingDefaults(max_tokens=4096)
 
-            _, _, _, _, _, _, _, max_tokens = get_sampling_params(
+            _, _, _, _, _, _, _, max_tokens, _, _ = get_sampling_params(
                 None, None, "test-model"
             )
             assert max_tokens == 8192  # model setting, not global 4096

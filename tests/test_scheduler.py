@@ -703,6 +703,41 @@ class TestSchedulerStopTokens:
         assert mock_tokenizer.eos_token_id in stop_tokens
 
 
+class TestSchedulerXtcSpecialTokens:
+    """Tests for _get_xtc_special_tokens()."""
+
+    def test_includes_newline_and_eos(self, mock_model, mock_tokenizer):
+        """Test that XTC special tokens include newline encoding and EOS."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        tokens = scheduler._get_xtc_special_tokens()
+
+        # Should include tokens from encoding "\n"
+        newline_tokens = mock_tokenizer.encode("\n")
+        for t in newline_tokens:
+            assert t in tokens
+
+        # Should include eos_token_id (MockTokenizer has eos_token_id=2)
+        assert mock_tokenizer.eos_token_id in tokens
+
+    def test_includes_eos_token_ids_plural(self, mock_model, mock_tokenizer):
+        """Test that eos_token_ids (plural) is used when available."""
+        mock_tokenizer.eos_token_ids = [2, 100, 200]
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        tokens = scheduler._get_xtc_special_tokens()
+
+        for eos_id in [2, 100, 200]:
+            assert eos_id in tokens
+
+    def test_falls_back_to_singular_eos(self, mock_model, mock_tokenizer):
+        """Test fallback to eos_token_id when eos_token_ids is absent."""
+        # MockTokenizer has eos_token_id=2 but no eos_token_ids
+        assert not hasattr(mock_tokenizer, 'eos_token_ids')
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        tokens = scheduler._get_xtc_special_tokens()
+
+        assert 2 in tokens
+
+
 class TestSchedulerFormatBytes:
     """Tests for Scheduler._format_bytes()."""
 

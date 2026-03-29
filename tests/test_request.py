@@ -76,6 +76,8 @@ class TestSamplingParams:
         assert params.top_p == 0.9
         assert params.top_k == 0
         assert params.min_p == 0.0
+        assert params.xtc_probability == 0.0
+        assert params.xtc_threshold == 0.1
         assert params.repetition_penalty == 1.0
         assert params.presence_penalty == 0.0
         assert params.stop == []
@@ -91,6 +93,8 @@ class TestSamplingParams:
             top_p=0.95,
             top_k=40,
             min_p=0.05,
+            xtc_probability=0.5,
+            xtc_threshold=0.1,
             repetition_penalty=1.1,
             presence_penalty=0.5,
             stop=["###", "END"],
@@ -103,6 +107,8 @@ class TestSamplingParams:
         assert params.top_p == 0.95
         assert params.top_k == 40
         assert params.min_p == 0.05
+        assert params.xtc_probability == 0.5
+        assert params.xtc_threshold == 0.1
         assert params.repetition_penalty == 1.1
         assert params.presence_penalty == 0.5
         assert params.stop == ["###", "END"]

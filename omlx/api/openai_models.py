@@ -162,6 +162,8 @@ class ChatCompletionRequest(BaseModel):
     stream_options: Optional[StreamOptions] = None
     stop: Optional[List[str]] = None
     min_p: float | None = None
+    xtc_probability: float | None = None
+    xtc_threshold: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
     # Tool calling
@@ -250,6 +252,8 @@ class CompletionRequest(BaseModel):
     stream_options: Optional[StreamOptions] = None
     stop: Optional[List[str]] = None
     min_p: float | None = None
+    xtc_probability: float | None = None
+    xtc_threshold: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
 
