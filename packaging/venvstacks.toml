@@ -55,8 +55,8 @@ requirements = [
     "modelscope>=1.10.0",
     # python-multipart needed by audio routes (File/Form uploads)
     "python-multipart>=0.0.5",
-    # NOTE: mlx-audio is installed separately with --no-deps in build.py
-    # to avoid mlx-lm version conflict (mlx-audio pins mlx-lm==0.31.1)
+    # mlx-audio from commit (6408d2a) - aligned with pyproject.toml
+    "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@6408d2a410eb8c57464e07725b92271860199250",
 ]
 platforms = [
     "macosx_arm64",

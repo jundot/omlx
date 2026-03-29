@@ -74,7 +74,8 @@ modelscope = [
     "modelscope>=1.10.0",
 ]
 audio = [
-    "mlx-audio==0.4.1",
+    # mlx-audio from commit (6408d2a)
+    "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@6408d2a410eb8c57464e07725b92271860199250",
     "python-multipart>=0.0.5",
 ]
 dev = [
