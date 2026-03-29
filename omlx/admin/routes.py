@@ -2528,6 +2528,25 @@ def _build_runtime_cache_observability(
             block_sizes.add(block_size)
 
     payload["effective_block_sizes"] = sorted(block_sizes)
+
+    # Fallback: if no loaded models contributed stats, scan the cache
+    # directory directly so the dashboard still shows real disk usage.
+    if payload["total_num_files"] == 0 and cache_dir.exists():
+        try:
+            num_files = 0
+            total_bytes = 0
+            for subdir in "0123456789abcdef":
+                subdir_path = cache_dir / subdir
+                if not subdir_path.exists():
+                    continue
+                for f in subdir_path.glob("*.safetensors"):
+                    num_files += 1
+                    total_bytes += f.stat().st_size
+            payload["total_num_files"] = num_files
+            payload["total_size_bytes"] = total_bytes
+        except Exception as exc:
+            logger.warning("Failed to scan SSD cache directory: %s", exc)
+
     return payload
 
 
@@ -2686,37 +2705,67 @@ async def clear_alltime_stats(is_admin: bool = Depends(require_admin)):
 
 @router.post("/api/ssd-cache/clear")
 async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
-    """Clear all SSD cache files for all loaded models."""
-    engine_pool = _get_engine_pool()
-    if engine_pool is None:
-        return {"status": "ok", "total_deleted": 0}
+    """Clear all SSD cache files for all loaded models.
 
+    Uses loaded models' SSD cache managers when available.  Falls back to
+    direct filesystem deletion so caches can be wiped even when no model
+    is loaded.
+    """
     total_deleted = 0
-    for model_info in engine_pool.get_status().get("models", []):
-        model_id = model_info.get("id")
-        if not model_id or not model_info.get("loaded"):
-            continue
 
-        entry = engine_pool._entries.get(model_id)
-        if entry is None or entry.engine is None:
-            continue
+    # Phase 1: clear via loaded models' cache managers (updates in-memory index)
+    engine_pool = _get_engine_pool()
+    if engine_pool is not None:
+        for model_info in engine_pool.get_status().get("models", []):
+            model_id = model_info.get("id")
+            if not model_id or not model_info.get("loaded"):
+                continue
 
-        async_core = getattr(entry.engine, "_engine", None)
-        core = getattr(async_core, "engine", None) if async_core is not None else None
-        scheduler = getattr(core, "scheduler", None) if core is not None else None
+            entry = engine_pool._entries.get(model_id)
+            if entry is None or entry.engine is None:
+                continue
 
-        if scheduler is not None:
-            ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
-            if ssd_manager is not None:
-                try:
-                    deleted = ssd_manager.clear()
-                    total_deleted += deleted
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to clear SSD cache for model '%s': %s",
-                        model_id,
-                        exc,
-                    )
+            async_core = getattr(entry.engine, "_engine", None)
+            core = (
+                getattr(async_core, "engine", None) if async_core is not None else None
+            )
+            scheduler = (
+                getattr(core, "scheduler", None) if core is not None else None
+            )
+
+            if scheduler is not None:
+                ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+                if ssd_manager is not None:
+                    try:
+                        deleted = ssd_manager.clear()
+                        total_deleted += deleted
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to clear SSD cache for model '%s': %s",
+                            model_id,
+                            exc,
+                        )
+
+    # Phase 2: remove any remaining files on disk (covers unloaded models)
+    global_settings = _get_global_settings()
+    if global_settings is not None:
+        cache_dir = global_settings.cache.get_ssd_cache_dir(
+            global_settings.base_path,
+        )
+        if cache_dir.exists():
+            try:
+                for subdir in "0123456789abcdef":
+                    subdir_path = cache_dir / subdir
+                    if not subdir_path.exists():
+                        continue
+                    for f in subdir_path.glob("*.safetensors"):
+                        try:
+                            f.unlink()
+                            total_deleted += 1
+                        except OSError:
+                            pass
+            except Exception as exc:
+                logger.warning("Failed to clean SSD cache directory: %s", exc)
 
     return {"status": "ok", "total_deleted": total_deleted}
 
