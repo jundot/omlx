@@ -151,7 +151,14 @@ class TTSEngine(BaseNonStreamingEngine):
                 "verbose": False,
             }
             if voice is not None:
-                gen_kwargs["voice"] = voice
+                # VoiceDesign models expect voice description in 'instruct',
+                # not 'voice'. Detect by checking if generate() accepts 'instruct'.
+                import inspect
+                gen_params = inspect.signature(model.generate).parameters
+                if "instruct" in gen_params and voice != "default":
+                    gen_kwargs["instruct"] = voice
+                else:
+                    gen_kwargs["voice"] = voice
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             gen_kwargs.update(kwargs)
