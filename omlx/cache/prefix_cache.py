@@ -2043,7 +2043,7 @@ class BlockAwarePrefixCache(CacheManager):
 
             parent_hash = block_hash
             prefix_len += len(block_tokens)
-            self._prefix_index[block_hash] = (prefix_len, block_ids, i + 1)
+            self._prefix_index[block_hash] = (prefix_len, tuple(block_ids[: i + 1]), i + 1)
 
     def get_stats(self) -> PrefixCacheStats:
         """
