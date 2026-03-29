@@ -57,6 +57,8 @@
   "status.scope_alltime": "累計",
   "status.clear_alltime": "クリア",
   "status.clear_alltime_tooltip": "累計メトリクスをクリア",
+  "status.clear_ssd_cache_tooltip": "SSDキャッシュをすべて削除",
+  "status.clear_ssd_cache_confirm": "SSDキャッシュをすべて削除しますか？",
   "status.filter_all_models": "全モデル",
   "status.stat.total_tokens": "プリフィルトークン合計",
   "status.stat.cached_tokens": "キャッシュトークン数",

@@ -57,6 +57,8 @@
   "status.scope_alltime": "累计",
   "status.clear_alltime": "清除",
   "status.clear_alltime_tooltip": "清除累计指标",
+  "status.clear_ssd_cache_tooltip": "删除所有SSD缓存",
+  "status.clear_ssd_cache_confirm": "确定删除所有SSD缓存吗？",
   "status.filter_all_models": "所有模型",
   "status.stat.total_tokens": "预填充 Token 总数",
   "status.stat.cached_tokens": "缓存 Token 数",

@@ -2684,6 +2684,43 @@ async def clear_alltime_stats(is_admin: bool = Depends(require_admin)):
     return {"status": "ok"}
 
 
+@router.post("/api/ssd-cache/clear")
+async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
+    """Clear all SSD cache files for all loaded models."""
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        return {"status": "ok", "total_deleted": 0}
+
+    total_deleted = 0
+    for model_info in engine_pool.get_status().get("models", []):
+        model_id = model_info.get("id")
+        if not model_id or not model_info.get("loaded"):
+            continue
+
+        entry = engine_pool._entries.get(model_id)
+        if entry is None or entry.engine is None:
+            continue
+
+        async_core = getattr(entry.engine, "_engine", None)
+        core = getattr(async_core, "engine", None) if async_core is not None else None
+        scheduler = getattr(core, "scheduler", None) if core is not None else None
+
+        if scheduler is not None:
+            ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+            if ssd_manager is not None:
+                try:
+                    deleted = ssd_manager.clear()
+                    total_deleted += deleted
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to clear SSD cache for model '%s': %s",
+                        model_id,
+                        exc,
+                    )
+
+    return {"status": "ok", "total_deleted": total_deleted}
+
+
 # =============================================================================
 # HuggingFace Downloader API Routes
 # =============================================================================

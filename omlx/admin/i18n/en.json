@@ -57,6 +57,8 @@
   "status.scope_alltime": "All-Time",
   "status.clear_alltime": "Clear",
   "status.clear_alltime_tooltip": "Clear all-time metrics",
+  "status.clear_ssd_cache_tooltip": "Delete all SSD cache",
+  "status.clear_ssd_cache_confirm": "Delete all SSD cache?",
   "status.filter_all_models": "All Models",
   "status.stat.total_tokens": "Total Prefill Tokens",
   "status.stat.cached_tokens": "Cached Tokens",

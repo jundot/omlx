@@ -141,6 +141,7 @@
             selectedStatsModel: '',
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
+            showClearSsdCacheConfirm: false,
             _statsRefreshTimer: null,
 
             // Log viewer state
@@ -1244,6 +1245,17 @@
                 } catch (err) {
                     console.error('Failed to clear all-time stats:', err);
                     this.showClearAlltimeConfirm = false;
+                }
+            },
+
+            async clearSsdCache() {
+                try {
+                    await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
+                    this.showClearSsdCacheConfirm = false;
+                    await this.loadStats();
+                } catch (err) {
+                    console.error('Failed to clear SSD cache:', err);
+                    this.showClearSsdCacheConfirm = false;
                 }
             },
 

@@ -240,8 +240,29 @@
                                 <i data-lucide="database" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Runtime Cache Observability</span>
                             </div>
-                            <div class="text-xs text-neutral-500"
-                                 x-text="formatNumber((stats.runtime_cache?.total_num_files || 0)) + ' files · ' + formatSizeBytes((stats.runtime_cache?.total_size_bytes || 0))"></div>
+                            <div class="flex items-center gap-2">
+                                <span class="text-xs text-neutral-500"
+                                      x-text="formatNumber((stats.runtime_cache?.total_num_files || 0)) + ' files · ' + formatSizeBytes((stats.runtime_cache?.total_size_bytes || 0))"></span>
+                                <div class="flex items-center gap-1.5">
+                                    <button x-show="!showClearSsdCacheConfirm && (stats.runtime_cache?.total_num_files || 0) > 0"
+                                            @click="showClearSsdCacheConfirm = true"
+                                            class="p-1 text-neutral-400 hover:text-red-500 hover:bg-neutral-200 rounded-lg transition-all"
+                                            :title="window.t('status.clear_ssd_cache_tooltip')">
+                                        <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                    </button>
+                                    <div x-show="showClearSsdCacheConfirm" x-cloak class="flex items-center gap-1.5">
+                                        <span class="text-xs text-red-600" x-text="window.t('status.clear_ssd_cache_confirm')"></span>
+                                        <button @click="clearSsdCache()"
+                                                class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                            {{ t('status.clear_yes') }}
+                                        </button>
+                                        <button @click="showClearSsdCacheConfirm = false"
+                                                class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                            {{ t('status.clear_cancel') }}
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
                         <div class="px-6 py-4 space-y-3">
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
