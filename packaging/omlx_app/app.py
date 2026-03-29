@@ -562,25 +562,7 @@ class OMLXAppDelegate(NSObject):
         # All three items are always present; setHidden_ controls visibility so
         # _refresh_menu_in_place() can toggle them without replacing the NSMenu.
 
-        # Stop Server — visible when RUNNING / STARTING / UNRESPONSIVE
-        stop_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Stop Server", "stopServer:", ""
-        )
-        stop_item.setTarget_(self)
-        stop_icon = self._create_menu_icon("stop.circle")
-        if stop_icon:
-            stop_item.setImage_(stop_icon)
-        stop_item.setHidden_(
-            status not in (
-                ServerStatus.RUNNING,
-                ServerStatus.STARTING,
-                ServerStatus.UNRESPONSIVE,
-            )
-        )
-        self.menu.addItem_(stop_item)
-        self._stop_item = stop_item
-
-        # Force Restart — visible when UNRESPONSIVE / ERROR
+        # Force Restart — visible when UNRESPONSIVE / ERROR (most important, shown first)
         restart_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Force Restart", "forceRestart:", ""
         )
@@ -593,6 +575,25 @@ class OMLXAppDelegate(NSObject):
         )
         self.menu.addItem_(restart_item)
         self._restart_item = restart_item
+
+        # Stop Server — visible when RUNNING / STARTING / STOPPING / UNRESPONSIVE
+        stop_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Stop Server", "stopServer:", ""
+        )
+        stop_item.setTarget_(self)
+        stop_icon = self._create_menu_icon("stop.circle")
+        if stop_icon:
+            stop_item.setImage_(stop_icon)
+        stop_item.setHidden_(
+            status not in (
+                ServerStatus.RUNNING,
+                ServerStatus.STARTING,
+                ServerStatus.STOPPING,
+                ServerStatus.UNRESPONSIVE,
+            )
+        )
+        self.menu.addItem_(stop_item)
+        self._stop_item = stop_item
 
         # Start Server — visible when STOPPED
         start_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -790,6 +791,7 @@ class OMLXAppDelegate(NSObject):
                 status not in (
                     ServerStatus.RUNNING,
                     ServerStatus.STARTING,
+                    ServerStatus.STOPPING,
                     ServerStatus.UNRESPONSIVE,
                 )
             )
@@ -800,11 +802,17 @@ class OMLXAppDelegate(NSObject):
         if self._start_item:
             self._start_item.setHidden_(status != ServerStatus.STOPPED)
 
-        # Toggle Admin Panel / Chat enabled state
+        # Toggle Admin Panel / Chat enabled state and keep icon template in sync
         if self._admin_panel_item:
             self._admin_panel_item.setEnabled_(is_running)
+            icon = self._admin_panel_item.image()
+            if icon:
+                icon.setTemplate_(True)
         if self._chat_item:
             self._chat_item.setEnabled_(is_running)
+            icon = self._chat_item.image()
+            if icon:
+                icon.setTemplate_(True)
 
     # --- NSMenuDelegate ---
 
@@ -899,14 +907,16 @@ class OMLXAppDelegate(NSObject):
         prev_status = self.server_manager.status
 
         if self.server_manager.status == ServerStatus.RUNNING:
-            # Refresh stats periodically
+            # Refresh stats periodically — skip blocking HTTP when menu is open
             now = time.time()
             if now - self._last_stats_fetch >= 5:
-                self._fetch_stats()
-                self._last_stats_fetch = now
                 if self._menu_is_open:
+                    # Menu is tracking on main thread; avoid sync HTTP (up to 6s).
+                    # In-place refresh only; fetch will run after menu closes.
                     self._refresh_menu_in_place()
                 else:
+                    self._fetch_stats()
+                    self._last_stats_fetch = now
                     self._build_menu()
 
         elif self.server_manager.status in (
