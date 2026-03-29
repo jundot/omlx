@@ -374,11 +374,6 @@ def extract_text_content(
             # Unknown format, try to convert
             processed_messages.append({"role": role, "content": str(content), **_extra})
 
-    # Final safety check: ensure all content is string type
-    for msg in processed_messages:
-        if not isinstance(msg.get("content"), str):
-            msg["content"] = str(msg.get("content", ""))
-
     return _merge_consecutive_roles(
         _consolidate_system_messages(processed_messages)
     )
@@ -717,15 +712,7 @@ def extract_harmony_messages(
             processed_messages.append({"role": role, "content": content})
         elif isinstance(content, list):
             # Extract text parts from content array
-            text_parts = []
-            for item in content:
-                if hasattr(item, 'model_dump'):
-                    item = item.model_dump()
-                elif hasattr(item, 'dict'):
-                    item = item.dict()
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text_parts.append(item.get("text", ""))
-            processed_messages.append({"role": role, "content": "\n".join(text_parts)})
+            processed_messages.append({"role": role, "content": _extract_text_from_content_list(content)})
         else:
             processed_messages.append({"role": role, "content": str(content)})
 

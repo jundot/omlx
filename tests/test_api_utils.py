@@ -1146,6 +1146,23 @@ class TestExtractHarmonyMessages:
         assert len(result[0]["tool_calls"]) == 1
         assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
 
+    def test_tool_message_with_content_part_list(self):
+        """Test that tool messages with ContentPart list content are extracted properly."""
+        messages = [
+            Message(
+                role="tool",
+                content=[ContentPart(type="text", text='{"result": "success"}')],
+                tool_call_id="call_123",
+            )
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert result[0]["role"] == "tool"
+        assert result[0]["tool_call_id"] == "call_123"
+        # Harmony parses JSON content via _try_parse_json for |tojson compatibility
+        assert not isinstance(result[0]["content"], list)
+
     def test_json_arguments_parsed(self):
         """Test that JSON arguments are parsed to dict."""
         messages = [
@@ -1449,6 +1466,24 @@ class TestMergeConsecutiveRoles:
 
 class TestExtractMultimodalContent:
     """Tests for extract_multimodal_content normalization."""
+
+    def test_tool_message_with_content_part_list(self):
+        """Test that tool messages with ContentPart list content are converted to string."""
+        messages = [
+            Message(
+                role="tool",
+                content=[ContentPart(type="text", text='{"result": "success"}')],
+                tool_call_id="call_123",
+            )
+        ]
+
+        result = extract_multimodal_content(messages)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"  # Converted to user (no has_tool_calling)
+        assert "call_123" in result[0]["content"]
+        assert "success" in result[0]["content"]
+        assert isinstance(result[0]["content"], str)
 
     def test_converts_input_text_and_input_image(self):
         """Responses-style input_text/input_image should normalize for VLM."""
