@@ -31,7 +31,7 @@ from AppKit import (
     NSStatusBar,
     NSVariableStatusItemLength,
 )
-from Foundation import NSData, NSObject, NSRunLoop, NSDefaultRunLoopMode, NSRunLoopCommonModes, NSTimer
+from Foundation import NSData, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
 
 from .config import ServerConfig
 from .server_manager import PortConflict, ServerManager, ServerStatus
@@ -401,7 +401,8 @@ class OMLXAppDelegate(NSObject):
     def updateProgressOnMain_(self, message):
         """Main thread: rebuild menu to show download progress."""
         self._update_progress_text = message
-        self._build_menu()
+        if not self._menu_is_open:
+            self._build_menu()
 
     def _on_update_error(self, message: str):
         """Called from background thread on failure."""
@@ -413,7 +414,8 @@ class OMLXAppDelegate(NSObject):
         """Main thread: show error and offer browser fallback."""
         self._updater = None
         self._update_progress_text = ""
-        self._build_menu()
+        if not self._menu_is_open:
+            self._build_menu()
 
         from AppKit import NSAlert, NSAlertFirstButtonReturn
 
@@ -438,7 +440,8 @@ class OMLXAppDelegate(NSObject):
         """Main thread: download complete, auto-install and relaunch."""
         self._updater = None
         self._update_progress_text = "Installing update..."
-        self._build_menu()
+        if not self._menu_is_open:
+            self._build_menu()
         self._perform_update_and_relaunch()
 
     def _perform_update_and_relaunch(self):
@@ -493,6 +496,23 @@ class OMLXAppDelegate(NSObject):
             logger.debug(f"Failed to load SF Symbol {sf_symbol}: {e}")
         return None
 
+    def _get_status_display(self):
+        """Return (text, color) for the current server status header."""
+        status = self.server_manager.status
+        if status == ServerStatus.RUNNING:
+            return "● oMLX Server is running", NSColor.systemGreenColor()
+        elif status == ServerStatus.STARTING:
+            return "● oMLX Server is starting...", NSColor.systemOrangeColor()
+        elif status == ServerStatus.STOPPING:
+            return "● oMLX Server is stopping...", NSColor.systemOrangeColor()
+        elif status == ServerStatus.UNRESPONSIVE:
+            return "● oMLX Server is not responding", NSColor.systemOrangeColor()
+        elif status == ServerStatus.ERROR:
+            err = self.server_manager.error_message or "Unknown error"
+            return f"● {err}", NSColor.systemRedColor()
+        else:
+            return "● oMLX Server is stopped", NSColor.secondaryLabelColor()
+
     def _build_menu(self):
         """Build the status bar menu (Docker Desktop style with icons)."""
         self.menu = NSMenu.alloc().init()
@@ -501,22 +521,7 @@ class OMLXAppDelegate(NSObject):
         is_running = status == ServerStatus.RUNNING
 
         # --- Status Header (colored dot + text) ---
-        if status == ServerStatus.RUNNING:
-            status_text = "● oMLX Server is running"
-            status_color = NSColor.systemGreenColor()
-        elif status == ServerStatus.STARTING:
-            status_text = "● oMLX Server is starting..."
-            status_color = NSColor.systemOrangeColor()
-        elif status == ServerStatus.UNRESPONSIVE:
-            status_text = "● oMLX Server is not responding"
-            status_color = NSColor.systemOrangeColor()
-        elif status == ServerStatus.ERROR:
-            error_detail = self.server_manager.error_message or "Unknown error"
-            status_text = f"● {error_detail}"
-            status_color = NSColor.systemRedColor()
-        else:
-            status_text = "● oMLX Server is stopped"
-            status_color = NSColor.secondaryLabelColor()
+        status_text, status_color = self._get_status_display()
 
         attributed_status = NSAttributedString.alloc().initWithString_attributes_(
             status_text, {NSForegroundColorAttributeName: status_color}
@@ -767,17 +772,7 @@ class OMLXAppDelegate(NSObject):
         is_running = status == ServerStatus.RUNNING
 
         # Update status header color and text
-        if status == ServerStatus.RUNNING:
-            text, color = "● oMLX Server is running", NSColor.systemGreenColor()
-        elif status == ServerStatus.STARTING:
-            text, color = "● oMLX Server is starting...", NSColor.systemOrangeColor()
-        elif status == ServerStatus.UNRESPONSIVE:
-            text, color = "● oMLX Server is not responding", NSColor.systemOrangeColor()
-        elif status == ServerStatus.ERROR:
-            err = self.server_manager.error_message or "Unknown error"
-            text, color = f"● {err}", NSColor.systemRedColor()
-        else:
-            text, color = "● oMLX Server is stopped", NSColor.secondaryLabelColor()
+        text, color = self._get_status_display()
 
         self._status_header_item.setAttributedTitle_(
             NSAttributedString.alloc().initWithString_attributes_(
