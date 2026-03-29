@@ -1450,7 +1450,7 @@ async def update_model_settings(
                     )
         current_settings.model_alias = alias_value
     if "model_type_override" in sent:
-        valid_types = {"llm", "vlm", "embedding", "reranker"}
+        valid_types = {"llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"}
         # Treat empty string as None (auto-detect)
         override_value = request.model_type_override or None
         if override_value is not None and override_value not in valid_types:
@@ -1465,6 +1465,9 @@ async def update_model_settings(
             "vlm": "vlm",
             "embedding": "embedding",
             "reranker": "reranker",
+            "audio_stt": "audio_stt",
+            "audio_tts": "audio_tts",
+            "audio_sts": "audio_sts",
         }
         if override_value:
             entry.model_type = override_value
@@ -2273,6 +2276,7 @@ def _get_engine_info() -> dict:
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
         "mlx-vlm": "https://github.com/Blaizzy/mlx-vlm",
         "mlx-embeddings": "https://github.com/Blaizzy/mlx-embeddings",
+        "mlx-audio": "https://github.com/Blaizzy/mlx-audio",
     }
 
     fallback_commits = _load_fallback_commits(packages)

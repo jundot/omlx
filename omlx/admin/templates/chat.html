@@ -1033,7 +1033,16 @@
                     }
 
                     const modelsData = await modelsResponse.json();
-                    this.availableModels = modelsData.data || [];
+                    const allModels = modelsData.data || [];
+
+                    // Fetch model types first (needed for filtering and VLM detection)
+                    await this.fetchModelTypes();
+
+                    // Filter out audio/embedding/reranker — chat only works with LLM/VLM
+                    this.availableModels = allModels.filter(m => {
+                        const t = (this.modelTypeMap[m.id] || '').toLowerCase();
+                        return !t.startsWith('audio_') && t !== 'embedding' && t !== 'reranker';
+                    });
 
                     // Get default model from health endpoint
                     let defaultModel = null;
@@ -1050,8 +1059,6 @@
                             this.currentModel = this.availableModels[0].id;
                         }
                     }
-                    // Fetch model types for VLM detection
-                    await this.fetchModelTypes();
                 } catch (error) {
                     console.error('Error loading models:', error);
                 }

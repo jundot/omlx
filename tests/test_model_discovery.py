@@ -751,34 +751,34 @@ class TestDiscoverModelsFromDirs:
 
 
 class TestUnsupportedModels:
-    """Tests for unsupported model detection (TTS, ASR, etc.)."""
+    """Tests for _is_unsupported_model() — audio models are now supported."""
 
-    def test_whisper_detected_by_architecture(self, tmp_path):
-        """Whisper model detected as unsupported via architecture."""
+    def test_whisper_not_unsupported(self, tmp_path):
+        """Whisper is now an audio_stt model, not unsupported."""
         config = {
             "model_type": "whisper",
             "architectures": ["WhisperForConditionalGeneration"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
-        assert _is_unsupported_model(tmp_path) is True
+        assert _is_unsupported_model(tmp_path) is False
 
-    def test_whisper_detected_by_model_type(self, tmp_path):
-        """Whisper model detected as unsupported via model_type alone."""
+    def test_whisper_model_type_not_unsupported(self, tmp_path):
+        """Whisper by model_type alone is not unsupported."""
         config = {
             "model_type": "whisper",
             "architectures": ["SomeCustomWhisperArch"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
-        assert _is_unsupported_model(tmp_path) is True
+        assert _is_unsupported_model(tmp_path) is False
 
-    def test_tts_detected_by_model_type(self, tmp_path):
-        """TTS model detected as unsupported via model_type."""
+    def test_tts_not_unsupported(self, tmp_path):
+        """qwen3_tts is now an audio_tts model, not unsupported."""
         config = {
             "model_type": "qwen3_tts",
             "architectures": ["Qwen3TTSForConditionalGeneration"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
-        assert _is_unsupported_model(tmp_path) is True
+        assert _is_unsupported_model(tmp_path) is False
 
     def test_multimodal_with_audio_not_unsupported(self, tmp_path):
         """Multimodal model with nested audio_config is NOT unsupported."""
@@ -801,8 +801,8 @@ class TestUnsupportedModels:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert _is_unsupported_model(tmp_path) is False
 
-    def test_unsupported_model_skipped_in_discovery(self, tmp_path):
-        """Unsupported models are skipped during discover_models()."""
+    def test_audio_models_included_in_discovery(self, tmp_path):
+        """Audio models are now discovered (not skipped) with correct types."""
         # Create a normal LLM model
         llm_dir = tmp_path / "llama-3b"
         llm_dir.mkdir()
@@ -833,7 +833,9 @@ class TestUnsupportedModels:
         (tts_dir / "model.safetensors").write_bytes(b"0" * 1500)
 
         models = discover_models(tmp_path)
-        assert len(models) == 1
+        assert len(models) == 3
         assert "llama-3b" in models
-        assert "whisper-large-v3" not in models
-        assert "Qwen3-TTS" not in models
+        assert "whisper-large-v3" in models
+        assert models["whisper-large-v3"].model_type == "audio_stt"
+        assert "Qwen3-TTS" in models
+        assert models["Qwen3-TTS"].model_type == "audio_tts"

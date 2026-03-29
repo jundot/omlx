@@ -10,6 +10,8 @@ Supports:
 - VLM models: Use VLMBatchedEngine for vision-language model inference
 - Embedding models: Use EmbeddingEngine for batch embedding generation
 - Reranker models: Use RerankerEngine for document reranking
+- Audio STT models: Use STTEngine for speech-to-text (Whisper, Qwen3-ASR, ...)
+- Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
 """
 
 import json
@@ -20,8 +22,8 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker"]
+ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -136,16 +138,106 @@ UNSUPPORTED_RERANKER_ARCHITECTURES = {
 RERANKER_ARCHITECTURES = SUPPORTED_RERANKER_ARCHITECTURES | UNSUPPORTED_RERANKER_ARCHITECTURES
 
 # Unsupported model types — detected and skipped during discovery.
-# These models require audio endpoints (/v1/audio/*) that oMLX doesn't implement.
 # Only top-level config fields are checked; nested audio_config/tts_config in
 # multimodal models (e.g., MiniCPM-o) won't trigger this.
-UNSUPPORTED_MODEL_TYPES = {
-    "whisper",
-    "qwen3_tts",
+# Note: "whisper" and "qwen3_tts" were previously listed here but are now
+# handled as audio types (audio_stt / audio_tts) — see AUDIO_* sets below.
+UNSUPPORTED_MODEL_TYPES: set[str] = set()
+
+UNSUPPORTED_ARCHITECTURES: set[str] = set()
+
+# ---------------------------------------------------------------------------
+# Audio model detection — dynamically loaded from mlx-audio when available
+# ---------------------------------------------------------------------------
+#
+# mlx-audio maintains MODEL_REMAPPING dicts (model_type → module directory)
+# and model directories under mlx_audio/{stt,tts,sts}/models/. We read these
+# at import time so oMLX automatically recognises new audio model families
+# when mlx-audio is updated.  Falls back to static sets when mlx-audio is
+# not installed.
+#
+# Some base LLM model_types (qwen3, llama, …) collide with mlx-audio TTS
+# model directory names because mlx-audio extends these architectures for
+# audio.  We exclude them so a plain Qwen3 LLM is not misdetected as TTS.
+
+_LLM_TYPE_COLLISIONS = {"qwen3", "llama", "dense"}
+
+
+def _build_audio_detection_sets():
+    """Build STT/TTS/STS model-type sets from mlx-audio at import time.
+
+    Returns (stt_types, tts_types, sts_types) where each is a set of
+    model_type strings that should trigger audio detection.
+    """
+    try:
+        from pathlib import Path as _P
+
+        import mlx_audio as _mla
+
+        _base = _P(_mla.__file__).parent
+
+        def _dir_names(subdir: str) -> set:
+            d = _base / subdir / "models"
+            if d.is_dir():
+                return {p.name for p in d.iterdir()
+                        if p.is_dir() and not p.name.startswith("__")}
+            return set()
+
+        # TTS: MODEL_REMAPPING keys + model dir names
+        from mlx_audio.tts.utils import MODEL_REMAPPING as _tts_remap
+        tts = set(_tts_remap.keys()) | _dir_names("tts")
+
+        # STT: MODEL_REMAPPING keys + model dir names
+        from mlx_audio.stt.utils import MODEL_REMAPPING as _stt_remap
+        stt = set(_stt_remap.keys()) | _dir_names("stt")
+
+        # STS: model dir names only (no unified utils/remapping)
+        sts = _dir_names("sts")
+
+        # Strip base-LLM names that collide with audio model dirs
+        tts -= _LLM_TYPE_COLLISIONS
+        stt -= _LLM_TYPE_COLLISIONS
+
+        logger.debug(
+            "Audio detection sets loaded from mlx-audio: "
+            "STT=%d, TTS=%d, STS=%d", len(stt), len(tts), len(sts),
+        )
+        return stt, tts, sts
+
+    except ImportError:
+        logger.debug("mlx-audio not installed — using static audio detection sets")
+        # Static fallback so model discovery still works without mlx-audio
+        _stt = {"whisper", "qwen3_asr", "parakeet"}
+        _tts = {"qwen3_tts", "kokoro", "chatterbox"}
+        _sts = {"deepfilternet", "mossformer2_se", "sam_audio", "lfm_audio"}
+        return _stt, _tts, _sts
+
+
+AUDIO_STT_MODEL_TYPES, AUDIO_TTS_MODEL_TYPES, AUDIO_STS_MODEL_TYPES = (
+    _build_audio_detection_sets()
+)
+
+# Architecture-based detection — these are checked before model_type and
+# are always static because architecture strings are stable identifiers.
+AUDIO_STT_ARCHITECTURES = {
+    "WhisperForConditionalGeneration",
+    "Qwen3ASRForConditionalGeneration",
+    "ParakeetForCTC",
 }
 
-UNSUPPORTED_ARCHITECTURES = {
-    "WhisperForConditionalGeneration",
+AUDIO_TTS_ARCHITECTURES = {
+    "KokoroForConditionalGeneration",
+    "Qwen3TTSForConditionalGeneration",
+    "ChatterboxForConditionalGeneration",
+    "VibeVoiceForConditionalGeneration",
+    "VibeVoiceStreamingForConditionalGenerationInference",
+}
+
+AUDIO_STS_ARCHITECTURES = {
+    "DeepFilterNetModel",
+    "MossFormer2SEModel",
+    "SAMAudio",
+    "LFM2AudioModel",
 }
 
 
@@ -163,7 +255,11 @@ class DiscoveredModel:
 
 def _is_unsupported_model(model_path: Path) -> bool:
     """
-    Check if model is an unsupported type (TTS, ASR, etc.).
+    Check if model is an unsupported type that should be skipped during discovery.
+
+    Audio models (STT/TTS) are NOT unsupported — they are detected as
+    "audio_stt" or "audio_tts" by detect_model_type() and served via
+    their own engine types.
 
     Only checks top-level config fields. Multimodal models with nested
     audio_config/tts_config (e.g., MiniCPM-o) are not affected.
@@ -228,7 +324,7 @@ def detect_model_type(model_path: Path) -> ModelType:
         model_path: Path to model directory
 
     Returns:
-        Model type: "llm", "vlm", "embedding", or "reranker"
+        Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", or "audio_sts"
     """
     config_path = model_path / "config.json"
     if not config_path.exists():
@@ -309,6 +405,34 @@ def detect_model_type(model_path: Path) -> ModelType:
     if "vision_config" in config:
         return "vlm"
 
+    # Check for audio models — architectures take priority over model_type.
+    # Only top-level architectures/model_type are inspected; nested audio_config
+    # inside multimodal models (e.g., MiniCPM-o) does not trigger this path.
+    #
+    # Architecture check first (unambiguous):
+    for arch in architectures:
+        if arch in AUDIO_STT_ARCHITECTURES:
+            return "audio_stt"
+    for arch in architectures:
+        if arch in AUDIO_TTS_ARCHITECTURES:
+            return "audio_tts"
+    for arch in architectures:
+        if arch in AUDIO_STS_ARCHITECTURES:
+            return "audio_sts"
+
+    # model_type check (dynamically loaded from mlx-audio when available).
+    # Check TTS before STT because some model_type values (e.g. "vibevoice")
+    # appear in both sets — TTS is the more common category for these.
+    if normalized_type in AUDIO_TTS_MODEL_TYPES or model_type in AUDIO_TTS_MODEL_TYPES:
+        return "audio_tts"
+    if normalized_type in AUDIO_STT_MODEL_TYPES or model_type in AUDIO_STT_MODEL_TYPES:
+        return "audio_stt"
+    if normalized_type in AUDIO_STS_MODEL_TYPES or model_type in AUDIO_STS_MODEL_TYPES:
+        return "audio_sts"
+    # LFM2 audio: model_type starts with "lfm" and is not an embedding
+    if normalized_type.startswith("lfm") and normalized_type not in EMBEDDING_MODEL_TYPES:
+        return "audio_sts"
+
     return "llm"
 
 
@@ -372,10 +496,7 @@ def _register_model(
     """Try to register a single model directory into the models dict."""
     try:
         if _is_unsupported_model(model_dir):
-            logger.info(
-                f"Skipping unsupported model: {model_id} "
-                "(TTS/ASR models require audio endpoints not implemented in oMLX)"
-            )
+            logger.info(f"Skipping unsupported model: {model_id}")
             return
 
         model_type = detect_model_type(model_dir)
@@ -385,6 +506,12 @@ def _register_model(
             engine_type = "reranker"
         elif model_type == "vlm":
             engine_type = "vlm"
+        elif model_type == "audio_stt":
+            engine_type = "audio_stt"
+        elif model_type == "audio_tts":
+            engine_type = "audio_tts"
+        elif model_type == "audio_sts":
+            engine_type = "audio_sts"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)

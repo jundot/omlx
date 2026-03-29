@@ -71,6 +71,10 @@ mcp = [
 modelscope = [
     "modelscope>=1.10.0",
 ]
+audio = [
+    "mlx-audio>=0.4.0",
+    "python-multipart>=0.0.5",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
