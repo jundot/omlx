@@ -173,7 +173,7 @@ class HumanEvalBenchmark(BaseBenchmark):
         return deterministic_sample(normalized, sample_size)
 
     def get_max_tokens(self) -> int:
-        return 512
+        return 2048
 
     def format_prompt(self, item: dict) -> list[dict[str, str]]:
         """Format as a function completion prompt."""

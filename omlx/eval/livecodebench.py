@@ -167,7 +167,7 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
         return deterministic_sample(normalized, sample_size)
 
     def get_max_tokens(self) -> int:
-        return 2048
+        return 16384
 
     def format_prompt(self, item: dict) -> list[dict[str, str]]:
         """Format as a coding problem prompt."""
