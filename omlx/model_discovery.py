@@ -500,12 +500,8 @@ def _resolve_hf_cache_entry(path: Path) -> tuple[Path, str] | None:
     # "models--Org--Name" → "Name"
     model_name = name.split("--", 2)[2]
 
-    refs_main = path / "refs" / "main"
-    if not refs_main.is_file():
-        return None
-
     try:
-        commit_hash = refs_main.read_text().strip()
+        commit_hash = (path / "refs" / "main").read_text().strip()
     except OSError:
         return None
 
