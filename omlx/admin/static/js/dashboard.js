@@ -395,6 +395,16 @@
                 window.addEventListener('popstate', () => {
                     this.applyTabStateFromUrl();
                 });
+
+                // Pause stats polling when tab is hidden to reduce server load
+                document.addEventListener('visibilitychange', () => {
+                    if (document.hidden) {
+                        this.stopStatsRefresh();
+                    } else if (this.mainTab === 'status') {
+                        this.loadStats();
+                        this.startStatsRefresh();
+                    }
+                });
             },
 
             async handleMainTabChange(value) {
