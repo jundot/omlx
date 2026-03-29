@@ -89,19 +89,6 @@
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('bench.config.batch_hint') }}</p>
                             </div>
 
-                            <!-- VLM Image Option -->
-                            <div x-show="models.find(m => m.id === benchModelId)?.model_type === 'vlm'"
-                                 x-transition>
-                                <label class="flex items-center gap-2 cursor-pointer">
-                                    <input type="checkbox"
-                                           x-model="benchIncludeImage"
-                                           :disabled="benchRunning"
-                                           class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                    <span class="text-sm text-neutral-600">{{ t('bench.config.include_image') }}</span>
-                                </label>
-                                <p class="text-xs text-neutral-400 mt-1">{{ t('bench.config.include_image_hint') }}</p>
-                            </div>
-
                             <!-- Run / Cancel Button -->
                             <div class="flex items-center gap-3 pt-2">
                                 <button x-show="!benchRunning"
@@ -192,15 +179,14 @@
                         </div>
                     </div>
 
-                    <!-- Batch Results: Same Prompt (cache reuse) -->
-                    <div x-show="benchBatchSameResults.length > 0" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                    <!-- Batch Results: Continuous Batching -->
+                    <div x-show="benchBatchResults.length > 0" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="layers" class="w-4 h-4 text-neutral-500"></i>
-                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('bench.results.batch_same.section_label') }}</span>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('bench.results.batch.section_label') }}</span>
                             </div>
-                            <span class="text-xs text-neutral-400"
-                                  x-text="benchIncludeImage ? '{{ t('bench.results.batch_same.subtitle_image') }}' : '{{ t('bench.results.batch_same.subtitle') }}'"></span>
+                            <span class="text-xs text-neutral-400">{{ t('bench.results.batch.subtitle') }}</span>
                         </div>
                         <div class="overflow-x-auto">
                             <table class="w-full text-sm">
@@ -226,57 +212,7 @@
                                         <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="benchSingleResults.find(r => r.pp === 1024)?.ttft_ms?.toFixed(1) || '-'"></td>
                                         <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.e2e_latency_s?.toFixed(3) || '-') + 's'"></td>
                                     </tr>
-                                    <template x-for="r in benchBatchSameResults" :key="r.batch_size">
-                                        <tr class="border-b border-neutral-100 hover:bg-neutral-50">
-                                            <td class="px-4 py-3 font-medium text-neutral-900" x-text="r.batch_size + 'x'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.tg_tps.toFixed(1) + ' tok/s'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums font-medium" :class="benchGetSpeedup(r) >= 1.5 ? 'text-green-600' : 'text-neutral-700'" x-text="benchGetSpeedup(r).toFixed(2) + 'x'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.pp_tps.toFixed(1) + ' tok/s'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(r.pp_tps / r.batch_size).toFixed(1) + ' tok/s'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.avg_ttft_ms.toFixed(1)"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
-                                        </tr>
-                                    </template>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-
-                    <!-- Batch Results: Different Prompts (no cache) -->
-                    <div x-show="benchBatchDiffResults.length > 0" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
-                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                            <div class="flex items-center gap-3">
-                                <i data-lucide="layers" class="w-4 h-4 text-neutral-500"></i>
-                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('bench.results.batch_diff.section_label') }}</span>
-                            </div>
-                            <span class="text-xs text-neutral-400"
-                                  x-text="benchIncludeImage ? '{{ t('bench.results.batch_diff.subtitle_image') }}' : '{{ t('bench.results.batch_diff.subtitle') }}'"></span>
-                        </div>
-                        <div class="overflow-x-auto">
-                            <table class="w-full text-sm">
-                                <thead>
-                                    <tr class="border-b border-neutral-200 bg-neutral-50">
-                                        {{ bench_th('bench.results.batch.batch_size', 'bench.metrics.batch_size.tooltip', align='left') }}
-                                        {{ bench_th('bench.results.batch.tg_tps', 'bench.metrics.tg_tps.tooltip') }}
-                                        {{ bench_th('bench.results.batch.speedup', 'bench.metrics.speedup.tooltip') }}
-                                        {{ bench_th('bench.results.batch.pp_tps', 'bench.metrics.pp_tps.tooltip') }}
-                                        {{ bench_th('bench.results.batch.pp_tps_req', 'bench.metrics.pp_tps_req.tooltip') }}
-                                        {{ bench_th('bench.results.batch.avg_ttft', 'bench.metrics.avg_ttft.tooltip') }}
-                                        {{ bench_th('bench.results.batch.e2e_latency', 'bench.metrics.e2e.tooltip') }}
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <!-- 1x baseline from single request -->
-                                    <tr x-show="benchSingleResults.some(r => r.pp === 1024)" class="border-b border-neutral-100 bg-neutral-50/50">
-                                        <td class="px-4 py-3 font-medium text-neutral-500">{{ t('bench.results.batch.baseline') }}</td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.gen_tps?.toFixed(1) || '-') + ' tok/s'"></td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500">1.00x</td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="benchSingleResults.find(r => r.pp === 1024)?.ttft_ms?.toFixed(1) || '-'"></td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.e2e_latency_s?.toFixed(3) || '-') + 's'"></td>
-                                    </tr>
-                                    <template x-for="r in benchBatchDiffResults" :key="r.batch_size">
+                                    <template x-for="r in benchBatchResults" :key="r.batch_size">
                                         <tr class="border-b border-neutral-100 hover:bg-neutral-50">
                                             <td class="px-4 py-3 font-medium text-neutral-900" x-text="r.batch_size + 'x'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.tg_tps.toFixed(1) + ' tok/s'"></td>
@@ -293,7 +229,7 @@
                     </div>
 
                     <!-- Benchmark Results (Text Export) -->
-                    <div x-show="benchSingleResults.length > 0 || benchBatchSameResults.length > 0 || benchBatchDiffResults.length > 0" x-cloak
+                    <div x-show="benchSingleResults.length > 0 || benchBatchResults.length > 0" x-cloak
                          class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
                         <button @click="benchShowText = !benchShowText"
                                 class="w-full flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200 hover:bg-neutral-150 transition-colors">

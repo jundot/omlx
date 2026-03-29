@@ -303,15 +303,13 @@
             benchBenchId: null,
             benchProgress: null,
             benchSingleResults: [],
-            benchBatchSameResults: [],
-            benchBatchDiffResults: [],
+            benchBatchResults: [],
             benchError: '',
             benchEventSource: null,
             benchShowMetrics: false,
             benchShowText: false,
             benchCopied: false,
             benchTip: null,
-            benchIncludeImage: false,
             benchDeviceInfo: null,
             benchUploadResults: [],
             benchUploadDone: null,
@@ -1354,8 +1352,7 @@
                 this.benchRunning = true;
                 this.benchProgress = null;
                 this.benchSingleResults = [];
-                this.benchBatchSameResults = [];
-                this.benchBatchDiffResults = [];
+                this.benchBatchResults = [];
                 this.benchError = '';
                 this.benchBenchId = null;
                 this.benchUploadResults = [];
@@ -1371,7 +1368,6 @@
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
-                            include_image: this.benchIncludeImage,
                         }),
                     });
 
@@ -1419,10 +1415,8 @@
                         } else if (data.type === 'result') {
                             if (data.data.test_type === 'single') {
                                 this.benchSingleResults = [...this.benchSingleResults, data.data];
-                            } else if (data.data.test_type === 'batch_same') {
-                                this.benchBatchSameResults = [...this.benchBatchSameResults, data.data];
-                            } else if (data.data.test_type === 'batch_diff') {
-                                this.benchBatchDiffResults = [...this.benchBatchDiffResults, data.data];
+                            } else if (data.data.test_type === 'batch') {
+                                this.benchBatchResults = [...this.benchBatchResults, data.data];
                             }
                         } else if (data.type === 'done') {
                             // Benchmark tests done, uploading starts
@@ -1561,16 +1555,10 @@
                     }
                 };
 
-                const imgSuffix = this.benchIncludeImage ? ' + image tokens' : '';
                 buildBatchText(
-                    'Continuous Batching — Same Prompt',
-                    `pp1024${imgSuffix} / tg128 · partial prefix cache hit`,
-                    this.benchBatchSameResults
-                );
-                buildBatchText(
-                    'Continuous Batching — Different Prompts',
-                    `pp1024${imgSuffix} / tg128 · no cache reuse`,
-                    this.benchBatchDiffResults
+                    'Continuous Batching',
+                    'pp1024 / tg128',
+                    this.benchBatchResults
                 );
 
                 return lines.join('\n');

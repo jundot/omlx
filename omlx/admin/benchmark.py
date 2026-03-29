@@ -8,7 +8,6 @@ real-time progress reporting via SSE events.
 import asyncio
 import json
 import logging
-import os
 import re
 import time
 import uuid
@@ -44,8 +43,6 @@ class BenchmarkRequest(BaseModel):
     prompt_lengths: list[int]
     generation_length: int = 128
     batch_sizes: list[int] = []
-    include_image: bool = False
-
     @field_validator("prompt_lengths")
     @classmethod
     def validate_prompt_lengths(cls, v: list[int]) -> list[int]:
@@ -106,18 +103,6 @@ def cleanup_old_runs(max_runs: int = 10) -> None:
         for bid, _ in completed[:-max_runs]:
             del _benchmark_runs[bid]
 
-
-# Path to bundled sample image (relative to this file)
-_SAMPLE_IMAGE_PATH = os.path.join(
-    os.path.dirname(__file__), "static", "img", "bench_sample.jpg"
-)
-
-
-def _get_sample_image_path() -> str:
-    """Return the path to the bundled sample image for VLM benchmarking."""
-    if not os.path.exists(_SAMPLE_IMAGE_PATH):
-        raise FileNotFoundError(f"Sample image not found: {_SAMPLE_IMAGE_PATH}")
-    return _SAMPLE_IMAGE_PATH
 
 
 def _generate_prompt(tokenizer: Any, target_tokens: int) -> str:
@@ -255,7 +240,6 @@ async def _run_batch_test(
     prompt_tokens: int,
     max_tokens: int,
     batch_size: int,
-    image: Any = None,
 ) -> dict:
     """Run a continuous batching benchmark test.
 
@@ -267,7 +251,6 @@ async def _run_batch_test(
                  all entries are identical. For different-prompt tests, each
                  has a unique UUID prefix.
         prompt_tokens: Number of prompt tokens per request (for pp TPS calc).
-        image: Optional PIL Image to include in each request (VLM benchmark).
     """
     from ..request import SamplingParams
 
@@ -285,43 +268,18 @@ async def _run_batch_test(
         first_token = None
         tokens = 0
         prev_tokens = 0
-        actual_prompt_tokens = 0
 
-        if image is not None:
-            # VLM path: use stream_chat with image
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": image}},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ]
-            async for output in engine.stream_chat(
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=0.0,
-                top_p=1.0,
-            ):
-                if first_token is None and output.completion_tokens > prev_tokens:
-                    first_token = time.perf_counter()
-                prev_tokens = output.completion_tokens
+        request_id = await engine_core.add_request(
+            prompt=prompt,
+            sampling_params=sampling_params,
+        )
+
+        async for output in engine_core.stream_outputs(request_id):
+            if first_token is None and output.completion_tokens > prev_tokens:
+                first_token = time.perf_counter()
+            prev_tokens = output.completion_tokens
+            if output.finished:
                 tokens = output.completion_tokens
-                actual_prompt_tokens = output.prompt_tokens
-        else:
-            # Text-only path: use engine_core directly
-            request_id = await engine_core.add_request(
-                prompt=prompt,
-                sampling_params=sampling_params,
-            )
-
-            async for output in engine_core.stream_outputs(request_id):
-                if first_token is None and output.completion_tokens > prev_tokens:
-                    first_token = time.perf_counter()
-                prev_tokens = output.completion_tokens
-                if output.finished:
-                    tokens = output.completion_tokens
 
         end = time.perf_counter()
         if first_token is None:
@@ -332,7 +290,6 @@ async def _run_batch_test(
             "first_token_abs": first_token,
             "end_abs": end,
             "completion_tokens": tokens,
-            "prompt_tokens": actual_prompt_tokens,
         }
 
     # Submit all requests concurrently
@@ -344,11 +301,7 @@ async def _run_batch_test(
 
     # Aggregate metrics
     total_gen_tokens = sum(r["completion_tokens"] for r in results)
-    # For VLM image requests, use actual prompt tokens (includes vision tokens)
-    if image is not None:
-        total_prompt_tokens = sum(r["prompt_tokens"] for r in results)
-    else:
-        total_prompt_tokens = prompt_tokens * batch_size
+    total_prompt_tokens = prompt_tokens * batch_size
     wall_time = wall_end - wall_start
     avg_ttft_ms = (sum(r["ttft_s"] for r in results) / batch_size) * 1000
 
@@ -477,21 +430,21 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
 
     # Collect single results and batch results
     single_results = [r for r in run.results if r.get("test_type") == "single"]
-    batch_diff_results = [r for r in run.results if r.get("test_type") == "batch_diff"]
+    batch_results = [r for r in run.results if r.get("test_type") == "batch"]
 
-    # Build batching_results from batch_diff (uncached) data
+    # Build batching_results from batch data
     batching_results = []
     pp1024_single = next(
         (r for r in single_results if r.get("pp") == 1024), None
     )
-    if pp1024_single and batch_diff_results:
+    if pp1024_single and batch_results:
         baseline_tps = pp1024_single["gen_tps"]
         batching_results.append({
             "batch_size": 1,
             "tg_tps": baseline_tps,
             "speedup": 1.0,
         })
-        for br in batch_diff_results:
+        for br in batch_results:
             speedup = round(br["tg_tps"] / baseline_tps, 2) if baseline_tps > 0 else 1.0
             batching_results.append({
                 "batch_size": br["batch_size"],
@@ -619,8 +572,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     5. Unload the benchmark model
     """
     request = run.request
-    # Each batch size runs twice: same prompt + different prompts
-    total_tests = len(request.prompt_lengths) + len(request.batch_sizes) * 2
+    total_tests = len(request.prompt_lengths) + len(request.batch_sizes)
     current_test = 0
     overall_start = time.perf_counter()
 
@@ -650,7 +602,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             "current": 0,
             "total": total_tests,
         })
-        engine = await engine_pool.get_engine(request.model_id)
+        engine = await engine_pool.get_engine(request.model_id, force_lm=True)
         logger.info(f"Benchmark: loaded {request.model_id}")
 
         # Generate prompts for all needed lengths
@@ -716,90 +668,36 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 single_pp1024_gen_tps = metrics["gen_tps"]
 
         # Phase 4: Batch tests
-        # Load sample image for VLM benchmarking if requested
-        bench_image = None
-        if request.include_image:
-            try:
-                bench_image = _get_sample_image_path()
-                logger.info("Benchmark: sample image ready for VLM testing")
-            except Exception as e:
-                logger.warning(f"Benchmark: failed to find sample image: {e}")
-
-        # Prepare prompts: one shared prompt for same-prompt tests,
-        # unique prompts for different-prompt tests.
+        # Each request has a unique UUID prefix (no cache hits)
         max_batch = max(request.batch_sizes) if request.batch_sizes else 0
-
-        # Same prompt with variant suffix: all requests share the same prefix
-        # but differ in the last few tokens. This ensures partial prefix cache
-        # hits (3 out of 4 blocks) instead of an exact hit, which would fall
-        # back to full prefill on stateful cache types (e.g. RotatingKVCache).
-        base_prompt = _generate_prompt(tokenizer, 1024)
-        base_tokens = tokenizer.encode(base_prompt)
-        same_prompts = []
-        for i in range(max_batch):
-            suffix_tokens = tokenizer.encode(f" variant-{i}")
-            modified = base_tokens[: -len(suffix_tokens)] + suffix_tokens
-            same_prompts.append(tokenizer.decode(modified[:1024]))
-
-        # Different prompts: each request has a unique UUID prefix (no cache hits)
-        diff_prompts = [_generate_prompt(tokenizer, 1024) for _ in range(max_batch)]
+        batch_prompts = [_generate_prompt(tokenizer, 1024) for _ in range(max_batch)]
 
         for batch_size in request.batch_sizes:
-            # 4a: Same prompt batch test
             current_test += 1
             await _send_event(run, {
                 "type": "progress",
                 "phase": "batch",
-                "message": f"Batch {batch_size}x (same prompt): pp1024/tg{request.generation_length}",
+                "message": f"Batch {batch_size}x: pp1024/tg{request.generation_length}",
                 "current": current_test,
                 "total": total_tests,
             })
 
-            same_metrics = await _run_batch_test(
+            batch_metrics = await _run_batch_test(
                 engine=engine,
-                prompts=same_prompts[:batch_size],
+                prompts=batch_prompts[:batch_size],
                 prompt_tokens=1024,
                 max_tokens=request.generation_length,
                 batch_size=batch_size,
-                image=bench_image,
             )
 
-            result_same = {
-                "test_type": "batch_same",
+            result = {
+                "test_type": "batch",
                 "pp": 1024,
                 "tg": request.generation_length,
-                **same_metrics,
+                **batch_metrics,
             }
-            run.results.append(result_same)
-            await _send_event(run, {"type": "result", "data": result_same})
-
-            # 4b: Different prompt batch test
-            current_test += 1
-            await _send_event(run, {
-                "type": "progress",
-                "phase": "batch",
-                "message": f"Batch {batch_size}x (diff prompt): pp1024/tg{request.generation_length}",
-                "current": current_test,
-                "total": total_tests,
-            })
-
-            diff_metrics = await _run_batch_test(
-                engine=engine,
-                prompts=diff_prompts[:batch_size],
-                prompt_tokens=1024,
-                max_tokens=request.generation_length,
-                batch_size=batch_size,
-                image=bench_image,
-            )
-
-            result_diff = {
-                "test_type": "batch_diff",
-                "pp": 1024,
-                "tg": request.generation_length,
-                **diff_metrics,
-            }
-            run.results.append(result_diff)
-            await _send_event(run, {"type": "result", "data": result_diff})
+            run.results.append(result)
+            await _send_event(run, {"type": "result", "data": result})
 
         # Phase 5: Unload benchmark model
         await _send_event(run, {
