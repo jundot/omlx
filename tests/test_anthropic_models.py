@@ -17,6 +17,7 @@ from omlx.api.anthropic_models import (
     AnthropicTool,
     AnthropicUsage,
     ContentBlockDeltaEvent,
+    ContentBlockDocument,
     ContentBlockStartEvent,
     ContentBlockStopEvent,
     ContentBlockText,
@@ -118,6 +119,57 @@ class TestContentBlocks:
         )
 
         assert isinstance(block.content, list)
+
+    def test_content_block_document_pdf(self):
+        """Test creating document content block for PDF."""
+        block = ContentBlockDocument(
+            source={
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "JVBERi0xLjQ=",
+            },
+            title="test.pdf",
+        )
+
+        assert block.type == "document"
+        assert block.source["media_type"] == "application/pdf"
+        assert block.title == "test.pdf"
+
+    def test_content_block_document_text(self):
+        """Test creating document content block for plain text."""
+        import base64
+
+        text_data = base64.b64encode(b"Hello world").decode()
+        block = ContentBlockDocument(
+            source={
+                "type": "base64",
+                "media_type": "text/plain",
+                "data": text_data,
+            },
+        )
+
+        assert block.type == "document"
+        assert block.title is None
+
+    def test_content_block_document_in_message(self):
+        """Test that document blocks are accepted in AnthropicMessage."""
+        msg = AnthropicMessage(
+            role="user",
+            content=[
+                ContentBlockText(text="Read this document:"),
+                ContentBlockDocument(
+                    source={
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": "JVBERi0=",
+                    },
+                    title="manual.pdf",
+                ),
+            ],
+        )
+
+        assert len(msg.content) == 2
+        assert msg.content[1].type == "document"
 
 
 class TestSystemContent:

@@ -59,6 +59,17 @@ class ContentBlockThinking(BaseModel):
     signature: str | None = None
 
 
+class ContentBlockDocument(BaseModel):
+    """Document content block (PDF, plain text)."""
+
+    type: Literal["document"] = "document"
+    source: dict[str, Any]  # {"type": "base64", "media_type": "application/pdf", "data": "..."}
+    title: str | None = None
+    context: str | None = None
+    citations: dict[str, Any] | None = None
+    cache_control: dict[str, str] | None = None
+
+
 # Union type for all content blocks
 ContentBlock = (
     ContentBlockText
@@ -66,6 +77,7 @@ ContentBlock = (
     | ContentBlockToolUse
     | ContentBlockToolResult
     | ContentBlockThinking
+    | ContentBlockDocument
 )
 
 

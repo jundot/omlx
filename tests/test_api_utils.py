@@ -36,6 +36,7 @@ from omlx.api.openai_models import ContentPart, FunctionCall, Message, ToolCall
 from omlx.api.anthropic_models import (
     AnthropicMessage,
     AnthropicTool,
+    ContentBlockDocument,
     ContentBlockText,
     ContentBlockToolResult,
     ContentBlockToolUse,
@@ -728,6 +729,99 @@ class TestConvertAnthropicToInternal:
         image_parts = [p for p in content if p.get("type") == "image_url"]
         assert len(image_parts) == 1
         assert "iVBOR" in image_parts[0]["image_url"]["url"]
+
+    def test_document_block_text_plain(self):
+        """Test converting text/plain document block decodes content."""
+        import base64
+
+        text_data = base64.b64encode(b"Hello from document").decode()
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockDocument(
+                            source={
+                                "type": "base64",
+                                "media_type": "text/plain",
+                                "data": text_data,
+                            },
+                            title="notes.txt",
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert "Hello from document" in result[0]["content"]
+        assert "[Document: notes.txt]" in result[0]["content"]
+
+    def test_document_block_pdf_placeholder(self):
+        """Test converting PDF document block returns placeholder."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockDocument(
+                            source={
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": "JVBERi0xLjQ=",
+                            },
+                            title="manual.pdf",
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert "manual.pdf" in content
+        assert "oMLX does not provide PDF parsing" in content
+
+    def test_document_block_mixed_with_text(self):
+        """Test document block alongside text blocks."""
+        import base64
+
+        text_data = base64.b64encode(b"Doc content here").decode()
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockText(text="Please read this:"),
+                        ContentBlockDocument(
+                            source={
+                                "type": "base64",
+                                "media_type": "text/plain",
+                                "data": text_data,
+                            },
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert "Please read this:" in content
+        assert "Doc content here" in content
 
 
 class TestConvertAnthropicToolsToInternal:
