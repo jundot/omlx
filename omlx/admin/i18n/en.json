@@ -58,7 +58,7 @@
   "status.clear_alltime": "Clear",
   "status.clear_alltime_tooltip": "Clear all-time metrics",
   "status.filter_all_models": "All Models",
-  "status.stat.total_tokens": "Total Tokens Processed",
+  "status.stat.total_tokens": "Total Prefill Tokens",
   "status.stat.cached_tokens": "Cached Tokens",
   "status.stat.cache_efficiency": "Cache Efficiency",
   "status.speed.section_label": "Average Speed",

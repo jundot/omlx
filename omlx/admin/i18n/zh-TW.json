@@ -58,7 +58,7 @@
   "status.clear_alltime": "清除",
   "status.clear_alltime_tooltip": "清除累計指標",
   "status.filter_all_models": "所有模型",
-  "status.stat.total_tokens": "已處理 Token 總數",
+  "status.stat.total_tokens": "預填充 Token 總數",
   "status.stat.cached_tokens": "快取 Token 數",
   "status.stat.cache_efficiency": "快取效率",
   "status.speed.section_label": "平均速度",

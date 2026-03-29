@@ -58,7 +58,7 @@
   "status.clear_alltime": "クリア",
   "status.clear_alltime_tooltip": "累計メトリクスをクリア",
   "status.filter_all_models": "全モデル",
-  "status.stat.total_tokens": "処理トークン合計",
+  "status.stat.total_tokens": "プリフィルトークン合計",
   "status.stat.cached_tokens": "キャッシュトークン数",
   "status.stat.cache_efficiency": "キャッシュ効率",
   "status.speed.section_label": "平均速度",
