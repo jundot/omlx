@@ -845,31 +845,33 @@ class TestUnsupportedModels:
 class TestHfCacheDiscovery:
     """Tests for HF Hub cache entry resolution and discovery."""
 
+    FAKE_COMMIT = "abc123def456"
+
     def _make_model(self, path: Path, model_type: str = "llama"):
         """Helper to create a valid model directory."""
         path.mkdir(parents=True, exist_ok=True)
         (path / "config.json").write_text(json.dumps({"model_type": model_type}))
         (path / "model.safetensors").write_bytes(b"0" * 1000)
 
-    def _make_hf_cache_model(self, parent: Path, org: str, name: str, model_type: str = "llama"):
-        """Helper to create an HF cache entry with a valid model in the snapshot."""
+    def _make_hf_cache_entry(self, parent: Path, org: str, name: str):
+        """Helper to create a bare HF Hub cache directory layout (no model files)."""
         entry = parent / f"models--{org}--{name}"
         refs = entry / "refs"
         refs.mkdir(parents=True)
-        (refs / "main").write_text("abc123def456")
-        snapshot = entry / "snapshots" / "abc123def456"
+        (refs / "main").write_text(self.FAKE_COMMIT)
+        snapshot = entry / "snapshots" / self.FAKE_COMMIT
         snapshot.mkdir(parents=True)
+        return entry, snapshot
+
+    def _make_hf_cache_model(self, parent: Path, org: str, name: str, model_type: str = "llama"):
+        """Helper to create an HF cache entry with a valid model in the snapshot."""
+        _, snapshot = self._make_hf_cache_entry(parent, org, name)
         (snapshot / "config.json").write_text(json.dumps({"model_type": model_type}))
         (snapshot / "model.safetensors").write_bytes(b"0" * 1000)
 
     def test_resolve_valid_entry(self, tmp_path):
         """Valid HF cache entry resolves to snapshot path and model name."""
-        entry = tmp_path / "models--mlx-community--Qwen3-8B-4bit"
-        refs = entry / "refs"
-        refs.mkdir(parents=True)
-        (refs / "main").write_text("abc123")
-        snapshot = entry / "snapshots" / "abc123"
-        snapshot.mkdir(parents=True)
+        entry, snapshot = self._make_hf_cache_entry(tmp_path, "mlx-community", "Qwen3-8B-4bit")
 
         result = _resolve_hf_cache_entry(entry)
         assert result is not None
@@ -904,12 +906,9 @@ class TestHfCacheDiscovery:
 
     def test_resolve_strips_whitespace_from_refs(self, tmp_path):
         """Trailing newline in refs/main is stripped (matches real HF cache)."""
-        entry = tmp_path / "models--mlx-community--Qwen3-8B"
-        refs = entry / "refs"
-        refs.mkdir(parents=True)
-        (refs / "main").write_text("abc123\n")
-        snapshot = entry / "snapshots" / "abc123"
-        snapshot.mkdir(parents=True)
+        entry, snapshot = self._make_hf_cache_entry(tmp_path, "mlx-community", "Qwen3-8B")
+        # Overwrite with trailing newline (like real HF cache)
+        (entry / "refs" / "main").write_text(self.FAKE_COMMIT + "\n")
 
         result = _resolve_hf_cache_entry(entry)
         assert result is not None
@@ -940,17 +939,12 @@ class TestHfCacheDiscovery:
 
         models = discover_models(tmp_path)
         assert models["Qwen3-8B-4bit"].model_path == str(
-            tmp_path / "models--mlx-community--Qwen3-8B-4bit" / "snapshots" / "abc123def456"
+            tmp_path / "models--mlx-community--Qwen3-8B-4bit" / "snapshots" / self.FAKE_COMMIT
         )
 
     def test_hf_cache_without_config_json_skipped(self, tmp_path):
         """HF cache entries without config.json in snapshot are skipped."""
-        entry = tmp_path / "models--mlx-community--NoConfig"
-        refs = entry / "refs"
-        refs.mkdir(parents=True)
-        (refs / "main").write_text("abc123")
-        snapshot = entry / "snapshots" / "abc123"
-        snapshot.mkdir(parents=True)
+        self._make_hf_cache_entry(tmp_path, "mlx-community", "NoConfig")
 
         models = discover_models(tmp_path)
         assert len(models) == 0
