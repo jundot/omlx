@@ -59,8 +59,8 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (b7f853a)
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@b7f853a26a0bdcb60a307b1deb01ba5be9ac9ffc",
+    # mlx-vlm from commit (7f7a04c)
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@7f7a04ce20337996da335ab17cdfee0ba51d6610",
     "Pillow>=9.0.0",
 ]
 
