@@ -446,6 +446,7 @@ class MLXEmbeddingModel:
                     )
                     self._is_compiled = False
                     self._compiled_embed = None
+                    total_tokens = None
 
             if embeddings_array is None:
                 if uses_custom_embedding_inputs:
@@ -523,7 +524,7 @@ class MLXEmbeddingModel:
         if attention_mask is not None:
             try:
                 return int(mx.sum(attention_mask).item())
-            except Exception:
+            except (TypeError, ValueError):
                 pass
             if isinstance(attention_mask, list):
                 return int(sum(sum(row) if isinstance(row, list) else row for row in attention_mask))

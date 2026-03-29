@@ -10,7 +10,6 @@ Provides:
 
 import base64
 import math
-import os
 import struct
 from typing import Any, Dict, List, Union
 
@@ -153,8 +152,3 @@ def normalize_embedding_items(
     return normalized
 
 
-def is_likely_local_image_path(image: str) -> bool:
-    """Return True when the image string looks like a local filesystem path."""
-    if image.startswith(("http://", "https://", "data:")):
-        return False
-    return os.path.exists(image)
