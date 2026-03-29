@@ -209,6 +209,48 @@ class MLXEmbeddingModel:
             "(text_embeds, pooler_output, or last_hidden_state)"
         )
 
+    def _uses_custom_embedding_inputs(self, processor) -> bool:
+        """Return True when processor exposes a custom embedding input API."""
+        return hasattr(processor, "prepare_embedding_inputs") or hasattr(
+            processor, "prepare_model_inputs"
+        )
+
+    def _prepare_embedding_inputs(
+        self,
+        processor,
+        texts: List[str],
+        max_length: int,
+        padding: bool,
+        truncation: bool,
+    ):
+        """
+        Prepare inputs for embedding inference.
+
+        Some embedding processors, such as qwen3_vl in mlx-embeddings, expose
+        a higher-level embedding API instead of the tokenizer-style
+        ``processor(texts, ...)`` path. Reuse that official extension point
+        when available to avoid positional-argument mismatches.
+        """
+        if self._uses_custom_embedding_inputs(processor):
+            items = [{"text": text} for text in texts]
+            if hasattr(processor, "prepare_embedding_inputs"):
+                return processor.prepare_embedding_inputs(
+                    items, return_tensors="mlx"
+                )
+            return processor.prepare_model_inputs(items, return_tensors="mlx")
+
+        from mlx_embeddings.utils import prepare_inputs
+
+        return prepare_inputs(
+            processor,
+            None,
+            texts,
+            max_length,
+            padding,
+            truncation,
+            None,
+        )
+
     def _try_compile(self) -> bool:
         """
         Compile a primitive-output embedding forward function.
@@ -266,7 +308,9 @@ class MLXEmbeddingModel:
             texts = [texts]
 
         processor = self.processor
-        if hasattr(processor, "_tokenizer"):
+        if hasattr(processor, "_tokenizer") and not self._uses_custom_embedding_inputs(
+            processor
+        ):
             processor = processor._tokenizer
 
         embeddings_array = None
@@ -301,19 +345,14 @@ class MLXEmbeddingModel:
             outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
             embeddings_array = self._extract_embeddings_array(outputs)
         else:
-            from mlx_embeddings import generate
-            from mlx_embeddings.utils import prepare_inputs
-
             if self._is_compiled and self._compiled_embed is not None:
                 try:
-                    inputs = prepare_inputs(
+                    inputs = self._prepare_embedding_inputs(
                         processor,
-                        None,
                         texts,
                         max_length,
                         padding,
                         truncation,
-                        None,
                     )
                     if not isinstance(inputs, dict):
                         inputs = dict(inputs)
@@ -327,14 +366,28 @@ class MLXEmbeddingModel:
                     self._compiled_embed = None
 
             if embeddings_array is None:
-                outputs = generate(
-                    self.model,
-                    processor,
-                    texts,
-                    max_length=max_length,
-                    padding=padding,
-                    truncation=truncation,
-                )
+                if self._uses_custom_embedding_inputs(processor):
+                    inputs = self._prepare_embedding_inputs(
+                        processor,
+                        texts,
+                        max_length,
+                        padding,
+                        truncation,
+                    )
+                    if not isinstance(inputs, dict):
+                        inputs = dict(inputs)
+                    outputs = self.model(**inputs)
+                else:
+                    from mlx_embeddings import generate
+
+                    outputs = generate(
+                        self.model,
+                        processor,
+                        texts,
+                        max_length=max_length,
+                        padding=padding,
+                        truncation=truncation,
+                    )
                 embeddings_array = self._extract_embeddings_array(outputs)
 
         mx.eval(embeddings_array)
