@@ -553,6 +553,26 @@ class VLMBatchedEngine(BaseEngine):
             prompt = template_target.apply_chat_template(
                 formatted_messages, **template_kwargs
             )
+        except ValueError:
+            # Processor has apply_chat_template but no chat_template set
+            # (e.g. mlx-vlm custom processor without processor_config.json).
+            # Fall back to processor.tokenizer which holds the actual template.
+            fallback = getattr(self._processor, "tokenizer", None)
+            if fallback is not None and fallback is not template_target:
+                try:
+                    prompt = fallback.apply_chat_template(
+                        formatted_messages, **template_kwargs
+                    )
+                except TypeError:
+                    if chat_template_kwargs:
+                        for key in chat_template_kwargs:
+                            template_kwargs.pop(key, None)
+                    template_kwargs.pop("enable_thinking", None)
+                    prompt = fallback.apply_chat_template(
+                        formatted_messages, **template_kwargs
+                    )
+            else:
+                raise
 
         # Tokenize text and preprocess images
         inputs = prepare_inputs(
