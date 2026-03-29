@@ -101,6 +101,7 @@ class ModelSettingsRequest(BaseModel):
     specprefill_draft_model: Optional[str] = None
     specprefill_keep_pct: Optional[float] = None
     specprefill_threshold: Optional[int] = None
+    reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
 
@@ -1310,6 +1311,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "max_tool_result_tokens": settings.max_tool_result_tokens,
                 "thinking_budget_enabled": settings.thinking_budget_enabled,
                 "thinking_budget_tokens": settings.thinking_budget_tokens,
+                "reasoning_parser": settings.reasoning_parser,
                 "chat_template_kwargs": settings.chat_template_kwargs,
                 "forced_ct_kwargs": settings.forced_ct_kwargs,
                 "ttl_seconds": settings.ttl_seconds,
@@ -1538,6 +1540,8 @@ async def update_model_settings(
     if "specprefill_threshold" in sent:
         current_settings.specprefill_threshold = request.specprefill_threshold or None
 
+    if "reasoning_parser" in sent:
+        current_settings.reasoning_parser = request.reasoning_parser or None
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry

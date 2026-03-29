@@ -122,6 +122,26 @@ class ResponseFormat(BaseModel):
     json_schema: Optional[ResponseFormatJsonSchema] = None
 
 
+class StructuredOutputOptions(BaseModel):
+    """vLLM-compatible structured output options.
+
+    Exactly one field should be set. When passed via ``extra_body`` in the
+    OpenAI client, the key is ``structured_outputs``.
+
+    Supports:
+    - json: JSON schema (dict or string) for logit-level enforcement
+    - regex: Regular expression the output must match
+    - choice: List of allowed string values (output will be exactly one)
+    - grammar: EBNF/GBNF context-free grammar string
+    """
+    model_config = {"populate_by_name": True}
+
+    json_schema: Optional[Union[str, dict]] = Field(None, alias="json")
+    regex: Optional[str] = None
+    choice: Optional[List[str]] = None
+    grammar: Optional[str] = None
+
+
 # =============================================================================
 # Chat Completion
 # =============================================================================
@@ -149,6 +169,8 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Optional[Union[str, dict]] = None  # "auto", "none", or specific tool
     # Structured output
     response_format: Optional[Union[ResponseFormat, dict]] = None
+    # vLLM-compatible structured output (grammar, regex, choice, json)
+    structured_outputs: Optional[Union[StructuredOutputOptions, dict]] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     # Thinking budget (max thinking tokens, None = unlimited)

@@ -346,20 +346,25 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         tokens: List[mx.array],
         **kwargs: Any,
     ):
-        """Override to pass VLM kwargs (inputs_embeds etc.) to self.model()."""
+        """Override to pass VLM kwargs and use batched grammar bitmask fill.
+
+        When grammar-constrained requests are present in the batch:
+        1. Queue model forward (MLX lazy eval)
+        2. Kick off Metal evaluation asynchronously
+        3. Advance grammar state + batch-fill bitmasks on CPU (overlaps
+           with Metal)
+        4. Apply the batched bitmask to all logits at once
+        5. Run remaining (non-grammar) logits processors per-request
+        """
         batch_size = input_tokens.shape[0]
 
         logits = self.model(input_tokens, cache=prompt_cache, **kwargs)
         logits = logits[:, -1, :]
 
         if any(logits_processors):
-            processed_logits = []
-            for e in range(batch_size):
-                sample_logits = logits[e : e + 1]
-                for processor in logits_processors[e]:
-                    sample_logits = processor(tokens[e], sample_logits)
-                processed_logits.append(sample_logits)
-            logits = mx.concatenate(processed_logits, axis=0)
+            logits = self._apply_logits_processors(
+                logits, logits_processors, tokens, batch_size,
+            )
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         if any(samplers):
@@ -373,6 +378,111 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             sampled = self.sampler(logprobs)
 
         return sampled, list(logprobs)
+
+    def _apply_logits_processors(
+        self,
+        logits: mx.array,
+        logits_processors: list,
+        tokens: List[mx.array],
+        batch_size: int,
+    ) -> mx.array:
+        """Apply logits processors, using batched grammar fill when possible.
+
+        Separates grammar processors from other processors.  Grammar
+        bitmasks are filled in parallel via ``BatchGrammarMatcher`` while
+        Metal evaluates the model forward pass.  Other processors (e.g.
+        ``ThinkingBudgetProcessor``) run per-request as before.
+        """
+        from .api.grammar import GrammarConstraintProcessor
+
+        grammar_procs: list[tuple[int, GrammarConstraintProcessor]] = []
+        other_procs: list[list] = [[] for _ in range(batch_size)]
+
+        for e in range(batch_size):
+            for proc in logits_processors[e]:
+                if isinstance(proc, GrammarConstraintProcessor):
+                    grammar_procs.append((e, proc))
+                else:
+                    other_procs[e].append(proc)
+
+        if grammar_procs:
+            logits = self._apply_batched_grammar(
+                logits, grammar_procs, tokens, batch_size,
+            )
+
+        if any(other_procs):
+            processed_logits = []
+            for e in range(batch_size):
+                sample_logits = logits[e : e + 1]
+                for processor in other_procs[e]:
+                    sample_logits = processor(tokens[e], sample_logits)
+                processed_logits.append(sample_logits)
+            logits = mx.concatenate(processed_logits, axis=0)
+
+        return logits
+
+    def _apply_batched_grammar(
+        self,
+        logits: mx.array,
+        grammar_procs: list,
+        tokens: List[mx.array],
+        batch_size: int,
+    ) -> mx.array:
+        """Advance grammar state and apply bitmasks using BatchGrammarMatcher.
+
+        Kicks off ``mx.async_eval(logits)`` before CPU-side bitmask
+        computation so that Metal and CPU work overlap.
+        """
+        from xgrammar.kernels.apply_token_bitmask_mlx import apply_token_bitmask_mlx
+
+        mx.async_eval(logits)
+
+        active_matchers = []
+        active_batch_indices = []
+        for batch_idx, proc in grammar_procs:
+            if proc.advance(tokens[batch_idx]):
+                active_matchers.append(proc.matcher)
+                active_batch_indices.append(batch_idx)
+
+        if not active_matchers:
+            return logits
+
+        vocab_size = grammar_procs[0][1]._vocab_size
+        bitmask_width = (vocab_size + 31) // 32
+
+        bitmask = self._get_grammar_bitmask(batch_size, bitmask_width)
+        bitmask[:batch_size] = -1
+
+        if len(active_matchers) >= self._BATCH_GRAMMAR_THRESHOLD:
+            batch_matcher = self._get_batch_grammar_matcher()
+            batch_matcher.batch_fill_next_token_bitmask(
+                active_matchers, bitmask, indices=active_batch_indices,
+            )
+        else:
+            for matcher, idx in zip(active_matchers, active_batch_indices):
+                matcher.fill_next_token_bitmask(bitmask, idx)
+
+        mx_bitmask = mx.array(bitmask[:batch_size])
+        return apply_token_bitmask_mlx(mx_bitmask, logits, vocab_size)
+
+    _BATCH_GRAMMAR_THRESHOLD = 64
+
+    def _get_batch_grammar_matcher(self):
+        """Return a shared ``BatchGrammarMatcher`` (lazy-initialized)."""
+        if not hasattr(self, '_batch_grammar_matcher'):
+            import xgrammar as xgr
+            self._batch_grammar_matcher = xgr.BatchGrammarMatcher()
+        return self._batch_grammar_matcher
+
+    def _get_grammar_bitmask(self, batch_size: int, bitmask_width: int):
+        """Return a reusable numpy bitmask buffer, resizing if needed."""
+        buf = getattr(self, '_grammar_bitmask_buf', None)
+        if buf is None or buf.shape[0] < batch_size or buf.shape[1] < bitmask_width:
+            import numpy as np
+            self._grammar_bitmask_buf = np.full(
+                (max(batch_size, 8), bitmask_width), -1, dtype=np.int32,
+            )
+        return self._grammar_bitmask_buf
 
     def _process_prompts(self, prompts):
         # Clear stale mRoPE position state from prior _process_prompts() call.
@@ -1730,7 +1840,46 @@ class Scheduler:
                 )
                 logits_processors.append(processor)
 
+        # Add grammar constraint processor for structured output.
+        # Phase awareness (thinking vs output) is handled by the compiled
+        # grammar itself via xgrammar structural tags, so we don't need
+        # think_end_ids here.
+        if sampling_params.compiled_grammar is not None:
+            try:
+                from .api.grammar import GrammarConstraintProcessor
+
+                vocab_size = self._get_model_vocab_size()
+                if vocab_size is not None:
+                    processor = GrammarConstraintProcessor(
+                        compiled_grammar=sampling_params.compiled_grammar,
+                        vocab_size=vocab_size,
+                    )
+                    logits_processors.append(processor)
+                else:
+                    logger.warning("Cannot determine vocab_size; skipping grammar constraint")
+            except ImportError:
+                logger.warning("xgrammar not installed; skipping grammar constraint")
+
         return sampler, logits_processors
+
+    def _get_model_vocab_size(self) -> int | None:
+        """Return vocab_size from model config, or None if unavailable."""
+        for attr in ('config', 'args'):
+            config = getattr(self.model, attr, None)
+            if config is None:
+                continue
+            vs = getattr(config, 'vocab_size', None)
+            if isinstance(vs, int):
+                return vs
+            # Some models (e.g. Qwen3.5) nest vocab_size inside text_config
+            text_cfg = getattr(config, 'text_config', None)
+            if isinstance(text_cfg, dict):
+                vs = text_cfg.get('vocab_size')
+            elif text_cfg is not None:
+                vs = getattr(text_cfg, 'vocab_size', None)
+            if isinstance(vs, int):
+                return vs
+        return None
 
     def _resolve_think_end_token_ids(self) -> list[int] | None:
         """Resolve token ID(s) for the close-think tag.

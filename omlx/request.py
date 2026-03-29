@@ -71,6 +71,10 @@ class SamplingParams:
     # Thinking budget (None = unlimited thinking)
     thinking_budget: Optional[int] = None
 
+    # Compiled grammar for constrained decoding (xgrammar CompiledGrammar).
+    # Typed as Any to avoid a hard dependency on xgrammar at import time.
+    compiled_grammar: Any = None
+
     def __post_init__(self):
         if self.stop is None:
             self.stop = []

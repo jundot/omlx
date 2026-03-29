@@ -55,6 +55,7 @@ class ModelSettings:
     index_cache_freq: Optional[int] = None  # IndexCache: every Nth layer keeps indexer (DSA models only)
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
+    reasoning_parser: Optional[str] = None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
 
     # TurboQuant KV cache (temporarily disabled - performance issues)
     turboquant_kv_enabled: bool = False

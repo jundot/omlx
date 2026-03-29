@@ -199,6 +199,15 @@ class BaseEngine(ABC):
         """
         pass
 
+    @property
+    def grammar_compiler(self):
+        """Return the grammar compiler for this engine, or ``None``.
+
+        Subclasses that support xgrammar should override this with a
+        lazy-initializing property.
+        """
+        return None
+
     @abstractmethod
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics.

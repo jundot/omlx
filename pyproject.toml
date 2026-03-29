@@ -65,6 +65,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+grammar = [
+    "xgrammar>=0.1.32",
+]
 mcp = [
     "mcp>=1.0.0",
 ]

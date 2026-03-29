@@ -908,6 +908,7 @@
                     thinking_budget_tokens: settings.thinking_budget_tokens || null,
                     enableToolResultLimit: !!(settings.max_tool_result_tokens),
                     max_tool_result_tokens: settings.max_tool_result_tokens || null,
+                    reasoning_parser: settings.reasoning_parser || '',
                     ttl_seconds: settings.ttl_seconds ?? null,
                     enableIndexCache: !!(settings.index_cache_freq),
                     index_cache_freq: settings.index_cache_freq || null,
@@ -963,6 +964,7 @@
                                 min_p: Number.isFinite(this.modelSettings.min_p) ? this.modelSettings.min_p : null,
                                 presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
                                 force_sampling: this.modelSettings.force_sampling,
+                                reasoning_parser: this.modelSettings.reasoning_parser || null,
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)
