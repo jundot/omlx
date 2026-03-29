@@ -98,7 +98,7 @@ class BlockAwarePrefixCache(CacheManager):
 
         # Hash table for quick prefix lookup
         # Maps chain-hash(prefix) -> (prefix_len, block_ids, num_blocks)
-        self._prefix_index: Dict[bytes, Tuple[int, List[int], int]] = {}
+        self._prefix_index: Dict[bytes, Tuple[int, Tuple[int, ...], int]] = {}
 
         # Request to block table mapping
         self._request_tables: Dict[str, BlockCacheEntry] = {}
@@ -1980,7 +1980,7 @@ class BlockAwarePrefixCache(CacheManager):
         self,
         tokens: List[int],
         extra_keys: Optional[Tuple[Any, ...]] = None,
-    ) -> Optional[Tuple[int, List[int], int]]:
+    ) -> Optional[Tuple[int, Tuple[int, ...], int]]:
         """Find best matching prefix in the index."""
         best_match = None
         best_len = 0
