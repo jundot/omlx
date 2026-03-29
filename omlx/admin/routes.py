@@ -1642,6 +1642,18 @@ async def get_generation_config(
                 or model_config.get("seq_length")
                 or model_config.get("n_positions")
             )
+
+            # Nested config fallback (VLM, MoE models like Qwen3.5, GLM-4V)
+            if not max_pos:
+                text_config = model_config.get("text_config", {})
+                if isinstance(text_config, dict):
+                    max_pos = (
+                        text_config.get("max_position_embeddings")
+                        or text_config.get("max_seq_len")
+                        or text_config.get("seq_length")
+                        or text_config.get("n_positions")
+                    )
+
             if max_pos and isinstance(max_pos, int):
                 result["max_context_window"] = max_pos
 
