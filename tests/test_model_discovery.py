@@ -11,6 +11,7 @@ from omlx.model_discovery import (
     DiscoveredModel,
     _is_adapter_dir,
     _is_unsupported_model,
+    _resolve_hf_cache_entry,
     detect_model_type,
     discover_models,
     discover_models_from_dirs,
@@ -839,3 +840,149 @@ class TestUnsupportedModels:
         assert models["whisper-large-v3"].model_type == "audio_stt"
         assert "Qwen3-TTS" in models
         assert models["Qwen3-TTS"].model_type == "audio_tts"
+
+
+class TestHfCacheDiscovery:
+    """Tests for HF Hub cache entry resolution and discovery."""
+
+    def _make_model(self, path: Path, model_type: str = "llama"):
+        """Helper to create a valid model directory."""
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "config.json").write_text(json.dumps({"model_type": model_type}))
+        (path / "model.safetensors").write_bytes(b"0" * 1000)
+
+    def _make_hf_cache_model(self, parent: Path, org: str, name: str, model_type: str = "llama"):
+        """Helper to create an HF cache entry with a valid model in the snapshot."""
+        entry = parent / f"models--{org}--{name}"
+        refs = entry / "refs"
+        refs.mkdir(parents=True)
+        (refs / "main").write_text("abc123def456")
+        snapshot = entry / "snapshots" / "abc123def456"
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text(json.dumps({"model_type": model_type}))
+        (snapshot / "model.safetensors").write_bytes(b"0" * 1000)
+
+    # --- _resolve_hf_cache_entry unit tests ---
+
+    def test_resolve_valid_entry(self, tmp_path):
+        """Valid HF cache entry resolves to snapshot path and model name."""
+        entry = tmp_path / "models--mlx-community--Qwen3-8B-4bit"
+        refs = entry / "refs"
+        refs.mkdir(parents=True)
+        (refs / "main").write_text("abc123")
+        snapshot = entry / "snapshots" / "abc123"
+        snapshot.mkdir(parents=True)
+
+        result = _resolve_hf_cache_entry(entry)
+        assert result is not None
+        assert result[0] == snapshot
+        assert result[1] == "Qwen3-8B-4bit"
+
+    def test_resolve_regular_dir_returns_none(self, tmp_path):
+        """Regular directory without models-- prefix returns None."""
+        regular = tmp_path / "mlx-community"
+        regular.mkdir()
+        assert _resolve_hf_cache_entry(regular) is None
+
+    def test_resolve_single_separator_returns_none(self, tmp_path):
+        """models--Name (no org separator) returns None."""
+        entry = tmp_path / "models--NoOrg"
+        entry.mkdir()
+        assert _resolve_hf_cache_entry(entry) is None
+
+    def test_resolve_missing_refs_main_returns_none(self, tmp_path):
+        """Missing refs/main returns None."""
+        entry = tmp_path / "models--mlx-community--Qwen3-8B"
+        entry.mkdir(parents=True)
+        assert _resolve_hf_cache_entry(entry) is None
+
+    def test_resolve_missing_snapshot_returns_none(self, tmp_path):
+        """Valid refs/main but missing snapshot directory returns None."""
+        entry = tmp_path / "models--mlx-community--Qwen3-8B"
+        refs = entry / "refs"
+        refs.mkdir(parents=True)
+        (refs / "main").write_text("deadbeef")
+        assert _resolve_hf_cache_entry(entry) is None
+
+    def test_resolve_strips_whitespace_from_refs(self, tmp_path):
+        """Trailing newline in refs/main is stripped (matches real HF cache)."""
+        entry = tmp_path / "models--mlx-community--Qwen3-8B"
+        refs = entry / "refs"
+        refs.mkdir(parents=True)
+        (refs / "main").write_text("abc123\n")
+        snapshot = entry / "snapshots" / "abc123"
+        snapshot.mkdir(parents=True)
+
+        result = _resolve_hf_cache_entry(entry)
+        assert result is not None
+        assert result[0] == snapshot
+
+    # --- discover_models integration tests ---
+
+    def test_discover_hf_cache_model(self, tmp_path):
+        """HF cache entries are discovered as models."""
+        self._make_hf_cache_model(tmp_path, "mlx-community", "Qwen3-8B-4bit")
+
+        models = discover_models(tmp_path)
+        assert len(models) == 1
+        assert "Qwen3-8B-4bit" in models
+        assert models["Qwen3-8B-4bit"].model_type == "llm"
+
+    def test_discover_multiple_hf_cache_models(self, tmp_path):
+        """Multiple HF cache entries are all discovered."""
+        self._make_hf_cache_model(tmp_path, "mlx-community", "Qwen3-8B-4bit")
+        self._make_hf_cache_model(tmp_path, "mlx-community", "Mistral-7B-v0.3")
+
+        models = discover_models(tmp_path)
+        assert len(models) == 2
+        assert "Qwen3-8B-4bit" in models
+        assert "Mistral-7B-v0.3" in models
+
+    def test_hf_cache_model_path_points_to_snapshot(self, tmp_path):
+        """model_path points to the snapshot dir, not the cache entry."""
+        self._make_hf_cache_model(tmp_path, "mlx-community", "Qwen3-8B-4bit")
+
+        models = discover_models(tmp_path)
+        assert models["Qwen3-8B-4bit"].model_path == str(
+            tmp_path / "models--mlx-community--Qwen3-8B-4bit" / "snapshots" / "abc123def456"
+        )
+
+    def test_hf_cache_without_config_json_skipped(self, tmp_path):
+        """HF cache entries without config.json in snapshot are skipped."""
+        entry = tmp_path / "models--mlx-community--NoConfig"
+        refs = entry / "refs"
+        refs.mkdir(parents=True)
+        (refs / "main").write_text("abc123")
+        snapshot = entry / "snapshots" / "abc123"
+        snapshot.mkdir(parents=True)
+
+        models = discover_models(tmp_path)
+        assert len(models) == 0
+
+    def test_mixed_flat_and_hf_cache(self, tmp_path):
+        """Mix of flat models and HF cache entries."""
+        self._make_model(tmp_path / "mistral-7b")
+        self._make_hf_cache_model(tmp_path, "mlx-community", "Qwen3-8B-4bit")
+
+        models = discover_models(tmp_path)
+        assert len(models) == 2
+        assert "mistral-7b" in models
+        assert "Qwen3-8B-4bit" in models
+
+    def test_mixed_org_and_hf_cache(self, tmp_path):
+        """Mix of org folders and HF cache entries."""
+        self._make_model(tmp_path / "Qwen" / "Qwen3-8B", model_type="qwen2")
+        self._make_hf_cache_model(tmp_path, "mlx-community", "Mistral-7B")
+
+        models = discover_models(tmp_path)
+        assert len(models) == 2
+        assert "Qwen3-8B" in models
+        assert "Mistral-7B" in models
+
+    def test_hf_cache_does_not_fall_through_to_org_scan(self, tmp_path):
+        """HF cache entries don't get scanned as org folders."""
+        self._make_hf_cache_model(tmp_path, "mlx-community", "Qwen3-8B-4bit")
+
+        models = discover_models(tmp_path)
+        assert len(models) == 1
+        assert "Qwen3-8B-4bit" in models
