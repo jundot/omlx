@@ -8,12 +8,14 @@ for XLMRoBERTa and BERT embedding models.
 """
 
 import json
+import inspect
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +126,8 @@ class MLXEmbeddingModel:
                         weights[key] = f.get_tensor(key)
 
             weights = model_instance.sanitize(weights)
-            model_instance.load_weights(list(weights.items()))
+            self._validate_native_weights(model_instance, weights)
+            model_instance.load_weights(list(weights.items()), strict=False)
             mx.eval(model_instance.parameters())
 
             try:
@@ -209,16 +212,77 @@ class MLXEmbeddingModel:
             "(text_embeds, pooler_output, or last_hidden_state)"
         )
 
+    def _validate_native_weights(
+        self, model_instance, weights: Dict[str, Any]
+    ) -> None:
+        """Reject native checkpoints with missing or shape-incompatible core weights."""
+        expected_weights = dict(tree_flatten(model_instance.parameters()))
+        expected_weight_names = set(expected_weights.keys())
+        provided_weight_names = set(weights.keys())
+        missing_weight_names = expected_weight_names - provided_weight_names
+
+        optional_missing_prefixes = ("pooler.",)
+        required_missing = sorted(
+            name
+            for name in missing_weight_names
+            if not name.startswith(optional_missing_prefixes)
+        )
+        if required_missing:
+            preview = ", ".join(required_missing[:10])
+            suffix = "..." if len(required_missing) > 10 else ""
+            raise ValueError(
+                "Native embedding checkpoint is missing required weights: "
+                f"{preview}{suffix}"
+            )
+
+        shape_mismatches = []
+        for name in expected_weight_names & provided_weight_names:
+            expected_shape = tuple(expected_weights[name].shape)
+            provided_shape = tuple(weights[name].shape)
+            if expected_shape != provided_shape:
+                shape_mismatches.append((name, expected_shape, provided_shape))
+
+        if shape_mismatches:
+            preview = ", ".join(
+                f"{name}: expected {expected_shape}, got {provided_shape}"
+                for name, expected_shape, provided_shape in shape_mismatches[:5]
+            )
+            suffix = "..." if len(shape_mismatches) > 5 else ""
+            raise ValueError(
+                "Native embedding checkpoint has incompatible weight shapes: "
+                f"{preview}{suffix}"
+            )
+
     def _uses_custom_embedding_inputs(self, processor) -> bool:
         """Return True when processor exposes a custom embedding input API."""
-        return hasattr(processor, "prepare_embedding_inputs") or hasattr(
-            processor, "prepare_model_inputs"
-        )
+        for attr_name in ("prepare_embedding_inputs", "prepare_model_inputs"):
+            try:
+                inspect.getattr_static(processor, attr_name)
+                return True
+            except AttributeError:
+                continue
+        return False
+
+    def _normalize_embedding_inputs(
+        self,
+        inputs: Union[str, Dict[str, str], List[str], List[Dict[str, str]]],
+    ) -> List[Dict[str, str]]:
+        """Normalize embedding inputs into item dicts."""
+        if not inputs:
+            return []
+        if isinstance(inputs, str):
+            return [{"text": inputs}]
+        if isinstance(inputs, dict):
+            return [dict(inputs)]
+        first = inputs[0]
+        if isinstance(first, str):
+            return [{"text": text} for text in inputs]
+        return [dict(item) for item in inputs]
 
     def _prepare_embedding_inputs(
         self,
         processor,
-        texts: List[str],
+        inputs: Union[List[str], List[Dict[str, str]]],
         max_length: int,
         padding: bool,
         truncation: bool,
@@ -231,20 +295,28 @@ class MLXEmbeddingModel:
         ``processor(texts, ...)`` path. Reuse that official extension point
         when available to avoid positional-argument mismatches.
         """
+        normalized_inputs = self._normalize_embedding_inputs(inputs)
+
         if self._uses_custom_embedding_inputs(processor):
-            items = [{"text": text} for text in texts]
             if hasattr(processor, "prepare_embedding_inputs"):
                 return processor.prepare_embedding_inputs(
-                    items, return_tensors="mlx"
+                    normalized_inputs, return_tensors="mlx"
                 )
-            return processor.prepare_model_inputs(items, return_tensors="mlx")
+            return processor.prepare_model_inputs(
+                normalized_inputs, return_tensors="mlx"
+            )
+
+        if any("image" in item for item in normalized_inputs):
+            raise ValueError(
+                f"Embedding model '{self.model_name}' does not support image inputs"
+            )
 
         from mlx_embeddings.utils import prepare_inputs
 
         return prepare_inputs(
             processor,
             None,
-            texts,
+            [item.get("text", "") for item in normalized_inputs],
             max_length,
             padding,
             truncation,
@@ -284,7 +356,7 @@ class MLXEmbeddingModel:
 
     def embed(
         self,
-        texts: List[str],
+        inputs: Union[str, List[str], List[Dict[str, str]]],
         max_length: int = 512,
         padding: bool = True,
         truncation: bool = True,
@@ -304,21 +376,27 @@ class MLXEmbeddingModel:
         if not self._loaded:
             self.load()
 
-        if isinstance(texts, str):
-            texts = [texts]
+        normalized_inputs = self._normalize_embedding_inputs(inputs)
+        input_texts = [item["text"] for item in normalized_inputs if "text" in item]
+        has_image_inputs = any("image" in item for item in normalized_inputs)
 
         processor = self.processor
-        if hasattr(processor, "_tokenizer") and not self._uses_custom_embedding_inputs(
-            processor
-        ):
+        uses_custom_embedding_inputs = self._uses_custom_embedding_inputs(processor)
+        if hasattr(processor, "_tokenizer") and not uses_custom_embedding_inputs:
             processor = processor._tokenizer
 
+        if has_image_inputs and (self._using_native or not uses_custom_embedding_inputs):
+            raise ValueError(
+                f"Embedding model '{self.model_name}' does not support image inputs"
+            )
+
         embeddings_array = None
+        total_tokens: Optional[int] = None
 
         if self._using_native:
             if hasattr(processor, "__call__"):
                 encoded = processor(
-                    texts,
+                    input_texts,
                     padding=padding,
                     truncation=truncation,
                     max_length=max_length,
@@ -329,7 +407,7 @@ class MLXEmbeddingModel:
             else:
                 encoded_ids = []
                 masks = []
-                for text in texts:
+                for text in input_texts:
                     enc = processor.encode(text, add_special_tokens=True)
                     ids = list(enc.ids)[:max_length]
                     encoded_ids.append(ids)
@@ -344,18 +422,22 @@ class MLXEmbeddingModel:
 
             outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
             embeddings_array = self._extract_embeddings_array(outputs)
+            total_tokens = self._count_prepared_tokens(
+                {"attention_mask": attention_mask, "input_ids": input_ids}
+            )
         else:
             if self._is_compiled and self._compiled_embed is not None:
                 try:
                     inputs = self._prepare_embedding_inputs(
                         processor,
-                        texts,
+                        normalized_inputs,
                         max_length,
                         padding,
                         truncation,
                     )
                     if not isinstance(inputs, dict):
                         inputs = dict(inputs)
+                    total_tokens = self._count_prepared_tokens(inputs)
                     embeddings_array = self._compiled_embed(inputs)
                 except Exception as e:
                     logger.warning(
@@ -366,10 +448,10 @@ class MLXEmbeddingModel:
                     self._compiled_embed = None
 
             if embeddings_array is None:
-                if self._uses_custom_embedding_inputs(processor):
+                if uses_custom_embedding_inputs:
                     inputs = self._prepare_embedding_inputs(
                         processor,
-                        texts,
+                        normalized_inputs,
                         max_length,
                         padding,
                         truncation,
@@ -377,13 +459,14 @@ class MLXEmbeddingModel:
                     if not isinstance(inputs, dict):
                         inputs = dict(inputs)
                     outputs = self.model(**inputs)
+                    total_tokens = self._count_prepared_tokens(inputs)
                 else:
                     from mlx_embeddings import generate
 
                     outputs = generate(
                         self.model,
                         processor,
-                        texts,
+                        input_texts,
                         max_length=max_length,
                         padding=padding,
                         truncation=truncation,
@@ -392,7 +475,8 @@ class MLXEmbeddingModel:
 
         mx.eval(embeddings_array)
         embeddings = embeddings_array.tolist()
-        total_tokens = self._count_tokens(texts)
+        if total_tokens is None:
+            total_tokens = self._count_tokens(normalized_inputs)
         dimensions = len(embeddings[0]) if embeddings else 0
 
         return EmbeddingOutput(
@@ -401,12 +485,17 @@ class MLXEmbeddingModel:
             dimensions=dimensions,
         )
 
-    def _count_tokens(self, texts: List[str]) -> int:
+    def _count_tokens(
+        self, inputs: Union[List[str], List[Dict[str, str]]]
+    ) -> int:
         """Count total tokens in input texts."""
         total = 0
         processor = self.processor
 
-        for text in texts:
+        for item in self._normalize_embedding_inputs(inputs):
+            text = item.get("text")
+            if not text:
+                continue
             if hasattr(processor, "encode"):
                 tokens = processor.encode(text, add_special_tokens=True)
                 if isinstance(tokens, list):
@@ -427,6 +516,37 @@ class MLXEmbeddingModel:
                 total += len(text.split()) + 2
 
         return total
+
+    def _count_prepared_tokens(self, prepared_inputs: Dict[str, Any]) -> int:
+        """Count tokens from prepared model inputs, including multimodal tokens."""
+        attention_mask = prepared_inputs.get("attention_mask")
+        if attention_mask is not None:
+            try:
+                return int(mx.sum(attention_mask).item())
+            except Exception:
+                pass
+            if isinstance(attention_mask, list):
+                return int(sum(sum(row) if isinstance(row, list) else row for row in attention_mask))
+            if hasattr(attention_mask, "tolist"):
+                values = attention_mask.tolist()
+                if values and isinstance(values[0], list):
+                    return int(sum(sum(row) for row in values))
+                return int(sum(values))
+
+        input_ids = prepared_inputs.get("input_ids")
+        if input_ids is None:
+            return 0
+        if hasattr(input_ids, "shape"):
+            if len(input_ids.shape) == 0:
+                return 1
+            if len(input_ids.shape) == 1:
+                return int(input_ids.shape[0])
+            return int(input_ids.shape[0] * input_ids.shape[1])
+        if isinstance(input_ids, list):
+            if input_ids and isinstance(input_ids[0], list):
+                return int(sum(len(row) for row in input_ids))
+            return int(len(input_ids))
+        return 0
 
     @property
     def hidden_size(self) -> Optional[int]:
