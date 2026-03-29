@@ -255,6 +255,7 @@ class EngineCore:
         vlm_image_hash: Optional[str] = None,
         specprefill: Optional[bool] = None,
         specprefill_keep_pct: Optional[float] = None,
+        specprefill_threshold: Optional[int] = None,
         specprefill_system_end: Optional[int] = None,
     ) -> str:
         """
@@ -271,6 +272,7 @@ class EngineCore:
             vlm_image_hash: SHA256 hash of images for prefix cache
             specprefill: Per-request SpecPrefill override (True/False/None)
             specprefill_keep_pct: Per-request keep rate override
+            specprefill_threshold: Per-request threshold override (min tokens)
 
         Returns:
             The request ID
@@ -301,6 +303,8 @@ class EngineCore:
             request._specprefill_enabled = True
         if specprefill_keep_pct is not None:
             request._specprefill_keep_pct = specprefill_keep_pct
+        if specprefill_threshold is not None:
+            request._specprefill_threshold = specprefill_threshold
         if specprefill_system_end is not None and specprefill_system_end > 0:
             request.specprefill_system_end = specprefill_system_end
 

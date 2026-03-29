@@ -279,3 +279,69 @@ class TestRequestFields:
         assert r.specprefill_indices is None
         assert r.specprefill_total_tokens == 0
         assert r.specprefill_position_offset == 0
+
+
+class TestEngineCorePropagation:
+    """Tests for SpecPrefill param propagation through AsyncEngineCore.add_request."""
+
+    def _make_engine_core(self, draft_model=None):
+        """Create a minimal EngineCore for testing add_request propagation."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from omlx.engine_core import EngineCore
+
+        core = object.__new__(EngineCore)
+        core._output_collectors = {}
+        core._active_requests = {}
+        core._stream_states = {}
+        core._finished_events = {}
+
+        mock_scheduler = MagicMock(spec=[])
+        mock_scheduler._specprefill_draft_model = draft_model
+        core.scheduler = mock_scheduler
+
+        mock_config = MagicMock(spec=[])
+        mock_config.stream_interval = 0
+        core.config = mock_config
+
+        # _mlx_executor=None makes run_in_executor use the default pool
+        core._mlx_executor = None
+        # scheduler.add_request is a no-op for this test
+        mock_scheduler.add_request = MagicMock()
+        return core
+
+    @pytest.mark.asyncio
+    async def test_threshold_propagated_to_request(self):
+        """specprefill_threshold should be set on request._specprefill_threshold."""
+        from omlx.request import SamplingParams
+
+        core = self._make_engine_core(draft_model="/some/draft")
+
+        await core.add_request(
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(),
+            specprefill_threshold=4096,
+            specprefill_keep_pct=0.3,
+        )
+
+        # Retrieve the request passed to scheduler.add_request
+        req = core.scheduler.add_request.call_args[0][0]
+        assert req._specprefill_threshold == 4096
+        assert req._specprefill_keep_pct == 0.3
+        assert req._specprefill_enabled is True
+
+    @pytest.mark.asyncio
+    async def test_threshold_not_set_when_none(self):
+        """When specprefill_threshold is None, _specprefill_threshold should not exist."""
+        from omlx.request import SamplingParams
+
+        core = self._make_engine_core(draft_model=None)
+
+        await core.add_request(
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(),
+        )
+
+        req = core.scheduler.add_request.call_args[0][0]
+        assert not hasattr(req, "_specprefill_threshold")
+        assert not hasattr(req, "_specprefill_keep_pct")
