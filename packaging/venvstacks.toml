@@ -53,6 +53,10 @@ requirements = [
     "xgrammar>=0.1.32",
     # ModelScope SDK for downloading models from ModelScope Hub
     "modelscope>=1.10.0",
+    # python-multipart needed by audio routes (File/Form uploads)
+    "python-multipart>=0.0.5",
+    # NOTE: mlx-audio is installed separately with --no-deps in build.py
+    # to avoid mlx-lm version conflict (mlx-audio pins mlx-lm==0.31.1)
 ]
 platforms = [
     "macosx_arm64",

@@ -435,6 +435,18 @@ def build_venvstacks():
     if version_map and resolved_toml.exists():
         resolved_toml.unlink()
 
+    # Install mlx-audio with --no-deps to avoid mlx-lm version conflict
+    # (mlx-audio pins mlx-lm==0.31.1 but omlx uses a newer commit)
+    fw_python = (
+        EXPORT_DIR / "framework-mlx-framework" / "bin" / "python3"
+    )
+    if fw_python.exists():
+        print("\n  Installing mlx-audio (--no-deps)...")
+        run_cmd([
+            str(fw_python), "-m", "pip", "install",
+            "--no-deps", "mlx-audio==0.4.1",
+        ])
+
     return EXPORT_DIR
 
 

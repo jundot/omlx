@@ -28,7 +28,11 @@ class Omlx < Formula
     # Build Rust-based packages from source with headerpad to prevent
     # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths)
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
-    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken,tokenizers", "#{buildpath}[audio]"
+    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken,tokenizers", buildpath
+    # mlx-audio installed with --no-deps to avoid mlx-lm version conflict
+    # (mlx-audio pins mlx-lm==0.31.1 but omlx uses a newer commit)
+    system libexec/"bin/pip", "install", "--no-deps", "mlx-audio==0.4.1"
+    system libexec/"bin/pip", "install", "python-multipart>=0.0.5"
 
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end
