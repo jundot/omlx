@@ -460,7 +460,14 @@
                 </div>
             </div>
 
-            <div class="w-10"></div>
+            <button @click="systemPromptDraft = systemPrompt; showSystemPromptModal = true"
+                    class="p-2 hover:bg-surface-muted rounded-lg relative"
+                    style="color: var(--text-primary);"
+                    :title="window.t('chat.system_prompt.title')">
+                <i data-lucide="settings" class="w-5 h-5"></i>
+                <span x-show="systemPrompt.trim()" x-cloak
+                      class="absolute top-1 right-1 w-2 h-2 bg-accent rounded-full"></span>
+            </button>
         </header>
 
         <!-- Messages Area -->
@@ -665,6 +672,50 @@
         </button>
         <img :src="imageModal.src" @click.stop alt="Preview" x-show="imageModal.src">
     </div>
+
+    <!-- System Prompt Modal -->
+    <div x-show="showSystemPromptModal" x-cloak
+         class="fixed inset-0 bg-black/50 flex items-center justify-center z-[1000]"
+         @click="showSystemPromptModal = false"
+         @keydown.escape.window="showSystemPromptModal = false">
+        <div class="bg-surface rounded-2xl p-6 max-w-[500px] w-[90%] shadow-2xl" @click.stop>
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-bold" style="color: var(--text-primary);">
+                    {{ t('chat.system_prompt.title') }}
+                </h3>
+                <button @click="showSystemPromptModal = false" class="p-1 hover:bg-surface-muted rounded-lg" style="color: var(--text-tertiary);">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+            <p class="text-sm mb-3" style="color: var(--text-tertiary);">
+                {{ t('chat.system_prompt.description') }}
+            </p>
+            <textarea x-model="systemPromptDraft" rows="6"
+                      :placeholder="window.t('chat.system_prompt.placeholder')"
+                      class="w-full px-4 py-3 border border-line rounded-xl mb-4 focus:outline-none focus:border-line-strong resize-y"
+                      style="background: var(--bg-primary); color: var(--text-primary);"
+            ></textarea>
+            <div class="flex items-center justify-between">
+                <button @click="systemPromptDraft = ''; systemPrompt = ''; localStorage.removeItem('omlx_chat_system_prompt'); showSystemPromptModal = false"
+                        class="text-sm px-3 py-2 hover:bg-surface-muted rounded-lg"
+                        style="color: var(--text-tertiary);"
+                        x-show="systemPrompt.trim()">
+                    {{ t('chat.system_prompt.clear') }}
+                </button>
+                <div class="flex items-center gap-2 ml-auto">
+                    <button @click="showSystemPromptModal = false"
+                            class="px-4 py-2 text-sm rounded-xl hover:bg-surface-muted"
+                            style="color: var(--text-primary);">
+                        {{ t('chat.system_prompt.cancel') }}
+                    </button>
+                    <button @click="systemPrompt = systemPromptDraft; localStorage.setItem('omlx_chat_system_prompt', systemPrompt); showSystemPromptModal = false"
+                            class="px-4 py-2 text-sm bg-accent text-accent-fg rounded-xl hover:bg-accent-hover">
+                        {{ t('chat.system_prompt.save') }}
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
 {% endblock %}
 
@@ -745,6 +796,11 @@
 
             // VLM Detection State
             modelTypeMap: {},            // { modelId: "llm"|"vlm"|"embedding"|"reranker" }
+
+            // System Prompt
+            systemPrompt: localStorage.getItem('omlx_chat_system_prompt') || '',
+            showSystemPromptModal: false,
+            systemPromptDraft: '',
 
             async init() {
                 // Auto-inject API key from server (admin session already authenticated)
@@ -1024,6 +1080,7 @@
                 this.currentChatId = 'chat_' + Date.now();
                 this.messages = [];
                 this.uploadImages = [];
+                this.systemPrompt = localStorage.getItem('omlx_chat_system_prompt') || '';
                 this.sidebarOpen = window.innerWidth >= 768;
             },
 
@@ -1032,6 +1089,7 @@
                 if (chat) {
                     this.currentChatId = chatId;
                     this.messages = chat.messages || [];
+                    this.systemPrompt = chat.systemPrompt || '';
                     if (chat.model) {
                         this.currentModel = chat.model;
                     }
@@ -1066,6 +1124,7 @@
                     title,
                     messages: messagesForStorage,
                     model: this.currentModel,
+                    systemPrompt: this.systemPrompt,
                     updatedAt: new Date().toISOString()
                 };
 
@@ -1125,6 +1184,14 @@
                     role: msg.role,
                     content: msg.content
                 }));
+
+                // Prepend system prompt if set
+                if (this.systemPrompt.trim()) {
+                    messagesForApi.unshift({
+                        role: 'system',
+                        content: this.systemPrompt.trim()
+                    });
+                }
 
                 try {
                     const response = await fetch('/v1/chat/completions', {
