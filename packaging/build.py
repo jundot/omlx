@@ -435,7 +435,53 @@ def build_venvstacks():
     if version_map and resolved_toml.exists():
         resolved_toml.unlink()
 
+    # Install mlx-audio separately: build wheel from git, install --no-deps.
+    # mlx-audio pins mlx-lm==0.31.1 which conflicts with our git-pinned mlx-lm,
+    # so it can't go through venvstacks' uv resolver.
+    _install_mlx_audio(EXPORT_DIR)
+
     return EXPORT_DIR
+
+
+# mlx-audio git commit — aligned with pyproject.toml [audio] extra
+_MLX_AUDIO_GIT = "git+https://github.com/Blaizzy/mlx-audio@6408d2a410eb8c57464e07725b92271860199250"
+
+
+def _install_mlx_audio(export_dir: Path):
+    """Build mlx-audio wheel from git and install into exported framework."""
+    print("\n  Building mlx-audio from git...")
+    audio_wheels = SCRIPT_DIR / "_audio_wheels"
+    if audio_wheels.exists():
+        shutil.rmtree(audio_wheels)
+    audio_wheels.mkdir()
+
+    # Build wheel
+    run_cmd([
+        sys.executable, "-m", "pip", "wheel",
+        "--no-deps", "--wheel-dir", str(audio_wheels),
+        _MLX_AUDIO_GIT,
+    ])
+
+    # Install into framework site-packages
+    fw_site = (
+        export_dir
+        / "framework-mlx-framework"
+        / "lib"
+        / "python3.11"
+        / "site-packages"
+    )
+    if not fw_site.exists():
+        print(f"  ✗ site-packages not found: {fw_site}")
+        return
+
+    import zipfile
+    for whl in audio_wheels.glob("*.whl"):
+        print(f"    Installing {whl.name} (--no-deps)")
+        with zipfile.ZipFile(whl) as zf:
+            zf.extractall(fw_site)
+
+    shutil.rmtree(audio_wheels)
+    print("  ✓ mlx-audio installed")
 
 
 def _create_c_launcher(macos_dir: Path, app_name: str):
