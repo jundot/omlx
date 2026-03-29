@@ -22,7 +22,7 @@
                             </div>
                         </div>
 
-                        <div class="flex flex-wrap items-center gap-4 px-6 py-4">
+                        <div class="flex flex-wrap items-center gap-4 px-4 sm:px-6 py-4">
                             <!-- Lines input -->
                             <div class="flex items-center gap-2">
                                 <label class="text-sm text-neutral-600">{{ t('logs.lines_label') }}</label>
@@ -81,7 +81,7 @@
                             x-ref="logTextarea"
                             x-model="logContent"
                             readonly
-                            class="w-full h-[600px] px-4 py-4 bg-neutral-900 text-green-400 font-mono text-xs leading-relaxed resize-none focus:outline-none"
+                            class="w-full h-[400px] sm:h-[600px] px-4 py-4 bg-neutral-900 text-green-400 font-mono text-xs leading-relaxed resize-none focus:outline-none"
                             :placeholder="window.t('logs.placeholder')"
                         ></textarea>
                     </div>

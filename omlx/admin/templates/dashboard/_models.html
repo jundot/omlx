@@ -1,7 +1,7 @@
             <div x-show="mainTab === 'models'" x-cloak>
                 <div class="animate-fade-in-up">
                     <!-- Sub-tab navigation (Manager / Downloader) -->
-                    <div class="flex items-center gap-2 mb-10 animate-fade-in-up">
+                    <div class="flex flex-wrap items-center gap-2 mb-10 animate-fade-in-up">
                         <button
                             @click="setModelsTab('manager')"
                             :class="modelsTab === 'manager'
@@ -57,7 +57,7 @@
 
                         <!-- Local Models Section -->
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center justify-between px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="hard-drive" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.manager.local_models') }}</span>
@@ -78,7 +78,7 @@
                                     </div>
                                 </template>
                                 <template x-for="model in hfModels" :key="model.name">
-                                    <div class="px-6 py-3 flex items-center justify-between hover:bg-neutral-50 transition-colors">
+                                    <div class="px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 hover:bg-neutral-50 transition-colors">
                                         <div class="min-w-0 flex-1 flex items-center gap-2">
                                             <span class="text-sm font-medium text-neutral-900 truncate" x-text="model.name"></span>
                                             <template x-if="models.find(m => m.id === model.name)?.settings?.model_alias">
@@ -165,14 +165,14 @@
 
                         <!-- Download Form Section -->
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center justify-between px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="cloud-download" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.downloader.download_section') }}</span>
                                 </div>
                             </div>
                             <div class="px-6 py-5">
-                                <div class="flex items-end gap-4">
+                                <div class="flex flex-col sm:flex-row sm:items-end gap-4">
                                     <div class="flex-1">
                                         <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.downloader.repo_id') }}</label>
                                         <input type="text" x-model="hfRepoId"
@@ -183,7 +183,7 @@
                                                       bg-white font-mono text-xs"
                                         >
                                     </div>
-                                    <div class="w-48">
+                                    <div class="w-full sm:w-48">
                                         <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">
                                             {{ t('models.downloader.hf_token') }} <span class="text-neutral-400 normal-case">{{ t('models.downloader.hf_token_optional') }}</span>
                                         </label>
@@ -219,7 +219,7 @@
 
                         <!-- Search HuggingFace Section -->
                         <div class="bg-white rounded-2xl border border-neutral-200 mb-6">
-                            <div class="flex items-center gap-3 px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <i data-lucide="search" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.search.section_label') }}</span>
                             </div>
@@ -279,7 +279,7 @@
 
                         <!-- Model List Section (Trending / Popular / Search Results) -->
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center justify-between px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="star" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.browse.section_label') }}</span>
@@ -527,7 +527,7 @@
                         <!-- Download Queue Section -->
                         <template x-if="hfTasks.length > 0">
                             <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
-                                <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center justify-between px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                     <div class="flex items-center gap-3">
                                         <i data-lucide="list" class="w-4 h-4 text-neutral-500"></i>
                                         <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.queue.section_label') }}</span>
@@ -611,14 +611,14 @@
                                 <div>
                                     <!-- MS Download Form -->
                                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
-                                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                        <div class="flex items-center justify-between px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                             <div class="flex items-center gap-3">
                                                 <i data-lucide="cloud-download" class="w-4 h-4 text-neutral-500"></i>
                                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600" x-text="window.t('models.downloader.ms_download_section')"></span>
                                             </div>
                                         </div>
                                         <div class="px-6 py-5">
-                                            <div class="flex items-end gap-4">
+                                            <div class="flex flex-col sm:flex-row sm:items-end gap-4">
                                                 <div class="flex-1">
                                                     <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.downloader.repo_id') }}</label>
                                                     <input type="text" x-model="msRepoId"
@@ -628,7 +628,7 @@
                                                                   focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all
                                                                   bg-white font-mono text-xs">
                                                 </div>
-                                                <div class="w-48">
+                                                <div class="w-full sm:w-48">
                                                     <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">
                                                         <span x-text="window.t('models.downloader.ms_token')"></span>
                                                         <span class="text-neutral-400 normal-case" x-text="window.t('models.downloader.ms_token_optional')"></span>
@@ -664,7 +664,7 @@
 
                                     <!-- Search ModelScope Section -->
                                     <div class="bg-white rounded-2xl border border-neutral-200 mb-6">
-                                        <div class="flex items-center gap-3 px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                        <div class="flex items-center gap-3 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                             <i data-lucide="search" class="w-4 h-4 text-neutral-500"></i>
                                             <span class="text-xs font-bold uppercase tracking-wider text-neutral-600" x-text="window.t('models.search.ms_section_label')"></span>
                                         </div>
@@ -722,7 +722,7 @@
 
                                     <!-- MS Model List Section (Recommended / Search Results) -->
                                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
-                                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                        <div class="flex items-center justify-between px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                             <div class="flex items-center gap-3">
                                                 <i data-lucide="star" class="w-4 h-4 text-neutral-500"></i>
                                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.browse.section_label') }}</span>
@@ -947,7 +947,7 @@
                                     <!-- MS Download Queue -->
                                     <template x-if="msTasks.length > 0">
                                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
-                                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                            <div class="flex items-center justify-between px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                                 <div class="flex items-center gap-3">
                                                     <i data-lucide="list" class="w-4 h-4 text-neutral-500"></i>
                                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.queue.section_label') }}</span>
@@ -1033,7 +1033,7 @@
 
                         <!-- Quantization Form -->
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
-                            <div class="flex items-center gap-3 px-6 py-4 bg-neutral-50 border-b border-neutral-200">
+                            <div class="flex items-center gap-3 px-4 sm:px-6 py-4 bg-neutral-50 border-b border-neutral-200">
                                 <i data-lucide="sparkles" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.oq.form_section') }}</span>
                             </div>
@@ -1219,7 +1219,7 @@
                         <!-- oQ Queue Section -->
                         <template x-if="oqTasks.length > 0">
                             <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
-                                <div class="flex items-center gap-3 px-6 py-4 bg-neutral-50 border-b border-neutral-200">
+                                <div class="flex items-center gap-3 px-4 sm:px-6 py-4 bg-neutral-50 border-b border-neutral-200">
                                     <i data-lucide="list" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.oq.queue_section') }}</span>
                                 </div>
@@ -1431,7 +1431,7 @@
                                 <i data-lucide="key" class="w-4 h-4 text-neutral-400"></i>
                                 <span x-text="window.t('models.uploader.hf_token_label')"></span>
                             </h4>
-                            <div class="flex items-center gap-3">
+                            <div class="flex flex-col sm:flex-row sm:items-center gap-3">
                                 <div class="flex-1 relative">
                                     <input type="password"
                                            x-model="uploadHfToken"
@@ -1486,7 +1486,7 @@
                         <!-- oQ Models List -->
                         <div x-show="uploadTokenValidated" x-cloak>
                             <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
-                                <div class="px-6 py-4 border-b border-neutral-100 flex items-center justify-between">
+                                <div class="px-4 sm:px-6 py-4 border-b border-neutral-100 flex items-center justify-between">
                                     <h4 class="text-sm font-semibold text-neutral-900 flex items-center gap-2">
                                         <i data-lucide="package" class="w-4 h-4 text-neutral-400"></i>
                                         <span x-text="window.t('models.uploader.oq_models_label')"></span>
@@ -1506,7 +1506,7 @@
                                 <!-- Model list -->
                                 <div x-show="uploadOqModels.length > 0">
                                     <template x-for="model in uploadOqModels" :key="model.path">
-                                        <div class="px-6 py-3.5 border-b border-neutral-50 last:border-b-0 flex items-center justify-between
+                                        <div class="px-4 sm:px-6 py-3.5 border-b border-neutral-50 last:border-b-0 flex items-center justify-between
                                                     hover:bg-neutral-50 transition-colors">
                                             <div class="flex-1 min-w-0">
                                                 <div class="text-sm font-medium text-neutral-900 truncate" x-text="model.name"></div>
@@ -1527,15 +1527,15 @@
                         <!-- Upload Queue -->
                         <div x-show="uploadTasks.length > 0" x-cloak>
                             <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                                <div class="px-6 py-4 border-b border-neutral-100">
+                                <div class="px-4 sm:px-6 py-4 border-b border-neutral-100">
                                     <h4 class="text-sm font-semibold text-neutral-900 flex items-center gap-2">
                                         <i data-lucide="list" class="w-4 h-4 text-neutral-400"></i>
                                         <span x-text="window.t('models.uploader.queue_section')"></span>
                                     </h4>
                                 </div>
                                 <template x-for="task in uploadTasks" :key="task.task_id">
-                                    <div class="px-6 py-4 border-b border-neutral-50 last:border-b-0">
-                                        <div class="flex items-center justify-between mb-2">
+                                    <div class="px-4 sm:px-6 py-4 border-b border-neutral-50 last:border-b-0">
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-2">
                                             <div class="flex-1 min-w-0">
                                                 <div class="text-sm font-medium text-neutral-900 truncate" x-text="task.model_name"></div>
                                                 <div class="text-xs text-neutral-400 mt-0.5 flex items-center gap-2">

@@ -15,6 +15,9 @@
             // Theme
             theme: localStorage.getItem('omlx-chat-theme') || 'light',
 
+            // Mobile menu
+            mobileMenuOpen: false,
+
             // Main tab state (Status, Settings, or Logs)
             mainTab: 'status',
 

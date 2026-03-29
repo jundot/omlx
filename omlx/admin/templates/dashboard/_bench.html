@@ -10,12 +10,32 @@
             </th>
             {% endmacro %}
             <div x-show="mainTab === 'bench'" x-cloak>
+                <!-- Sub-tab navigation -->
+                <div class="flex flex-wrap items-center gap-2 mb-10 animate-fade-in-up">
+                    <button
+                        @click="setBenchTab('throughput')"
+                        :class="benchTab === 'throughput'
+                            ? 'bg-neutral-900 text-white'
+                            : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
+                        class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
+                        {{ t('navbar.dropdown.performance') }}
+                    </button>
+                    <button
+                        @click="setBenchTab('accuracy')"
+                        :class="benchTab === 'accuracy'
+                            ? 'bg-neutral-900 text-white'
+                            : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
+                        class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
+                        {{ t('navbar.dropdown.accuracy') }}
+                    </button>
+                </div>
+
                 <!-- Throughput tab -->
                 <div x-show="benchTab === 'throughput'" x-cloak>
                 <div class="animate-fade-in-up">
                     <!-- Header -->
                     <div class="mb-8">
-                        <div class="flex items-center justify-between">
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
                             <div>
                                 <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('bench.section_label') }}</h2>
                                 <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('bench.heading') }}</h3>
@@ -104,8 +124,8 @@
 
                     <!-- Progress Section -->
                     <div x-show="benchRunning && benchProgress" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
-                        <div class="px-6 py-4">
-                            <div class="flex items-center justify-between mb-3">
+                        <div class="px-4 sm:px-6 py-4">
+                            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-3">
                                 <span class="text-sm font-medium text-neutral-700" x-text="benchProgress?.message || window.t('bench.progress.preparing')"></span>
                                 <div class="flex items-center gap-3">
                                     <span class="text-sm text-neutral-500" x-text="benchProgress?.current + ' / ' + benchProgress?.total"></span>

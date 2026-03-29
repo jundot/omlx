@@ -1,12 +1,12 @@
             <div x-show="mainTab === 'status'" x-cloak>
                 <div class="animate-fade-in-up">
                     <!-- Serving Stats Header -->
-                    <div class="flex items-end justify-between mb-8">
+                    <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 mb-8">
                         <div>
                             <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('status.section_label') }}</h2>
                             <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('status.heading') }}</h3>
                         </div>
-                        <div class="flex items-center gap-2">
+                        <div class="flex flex-wrap items-center gap-2">
                             <!-- Scope toggle -->
                             <div class="flex rounded-lg border border-neutral-200 overflow-hidden">
                                 <button @click="statsScope = 'session'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
@@ -54,9 +54,9 @@
                     </div>
 
                     <!-- Three Stat Cards -->
-                    <div class="grid grid-cols-3 gap-6 mb-8">
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 sm:gap-6 mb-8">
                         <!-- Total Prefill Tokens -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 p-8 text-center">
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.total_tokens') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
                                :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"
@@ -64,7 +64,7 @@
                         </div>
 
                         <!-- Cached Tokens Served -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 p-8 text-center">
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cached_tokens') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
                                :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"
@@ -72,7 +72,7 @@
                         </div>
 
                         <!-- Cache Efficiency -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 p-8 text-center">
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cache_efficiency') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
                                :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency)"
@@ -88,7 +88,7 @@
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.speed.section_label') }}</span>
                             </div>
                         </div>
-                        <div class="grid grid-cols-2 divide-x divide-neutral-100">
+                        <div class="grid grid-cols-1 sm:grid-cols-2 sm:divide-x divide-neutral-100">
                             <div class="p-6">
                                 <p class="text-xs text-neutral-500 mb-1">{{ t('status.speed.prompt_processing') }} <span class="text-neutral-400">{{ t('status.speed.prompt_processing_note') }}</span></p>
                                 <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_prefill_tps.toFixed(1) + ' tok/s'"></p>
@@ -102,7 +102,7 @@
 
                     <!-- Active Models -->
                     <div class="bg-white rounded-2xl border border-neutral-200 mb-8">
-                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.active_models.section_label') }}</span>
@@ -338,7 +338,7 @@
                             </div>
                         </div>
                         <div class="divide-y divide-neutral-100">
-                            <div class="flex items-center justify-between px-6 py-4">
+                            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                 <label class="text-sm text-neutral-700 font-medium">{{ t('status.api.openai') }}</label>
                                 <div class="flex items-center gap-2">
                                     <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
@@ -353,7 +353,7 @@
                                     </button>
                                 </div>
                             </div>
-                            <div class="flex items-center justify-between px-6 py-4">
+                            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                 <label class="text-sm text-neutral-700 font-medium">{{ t('status.api.claude') }}</label>
                                 <div class="flex items-center gap-2">
                                     <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
@@ -380,9 +380,9 @@
                             </div>
                         </div>
                         <div class="px-6 py-5">
-                            <div class="flex gap-4 items-start">
+                            <div class="flex flex-col sm:flex-row gap-4 items-start">
                                 <!-- Left: Mode Toggle -->
-                                <div class="w-48 flex-shrink-0">
+                                <div class="w-full sm:w-48 sm:flex-shrink-0">
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('status.claude_code.mode') }}</label>
                                     <div class="flex items-center gap-3">
                                         <button type="button"
@@ -422,7 +422,7 @@
                                     <i data-lucide="alert-triangle" class="w-3.5 h-3.5 flex-shrink-0"></i>
                                     <span>{{ t('status.claude_code.no_models_warning') }}</span>
                                 </div>
-                                <div class="grid grid-cols-3 gap-4">
+                                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                                     <!-- Opus tier -->
                                     <div>
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.claude_code.opus_tier') }}</label>
@@ -483,7 +483,7 @@
 
                             <!-- Context Scaling for Claude Code -->
                             <div class="mt-4 pt-4 border-t border-neutral-100">
-                                <div class="flex gap-4 items-center">
+                                <div class="flex flex-col sm:flex-row gap-4 sm:items-center">
                                     <div class="flex items-center gap-3">
                                         <label class="text-xs font-bold uppercase tracking-wider text-neutral-500">{{ t('status.claude_code.context_scaling') }}</label>
                                         <button type="button"
@@ -525,8 +525,8 @@
                                     <span class="text-base font-bold text-neutral-800">Codex</span>
                                     <span class="text-xs text-neutral-400">OpenAI Codex CLI</span>
                                 </div>
-                                <div class="flex gap-4 items-start">
-                                    <div class="w-64 flex-shrink-0">
+                                <div class="flex flex-col sm:flex-row gap-4 items-start">
+                                    <div class="w-full sm:w-64 sm:flex-shrink-0">
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
                                         <select x-model="globalSettings.integrations.codex_model"
                                                 @change="globalSettings.integrations.codex_model = globalSettings.integrations.codex_model || null; saveIntegrationSettings()"
@@ -569,8 +569,8 @@
                                     <span class="text-base font-bold text-neutral-800">OpenCode</span>
                                     <span class="text-xs text-neutral-400">{{ t('status.integrations.opencode_desc') }}</span>
                                 </div>
-                                <div class="flex gap-4 items-start">
-                                    <div class="w-64 flex-shrink-0">
+                                <div class="flex flex-col sm:flex-row gap-4 items-start">
+                                    <div class="w-full sm:w-64 sm:flex-shrink-0">
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
                                         <select x-model="globalSettings.integrations.opencode_model"
                                                 @change="globalSettings.integrations.opencode_model = globalSettings.integrations.opencode_model || null; saveIntegrationSettings()"
@@ -613,8 +613,8 @@
                                     <span class="text-base font-bold text-neutral-800">OpenClaw</span>
                                     <span class="text-xs text-neutral-400">{{ t('status.integrations.openclaw_desc') }}</span>
                                 </div>
-                                <div class="flex gap-4 items-start">
-                                    <div class="w-48 flex-shrink-0">
+                                <div class="flex flex-col sm:flex-row gap-4 items-start">
+                                    <div class="w-full sm:w-48 sm:flex-shrink-0">
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
                                         <select x-model="globalSettings.integrations.openclaw_model"
                                                 @change="globalSettings.integrations.openclaw_model = globalSettings.integrations.openclaw_model || null; saveIntegrationSettings()"
@@ -631,7 +631,7 @@
                                             <span>{{ t('status.integrations.model_unavailable') }}</span>
                                         </div>
                                     </div>
-                                    <div class="w-36 flex-shrink-0">
+                                    <div class="w-full sm:w-36 sm:flex-shrink-0">
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.openclaw_tools_profile') }}</label>
                                         <select x-model="globalSettings.integrations.openclaw_tools_profile"
                                                 @change="saveIntegrationSettings()"

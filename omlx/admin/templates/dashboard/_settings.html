@@ -45,7 +45,7 @@
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <label class="text-sm text-neutral-700">{{ t('settings.language.label') }}</label>
                                     <select x-model="globalSettings.ui.language"
                                             @change="saveLanguage(globalSettings.ui.language)"
@@ -69,14 +69,14 @@
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.auth.base_path') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.auth.base_path_hint') }}</p>
                                     </div>
                                     <span class="text-sm text-neutral-700 font-mono" x-text="globalSettings.base_path || '~/.omlx'"></span>
                                 </div>
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.auth.api_key') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.auth.api_key_hint') }}</p>
@@ -85,7 +85,7 @@
                                         <input :type="showApiKey ? 'text' : 'password'"
                                                x-model="globalSettings.auth.api_key"
                                                placeholder="{{ t('settings.auth.api_key_placeholder') }}"
-                                               class="w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                               class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                         <button type="button" @click="showApiKey = !showApiKey"
                                                 class="p-2 rounded-lg hover:bg-neutral-100 transition-colors text-neutral-400 hover:text-neutral-600"
                                                 title="{{ t('settings.auth.toggle_visibility_tooltip') }}">
@@ -98,7 +98,7 @@
                                         </button>
                                     </div>
                                 </div>
-                                <div class="flex items-center justify-between px-6 py-4"
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4"
                                      x-show="globalSettings.server.host === '127.0.0.1'" x-cloak>
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.auth.skip_verification') }}</label>
@@ -128,10 +128,10 @@
 
                                     <!-- New Sub Key Form -->
                                     <div x-show="showNewSubKeyForm" x-cloak class="mb-3 p-3 bg-neutral-50 rounded-xl border border-neutral-200">
-                                        <div class="flex gap-2 mb-2">
+                                        <div class="flex flex-col sm:flex-row gap-2 mb-2">
                                             <input type="text" x-model="newSubKeyName"
                                                    placeholder="{{ t('settings.auth.sub_keys_name_placeholder') }}"
-                                                   class="w-1/3 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                                   class="w-full sm:w-1/3 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                                             <input :type="showNewSubKey ? 'text' : 'password'" x-model="newSubKeyValue"
                                                    placeholder="{{ t('settings.auth.sub_keys_key_placeholder') }}"
                                                    class="flex-1 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent font-mono">
@@ -200,7 +200,7 @@
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
-                                <div class="flex items-center justify-between px-6 py-4"
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4"
                                      x-data="{
                                          _mode: (globalSettings.server.host === '127.0.0.1' || globalSettings.server.host === '0.0.0.0') ? null : 'custom',
                                          get hostMode() {
@@ -229,23 +229,23 @@
                                         </select>
                                         <input x-show="hostMode === 'custom'" x-cloak
                                                type="text" x-model="globalSettings.server.host" placeholder="{{ t('settings.server.host_placeholder') }}"
-                                               class="w-40 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                               class="w-full sm:w-40 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                     </div>
                                 </div>
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.server.port') }}</label>
                                         <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.global.restart_badge') }}</span>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.server.port"
-                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                           class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.server.log_level') }}</label>
                                     </div>
                                     <select x-model="globalSettings.server.log_level"
-                                            class="w-48 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                            class="w-full sm:w-48 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                         <option value="error">{{ t('settings.server.log_level_error') }}</option>
                                         <option value="warning">{{ t('settings.server.log_level_warning') }}</option>
                                         <option value="info">{{ t('settings.server.log_level_info') }}</option>
@@ -265,7 +265,7 @@
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.model.model_fallback') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.model.model_fallback_desc') }}</p>
@@ -320,7 +320,7 @@
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <!-- Memory Guard -->
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.resource.prefill_memory_guard') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.prefill_memory_guard_description') }}</p>
@@ -334,7 +334,7 @@
                                     </button>
                                 </div>
                                 <!-- Memory Limit (Total) -->
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.resource.memory_limit_total') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">
@@ -345,7 +345,7 @@
                                             {{ t('settings.resource.memory_limit_total_disabled') }}
                                         </p>
                                     </div>
-                                    <div class="flex items-center gap-3">
+                                    <div class="flex flex-wrap items-center gap-2 sm:gap-3">
                                         <label class="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
                                             <input type="checkbox" x-model="processMemoryAuto"
                                                    @change="if(processMemoryAuto) { globalSettings.memory.max_process_memory = 'auto'; } else { updateProcessMemoryFromSlider(); }"
@@ -378,14 +378,14 @@
                                     </div>
                                 </div>
                                 <!-- Memory Limit (Models Only) -->
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.resource.memory_limit_models') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">
                                             {{ t('settings.resource.memory_limit_models_description') }}
                                         </p>
                                     </div>
-                                    <div class="flex items-center gap-3">
+                                    <div class="flex flex-wrap items-center gap-2 sm:gap-3">
                                         <label class="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
                                             <input type="checkbox" x-model="modelMemoryAuto"
                                                    @change="if(modelMemoryAuto) { memoryPercent = 90; updateMemoryFromSlider(); }"
@@ -418,7 +418,7 @@
                                     </div>
                                 </div>
                                 <!-- Memory Limit (In-Memory Hot Cache) -->
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.resource.hot_cache_limit') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">
@@ -427,7 +427,7 @@
                                             {{ t('settings.resource.hot_cache_zero_note') }} <strong>{{ t('settings.resource.hot_cache_disabled') }}</strong> {{ t('settings.resource.hot_cache_disabled_label') }}
                                         </p>
                                     </div>
-                                    <div class="flex items-center gap-3">
+                                    <div class="flex flex-wrap items-center gap-2 sm:gap-3">
                                         <input type="range" min="0" max="50" step="1"
                                                x-model.number="hotCachePercent"
                                                @input="updateHotCacheFromSlider()"
@@ -452,14 +452,14 @@
                                     </div>
                                 </div>
                                 <!-- SSD Cache Limit (Cold Cache) -->
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.resource.cold_cache_limit') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">
                                             {{ t('settings.resource.cold_cache_description') }}
                                         </p>
                                     </div>
-                                    <div class="flex items-center gap-3">
+                                    <div class="flex flex-wrap items-center gap-2 sm:gap-3">
                                         <input type="range" min="0" max="100" step="5"
                                                x-model.number="cachePercent"
                                                @input="updateCacheFromSlider()"
@@ -495,7 +495,7 @@
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.cache.enabled') }}</label>
                                     </div>
@@ -506,12 +506,12 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.cache.ssd_directory') }}</label>
                                     </div>
                                     <input type="text" x-model="globalSettings.cache.ssd_cache_dir"
-                                           class="w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                           class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                             </div>
                         </div>
@@ -525,20 +525,20 @@
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.generation.max_context_window') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.max_context_window_hint') }}</p>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.sampling.max_context_window" min="1" max="2097152"
-                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                           class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <label class="text-sm text-neutral-700">{{ t('settings.generation.max_tokens') }}</label>
                                     <input type="number" x-model.number="globalSettings.sampling.max_tokens" min="1" max="131072"
-                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                           class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.generation.temperature') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.temperature_hint') }}</p>
@@ -553,7 +553,7 @@
                                                class="w-20 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                     </div>
                                 </div>
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.generation.top_p') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.top_p_hint') }}</p>
@@ -568,21 +568,21 @@
                                                class="w-20 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                     </div>
                                 </div>
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.generation.top_k') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.top_k_hint') }}</p>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.sampling.top_k" min="0"
-                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                           class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.generation.repetition_penalty') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.repetition_penalty_hint') }}</p>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.sampling.repetition_penalty" step="0.05" min="1"
-                                           class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                           class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                             </div>
                         </div>
@@ -599,10 +599,10 @@
                                 </span>
                             </div>
                             <div class="divide-y divide-neutral-100">
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <label class="text-sm text-neutral-700">{{ t('settings.mcp.config_path') }}</label>
                                     <input type="text" x-model="globalSettings.mcp.config_path" placeholder="{{ t('settings.mcp.config_placeholder') }}"
-                                           class="w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                           class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                             </div>
                         </div>
@@ -633,21 +633,21 @@
                                         </div>
                                     </div>
                                     <div class="divide-y divide-neutral-100">
-                                        <div class="flex items-center justify-between px-6 py-4">
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                             <div>
                                                 <label class="text-sm text-neutral-700">{{ t('settings.advanced.max_sequences') }}</label>
                                                 <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.max_sequences_hint') }}</p>
                                             </div>
                                             <input type="number" x-model.number="globalSettings.scheduler.max_num_seqs"
-                                                   class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
-                                        <div class="flex items-center justify-between px-6 py-4">
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                             <div>
                                                 <label class="text-sm text-neutral-700">{{ t('settings.advanced.completion_batch_size') }}</label>
                                                 <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.completion_batch_size_hint') }}</p>
                                             </div>
                                             <input type="number" x-model.number="globalSettings.scheduler.completion_batch_size"
-                                                   class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                     </div>
                                     <!-- Cache subsection -->
@@ -658,14 +658,14 @@
                                         </div>
                                     </div>
                                     <div class="divide-y divide-neutral-100">
-                                        <div class="flex items-center justify-between px-6 py-4">
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                             <div>
                                                 <label class="text-sm text-neutral-700">{{ t('settings.advanced.initial_cache_blocks') }}</label>
                                                 <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.initial_cache_blocks_hint') }}</p>
                                             </div>
                                             <input type="number" x-model.number="globalSettings.cache.initial_cache_blocks"
                                                    min="1"
-                                                   class="w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                     </div>
                                 </div>
@@ -675,7 +675,7 @@
                     </div>
 
                     <!-- Save Button -->
-                    <div class="mt-10 flex items-center justify-between">
+                    <div class="mt-10 flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-4">
                         <div>
                             <!-- Success Message -->
                             <div x-show="saveSuccess" x-cloak
@@ -756,17 +756,18 @@
 
                     <!-- Model Table -->
                     <div x-show="!loadingModels && models.length > 0" class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <div class="overflow-x-auto">
                         <!-- Table Header -->
-                        <div class="flex items-center gap-4 px-6 py-3 bg-neutral-50 border-b border-neutral-200 text-xs font-bold uppercase tracking-wider text-neutral-500">
+                        <div class="flex items-center gap-4 px-4 sm:px-6 py-3 bg-neutral-50 border-b border-neutral-200 text-xs font-bold uppercase tracking-wider text-neutral-500">
                             <div class="flex-1 min-w-0 flex items-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('id')">
                                 {{ t('settings.models.table.model') }}
                                 <span x-show="sortBy === 'id'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
-                            <div class="w-20 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('type')">
+                            <div class="hidden sm:flex w-20 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('type')">
                                 {{ t('settings.models.table.type') }}
                                 <span x-show="sortBy === 'type'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
-                            <div class="w-20 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('size')">
+                            <div class="hidden sm:flex w-20 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('size')">
                                 {{ t('settings.models.table.size') }}
                                 <span x-show="sortBy === 'size'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
@@ -774,11 +775,11 @@
                                 {{ t('settings.models.table.status') }}
                                 <span x-show="sortBy === 'loaded'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
-                            <div class="w-12 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('pinned')">
+                            <div class="hidden sm:flex w-12 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('pinned')">
                                 {{ t('settings.models.table.pin') }}
                                 <span x-show="sortBy === 'pinned'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
-                            <div class="w-14 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_default')">
+                            <div class="hidden sm:flex w-14 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_default')">
                                 {{ t('settings.models.table.default') }}
                                 <span x-show="sortBy === 'is_default'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
@@ -796,7 +797,7 @@
                                             <div class="w-8 h-8 bg-neutral-100 rounded-lg flex items-center justify-center flex-shrink-0">
                                                 <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
                                             </div>
-                                            <p class="text-sm font-medium text-neutral-900 truncate" x-text="model.id"></p>
+                                            <p class="text-sm font-medium text-neutral-900 break-all sm:truncate" x-text="model.id"></p>
                                             <span x-show="model.settings?.model_alias" x-cloak
                                                   class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
                                                   x-text="model.settings?.model_alias"></span>
@@ -811,13 +812,13 @@
                                         </div>
 
                                         <!-- Type -->
-                                        <div class="w-20 text-center flex-shrink-0">
+                                        <div class="hidden sm:block w-20 text-center flex-shrink-0">
                                             <span class="px-2 py-0.5 text-xs font-medium rounded-full bg-neutral-100 text-neutral-600"
                                                   x-text="model.model_type || 'llm'"></span>
                                         </div>
 
                                         <!-- Size -->
-                                        <div class="w-20 text-center flex-shrink-0">
+                                        <div class="hidden sm:block w-20 text-center flex-shrink-0">
                                             <span class="text-sm text-neutral-600" x-text="model.estimated_size_formatted || '-'"></span>
                                         </div>
 
@@ -860,7 +861,7 @@
                                         </div>
 
                                         <!-- Pin Toggle -->
-                                        <div class="w-12 flex justify-center flex-shrink-0">
+                                        <div class="hidden sm:flex w-12 justify-center flex-shrink-0">
                                             <button
                                                 @click="updateModelSetting(model.id, 'is_pinned', !model.pinned)"
                                                 :class="model.pinned ? 'bg-black' : 'bg-neutral-200'"
@@ -874,7 +875,7 @@
                                         </div>
 
                                         <!-- Default Radio (only for LLM models) -->
-                                        <div class="w-14 flex justify-center flex-shrink-0">
+                                        <div class="hidden sm:flex w-14 justify-center flex-shrink-0">
                                             <template x-if="model.model_type === 'llm' || model.model_type === 'vlm' || !model.model_type">
                                                 <button
                                                     @click="updateModelSetting(model.id, 'is_default', true)"
@@ -973,6 +974,7 @@
                                     </div>
                                 </div>
                             </template>
+                        </div>
                         </div>
                     </div>
                 </div>
