@@ -55,6 +55,13 @@ requirements = [
     "modelscope>=1.10.0",
     # python-multipart needed by audio routes (File/Form uploads)
     "python-multipart>=0.0.5",
+    # mlx-audio runtime deps (mlx-audio itself installed --no-deps in build.py)
+    "scipy>=1.11.0",
+    "librosa>=0.10.0",
+    "miniaudio>=1.59",
+    "numba>=0.59.0",
+    "pyloudnorm>=0.1.0",
+    "sounddevice>=0.4.6",
     # NOTE: mlx-audio is built from git and installed with --no-deps in build.py
     # because mlx-audio pins mlx-lm==0.31.1 which conflicts with our git-pinned mlx-lm
 ]
@@ -72,6 +79,8 @@ dynlib_exclude = [
     "cv2/.dylibs/liblzma*",
     "cv2/.dylibs/libxcb*",
     "cv2/.dylibs/libXau*",
+    # torch's libomp conflicts with sklearn's — torch is stripped post-build anyway
+    "torch/lib/libomp*",
 ]
 
 [[applications]]
