@@ -245,6 +245,8 @@ class TestExtractTextContent:
         result = extract_text_content(messages)
 
         assert "Hello" in result[0]["content"]
+        # Ensure content is a string, not a list
+        assert isinstance(result[0]["content"], str)
 
     def test_none_content(self):
         """Test extracting message with None content."""
@@ -270,6 +272,25 @@ class TestExtractTextContent:
         assert result[0]["role"] == "user"  # Converted to user
         assert "call_123" in result[0]["content"]
         assert "success" in result[0]["content"]
+
+    def test_tool_response_message_with_content_part_list(self):
+        """Test extracting tool response with ContentPart list content."""
+        messages = [
+            Message(
+                role="tool",
+                content=[ContentPart(type="text", text='{"result": "success"}')],
+                tool_call_id="call_123",
+            )
+        ]
+
+        result = extract_text_content(messages)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"  # Converted to user
+        assert "call_123" in result[0]["content"]
+        assert "success" in result[0]["content"]
+        # Ensure content is a string, not a list
+        assert isinstance(result[0]["content"], str)
 
     def test_tool_response_fallback_preserves_role_boundary(self):
         """Fallback tool history must not merge into adjacent user turns."""
