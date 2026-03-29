@@ -31,8 +31,8 @@ dependencies = [
     "mlx>=0.31.1",
     # mlx-lm from latest commit (564281f)
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@564281f",
-    # mlx-embeddings from latest commit (6e2ef52)
-    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@6e2ef5256faadf1d79c3bf339686d43f8db17cdd",
+    # mlx-embeddings from latest commit (32981fa)
+    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # transformers version aligned with mlx-lm requirement
     # 5.4.0 broke VLM: Qwen2VLImageProcessor now hard-requires torch (#431)
     "transformers>=5.0.0,<5.4.0",
