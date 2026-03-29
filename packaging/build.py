@@ -440,6 +440,10 @@ def build_venvstacks():
     # so it can't go through venvstacks' uv resolver.
     _install_mlx_audio(EXPORT_DIR)
 
+    # Strip large packages that are only needed for model conversion / data
+    # loading, not inference. Saves ~780 MB in the app bundle.
+    _strip_unused_packages(EXPORT_DIR)
+
     return EXPORT_DIR
 
 
@@ -482,6 +486,58 @@ def _install_mlx_audio(export_dir: Path):
 
     shutil.rmtree(audio_wheels)
     print("  ✓ mlx-audio installed")
+
+
+# Packages to strip from the app bundle. These are transitive dependencies
+# pulled in by xgrammar (torch), modelscope (datasets→pyarrow/pandas), and
+# mlx-vlm (opencv) but are NOT needed for inference at runtime.
+_STRIP_PACKAGES = [
+    "torch",
+    "sympy",           # torch dep
+    "cv2",             # opencv-python, mlx-vlm only uses it for image loading (Pillow suffices)
+    "pyarrow",         # datasets dep
+    "pandas",          # datasets dep
+    "datasets",        # modelscope dep, not used at inference
+    # dist-info dirs (matched by prefix)
+]
+
+# Prefixes for dist-info directories to remove alongside the packages above.
+_STRIP_DIST_PREFIXES = [
+    "torch-", "sympy-", "opencv_python-", "pyarrow-", "pandas-", "datasets-",
+]
+
+
+def _strip_unused_packages(export_dir: Path):
+    """Remove large packages not needed for inference from exported framework."""
+    fw_site = (
+        export_dir
+        / "framework-mlx-framework"
+        / "lib"
+        / "python3.11"
+        / "site-packages"
+    )
+    if not fw_site.exists():
+        return
+
+    print("\n  Stripping unused packages from app bundle...")
+    saved = 0
+
+    for item in sorted(fw_site.iterdir()):
+        name = item.name
+        should_strip = (
+            name in _STRIP_PACKAGES
+            or any(name.startswith(p) for p in _STRIP_DIST_PREFIXES)
+        )
+        if should_strip and item.exists():
+            size = sum(f.stat().st_size for f in item.rglob("*") if f.is_file())
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+            saved += size
+            print(f"    Removed {name} ({size / 1024 / 1024:.0f} MB)")
+
+    print(f"  ✓ Stripped {saved / 1024 / 1024:.0f} MB total")
 
 
 def _create_c_launcher(macos_dir: Path, app_name: str):
