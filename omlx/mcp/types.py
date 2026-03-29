@@ -13,6 +13,7 @@ class MCPTransport(str, Enum):
     """Supported MCP transport types."""
     STDIO = "stdio"
     SSE = "sse"
+    STREAMABLE_HTTP = "streamable-http"
 
 
 class MCPServerState(str, Enum):
@@ -38,6 +39,9 @@ class MCPServerConfig:
     # For SSE transport
     url: Optional[str] = None
 
+    # For streamable-http transport
+    headers: Optional[Dict[str, str]] = None
+
     # Common options
     enabled: bool = True
     timeout: float = 30.0
@@ -53,6 +57,9 @@ class MCPServerConfig:
         elif self.transport == MCPTransport.SSE:
             if not self.url:
                 raise ValueError(f"MCP server '{self.name}': sse transport requires 'url'")
+        elif self.transport == MCPTransport.STREAMABLE_HTTP:
+            if not self.url:
+                raise ValueError(f"MCP server '{self.name}': streamable-http transport requires 'url''")
 
 
 @dataclass
