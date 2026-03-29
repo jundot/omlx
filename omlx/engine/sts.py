@@ -238,10 +238,10 @@ def _process_lfm2(model_and_processor, audio_path: str, **kwargs) -> bytes:
 
 
 _FAMILY_PROCESSORS = {
-    "deepfilternet": lambda model, path, **kw: _process_deepfilternet(model, path, **kw),
-    "mossformer2": lambda model, path, **kw: _process_mossformer2(model, path, **kw),
-    "sam_audio": lambda model, path, **kw: _process_sam_audio(model, path, **kw),
-    "lfm2": lambda model, path, **kw: _process_lfm2(model, path, **kw),
+    "deepfilternet": _process_deepfilternet,
+    "mossformer2": _process_mossformer2,
+    "sam_audio": _process_sam_audio,
+    "lfm2": _process_lfm2,
 }
 
 

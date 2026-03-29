@@ -22,13 +22,6 @@ class AudioTranscriptionRequest(BaseModel):
     temperature: Optional[float] = 0.0
 
 
-class AudioSegment(BaseModel):
-    id: int
-    start: float
-    end: float
-    text: str
-
-
 class AudioTranscriptionResponse(BaseModel):
     text: str
     language: Optional[str] = None

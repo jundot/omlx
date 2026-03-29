@@ -9,7 +9,6 @@ required. Integration tests (marked @pytest.mark.slow) need a real model.
 """
 
 import io
-import struct
 import wave
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -65,10 +64,22 @@ def _make_mock_pool(tts_engine=None, model_id: str = "qwen3-tts") -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
+def _ensure_audio_routes(app):
+    """Register audio routes if not already present (e.g., mlx-audio not installed)."""
+    from omlx.api.audio_routes import router as audio_router
+
+    audio_paths = {"/v1/audio/transcriptions", "/v1/audio/speech", "/v1/audio/process"}
+    existing = {getattr(r, "path", "") for r in app.routes}
+    if not audio_paths & existing:
+        app.include_router(audio_router)
+
+
 @pytest.fixture
 def server_tts_client():
     """TestClient using the full omlx server app with mocked TTS pool."""
     from omlx.server import app
+
+    _ensure_audio_routes(app)
 
     mock_pool = _make_mock_pool()
 

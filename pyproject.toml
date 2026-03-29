@@ -72,7 +72,7 @@ modelscope = [
     "modelscope>=1.10.0",
 ]
 audio = [
-    "mlx-audio>=0.4.0",
+    "mlx-audio==0.4.1",
     "python-multipart>=0.0.5",
 ]
 dev = [

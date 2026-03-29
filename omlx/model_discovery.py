@@ -204,11 +204,11 @@ def _build_audio_detection_sets():
         )
         return stt, tts, sts
 
-    except ImportError:
-        logger.debug("mlx-audio not installed — using static audio detection sets")
+    except Exception:
+        logger.debug("mlx-audio not available — using static audio detection sets")
         # Static fallback so model discovery still works without mlx-audio
         _stt = {"whisper", "qwen3_asr", "parakeet"}
-        _tts = {"qwen3_tts", "kokoro", "chatterbox"}
+        _tts = {"qwen3_tts", "kokoro", "chatterbox", "vibevoice", "vibevoice_streaming"}
         _sts = {"deepfilternet", "mossformer2_se", "sam_audio", "lfm_audio"}
         return _stt, _tts, _sts
 
