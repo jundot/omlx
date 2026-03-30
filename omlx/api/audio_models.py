@@ -32,7 +32,8 @@ class AudioTranscriptionResponse(BaseModel):
 class AudioSpeechRequest(BaseModel):
     model: str
     input: str
-    voice: Optional[str] = "default"
+    voice: Optional[str] = None
+    instructions: Optional[str] = None
     speed: Optional[float] = 1.0
     response_format: Optional[str] = "wav"
 

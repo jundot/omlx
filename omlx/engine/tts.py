@@ -116,6 +116,7 @@ class TTSEngine(BaseNonStreamingEngine):
         text: str,
         voice: Optional[str] = None,
         speed: float = 1.0,
+        instructions: Optional[str] = None,
         **kwargs,
     ) -> bytes:
         """
@@ -125,6 +126,7 @@ class TTSEngine(BaseNonStreamingEngine):
             text: Input text to synthesize
             voice: Optional voice/speaker identifier
             speed: Speech speed multiplier (1.0 = normal)
+            instructions: Optional voice description for instruct-capable models
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -150,17 +152,21 @@ class TTSEngine(BaseNonStreamingEngine):
                 "text": text,
                 "verbose": False,
             }
+            import inspect
+            gen_params = inspect.signature(model.generate).parameters
             if voice is not None:
-                # Route the voice value to the correct generate() parameter.
-                # Models like CustomVoice accept a speaker name via 'voice';
-                # VoiceDesign-only models accept a description via 'instruct'.
-                # When both exist, 'voice' takes priority (CustomVoice).
-                import inspect
-                gen_params = inspect.signature(model.generate).parameters
+                # Qwen3-TTS variants (Base/CustomVoice/VoiceDesign) share the
+                # same generate() signature with both 'voice' and 'instruct'.
+                # Pass voice to 'voice' kwarg when accepted. When no explicit
+                # instructions are given, also set 'instruct' as a fallback so
+                # VoiceDesign models (which require instruct) still work when
+                # users pass a voice description via the 'voice' API field.
                 if "voice" in gen_params:
                     gen_kwargs["voice"] = voice
-                elif "instruct" in gen_params:
+                if "instruct" in gen_params and instructions is None:
                     gen_kwargs["instruct"] = voice
+            if instructions is not None and "instruct" in gen_params:
+                gen_kwargs["instruct"] = instructions
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             gen_kwargs.update(kwargs)

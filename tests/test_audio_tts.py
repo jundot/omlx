@@ -255,15 +255,11 @@ class TestTTSVoiceRouting:
         import asyncio
         from omlx.engine.tts import TTSEngine
 
-        def _run(generate_sig_params, voice_value):
+        def _run(generate_sig_params, voice_value=None, instructions_value=None):
             engine = TTSEngine("test-model")
 
             # Build a mock model whose generate() has the requested signature
             mock_model = MagicMock()
-            params = [
-                MagicMock(name="text", default=MagicMock()),
-                MagicMock(name="verbose", default=False),
-            ]
             import inspect
             sig_params = {
                 "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
@@ -278,7 +274,9 @@ class TestTTSVoiceRouting:
             engine._model = mock_model
 
             try:
-                asyncio.run(engine.synthesize("Hello", voice=voice_value))
+                asyncio.run(engine.synthesize(
+                    "Hello", voice=voice_value, instructions=instructions_value,
+                ))
             except RuntimeError:
                 pass  # "no audio output" is expected with empty generate
 
@@ -286,25 +284,54 @@ class TestTTSVoiceRouting:
 
         return _run
 
-    def test_customvoice_routes_to_voice(self, _run_synthesize):
-        """Model with 'voice' param: value goes to voice, not instruct."""
-        call = _run_synthesize(["voice", "instruct"], "Vivian")
+    def test_customvoice_voice_and_fallback_instruct(self, _run_synthesize):
+        """Model with both params, voice only: voice goes to both kwargs
+        so VoiceDesign models (same signature) also get instruct."""
+        call = _run_synthesize(["voice", "instruct"], voice_value="Vivian")
         kwargs = call.kwargs if call else {}
         assert kwargs.get("voice") == "Vivian"
-        assert "instruct" not in kwargs
+        assert kwargs.get("instruct") == "Vivian"
 
     def test_voicedesign_routes_to_instruct(self, _run_synthesize):
         """Model with only 'instruct' param: value goes to instruct."""
-        call = _run_synthesize(["instruct"], "female, calm, slow")
+        call = _run_synthesize(["instruct"], voice_value="female, calm, slow")
         kwargs = call.kwargs if call else {}
         assert kwargs.get("instruct") == "female, calm, slow"
         assert "voice" not in kwargs
 
     def test_voice_only_model(self, _run_synthesize):
         """Model with only 'voice' param (e.g. Kokoro): value goes to voice."""
-        call = _run_synthesize(["voice"], "af_heart")
+        call = _run_synthesize(["voice"], voice_value="af_heart")
         kwargs = call.kwargs if call else {}
         assert kwargs.get("voice") == "af_heart"
+
+    def test_voice_none_skips_routing(self, _run_synthesize):
+        """voice=None should not add voice or instruct kwargs."""
+        call = _run_synthesize(["voice", "instruct"], voice_value=None)
+        kwargs = call.kwargs if call else {}
+        assert "voice" not in kwargs
+        assert "instruct" not in kwargs
+
+    def test_instructions_routes_to_instruct(self, _run_synthesize):
+        """instructions value should be routed to the instruct kwarg."""
+        call = _run_synthesize(
+            ["voice", "instruct"],
+            instructions_value="female, calm, slow",
+        )
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("instruct") == "female, calm, slow"
+        assert "voice" not in kwargs
+
+    def test_voice_and_instructions_both_passed(self, _run_synthesize):
+        """CustomVoice: voice→voice kwarg, instructions→instruct kwarg."""
+        call = _run_synthesize(
+            ["voice", "instruct"],
+            voice_value="Vivian",
+            instructions_value="female, calm, slow",
+        )
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("voice") == "Vivian"
+        assert kwargs.get("instruct") == "female, calm, slow"
 
 
 # ---------------------------------------------------------------------------
