@@ -128,13 +128,13 @@
             function processIcons() {
                 if (pending) return;
                 pending = true;
-                // setTimeout defers past Alpine's microtask rendering,
-                // then rAF ensures icons are ready before paint.
+                // setTimeout defers past Alpine's microtask rendering.
+                // Avoid wrapping in rAF — Safari may delay/skip rAF during
+                // page load, leaving pending=true forever and blocking all
+                // subsequent icon processing.
                 setTimeout(function() {
-                    requestAnimationFrame(function() {
-                        lucide.createIcons();
-                        pending = false;
-                    });
+                    lucide.createIcons();
+                    pending = false;
                 }, 0);
             }
 

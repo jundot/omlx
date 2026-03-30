@@ -147,7 +147,7 @@
   "models.downloader.ms_token_optional": "（選填）",
   "models.downloader.ms_token_placeholder": "your_token...",
   "models.downloader.ms_mirror_settings": "鏡像設定",
-  "models.downloader.ms_unavailable": "未安裝 ModelScope SDK。請執行：pip install omlx[modelscope]",
+  "models.downloader.ms_unavailable": "未安裝 ModelScope SDK。請執行：pip install \"omlx[modelscope]\"",
   "models.search.section_label": "搜尋 HuggingFace",
   "models.search.placeholder": "在 HuggingFace 上搜尋模型...",
   "models.search.ms_section_label": "搜尋魔搭社區",

@@ -147,7 +147,7 @@
   "models.downloader.ms_token_optional": "(선택사항)",
   "models.downloader.ms_token_placeholder": "your_token...",
   "models.downloader.ms_mirror_settings": "미러 설정",
-  "models.downloader.ms_unavailable": "ModelScope SDK가 설치되지 않았습니다. 설치: pip install omlx[modelscope]",
+  "models.downloader.ms_unavailable": "ModelScope SDK가 설치되지 않았습니다. 설치: pip install \"omlx[modelscope]\"",
   "models.search.section_label": "HuggingFace 검색",
   "models.search.placeholder": "HuggingFace에서 모델 검색...",
   "models.search.ms_section_label": "ModelScope 검색",

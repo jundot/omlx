@@ -147,7 +147,7 @@
   "models.downloader.ms_token_optional": "(optional)",
   "models.downloader.ms_token_placeholder": "your_token...",
   "models.downloader.ms_mirror_settings": "Mirror Settings",
-  "models.downloader.ms_unavailable": "ModelScope SDK not installed. Install with: pip install omlx[modelscope]",
+  "models.downloader.ms_unavailable": "ModelScope SDK not installed. Install with: pip install \"omlx[modelscope]\"",
   "models.search.section_label": "Search HuggingFace",
   "models.search.placeholder": "Search models on HuggingFace...",
   "models.search.ms_section_label": "Search ModelScope",
