@@ -4001,8 +4001,11 @@ async def init_mcp(config_path: str):
         )
         return
     except Exception as e:
-        logger.error(f"Failed to initialize MCP: {e}")
-        raise
+        logger.error(
+            f"Failed to initialize MCP: {e}. "
+            "MCP features disabled. Fix your MCP config and restart."
+        )
+        return
 
 
 # =============================================================================
