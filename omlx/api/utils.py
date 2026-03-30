@@ -46,10 +46,11 @@ def detect_and_strip_partial(messages: list[dict]) -> bool:
 
 # Pattern to match special tokens that should be removed from output
 SPECIAL_TOKENS_PATTERN = re.compile(
-    r'<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|'
-    r'<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|'
-    r'</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]'
+    r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|"
+    r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"
+    r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]"
 )
+
 
 def clean_special_tokens(text: str) -> str:
     """Clean model output by removing only special tokens.
@@ -64,7 +65,7 @@ def clean_special_tokens(text: str) -> str:
     """
     if not text:
         return text
-    return SPECIAL_TOKENS_PATTERN.sub('', text).strip()
+    return SPECIAL_TOKENS_PATTERN.sub("", text).strip()
 
 
 def clean_output_text(text: str) -> str:
@@ -78,8 +79,9 @@ def clean_output_text(text: str) -> str:
     """
     if not text:
         return text
-    text = SPECIAL_TOKENS_PATTERN.sub('', text)
+    text = SPECIAL_TOKENS_PATTERN.sub("", text)
     from .thinking import extract_thinking
+
     _, content = extract_thinking(text)
     return content.strip()
 
@@ -99,9 +101,9 @@ def _extract_text_from_content_list(content: list) -> str:
     text_parts = []
     for item in content:
         # Convert Pydantic models to dict
-        if hasattr(item, 'model_dump'):
+        if hasattr(item, "model_dump"):
             item = item.model_dump()
-        elif hasattr(item, 'dict'):
+        elif hasattr(item, "dict"):
             item = item.dict()
         
         if isinstance(item, dict):
@@ -122,9 +124,9 @@ def _extract_multimodal_content_list(content: list) -> list:
     """
     parts = []
     for item in content:
-        if hasattr(item, 'model_dump'):
+        if hasattr(item, "model_dump"):
             item = item.model_dump()
-        elif hasattr(item, 'dict'):
+        elif hasattr(item, "dict"):
             item = item.dict()
         if isinstance(item, dict):
             item_type = item.get("type")
@@ -141,22 +143,26 @@ def _extract_multimodal_content_list(content: list) -> list:
                 elif isinstance(image_url_value, dict):
                     url = image_url_value.get("url")
                 if url:
-                    parts.append({
-                        "type": "image_url",
-                        "image_url": {"url": url},
-                    })
+                    parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": url},
+                        }
+                    )
             elif item_type == "image":
                 # Anthropic format: convert to OpenAI image_url format
                 source = item.get("source", {})
                 if source.get("type") == "base64":
                     media_type = source.get("media_type", "image/jpeg")
                     data = source.get("data", "")
-                    parts.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{media_type};base64,{data}",
-                        },
-                    })
+                    parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{data}",
+                            },
+                        }
+                    )
     return parts
 
 
@@ -165,6 +171,25 @@ def _extract_multimodal_content_list(content: list) -> list:
 # (e.g., JSON schema instructions), and tool messages carry tool_call_id.
 _MERGEABLE_ROLES = {"user", "assistant"}
 _PRESERVE_BOUNDARY_KEY = "_preserve_role_boundary"
+
+
+def _drop_void_assistant_messages(messages: list[dict]) -> list[dict]:
+    """Drop assistant messages that have no content and no tool_calls.
+
+    Strict chat templates (e.g., Devstral/Mistral) raise an error when an
+    assistant message has empty content and no tool_calls.  These void messages
+    carry no information and can appear when a client echoes back a response
+    that had only tool calls which were not preserved in its history.
+    """
+    return [
+        msg
+        for msg in messages
+        if not (
+            msg.get("role") == "assistant"
+            and not msg.get("content")
+            and not msg.get("tool_calls")
+        )
+    ]
 
 
 def _consolidate_system_messages(messages: list[dict]) -> list[dict]:
@@ -263,7 +288,7 @@ def extract_text_content(
 
         # Handle tool response messages (role="tool")
         if role == "tool":
-            tool_call_id = getattr(msg, 'tool_call_id', None) or ''
+            tool_call_id = getattr(msg, "tool_call_id", None) or ""
             # Convert list content to string if needed
             if isinstance(content, list):
                 tool_content = _extract_text_from_content_list(content)
@@ -272,66 +297,77 @@ def extract_text_content(
             # Apply truncation if configured
             if max_tool_result_tokens and tokenizer and tool_content:
                 from .anthropic_utils import truncate_tool_result
+
                 tool_content = truncate_tool_result(
                     tool_content, max_tool_result_tokens, tokenizer
                 )
             # Preserve structured format for models with native tool calling
             # so the chat template renders tool results in the model's native format
-            if getattr(tokenizer, 'has_tool_calling', False):
-                processed_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": tool_content,
-                })
+            if getattr(tokenizer, "has_tool_calling", False):
+                processed_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": tool_content,
+                    }
+                )
             else:
-                processed_messages.append({
-                    "role": "user",  # mlx-lm expects user/assistant roles
-                    "content": f"[Tool Result ({tool_call_id})]: {tool_content}",
-                    _PRESERVE_BOUNDARY_KEY: True,
-                })
+                processed_messages.append(
+                    {
+                        "role": "user",  # mlx-lm expects user/assistant roles
+                        "content": f"[Tool Result ({tool_call_id})]: {tool_content}",
+                        _PRESERVE_BOUNDARY_KEY: True,
+                    }
+                )
             continue
 
         # Handle assistant messages with tool_calls
-        if role == "assistant" and hasattr(msg, 'tool_calls') and msg.tool_calls:
+        if role == "assistant" and hasattr(msg, "tool_calls") and msg.tool_calls:
             if isinstance(content, list):
                 content = _extract_text_from_content_list(content)
             msg_dict = {"role": role, "content": content if content else ""}
-            if getattr(msg, 'name', None):
+            if getattr(msg, "name", None):
                 msg_dict["name"] = msg.name
 
             # Preserve structured tool_calls for models with native tool calling
             # so the chat template renders them in the model's native format.
             # Without this, models mimic text-formatted tool calls from history
             # instead of generating their native parseable format.
-            if getattr(tokenizer, 'has_tool_calling', False):
+            if getattr(tokenizer, "has_tool_calling", False):
                 tool_calls_list = []
                 for tc in msg.tool_calls:
                     if isinstance(tc, dict):
                         func = tc.get("function", {})
-                        tool_calls_list.append({
-                            "id": tc.get("id", ""),
-                            "function": {
-                                "name": func.get("name", ""),
-                                "arguments": _try_parse_json(
-                                    func.get("arguments", "{}")
-                                ),
+                        tool_calls_list.append(
+                            {
+                                "id": tc.get("id", ""),
+                                "function": {
+                                    "name": func.get("name", ""),
+                                    "arguments": _try_parse_json(
+                                        func.get("arguments", "{}")
+                                    ),
+                                },
                             }
-                        })
+                        )
                     else:
                         args_str = (
-                            getattr(tc.function, 'arguments', '{}')
-                            if hasattr(tc, 'function') else '{}'
+                            getattr(tc.function, "arguments", "{}")
+                            if hasattr(tc, "function")
+                            else "{}"
                         )
-                        tool_calls_list.append({
-                            "id": getattr(tc, 'id', ''),
-                            "function": {
-                                "name": (
-                                    getattr(tc.function, 'name', '')
-                                    if hasattr(tc, 'function') else ''
-                                ),
-                                "arguments": _try_parse_json(args_str),
+                        tool_calls_list.append(
+                            {
+                                "id": getattr(tc, "id", ""),
+                                "function": {
+                                    "name": (
+                                        getattr(tc.function, "name", "")
+                                        if hasattr(tc, "function")
+                                        else ""
+                                    ),
+                                    "arguments": _try_parse_json(args_str),
+                                },
                             }
-                        })
+                        )
                 msg_dict["tool_calls"] = tool_calls_list
             else:
                 # Text fallback for models without native tool calling
@@ -353,9 +389,9 @@ def extract_text_content(
 
         # Build optional extra fields from the source message
         _extra: dict = {}
-        if getattr(msg, 'name', None):
+        if getattr(msg, "name", None):
             _extra["name"] = msg.name
-        if getattr(msg, 'partial', False):
+        if getattr(msg, "partial", False):
             _extra["partial"] = True
 
         # Handle None content
@@ -369,13 +405,15 @@ def extract_text_content(
         elif isinstance(content, list):
             # Content array - extract text parts only
             combined_text = _extract_text_from_content_list(content)
-            processed_messages.append({"role": role, "content": combined_text, **_extra})
+            processed_messages.append(
+                {"role": role, "content": combined_text, **_extra}
+            )
         else:
             # Unknown format, try to convert
             processed_messages.append({"role": role, "content": str(content), **_extra})
 
     return _merge_consecutive_roles(
-        _consolidate_system_messages(processed_messages)
+        _drop_void_assistant_messages(_consolidate_system_messages(processed_messages))
     )
 
 
@@ -409,7 +447,7 @@ def extract_multimodal_content(
 
         # Tool response messages - same as extract_text_content
         if role == "tool":
-            tool_call_id = getattr(msg, 'tool_call_id', None) or ''
+            tool_call_id = getattr(msg, "tool_call_id", None) or ""
             # Convert list content to string if needed
             if isinstance(content, list):
                 tool_content = _extract_text_from_content_list(content)
@@ -417,60 +455,71 @@ def extract_multimodal_content(
                 tool_content = content if content else ""
             if max_tool_result_tokens and tokenizer and tool_content:
                 from .anthropic_utils import truncate_tool_result
+
                 tool_content = truncate_tool_result(
                     tool_content, max_tool_result_tokens, tokenizer
                 )
-            if getattr(tokenizer, 'has_tool_calling', False):
-                processed_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": tool_content,
-                })
+            if getattr(tokenizer, "has_tool_calling", False):
+                processed_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": tool_content,
+                    }
+                )
             else:
-                processed_messages.append({
-                    "role": "user",
-                    "content": f"[Tool Result ({tool_call_id})]: {tool_content}",
-                    _PRESERVE_BOUNDARY_KEY: True,
-                })
+                processed_messages.append(
+                    {
+                        "role": "user",
+                        "content": f"[Tool Result ({tool_call_id})]: {tool_content}",
+                        _PRESERVE_BOUNDARY_KEY: True,
+                    }
+                )
             continue
 
         # Assistant with tool_calls - same as extract_text_content
-        if role == "assistant" and hasattr(msg, 'tool_calls') and msg.tool_calls:
+        if role == "assistant" and hasattr(msg, "tool_calls") and msg.tool_calls:
             if isinstance(content, list):
                 content = _extract_text_from_content_list(content)
             msg_dict = {"role": role, "content": content if content else ""}
-            if getattr(msg, 'name', None):
+            if getattr(msg, "name", None):
                 msg_dict["name"] = msg.name
 
-            if getattr(tokenizer, 'has_tool_calling', False):
+            if getattr(tokenizer, "has_tool_calling", False):
                 tool_calls_list = []
                 for tc in msg.tool_calls:
                     if isinstance(tc, dict):
                         func = tc.get("function", {})
-                        tool_calls_list.append({
-                            "id": tc.get("id", ""),
-                            "function": {
-                                "name": func.get("name", ""),
-                                "arguments": _try_parse_json(
-                                    func.get("arguments", "{}")
-                                ),
+                        tool_calls_list.append(
+                            {
+                                "id": tc.get("id", ""),
+                                "function": {
+                                    "name": func.get("name", ""),
+                                    "arguments": _try_parse_json(
+                                        func.get("arguments", "{}")
+                                    ),
+                                },
                             }
-                        })
+                        )
                     else:
                         args_str = (
-                            getattr(tc.function, 'arguments', '{}')
-                            if hasattr(tc, 'function') else '{}'
+                            getattr(tc.function, "arguments", "{}")
+                            if hasattr(tc, "function")
+                            else "{}"
                         )
-                        tool_calls_list.append({
-                            "id": getattr(tc, 'id', ''),
-                            "function": {
-                                "name": (
-                                    getattr(tc.function, 'name', '')
-                                    if hasattr(tc, 'function') else ''
-                                ),
-                                "arguments": _try_parse_json(args_str),
+                        tool_calls_list.append(
+                            {
+                                "id": getattr(tc, "id", ""),
+                                "function": {
+                                    "name": (
+                                        getattr(tc.function, "name", "")
+                                        if hasattr(tc, "function")
+                                        else ""
+                                    ),
+                                    "arguments": _try_parse_json(args_str),
+                                },
                             }
-                        })
+                        )
                 msg_dict["tool_calls"] = tool_calls_list
             else:
                 tool_calls_text = []
@@ -491,9 +540,9 @@ def extract_multimodal_content(
 
         # Build optional extra fields from the source message
         _extra: dict = {}
-        if getattr(msg, 'name', None):
+        if getattr(msg, "name", None):
             _extra["name"] = msg.name
-        if getattr(msg, 'partial', False):
+        if getattr(msg, "partial", False):
             _extra["partial"] = True
 
         if content is None:
@@ -505,25 +554,30 @@ def extract_multimodal_content(
         elif isinstance(content, list):
             # Preserve image_url parts for VLM processing
             multimodal_parts = _extract_multimodal_content_list(content)
-            has_images = any(
-                p.get("type") == "image_url" for p in multimodal_parts
-            )
+            has_images = any(p.get("type") == "image_url" for p in multimodal_parts)
             if has_images:
                 # Keep as content list for VLM engine
-                processed_messages.append({"role": role, "content": multimodal_parts, **_extra})
+                processed_messages.append(
+                    {"role": role, "content": multimodal_parts, **_extra}
+                )
             else:
                 # Text-only, flatten to string
                 combined_text = _extract_text_from_content_list(content)
-                processed_messages.append({"role": role, "content": combined_text, **_extra})
+                processed_messages.append(
+                    {"role": role, "content": combined_text, **_extra}
+                )
         else:
             processed_messages.append({"role": role, "content": str(content), **_extra})
 
-    return _consolidate_system_messages(processed_messages)
+    return _drop_void_assistant_messages(
+        _consolidate_system_messages(processed_messages)
+    )
 
 
 # =============================================================================
 # Harmony (gpt-oss) Message Extraction
 # =============================================================================
+
 
 def _try_parse_json(s: str):
     """
@@ -539,7 +593,7 @@ def _try_parse_json(s: str):
     if not s:
         return s
     # Quick check: must start with { or [ to be JSON object/array
-    if not (s.startswith('{') or s.startswith('[')):
+    if not (s.startswith("{") or s.startswith("[")):
         return s
     try:
         return json.loads(s)
@@ -633,9 +687,7 @@ def extract_harmony_messages(
                 parsed_json = _try_parse_json(tool_content)
                 if isinstance(parsed_json, (dict, list)):
                     # Valid JSON - pretty-print for line-boundary truncation
-                    pretty = json.dumps(
-                        parsed_json, indent=2, ensure_ascii=False
-                    )
+                    pretty = json.dumps(parsed_json, indent=2, ensure_ascii=False)
                     truncated = truncate_tool_result(
                         pretty, max_tool_result_tokens, tokenizer
                     )
@@ -653,11 +705,13 @@ def extract_harmony_messages(
             else:
                 # No truncation configured - just parse JSON if possible
                 parsed_content = _try_parse_json(tool_content)
-            processed_messages.append({
-                "role": "tool",
-                "tool_call_id": getattr(msg, 'tool_call_id', '') or '',
-                "content": parsed_content,
-            })
+            processed_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": getattr(msg, "tool_call_id", "") or "",
+                    "content": parsed_content,
+                }
+            )
             continue
 
         # Assistant messages - preserve tool_calls field
@@ -677,28 +731,38 @@ def extract_harmony_messages(
 
             # Preserve tool_calls field for chat_template
             # Parse arguments as JSON if possible (chat_template applies |tojson)
-            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
                 tool_calls_list = []
                 for tc in msg.tool_calls:
                     if isinstance(tc, dict):
                         args_str = tc.get("function", {}).get("arguments", "{}")
-                        tool_calls_list.append({
-                            "id": tc.get("id", ""),
-                            "function": {
-                                "name": tc.get("function", {}).get("name", ""),
-                                "arguments": _try_parse_json(args_str),
+                        tool_calls_list.append(
+                            {
+                                "id": tc.get("id", ""),
+                                "function": {
+                                    "name": tc.get("function", {}).get("name", ""),
+                                    "arguments": _try_parse_json(args_str),
+                                },
                             }
-                        })
+                        )
                     else:
                         # Pydantic model
-                        args_str = getattr(tc.function, 'arguments', '{}') if hasattr(tc, 'function') else '{}'
-                        tool_calls_list.append({
-                            "id": getattr(tc, 'id', ''),
-                            "function": {
-                                "name": getattr(tc.function, 'name', '') if hasattr(tc, 'function') else '',
-                                "arguments": _try_parse_json(args_str),
+                        args_str = (
+                            getattr(tc.function, "arguments", "{}")
+                            if hasattr(tc, "function")
+                            else "{}"
+                        )
+                        tool_calls_list.append(
+                            {
+                                "id": getattr(tc, "id", ""),
+                                "function": {
+                                    "name": getattr(tc.function, "name", "")
+                                    if hasattr(tc, "function")
+                                    else "",
+                                    "arguments": _try_parse_json(args_str),
+                                },
                             }
-                        })
+                        )
                 msg_dict["tool_calls"] = tool_calls_list
                 msg_dict[_PRESERVE_BOUNDARY_KEY] = True
 
@@ -717,5 +781,5 @@ def extract_harmony_messages(
             processed_messages.append({"role": role, "content": str(content)})
 
     return _merge_consecutive_roles(
-        _consolidate_system_messages(processed_messages)
+        _drop_void_assistant_messages(_consolidate_system_messages(processed_messages))
     )

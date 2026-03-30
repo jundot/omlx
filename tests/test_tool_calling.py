@@ -164,7 +164,7 @@ class TestExtractJsonFromText:
 
     def test_pure_json_array(self):
         """Test extracting pure JSON array."""
-        text = '[1, 2, 3]'
+        text = "[1, 2, 3]"
 
         result = extract_json_from_text(text)
 
@@ -180,11 +180,11 @@ class TestExtractJsonFromText:
 
     def test_json_in_markdown_code_block(self):
         """Test extracting JSON from markdown code block."""
-        text = '''Here is the result:
+        text = """Here is the result:
 ```json
 {"name": "John", "age": 30}
 ```
-'''
+"""
 
         result = extract_json_from_text(text)
 
@@ -192,11 +192,11 @@ class TestExtractJsonFromText:
 
     def test_json_in_plain_code_block(self):
         """Test extracting JSON from plain code block."""
-        text = '''Result:
+        text = """Result:
 ```
 {"status": "ok"}
 ```
-'''
+"""
 
         result = extract_json_from_text(text)
 
@@ -212,7 +212,7 @@ class TestExtractJsonFromText:
 
     def test_no_json_found(self):
         """Test when no valid JSON is found."""
-        text = 'This is just plain text without any JSON.'
+        text = "This is just plain text without any JSON."
 
         result = extract_json_from_text(text)
 
@@ -369,9 +369,9 @@ class TestParseJsonOutput:
 
     def test_json_from_code_block(self):
         """Test extracting JSON from code block."""
-        text = '''```json
+        text = """```json
 {"result": true}
-```'''
+```"""
         response_format = {"type": "json_object"}
 
         cleaned, parsed, is_valid, error = parse_json_output(text, response_format)
@@ -568,7 +568,10 @@ class TestConvertToolsForTemplate:
         result = convert_tools_for_template(tools)
 
         assert result is not None
-        assert result[0]["function"]["parameters"] == {"type": "object", "properties": {}}
+        assert result[0]["function"]["parameters"] == {
+            "type": "object",
+            "properties": {},
+        }
 
 
 class TestFormatToolCallForMessage:
@@ -770,7 +773,9 @@ class TestToolCallStreamFilter:
         result += f.finish()
         assert result == "literal [Calling tool: maybe later] and then  done"
 
-    def test_unresolved_bracket_prefix_before_parseable_envelope_does_not_leak_marker(self):
+    def test_unresolved_bracket_prefix_before_parseable_envelope_does_not_leak_marker(
+        self,
+    ):
         """An unresolved early bracket prefix must not leak when a later call is parseable."""
         f = ToolCallStreamFilter(_make_tokenizer())
         text = (
@@ -821,7 +826,7 @@ class TestToolCallStreamFilter:
     def test_hyphen_namespaced_tool_call_open_suppresses_markup(self):
         """Hyphenated namespace tool-call open tag should trigger suppression."""
         f = ToolCallStreamFilter(_make_tokenizer())
-        result = f.feed("Before <foo-bar:tool_call><invoke name=\"x\">")
+        result = f.feed('Before <foo-bar:tool_call><invoke name="x">')
         assert result == "Before "
         assert f.finish() == ""
 
@@ -940,18 +945,14 @@ class TestToolCallStreamFilterSuppressAfterMarker:
 
     def test_suppress_after_marker_basic(self):
         """Everything after a one-sided marker should be suppressed."""
-        f = ToolCallStreamFilter(
-            _make_tokenizer_with_end("[TOOL_CALLS]", "")
-        )
+        f = ToolCallStreamFilter(_make_tokenizer_with_end("[TOOL_CALLS]", ""))
         result = f.feed('[TOOL_CALLS]func_name[ARGS]{"key":"val"}')
         result += f.finish()
         assert result == ""
 
     def test_suppress_after_marker_with_preceding_text(self):
         """Text before one-sided marker should pass through."""
-        f = ToolCallStreamFilter(
-            _make_tokenizer_with_end("[TOOL_CALLS]", "")
-        )
+        f = ToolCallStreamFilter(_make_tokenizer_with_end("[TOOL_CALLS]", ""))
         r1 = f.feed("Hello ")
         r2 = f.feed('[TOOL_CALLS]func_name[ARGS]{"key":"val"}')
         result = r1 + r2 + f.finish()
@@ -959,9 +960,7 @@ class TestToolCallStreamFilterSuppressAfterMarker:
 
     def test_suppress_after_marker_partial_prefix(self):
         """Partial one-sided marker prefix should be buffered."""
-        f = ToolCallStreamFilter(
-            _make_tokenizer_with_end("[TOOL_CALLS]", "")
-        )
+        f = ToolCallStreamFilter(_make_tokenizer_with_end("[TOOL_CALLS]", ""))
         r1 = f.feed("[TOOL")
         r2 = f.feed('_CALLS]func_name[ARGS]{"key":"val"}')
         result = r1 + r2 + f.finish()
@@ -969,9 +968,7 @@ class TestToolCallStreamFilterSuppressAfterMarker:
 
     def test_suppress_after_marker_multi_feed(self):
         """Permanent suppression persists across multiple feeds."""
-        f = ToolCallStreamFilter(
-            _make_tokenizer_with_end("[TOOL_CALLS]", "")
-        )
+        f = ToolCallStreamFilter(_make_tokenizer_with_end("[TOOL_CALLS]", ""))
         r1 = f.feed("Hi [TOOL_CALLS]start")
         r2 = f.feed(" more data")
         r3 = f.feed(" even more")
@@ -998,6 +995,89 @@ class TestParseToolCallsEmptyEndMarker:
         assert tool_calls is not None
         assert len(tool_calls) == 1
         assert tool_calls[0].function.name == "test_func"
+
+    def test_empty_end_marker_parses_content_after_marker(self):
+        """One-sided marker should pass everything after it to the parser."""
+        received_inputs = []
+
+        def mock_parser(text, tools):
+            received_inputs.append(text)
+            return {"name": "list_files", "arguments": {"path": "."}}
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "[TOOL_CALLS]"
+        tok.tool_call_end = ""
+        tok.tool_parser = mock_parser
+
+        text = '[TOOL_CALLS]list_files[ARGS]{"path": "."}'
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "list_files"
+        # Parser should receive the content after [TOOL_CALLS], not empty string
+        assert len(received_inputs) == 1
+        assert received_inputs[0] == 'list_files[ARGS]{"path": "."}'
+
+    def test_empty_end_marker_cleans_text_before_marker(self):
+        """Text before a one-sided marker should be preserved as cleaned_text."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "[TOOL_CALLS]"
+        tok.tool_call_end = ""
+        tok.tool_parser = lambda text, tools: {
+            "name": "read_file",
+            "arguments": {"path": "README.md"},
+        }
+
+        text = 'Let me check that file.[TOOL_CALLS]read_file[ARGS]{"path": "README.md"}'
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert cleaned == "Let me check that file."
+
+    def test_empty_end_marker_multiple_tool_calls(self):
+        """Multiple one-sided tool calls should each be parsed separately."""
+        call_count = [0]
+
+        def mock_parser(text, tools):
+            call_count[0] += 1
+            if "list_files" in text:
+                return {"name": "list_files", "arguments": {"path": "."}}
+            elif "read_file" in text:
+                return {"name": "read_file", "arguments": {"path": "README.md"}}
+            raise ValueError(f"Unexpected: {text}")
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "[TOOL_CALLS]"
+        tok.tool_call_end = ""
+        tok.tool_parser = mock_parser
+
+        text = '[TOOL_CALLS]list_files[ARGS]{"path": "."}[TOOL_CALLS]read_file[ARGS]{"path": "README.md"}'
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 2
+        assert tool_calls[0].function.name == "list_files"
+        assert tool_calls[1].function.name == "read_file"
+        assert call_count[0] == 2
+
+    def test_empty_end_marker_parser_failure_skips(self):
+        """If the parser fails on a segment, it should be skipped gracefully."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "[TOOL_CALLS]"
+        tok.tool_call_end = ""
+
+        def failing_parser(text, tools):
+            raise ValueError("parse error")
+
+        tok.tool_parser = failing_parser
+
+        text = "[TOOL_CALLS]bad_input"
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        # Should fall through to other fallback parsers, not crash
+        assert tool_calls is None or len(tool_calls) == 0
 
 
 class TestParseBracketToolCalls:
@@ -1054,10 +1134,7 @@ class TestParseBracketToolCalls:
         """Both [Tool call:] and [Calling tool:] in same text should parse."""
         from omlx.api.tool_calling import _parse_bracket_tool_calls
 
-        text = (
-            '[Tool call: tool_a({"x":1})] middle '
-            '[Calling tool: tool_b({"y":2})]'
-        )
+        text = '[Tool call: tool_a({"x":1})] middle [Calling tool: tool_b({"y":2})]'
         cleaned, tool_calls = _parse_bracket_tool_calls(text)
         assert tool_calls is not None
         assert len(tool_calls) == 2
@@ -1092,7 +1169,9 @@ class TestParseToolCallsWithThinkingFallback:
         tok = self._make_tokenizer()
 
         cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
-            thinking, regular, tokenizer=tok,
+            thinking,
+            regular,
+            tokenizer=tok,
         )
         assert tool_calls is not None
         assert len(tool_calls) == 1
@@ -1106,7 +1185,9 @@ class TestParseToolCallsWithThinkingFallback:
         tok = self._make_tokenizer()
 
         cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
-            thinking, regular, tokenizer=tok,
+            thinking,
+            regular,
+            tokenizer=tok,
         )
         assert tool_calls is not None
         assert len(tool_calls) == 1
@@ -1119,7 +1200,9 @@ class TestParseToolCallsWithThinkingFallback:
         tok = self._make_tokenizer()
 
         cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
-            thinking, regular, tokenizer=tok,
+            thinking,
+            regular,
+            tokenizer=tok,
         )
         assert tool_calls is None
         assert cleaned == "Here is my answer."
@@ -1131,7 +1214,9 @@ class TestParseToolCallsWithThinkingFallback:
         tok = self._make_tokenizer()
 
         cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
-            thinking, regular, tokenizer=tok,
+            thinking,
+            regular,
+            tokenizer=tok,
         )
         assert tool_calls is None
         assert cleaned == "Just a regular response."
@@ -1139,15 +1224,17 @@ class TestParseToolCallsWithThinkingFallback:
     def test_thinking_fallback_qwen_format(self):
         """Qwen/Llama XML format inside thinking is recovered."""
         thinking = (
-            '<tool_call>'
-            '<function=read><parameter=filePath>/src/main.py</parameter></function>'
-            '</tool_call>'
+            "<tool_call>"
+            "<function=read><parameter=filePath>/src/main.py</parameter></function>"
+            "</tool_call>"
         )
         regular = ""
         tok = self._make_tokenizer()
 
         cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
-            thinking, regular, tokenizer=tok,
+            thinking,
+            regular,
+            tokenizer=tok,
         )
         assert tool_calls is not None
         assert len(tool_calls) == 1
@@ -1156,14 +1243,15 @@ class TestParseToolCallsWithThinkingFallback:
     def test_cleaned_text_from_regular_not_thinking(self):
         """cleaned_text always comes from regular_content, not thinking."""
         thinking = (
-            'reasoning here '
-            '<tool_call>{"name": "func", "arguments": {}}</tool_call>'
+            'reasoning here <tool_call>{"name": "func", "arguments": {}}</tool_call>'
         )
         regular = "visible response text"
         tok = self._make_tokenizer()
 
         cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
-            thinking, regular, tokenizer=tok,
+            thinking,
+            regular,
+            tokenizer=tok,
         )
         assert tool_calls is not None
         assert cleaned == "visible response text"
@@ -1171,9 +1259,9 @@ class TestParseToolCallsWithThinkingFallback:
     def test_extract_tool_calls_with_thinking_sanitizes_reasoning_markup(self):
         """Sanitized reasoning should keep prose but drop tool-call control text."""
         thinking = (
-            'Need to inspect first.'
+            "Need to inspect first."
             '<tool_call>{"name": "read_file", "arguments": {"path": "/tmp/a.py"}}</tool_call>'
-            'Then continue.'
+            "Then continue."
         )
         tok = self._make_tokenizer()
 
@@ -1186,14 +1274,16 @@ class TestParseToolCallsWithThinkingFallback:
         assert "Need to inspect first." in result.cleaned_thinking
         assert "Then continue." in result.cleaned_thinking
 
-    def test_extract_tool_calls_with_thinking_sanitizes_reasoning_even_when_regular_wins(self):
+    def test_extract_tool_calls_with_thinking_sanitizes_reasoning_even_when_regular_wins(
+        self,
+    ):
         """Thinking cleanup should still run when regular content provides tool calls."""
         thinking = (
-            'Reason about it.'
+            "Reason about it."
             '<tool_call>{"name": "wrong_tool", "arguments": {}}</tool_call>'
         )
         regular = (
-            'Visible text'
+            "Visible text"
             '<tool_call>{"name": "correct_tool", "arguments": {}}</tool_call>'
         )
         tok = self._make_tokenizer()

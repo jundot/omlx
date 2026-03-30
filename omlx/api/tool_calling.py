@@ -50,7 +50,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
         Tuple of (cleaned_text, tool_calls or None)
     """
     tool_calls = []
-    pattern = r'<tool_call>(.*?)</tool_call>'
+    pattern = r"<tool_call>(.*?)</tool_call>"
     matches = re.findall(pattern, text, re.DOTALL)
 
     for match in matches:
@@ -60,49 +60,60 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
             parsed = json.loads(content)
             name = parsed.get("name", "")
             arguments = parsed.get("arguments", {})
-            tool_calls.append(ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=name,
-                    arguments=json.dumps(arguments, ensure_ascii=False)
-                        if isinstance(arguments, dict) else str(arguments),
-                ),
-            ))
+            tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=name,
+                        arguments=json.dumps(arguments, ensure_ascii=False)
+                        if isinstance(arguments, dict)
+                        else str(arguments),
+                    ),
+                )
+            )
             continue
         except (json.JSONDecodeError, AttributeError):
             pass
 
         # Qwen/Llama format: <function=name><parameter=key>value</parameter></function>
-        func_match = re.match(r'<function=(\w+)>(.*?)</function>', content, re.DOTALL)
+        func_match = re.match(r"<function=(\w+)>(.*?)</function>", content, re.DOTALL)
         if func_match:
             func_name = func_match.group(1)
             params_text = func_match.group(2)
             arguments = {}
-            for pm in re.finditer(r'<parameter=(\w+)>\s*(.*?)\s*</parameter>', params_text, re.DOTALL):
+            for pm in re.finditer(
+                r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", params_text, re.DOTALL
+            ):
                 key = pm.group(1)
                 val = pm.group(2).strip()
                 try:
                     arguments[key] = json.loads(val)
                 except (json.JSONDecodeError, ValueError):
                     arguments[key] = val
-            tool_calls.append(ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=func_name,
-                    arguments=json.dumps(arguments, ensure_ascii=False),
-                ),
-            ))
+            tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=func_name,
+                        arguments=json.dumps(arguments, ensure_ascii=False),
+                    ),
+                )
+            )
             continue
 
         # GLM XML format: func_name<arg_key>k</arg_key><arg_value>v</arg_value>...
-        arg_keys = re.findall(r'<arg_key>(.*?)</arg_key>', content)
-        arg_values = re.findall(r'<arg_value>(.*?)</arg_value>', content, re.DOTALL)
+        arg_keys = re.findall(r"<arg_key>(.*?)</arg_key>", content)
+        arg_values = re.findall(r"<arg_value>(.*?)</arg_value>", content, re.DOTALL)
         if arg_keys:
             # Function name is the text before the first <arg_key>
-            name_match = re.match(r'^(.*?)<arg_key>', content, re.DOTALL)
-            func_name = name_match.group(1).strip() if name_match else content.split('<')[0].strip()
+            name_match = re.match(r"^(.*?)<arg_key>", content, re.DOTALL)
+            func_name = (
+                name_match.group(1).strip()
+                if name_match
+                else content.split("<")[0].strip()
+            )
             arguments = {}
             for k, v in zip(arg_keys, arg_values):
                 # Try to parse JSON values (arrays, objects, numbers, booleans)
@@ -110,24 +121,28 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                     arguments[k] = json.loads(v)
                 except (json.JSONDecodeError, ValueError):
                     arguments[k] = v
-            tool_calls.append(ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=func_name,
-                    arguments=json.dumps(arguments, ensure_ascii=False),
-                ),
-            ))
+            tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=func_name,
+                        arguments=json.dumps(arguments, ensure_ascii=False),
+                    ),
+                )
+            )
 
     if not tool_calls:
         return text, None
 
     # Remove tool call tags from text
-    cleaned = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL).strip()
+    cleaned = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL).strip()
     return cleaned, tool_calls
 
 
-def _parse_namespaced_tool_calls(text: str, namespace: str) -> Tuple[str, Optional[List[ToolCall]]]:
+def _parse_namespaced_tool_calls(
+    text: str, namespace: str
+) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Parse namespaced tool call tags like <minimax:tool_call>...</minimax:tool_call>.
 
@@ -138,9 +153,9 @@ def _parse_namespaced_tool_calls(text: str, namespace: str) -> Tuple[str, Option
         Tuple of (cleaned_text, tool_calls or None)
     """
     tool_calls = []
-    tag_start = f'<{namespace}:tool_call>'
-    tag_end = f'</{namespace}:tool_call>'
-    pattern = re.escape(tag_start) + r'(.*?)' + re.escape(tag_end)
+    tag_start = f"<{namespace}:tool_call>"
+    tag_end = f"</{namespace}:tool_call>"
+    pattern = re.escape(tag_start) + r"(.*?)" + re.escape(tag_end)
     matches = re.findall(pattern, text, re.DOTALL)
 
     for match in matches:
@@ -161,19 +176,21 @@ def _parse_namespaced_tool_calls(text: str, namespace: str) -> Tuple[str, Option
                     arguments[key] = json.loads(val)
                 except (json.JSONDecodeError, ValueError):
                     arguments[key] = val
-            tool_calls.append(ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=func_name,
-                    arguments=json.dumps(arguments, ensure_ascii=False),
-                ),
-            ))
+            tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=func_name,
+                        arguments=json.dumps(arguments, ensure_ascii=False),
+                    ),
+                )
+            )
 
     if not tool_calls:
         return text, None
 
-    cleaned = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+    cleaned = re.sub(pattern, "", text, flags=re.DOTALL).strip()
     return cleaned, tool_calls
 
 
@@ -190,7 +207,9 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
     """
     tool_calls = []
     # Match with args first (higher fidelity)
-    pattern_with_args = r'\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)\(({.*?})\)\]'
+    pattern_with_args = (
+        r"\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)\(({.*?})\)\]"
+    )
     matched_spans: list = []
     for match in re.finditer(pattern_with_args, text, re.DOTALL):
         name = match.group(1)
@@ -199,40 +218,44 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
             arguments = json.loads(args_str)
         except (json.JSONDecodeError, ValueError):
             arguments = {"raw": args_str}
-        tool_calls.append(ToolCall(
-            id=f"call_{uuid.uuid4().hex[:8]}",
-            type="function",
-            function=FunctionCall(
-                name=name,
-                arguments=json.dumps(arguments, ensure_ascii=False),
-            ),
-        ))
+        tool_calls.append(
+            ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                type="function",
+                function=FunctionCall(
+                    name=name,
+                    arguments=json.dumps(arguments, ensure_ascii=False),
+                ),
+            )
+        )
         matched_spans.append(match.span())
 
     # Match without args (model-generated simplified form)
-    pattern_no_args = r'\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)\]'
+    pattern_no_args = r"\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)\]"
     for match in re.finditer(pattern_no_args, text):
         # Skip if this span overlaps with an already-matched with-args span
         start, end = match.span()
         if any(s <= start < e for s, e in matched_spans):
             continue
         name = match.group(1)
-        tool_calls.append(ToolCall(
-            id=f"call_{uuid.uuid4().hex[:8]}",
-            type="function",
-            function=FunctionCall(
-                name=name,
-                arguments="{}",
-            ),
-        ))
+        tool_calls.append(
+            ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                type="function",
+                function=FunctionCall(
+                    name=name,
+                    arguments="{}",
+                ),
+            )
+        )
         matched_spans.append((start, end))
 
     if not tool_calls:
         return text, None
 
     # Remove all matched spans from text
-    cleaned = re.sub(pattern_with_args, '', text, flags=re.DOTALL)
-    cleaned = re.sub(pattern_no_args, '', cleaned).strip()
+    cleaned = re.sub(pattern_with_args, "", text, flags=re.DOTALL)
+    cleaned = re.sub(pattern_no_args, "", cleaned).strip()
     return cleaned, tool_calls
 
 
@@ -261,64 +284,79 @@ def parse_tool_calls(
 
     # Remove thinking tags if present (reasoning models)
     cleaned_text = re.sub(
-        r'<think>.*?</think>',
-        '',
-        cleaned_text,
-        flags=re.DOTALL
+        r"<think>.*?</think>", "", cleaned_text, flags=re.DOTALL
     ).strip()
 
     # Try mlx-lm's native tool parser first
-    if getattr(tokenizer, 'has_tool_calling', False):
+    if getattr(tokenizer, "has_tool_calling", False):
         tool_call_start = tokenizer.tool_call_start
         tool_call_end = tokenizer.tool_call_end
         tool_parser = tokenizer.tool_parser
 
-        if tool_call_start is not None and tool_call_end is not None and tool_parser is not None:
+        if tool_call_start is not None and tool_parser is not None:
             tool_calls = []
             start_escaped = re.escape(tool_call_start)
-            end_escaped = re.escape(tool_call_end)
-            pattern = rf'{start_escaped}(.*?){end_escaped}'
 
-            matches = re.findall(pattern, text, re.DOTALL)
+            if tool_call_end:
+                # Paired markers (e.g. <tool_call>...</tool_call>)
+                end_escaped = re.escape(tool_call_end)
+                pattern = rf"{start_escaped}(.*?){end_escaped}"
+                matches = re.findall(pattern, text, re.DOTALL)
+            else:
+                # One-sided marker (e.g. Mistral/Devstral "[TOOL_CALLS]"):
+                # split on the start marker and parse each segment.
+                # The model emits: [TOOL_CALLS]name[ARGS]{...}[TOOL_CALLS]name2[ARGS]{...}
+                parts = re.split(start_escaped, text)
+                # First part is pre-marker text, rest are tool call segments
+                matches = [p for p in parts[1:] if p.strip()]
 
             for match in matches:
                 try:
                     parsed = tool_parser(match.strip(), tools)
-                    name = parsed.get('name', '')
-                    arguments = parsed.get('arguments', {})
-                    tool_calls.append(ToolCall(
-                        id=f"call_{uuid.uuid4().hex[:8]}",
-                        type="function",
-                        function=FunctionCall(
-                            name=name,
-                            arguments=json.dumps(arguments, ensure_ascii=False)
-                                if isinstance(arguments, dict) else str(arguments)
+                    name = parsed.get("name", "")
+                    arguments = parsed.get("arguments", {})
+                    tool_calls.append(
+                        ToolCall(
+                            id=f"call_{uuid.uuid4().hex[:8]}",
+                            type="function",
+                            function=FunctionCall(
+                                name=name,
+                                arguments=json.dumps(arguments, ensure_ascii=False)
+                                if isinstance(arguments, dict)
+                                else str(arguments),
+                            ),
                         )
-                    ))
+                    )
                 except (ValueError, json.JSONDecodeError, AttributeError, KeyError):
                     continue
 
             if tool_calls:
-                cleaned_text = re.sub(
-                    rf'{start_escaped}.*?{end_escaped}',
-                    '',
-                    cleaned_text,
-                    flags=re.DOTALL
-                ).strip()
+                if tool_call_end:
+                    cleaned_text = re.sub(
+                        rf"{start_escaped}.*?{re.escape(tool_call_end)}",
+                        "",
+                        cleaned_text,
+                        flags=re.DOTALL,
+                    ).strip()
+                else:
+                    # One-sided: everything from first marker to end is tool calls
+                    idx = cleaned_text.find(tool_call_start)
+                    if idx >= 0:
+                        cleaned_text = cleaned_text[:idx].strip()
                 return cleaned_text, tool_calls
 
     # Fallback: parse XML <tool_call> tags (GLM, Qwen, generic formats)
-    if '<tool_call>' in cleaned_text:
+    if "<tool_call>" in cleaned_text:
         return _parse_xml_tool_calls(cleaned_text)
 
     # Fallback: namespaced tool_call tags (e.g. <minimax:tool_call>)
-    ns_match = re.search(r'<([A-Za-z_][\w.-]*):tool_call>', cleaned_text)
+    ns_match = re.search(r"<([A-Za-z_][\w.-]*):tool_call>", cleaned_text)
     if ns_match:
         ns = ns_match.group(1)
         return _parse_namespaced_tool_calls(cleaned_text, ns)
 
     # Fallback: bracket tool call formats (from text-formatted history)
-    if '[Calling tool:' in cleaned_text or '[Tool call:' in cleaned_text:
+    if "[Calling tool:" in cleaned_text or "[Tool call:" in cleaned_text:
         return _parse_bracket_tool_calls(cleaned_text)
 
     return cleaned_text, None
@@ -426,7 +464,7 @@ class ToolCallStreamFilter:
         self._namespaced_open_re = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>")
         self._bracket_prefixes = ["[Calling tool:", "[Tool call:"]
         self._bracket_call_re = re.compile(
-            r'^\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)(?:\(({.*?})\))?\]',
+            r"^\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)(?:\(({.*?})\))?\]",
             re.DOTALL,
         )
         self._buffer = ""
@@ -438,7 +476,9 @@ class ToolCallStreamFilter:
         """Whether this filter should run for tool-enabled streams."""
         return True
 
-    def _find_start_envelope(self, text: str) -> Optional[Tuple[int, int, Optional[str]]]:
+    def _find_start_envelope(
+        self, text: str
+    ) -> Optional[Tuple[int, int, Optional[str]]]:
         """Find earliest complete opening envelope.
 
         Returns:
@@ -456,7 +496,9 @@ class ToolCallStreamFilter:
         ns_match = self._namespaced_open_re.search(text)
         if ns_match:
             ns = ns_match.group(1)
-            starts.append((ns_match.start(), len(ns_match.group(0)), f"</{ns}:tool_call>"))
+            starts.append(
+                (ns_match.start(), len(ns_match.group(0)), f"</{ns}:tool_call>")
+            )
 
         for bp in self._bracket_prefixes:
             bracket_idx = text.find(bp)
@@ -613,7 +655,7 @@ class ToolCallStreamFilter:
                 continue
 
             # Preserve balanced literal bracket text that is not being suppressed.
-            out.append(text[bracket_idx:close_idx + 1])
+            out.append(text[bracket_idx : close_idx + 1])
             cursor = close_idx + 1
 
         return "".join(out)
@@ -638,10 +680,12 @@ class ToolCallStreamFilter:
             if self._suppressing_until is not None:
                 end_idx = self._buffer.find(self._suppressing_until)
                 if end_idx < 0:
-                    keep = self._partial_prefix_len(self._buffer, self._suppressing_until)
+                    keep = self._partial_prefix_len(
+                        self._buffer, self._suppressing_until
+                    )
                     self._buffer = self._buffer[-keep:] if keep else ""
                     break
-                self._buffer = self._buffer[end_idx + len(self._suppressing_until):]
+                self._buffer = self._buffer[end_idx + len(self._suppressing_until) :]
                 self._suppressing_until = None
                 continue
 
@@ -649,8 +693,10 @@ class ToolCallStreamFilter:
             if start:
                 idx, consume_len, close_marker = start
                 if idx > 0:
-                    out.append(self._sanitize_prefix_before_suppression(self._buffer[:idx]))
-                self._buffer = self._buffer[idx + consume_len:]
+                    out.append(
+                        self._sanitize_prefix_before_suppression(self._buffer[:idx])
+                    )
+                self._buffer = self._buffer[idx + consume_len :]
                 if close_marker is not None:
                     self._suppressing_until = close_marker
                 continue
@@ -694,9 +740,7 @@ class ToolCallStreamFilter:
         return buf
 
 
-def convert_tools_for_template(
-    tools: Optional[List]
-) -> Optional[List[dict]]:
+def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:
     """
     Convert OpenAI tools format to format expected by tokenizer.apply_chat_template.
 
@@ -730,20 +774,26 @@ def convert_tools_for_template(
             if isinstance(tool_func, dict):
                 func_name = tool_func.get("name", "")
                 func_desc = tool_func.get("description", "")
-                func_params = tool_func.get("parameters", {"type": "object", "properties": {}})
+                func_params = tool_func.get(
+                    "parameters", {"type": "object", "properties": {}}
+                )
             else:
                 func_name = getattr(tool_func, "name", "")
                 func_desc = getattr(tool_func, "description", "")
-                func_params = getattr(tool_func, "parameters", {"type": "object", "properties": {}})
+                func_params = getattr(
+                    tool_func, "parameters", {"type": "object", "properties": {}}
+                )
 
-            converted.append({
-                "type": "function",
-                "function": {
-                    "name": func_name,
-                    "description": func_desc,
-                    "parameters": func_params
+            converted.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": func_name,
+                        "description": func_desc,
+                        "parameters": func_params,
+                    },
                 }
-            })
+            )
 
     return converted if converted else None
 
@@ -764,7 +814,7 @@ def format_tool_call_for_message(tool_call: ToolCall) -> dict:
         "function": {
             "name": tool_call.function.name,
             "arguments": tool_call.function.arguments,
-        }
+        },
     }
 
 
@@ -772,9 +822,9 @@ def format_tool_call_for_message(tool_call: ToolCall) -> dict:
 # Structured Output (JSON Schema) Utilities
 # =============================================================================
 
+
 def validate_json_schema(
-    data: Any,
-    schema: Dict[str, Any]
+    data: Any, schema: Dict[str, Any]
 ) -> Tuple[bool, Optional[str]]:
     """
     Validate JSON data against a JSON Schema.
@@ -820,7 +870,7 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
 
     # Strategy 2: Extract from markdown code blocks
     # Match ```json ... ``` or ``` ... ```
-    code_block_pattern = r'```(?:json)?\s*([\s\S]*?)\s*```'
+    code_block_pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
     matches = re.findall(code_block_pattern, text)
     for match in matches:
         try:
@@ -831,8 +881,8 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     # Strategy 3: Find JSON object or array in text
     # Look for { ... } or [ ... ]
     json_patterns = [
-        r'(\{[\s\S]*\})',  # Object
-        r'(\[[\s\S]*\])',  # Array
+        r"(\{[\s\S]*\})",  # Object
+        r"(\[[\s\S]*\])",  # Array
     ]
     for pattern in json_patterns:
         match = re.search(pattern, text)
@@ -846,8 +896,7 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
 
 
 def parse_json_output(
-    text: str,
-    response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None
+    text: str, response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None
 ) -> Tuple[str, Optional[Dict[str, Any]], bool, Optional[str]]:
     """
     Parse JSON from model output when response_format is set.
@@ -871,10 +920,7 @@ def parse_json_output(
 
     # Normalize response_format to dict
     if isinstance(response_format, ResponseFormat):
-        rf_dict = {
-            "type": response_format.type,
-            "json_schema": None
-        }
+        rf_dict = {"type": response_format.type, "json_schema": None}
         if response_format.json_schema:
             rf_dict["json_schema"] = {
                 "name": response_format.json_schema.name,
@@ -918,7 +964,7 @@ def parse_json_output(
 
 
 def build_json_system_prompt(
-    response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None
+    response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None,
 ) -> Optional[str]:
     """
     Build a system prompt instruction for JSON output.
@@ -937,10 +983,7 @@ def build_json_system_prompt(
 
     # Normalize to dict
     if isinstance(response_format, ResponseFormat):
-        rf_dict = {
-            "type": response_format.type,
-            "json_schema": None
-        }
+        rf_dict = {"type": response_format.type, "json_schema": None}
         if response_format.json_schema:
             rf_dict["json_schema"] = {
                 "name": response_format.json_schema.name,
