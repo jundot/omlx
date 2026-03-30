@@ -242,6 +242,72 @@ class TestTTSEndpointErrors:
 
 
 # ---------------------------------------------------------------------------
+# TestTTSVoiceRouting — unit tests for voice/instruct parameter dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestTTSVoiceRouting:
+    """Verify that the voice value is routed to the correct generate() kwarg."""
+
+    @pytest.fixture
+    def _run_synthesize(self):
+        """Helper: run TTSEngine.synthesize and return the kwargs passed to generate()."""
+        import asyncio
+        from omlx.engine.tts import TTSEngine
+
+        def _run(generate_sig_params, voice_value):
+            engine = TTSEngine("test-model")
+
+            # Build a mock model whose generate() has the requested signature
+            mock_model = MagicMock()
+            params = [
+                MagicMock(name="text", default=MagicMock()),
+                MagicMock(name="verbose", default=False),
+            ]
+            import inspect
+            sig_params = {
+                "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                "verbose": inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
+            }
+            for p in generate_sig_params:
+                sig_params[p] = inspect.Parameter(p, inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None)
+            mock_model.generate = MagicMock()
+            mock_model.generate.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
+            mock_model.generate.return_value = []  # no audio chunks
+
+            engine._model = mock_model
+
+            try:
+                asyncio.run(engine.synthesize("Hello", voice=voice_value))
+            except RuntimeError:
+                pass  # "no audio output" is expected with empty generate
+
+            return mock_model.generate.call_args
+
+        return _run
+
+    def test_customvoice_routes_to_voice(self, _run_synthesize):
+        """Model with 'voice' param: value goes to voice, not instruct."""
+        call = _run_synthesize(["voice", "instruct"], "Vivian")
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("voice") == "Vivian"
+        assert "instruct" not in kwargs
+
+    def test_voicedesign_routes_to_instruct(self, _run_synthesize):
+        """Model with only 'instruct' param: value goes to instruct."""
+        call = _run_synthesize(["instruct"], "female, calm, slow")
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("instruct") == "female, calm, slow"
+        assert "voice" not in kwargs
+
+    def test_voice_only_model(self, _run_synthesize):
+        """Model with only 'voice' param (e.g. Kokoro): value goes to voice."""
+        call = _run_synthesize(["voice"], "af_heart")
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("voice") == "af_heart"
+
+
+# ---------------------------------------------------------------------------
 # Integration test (slow, requires mlx-audio)
 # ---------------------------------------------------------------------------
 

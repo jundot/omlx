@@ -151,14 +151,16 @@ class TTSEngine(BaseNonStreamingEngine):
                 "verbose": False,
             }
             if voice is not None:
-                # VoiceDesign models expect voice description in 'instruct',
-                # not 'voice'. Detect by checking if generate() accepts 'instruct'.
+                # Route the voice value to the correct generate() parameter.
+                # Models like CustomVoice accept a speaker name via 'voice';
+                # VoiceDesign-only models accept a description via 'instruct'.
+                # When both exist, 'voice' takes priority (CustomVoice).
                 import inspect
                 gen_params = inspect.signature(model.generate).parameters
-                if "instruct" in gen_params and voice != "default":
-                    gen_kwargs["instruct"] = voice
-                else:
+                if "voice" in gen_params:
                     gen_kwargs["voice"] = voice
+                elif "instruct" in gen_params:
+                    gen_kwargs["instruct"] = voice
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             gen_kwargs.update(kwargs)
