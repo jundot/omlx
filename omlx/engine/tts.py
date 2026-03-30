@@ -155,15 +155,13 @@ class TTSEngine(BaseNonStreamingEngine):
             import inspect
             gen_params = inspect.signature(model.generate).parameters
             if voice is not None:
-                # Qwen3-TTS variants (Base/CustomVoice/VoiceDesign) share the
-                # same generate() signature with both 'voice' and 'instruct'.
-                # Pass voice to 'voice' kwarg when accepted. When no explicit
-                # instructions are given, also set 'instruct' as a fallback so
-                # VoiceDesign models (which require instruct) still work when
-                # users pass a voice description via the 'voice' API field.
+                # Route voice to the correct generate() kwarg.
+                # Models with 'voice' param (CustomVoice, Kokoro) get it as
+                # a speaker name. Models with only 'instruct' (non-Qwen TTS)
+                # get it as a voice description fallback.
                 if "voice" in gen_params:
                     gen_kwargs["voice"] = voice
-                if "instruct" in gen_params and instructions is None:
+                elif "instruct" in gen_params:
                     gen_kwargs["instruct"] = voice
             if instructions is not None and "instruct" in gen_params:
                 gen_kwargs["instruct"] = instructions

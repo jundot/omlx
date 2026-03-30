@@ -284,13 +284,12 @@ class TestTTSVoiceRouting:
 
         return _run
 
-    def test_customvoice_voice_and_fallback_instruct(self, _run_synthesize):
-        """Model with both params, voice only: voice goes to both kwargs
-        so VoiceDesign models (same signature) also get instruct."""
+    def test_customvoice_routes_to_voice(self, _run_synthesize):
+        """Model with both params: voice goes to voice only, not instruct."""
         call = _run_synthesize(["voice", "instruct"], voice_value="Vivian")
         kwargs = call.kwargs if call else {}
         assert kwargs.get("voice") == "Vivian"
-        assert kwargs.get("instruct") == "Vivian"
+        assert "instruct" not in kwargs
 
     def test_voicedesign_routes_to_instruct(self, _run_synthesize):
         """Model with only 'instruct' param: value goes to instruct."""
