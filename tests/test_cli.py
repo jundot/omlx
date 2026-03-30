@@ -254,6 +254,65 @@ class TestServeCommandFunctions:
 
 
 
+class TestHasCliOverrides:
+    """Tests for _has_cli_overrides() — detects explicitly passed CLI args."""
+
+    @staticmethod
+    def _make_args(**kwargs):
+        """Namespace with all serve defaults (None), then apply overrides."""
+        defaults = {
+            "model_dir": None,
+            "port": None,
+            "max_model_memory": None,
+            "max_process_memory": None,
+            "host": None,
+            "log_level": None,
+        }
+        defaults.update(kwargs)
+        return argparse.Namespace(**defaults)
+
+    def test_no_overrides_returns_false(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args()) is False
+
+    def test_host_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(host="0.0.0.0")) is True
+        # Even the default value, when explicitly passed, counts as override
+        assert _has_cli_overrides(self._make_args(host="127.0.0.1")) is True
+
+    def test_port_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(port=9000)) is True
+        assert _has_cli_overrides(self._make_args(port=8000)) is True
+
+    def test_model_dir_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(model_dir="/tmp/models")) is True
+
+    def test_max_model_memory_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(max_model_memory="auto")) is True
+        assert _has_cli_overrides(self._make_args(max_model_memory="32GB")) is True
+
+    def test_max_process_memory_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(max_process_memory="64GB")) is True
+
+    def test_log_level_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(log_level="info")) is True
+        assert _has_cli_overrides(self._make_args(log_level="debug")) is True
+
+    def test_multiple_overrides(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(host="0.0.0.0", port=9000)) is True
+
+    def test_empty_namespace(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(argparse.Namespace()) is False
+
+
 class TestCLIDocstrings:
     """Tests for CLI module docstrings and descriptions."""
 

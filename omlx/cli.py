@@ -19,24 +19,22 @@ import sys
 
 
 def _has_cli_overrides(args) -> bool:
-    """Check if CLI args contain non-default values that should be saved."""
-    # model_dir: default=None (don't save None)
+    """Check if CLI args contain non-default values that should be saved.
+
+    All argparse defaults are None, so `is not None` means the user
+    explicitly passed the flag on the command line.
+    """
     if hasattr(args, "model_dir") and args.model_dir is not None:
         return True
-    # port: default=8000
-    if hasattr(args, "port") and args.port != 8000:
+    if hasattr(args, "port") and args.port is not None:
         return True
-    # max_model_memory: default="auto"
-    if hasattr(args, "max_model_memory") and args.max_model_memory != "auto":
+    if hasattr(args, "max_model_memory") and args.max_model_memory is not None:
         return True
-    # max_process_memory: default=None (don't save None)
     if hasattr(args, "max_process_memory") and args.max_process_memory is not None:
         return True
-    # host: default="127.0.0.1"
-    if hasattr(args, "host") and args.host != "127.0.0.1":
+    if hasattr(args, "host") and args.host is not None:
         return True
-    # log_level: default="info"
-    if hasattr(args, "log_level") and args.log_level != "info":
+    if hasattr(args, "log_level") and args.log_level is not None:
         return True
     return False
 
