@@ -119,63 +119,43 @@
     {% block content %}{% endblock %}
 
     <script>
-        // Auto-initialize Lucide icons via MutationObserver.
-        // Replaces all manual $nextTick(() => lucide.createIcons()) calls.
+        // Lucide icon processor — bypasses createIcons() which has Safari issues.
+        // Directly creates SVGs from lucide.icons definitions.
         (function() {
-            if (typeof lucide === 'undefined') return;
+            if (typeof lucide === 'undefined' || !lucide.icons) return;
 
-            var pending = false;
-            function processIcons() {
-                if (pending) return;
-                pending = true;
-                // setTimeout defers past Alpine's microtask rendering.
-                // Avoid wrapping in rAF — Safari may delay/skip rAF during
-                // page load, leaving pending=true forever and blocking all
-                // subsequent icon processing.
-                setTimeout(function() {
-                    lucide.createIcons();
-                    pending = false;
-                }, 0);
+            function toPascal(s) {
+                return s.replace(/(^|[-_ ])(\w)/g, function(m, sep, c) { return c.toUpperCase(); });
+            }
+
+            function replaceIcon(el) {
+                var name = el.getAttribute('data-lucide');
+                if (!name) return;
+                var def = lucide.icons[toPascal(name)];
+                if (!def) return;
+                var svg = lucide.createElement(def);
+                Array.from(el.attributes).forEach(function(a) {
+                    if (a.name !== 'data-lucide') svg.setAttribute(a.name, a.value);
+                });
+                svg.classList.add('lucide', 'lucide-' + name);
+                if (el.parentNode) el.parentNode.replaceChild(svg, el);
+            }
+
+            function processAll() {
+                document.querySelectorAll('i[data-lucide]').forEach(replaceIcon);
             }
 
             // Initial pass
             if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', processIcons);
+                document.addEventListener('DOMContentLoaded', processAll);
             } else {
-                processIcons();
+                processAll();
             }
 
-            // Watch for dynamically added icons and attribute changes.
-            // Lucide keeps data-lucide on output <svg>, so we must only match
-            // unprocessed <i> tags to avoid an infinite replace loop.
-            function hasUnprocessedIcons(node) {
-                if (node.tagName === 'I' && node.hasAttribute('data-lucide')) return true;
-                return node.querySelector && !!node.querySelector('i[data-lucide]');
-            }
-
-            new MutationObserver(function(mutations) {
-                for (var i = 0; i < mutations.length; i++) {
-                    var m = mutations[i];
-                    // Attribute change on <i data-lucide> (Alpine :data-lucide binding)
-                    if (m.type === 'attributes' && m.target.tagName === 'I') {
-                        processIcons();
-                        return;
-                    }
-                    // New nodes added (Alpine x-for, x-if rendering)
-                    var nodes = m.addedNodes;
-                    for (var j = 0; j < nodes.length; j++) {
-                        if (nodes[j].nodeType === 1 && hasUnprocessedIcons(nodes[j])) {
-                            processIcons();
-                            return;
-                        }
-                    }
-                }
-            }).observe(document.body || document.documentElement, {
-                childList: true,
-                subtree: true,
-                attributes: true,
-                attributeFilter: ['data-lucide']
-            });
+            // Poll for dynamically added icons (Alpine x-for, x-if, modals).
+            setInterval(function() {
+                if (document.querySelector('i[data-lucide]')) processAll();
+            }, 300);
         })();
     </script>
 
