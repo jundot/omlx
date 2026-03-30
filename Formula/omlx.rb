@@ -12,6 +12,13 @@ class Omlx < Formula
   depends_on :macos
   depends_on arch: :arm64
 
+  # mlx-audio pins mlx-lm==0.31.1 which conflicts with omlx's git-pinned
+  # mlx-lm. Fetch source separately so we can patch the pin before install.
+  resource "mlx-audio" do
+    url "https://github.com/Blaizzy/mlx-audio.git",
+      revision: "6408d2a410eb8c57464e07725b92271860199250"
+  end
+
   service do
     run [opt_bin/"omlx", "serve"]
     keep_alive true
@@ -28,7 +35,18 @@ class Omlx < Formula
     # Build Rust-based packages from source with headerpad to prevent
     # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths)
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
-    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken,tokenizers", "#{buildpath}[audio]"
+
+    # Install omlx without audio extra first
+    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken,tokenizers", buildpath.to_s
+
+    # Install mlx-audio with patched mlx-lm pin to avoid version conflict
+    resource("mlx-audio").stage do
+      inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
+      system libexec/"bin/pip", "install", "."
+    end
+
+    # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
+    system libexec/"bin/pip", "install", "python-multipart>=0.0.5"
 
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end
