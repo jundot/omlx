@@ -119,6 +119,13 @@ include = ["omlx*"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
 
+[tool.uv]
+# mlx-lm is pinned to a git commit; override transitive pins
+# (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
+override-dependencies = [
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@564281f",
+]
+
 [tool.black]
 line-length = 88
 target-version = ["py310", "py311", "py312", "py313"]
