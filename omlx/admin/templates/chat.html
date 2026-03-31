@@ -1260,7 +1260,7 @@
                         // Execute all tools in parallel, show indicators while waiting
                         const indicatorIndices = toolCalls.map(() => {
                             const idx = this.messages.length;
-                            this.messages.push({ role: 'tool_call', content: '', _ui: true });
+                            this.messages.push({ role: 'tool_call', content: '', _ui: true, _error: false });
                             return idx;
                         });
 
