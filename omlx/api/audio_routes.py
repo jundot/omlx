@@ -52,6 +52,17 @@ def _get_engine_pool():
     return pool
 
 
+def _get_settings_manager():
+    """Return the active SettingsManager from server state.
+
+    Imported lazily to avoid a circular import at module load time.
+    Can be replaced in tests via patch('omlx.api.audio_routes._get_settings_manager').
+    """
+    from omlx.server import _server_state
+
+    return _server_state.settings_manager
+
+
 async def _read_upload(file: UploadFile) -> bytes:
     """Read an uploaded file in chunks, bailing early if it exceeds the limit."""
     chunks: list[bytes] = []
@@ -95,6 +106,7 @@ async def create_transcription(
     from omlx.exceptions import ModelNotFoundError
 
     pool = _get_engine_pool()
+    model = pool.resolve_model_id(model, _get_settings_manager())
 
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
@@ -161,15 +173,16 @@ async def create_speech(request: AudioSpeechRequest):
         raise HTTPException(status_code=400, detail="'input' field must not be empty")
 
     pool = _get_engine_pool()
+    model = pool.resolve_model_id(request.model, _get_settings_manager())
 
     # Load the engine via pool
     try:
-        engine = await pool.get_engine(request.model)
+        engine = await pool.get_engine(model)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
             status_code=404,
-            detail=f"Model '{request.model}' not found. Available: {avail}",
+            detail=f"Model '{model}' not found. Available: {avail}",
         ) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -177,7 +190,7 @@ async def create_speech(request: AudioSpeechRequest):
     if not isinstance(engine, TTSEngine):
         raise HTTPException(
             status_code=400,
-            detail=f"Model '{request.model}' is not a text-to-speech model",
+            detail=f"Model '{model}' is not a text-to-speech model",
         )
 
     try:
@@ -210,6 +223,7 @@ async def process_audio(
     from omlx.exceptions import ModelNotFoundError
 
     pool = _get_engine_pool()
+    model = pool.resolve_model_id(model, _get_settings_manager())
 
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
