@@ -1906,7 +1906,10 @@ def _gptq_compute_hessian(X: Any, damp: float = 0.01) -> tuple:
     n = X.shape[1]
     H = (X.T @ X).astype(mx.float32)
     diag_mean = mx.diag(H).mean()
-    H = H + damp * diag_mean * mx.eye(n)
+    # Absolute floor prevents singular matrix when activations are near-zero
+    # (e.g. down_proj input after SiLU gating kills entire dimensions)
+    damp_value = mx.maximum(damp * diag_mean, mx.array(1e-6))
+    H = H + damp_value * mx.eye(n)
     mx.eval(H)
     L = mx.linalg.cholesky(H, stream=mx.cpu)
     I = mx.eye(n)
@@ -1975,9 +1978,13 @@ def _compute_per_expert_hessians(
 
         expert_x = mx.array(x_np[mask])
         expert_damp = damp if n_tokens >= in_dim else damp * (in_dim / max(n_tokens, 1))
-        _, Hinv_e = _gptq_compute_hessian(expert_x, damp=expert_damp)
-        mx.eval(Hinv_e)
-        hinvs.append(Hinv_e)
+        try:
+            _, Hinv_e = _gptq_compute_hessian(expert_x, damp=expert_damp)
+            mx.eval(Hinv_e)
+            hinvs.append(Hinv_e)
+        except Exception:
+            hinvs.append(mx.eye(in_dim))
+            identity_count += 1
         del expert_x
 
     logger.debug(
