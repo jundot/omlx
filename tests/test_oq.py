@@ -20,6 +20,7 @@ from omlx.oq import (
     _bpw_targets_for_level,
     _build_quant_plan,
     _compute_group_params,
+    _compute_per_expert_hessians,
     _extract_layer_index,
     _format_size,
     _get_predicate_bits,
@@ -898,6 +899,109 @@ class TestGPTQQuantize:
                 f"Expert {ei}: GPTQ degraded MSE by >5%: "
                 f"gptq={mse_g.item():.6f} vs plain={mse_p.item():.6f}"
             )
+
+    def test_gptq_experts_batched_3d_hinv(self):
+        """3D per-expert Hinv should produce different results than shared 2D."""
+        num_experts, out_dim, in_dim = 4, 64, 128
+        bits, gs = 4, 64
+
+        w_3d = mx.random.normal((num_experts, out_dim, in_dim)).astype(mx.float32) * 0.1
+        mx.eval(w_3d)
+
+        # Create different Hessians per expert (simulating routing)
+        hinvs_2d = []
+        for e in range(num_experts):
+            x_e = mx.random.normal((64, in_dim)).astype(mx.float32) * (1.0 + e * 0.5)
+            mx.eval(x_e)
+            _, hinv_e = _gptq_compute_hessian(x_e)
+            mx.eval(hinv_e)
+            hinvs_2d.append(hinv_e)
+        Hinv_3d = mx.stack(hinvs_2d, axis=0)  # (4, 128, 128)
+        mx.eval(Hinv_3d)
+
+        # Shared Hessian (from combined input)
+        x_all = mx.random.normal((256, in_dim)).astype(mx.float32)
+        mx.eval(x_all)
+        _, Hinv_shared = _gptq_compute_hessian(x_all)
+        mx.eval(Hinv_shared)
+
+        w_shared = _gptq_quantize_experts_batched(w_3d, Hinv_shared, bits, gs)
+        w_per_exp = _gptq_quantize_experts_batched(w_3d, Hinv_3d, bits, gs)
+        mx.eval(w_shared, w_per_exp)
+
+        # Per-expert should produce different weights than shared
+        diff = mx.abs(w_shared - w_per_exp).sum().item()
+        assert diff > 0, "Per-expert Hinv should produce different weights"
+
+        # Replicated shared should match original shared behavior
+        Hinv_replicated = mx.stack([Hinv_shared] * num_experts, axis=0)
+        mx.eval(Hinv_replicated)
+        w_replicated = _gptq_quantize_experts_batched(w_3d, Hinv_replicated, bits, gs)
+        mx.eval(w_replicated)
+        diff_rep = mx.abs(w_shared - w_replicated).max().item()
+        assert diff_rep < 1e-5, (
+            f"Replicated shared Hinv should match 2D shared: max diff={diff_rep}"
+        )
+
+    def test_compute_per_expert_hessians(self):
+        """Per-expert Hessian with 1D flat indices (SwitchLinear gather_mm format)."""
+        num_experts, in_dim = 8, 64
+        # Simulate SwitchLinear captured: N token-expert pairs with 1D indices
+        n_pairs = 512  # batch*seq*top_k
+        values = mx.random.normal((n_pairs, 1, in_dim)).astype(mx.float32)
+        indices = mx.random.randint(0, num_experts, (n_pairs,))
+        mx.eval(values, indices)
+
+        hinvs = _compute_per_expert_hessians(
+            values, indices, num_experts, min_tokens=16,
+        )
+
+        assert len(hinvs) == num_experts
+        for i, h in enumerate(hinvs):
+            assert h.shape == (in_dim, in_dim), f"Expert {i}: wrong shape {h.shape}"
+
+        # Different experts should have different Hessians
+        diff = mx.abs(hinvs[0] - hinvs[1]).sum().item()
+        assert diff > 0, "Different experts should have different Hessians"
+
+    def test_compute_per_expert_hessians_sparse_fallback(self):
+        """Experts with too few tokens should get identity Hessian."""
+        num_experts, in_dim = 8, 64
+        # All pairs go to expert 0 — experts 1-7 get zero tokens
+        n_pairs = 200
+        indices = mx.zeros((n_pairs,), dtype=mx.int32)
+        values = mx.random.normal((n_pairs, 1, in_dim)).astype(mx.float32)
+        mx.eval(values, indices)
+
+        hinvs = _compute_per_expert_hessians(
+            values, indices, num_experts, min_tokens=16,
+        )
+
+        # Expert 0 should have a real Hessian
+        identity = mx.eye(in_dim)
+        diff_0 = mx.abs(hinvs[0] - identity).sum().item()
+        assert diff_0 > 1.0, "Expert 0 should not be identity"
+
+        # Expert 1 should fall back to identity
+        diff_1 = mx.abs(hinvs[1] - identity).sum().item()
+        assert diff_1 < 1e-5, "Sparse expert should use identity fallback"
+
+    def test_compute_per_expert_hessians_down_proj(self):
+        """Per-expert Hessian for down_proj (smaller intermediate dim)."""
+        num_experts, inter_dim = 8, 32
+        n_pairs = 400
+
+        values = mx.random.normal((n_pairs, 1, inter_dim)).astype(mx.float32)
+        indices = mx.random.randint(0, num_experts, (n_pairs,))
+        mx.eval(values, indices)
+
+        hinvs = _compute_per_expert_hessians(
+            values, indices, num_experts, min_tokens=8,
+        )
+
+        assert len(hinvs) == num_experts
+        for h in hinvs:
+            assert h.shape == (inter_dim, inter_dim)
 
     def test_compute_group_params_partial_group(self):
         """_compute_group_params should handle partial last group by padding."""
