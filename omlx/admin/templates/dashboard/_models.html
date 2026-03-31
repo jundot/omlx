@@ -1634,6 +1634,21 @@
                                                 </template>
                                             </select>
                                         </div>
+                                        <!-- Re-download notice toggle (only when auto-generate) -->
+                                        <template x-if="uploadReadmeSource === ''">
+                                            <div class="flex items-center justify-between">
+                                                <div>
+                                                    <label class="text-xs font-medium text-neutral-500" x-text="window.t('models.uploader.modal_redownload_label')"></label>
+                                                    <p class="text-[10px] text-neutral-400 mt-0.5" x-text="window.t('models.uploader.modal_redownload_hint')"></p>
+                                                </div>
+                                                <button @click="uploadRedownloadNotice = !uploadRedownloadNotice"
+                                                        class="relative w-10 h-5 rounded-full transition-colors duration-200 shrink-0 ml-3"
+                                                        :class="uploadRedownloadNotice ? 'bg-neutral-900' : 'bg-neutral-200'">
+                                                    <span class="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform duration-200"
+                                                          :class="uploadRedownloadNotice ? 'translate-x-5' : ''"></span>
+                                                </button>
+                                            </div>
+                                        </template>
                                         <!-- Private toggle -->
                                         <div class="flex items-center justify-between">
                                             <label class="text-xs font-medium text-neutral-500" x-text="window.t('models.uploader.modal_private_label')"></label>

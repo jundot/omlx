@@ -2924,6 +2924,7 @@
                 this.uploadModalRepoId = (this.uploadHfNamespace || this.uploadHfUsername) + '/' + model.name;
                 this.uploadReadmeSource = '';
                 this.uploadAutoReadme = true;
+                this.uploadRedownloadNotice = false;
                 this.uploadPrivate = false;
                 this.uploadStarting = false;
                 this.uploadModalOpen = true;
@@ -2943,6 +2944,7 @@
                             hf_token: this.uploadHfToken,
                             readme_source_path: this.uploadReadmeSource,
                             auto_readme: this.uploadAutoReadme,
+                            redownload_notice: this.uploadRedownloadNotice && this.uploadReadmeSource === '',
                             private: this.uploadPrivate,
                         }),
                     });

@@ -224,6 +224,7 @@ class HFUploadRequest(BaseModel):
     hf_token: str
     readme_source_path: str = ""
     auto_readme: bool = True
+    redownload_notice: bool = False
     private: bool = False
 
 
@@ -3870,6 +3871,7 @@ async def start_upload(
             token=request.hf_token,
             readme_source_path=request.readme_source_path,
             auto_readme=request.auto_readme,
+            redownload_notice=request.redownload_notice,
             private=request.private,
         )
         return {"success": True, "task": task.to_dict()}

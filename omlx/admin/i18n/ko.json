@@ -224,6 +224,8 @@
   "models.uploader.modal_repo_label": "Repository Name",
   "models.uploader.modal_readme_label": "README Source",
   "models.uploader.modal_readme_none": "Auto-generate basic README",
+  "models.uploader.modal_redownload_label": "Show re-download notice",
+  "models.uploader.modal_redownload_hint": "Add a notice at the top of README asking previous users to re-download",
   "models.uploader.modal_private_label": "Private Repository",
   "models.uploader.modal_confirm": "Upload",
   "models.uploader.modal_cancel": "Cancel",
