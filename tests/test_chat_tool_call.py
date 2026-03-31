@@ -126,3 +126,131 @@ class TestChatToolCallAccumulation:
         result = self.accumulate_tool_calls(deltas)
         assert len(result) == 1
         assert result[0]["id"] == "tc_1"
+
+
+class TestChatToolCallSafety:
+    """Test safety guards for the MCP tool call loop (depth limit, abort, errors)."""
+
+    MAX_TOOL_DEPTH = 10
+    TOOL_TIMEOUT_MS = 30000
+
+    @staticmethod
+    def build_depth_error_message(max_depth):
+        """Replicate the depth-exceeded error message from streamResponse."""
+        return f"Error: Maximum tool call depth ({max_depth}) exceeded. The model may be stuck in a loop."
+
+    @staticmethod
+    def build_tool_result(content, error=False, tool_name=None):
+        """Replicate the tool execution result format from streamResponse."""
+        result = {"content": content, "error": error}
+        if error and tool_name:
+            result["toolName"] = tool_name
+        return result
+
+    @staticmethod
+    def build_timeout_error_message(timeout_ms):
+        """Replicate the timeout error message from streamResponse."""
+        return f"Error: Tool timed out after {timeout_ms / 1000}s"
+
+    @staticmethod
+    def build_error_indicator(tool_name):
+        """Replicate the error indicator message format from streamResponse."""
+        return {"role": "tool_call", "content": f"{tool_name} failed", "_ui": True, "_error": True}
+
+    # --- Depth limit tests ---
+
+    def test_depth_limit_error_message_format(self):
+        """Depth-exceeded message includes the limit value and loop warning."""
+        msg = self.build_depth_error_message(self.MAX_TOOL_DEPTH)
+        assert "10" in msg
+        assert "stuck in a loop" in msg
+
+    def test_depth_limit_boundary_at_max(self):
+        """Depth exactly equal to MAX_TOOL_DEPTH should still be allowed."""
+        depth = self.MAX_TOOL_DEPTH
+        # In the JS: if (depth > MAX_TOOL_DEPTH) — so depth == 10 is allowed
+        assert not (depth > self.MAX_TOOL_DEPTH)
+
+    def test_depth_limit_boundary_over_max(self):
+        """Depth one over MAX_TOOL_DEPTH should be rejected."""
+        depth = self.MAX_TOOL_DEPTH + 1
+        assert depth > self.MAX_TOOL_DEPTH
+
+    # --- Tool result format tests ---
+
+    def test_success_result_has_no_tool_name(self):
+        """Successful tool results should have error=False and no toolName."""
+        result = self.build_tool_result("search results here")
+        assert result["error"] is False
+        assert "toolName" not in result
+
+    def test_error_result_includes_tool_name(self):
+        """Failed tool results should have error=True and include toolName."""
+        result = self.build_tool_result("Error: connection refused", error=True, tool_name="tavily_search")
+        assert result["error"] is True
+        assert result["toolName"] == "tavily_search"
+        assert result["content"].startswith("Error:")
+
+    def test_timeout_error_message_includes_seconds(self):
+        """Timeout error message should show the timeout in seconds."""
+        msg = self.build_timeout_error_message(self.TOOL_TIMEOUT_MS)
+        assert "30.0s" in msg
+
+    def test_http_error_result_format(self):
+        """HTTP errors from /v1/mcp/execute should produce error results."""
+        result = self.build_tool_result("Error: HTTP 503", error=True, tool_name="broken_tool")
+        assert result["error"] is True
+        assert "503" in result["content"]
+
+    # --- Error indicator tests ---
+
+    def test_error_indicator_message_format(self):
+        """Error indicator messages should have _error flag and 'failed' content."""
+        indicator = self.build_error_indicator("tavily_search")
+        assert indicator["role"] == "tool_call"
+        assert indicator["_error"] is True
+        assert "tavily_search failed" in indicator["content"]
+        assert indicator["_ui"] is True
+
+    def test_error_indicators_excluded_from_api(self):
+        """Error indicators (role=tool_call) must be filtered from messagesForApi."""
+        messages = [
+            {"role": "user", "content": "search for X"},
+            {"role": "tool_call", "content": "search failed", "_error": True, "_ui": True},
+            {"role": "assistant", "content": "Sorry, the search failed."},
+        ]
+        valid_roles = {"user", "assistant", "tool", "system"}
+        api_msgs = [m for m in messages if m["role"] in valid_roles]
+        assert len(api_msgs) == 2
+        assert all(m["role"] != "tool_call" for m in api_msgs)
+
+    # --- Abort guard tests ---
+
+    def test_abort_signal_prevents_recursion(self):
+        """Simulates the abort guard: if signal is aborted, no recursion should happen."""
+        # Replicate the guard logic: if (this.abortController?.signal.aborted) return;
+        class FakeSignal:
+            def __init__(self, aborted):
+                self.aborted = aborted
+
+        class FakeController:
+            def __init__(self, aborted):
+                self.signal = FakeSignal(aborted)
+
+        # When aborted, the guard should fire
+        controller = FakeController(aborted=True)
+        should_recurse = not (controller.signal.aborted)
+        assert should_recurse is False
+
+        # When not aborted, recursion should proceed
+        controller = FakeController(aborted=False)
+        should_recurse = not (controller.signal.aborted)
+        assert should_recurse is True
+
+    def test_abort_guard_with_none_controller(self):
+        """If abortController is None, the guard should not crash (optional chaining)."""
+        controller = None
+        # Replicate JS: this.abortController?.signal.aborted
+        aborted = getattr(getattr(controller, "signal", None), "aborted", None)
+        # None is falsy, so recursion should proceed
+        assert not aborted

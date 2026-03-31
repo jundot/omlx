@@ -563,10 +563,12 @@
                             <div class="message-body markdown-content" x-html="renderMarkdown(msg.content)"></div>
                         </div>
                         <!-- Tool call indicator (shown while model is fetching tool results) -->
-                        <div x-show="msg.role === 'tool_call'" class="assistant-message" style="border-left: 2px solid var(--border-normal); opacity: 0.8;">
+                        <div x-show="msg.role === 'tool_call'" class="assistant-message" style="border-left: 2px solid var(--border-normal); opacity: 0.8;"
+                             :style="msg._error ? 'border-left-color: var(--text-danger);' : ''">
                             <div class="message-header">
-                                <div class="flex items-center gap-2 text-sm" style="color: var(--text-tertiary);">
+                                <div class="flex items-center gap-2 text-sm" :style="msg._error ? 'color: var(--text-danger);' : 'color: var(--text-tertiary);'">
                                     <i data-lucide="wrench" class="w-3.5 h-3.5"></i>
+                                    <svg x-show="msg._error" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
                                     <span x-text="msg.content"></span>
                                 </div>
                             </div>
@@ -754,6 +756,10 @@
 
             // VLM Detection State
             modelTypeMap: {},            // { modelId: "llm"|"vlm"|"embedding"|"reranker" }
+
+            // MCP Tool Call Limits
+            MAX_TOOL_DEPTH: 10,          // Max recursive streamResponse calls for tool loops
+            TOOL_TIMEOUT_MS: 30000,      // Per-tool execution timeout (ms)
 
             async init() {
                 // Auto-inject API key from server (admin session already authenticated)
@@ -1123,7 +1129,19 @@
                 await this.streamResponse();
             },
 
-            async streamResponse() {
+            async streamResponse(depth = 0) {
+                if (depth > this.MAX_TOOL_DEPTH) {
+                    this.messages.push({
+                        role: 'assistant',
+                        content: `Error: Maximum tool call depth (${this.MAX_TOOL_DEPTH}) exceeded. The model may be stuck in a loop.`,
+                        model: this.currentModel
+                    });
+                    this.saveCurrentChat();
+                    this.isStreaming = false;
+                    this.streamingContent = '';
+                    this.abortController = null;
+                    return;
+                }
                 this.isStreaming = true;
                 this.streamingContent = '';
                 this.abortController = new AbortController();
@@ -1253,29 +1271,67 @@
                             this.messages[indicatorIndices[i]].content = `${toolName}…`;
 
                             try {
+                                const timeoutSignal = AbortSignal.timeout?.(this.TOOL_TIMEOUT_MS);
+                                const combinedSignal = this.abortController?.signal && timeoutSignal
+                                    ? AbortSignal.any([this.abortController.signal, timeoutSignal])
+                                    : (timeoutSignal || this.abortController?.signal);
                                 const execResp = await fetch('/v1/mcp/execute', {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.getApiKey()}` },
                                     body: JSON.stringify({ tool_name: toolName, arguments: args }),
-                                    signal: this.abortController?.signal,
+                                    signal: combinedSignal,
                                 });
+                                if (!execResp.ok) {
+                                    return { content: `Error: HTTP ${execResp.status}`, error: true, toolName };
+                                }
                                 const execData = await execResp.json();
-                                return typeof execData.content === 'string' ? execData.content : JSON.stringify(execData.content ?? execData);
+                                return { content: typeof execData.content === 'string' ? execData.content : JSON.stringify(execData.content ?? execData), error: false };
                             } catch(e) {
-                                return `Error: ${e.message}`;
+                                const isTimeout = e.name === 'TimeoutError';
+                                return { content: isTimeout ? `Error: Tool timed out after ${this.TOOL_TIMEOUT_MS/1000}s` : `Error: ${e.message}`, error: true, toolName };
                             }
                         }));
 
-                        // Remove all indicators, push hidden tool result messages in order
-                        indicatorIndices.slice().reverse().forEach(idx => this.messages.splice(idx, 1));
-                        toolCalls.forEach((tc, i) => {
-                            this.messages.push({ role: 'tool', tool_call_id: tc.id, content: results[i], _ui: false });
+                        // Update indicators for errors, then remove successful ones
+                        const hasErrors = results.some(r => r.error);
+                        results.forEach((result, i) => {
+                            if (result.error) {
+                                this.messages[indicatorIndices[i]].content = `${result.toolName} failed`;
+                                this.messages[indicatorIndices[i]]._error = true;
+                            }
                         });
+
+                        // Remove only successful indicators immediately
+                        const successIndices = indicatorIndices.filter((_, i) => !results[i].error);
+                        successIndices.slice().reverse().forEach(idx => this.messages.splice(idx, 1));
+
+                        // Push hidden tool result messages in order
+                        toolCalls.forEach((tc, i) => {
+                            this.messages.push({ role: 'tool', tool_call_id: tc.id, content: results[i].content, _ui: false });
+                        });
+
+                        // Let user see error indicators for 2 seconds, then remove them
+                        if (hasErrors) {
+                            await new Promise(r => setTimeout(r, 2000));
+                            // Remove remaining error indicators by role+flag match (indices shifted)
+                            for (let j = this.messages.length - 1; j >= 0; j--) {
+                                if (this.messages[j].role === 'tool_call' && this.messages[j]._error) {
+                                    this.messages.splice(j, 1);
+                                }
+                            }
+                        }
 
                         this.saveCurrentChat();
                         this.streamingContent = '';
+
+                        // Abort guard: respect user clicking Stop during tool execution
+                        if (this.abortController?.signal.aborted) {
+                            this.isStreaming = false;
+                            return;
+                        }
+
                         // Loop back — model will now synthesize a final answer
-                        await this.streamResponse();
+                        await this.streamResponse(depth + 1);
                         return;
                     }
                     // --- end MCP tool call loop ---
