@@ -163,6 +163,10 @@ class TestOpenCodeIntegration:
         assert config["provider"]["omlx"]["npm"] == "@ai-sdk/openai-compatible"
         assert config["provider"]["omlx"]["options"]["apiKey"] == "test-key"
         assert config["provider"]["omlx"]["models"]["qwen3.5"]["name"] == "qwen3.5"
+        assert config["provider"]["omlx"]["models"]["qwen3.5"]["modalities"] == {
+            "input": ["text"],
+            "output": ["text"],
+        }
         assert config["model"] == "omlx/qwen3.5"
 
     def test_configure_custom_host(self, tmp_path):
@@ -243,6 +247,26 @@ class TestOpenCodeIntegration:
         model_config = config["provider"]["omlx"]["models"]["qwen3.5"]
         assert model_config["limit"]["context"] == 32768
         assert model_config["limit"]["output"] == 8192
+
+    def test_configure_vlm_modalities(self, tmp_path):
+        oc = OpenCodeIntegration()
+        config_path = tmp_path / "opencode" / "opencode.json"
+
+        with patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path):
+            oc.configure(
+                port=8000,
+                api_key="key",
+                model="qwen2.5-vl",
+                model_type="vlm",
+            )
+
+        config = json.loads(config_path.read_text())
+        model_config = config["provider"]["omlx"]["models"]["qwen2.5-vl"]
+        assert model_config["attachment"] is True
+        assert model_config["modalities"] == {
+            "input": ["text", "image"],
+            "output": ["text"],
+        }
 
     def test_configure_with_context_window_only(self, tmp_path):
         oc = OpenCodeIntegration()

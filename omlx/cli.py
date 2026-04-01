@@ -330,6 +330,7 @@ def launch_command(args):
     # Fetch model limits from server
     context_window = None
     max_tokens = None
+    model_type = None
     try:
         resp = requests.get(f"{base_url}/v1/models/status", headers=headers, timeout=5)
         if resp.ok:
@@ -337,6 +338,7 @@ def launch_command(args):
                 if m["id"] == model:
                     context_window = m.get("max_context_window")
                     max_tokens = m.get("max_tokens")
+                    model_type = m.get("model_type")
                     break
     except Exception:
         pass
@@ -352,6 +354,7 @@ def launch_command(args):
         tools_profile=tools_profile,
         context_window=context_window,
         max_tokens=max_tokens,
+        model_type=model_type,
     )
 
 
