@@ -126,7 +126,7 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         self._boundary_block_size = max(0, int(boundary_block_size))
         self._prefill_boundary_callback = prefill_boundary_callback
         self._abort_check_callback = abort_check_callback
-        self._turboquant_kv_bits: Optional[float] = None  # Set by Scheduler if enabled
+        self._turboquant_kv_bits: Optional[Any] = None  # int or (k_bits, v_bits)
         # Memory limits for inline prefill checking (set by Scheduler).
         # mx.get_active_memory() is ~20ns, negligible vs ~5s prefill chunks.
         self._memory_limit_bytes: int = 0  # soft limit, 0 = disabled
@@ -148,15 +148,25 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
 
         converted = 0
 
-        bits = int(self._turboquant_kv_bits)
+        bits_cfg = self._turboquant_kv_bits
+        if isinstance(bits_cfg, (list, tuple)) and len(bits_cfg) >= 2:
+            k_bits = int(bits_cfg[0])
+            v_bits = int(bits_cfg[1])
+        else:
+            k_bits = v_bits = int(bits_cfg)
         for i, cache_obj in enumerate(prompt_cache):
             cls_name = type(cache_obj).__name__
             if cls_name == "BatchKVCache":
                 left_padding = cache_obj.left_padding.tolist()
-                prompt_cache[i] = BatchTurboQuantKVCache(left_padding, bits=bits)
+                prompt_cache[i] = BatchTurboQuantKVCache(
+                    left_padding,
+                    bits=k_bits,
+                    k_bits=k_bits,
+                    v_bits=v_bits,
+                )
                 converted += 1
             elif isinstance(cache_obj, KVCache):
-                prompt_cache[i] = TurboQuantKVCache(bits=bits)
+                prompt_cache[i] = TurboQuantKVCache(bits=k_bits, k_bits=k_bits, v_bits=v_bits)
                 converted += 1
             elif isinstance(cache_obj, CacheList):
                 new_caches = []
@@ -164,16 +174,31 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     c_name = type(c).__name__
                     if c_name == "BatchKVCache":
                         left_padding = c.left_padding.tolist()
-                        new_caches.append(BatchTurboQuantKVCache(left_padding, bits=bits))
+                        new_caches.append(
+                            BatchTurboQuantKVCache(
+                                left_padding,
+                                bits=k_bits,
+                                k_bits=k_bits,
+                                v_bits=v_bits,
+                            )
+                        )
                         converted += 1
                     elif isinstance(c, KVCache):
-                        new_caches.append(TurboQuantKVCache(bits=bits))
+                        new_caches.append(
+                            TurboQuantKVCache(bits=k_bits, k_bits=k_bits, v_bits=v_bits)
+                        )
                         converted += 1
                     else:
                         new_caches.append(c)
                 cache_obj.caches = tuple(new_caches)
         if converted > 0:
-            logger.info(f"TurboQuant: converted {converted}/{len(prompt_cache)} cache layers to {bits}-bit")
+            logger.info(
+                "TurboQuant: converted %s/%s cache layers to K=%s, V=%s bits",
+                converted,
+                len(prompt_cache),
+                k_bits,
+                v_bits,
+            )
 
     def _boundary_capture_enabled(self) -> bool:
         return (
@@ -1203,7 +1228,7 @@ class Scheduler:
         self._enlarge_block_size_for_arrays_cache()
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
-        self._turboquant_kv_bits: Optional[float] = None
+        self._turboquant_kv_bits: Optional[Any] = None
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)

@@ -57,9 +57,11 @@ class ModelSettings:
     thinking_budget_tokens: Optional[int] = None
     reasoning_parser: Optional[str] = None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
 
-    # TurboQuant KV cache (temporarily disabled - performance issues)
+    # TurboQuant KV cache
     turboquant_kv_enabled: bool = False
     turboquant_kv_bits: int = 4  # 3 or 4
+    turboquant_kv_k_bits: Optional[int] = None  # Defaults to turboquant_kv_bits
+    turboquant_kv_v_bits: Optional[int] = None  # Defaults to turboquant_kv_bits
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
@@ -76,8 +78,10 @@ class ModelSettings:
     description: Optional[str] = None
 
     def __post_init__(self):
-        # TurboQuant is temporarily disabled due to performance issues
-        self.turboquant_kv_enabled = False
+        if self.turboquant_kv_k_bits is None:
+            self.turboquant_kv_k_bits = self.turboquant_kv_bits
+        if self.turboquant_kv_v_bits is None:
+            self.turboquant_kv_v_bits = self.turboquant_kv_bits
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

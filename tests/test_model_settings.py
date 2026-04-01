@@ -182,6 +182,26 @@ class TestModelSettings:
         d = settings.to_dict()
         assert "model_type_override" not in d
 
+    def test_turboquant_defaults_follow_base_bits(self):
+        settings = ModelSettings()
+        assert settings.turboquant_kv_enabled is False
+        assert settings.turboquant_kv_bits == 4
+        assert settings.turboquant_kv_k_bits == 4
+        assert settings.turboquant_kv_v_bits == 4
+
+    def test_turboquant_asymmetric_roundtrip(self):
+        original = ModelSettings(
+            turboquant_kv_enabled=True,
+            turboquant_kv_bits=4,
+            turboquant_kv_k_bits=8,
+            turboquant_kv_v_bits=2,
+        )
+        restored = ModelSettings.from_dict(original.to_dict())
+        assert restored.turboquant_kv_enabled is True
+        assert restored.turboquant_kv_bits == 4
+        assert restored.turboquant_kv_k_bits == 8
+        assert restored.turboquant_kv_v_bits == 2
+
 
 class TestModelSettingsManager:
     """Tests for ModelSettingsManager class."""

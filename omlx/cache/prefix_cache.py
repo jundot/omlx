@@ -1539,18 +1539,34 @@ class BlockAwarePrefixCache(CacheManager):
                     try:
                         from ..turboquant_kv import TurboQuantKVCache
                         from mlx_lm.models.cache import KVCache
-                        # Get bits from meta_state: (offset, bits, seed)
+                        # Get bits from meta_state: old=(offset, bits, seed),
+                        # new=(offset, k_bits, v_bits, seed)
                         tq_bits = 4
+                        tq_k_bits = 4
+                        tq_v_bits = 4
                         tq_seed = 0
                         ms = None
                         if first_block_meta_states and layer_idx < len(first_block_meta_states):
                             ms = first_block_meta_states[layer_idx]
                         if isinstance(ms, (list, tuple)) and len(ms) >= 3:
-                            tq_bits = int(ms[1])
-                            tq_seed = int(ms[2])
+                            if len(ms) >= 4:
+                                tq_k_bits = int(ms[1])
+                                tq_v_bits = int(ms[2])
+                                tq_bits = tq_k_bits
+                                tq_seed = int(ms[3])
+                            else:
+                                tq_bits = int(ms[1])
+                                tq_k_bits = tq_bits
+                                tq_v_bits = tq_bits
+                                tq_seed = int(ms[2])
                         # Dequantize back to fp16 KVCache for merge compatibility.
                         # TQ will be re-applied at decode start (lazy quantization).
-                        tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
+                        tq = TurboQuantKVCache(
+                            bits=tq_bits,
+                            k_bits=tq_k_bits,
+                            v_bits=tq_v_bits,
+                            seed=tq_seed,
+                        )
                         tq.state = ((cat_kn, cat_kp), (cat_vn, cat_vp))
                         tq._quantized = True
                         keys, values = tq.dequantize()
