@@ -62,6 +62,7 @@ def _make_mock_pool(sts_engine=None, model_id: str = "deepfilternet") -> MagicMo
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
+    pool.resolve_model_id = MagicMock(side_effect=lambda m, _: m)
     return pool
 
 

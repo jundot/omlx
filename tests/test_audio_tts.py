@@ -56,6 +56,7 @@ def _make_mock_pool(tts_engine=None, model_id: str = "qwen3-tts") -> MagicMock:
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
+    pool.resolve_model_id = MagicMock(side_effect=lambda m, _: m)
     return pool
 
 
@@ -252,7 +253,6 @@ class TestTTSModelAliasResolution:
     def test_speech_resolves_alias(self):
         """POST /v1/audio/speech with alias resolves to real model ID."""
         from omlx.server import app
-        from omlx.model_settings import ModelSettings
 
         _ensure_audio_routes(app)
 
