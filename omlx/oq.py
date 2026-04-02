@@ -556,74 +556,6 @@ def _build_quant_plan(
         total_bits_f += delta
         current_bpw = next_bpw
 
-    # Dense model MLP asymmetry: gate/down → base+1, up → base-1
-    # Inspired by unsloth Dynamic 2.0: SiLU gate and residual down_proj need
-    # protection, while up_proj (linear multiplicand) tolerates lower bits.
-    # Budget-approximately-neutral: 2 tensors boosted, 1 reduced.
-    _VALID_BITS_SET = {2, 3, 4, 5, 6, 8}
-    if is_dense and base_bits >= 3:
-        reduce_bits = max(base_bits - 1, 2)
-        boost_bits = base_bits + 1
-        while boost_bits not in _VALID_BITS_SET and boost_bits < 8:
-            boost_bits += 1
-        can_asymmetry = (
-            reduce_bits in _VALID_BITS_SET
-            and reduce_bits < base_bits
-            and boost_bits in _VALID_BITS_SET
-            and boost_bits > base_bits
-        )
-        if can_asymmetry:
-            # Pass 1: reduce up_proj → free budget
-            for path, shape in named_shapes.items():
-                if path in boost_map:
-                    continue
-                if "up_proj" not in path or "gate" in path:
-                    continue
-                if _extract_layer_index(path) < 0:
-                    continue
-                pred = universal_quant_predicate(
-                    path, module, {**config, "_oq_boost_map": {}}, oq_level
-                )
-                if pred is False:
-                    continue
-                cand_gs = _gs_for_mode(reduce_bits, _OQ_DEFAULT_GROUP_SIZE)
-                cand_mode = _mode_for_bits(reduce_bits)
-                old_cost = _tensor_quantized_bytes(
-                    shape, base_bits, base_group_size, base_mode
-                )
-                new_cost = _tensor_quantized_bytes(shape, reduce_bits, cand_gs, cand_mode)
-                delta = 8 * (new_cost - old_cost)  # negative
-                boost_map[path] = {"bits": reduce_bits, "group_size": cand_gs, "mode": cand_mode}
-                total_bits_f += delta
-                current_bpw = total_bits_f / total_params
-
-            # Pass 2: boost gate/down_proj → use freed budget (with cap check)
-            for path, shape in named_shapes.items():
-                if path in boost_map:
-                    continue
-                if not any(p in path for p in ("gate_proj", "down_proj", "wo")):
-                    continue
-                if _extract_layer_index(path) < 0:
-                    continue
-                pred = universal_quant_predicate(
-                    path, module, {**config, "_oq_boost_map": {}}, oq_level
-                )
-                if pred is False:
-                    continue
-                cand_gs = _gs_for_mode(boost_bits, _OQ_DEFAULT_GROUP_SIZE)
-                cand_mode = _mode_for_bits(boost_bits)
-                old_cost = _tensor_quantized_bytes(
-                    shape, base_bits, base_group_size, base_mode
-                )
-                new_cost = _tensor_quantized_bytes(shape, boost_bits, cand_gs, cand_mode)
-                delta = 8 * (new_cost - old_cost)
-                next_bpw = (total_bits_f + delta) / total_params
-                if next_bpw > hard_cap_bpw:
-                    continue
-                boost_map[path] = {"bits": boost_bits, "group_size": cand_gs, "mode": cand_mode}
-                total_bits_f += delta
-                current_bpw = next_bpw
-
     # Sensitivity-based greedy boost: boost tensors from their current bits
     # (which may already be elevated by the protection floor) using remaining
     # budget up to hard_cap_bpw.
@@ -2313,6 +2245,7 @@ def _run_gptq(
         # (e.g. gate_proj and up_proj both fed by layernorm output) get
         # identical Hessians, so compute once and reuse.
         _hinv_cache: dict[int, Any] = {}
+        _gptq_modified: dict[int, tuple] = {}  # id(module) → (bits, gs, mode)
         boost_map = config.get("_oq_boost_map") or {}
 
         for path, module in tree_flatten(
@@ -2376,6 +2309,7 @@ def _run_gptq(
                 w_f32, Hinv, bits, gs, mode, block_size=32,
             )
             module.weight = w_opt.astype(w.dtype)
+            _gptq_modified[id(module)] = (bits, gs, mode)
             mx.eval(module.weight)
             del w_f32, w_opt
             layer_opt += 1
@@ -2578,6 +2512,7 @@ def _run_gptq(
 
                 if target_type == "module":
                     target_ref.weight = new_3d
+                    _gptq_modified[id(target_ref)] = (base_bits, base_gs, base_mode)
                 else:
                     container, attr_name = target_ref
                     setattr(container, attr_name, new_3d)
@@ -2598,10 +2533,37 @@ def _run_gptq(
             )
 
         del captured
+
+        # QDQ only GPTQ-modified weights for inter-layer forward: simulate
+        # quantized inference to prevent activation drift that corrupts MoE
+        # routing in later layers. Non-modified modules (router, norms) keep
+        # their original precision to match inference behavior.
+        _saved_weights = {}
+        for path, module in tree_flatten(
+            block.leaf_modules(), is_leaf=nn.Module.is_module
+        ):
+            mid = id(module)
+            if mid not in _gptq_modified:
+                continue
+            bits_m, gs_m, mode_m = _gptq_modified[mid]
+            w = module.weight
+            if w.shape[-1] % gs_m != 0:
+                continue
+            _saved_weights[mid] = (module, w)
+            module.weight = _qdq_weight_only(w, bits_m, gs_m, mode_m).astype(w.dtype)
+
+        if _saved_weights:
+            mx.eval(*[m.weight for m, _ in _saved_weights.values()])
+
         out = _forward_layer(block, inputs, layer_mask, position_ids)
         if out is not None:
             inputs = out
         mx.eval(inputs)
+
+        for module, w_orig in _saved_weights.values():
+            module.weight = w_orig
+        del _saved_weights, _gptq_modified
+
         mx.synchronize()
         mx.clear_cache()
 
