@@ -40,6 +40,7 @@ class STTEngine(BaseNonStreamingEngine):
             model_name: HuggingFace model name or local path
             **kwargs: Additional model-specific parameters
         """
+        super().__init__()
         self._model_name = model_name
         self._model = None
         self._kwargs = kwargs
@@ -189,18 +190,24 @@ class STTEngine(BaseNonStreamingEngine):
                 "duration": 0.0,
             }
 
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            get_mlx_executor(), _transcribe_sync
-        )
+        with self._active_lock:
+            self._active_count += 1
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                get_mlx_executor(), _transcribe_sync
+            )
 
-        elapsed = time.monotonic() - t0
-        text_len = len(result.get("text", ""))
-        logger.info(
-            "STT transcribe done: model=%s, %.2fs, %d chars output",
-            self._model_name, elapsed, text_len,
-        )
-        return result
+            elapsed = time.monotonic() - t0
+            text_len = len(result.get("text", ""))
+            logger.info(
+                "STT transcribe done: model=%s, %.2fs, %d chars output",
+                self._model_name, elapsed, text_len,
+            )
+            return result
+        finally:
+            with self._active_lock:
+                self._active_count -= 1
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

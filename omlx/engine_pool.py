@@ -767,15 +767,7 @@ class EnginePool:
                     continue
 
                 # Check if model has active requests
-                has_active = False
-                if isinstance(entry.engine, BatchedEngine):
-                    engine_core = getattr(entry.engine, "_engine", None)
-                    if engine_core is not None:
-                        inner = getattr(engine_core, "engine", None)
-                        if inner is not None:
-                            collectors = getattr(inner, "_output_collectors", {})
-                            if len(collectors) > 0:
-                                has_active = True
+                has_active = entry.engine.has_active_requests()
 
                 if has_active:
                     entry.last_access = now

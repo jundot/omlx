@@ -39,6 +39,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         Args:
             model_name: HuggingFace model name or local path
         """
+        super().__init__()
         self._model_name = model_name
         self._model: Optional[MLXEmbeddingModel] = None
 
@@ -119,8 +120,14 @@ class EmbeddingEngine(BaseNonStreamingEngine):
                 truncation=truncation,
             )
 
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(get_mlx_executor(), _embed_sync)
+        with self._active_lock:
+            self._active_count += 1
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(get_mlx_executor(), _embed_sync)
+        finally:
+            with self._active_lock:
+                self._active_count -= 1
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

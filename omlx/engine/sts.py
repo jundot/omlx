@@ -271,6 +271,7 @@ class STSEngine(BaseNonStreamingEngine):
                 EnginePool for reliable family detection)
             **kwargs: Additional model-specific parameters
         """
+        super().__init__()
         self._model_name = model_name
         self._model = None  # For lfm2, this is (model, processor) tuple
         self._family = _detect_sts_family(model_name, config_model_type)
@@ -378,15 +379,21 @@ class STSEngine(BaseNonStreamingEngine):
         def _process_sync():
             return processor_fn(model, str(audio_path), **kwargs)
 
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(get_mlx_executor(), _process_sync)
+        with self._active_lock:
+            self._active_count += 1
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(get_mlx_executor(), _process_sync)
 
-        elapsed = time.monotonic() - t0
-        logger.info(
-            "STS process done: model=%s, %.2fs, %d bytes output",
-            self._model_name, elapsed, len(result),
-        )
-        return result
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "STS process done: model=%s, %.2fs, %d bytes output",
+                self._model_name, elapsed, len(result),
+            )
+            return result
+        finally:
+            with self._active_lock:
+                self._active_count -= 1
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

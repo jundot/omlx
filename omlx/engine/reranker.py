@@ -40,6 +40,7 @@ class RerankerEngine(BaseNonStreamingEngine):
         Args:
             model_name: HuggingFace model name or local path
         """
+        super().__init__()
         self._model_name = model_name
         self._model: MLXRerankerModel | None = None
 
@@ -121,22 +122,28 @@ class RerankerEngine(BaseNonStreamingEngine):
                 max_length=max_length,
             )
 
-        loop = asyncio.get_running_loop()
-        output = await loop.run_in_executor(
-            get_mlx_executor(), _rerank_sync
-        )
-
-        # Apply top_n filtering if specified
-        if top_n is not None and top_n < len(output.indices):
-            top_indices = output.indices[:top_n]
-            # Keep original scores but note which indices are in top_n
-            return RerankOutput(
-                scores=output.scores,
-                indices=top_indices,
-                total_tokens=output.total_tokens,
+        with self._active_lock:
+            self._active_count += 1
+        try:
+            loop = asyncio.get_running_loop()
+            output = await loop.run_in_executor(
+                get_mlx_executor(), _rerank_sync
             )
 
-        return output
+            # Apply top_n filtering if specified
+            if top_n is not None and top_n < len(output.indices):
+                top_indices = output.indices[:top_n]
+                # Keep original scores but note which indices are in top_n
+                return RerankOutput(
+                    scores=output.scores,
+                    indices=top_indices,
+                    total_tokens=output.total_tokens,
+                )
+
+            return output
+        finally:
+            with self._active_lock:
+                self._active_count -= 1
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

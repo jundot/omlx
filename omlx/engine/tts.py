@@ -43,6 +43,7 @@ class TTSEngine(BaseNonStreamingEngine):
             model_name: HuggingFace model name or local path
             **kwargs: Additional model-specific parameters
         """
+        super().__init__()
         self._model_name = model_name
         self._model = None
         self._kwargs = kwargs
@@ -184,17 +185,23 @@ class TTSEngine(BaseNonStreamingEngine):
             audio = np.concatenate(audio_chunks, axis=0)
             return _audio_to_wav_bytes(audio, int(sample_rate))
 
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            get_mlx_executor(), _synthesize_sync
-        )
+        with self._active_lock:
+            self._active_count += 1
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                get_mlx_executor(), _synthesize_sync
+            )
 
-        elapsed = time.monotonic() - t0
-        logger.info(
-            "TTS synthesize done: model=%s, %.2fs, %d bytes output",
-            self._model_name, elapsed, len(result),
-        )
-        return result
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "TTS synthesize done: model=%s, %.2fs, %d bytes output",
+                self._model_name, elapsed, len(result),
+            )
+            return result
+        finally:
+            with self._active_lock:
+                self._active_count -= 1
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
