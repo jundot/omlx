@@ -79,6 +79,10 @@ class BoundarySnapshotSSDStore:
         self._pending_writes: Dict[Tuple[str, int], Dict] = {}
         self._pending_lock = threading.Lock()
 
+        # Requests whose snapshots have been cleaned up — writer thread
+        # skips queued items for these request IDs.
+        self._cancelled_requests: set[str] = set()
+
         # Background writer thread.
         self._write_queue: queue.Queue = queue.Queue(maxsize=_MAX_PENDING_WRITES)
         self._shutdown = threading.Event()
@@ -234,6 +238,9 @@ class BoundarySnapshotSSDStore:
 
     def cleanup_request(self, request_id: str) -> None:
         """Delete all snapshot files and pending writes for a request."""
+        # Mark as cancelled so the writer thread skips queued items.
+        self._cancelled_requests.add(request_id)
+
         # Remove from pending writes.
         keys_to_remove = []
         with self._pending_lock:
@@ -257,10 +264,22 @@ class BoundarySnapshotSSDStore:
 
     def cleanup_all(self) -> None:
         """Delete all snapshot files (for reset/startup)."""
+        # Drain write queue so the writer thread doesn't process stale
+        # items after the directory is deleted.
+        while True:
+            try:
+                item = self._write_queue.get_nowait()
+                if item is None:  # Sentinel — put it back for shutdown.
+                    self._write_queue.put(item)
+                    break
+            except queue.Empty:
+                break
+
         with self._pending_lock:
             self._pending_writes.clear()
         with self._registry_lock:
             self._file_registry.clear()
+        self._cancelled_requests.clear()
 
         if self._snapshot_dir.exists():
             try:
@@ -297,6 +316,13 @@ class BoundarySnapshotSSDStore:
                 break
 
             pw_key, tensors_raw, metadata, file_path = item
+
+            # Skip writes for cancelled/cleaned-up requests.
+            if pw_key[0] in self._cancelled_requests:
+                with self._pending_lock:
+                    self._pending_writes.pop(pw_key, None)
+                continue
+
             try:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 temp_path = file_path.with_name(
