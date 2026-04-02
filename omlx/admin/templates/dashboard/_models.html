@@ -1110,28 +1110,8 @@
                                         {{ t('models.oq.advanced_settings') }}
                                     </button>
                                     <div x-show="oqAdvancedOpen" x-cloak class="mt-3 space-y-3 pl-1">
-                                        <!-- Enhanced Quantization(+) -->
-                                        <div class="flex items-center justify-between">
-                                            <div class="flex items-center gap-2">
-                                                <span class="text-sm text-neutral-600">Enhanced Quantization(+)</span>
-                                                <span x-show="!oqSelectedModelSupportsClip()" x-cloak
-                                                      class="text-[10px] text-neutral-400">(not available for this model)</span>
-                                            </div>
-                                            <button type="button"
-                                                    @click="if(oqSelectedModelSupportsClip()) oqEnableClip = !oqEnableClip"
-                                                    :class="oqEnableClip && oqSelectedModelSupportsClip() ? 'bg-black' : 'bg-neutral-200'"
-                                                    :disabled="!oqSelectedModelSupportsClip()"
-                                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black disabled:opacity-40 disabled:cursor-not-allowed">
-                                                <span :class="oqEnableClip && oqSelectedModelSupportsClip() ? 'translate-x-5' : 'translate-x-0'"
-                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
-                                            </button>
-                                        </div>
-                                        <p x-show="oqEnableClip" x-cloak class="text-xs text-amber-600 leading-relaxed">
-                                            Uses oQ's MoE-optimized <a href="https://arxiv.org/abs/2210.17323" target="_blank" class="underline">GPTQ(arXiv)</a> with batched expert processing and sensitivity-aware bit allocation. Requires full model load.
-                                        </p>
-                                        <p class="text-[11px] text-neutral-400 leading-relaxed">
-                                            Supported: Qwen3.5 MoE, Qwen3.5, MiniMax M2, GLM MoE, Nemotron, Step-3.5.
-                                        </p>
+                                        <!-- Enhanced Quantization(+) — temporarily disabled -->
+                                        <!-- TODO: re-enable when ready -->
                                         <!-- Text Only (VLM only) -->
                                         <div x-show="oqSelectedModelIsVLM()" x-cloak class="flex items-center justify-between">
                                             <span class="text-sm text-neutral-600">Text Only</span>
@@ -1297,10 +1277,10 @@
                                 <!-- Intro -->
                                 <div>
                                     <p class="mt-1.5 text-sm text-neutral-500">
-                                        oQ measures each layer's actual quantization sensitivity through calibration and allocates bits
-                                        where the data says they matter most. Combined with AWQ weight equalization, built-in calibration
-                                        data (600 samples across code, multilingual, reasoning, and tool calling), and budget-constrained
-                                        mixed-precision allocation.
+                                        oQ measures each layer's quantization sensitivity through calibration (relative MSE vs float16)
+                                        and builds a byte-budgeted mixed-precision plan that allocates bits where the data says they
+                                        matter most. Built-in calibration data (600 samples across code, multilingual, reasoning, and
+                                        tool calling). Every model gets a unique bit allocation tuned to its architecture.
                                     </p>
                                 </div>
 
@@ -1310,20 +1290,21 @@
                                     <div class="mt-3 space-y-3">
                                         <div class="flex gap-3">
                                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Data-driven sensitivity</strong> <span class="text-neutral-500">Per-layer quantization sensitivity measured via calibration. Sensitive layers get more bits, insensitive layers stay at base. Every model gets a unique bit allocation.</span></div>
+                                            <div class="text-sm"><strong class="text-neutral-700">Data-driven sensitivity</strong> <span class="text-neutral-500">Per-layer relative MSE measured against float16. Layers are ranked by quantization impact; the top 25% are marked as sensitive and receive priority in bit allocation.</span></div>
                                         </div>
                                         <div class="flex gap-3">
                                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Budget-constrained allocation</strong> <span class="text-neutral-500">Affine base (group_size=64), 8-bit uses mxfp8. Greedy budget plan allocates boost bits within target bpw. Routed experts stay at base; non-expert tensors compete by sensitivity.</span></div>
+                                            <div class="text-sm"><strong class="text-neutral-700">Budget-constrained allocation</strong> <span class="text-neutral-500">4-phase greedy plan within a hard bpw cap. Consensus tensors (lm_head, embeddings) get 8-bit first. Then attention and shared-expert layers get a protection floor. Remaining budget goes to the highest-sensitivity tensors. Routed experts (93-98% of MoE params) stay at base bits so the budget concentrates on the layers that actually move output quality.</span></div>
+                                        </div>
+                                        <div class="flex gap-3">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="M2 12h5l3-9 4 18 3-9h5"/></svg>
+                                            <div class="text-sm"><strong class="text-neutral-700">Model-aware quantization</strong> <span class="text-neutral-500">MoE: router fp16, routed experts at base, shared experts protected. VLM: vision encoder fp16. SSM: state tensors fp32. 512+ expert models get larger group size automatically.</span></div>
                                         </div>
                                         <div class="flex gap-3">
                                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Streaming</strong> <span class="text-neutral-500">Tensor-by-tensor quantization with sensitivity-driven mixed precision. Use a Sensitivity Model to reduce memory.</span></div>
+                                            <div class="text-sm"><strong class="text-neutral-700">Streaming</strong> <span class="text-neutral-500">Tensor-by-tensor quantization from safetensors. Use a sensitivity model (pre-quantized proxy) to measure layer ranking at ~4x less memory than float16 calibration.</span></div>
                                         </div>
-                                        <div class="flex gap-3">
-                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Enhanced (+)</strong> <span class="text-neutral-500">AWQ weight equalization with 20-point grid search. Sensitivity measured before AWQ, budget plan before AWQ, so equalization uses actual target bits.</span></div>
-                                        </div>
+
                                     </div>
                                 </div>
 
@@ -1353,7 +1334,7 @@
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Mixed precision</td>
-                                                    <td class="py-1.5 px-3">Data-driven sensitivity + AWQ equalization</td>
+                                                    <td class="py-1.5 px-3">Data-driven sensitivity (per-layer MSE)</td>
                                                     <td class="py-1.5 px-3">~15 type rules</td>
                                                     <td class="py-1.5 px-3">imatrix per-weight</td>
                                                     <td class="py-1.5 px-3">Per-layer (proprietary)</td>
@@ -1361,7 +1342,7 @@
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Hybrid modes</td>
-                                                    <td class="py-1.5 px-3">Affine + mxfp8</td>
+                                                    <td class="py-1.5 px-3">Affine (group_size=64)</td>
                                                     <td class="py-1.5 px-3">K-quant types</td>
                                                     <td class="py-1.5 px-3">E8 lattice</td>
                                                     <td class="py-1.5 px-3">Proprietary</td>
@@ -1369,7 +1350,7 @@
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">MoE support</td>
-                                                    <td class="py-1.5 px-3">Router fp16, fused-expert AWQ</td>
+                                                    <td class="py-1.5 px-3">Router fp16, expert-aware budget</td>
                                                     <td class="py-1.5 px-3">Basic</td>
                                                     <td class="py-1.5 px-3">Basic</td>
                                                     <td class="py-1.5 px-3">Router fp16</td>
@@ -1393,7 +1374,7 @@
                                                 </tr>
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Memory</td>
-                                                    <td class="py-1.5 px-3">~1.5× model</td>
+                                                    <td class="py-1.5 px-3">Streaming (~5-7GB)</td>
                                                     <td class="py-1.5 px-3">1× model</td>
                                                     <td class="py-1.5 px-3">1× model</td>
                                                     <td class="py-1.5 px-3">Proprietary</td>
@@ -1401,7 +1382,7 @@
                                                 </tr>
                                                 <tr>
                                                     <td class="py-1.5 pr-4 font-medium text-neutral-600">Apple Silicon</td>
-                                                    <td class="py-1.5 px-3">Native (MLX affine/mxfp8)</td>
+                                                    <td class="py-1.5 px-3">Native (MLX affine)</td>
                                                     <td class="py-1.5 px-3">Via llama.cpp</td>
                                                     <td class="py-1.5 px-3">Via llama.cpp</td>
                                                     <td class="py-1.5 px-3">GGUF only</td>
