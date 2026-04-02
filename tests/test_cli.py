@@ -231,6 +231,63 @@ class TestLaunchCommandOptions:
         assert "--model" in result.stdout
 
 
+class TestLaunchCommandFunction:
+    """Tests for launch command runtime behavior."""
+
+    def test_launch_command_passes_model_type_to_integration(self):
+        """VLM model metadata should be forwarded to integrations."""
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "OpenCode"
+        integration.is_installed.return_value = True
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [
+                {
+                    "id": "qwen2.5-vl",
+                    "model_type": "vlm",
+                    "max_context_window": 32768,
+                    "max_tokens": 8192,
+                }
+            ]
+        }
+
+        settings = MagicMock()
+        settings.server.host = "127.0.0.1"
+        settings.server.port = 8000
+
+        args = argparse.Namespace(
+            tool="opencode",
+            host=None,
+            port=None,
+            api_key="test-key",
+            model="qwen2.5-vl",
+            tools_profile="coding",
+        )
+
+        with patch("requests.get", side_effect=[health_response, status_response]):
+            with patch("omlx.integrations.get_integration", return_value=integration):
+                with patch("omlx.settings.GlobalSettings.load", return_value=settings):
+                    launch_command(args)
+
+        integration.launch.assert_called_once_with(
+            port=8000,
+            api_key="test-key",
+            model="qwen2.5-vl",
+            host="127.0.0.1",
+            tools_profile="coding",
+            context_window=32768,
+            max_tokens=8192,
+            model_type="vlm",
+        )
+
+
 class TestServeCommandFunctions:
     """Tests for serve command function."""
 
