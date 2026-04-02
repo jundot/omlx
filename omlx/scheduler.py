@@ -485,13 +485,6 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         return self._grammar_bitmask_buf
 
     def _process_prompts(self, prompts):
-        # Clear stale mRoPE position state from prior _process_prompts() call.
-        # With prefill_batch_size=1, _next() calls _process_prompts() once per
-        # prompt sequentially; the previous call's cached _position_ids would
-        # cause shape mismatches for mRoPE models (e.g. Qwen3.5).
-        if hasattr(self.model, "clear_vlm_position_state"):
-            self.model.clear_vlm_position_state()
-
         (
             uids,
             inputs,
@@ -518,6 +511,14 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         for uid in uids:
             if uid in self._vlm_pending:
                 vlm_embeds_map[uid] = self._vlm_pending.pop(uid)
+
+        # Clear stale mRoPE position state only for text-only batches.
+        # VLM batches need the position state (_position_ids, _rope_deltas)
+        # set by get_input_embeddings() during vision preprocessing.
+        # Clearing unconditionally would wipe valid VLM position state,
+        # causing bbox drift for mRoPE models like Qwen3.5-VL (#531).
+        if not vlm_embeds_map and hasattr(self.model, "clear_vlm_position_state"):
+            self.model.clear_vlm_position_state()
 
         self._stats.prompt_tokens += sum(lengths)
 
@@ -3462,9 +3463,13 @@ class Scheduler:
                 )
                 continue
 
-            # Clear stale mRoPE position state to prevent position
-            # contamination from prior requests (VLM or text-only).
-            if hasattr(self.model, "clear_vlm_position_state"):
+            # Clear stale mRoPE position state for text-only requests to
+            # prevent contamination from prior VLM requests. VLM requests
+            # preserve the position state set by get_input_embeddings() (#531).
+            if (
+                request.vlm_inputs_embeds is None
+                and hasattr(self.model, "clear_vlm_position_state")
+            ):
                 self.model.clear_vlm_position_state()
 
             # SpecPrefill: replace tokens with selected subset and pre-fill

@@ -1544,3 +1544,76 @@ class TestDetectNeedsThinkPrefix:
         scheduler = self._make_scheduler(mock_model, think_start_id=100)
         request = self._make_request([1, 2, 100, 101])
         assert scheduler._detect_needs_think_prefix(request) is True
+
+
+class TestVLMPositionStateClearing:
+    """Tests for conditional mRoPE position state clearing (#531).
+
+    VLM batches must preserve position state set by get_input_embeddings();
+    text-only batches must clear stale VLM position state.
+    """
+
+    def _make_vlm_model(self):
+        """Create a mock model with clear_vlm_position_state."""
+        model = MagicMock(spec=[
+            "__call__", "clear_vlm_position_state", "parameters",
+        ])
+        model.clear_vlm_position_state = MagicMock()
+        return model
+
+    def test_schedule_waiting_preserves_vlm_position_state(
+        self, mock_tokenizer
+    ):
+        """VLM request in _schedule_waiting should NOT clear position state."""
+        model = self._make_vlm_model()
+        scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
+
+        # Minimal batch generator mock
+        mock_bg = MagicMock()
+        mock_bg.add = MagicMock(return_value=[42])
+        mock_bg._vlm_pending = {}
+        scheduler.batch_generator = mock_bg
+
+        request = Request(
+            request_id="vlm-001",
+            prompt="describe this image",
+            sampling_params=SamplingParams(max_tokens=50),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5]
+        request.num_prompt_tokens = 5
+        request.vlm_inputs_embeds = MagicMock()  # VLM request
+
+        scheduler.waiting.append(request)
+        scheduler.requests[request.request_id] = request
+
+        scheduler._schedule_waiting()
+
+        model.clear_vlm_position_state.assert_not_called()
+
+    def test_schedule_waiting_clears_text_only_position_state(
+        self, mock_tokenizer
+    ):
+        """Text-only request in _schedule_waiting should clear position state."""
+        model = self._make_vlm_model()
+        scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
+
+        mock_bg = MagicMock()
+        mock_bg.add = MagicMock(return_value=[42])
+        mock_bg._vlm_pending = {}
+        scheduler.batch_generator = mock_bg
+
+        request = Request(
+            request_id="text-001",
+            prompt="hello world",
+            sampling_params=SamplingParams(max_tokens=50),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5]
+        request.num_prompt_tokens = 5
+        # vlm_inputs_embeds is None by default (text-only)
+
+        scheduler.waiting.append(request)
+        scheduler.requests[request.request_id] = request
+
+        scheduler._schedule_waiting()
+
+        model.clear_vlm_position_state.assert_called_once()
