@@ -46,8 +46,8 @@ requirements = [
     "mcp>=1.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (756dd89) - aligned with pyproject.toml
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@756dd89bb93ecc9ad8959d7c5a40f3e87735e044",
+    # mlx-vlm from commit (9db27b5) - aligned with pyproject.toml
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@9db27b589663c82cc1aefcc3f21ac5751fafdad2",
     "Pillow>=9.0.0",
     # ModelScope SDK for downloading models from ModelScope Hub
     "modelscope>=1.10.0",
