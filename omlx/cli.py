@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import faulthandler
 import sys
 
 
@@ -120,6 +121,13 @@ def serve_command(args):
         retention_days=settings.logging.retention_days,
     )
     print(f"Log directory: {log_dir}")
+
+    # Enable native crash diagnostics (SIGABRT, SIGSEGV, SIGFPE, SIGBUS).
+    # On Metal/MLX crashes (#511, #520), this dumps all Python thread
+    # tracebacks to the server log before the process terminates.
+    crash_log_path = log_dir / "crash.log"
+    _crash_file = open(crash_log_path, "a")
+    faulthandler.enable(file=_crash_file, all_threads=True)
 
     # Validate settings
     errors = settings.validate()
