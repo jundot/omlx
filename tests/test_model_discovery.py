@@ -169,6 +169,15 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_vlm_gemma4(self, tmp_path):
+        """Test detection of Gemma4 as VLM."""
+        config = {
+            "model_type": "gemma4",
+            "architectures": ["Gemma4ForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_vlm_qwen3_5_moe(self, tmp_path):
         """Test detection of Qwen3.5 MoE as VLM."""
         config = {
