@@ -46,11 +46,9 @@ requirements = [
     "mcp>=1.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (7f7a04c) - aligned with pyproject.toml
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@7f7a04ce20337996da335ab17cdfee0ba51d6610",
+    # mlx-vlm from commit (756dd89) - aligned with pyproject.toml
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@756dd89bb93ecc9ad8959d7c5a40f3e87735e044",
     "Pillow>=9.0.0",
-    # Grammar-constrained decoding for structured output
-    "xgrammar>=0.1.32",
     # ModelScope SDK for downloading models from ModelScope Hub
     "modelscope>=1.10.0",
     # python-multipart needed by audio routes (File/Form uploads)
@@ -62,6 +60,16 @@ requirements = [
     "numba>=0.59.0",
     "pyloudnorm>=0.1.0",
     "sounddevice>=0.4.6",
+    # mlx-audio [tts] extra deps
+    "misaki>=0.9.4",
+    "num2words>=0.5.14",
+    "spacy>=3.8.4",
+    "phonemizer-fork>=3.3.2",
+    "espeakng-loader>=0.2.4",
+    # mlx-audio [stt] extra deps
+    "mistral-common[audio]>=0.4.2",
+    # mlx-audio [sts] extra deps
+    "webrtcvad>=2.0.10",
     # NOTE: mlx-audio is built from git and installed with --no-deps in build.py
     # because mlx-audio pins mlx-lm==0.31.1 which conflicts with our git-pinned mlx-lm
 ]
@@ -79,8 +87,6 @@ dynlib_exclude = [
     "cv2/.dylibs/liblzma*",
     "cv2/.dylibs/libxcb*",
     "cv2/.dylibs/libXau*",
-    # torch's libomp conflicts with sklearn's — torch is stripped post-build anyway
-    "torch/lib/libomp*",
 ]
 
 [[applications]]
