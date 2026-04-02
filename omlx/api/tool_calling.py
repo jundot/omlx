@@ -373,6 +373,19 @@ def sanitize_tool_call_markup(text: str, tokenizer: Any) -> str:
     return cleaned.strip()
 
 
+def _extract_tool_names(tools: List) -> set:
+    """Extract function names from OpenAI-format tool definitions."""
+    names = set()
+    for tool in tools:
+        if isinstance(tool, dict):
+            func = tool.get("function", {})
+            if isinstance(func, dict):
+                name = func.get("name")
+                if name:
+                    names.add(name)
+    return names
+
+
 def extract_tool_calls_with_thinking(
     thinking_content: str,
     regular_content: str,
@@ -387,6 +400,20 @@ def extract_tool_calls_with_thinking(
     if not tool_calls and thinking_content:
         _, tool_calls = parse_tool_calls(thinking_content, tokenizer, tools)
         tool_calls_from_thinking = bool(tool_calls)
+
+        # Guard 1: if model produced regular text, the tool call in thinking
+        # is just reasoning, not an actual invocation request.
+        if tool_calls and regular_content.strip():
+            tool_calls = None
+            tool_calls_from_thinking = False
+
+        # Guard 2: only keep tool calls whose name matches a provided tool.
+        if tool_calls and tools:
+            valid_names = _extract_tool_names(tools)
+            tool_calls = [tc for tc in tool_calls if tc.function.name in valid_names]
+            if not tool_calls:
+                tool_calls = None
+                tool_calls_from_thinking = False
 
     return ToolCallExtraction(
         cleaned_text=cleaned_text,

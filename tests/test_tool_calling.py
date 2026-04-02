@@ -1241,7 +1241,7 @@ class TestParseToolCallsWithThinkingFallback:
         assert tool_calls[0].function.name == "read"
 
     def test_cleaned_text_from_regular_not_thinking(self):
-        """cleaned_text always comes from regular_content, not thinking."""
+        """When regular content has text, thinking tool calls are discarded."""
         thinking = (
             'reasoning here <tool_call>{"name": "func", "arguments": {}}</tool_call>'
         )
@@ -1253,7 +1253,7 @@ class TestParseToolCallsWithThinkingFallback:
             regular,
             tokenizer=tok,
         )
-        assert tool_calls is not None
+        assert tool_calls is None
         assert cleaned == "visible response text"
 
     def test_extract_tool_calls_with_thinking_sanitizes_reasoning_markup(self):
@@ -1294,3 +1294,65 @@ class TestParseToolCallsWithThinkingFallback:
         assert result.tool_calls[0].function.name == "correct_tool"
         assert result.cleaned_text == "Visible text"
         assert result.cleaned_thinking == "Reason about it."
+
+    # --- Thinking fallback guard tests (Issue #484) ---
+
+    def test_thinking_fallback_blocked_when_regular_content_exists(self):
+        """Tool calls in thinking are discarded when model produced regular text."""
+        thinking = '<tool_call>{"name": "search", "arguments": {"q": "weather"}}</tool_call>'
+        regular = "The weather is sunny today."
+        tok = self._make_tokenizer()
+
+        result = extract_tool_calls_with_thinking(thinking, regular, tokenizer=tok)
+
+        assert result.tool_calls is None
+        assert result.cleaned_text == "The weather is sunny today."
+        assert result.tool_calls_from_thinking is False
+
+    def test_thinking_fallback_filters_unknown_tools(self):
+        """Tool calls with names not in provided tools list are discarded."""
+        thinking = '<tool_call>{"name": "hallucinated_tool", "arguments": {}}</tool_call>'
+        regular = ""
+        tok = self._make_tokenizer()
+        tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]
+
+        result = extract_tool_calls_with_thinking(
+            thinking, regular, tokenizer=tok, tools=tools,
+        )
+
+        assert result.tool_calls is None
+        assert result.tool_calls_from_thinking is False
+
+    def test_thinking_fallback_keeps_known_tools_no_regular(self):
+        """Tool calls matching provided tools are kept when regular is empty."""
+        thinking = '<tool_call>{"name": "get_weather", "arguments": {"city": "Seoul"}}</tool_call>'
+        regular = ""
+        tok = self._make_tokenizer()
+        tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]
+
+        result = extract_tool_calls_with_thinking(
+            thinking, regular, tokenizer=tok, tools=tools,
+        )
+
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "get_weather"
+        assert result.tool_calls_from_thinking is True
+
+    def test_thinking_fallback_mixed_known_unknown(self):
+        """Only tool calls matching provided tools survive filtering."""
+        thinking = (
+            '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
+            '<tool_call>{"name": "fake_tool", "arguments": {}}</tool_call>'
+        )
+        regular = ""
+        tok = self._make_tokenizer()
+        tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]
+
+        result = extract_tool_calls_with_thinking(
+            thinking, regular, tokenizer=tok, tools=tools,
+        )
+
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "get_weather"
