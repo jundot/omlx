@@ -7,6 +7,8 @@ class Omlx < Formula
 
   head "https://github.com/jundot/omlx.git", branch: "main"
 
+  option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
+
   depends_on "rust" => :build
   depends_on "python@3.11"
   depends_on :macos
@@ -36,13 +38,14 @@ class Omlx < Formula
     # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths)
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
 
-    # Install omlx without audio extra first
-    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken,tokenizers", buildpath.to_s
+    # Install omlx (with optional grammar extra for structured output)
+    install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
+    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken,tokenizers", install_spec
 
     # Install mlx-audio with patched mlx-lm pin to avoid version conflict
     resource("mlx-audio").stage do
       inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
-      system libexec/"bin/pip", "install", "."
+      system libexec/"bin/pip", "install", ".[all]"
     end
 
     # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
