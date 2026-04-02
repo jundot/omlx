@@ -2268,11 +2268,26 @@ def _compile_grammar_for_request(
 
     if compiler is None:
         if structured_outputs is not None:
-            raise HTTPException(
-                status_code=400,
-                detail="Grammar-constrained decoding requires the xgrammar package. "
-                       "Install it with: pip install 'omlx[grammar]'",
-            )
+            from omlx.utils.install import get_install_method
+
+            method = get_install_method()
+            if method == "dmg":
+                detail = (
+                    "Structured output is not available in the DMG version. "
+                    "xgrammar requires torch which significantly increases app size. "
+                    "Use the pip or Homebrew version for structured output support."
+                )
+            elif method == "homebrew":
+                detail = (
+                    "Structured output requires xgrammar. "
+                    "Reinstall with: brew reinstall omlx --with-grammar"
+                )
+            else:
+                detail = (
+                    "Structured output requires xgrammar. "
+                    "Install with: pip install 'omlx[grammar]'"
+                )
+            raise HTTPException(status_code=400, detail=detail)
         return None
 
     try:

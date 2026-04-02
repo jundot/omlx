@@ -197,8 +197,26 @@ class VLMBatchedEngine(BaseEngine):
 
             self._grammar_compiler = create_grammar_compiler(self._tokenizer, self._vlm_model)
             logger.info("GrammarCompiler initialized for %s", self._model_name)
-        except Exception as e:
-            logger.warning("Failed to initialize GrammarCompiler: %s", e)
+        except Exception:
+            from ..utils.install import get_install_method
+
+            method = get_install_method()
+            if method == "dmg":
+                logger.info(
+                    "Structured output is not available in the DMG version "
+                    "(xgrammar requires torch which significantly increases app size). "
+                    "Use the pip or Homebrew version for structured output support."
+                )
+            elif method == "homebrew":
+                logger.info(
+                    "Structured output requires xgrammar. "
+                    "Reinstall with: brew reinstall omlx --with-grammar"
+                )
+            else:
+                logger.info(
+                    "Structured output requires xgrammar. "
+                    "Install with: pip install 'omlx[grammar]'"
+                )
         return self._grammar_compiler
 
     def _resolve_ocr_stop_token_ids(self) -> list[int]:

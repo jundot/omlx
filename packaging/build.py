@@ -489,11 +489,12 @@ def _install_mlx_audio(export_dir: Path):
 
 
 # Packages to strip from the app bundle. These are transitive dependencies
-# pulled in by xgrammar (torch), modelscope (datasets→pyarrow/pandas), and
-# mlx-vlm (opencv) but are NOT needed for inference at runtime.
+# pulled in by modelscope (datasets→pyarrow/pandas) and mlx-vlm (opencv)
+# but are NOT needed for inference at runtime. torch/sympy kept as safety
+# net in case any future dependency pulls them in transitively.
 _STRIP_PACKAGES = [
     "torch",
-    "sympy",           # torch dep
+    "sympy",           # torch dep (safety net)
     "cv2",             # opencv-python, mlx-vlm only uses it for image loading (Pillow suffices)
     "pyarrow",         # datasets dep
     "pandas",          # datasets dep
