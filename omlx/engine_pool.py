@@ -559,7 +559,37 @@ class EnginePool:
             try:
                 await engine.start()
             except Exception as start_error:
-                if entry.engine_type == "vlm":
+                if force_lm and entry.engine_type == "vlm":
+                    # force_lm created a BatchedEngine but mlx-lm can't
+                    # load this VLM model — fall back to VLMBatchedEngine.
+                    logger.warning(
+                        f"LM loading failed for VLM model {model_id} "
+                        f"(force_lm=True), falling back to VLM engine: "
+                        f"{start_error}"
+                    )
+                    try:
+                        await engine.stop()
+                    except Exception:
+                        pass
+                    gc.collect()
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        get_mlx_executor(),
+                        lambda: (mx.synchronize(), mx.clear_cache()),
+                    )
+
+                    engine = VLMBatchedEngine(
+                        model_name=entry.model_path,
+                        scheduler_config=self._scheduler_config,
+                        model_settings=model_settings,
+                    )
+                    await engine.start()
+
+                    logger.info(
+                        f"Successfully loaded {model_id} as VLM "
+                        f"(fallback from force_lm)"
+                    )
+                elif entry.engine_type == "vlm":
                     # VLM loading failed — fall back to LLM (BatchedEngine)
                     logger.warning(
                         f"VLM loading failed for {model_id}, "

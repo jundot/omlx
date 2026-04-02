@@ -411,6 +411,62 @@ class TestVLMFallback:
         ), pytest.raises(Exception, match="Load failed"):
             await pool._load_engine("model-a")
 
+    @pytest.mark.asyncio
+    async def test_force_lm_fallback_to_vlm_on_start_failure(
+        self, small_mock_model_dir
+    ):
+        """Test that force_lm failure for VLM model falls back to VLMBatchedEngine."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Force model-a to be VLM type
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+
+        # BatchedEngine (force_lm) fails on start
+        mock_batched_engine = MagicMock()
+        mock_batched_engine.start = AsyncMock(
+            side_effect=TypeError(
+                "ModelArgs.__init__() missing 1 required positional argument: "
+                "'tie_word_embeddings'"
+            )
+        )
+        mock_batched_engine.stop = AsyncMock()
+
+        # VLMBatchedEngine succeeds
+        mock_vlm_engine = MagicMock()
+        mock_vlm_engine.start = AsyncMock()
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
+        ), patch(
+            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
+        ):
+            await pool._load_engine("model-a", force_lm=True)
+
+        # Should have fallen back to VLM
+        assert entry.model_type == "vlm"
+        assert entry.engine_type == "vlm"
+        assert entry.engine is mock_vlm_engine
+
+    @pytest.mark.asyncio
+    async def test_force_lm_no_fallback_for_non_vlm(self, small_mock_model_dir):
+        """Test that force_lm failure for non-VLM model still raises."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool.get_entry("model-a")
+        assert entry.engine_type == "batched"  # LLM, not VLM
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock(side_effect=Exception("Load failed"))
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine", return_value=mock_engine
+        ), pytest.raises(Exception, match="Load failed"):
+            await pool._load_engine("model-a", force_lm=True)
+
 
 class TestEnginePoolLRU:
     """Tests for LRU eviction logic."""
