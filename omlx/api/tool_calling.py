@@ -11,6 +11,9 @@ Uses mlx-lm's modular tool parser system to support multiple model formats:
 
 The tool parser is automatically selected based on the model's chat template.
 
+Also includes fallback parsing for raw formats not yet handled natively,
+including Gemma 4's ``<|tool_call>call:name{...}<tool_call|>`` envelopes.
+
 Also includes structured output (JSON Schema) utilities:
 - parse_json_output: Extract JSON from model output
 - validate_json_schema: Validate JSON against a schema
@@ -194,6 +197,51 @@ def _parse_namespaced_tool_calls(
     return cleaned, tool_calls
 
 
+def _parse_gemma4_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
+    """
+    Fallback parser for Gemma 4 tool-call envelopes.
+
+    Gemma 4 emits raw tool calls in the form:
+    ``<|tool_call>call:function_name{"arg": "value"}<tool_call|>``
+
+    Returns:
+        Tuple of (cleaned_text, tool_calls or None)
+    """
+    tool_calls = []
+    pattern = r"<\|tool_call>(.*?)<tool_call\|>"
+
+    for match in re.finditer(pattern, text, re.DOTALL):
+        content = match.group(1).strip()
+        parsed_match = re.match(r"^call:\s*([A-Za-z_][\w.-]*)(\{.*\})$", content, re.DOTALL)
+        if not parsed_match:
+            continue
+
+        name = parsed_match.group(1)
+        arguments_raw = parsed_match.group(2).strip()
+        try:
+            arguments = json.loads(arguments_raw)
+            arguments_str = json.dumps(arguments, ensure_ascii=False)
+        except (json.JSONDecodeError, ValueError):
+            arguments_str = arguments_raw
+
+        tool_calls.append(
+            ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                type="function",
+                function=FunctionCall(
+                    name=name,
+                    arguments=arguments_str,
+                ),
+            )
+        )
+
+    if not tool_calls:
+        return text, None
+
+    cleaned = re.sub(pattern, "", text, flags=re.DOTALL).strip()
+    return cleaned, tool_calls
+
+
 def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Fallback parser for bracket-style tool call formats.
@@ -344,6 +392,10 @@ def parse_tool_calls(
                     if idx >= 0:
                         cleaned_text = cleaned_text[:idx].strip()
                 return cleaned_text, tool_calls
+
+    # Fallback: Gemma 4 raw tool-call envelopes
+    if "<|tool_call>" in cleaned_text and "<tool_call|>" in cleaned_text:
+        return _parse_gemma4_tool_calls(cleaned_text)
 
     # Fallback: parse XML <tool_call> tags (GLM, Qwen, generic formats)
     if "<tool_call>" in cleaned_text:

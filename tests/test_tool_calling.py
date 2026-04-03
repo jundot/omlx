@@ -1080,6 +1080,69 @@ class TestParseToolCallsEmptyEndMarker:
         assert tool_calls is None or len(tool_calls) == 0
 
 
+class TestParseGemma4ToolCalls:
+    """Tests for Gemma 4 raw tool call parsing."""
+
+    def test_gemma4_tool_call_with_arguments(self):
+        """Gemma 4 envelopes should parse into OpenAI-style tool calls."""
+        from omlx.api.tool_calling import _parse_gemma4_tool_calls
+
+        text = 'Before <|tool_call>call:get_weather{"city":"Tokyo"}<tool_call|> after'
+        cleaned, tool_calls = _parse_gemma4_tool_calls(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_weather"
+        assert json.loads(tool_calls[0].function.arguments) == {"city": "Tokyo"}
+        assert cleaned == "Before  after"
+
+    def test_gemma4_tool_call_with_empty_arguments(self):
+        """Gemma 4 no-arg calls should preserve an empty JSON object."""
+        from omlx.api.tool_calling import _parse_gemma4_tool_calls
+
+        text = '<|tool_call>call:get_current_time{}<tool_call|>'
+        cleaned, tool_calls = _parse_gemma4_tool_calls(text)
+        assert cleaned == ""
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_current_time"
+        assert tool_calls[0].function.arguments == "{}"
+
+    def test_gemma4_multiple_tool_calls(self):
+        """Multiple Gemma 4 envelopes should all be recovered."""
+        from omlx.api.tool_calling import _parse_gemma4_tool_calls
+
+        text = (
+            '<|tool_call>call:first_tool{"x":1}<tool_call|>'
+            ' middle '
+            '<|tool_call>call:second_tool{"y":2}<tool_call|>'
+        )
+        cleaned, tool_calls = _parse_gemma4_tool_calls(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 2
+        assert [tc.function.name for tc in tool_calls] == ["first_tool", "second_tool"]
+        assert cleaned == "middle"
+
+    def test_parse_tool_calls_falls_back_to_gemma4_when_native_parser_fails(self):
+        """Gemma 4 raw envelopes should still parse if mlx-lm's parser misses them."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<|tool_call>"
+        tok.tool_call_end = "<tool_call|>"
+
+        def failing_parser(text, tools):
+            raise ValueError("parse error")
+
+        tok.tool_parser = failing_parser
+
+        text = 'Lead <|tool_call>call:get_weather{"city":"Seoul"}<tool_call|> tail'
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_weather"
+        assert json.loads(tool_calls[0].function.arguments) == {"city": "Seoul"}
+        assert cleaned == "Lead  tail"
+
+
 class TestParseBracketToolCalls:
     """Tests for bracket-style tool call parsing (issue #159)."""
 
