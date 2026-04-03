@@ -841,6 +841,7 @@ class OMLXAppDelegate(NSObject):
 
             if self._admin_session is None:
                 self._admin_session = requests.Session()
+                self._admin_session.trust_env = False
 
             session = self._admin_session
 

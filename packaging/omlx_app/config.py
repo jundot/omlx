@@ -121,6 +121,7 @@ class ServerConfig:
 
         try:
             session = requests.Session()
+            session.trust_env = False
 
             if current_key:
                 # Login with current API key
