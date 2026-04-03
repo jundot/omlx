@@ -926,9 +926,7 @@
 
             setEngineStatus(status, { log = true } = {}) {
                 this.engineStatus = status;
-                // Only log meaningful events — skip noisy poller-driven and per-turn thinking status
-                const _noisy = /^(Starting|Generating|Prefilling|Loading model|Thinking|Thought for)/;
-                if (log && status && !_noisy.test(status.text)) {
+                if (log && status) {
                     const elapsed = ((Date.now() - this._statusStart) / 1000).toFixed(1);
                     const last = this.statusLog[this.statusLog.length - 1];
                     if (!last || last.text !== status.text || last.icon !== (status.icon || null)) {
