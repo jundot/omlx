@@ -58,18 +58,13 @@ def apply_turboquant_attention_patch() -> bool:
                     scale=scale,
                     mask=mask,
                 )
-            # Prefill: try fast quantized path first
+            # Prefill: try quantized fast path, fallback to dequantize+SDPA
             result = real_cache.prefill_attention(
-                queries,
-                keys_state=keys,
-                values_state=values,
-                scale=scale,
-                mask=mask,
+                queries, scale=scale, mask=mask,
             )
             if result is not None:
                 return result
-            # Fallback: dequantize + standard SDPA
-            dequantized_keys, dequantized_values = real_cache.dequantize(keys, values)
+            dequantized_keys, dequantized_values = real_cache.dequantize()
             return mx.fast.scaled_dot_product_attention(
                 queries,
                 dequantized_keys.astype(queries.dtype),

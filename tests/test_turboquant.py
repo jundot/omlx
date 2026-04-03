@@ -97,28 +97,28 @@ def test_turboquant_cache_round_trip():
 # ---------------------------------------------------------------------------
 
 
-def test_batch_tq_prefill_stores_fp16():
+def test_batch_tq_prefill_quantizes_immediately():
     batch = BatchTurboQuantKVCache([0, 0], bits=4.0)
     keys = mx.random.normal((2, 4, 8, 32))
     values = mx.random.normal((2, 4, 8, 32))
     k_out, v_out = batch.update_and_fetch(keys, values)
-    # During prefill, should store fp16
-    assert not batch._quantized
+    # Internal storage should be quantized immediately
+    assert batch._key_state is not None
+    # Returns raw fp16 input (current chunk) for model compatibility
+    assert isinstance(k_out, mx.array)
     assert k_out.shape == (2, 4, 8, 32)
-    assert v_out.shape == (2, 4, 8, 32)
 
 
-def test_batch_tq_decode_quantizes():
+def test_batch_tq_decode_appends():
     batch = BatchTurboQuantKVCache([0, 0], bits=4.0)
     # Prefill
     keys = mx.random.normal((2, 4, 8, 32))
     values = mx.random.normal((2, 4, 8, 32))
     batch.update_and_fetch(keys, values)
-    # First decode token triggers quantization
+    # Decode appends to existing quantized state
     dk = mx.random.normal((2, 4, 1, 32))
     dv = mx.random.normal((2, 4, 1, 32))
     batch.update_and_fetch(dk, dv)
-    assert batch._quantized
     assert batch._idx == 9
 
 
@@ -138,7 +138,7 @@ def test_batch_tq_merge_extract():
 
     # Merge into batch
     batch = BatchTurboQuantKVCache.merge([c1, c2])
-    assert batch._quantized
+    assert batch._key_state is not None
     assert batch._idx == 8  # max(8, 4)
     # left_padding: c1 needs 0, c2 needs 4
     assert batch.left_padding[0].item() == 0
@@ -156,12 +156,6 @@ def test_batch_tq_filter():
     keys = mx.random.normal((3, 2, 8, 32))
     values = mx.random.normal((3, 2, 8, 32))
     batch.update_and_fetch(keys, values)
-    # Trigger quantization
-    batch.update_and_fetch(
-        mx.random.normal((3, 2, 1, 32)),
-        mx.random.normal((3, 2, 1, 32)),
-    )
-    assert batch._quantized
     # Filter to keep only requests 0 and 2
     batch.filter([0, 2])
     assert batch._key_state.norms.shape[0] == 2
@@ -170,11 +164,9 @@ def test_batch_tq_filter():
 def test_batch_tq_extend():
     b1 = BatchTurboQuantKVCache([0], bits=4.0)
     b1.update_and_fetch(mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32)))
-    b1.update_and_fetch(mx.random.normal((1, 2, 1, 32)), mx.random.normal((1, 2, 1, 32)))
 
     b2 = BatchTurboQuantKVCache([0], bits=4.0)
     b2.update_and_fetch(mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32)))
-    b2.update_and_fetch(mx.random.normal((1, 2, 1, 32)), mx.random.normal((1, 2, 1, 32)))
 
     b1.extend(b2)
     assert b1._key_state.norms.shape[0] == 2  # Two requests in batch
@@ -185,9 +177,7 @@ def test_batch_tq_dequantize():
     keys = mx.random.normal((1, 2, 8, 32))
     values = mx.random.normal((1, 2, 8, 32))
     batch.update_and_fetch(keys, values)
-    # Quantize
     batch.update_and_fetch(mx.random.normal((1, 2, 1, 32)), mx.random.normal((1, 2, 1, 32)))
-    # Dequantize
     dk, dv = batch.dequantize()
     assert dk.shape[2] == 9  # 8 prefill + 1 decode
     assert dv.shape[2] == 9
@@ -195,22 +185,33 @@ def test_batch_tq_dequantize():
 
 def test_batch_tq_state_property():
     batch = BatchTurboQuantKVCache([2, 0], bits=4.0)
-    # Test empty state
     s = batch.state
     assert s[0] is None
     assert s[1] is None
 
-    # Prefill
+    # Prefill — should be quantized immediately
     keys = mx.random.normal((2, 2, 4, 32))
     values = mx.random.normal((2, 2, 4, 32))
     batch.update_and_fetch(keys, values)
     s = batch.state
-    assert s[0].shape == (2, 2, 4, 32)  # fp16 keys
+    assert hasattr(s[0], 'norms')  # NamedTuple state
 
-    # Decode -> quantized
-    batch.update_and_fetch(mx.random.normal((2, 2, 1, 32)), mx.random.normal((2, 2, 1, 32)))
-    s = batch.state
-    assert hasattr(s[0], 'shape')  # _QuantizedStateProxy
+
+def test_batch_tq_finalize_with_right_padding():
+    batch = BatchTurboQuantKVCache([0, 0], bits=4.0)
+    batch.prepare(right_padding=[2, 0])
+    # Prefill (quantizes immediately)
+    keys = mx.random.normal((2, 2, 8, 32))
+    values = mx.random.normal((2, 2, 8, 32))
+    batch.update_and_fetch(keys, values)
+    assert batch._key_state is not None
+    # Finalize applies right-padding via dequantize-roll-requantize
+    batch.finalize()
+    assert batch._right_padding is None
+    assert batch._idx == 8
+    # left_padding should be adjusted
+    assert batch.left_padding[0].item() == 2
+    assert batch.left_padding[1].item() == 0
 
 
 def test_batch_tq_meta_state_round_trip():

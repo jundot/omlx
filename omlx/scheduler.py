@@ -604,8 +604,16 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                         model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
                             batched_extra, n_to_process
                         )
-                self.model(inputs[:, :n_to_process], cache=prompt_cache, **model_kwargs)
-                mx.eval([c.state for c in prompt_cache])
+                if self._turboquant_kv_bits is not None:
+                    # TurboQuant: eval logits instead of cache states.
+                    # mx.eval with NamedTuple cache states hangs in bulk;
+                    # logits depend on all cache updates so this evals everything.
+                    _logits = self.model(inputs[:, :n_to_process], cache=prompt_cache, **model_kwargs)
+                    mx.eval(_logits)
+                    del _logits
+                else:
+                    self.model(inputs[:, :n_to_process], cache=prompt_cache, **model_kwargs)
+                    mx.eval([c.state for c in prompt_cache])
                 inputs = inputs[:, n_to_process:]
                 if batched_embeds is not None:
                     batched_embeds = batched_embeds[:, n_to_process:]
@@ -731,8 +739,13 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                         model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
                             batched_extra, n_to_process
                         )
-                self.model(inputs[:, :n_to_process], cache=prompt_cache, **model_kwargs)
-                mx.eval([c.state for c in prompt_cache])
+                if self._turboquant_kv_bits is not None:
+                    _logits = self.model(inputs[:, :n_to_process], cache=prompt_cache, **model_kwargs)
+                    mx.eval(_logits)
+                    del _logits
+                else:
+                    self.model(inputs[:, :n_to_process], cache=prompt_cache, **model_kwargs)
+                    mx.eval([c.state for c in prompt_cache])
                 inputs = inputs[:, n_to_process:]
                 if batched_embeds is not None:
                     batched_embeds = batched_embeds[:, n_to_process:]
@@ -966,8 +979,22 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                 if val is None:
                     return None  # heterogeneous → skip batching
                 if isinstance(val, mx.array) and val.ndim >= 2:
-                    if val.ndim >= 3:
-                        # 3D+ tensors (e.g. mRoPE position_ids (3,1,seq)):
+                    if val.ndim >= 3 and val.shape[0] == 1:
+                        # Standard (batch, seq, ...) layout — seq at dim 1
+                        # e.g. Gemma 4 per_layer_inputs (1, seq, 35, 256)
+                        val = val[:, start_offset:]
+                        pad_len = max_length - val.shape[1]
+                        if pad_len > 0:
+                            pad_shape = (val.shape[0], pad_len) + val.shape[2:]
+                            pad = mx.zeros(pad_shape, dtype=val.dtype)
+                            if pad_side == "left":
+                                val = mx.concatenate([pad, val], axis=1)
+                            else:
+                                val = mx.concatenate([val, pad], axis=1)
+                        else:
+                            val = val[:, :max_length]
+                    elif val.ndim >= 3:
+                        # Special layout (e.g. mRoPE position_ids (3,1,seq)):
                         # seq is last axis, batch is axis 1.
                         val = val[..., start_offset:]
                         pad_len = max_length - val.shape[-1]
@@ -999,8 +1026,12 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                 values.append(val)
 
             if all(isinstance(v, mx.array) for v in values):
-                # For 3D+ tensors, batch dim is axis 1; for 2D, axis 0.
-                concat_axis = 1 if values[0].ndim >= 3 else 0
+                # Batch concat axis: standard (batch, seq, ...) → axis 0;
+                # special layout (3, batch, seq) → axis 1.
+                if values[0].ndim >= 3 and values[0].shape[0] != 1:
+                    concat_axis = 1
+                else:
+                    concat_axis = 0
                 batched[key] = mx.concatenate(values, axis=concat_axis)
             else:
                 # Scalar values: use if all identical
@@ -1012,16 +1043,27 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         return batched if batched else None
 
 
+def _vlm_extra_seq_slice(val: mx.array, s: slice) -> mx.array:
+    """Slice a VLM extra tensor along its seq dimension.
+
+    Standard layout (batch=1, seq, ...): seq at dim 1.
+    Special layout (e.g. mRoPE (3, batch, seq)): seq at last dim.
+    """
+    if val.ndim >= 3 and val.shape[0] == 1:
+        return val[:, s]
+    if val.ndim >= 3:
+        return val[..., s]
+    return val[:, s]
+
+
 def _slice_vlm_extra(
     extra: Dict[str, Any], n: int
 ) -> Dict[str, Any]:
     """Slice VLM extra kwargs to first n tokens along seq dimension."""
     sliced: Dict[str, Any] = {}
     for key, val in extra.items():
-        if isinstance(val, mx.array) and val.ndim >= 3:
-            sliced[key] = val[..., :n]
-        elif isinstance(val, mx.array) and val.ndim == 2:
-            sliced[key] = val[:, :n]
+        if isinstance(val, mx.array) and val.ndim >= 2:
+            sliced[key] = _vlm_extra_seq_slice(val, slice(None, n))
         else:
             sliced[key] = val
     return sliced
@@ -1033,10 +1075,8 @@ def _advance_vlm_extra(
     """Advance VLM extra kwargs past first n tokens along seq dimension."""
     advanced: Dict[str, Any] = {}
     for key, val in extra.items():
-        if isinstance(val, mx.array) and val.ndim >= 3:
-            advanced[key] = val[..., n:]
-        elif isinstance(val, mx.array) and val.ndim == 2:
-            advanced[key] = val[:, n:]
+        if isinstance(val, mx.array) and val.ndim >= 2:
+            advanced[key] = _vlm_extra_seq_slice(val, slice(n, None))
         else:
             advanced[key] = val
     return advanced
