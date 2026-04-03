@@ -123,8 +123,45 @@ class TestInjectToolCalling:
         assert tokenizer.has_tool_calling is True
         assert tokenizer.tool_call_start == "<tool_call>"
 
+    def test_injects_gemma4_parser_from_model_type_without_chat_template(self):
+        """Gemma 4 falls back to model_type when chat_template is missing."""
+        engine = _make_loaded_engine(model_type="gemma4")
+        tokenizer = MockVLMTokenizer(
+            chat_template=None,
+            vocab={"<|tool_call>": 100, "<tool_call|>": 101},
+        )
+
+        engine._inject_tool_calling(tokenizer)
+
+        assert tokenizer.has_tool_calling is True
+        assert tokenizer.tool_call_start == "<|tool_call>"
+        assert tokenizer.tool_call_end == "<tool_call|>"
+        assert tokenizer.tool_parser("call:get_current_time{}") == {
+            "name": "get_current_time",
+            "arguments": {},
+        }
+
+    def test_prefers_chat_template_parser_over_gemma4_model_type_fallback(self):
+        """Chat-template inference should win over model-type fallback."""
+        engine = _make_loaded_engine(model_type="gemma4")
+        tokenizer = MockVLMTokenizer(
+            chat_template="some template with <tool_call> and tool_call.name",
+            vocab={
+                "<tool_call>": 100,
+                "</tool_call>": 101,
+                "<|tool_call>": 102,
+                "<tool_call|>": 103,
+            },
+        )
+
+        engine._inject_tool_calling(tokenizer)
+
+        assert tokenizer.has_tool_calling is True
+        assert tokenizer.tool_call_start == "<tool_call>"
+        assert tokenizer.tool_call_end == "</tool_call>"
+
     def test_skips_when_no_chat_template(self):
-        """No chat template → no injection."""
+        """No chat template and no model-type override → no injection."""
         engine = _make_engine()
         tokenizer = MockVLMTokenizer(chat_template=None)
 

@@ -1080,6 +1080,60 @@ class TestParseToolCallsEmptyEndMarker:
         assert tool_calls is None or len(tool_calls) == 0
 
 
+class TestParseToolCallsGemma4:
+    """Tests for Gemma 4 paired tool-call markers and JSON arguments."""
+
+    def test_gemma4_native_parser_single_call(self):
+        """Gemma 4 paired markers should parse a single JSON tool call."""
+        from omlx.tool_parsers.function_gemma4 import parse_tool_call
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<|tool_call>"
+        tok.tool_call_end = "<tool_call|>"
+        tok.tool_parser = parse_tool_call
+
+        text = "Let me check.<|tool_call>call:get_current_time{}<tool_call|>"
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert cleaned == "Let me check."
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_current_time"
+        assert tool_calls[0].function.arguments == "{}"
+
+    def test_gemma4_native_parser_multiple_calls(self):
+        """Gemma 4 multiple paired tool calls should all be parsed."""
+        from omlx.tool_parsers.function_gemma4 import parse_tool_call
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<|tool_call>"
+        tok.tool_call_end = "<tool_call|>"
+        tok.tool_parser = parse_tool_call
+
+        text = (
+            "<|tool_call>call:get_current_time{}<tool_call|>"
+            '<|tool_call>call:get_weather{"city": "Bangkok"}<tool_call|>'
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert cleaned == ""
+        assert tool_calls is not None
+        assert len(tool_calls) == 2
+        assert tool_calls[0].function.name == "get_current_time"
+        assert tool_calls[0].function.arguments == "{}"
+        assert tool_calls[1].function.name == "get_weather"
+        assert json.loads(tool_calls[1].function.arguments) == {"city": "Bangkok"}
+
+    def test_gemma4_parser_rejects_non_object_arguments(self):
+        """Gemma 4 tool arguments must decode to a JSON object."""
+        from omlx.tool_parsers.function_gemma4 import parse_tool_call
+
+        with pytest.raises(ValueError):
+            parse_tool_call('call:get_weather["Bangkok"]')
+
+
 class TestParseBracketToolCalls:
     """Tests for bracket-style tool call parsing (issue #159)."""
 

@@ -67,6 +67,12 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
     "<|endofassistant|>",
 ]
 
+# VLM model types that require tool parser selection without relying on a
+# chat_template in tokenizer_config.json.
+VLM_TOOL_PARSER_TYPES: Dict[str, str] = {
+    "gemma4": "function_gemma4",
+}
+
 # Per-model OCR generation defaults from official configs.
 # Applied automatically when no explicit user override is provided.
 OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
@@ -351,34 +357,69 @@ class VLMBatchedEngine(BaseEngine):
         self._loaded = False
         logger.info("VLMBatchedEngine stopped")
 
+    def _get_tool_parser_type(self, tokenizer) -> Optional[str]:
+        """Resolve the tool parser type for a VLM tokenizer.
+
+        Prefer tokenizer-config and chat-template inference to match mlx-lm's
+        native behavior. Fall back to model-type overrides for models like
+        Gemma 4 whose tokenizer_config.json currently lacks a chat template.
+        """
+        tokenizer_config = getattr(tokenizer, "init_kwargs", None)
+        tool_parser_type = None
+        if isinstance(tokenizer_config, dict):
+            tool_parser_type = tokenizer_config.get("tool_parser_type")
+
+        chat_template = getattr(tokenizer, "chat_template", None)
+        if tool_parser_type is None and isinstance(chat_template, str):
+            try:
+                from mlx_lm.tokenizer_utils import _infer_tool_parser
+            except ImportError:
+                _infer_tool_parser = None
+
+            if _infer_tool_parser is not None:
+                tool_parser_type = _infer_tool_parser(chat_template)
+
+        if tool_parser_type is None:
+            config = getattr(getattr(self, "_vlm_model", None), "config", None)
+            model_type = self.model_type or getattr(config, "model_type", None)
+            tool_parser_type = VLM_TOOL_PARSER_TYPES.get(str(model_type or "").lower())
+            if tool_parser_type is not None and isinstance(tokenizer_config, dict):
+                tokenizer_config["tool_parser_type"] = tool_parser_type
+
+        return tool_parser_type
+
+    @staticmethod
+    def _load_tool_parser_module(tool_parser_type: str):
+        """Load a tool parser module from mlx-lm or oMLX local fallbacks."""
+        import importlib
+
+        module_names = (
+            f"mlx_lm.tool_parsers.{tool_parser_type}",
+            f"omlx.tool_parsers.{tool_parser_type}",
+        )
+
+        for module_name in module_names:
+            try:
+                return importlib.import_module(module_name)
+            except ImportError:
+                continue
+
+        return None
+
     def _inject_tool_calling(self, tokenizer) -> None:
         """Inject mlx-lm's tool calling attributes into VLM tokenizer.
 
         mlx-vlm's TokenizerWrapper lacks tool calling support (has_tool_calling,
-        tool_parser, etc). We reuse mlx-lm's _infer_tool_parser() to detect the
-        parser type from the chat template, then set the attributes directly on
-        the wrapper instance so parse_tool_calls() can use native tool parsing.
+        tool_parser, etc). We resolve the parser type using mlx-lm's native
+        tokenizer heuristics first, then apply model-type fallbacks for VLMs
+        whose tokenizer config lacks chat-template metadata.
         """
-        try:
-            from mlx_lm.tokenizer_utils import _infer_tool_parser
-        except ImportError:
-            return
-
-        chat_template = getattr(tokenizer, "chat_template", None)
-        if not chat_template:
-            return
-
-        tool_parser_type = _infer_tool_parser(chat_template)
+        tool_parser_type = self._get_tool_parser_type(tokenizer)
         if tool_parser_type is None:
             return
 
-        try:
-            import importlib
-
-            tool_module = importlib.import_module(
-                f"mlx_lm.tool_parsers.{tool_parser_type}"
-            )
-        except ImportError:
+        tool_module = self._load_tool_parser_module(tool_parser_type)
+        if tool_module is None:
             logger.warning(
                 f"VLM tool parser module not found: {tool_parser_type}"
             )
