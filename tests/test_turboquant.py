@@ -115,11 +115,12 @@ def test_batch_tq_decode_appends():
     keys = mx.random.normal((2, 4, 8, 32))
     values = mx.random.normal((2, 4, 8, 32))
     batch.update_and_fetch(keys, values)
-    # Decode appends to existing quantized state
+    # Decode buffers fp16, batch-quantizes later
     dk = mx.random.normal((2, 4, 1, 32))
     dv = mx.random.normal((2, 4, 1, 32))
     batch.update_and_fetch(dk, dv)
-    assert batch._idx == 9
+    assert batch.total_tokens == 9
+    assert batch._decode_buf_count == 1  # buffered, not yet quantized
 
 
 def test_batch_tq_merge_extract():

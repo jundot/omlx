@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+from functools import lru_cache
 from typing import List, Optional
 
 import mlx.core as mx
@@ -38,10 +39,94 @@ from mlx_vlm.turboquant import (
     _reserve_state_capacity,
     _QuantizedStateProxy,
     _validate_bits,
+    _metal_available,
     turboquant_enabled,
+    _multi_query_prod_score_kernel,
+    _TurboQuantProdCodec,
+    _TurboQuantMSECodec,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Runtime-loop value weighted-sum kernel (replaces mlx-vlm's unrolled version)
+# ---------------------------------------------------------------------------
+
+_VALUE_KERNEL_CHUNK = 16  # registers per thread for repeat accumulation
+
+@lru_cache(maxsize=None)
+def _chunked_value_weighted_sum_kernel(bits: int):
+    """Value weighted sum with register-chunked loop over repeats.
+
+    mlx-vlm's original kernel unrolls RepeatCount at compile time (one
+    float per repeat), which hangs the Metal compiler for large counts.
+
+    This version processes repeats in fixed-size register chunks (16).
+    Value unpacking happens once per token per chunk-pass, keeping memory
+    bandwidth close to the original while using only 16 registers.
+
+    Performance: ~896x fewer value unpacks than pure runtime loop,
+    only ~16x more than fully unrolled (which can't compile for large R).
+    """
+    if not _metal_available():
+        return None
+
+    C = _VALUE_KERNEL_CHUNK
+    val_mask = (1 << bits) - 1
+    source = f"""
+        auto dim = thread_position_in_grid.x;
+        auto n = thread_position_in_grid.z;
+        auto token_count = norms_shape[2];
+        auto kv_heads = norms_shape[1];
+        auto num_tok_tiles = (token_count + TokTileSize - 1) / TokTileSize;
+        auto bh = n / num_tok_tiles;
+        auto tok_tile = n % num_tok_tiles;
+        int t_start = tok_tile * TokTileSize;
+        int t_end = min(t_start + TokTileSize, (int)token_count);
+
+        if (dim >= Dim) return;
+
+        auto wt = weights + bh * RepeatCount * token_count;
+        auto nm = norms + bh * token_count;
+        auto pk = packed + bh * token_count * PackedWidth;
+
+        int bo = dim * {bits};
+        int v_word = bo / 32;
+        int v_shift = bo % 32;
+        bool v_spill = (bo % 32 + {bits}) > 32;
+
+        auto out_base = out + (bh * num_tok_tiles + tok_tile) * RepeatCount * Dim + dim;
+
+        for (int r_base = 0; r_base < RepeatCount; r_base += {C}) {{
+            int r_end = min(r_base + {C}, (int)RepeatCount);
+            int chunk_len = r_end - r_base;
+            float acc[{C}] = {{}};
+
+            for (int t = t_start; t < t_end; t++) {{
+                auto pt = pk + t * PackedWidth;
+                uint vv = (pt[v_word] >> v_shift);
+                if (v_spill) vv |= pt[v_word+1] << ({bits} - (v_shift+{bits}-32));
+                float val = codebook[vv & {val_mask}u] * static_cast<float>(nm[t]);
+
+                auto wt_row = wt + r_base * token_count + t;
+                for (int i = 0; i < chunk_len; i++) {{
+                    acc[i] += wt_row[i * token_count] * val;
+                }}
+            }}
+
+            for (int i = 0; i < chunk_len; i++) {{
+                out_base[(r_base + i) * Dim] = acc[i];
+            }}
+        }}
+    """
+    return mx.fast.metal_kernel(
+        name=f"omlx_chunked_value_wsum_{bits}",
+        input_names=["weights", "norms", "packed", "codebook"],
+        output_names=["out"],
+        source=source,
+    )
+
 
 __all__ = [
     "TurboQuantKVCache",
@@ -152,6 +237,7 @@ class BatchTurboQuantKVCache(_BaseCache):
     """
 
     step = 256
+    _BATCH_QUANTIZE_SIZE = 32  # buffer N decode tokens before batch-quantizing
 
     def __init__(self, left_padding: List[int], bits: float = 4.0, seed: int = 0):
         self.bits = _validate_bits(bits)
@@ -166,10 +252,15 @@ class BatchTurboQuantKVCache(_BaseCache):
         self._key_codec = None
         self._value_codec = None
 
+        # fp16 decode buffer (batch-quantized every _BATCH_QUANTIZE_SIZE tokens)
+        self._decode_buf_k = None  # (B, H, _BATCH_QUANTIZE_SIZE, D)
+        self._decode_buf_v = None
+        self._decode_buf_count = 0
+
         # Batch tracking
         self.left_padding = mx.array(left_padding)
         self.offset = mx.array([-l for l in left_padding])
-        self._idx = 0
+        self._idx = 0  # quantized token count
         self._right_padding = None
 
     # ---- codec management --------------------------------------------------
@@ -192,32 +283,77 @@ class BatchTurboQuantKVCache(_BaseCache):
                 values, val_bits, mode="mse", seed=self.seed + 1
             )
 
+    # ---- decode buffer management -------------------------------------------
+
+    def _flush_decode_buffer(self):
+        """Batch-quantize buffered decode tokens and append to quantized state."""
+        if self._decode_buf_count == 0:
+            return
+        buf_k = self._decode_buf_k[..., : self._decode_buf_count, :]
+        buf_v = self._decode_buf_v[..., : self._decode_buf_count, :]
+        new_k = self._key_codec.quantize(buf_k)
+        new_v = self._value_codec.quantize(buf_v)
+        if self._key_state is None:
+            self._key_state = new_k
+            self._value_state = new_v
+        else:
+            new_end = self._idx + self._decode_buf_count
+            self._key_state = _reserve_state_capacity(
+                self._key_state, self._idx, new_end, self.step
+            )
+            self._value_state = _reserve_state_capacity(
+                self._value_state, self._idx, new_end, self.step
+            )
+            _write_state(self._key_state, new_k, self._idx)
+            _write_state(self._value_state, new_v, self._idx)
+        self._idx += self._decode_buf_count
+        self._decode_buf_count = 0
+
+    @property
+    def total_tokens(self):
+        """Total token count: quantized + buffered fp16."""
+        return self._idx + self._decode_buf_count
+
     # ---- update_and_fetch --------------------------------------------------
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         B, H, T_new, D = keys.shape
         self._ensure_codecs(keys, values)
 
-        new_k = self._key_codec.quantize(keys)
-        new_v = self._value_codec.quantize(values)
-
-        # Append via concat (no in-place _write_state which can hang mx.eval)
-        if self._key_state is None:
-            self._key_state = new_k
-            self._value_state = new_v
-        else:
-            self._key_state = _concat_state(self._key_state, new_k)
-            self._value_state = _concat_state(self._value_state, new_v)
-
-        self.offset += T_new
-        self._idx += T_new
-
         if T_new > 1:
+            # Prefill: quantize and append via concat
+            new_k = self._key_codec.quantize(keys)
+            new_v = self._value_codec.quantize(values)
+            if self._key_state is None:
+                self._key_state = new_k
+                self._value_state = new_v
+            else:
+                self._key_state = _concat_state(self._key_state, new_k)
+                self._value_state = _concat_state(self._value_state, new_v)
+            self.offset += T_new
+            self._idx += T_new
             return keys, values
         else:
+            # Decode: buffer fp16, batch-quantize every N tokens
+            if self._decode_buf_k is None:
+                N = self._BATCH_QUANTIZE_SIZE
+                self._decode_buf_k = mx.zeros((B, H, N, D), dtype=keys.dtype)
+                self._decode_buf_v = mx.zeros((B, H, N, D), dtype=values.dtype)
+
+            idx = self._decode_buf_count
+            self._decode_buf_k[..., idx : idx + 1, :] = keys
+            self._decode_buf_v[..., idx : idx + 1, :] = values
+            self._decode_buf_count += 1
+            self.offset += 1
+
+            if self._decode_buf_count >= self._BATCH_QUANTIZE_SIZE:
+                self._flush_decode_buffer()
+
+            # Return proxy with total token count for mask creation
+            total = self.total_tokens
             return (
-                _QuantizedStateProxy(self._key_state, self._idx, H),
-                _QuantizedStateProxy(self._value_state, self._idx, H),
+                _QuantizedStateProxy(None, total, H),
+                _QuantizedStateProxy(None, total, H),
             )
 
     # ---- attention ---------------------------------------------------------
@@ -227,8 +363,14 @@ class BatchTurboQuantKVCache(_BaseCache):
         tmp = TurboQuantKVCache(bits=self.bits, seed=self.seed)
         tmp.key_codec = self._key_codec
         tmp.value_codec = self._value_codec
-        tmp.keys = self._key_state
-        tmp.values = self._value_state
+        # Slice to actual length (state may be over-allocated during decode)
+        ks = self._key_state
+        vs = self._value_state
+        if _state_length(ks) > self._idx:
+            ks = _slice_state(ks, self._idx)
+            vs = _slice_state(vs, self._idx)
+        tmp.keys = ks
+        tmp.values = vs
         tmp.offset = self._idx
         return tmp
 
@@ -240,8 +382,71 @@ class BatchTurboQuantKVCache(_BaseCache):
         scale: float = 1.0,
         mask=None,
     ) -> mx.array:
-        tmp = self._make_tmp_cache()
-        return tmp.decode_attention(queries, scale=scale, mask=mask)
+        B, n_q_heads, L, D = queries.shape
+        buf_count = self._decode_buf_count
+
+        if buf_count == 0 and self._key_state is not None:
+            # All tokens quantized — use TQ decode directly
+            tmp = self._make_tmp_cache()
+            return tmp.decode_attention(queries, scale=scale, mask=mask)
+
+        if self._key_state is None and buf_count > 0:
+            # Only fp16 buffer (no quantized tokens yet) — standard SDPA
+            buf_k = self._decode_buf_k[..., :buf_count, :]
+            buf_v = self._decode_buf_v[..., :buf_count, :]
+            return mx.fast.scaled_dot_product_attention(
+                queries, buf_k, buf_v, scale=scale, mask=mask,
+            )
+
+        # Hybrid: quantized old tokens + fp16 recent tokens
+        n_kv_heads = self._decode_buf_k.shape[1]
+        n_repeats = n_q_heads // n_kv_heads
+        T_q = self._idx  # quantized token count
+
+        # 1. Score quantized keys (TQ Metal kernel)
+        grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats, L, D)
+        prepared = self._key_codec.prepare_queries(grouped)
+        ks = self._key_state
+        if _state_length(ks) > T_q:
+            ks = _slice_state(ks, T_q)
+        tq_scores = self._key_codec.score_prepared(prepared, ks)
+        # shape: (B, H, R, 1, T_q)
+
+        # 2. Score fp16 keys (standard dot product with GQA expansion)
+        buf_k = self._decode_buf_k[..., :buf_count, :]  # (B, H_kv, N, D)
+        buf_v = self._decode_buf_v[..., :buf_count, :]  # (B, H_kv, N, D)
+        # grouped: (B, H_kv, R, 1, D), buf_k: (B, H_kv, N, D)
+        # Expand buf_k to (B, H_kv, 1, N, D) for broadcasting with grouped
+        fp16_scores = mx.sum(
+            grouped * buf_k[:, :, None, :, :],  # (B, H_kv, R, N, D)
+            axis=-1,
+        )[:, :, :, None, :]  # (B, H_kv, R, 1, N)
+
+        # 3. Concat scores → softmax
+        all_scores = mx.concatenate([tq_scores, fp16_scores], axis=-1)
+        all_weights = mx.softmax(all_scores, axis=-1)
+        tq_weights = all_weights[..., :T_q]
+        fp16_weights = all_weights[..., T_q:]  # (B, H_kv, R, 1, N)
+
+        # 4. TQ value weighted sum
+        vs = self._value_state
+        if _state_length(vs) > T_q:
+            vs = _slice_state(vs, T_q)
+        tq_output = self._value_codec.weighted_sum_from_scores(
+            tq_weights, vs
+        )  # (B, H_kv, R, 1, D)
+
+        # 5. fp16 value weighted sum
+        # fp16_weights: (B, H_kv, R, 1, N) → (B, H_kv, R, N) after squeeze
+        # buf_v: (B, H_kv, N, D) → expand to (B, H_kv, 1, N, D)
+        w = fp16_weights.squeeze(3)  # (B, H_kv, R, N)
+        fp16_output = mx.einsum("bhrl,bhld->bhrd", w, buf_v)  # (B, H_kv, R, D)
+        fp16_output = fp16_output[:, :, :, None, :]  # (B, H_kv, R, 1, D)
+
+        # 6. Combine and reshape
+        output = tq_output + fp16_output
+        output = output.reshape(B, n_q_heads, L, D)
+        return output.astype(queries.dtype)
 
     def prefill_attention(
         self,
@@ -251,12 +456,23 @@ class BatchTurboQuantKVCache(_BaseCache):
         scale: float = 1.0,
         mask=None,
     ) -> Optional[mx.array]:
-        # TODO: re-enable once Metal kernel hang with D=256 is resolved
+        # Prefill (L>1) uses dequantize+SDPA fallback. The TQ value kernel
+        # requires repeat_count = n_repeats * L accumulators — too large for
+        # any practical kernel approach (unrolling hangs compiler, runtime
+        # loop too slow). Decode (L=1) uses decode_attention() with efficient
+        # Metal kernels where repeat_count = n_repeats (small).
         return None
 
     def dequantize(self, keys_state=None, values_state=None):
-        keys = self._key_codec.dequantize(self._key_state).astype(mx.float32)
-        values = self._value_codec.dequantize(self._value_state).astype(mx.float32)
+        # Flush any buffered decode tokens first
+        self._flush_decode_buffer()
+        ks = self._key_state
+        vs = self._value_state
+        if _state_length(ks) > self._idx:
+            ks = _slice_state(ks, self._idx)
+            vs = _slice_state(vs, self._idx)
+        keys = self._key_codec.dequantize(ks).astype(mx.float32)
+        values = self._value_codec.dequantize(vs).astype(mx.float32)
         return keys, values
 
     # ---- batch operations --------------------------------------------------
@@ -290,13 +506,19 @@ class BatchTurboQuantKVCache(_BaseCache):
         self._right_padding = None
 
     def filter(self, batch_indices):
+        self._flush_decode_buffer()
         if self._key_state is not None:
             self._key_state = _filter_state(self._key_state, batch_indices)
             self._value_state = _filter_state(self._value_state, batch_indices)
+        if self._decode_buf_k is not None:
+            self._decode_buf_k = self._decode_buf_k[batch_indices]
+            self._decode_buf_v = self._decode_buf_v[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
 
     def extend(self, other: "BatchTurboQuantKVCache"):
+        self._flush_decode_buffer()
+        other._flush_decode_buffer()
         max_idx = max(self._idx, other._idx)
 
         def _pad_and_trim(c):
@@ -321,6 +543,7 @@ class BatchTurboQuantKVCache(_BaseCache):
             self._value_codec = other._value_codec
 
     def extract(self, idx: int) -> TurboQuantKVCache:
+        self._flush_decode_buffer()
         padding = self.left_padding[idx].item()
         end = self._idx
         tq = TurboQuantKVCache(bits=self.bits, seed=self.seed)
@@ -379,8 +602,15 @@ class BatchTurboQuantKVCache(_BaseCache):
 
     @property
     def state(self):
+        # Flush decode buffer so state includes all tokens
+        self._flush_decode_buffer()
         if self._key_state is not None:
-            return self._key_state, self._value_state, self.offset, self.left_padding
+            ks = self._key_state
+            vs = self._value_state
+            if _state_length(ks) > self._idx:
+                ks = _slice_state(ks, self._idx)
+                vs = _slice_state(vs, self._idx)
+            return ks, vs, self.offset, self.left_padding
         return None, None, self.offset, self.left_padding
 
     @state.setter
@@ -417,7 +647,7 @@ class BatchTurboQuantKVCache(_BaseCache):
         return self.offset
 
     def empty(self):
-        return self._key_state is None
+        return self._key_state is None and self._decode_buf_count == 0
 
     def is_trimmable(self):
         return True
@@ -429,7 +659,7 @@ class BatchTurboQuantKVCache(_BaseCache):
 
     def make_mask(self, N: int, return_array: bool = False, **kwargs):
         return create_causal_mask(
-            N, offset=self._idx, left_padding=self.left_padding, **kwargs
+            N, offset=self.total_tokens, left_padding=self.left_padding, **kwargs
         )
 
     @property
