@@ -309,7 +309,7 @@ class VLMBatchedEngine(BaseEngine):
             if tq_enabled:
                 from ..patches.turboquant_attention import apply_turboquant_attention_patch
                 apply_turboquant_attention_patch()
-                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
                 logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
 

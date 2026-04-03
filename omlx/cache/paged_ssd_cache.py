@@ -1013,14 +1013,22 @@ class PagedSSDCacheManager(CacheManager):
                     cache_list_meta[f"layer_{i}_sub_count"] = str(len(sub_tensors))
                 elif (isinstance(layer_data, tuple) and len(layer_data) == 2
                         and isinstance(layer_data[0], str)
-                        and layer_data[0] == '__turboquant__'):
-                    # TurboQuant: 4 tensors (k_norms, k_packed, v_norms, v_packed)
-                    k_norms, k_packed, v_norms, v_packed = layer_data[1]
-                    arrays[f"layer_{i}_k_norms"] = k_norms
-                    arrays[f"layer_{i}_k_packed"] = k_packed
-                    arrays[f"layer_{i}_v_norms"] = v_norms
-                    arrays[f"layer_{i}_v_packed"] = v_packed
-                    cache_list_meta[f"layer_{i}_turboquant"] = "1"
+                        and layer_data[0] in ('__turboquant__', '__turboquant_v2__')):
+                    # TurboQuant v2: NamedTuple states (ks, vs)
+                    ks, vs = layer_data[1]
+                    # Flatten NamedTuple fields into individual tensors
+                    tq_tensor_idx = 0
+                    for prefix, state in [("k", ks), ("v", vs)]:
+                        for field_name in state._fields:
+                            val = getattr(state, field_name)
+                            if isinstance(val, mx.array):
+                                arrays[f"layer_{i}_tq_{prefix}_{field_name}"] = val
+                                tq_tensor_idx += 1
+                    cache_list_meta[f"layer_{i}_turboquant_v2"] = "1"
+                    cache_list_meta[f"layer_{i}_tq_key_type"] = type(ks).__name__
+                    cache_list_meta[f"layer_{i}_tq_value_type"] = type(vs).__name__
+                    cache_list_meta[f"layer_{i}_tq_key_fields"] = ",".join(ks._fields)
+                    cache_list_meta[f"layer_{i}_tq_value_fields"] = ",".join(vs._fields)
                 else:
                     keys, values = layer_data
                     if _has_zero_dim(keys):
@@ -1215,20 +1223,31 @@ class PagedSSDCacheManager(CacheManager):
                         logger.error(f"Missing keys/values for layer {i}")
                         return None
                     cache_data.append((arrays[keys_key], arrays[values_key]))
-            elif (file_metadata and f"layer_{i}_turboquant" in file_metadata) or (
-                cache_type in ('TurboQuantKVCache', 'BatchTurboQuantKVCache')
-                and f"layer_{i}_k_norms" in arrays
-            ):
-                # TurboQuant: 4 tensors
-                kn = arrays.get(f"layer_{i}_k_norms")
-                kp = arrays.get(f"layer_{i}_k_packed")
-                vn = arrays.get(f"layer_{i}_v_norms")
-                vp = arrays.get(f"layer_{i}_v_packed")
-                if kn is None or kp is None or vn is None or vp is None:
-                    logger.error(f"Missing TurboQuant tensors for layer {i}")
+            elif file_metadata and f"layer_{i}_turboquant_v2" in file_metadata:
+                # TurboQuant v2: reconstruct NamedTuple states from flattened tensors
+                from ..turboquant_kv import (
+                    TurboQuantMSEState,
+                    TurboQuantProdState,
+                )
+                key_type = file_metadata.get(f"layer_{i}_tq_key_type", "")
+                value_type = file_metadata.get(f"layer_{i}_tq_value_type", "")
+                key_fields = file_metadata.get(f"layer_{i}_tq_key_fields", "").split(",")
+                value_fields = file_metadata.get(f"layer_{i}_tq_value_fields", "").split(",")
+                _type_map = {
+                    "TurboQuantMSEState": TurboQuantMSEState,
+                    "TurboQuantProdState": TurboQuantProdState,
+                }
+                try:
+                    k_cls = _type_map[key_type]
+                    v_cls = _type_map[value_type]
+                    k_tensors = [arrays[f"layer_{i}_tq_k_{f}"] for f in key_fields]
+                    v_tensors = [arrays[f"layer_{i}_tq_v_{f}"] for f in value_fields]
+                    ks = k_cls(*k_tensors)
+                    vs = v_cls(*v_tensors)
+                    cache_data.append(('__turboquant_v2__', (ks, vs)))
+                except (KeyError, TypeError) as e:
+                    logger.error(f"TurboQuant v2 layer {i}: reconstruction failed: {e}")
                     return None
-                # Return as nested tuple matching TurboQuantKVCache state format
-                cache_data.append(((kn, kp), (vn, vp)))
             else:
                 keys_key = f"layer_{i}_keys"
                 values_key = f"layer_{i}_values"

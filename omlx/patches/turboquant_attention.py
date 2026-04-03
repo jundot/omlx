@@ -3,7 +3,8 @@
 
 When TurboQuantKVCache is detected, routes attention to:
   - Decode (L=1): cache.decode_attention() — Metal kernel, no dequant
-  - Prefill (L>1): cache.dequantize() + mx.fast.scaled_dot_product_attention
+  - Prefill (L>1): cache.prefill_attention() fast path, fallback to
+    dequantize + mx.fast.scaled_dot_product_attention
 """
 
 import logging
@@ -38,19 +39,18 @@ def apply_turboquant_attention_patch() -> bool:
         mask: Optional[mx.array],
         sinks: Optional[mx.array] = None,
     ) -> mx.array:
-        from ..turboquant_kv import TurboQuantKVCache, BatchTurboQuantKVCache
+        from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
+        from ..turboquant_kv import BatchTurboQuantKVCache
 
         # Unwrap VLM _IntOffsetCacheProxy to detect underlying TQ cache
         real_cache = cache
         if hasattr(cache, "_cache") and not isinstance(
-            cache, (TurboQuantKVCache, BatchTurboQuantKVCache)
+            cache, (_TQCache, BatchTurboQuantKVCache)
         ):
             real_cache = cache._cache
 
-        if isinstance(real_cache, (TurboQuantKVCache, BatchTurboQuantKVCache)):
-            if queries.shape[-2] == 1 and real_cache._quantized:
-                # Fused decode attention — no dequantize, works for both
-                # single and batch (kernel uses batch_idx from grid)
+        if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
+            if queries.shape[-2] == 1:
                 return real_cache.decode_attention(
                     queries,
                     keys_state=keys,
@@ -58,15 +58,25 @@ def apply_turboquant_attention_patch() -> bool:
                     scale=scale,
                     mask=mask,
                 )
-            else:
-                # Prefill: fp16 from update_and_fetch
-                return mx.fast.scaled_dot_product_attention(
-                    queries,
-                    keys.astype(queries.dtype),
-                    values.astype(queries.dtype),
-                    scale=scale,
-                    mask=mask,
-                )
+            # Prefill: try fast quantized path first
+            result = real_cache.prefill_attention(
+                queries,
+                keys_state=keys,
+                values_state=values,
+                scale=scale,
+                mask=mask,
+            )
+            if result is not None:
+                return result
+            # Fallback: dequantize + standard SDPA
+            dequantized_keys, dequantized_values = real_cache.dequantize(keys, values)
+            return mx.fast.scaled_dot_product_attention(
+                queries,
+                dequantized_keys.astype(queries.dtype),
+                dequantized_values.astype(queries.dtype),
+                scale=scale,
+                mask=mask,
+            )
 
         return original_sdpa(queries, keys, values, cache, scale, mask, sinks)
 

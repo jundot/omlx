@@ -207,7 +207,7 @@ class BatchedEngine(BaseEngine):
             if tq_enabled:
                 from ..patches.turboquant_attention import apply_turboquant_attention_patch
                 apply_turboquant_attention_patch()
-                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 
         # Create engine config (copy to avoid mutating the shared instance)
@@ -232,7 +232,7 @@ class BatchedEngine(BaseEngine):
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled:
-                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
 
         # SpecPrefill: load draft model and pass to scheduler

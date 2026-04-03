@@ -612,12 +612,18 @@ class BlockAwarePrefixCache(CacheManager):
 
                 state = layer_state['state']
                 keys = state[0] if isinstance(state, (list, tuple)) else state
-                # TurboQuant: keys = (k_norms, k_packed) tuple
-                if isinstance(keys, tuple) and len(keys) == 2 and hasattr(keys[0], 'shape'):
-                    k_norms = keys[0]
-                    seq_len = k_norms.shape[2] if len(k_norms.shape) >= 3 else k_norms.shape[1]
+                # TurboQuant v2: NamedTuple state with .norms attribute
+                if hasattr(keys, 'norms') and hasattr(keys.norms, 'shape'):
+                    seq_len = keys.norms.shape[2]
                     logger.debug(
                         f"Found TurboQuantKVCache at layer {layer_idx} with seq_len={seq_len}"
+                    )
+                    return seq_len
+                # TurboQuant v2: SplitState with .low/.high sub-states
+                if hasattr(keys, 'low') and hasattr(keys.low, 'norms'):
+                    seq_len = keys.low.norms.shape[2]
+                    logger.debug(
+                        f"Found TurboQuantKVCache (split) at layer {layer_idx} with seq_len={seq_len}"
                     )
                     return seq_len
                 if not hasattr(keys, 'shape'):
@@ -737,44 +743,28 @@ class BlockAwarePrefixCache(CacheManager):
                 handler = CacheTypeRegistry.get_handler_by_class_name(cache_type_name)
 
                 if cache_type_name in ('TurboQuantKVCache', 'BatchTurboQuantKVCache'):
-                    # TurboQuant: state = ((k_norms, k_packed), (v_norms, v_packed))
+                    # TurboQuant v2: NamedTuple state from mlx-vlm
+                    from ..turboquant_kv import _slice_state_range, _state_length
                     state = layer_state['state']
                     if not isinstance(state, (list, tuple)) or len(state) < 2:
                         block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                         continue
-                    k_state, v_state = state
-                    if not isinstance(k_state, (list, tuple)) or len(k_state) < 2:
-                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
-                        continue
-                    k_norms, k_packed = k_state
-                    v_norms, v_packed = v_state
-                    # Slice along axis 2 (sequence dimension)
-                    # k_norms: (B, H, T), k_packed: (B, H, T, pw)
-                    seq_len = k_norms.shape[2] if len(k_norms.shape) >= 3 else k_norms.shape[1]
+                    k_state, v_state = state[0], state[1]
+                    # Unwrap _QuantizedStateProxy if present
+                    if hasattr(k_state, '_state'):
+                        k_state = k_state._state
+                    if hasattr(v_state, '_state'):
+                        v_state = v_state._state
+                    seq_len = _state_length(k_state)
                     actual_end = min(end_idx, seq_len)
                     if start_idx >= actual_end:
                         block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                         continue
-                    if len(k_norms.shape) >= 3:
-                        kn_s = k_norms[:, :, start_idx:actual_end]
-                        kp_s = k_packed[:, :, start_idx:actual_end, :]
-                        vn_s = v_norms[:, :, start_idx:actual_end]
-                        vp_s = v_packed[:, :, start_idx:actual_end, :]
-                    else:
-                        kn_s = k_norms[:, start_idx:actual_end]
-                        kp_s = k_packed[:, start_idx:actual_end, :]
-                        vn_s = v_norms[:, start_idx:actual_end]
-                        vp_s = v_packed[:, start_idx:actual_end, :]
-                    # Store with extra metadata for reconstruction
-                    bits = layer_state.get('meta_state', (0,))
+                    ks = _slice_state_range(k_state, start_idx, actual_end)
+                    vs = _slice_state_range(v_state, start_idx, actual_end)
                     block_slices.append((
-                        '__turboquant__',
-                        (
-                            self._clone_tensor(kn_s),
-                            self._clone_tensor(kp_s),
-                            self._clone_tensor(vn_s),
-                            self._clone_tensor(vp_s),
-                        ),
+                        '__turboquant_v2__',
+                        (ks, vs),
                     ))
                 elif handler.supports_block_slicing:
                     # Standard 4D KV cache slicing
@@ -1510,49 +1500,48 @@ class BlockAwarePrefixCache(CacheManager):
                     reconstructed_caches.append(cache)
                     continue
 
-                # === TurboQuantKVCache: concat 4 tensors, reconstruct directly ===
+                # === TurboQuantKVCache: concat NamedTuple states, reconstruct ===
                 if cache_type_name in ('TurboQuantKVCache', 'BatchTurboQuantKVCache'):
-                    kn_list, kp_list, vn_list, vp_list = [], [], [], []
+                    from ..turboquant_kv import _concat_state, _state_length
+                    key_states, value_states = [], []
                     for block_data in all_block_data:
                         if layer_idx >= len(block_data):
                             continue
                         bd = block_data[layer_idx]
-                        # From SSD: ((kn, kp), (vn, vp)) nested tuple
                         if isinstance(bd, tuple) and len(bd) == 2:
-                            if isinstance(bd[0], str) and bd[0] == '__turboquant__':
-                                kn, kp, vn, vp = bd[1]
-                            elif isinstance(bd[0], tuple):
-                                (kn, kp), (vn, vp) = bd
+                            if isinstance(bd[0], str) and bd[0] == '__turboquant_v2__':
+                                ks, vs = bd[1]
                             else:
-                                continue
-                            kn_list.append(kn)
-                            kp_list.append(kp)
-                            vn_list.append(vn)
-                            vp_list.append(vp)
-                    if not kn_list:
+                                ks, vs = bd
+                            key_states.append(ks)
+                            value_states.append(vs)
+                    if not key_states:
                         logger.debug(f"TQ layer {layer_idx}: no block data")
                         return None
-                    cat_kn = mx.concatenate(kn_list, axis=2) if len(kn_list[0].shape) >= 3 else mx.concatenate(kn_list, axis=1)
-                    cat_kp = mx.concatenate(kp_list, axis=2) if len(kp_list[0].shape) >= 4 else mx.concatenate(kp_list, axis=1)
-                    cat_vn = mx.concatenate(vn_list, axis=2) if len(vn_list[0].shape) >= 3 else mx.concatenate(vn_list, axis=1)
-                    cat_vp = mx.concatenate(vp_list, axis=2) if len(vp_list[0].shape) >= 4 else mx.concatenate(vp_list, axis=1)
+                    # Concatenate along token dimension
+                    cat_ks = key_states[0]
+                    for s in key_states[1:]:
+                        cat_ks = _concat_state(cat_ks, s)
+                    cat_vs = value_states[0]
+                    for s in value_states[1:]:
+                        cat_vs = _concat_state(cat_vs, s)
                     try:
-                        from ..turboquant_kv import TurboQuantKVCache
+                        from mlx_vlm.turboquant import TurboQuantKVCache
                         from mlx_lm.models.cache import KVCache
-                        # Get bits from meta_state: (offset, bits, seed)
-                        tq_bits = 4
+                        tq_bits = 4.0
                         tq_seed = 0
                         ms = None
                         if first_block_meta_states and layer_idx < len(first_block_meta_states):
                             ms = first_block_meta_states[layer_idx]
                         if isinstance(ms, (list, tuple)) and len(ms) >= 3:
-                            tq_bits = int(ms[1])
+                            tq_bits = float(ms[1])
                             tq_seed = int(ms[2])
                         # Dequantize back to fp16 KVCache for merge compatibility.
                         # TQ will be re-applied at decode start (lazy quantization).
                         tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
-                        tq.state = ((cat_kn, cat_kp), (cat_vn, cat_vp))
-                        tq._quantized = True
+                        tq.keys = cat_ks
+                        tq.values = cat_vs
+                        tq.offset = _state_length(cat_ks)
                         keys, values = tq.dequantize()
                         cache = KVCache()
                         cache.keys = keys

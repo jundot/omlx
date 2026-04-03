@@ -93,9 +93,9 @@ class ModelSettingsRequest(BaseModel):
     index_cache_freq: Optional[int] = None
     thinking_budget_enabled: Optional[bool] = None
     thinking_budget_tokens: Optional[int] = None
-    # TurboQuant KV cache (experimental)
+    # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: Optional[bool] = None
-    turboquant_kv_bits: Optional[int] = None
+    turboquant_kv_bits: Optional[float] = None
     # SpecPrefill (experimental)
     specprefill_enabled: Optional[bool] = None
     specprefill_draft_model: Optional[str] = None
@@ -1520,11 +1520,11 @@ async def update_model_settings(
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
         )
-    # TurboQuant KV cache settings (temporarily disabled - ignore any values)
-    # if "turboquant_kv_enabled" in sent:
-    #     current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
-    # if "turboquant_kv_bits" in sent:
-    #     current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+    # TurboQuant KV cache settings
+    if "turboquant_kv_enabled" in sent:
+        current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
+    if "turboquant_kv_bits" in sent:
+        current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False

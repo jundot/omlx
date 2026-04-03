@@ -143,12 +143,13 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
 
     def _apply_turboquant_kv(self, prompt_cache: List[Any]) -> None:
         """Convert BatchKVCache layers to BatchTurboQuantKVCache."""
-        from .turboquant_kv import BatchTurboQuantKVCache, TurboQuantKVCache
+        from .turboquant_kv import BatchTurboQuantKVCache
+        from mlx_vlm.turboquant import TurboQuantKVCache
         from mlx_lm.models.cache import KVCache, CacheList
 
         converted = 0
 
-        bits = int(self._turboquant_kv_bits)
+        bits = float(self._turboquant_kv_bits)
         for i, cache_obj in enumerate(prompt_cache):
             cls_name = type(cache_obj).__name__
             if cls_name == "BatchKVCache":

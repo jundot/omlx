@@ -990,7 +990,7 @@
                                     ? forcedCtKwargs : null,
                                 turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
-                                    ? (this.modelSettings.turboquant_kv_bits || 4)
+                                    ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
