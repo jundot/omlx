@@ -337,8 +337,14 @@
                                     </div>
                                     <div x-show="modelSettings.turboquant_kv_enabled" x-transition class="pt-1">
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.turboquant_kv_bits_label') }}</label>
-                                        <input type="number" x-model.number="modelSettings.turboquant_kv_bits" min="2" max="4" step="0.5" placeholder="4"
-                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        <select x-model="modelSettings.turboquant_kv_bits"
+                                                class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                            <option value="2">2-bit</option>
+                                            <option value="2.5">2.5-bit</option>
+                                            <option value="3">3-bit</option>
+                                            <option value="3.5">3.5-bit</option>
+                                            <option value="4">4-bit</option>
+                                        </select>
                                     </div>
                                 </div>
 
