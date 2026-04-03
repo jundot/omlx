@@ -468,7 +468,14 @@
                 </div>
             </div>
 
-            <div class="w-10"></div>
+            <button @click="systemPromptDraft = systemPrompt; showSystemPromptModal = true"
+                    class="p-2 hover:bg-surface-muted rounded-lg relative"
+                    style="color: var(--text-primary);"
+                    :title="window.t('chat.system_prompt.title')">
+                <i data-lucide="settings" class="w-5 h-5"></i>
+                <span x-show="systemPrompt.trim()" x-cloak
+                      class="absolute top-1 right-1 w-2 h-2 bg-accent rounded-full"></span>
+            </button>
         </header>
 
         <!-- Messages Area -->
@@ -492,7 +499,7 @@
             <!-- Messages -->
             <div x-show="messages.length > 0" class="max-w-4xl mx-auto px-4 py-6 space-y-4">
                 <template x-for="(msg, index) in messages" :key="index">
-                    <div class="message-fade-in" x-show="msg._ui !== false">
+                    <div class="message-fade-in">
                         <!-- User Message -->
                         <div x-show="msg.role === 'user'" class="flex justify-end">
                             <div class="user-message">
@@ -751,6 +758,50 @@
         </button>
         <img :src="imageModal.src" @click.stop alt="Preview" x-show="imageModal.src">
     </div>
+
+    <!-- System Prompt Modal -->
+    <div x-show="showSystemPromptModal" x-cloak
+         class="fixed inset-0 bg-black/50 flex items-center justify-center z-[1000]"
+         @click="showSystemPromptModal = false"
+         @keydown.escape.window="showSystemPromptModal = false">
+        <div class="bg-surface rounded-2xl p-6 max-w-[500px] w-[90%] shadow-2xl" @click.stop>
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-bold" style="color: var(--text-primary);">
+                    {{ t('chat.system_prompt.title') }}
+                </h3>
+                <button @click="showSystemPromptModal = false" class="p-1 hover:bg-surface-muted rounded-lg" style="color: var(--text-tertiary);">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+            <p class="text-sm mb-3" style="color: var(--text-tertiary);">
+                {{ t('chat.system_prompt.description') }}
+            </p>
+            <textarea x-model="systemPromptDraft" rows="6"
+                      :placeholder="window.t('chat.system_prompt.placeholder')"
+                      class="w-full px-4 py-3 border border-line rounded-xl mb-4 focus:outline-none focus:border-line-strong resize-y"
+                      style="background: var(--bg-primary); color: var(--text-primary);"
+            ></textarea>
+            <div class="flex items-center justify-between">
+                <button @click="systemPromptDraft = ''; systemPrompt = ''; localStorage.removeItem('omlx_chat_system_prompt'); showSystemPromptModal = false"
+                        class="text-sm px-3 py-2 hover:bg-surface-muted rounded-lg"
+                        style="color: var(--text-tertiary);"
+                        x-show="systemPrompt.trim()">
+                    {{ t('chat.system_prompt.clear') }}
+                </button>
+                <div class="flex items-center gap-2 ml-auto">
+                    <button @click="showSystemPromptModal = false"
+                            class="px-4 py-2 text-sm rounded-xl hover:bg-surface-muted"
+                            style="color: var(--text-primary);">
+                        {{ t('chat.system_prompt.cancel') }}
+                    </button>
+                    <button @click="systemPrompt = systemPromptDraft; localStorage.setItem('omlx_chat_system_prompt', systemPrompt); showSystemPromptModal = false"
+                            class="px-4 py-2 text-sm bg-accent text-accent-fg rounded-xl hover:bg-accent-hover">
+                        {{ t('chat.system_prompt.save') }}
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
 {% endblock %}
 
@@ -836,6 +887,10 @@
             // VLM Detection State
             modelTypeMap: {},            // { modelId: "llm"|"vlm"|"embedding"|"reranker" }
 
+             // System Prompt
+            systemPrompt: localStorage.getItem('omlx_chat_system_prompt') || '',
+            showSystemPromptModal: false,
+            systemPromptDraft: '',
             // MCP Tool Call Limits
             MAX_TOOL_DEPTH: 10,          // Max recursive streamResponse calls for tool loops
             TOOL_TIMEOUT_MS: 30000,      // Per-tool execution timeout (ms)
@@ -1077,7 +1132,7 @@
             getStrippedImageCount(content) {
                 if (!Array.isArray(content)) return [];
                 const count = content.filter(p => p.type === 'image_url' && !p.image_url?.url).length;
-                return Array.from({ length: count });
+                return new Array(count);
             },
 
             // ===== End Image Upload Functions =====
@@ -1157,9 +1212,17 @@
                         throw new Error('Failed to load models');
                     }
 
-                    const modelsData = await modelsResponse.json();
-                    this.availableModels = modelsData.data || [];
+                     const modelsData = await modelsResponse.json();
+                    const allModels = modelsData.data || [];
 
+                    // Fetch model types first (needed for filtering and VLM detection)
+                    await this.fetchModelTypes();
+
+                    // Filter out audio/embedding/reranker — chat only works with LLM/VLM
+                    this.availableModels = allModels.filter(m => {
+                        const t = (this.modelTypeMap[m.id] || '').toLowerCase();
+                        return !t.startsWith('audio_') && t !== 'embedding' && t !== 'reranker';
+                    });
                     // Get default model from health endpoint
                     let defaultModel = null;
                     if (healthResponse.ok) {
@@ -1175,8 +1238,6 @@
                             this.currentModel = this.availableModels[0].id;
                         }
                     }
-                    // Fetch model types for VLM detection
-                    await this.fetchModelTypes();
                 } catch (error) {
                     console.error('Error loading models:', error);
                 }
@@ -1205,6 +1266,7 @@
                 this.currentChatId = 'chat_' + Date.now();
                 this.messages = [];
                 this.uploadImages = [];
+                this.systemPrompt = localStorage.getItem('omlx_chat_system_prompt') || '';
                 this.sidebarOpen = window.innerWidth >= 768;
             },
 
@@ -1213,6 +1275,7 @@
                 if (chat) {
                     this.currentChatId = chatId;
                     this.messages = chat.messages || [];
+                    this.systemPrompt = chat.systemPrompt || '';
                     if (chat.model) {
                         this.currentModel = chat.model;
                     }
@@ -1247,6 +1310,7 @@
                     title,
                     messages: messagesForStorage,
                     model: this.currentModel,
+                    systemPrompt: this.systemPrompt,
                     updatedAt: new Date().toISOString()
                 };
 
@@ -1337,6 +1401,13 @@
                         if (msg.tool_call_id) m.tool_call_id = msg.tool_call_id;
                         return m;
                     });
+                    // Prepend system prompt if set
+                if (this.systemPrompt.trim()) {
+                    messagesForApi.unshift({
+                        role: 'system',
+                        content: this.systemPrompt.trim()
+                    });
+                }
 
                 try {
                     const response = await fetch('/v1/chat/completions', {
@@ -1494,6 +1565,7 @@
                         this.messages.push({
                             role: 'assistant',
                             content: this.streamingContent || null,
+                            model: this.currentModel,
                             tool_calls: toolCalls,
                             _ui: false,
                         });
@@ -1608,20 +1680,15 @@
                     // Attach performance timeline and thinking to the final assistant message, once per prompt
                     if (depth === 0) {
                         for (let i = this.messages.length - 1; i >= 0; i--) {
-                            if (this.messages[i].role === 'assistant' && this.messages[i]._ui !== false) {
-                                const patch = {};
+                            const msg = this.messages[i];
+                            if (msg.role === 'assistant' && msg._ui !== false) {
                                 if (this.statusLog.length > 0) {
                                     const totalTime = ((Date.now() - this._statusStart) / 1000).toFixed(2) + 's total';
-                                    patch._perfLog = [...this.statusLog];
-                                    patch._perfTotal = totalTime;
-                                    patch._perfVisible = false;
+                                    msg._perfLog = [...this.statusLog];
+                                    msg._perfTotal = totalTime;
                                 }
                                 if (this.streamingThinking) {
-                                    patch._thinking = this.streamingThinking;
-                                    patch._thinkingOpen = false;
-                                }
-                                if (Object.keys(patch).length > 0) {
-                                    this.messages.splice(i, 1, { ...this.messages[i], ...patch });
+                                    msg._thinking = this.streamingThinking;
                                 }
                                 break;
                             }
