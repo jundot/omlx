@@ -13,7 +13,7 @@ import io
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +54,11 @@ def load_image(url_or_base64: str) -> Image.Image:
         # Try as local file path
         img = Image.open(url_or_base64)
 
+    # Apply EXIF orientation (phone photos etc.) before processing.
+    # Matches mlx-vlm's load_image which calls ImageOps.exif_transpose().
+    img = ImageOps.exif_transpose(img)
     # Ensure RGB format (RGBA/P/L etc. cause broadcast errors in vision processors)
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-    return img
+    return img.convert("RGB")
 
 
 def extract_images_from_messages(
