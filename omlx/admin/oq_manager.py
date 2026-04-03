@@ -70,15 +70,9 @@ class QuantTask:
     completed_at: float = 0.0
     source_size: int = 0
     output_size: int = 0
-    enable_clip: bool = False
     group_size: int = 64
-    clip_num_samples: int = 128
-    clip_seq_length: int = 512
-    calib_dataset: str = "default"
-    clip_batch_size: int = 1024
     sensitivity_model_path: str = ""
     text_only: bool = False
-    expert_batch_size: int = 32
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -118,26 +112,6 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / 1024**2:.1f} MB"
     else:
         return f"{size_bytes / 1024**3:.1f} GB"
-
-
-# Models that support clip optimization (tested forward pass)
-_CLIP_SUPPORTED_MODEL_TYPES = {
-    "qwen3_5_moe",
-    "qwen3_5",
-    "minimax_m2",
-    "glm_moe_dsa",
-    "deepseek_v32",
-    "ministral3",
-    "nemotron_h",
-    # TODO: MLA attention AWQ pairs not yet implemented for DeepSeek/GLM.
-    # AWQ works for their MLP layers; attention layers skip gracefully.
-}
-
-
-def _supports_clip(config: dict) -> bool:
-    """Check if clip optimization is supported for this model type."""
-    model_type = config.get("model_type", "").lower()
-    return any(t in model_type for t in _CLIP_SUPPORTED_MODEL_TYPES)
 
 
 class OQManager:
@@ -217,7 +191,6 @@ class OQManager:
                                 "size_formatted": _format_size(size),
                                 "model_type": config.get("model_type", "") or tc.get("model_type", ""),
                                 "is_quantized": "quantization" in config,
-                                "supports_clip": _supports_clip(config),
                                 "is_vlm": "vision_config" in config,
                             }
                             all_models.append(info)
@@ -230,10 +203,7 @@ class OQManager:
                                     "num_local_experts", 0
                                 )
                                 info_full["memory_streaming"] = estimate_memory(
-                                    size, enable_clip=False
-                                )
-                                info_full["memory_clip"] = estimate_memory(
-                                    size, enable_clip=True
+                                    size
                                 )
                                 source_models.append(info_full)
                         except Exception:
@@ -246,15 +216,9 @@ class OQManager:
         self,
         model_path: str,
         oq_level: float,
-        enable_clip: bool = False,
         group_size: int = 64,
-        clip_num_samples: int = 128,
-        clip_seq_length: int = 512,
-        calib_dataset: str = "default",
-        clip_batch_size: int = 1024,
         sensitivity_model_path: str = "",
         text_only: bool = False,
-        expert_batch_size: int = 32,
     ) -> QuantTask:
         """Start a quantization job.
 
@@ -280,7 +244,7 @@ class OQManager:
             raise ValueError(f"Model not found: {model_path}")
 
         model_name = source.name
-        output_name = resolve_output_name(model_name, oq_level, enable_clip)
+        output_name = resolve_output_name(model_name, oq_level)
         output_path = self._output_dir / output_name
 
         if output_path.exists():
@@ -294,12 +258,10 @@ class OQManager:
             if (
                 task.model_path == model_path
                 and task.oq_level == oq_level
-                and task.enable_clip == enable_clip
                 and task.status in _ACTIVE_STATUSES
             ):
-                suffix = "e" if enable_clip else ""
                 raise ValueError(
-                    f"Quantization for '{model_name}' at oQ{oq_level:g}{suffix} "
+                    f"Quantization for '{model_name}' at oQ{oq_level:g} "
                     "is already in progress"
                 )
 
@@ -318,15 +280,9 @@ class OQManager:
             output_name=output_name,
             output_path=str(output_path),
             source_size=source_size,
-            enable_clip=enable_clip,
             group_size=group_size,
-            clip_num_samples=clip_num_samples,
-            clip_seq_length=clip_seq_length,
-            calib_dataset=calib_dataset,
-            clip_batch_size=clip_batch_size,
             sensitivity_model_path=sensitivity_model_path,
             text_only=text_only,
-            expert_batch_size=expert_batch_size,
         )
         self._tasks[task_id] = task
 
@@ -469,43 +425,20 @@ class OQManager:
                     self._estimate_progress(task_id)
                 )
 
-                if task.enable_clip:
-                    # Full model load + GPTQ optimization
-                    from ..oq import quantize_oq
+                from ..oq import quantize_oq_streaming
 
-                    await asyncio.to_thread(
-                        quantize_oq,
-                        task.model_path,
-                        task.output_path,
-                        task.oq_level,
-                        True,
-                        _progress_cb,
-                        task.clip_batch_size,
-                        task.calib_dataset,
-                        task.text_only,
-                        task.clip_num_samples,
-                        task.clip_seq_length,
-                        None,  # target_bpw
-                        None,  # hard_cap_bpw
-                        task.sensitivity_model_path,
-                        expert_batch_size=task.expert_batch_size,
-                    )
-                else:
-                    # Tensor-by-tensor (low memory)
-                    from ..oq import quantize_oq_streaming
-
-                    await asyncio.to_thread(
-                        quantize_oq_streaming,
-                        task.model_path,
-                        task.output_path,
-                        task.oq_level,
-                        task.group_size,
-                        _progress_cb,
-                        task.text_only,
-                        None,  # target_bpw
-                        None,  # hard_cap_bpw
-                        task.sensitivity_model_path,
-                    )
+                await asyncio.to_thread(
+                    quantize_oq_streaming,
+                    task.model_path,
+                    task.output_path,
+                    task.oq_level,
+                    task.group_size,
+                    _progress_cb,
+                    task.text_only,
+                    None,  # target_bpw
+                    None,  # hard_cap_bpw
+                    task.sensitivity_model_path,
+                )
 
                 if task_id in self._cancelled:
                     return
@@ -595,7 +528,6 @@ class OQManager:
         labels = {
             "loading": "Loading model...",
             "quantizing": f"Quantizing to oQ{oq_level:g}...",
-            "optimizing": f"GPTQ optimization oQ{oq_level:g}...",
             "saving": "Saving quantized model...",
         }
         # Handle progress: "quantizing_eta|792|879|0:02"
@@ -609,7 +541,4 @@ class OQManager:
             if eta:
                 label += f" ({eta} remaining)"
             return label
-        # Handle optimizing progress: "optimizing (5/48, 2:30 remaining)"
-        if phase.startswith("optimizing"):
-            return f"Enhanced+ {phase.replace('optimizing', '').strip()}"
         return labels.get(phase, phase)

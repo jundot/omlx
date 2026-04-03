@@ -1023,7 +1023,7 @@
 
                     <!-- ==================== QUANTIZER TAB ==================== -->
                     <div x-show="modelsTab === 'quantizer'" x-cloak
-                         x-effect="oqSelectedModelPath; oqLevel; oqEnableClip; oqRefreshEstimate()">
+                         x-effect="oqSelectedModelPath; oqLevel; oqRefreshEstimate()">
                         <!-- Header -->
                         <div class="mb-8">
                             <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('models.oq.section_label') }}</h2>
@@ -1076,13 +1076,13 @@
                                         <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.oq.level') }}</label>
                                         <select x-model.number="oqLevel"
                                                 class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <option value="2" x-text="'oQ2' + (oqEnableClip ? 'e' : '')">oQ2</option>
-                                            <option value="3" x-text="'oQ3' + (oqEnableClip ? 'e' : '')">oQ3</option>
-                                            <option value="3.5" x-text="'oQ3.5' + (oqEnableClip ? 'e' : '')">oQ3.5</option>
-                                            <option value="4" selected x-text="'oQ4' + (oqEnableClip ? 'e' : '')">oQ4</option>
-                                            <option value="5" x-text="'oQ5' + (oqEnableClip ? 'e' : '')">oQ5</option>
-                                            <option value="6" x-text="'oQ6' + (oqEnableClip ? 'e' : '')">oQ6</option>
-                                            <option value="8" x-text="'oQ8' + (oqEnableClip ? 'e' : '')">oQ8</option>
+                                            <option value="2">oQ2</option>
+                                            <option value="3">oQ3</option>
+                                            <option value="3.5">oQ3.5</option>
+                                            <option value="4" selected>oQ4</option>
+                                            <option value="5">oQ5</option>
+                                            <option value="6">oQ6</option>
+                                            <option value="8">oQ8</option>
                                         </select>
                                     </div>
                                     <!-- Start Button -->
@@ -1110,8 +1110,6 @@
                                         {{ t('models.oq.advanced_settings') }}
                                     </button>
                                     <div x-show="oqAdvancedOpen" x-cloak class="mt-3 space-y-3 pl-1">
-                                        <!-- Enhanced Quantization(+) — temporarily disabled -->
-                                        <!-- TODO: re-enable when ready -->
                                         <!-- Text Only (VLM only) -->
                                         <div x-show="oqSelectedModelIsVLM()" x-cloak class="flex items-center justify-between">
                                             <span class="text-sm text-neutral-600">Text Only</span>
@@ -1126,53 +1124,6 @@
                                         <p x-show="oqTextOnly && oqSelectedModelIsVLM()" x-cloak class="text-xs text-amber-600 leading-relaxed">
                                             Excludes vision encoder weights. Output is a text-only model (~2-3% smaller).
                                         </p>
-                                        <!-- Calibration Dataset (clip ON only) -->
-                                        <div x-show="oqEnableClip" x-cloak class="flex items-center justify-between">
-                                            <span class="text-sm text-neutral-600">{{ t('models.oq.calib_dataset') }}</span>
-                                            <select x-model="oqCalibDataset"
-                                                    class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                                <option value="code_multilingual">Code + Multilingual + Tool Calling</option>
-                                                <option value="code">Code + English</option>
-                                                <option value="multilingual">Multilingual (en/ko/zh/ja)</option>
-                                            </select>
-                                        </div>
-                                        <!-- Calibration Samples (clip ON only) -->
-                                        <div x-show="oqEnableClip" x-cloak class="flex items-center justify-between">
-                                            <span class="text-sm text-neutral-600">{{ t('models.oq.calib_samples') }}</span>
-                                            <select x-model.number="oqClipSamples"
-                                                    class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                                <option value="32">32 (fast)</option>
-                                                <option value="64">64</option>
-                                                <option value="128" selected>128</option>
-                                                <option value="256">256</option>
-                                                <option value="512">512 (slow)</option>
-                                            </select>
-                                        </div>
-                                        <!-- Sequence Length (clip ON only) -->
-                                        <div x-show="oqEnableClip" x-cloak class="flex items-center justify-between">
-                                            <span class="text-sm text-neutral-600">{{ t('models.oq.calib_seq_length') }}</span>
-                                            <select x-model.number="oqClipSeqLen"
-                                                    class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                                <option value="256">256</option>
-                                                <option value="512" selected>512</option>
-                                                <option value="1024">1024</option>
-                                            </select>
-                                        </div>
-                                        <!-- Expert GPTQ Batch (clip ON only) -->
-                                        <div x-show="oqEnableClip" x-cloak class="space-y-1">
-                                            <div class="flex items-center justify-between">
-                                                <span class="text-sm text-neutral-600">{{ t('models.oq.expert_batch_size') }}</span>
-                                                <select x-model.number="oqExpertBatchSize"
-                                                        class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                                    <option value="0">{{ t('models.oq.expert_batch_none') }}</option>
-                                                    <option value="32" selected>32 ({{ t('models.oq.expert_batch_default') }})</option>
-                                                    <option value="16">16 ({{ t('models.oq.expert_batch_slow') }})</option>
-                                                </select>
-                                            </div>
-                                            <p class="text-[11px] text-neutral-400 leading-relaxed">
-                                                {{ t('models.oq.expert_batch_desc') }}
-                                            </p>
-                                        </div>
                                     </div>
                                 </div>
                                 <!-- Error -->

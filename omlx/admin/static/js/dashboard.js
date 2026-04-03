@@ -266,14 +266,8 @@
             _oqRefreshTimer: null,
             // oQ Advanced Settings
             oqAdvancedOpen: false,
-            oqEnableClip: false,
             oqTextOnly: false,
-            oqClipSamples: 128,
-            oqClipSeqLen: 512,
-            oqCalibDataset: 'code_multilingual',
-            oqClipBatchSize: 1024,
             oqSensitivityModelPath: '',
-            oqExpertBatchSize: 32,
 
             // oQ Uploader state
             uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
@@ -2693,15 +2687,9 @@
                         body: JSON.stringify({
                             model_path: this.oqSelectedModelPath,
                             oq_level: this.oqLevel,
-                            enable_clip: this.oqEnableClip,
                             group_size: 64,
-                            clip_num_samples: this.oqClipSamples,
-                            clip_seq_length: this.oqClipSeqLen,
-                            calib_dataset: this.oqCalibDataset,
-                            clip_batch_size: this.oqClipBatchSize,
                             sensitivity_model_path: this.oqSensitivityModelPath,
                             text_only: this.oqTextOnly,
-                            expert_batch_size: this.oqExpertBatchSize,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));
@@ -2801,11 +2789,6 @@
                 );
             },
 
-            oqSelectedModelSupportsClip() {
-                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
-                return model?.supports_clip || false;
-            },
-
             oqSelectedModelIsVLM() {
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 return model?.is_vlm || false;
@@ -2814,9 +2797,6 @@
             oqEstimatedMemory() {
                 // Use precise estimate from API if available
                 if (this.oqEstimate) {
-                    if (this.oqEnableClip) {
-                        return this.oqEstimate.memory_clip_formatted || '';
-                    }
                     // If sensitivity model selected, memory ≈ sensitivity model size × 1.5
                     if (this.oqSensitivityModelPath) {
                         const sensModel = this.oqAllModels.find(m => m.path === this.oqSensitivityModelPath);
@@ -2831,9 +2811,6 @@
                 // Fallback to rough model-level estimate
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 if (!model) return '';
-                if (this.oqEnableClip) {
-                    return model.memory_clip?.peak_formatted || '';
-                }
                 return model.memory_streaming?.peak_formatted || '';
             },
 

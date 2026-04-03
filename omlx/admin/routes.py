@@ -205,15 +205,9 @@ class OQStartRequest(BaseModel):
 
     model_path: str
     oq_level: float
-    enable_clip: bool = False
     group_size: int = 64
-    clip_num_samples: int = 128
-    clip_seq_length: int = 512
-    calib_dataset: str = "default"
-    clip_batch_size: int = 1024
     sensitivity_model_path: str = ""
     text_only: bool = False
-    expert_batch_size: int = 32
 
 
 class HFUploadRequest(BaseModel):
@@ -3761,15 +3755,9 @@ async def start_oq_quantization(
         task = await _oq_manager.start_quantization(
             model_path=request.model_path,
             oq_level=request.oq_level,
-            enable_clip=request.enable_clip,
             group_size=request.group_size,
-            clip_num_samples=request.clip_num_samples,
-            clip_seq_length=request.clip_seq_length,
-            calib_dataset=request.calib_dataset,
-            clip_batch_size=request.clip_batch_size,
             sensitivity_model_path=request.sensitivity_model_path,
             text_only=request.text_only,
-            expert_batch_size=request.expert_batch_size,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

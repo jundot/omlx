@@ -19,17 +19,11 @@ from omlx.oq import (
     _OQ_BPW_TARGETS,
     _bpw_targets_for_level,
     _build_quant_plan,
-    _compute_group_params,
-    _compute_per_expert_hessians,
     _extract_layer_index,
     _format_size,
     _get_predicate_bits,
-    _gptq_compute_hessian,
-    _gptq_quantize_experts_batched,
-    _gptq_quantize_weight,
     _is_moe_router,
     _normalize_quant_path,
-    _search_best_clip,
     _should_quantize_tensor,
     estimate_memory,
     make_predicate,
@@ -325,21 +319,13 @@ class TestResolveOutputName:
     def test_strip_existing_oq_suffix(self):
         assert resolve_output_name("Qwen3.5-122B-A10B-oQ6", 2) == "Qwen3.5-122B-A10B-oQ2"
 
-    def test_clip_suffix(self):
-        assert resolve_output_name("Qwen3.5-122B-A10B", 4, enable_clip=True) == "Qwen3.5-122B-A10B-oQ4e"
-
-    def test_strip_existing_clip_suffix(self):
+    def test_strip_existing_enhanced_suffix(self):
         assert resolve_output_name("Qwen3.5-122B-A10B-oQ4e", 2) == "Qwen3.5-122B-A10B-oQ2"
 
     def test_all_levels(self):
         for level in OQ_LEVELS:
             result = resolve_output_name("Model-7B", level)
             assert result == f"Model-7B-oQ{level}"
-
-    def test_all_levels_clip(self):
-        for level in OQ_LEVELS:
-            result = resolve_output_name("Model-7B", level, enable_clip=True)
-            assert result == f"Model-7B-oQ{level}e"
 
 
 # =============================================================================
@@ -369,71 +355,6 @@ class TestValidateQuantizable:
 # =============================================================================
 # Test make_predicate
 # =============================================================================
-
-
-@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
-class TestClipOptimization:
-    """Test AWQ-style output-MSE clip optimization."""
-
-    def test_search_best_clip_returns_same_shape(self):
-        """Clipped weights should have the same shape as input."""
-
-        w = mx.random.normal((64, 128))
-        x = mx.random.normal((32, 128))  # 32 activation samples
-        clipped = _search_best_clip(w, x, group_size=64, bits=4)
-        assert clipped.shape == w.shape
-
-    def test_search_best_clip_reduces_range(self):
-        """Clipping should reduce the weight range (or keep it same)."""
-
-        w = mx.random.normal((32, 64))
-        x = mx.random.normal((16, 64))
-        clipped = _search_best_clip(w, x, group_size=64, bits=2, n_grid=10)
-        # Clipped range should be <= original range
-        orig_range = float(w.max() - w.min())
-        clip_range = float(clipped.max() - clipped.min())
-        assert clip_range <= orig_range * 1.01
-
-    def test_search_best_clip_2bit(self):
-        """2-bit clip search should work."""
-
-        w = mx.random.normal((16, 128))
-        x = mx.random.normal((8, 128))
-        clipped = _search_best_clip(w, x, group_size=64, bits=2, n_grid=5)
-        assert clipped.shape == w.shape
-        assert clipped.dtype == w.dtype
-
-    def test_output_mse_improves_with_clip(self):
-        """Clipped + quantized should have lower output MSE than raw quantized."""
-
-        np.random.seed(42)
-        # Weight with outliers
-        w_np = np.random.randn(32, 64).astype(np.float32) * 0.1
-        w_np[0, 0] = 5.0
-        w_np[1, 1] = -4.0
-        w = mx.array(w_np)
-        x = mx.random.normal((16, 64))
-
-        # Baseline: quantize directly
-        rtn_q = mx.dequantize(*mx.quantize(w, group_size=64, bits=2), 64, 2)
-        x_grouped = x.reshape(x.shape[0], -1, 64)
-        w_grouped = w.reshape(w.shape[0], -1, 64)
-        rtn_q_grouped = rtn_q.reshape(rtn_q.shape[0], -1, 64)
-        out_orig = mx.einsum("bdg,odg->bod", x_grouped, w_grouped)
-        out_rtn = mx.einsum("bdg,odg->bod", x_grouped, rtn_q_grouped)
-        rtn_loss = float(((out_orig - out_rtn) ** 2).mean())
-
-        # Clip-optimized: search + quantize
-        clipped = _search_best_clip(w, x, group_size=64, bits=2, n_grid=10)
-        clip_q = mx.dequantize(*mx.quantize(clipped, group_size=64, bits=2), 64, 2)
-        clip_q_grouped = clip_q.reshape(clip_q.shape[0], -1, 64)
-        out_clip = mx.einsum("bdg,odg->bod", x_grouped, clip_q_grouped)
-        clip_loss = float(((out_orig - out_clip) ** 2).mean())
-
-        # Clip-optimized should have equal or better output MSE
-        assert clip_loss <= rtn_loss * 1.05, (
-            f"Clip output MSE ({clip_loss:.6f}) worse than RTN ({rtn_loss:.6f})"
-        )
 
 
 class TestMakePredicate:
@@ -478,19 +399,13 @@ class TestMakePredicate:
 class TestEstimateMemory:
     def test_streaming_includes_buffer(self):
         size = 100 * 1024**3  # 100GB model
-        result = estimate_memory(size, enable_clip=False)
-        # Streaming: source + 5GB buffer + 5% sanitize overhead
+        result = estimate_memory(size)
+        # Streaming: source + 6GB buffer
         assert result["peak_bytes"] > size
         assert result["peak_bytes"] < size * 1.2
 
-    def test_clip_larger_than_streaming(self):
-        size = 50 * 1024**3
-        streaming = estimate_memory(size, enable_clip=False)
-        clip = estimate_memory(size, enable_clip=True)
-        assert clip["peak_bytes"] > streaming["peak_bytes"]
-
     def test_has_formatted(self):
-        result = estimate_memory(10 * 1024**3, enable_clip=False)
+        result = estimate_memory(10 * 1024**3)
         assert "peak_formatted" in result
         assert "GB" in result["peak_formatted"]
 
@@ -785,237 +700,3 @@ class TestLevelBudgetPlan:
 
 # =============================================================================
 # Test GPTQ quantization
-# =============================================================================
-
-
-@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
-class TestGPTQQuantize:
-    """Tests for GPTQ weight optimization functions."""
-
-    def test_gptq_axis_alignment(self):
-        """GPTQ qdq must match mx.quantize row-wise grouping (last axis)."""
-        out_dim, in_dim = 128, 256
-        bits, gs = 4, 64
-
-        w = mx.random.normal((out_dim, in_dim)).astype(mx.float32) * 0.1
-        x = mx.random.normal((32, in_dim)).astype(mx.float32)
-        mx.eval(w, x)
-
-        _, Hinv = _gptq_compute_hessian(x)
-        w_opt = _gptq_quantize_weight(w, Hinv, bits, gs)
-        mx.eval(w_opt)
-
-        # Quantize with mx.quantize (groups along last axis = in_dim)
-        qdq_opt = mx.dequantize(
-            *mx.quantize(w_opt, group_size=gs, bits=bits),
-            group_size=gs, bits=bits,
-        )
-        qdq_plain = mx.dequantize(
-            *mx.quantize(w, group_size=gs, bits=bits),
-            group_size=gs, bits=bits,
-        )
-        mx.eval(qdq_opt, qdq_plain)
-
-        # GPTQ output should already be on the quantization grid
-        # (re-quantization should be nearly lossless)
-        regrid_mse = ((w_opt - qdq_opt) ** 2).mean().item()
-        plain_mse = ((w - qdq_plain) ** 2).mean().item()
-        assert regrid_mse < plain_mse * 0.5, (
-            f"GPTQ output not grid-aligned: regrid_mse={regrid_mse:.6f} "
-            f"vs plain_mse={plain_mse:.6f}"
-        )
-
-    def test_gptq_does_not_degrade_mse(self):
-        """GPTQ-optimized weights should not significantly degrade output MSE.
-
-        With random weights GPTQ may not always improve (real model structure
-        is needed for significant gains), but it should stay within a small
-        tolerance of plain RTN.
-        """
-        # Multiple groups (in_dim / gs = 2) with well-conditioned Hessian
-        out_dim, in_dim = 128, 128
-        bits, gs = 4, 64
-
-        w = mx.random.normal((out_dim, in_dim)).astype(mx.float32) * 0.1
-        x = mx.random.normal((512, in_dim)).astype(mx.float32)
-        mx.eval(w, x)
-
-        float_out = x @ w.T
-        _, Hinv = _gptq_compute_hessian(x)
-
-        # Plain RTN quantization
-        qdq_plain = mx.dequantize(
-            *mx.quantize(w, group_size=gs, bits=bits),
-            group_size=gs, bits=bits,
-        )
-        mse_plain = ((float_out - x @ qdq_plain.T) ** 2).mean()
-
-        # GPTQ-optimized quantization
-        w_opt = _gptq_quantize_weight(w, Hinv, bits, gs)
-        qdq_gptq = mx.dequantize(
-            *mx.quantize(w_opt, group_size=gs, bits=bits),
-            group_size=gs, bits=bits,
-        )
-        mse_gptq = ((float_out - x @ qdq_gptq.T) ** 2).mean()
-        mx.eval(mse_plain, mse_gptq)
-
-        # GPTQ should not make things significantly worse (< 10% degradation)
-        assert mse_gptq.item() <= mse_plain.item() * 1.10, (
-            f"GPTQ degraded MSE by >10%: gptq={mse_gptq.item():.6f} "
-            f"vs plain={mse_plain.item():.6f}"
-        )
-
-    def test_gptq_experts_batched(self):
-        """Batched expert GPTQ should improve or match plain quantization."""
-        num_experts, out_dim, in_dim = 4, 64, 128
-        bits, gs = 4, 64
-
-        w_3d = mx.random.normal((num_experts, out_dim, in_dim)).astype(mx.float32) * 0.1
-        x = mx.random.normal((32, in_dim)).astype(mx.float32)
-        mx.eval(w_3d, x)
-
-        _, Hinv = _gptq_compute_hessian(x)
-        w_opt = _gptq_quantize_experts_batched(w_3d, Hinv, bits, gs)
-        mx.eval(w_opt)
-
-        # Check each expert: GPTQ should not increase output MSE
-        for ei in range(num_experts):
-            w_orig = w_3d[ei]
-            w_new = w_opt[ei]
-            float_out = x @ w_orig.T
-
-            qdq_plain = mx.dequantize(
-                *mx.quantize(w_orig, group_size=gs, bits=bits),
-                group_size=gs, bits=bits,
-            )
-            qdq_gptq = mx.dequantize(
-                *mx.quantize(w_new, group_size=gs, bits=bits),
-                group_size=gs, bits=bits,
-            )
-            mse_p = ((float_out - x @ qdq_plain.T) ** 2).mean()
-            mse_g = ((float_out - x @ qdq_gptq.T) ** 2).mean()
-            mx.eval(mse_p, mse_g)
-            assert mse_g.item() <= mse_p.item() * 1.05, (
-                f"Expert {ei}: GPTQ degraded MSE by >5%: "
-                f"gptq={mse_g.item():.6f} vs plain={mse_p.item():.6f}"
-            )
-
-    def test_gptq_experts_batched_3d_hinv(self):
-        """3D per-expert Hinv should produce different results than shared 2D."""
-        num_experts, out_dim, in_dim = 4, 64, 128
-        bits, gs = 4, 64
-
-        w_3d = mx.random.normal((num_experts, out_dim, in_dim)).astype(mx.float32) * 0.1
-        mx.eval(w_3d)
-
-        # Create different Hessians per expert (simulating routing)
-        hinvs_2d = []
-        for e in range(num_experts):
-            x_e = mx.random.normal((64, in_dim)).astype(mx.float32) * (1.0 + e * 0.5)
-            mx.eval(x_e)
-            _, hinv_e = _gptq_compute_hessian(x_e)
-            mx.eval(hinv_e)
-            hinvs_2d.append(hinv_e)
-        Hinv_3d = mx.stack(hinvs_2d, axis=0)  # (4, 128, 128)
-        mx.eval(Hinv_3d)
-
-        # Shared Hessian (from combined input)
-        x_all = mx.random.normal((256, in_dim)).astype(mx.float32)
-        mx.eval(x_all)
-        _, Hinv_shared = _gptq_compute_hessian(x_all)
-        mx.eval(Hinv_shared)
-
-        w_shared = _gptq_quantize_experts_batched(w_3d, Hinv_shared, bits, gs)
-        w_per_exp = _gptq_quantize_experts_batched(w_3d, Hinv_3d, bits, gs)
-        mx.eval(w_shared, w_per_exp)
-
-        # Per-expert should produce different weights than shared
-        diff = mx.abs(w_shared - w_per_exp).sum().item()
-        assert diff > 0, "Per-expert Hinv should produce different weights"
-
-        # Replicated shared should match original shared behavior
-        Hinv_replicated = mx.stack([Hinv_shared] * num_experts, axis=0)
-        mx.eval(Hinv_replicated)
-        w_replicated = _gptq_quantize_experts_batched(w_3d, Hinv_replicated, bits, gs)
-        mx.eval(w_replicated)
-        diff_rep = mx.abs(w_shared - w_replicated).max().item()
-        assert diff_rep < 1e-5, (
-            f"Replicated shared Hinv should match 2D shared: max diff={diff_rep}"
-        )
-
-    def test_compute_per_expert_hessians(self):
-        """Per-expert Hessian with 1D flat indices (SwitchLinear gather_mm format)."""
-        num_experts, in_dim = 8, 64
-        # Simulate SwitchLinear captured: N token-expert pairs with 1D indices
-        n_pairs = 512  # batch*seq*top_k
-        values = mx.random.normal((n_pairs, 1, in_dim)).astype(mx.float32)
-        indices = mx.random.randint(0, num_experts, (n_pairs,))
-        mx.eval(values, indices)
-
-        hinvs = _compute_per_expert_hessians(
-            values, indices, num_experts, min_tokens=16,
-        )
-
-        assert len(hinvs) == num_experts
-        for i, h in enumerate(hinvs):
-            assert h.shape == (in_dim, in_dim), f"Expert {i}: wrong shape {h.shape}"
-
-        # Different experts should have different Hessians
-        diff = mx.abs(hinvs[0] - hinvs[1]).sum().item()
-        assert diff > 0, "Different experts should have different Hessians"
-
-    def test_compute_per_expert_hessians_sparse_fallback(self):
-        """Experts with too few tokens should get identity Hessian."""
-        num_experts, in_dim = 8, 64
-        # All pairs go to expert 0 — experts 1-7 get zero tokens
-        n_pairs = 200
-        indices = mx.zeros((n_pairs,), dtype=mx.int32)
-        values = mx.random.normal((n_pairs, 1, in_dim)).astype(mx.float32)
-        mx.eval(values, indices)
-
-        hinvs = _compute_per_expert_hessians(
-            values, indices, num_experts, min_tokens=16,
-        )
-
-        # Expert 0 should have a real Hessian
-        identity = mx.eye(in_dim)
-        diff_0 = mx.abs(hinvs[0] - identity).sum().item()
-        assert diff_0 > 1.0, "Expert 0 should not be identity"
-
-        # Expert 1 should fall back to identity
-        diff_1 = mx.abs(hinvs[1] - identity).sum().item()
-        assert diff_1 < 1e-5, "Sparse expert should use identity fallback"
-
-    def test_compute_per_expert_hessians_down_proj(self):
-        """Per-expert Hessian for down_proj (smaller intermediate dim)."""
-        num_experts, inter_dim = 8, 32
-        n_pairs = 400
-
-        values = mx.random.normal((n_pairs, 1, inter_dim)).astype(mx.float32)
-        indices = mx.random.randint(0, num_experts, (n_pairs,))
-        mx.eval(values, indices)
-
-        hinvs = _compute_per_expert_hessians(
-            values, indices, num_experts, min_tokens=8,
-        )
-
-        assert len(hinvs) == num_experts
-        for h in hinvs:
-            assert h.shape == (inter_dim, inter_dim)
-
-    def test_compute_group_params_partial_group(self):
-        """_compute_group_params should handle partial last group by padding."""
-        # Partial group: width=48 with group_size=64
-        w = mx.random.normal((32, 48)).astype(mx.float32)
-        mx.eval(w)
-        scales, biases = _compute_group_params(w, bits=4, group_size=64)
-        assert scales.shape == (32, 1)
-        assert biases.shape == (32, 1)
-
-    def test_compute_group_params_full_group(self):
-        """_compute_group_params with exact group_size should work."""
-        w = mx.random.normal((32, 64)).astype(mx.float32)
-        mx.eval(w)
-        scales, biases = _compute_group_params(w, bits=4, group_size=64)
-        assert scales.shape == (32, 1)
-        assert biases.shape == (32, 1)
