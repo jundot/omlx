@@ -59,8 +59,8 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (b21d095) - adds VisionFeatureCache for multi-turn image caching
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@b21d09577c962f2bc0854dfea5fae748cfc01361",
+    # mlx-vlm from commit (90732bd) - optimized TurboQuant Metal kernels (0.85-1.90x baseline)
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@90732bdee6a361ae5003b180dc3c1b17b9d01a80",
     "Pillow>=9.0.0",
 ]
 
