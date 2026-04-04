@@ -125,7 +125,7 @@ class TestUniversalQuantPredicate:
             "model.layers.0.mlp.shared_expert.gate_proj", module, moe_config
         )
         assert isinstance(result, dict)
-        assert result["bits"] == 6
+        assert result["bits"] == 8
 
     def test_512_expert_gate_proj_floor(self, large_moe_config, module):
         result = universal_quant_predicate(

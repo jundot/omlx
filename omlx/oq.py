@@ -198,10 +198,7 @@ def universal_quant_predicate(
             return bits(5)
 
     if "shared_expert" in path and not path.endswith("shared_expert_gate"):
-        if "gate_proj" in path or "up_proj" in path:
-            return bits(6)
-        if "down_proj" in path:
-            return bits(5)
+        return bits(8)
 
     if num_experts >= 512 and hidden_size >= 4096:
         if "gate_proj" in path and "shared_expert" not in path:
