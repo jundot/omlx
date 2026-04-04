@@ -237,6 +237,16 @@ class VLMBatchedEngine(BaseEngine):
         return None
 
     @property
+    def message_extractor(self):
+        """Return the model-specific message extractor function, or ``None``."""
+        try:
+            from ..adapter.output_parser import detect_message_extractor
+            model_config = {"model_type": self.model_type} if self.model_type else None
+            return detect_message_extractor(self._model_name, model_config)
+        except Exception:
+            return None
+
+    @property
     def is_ocr_model(self) -> bool:
         return (self.model_type or "") in OCR_MODEL_TYPES
 
@@ -426,37 +436,53 @@ class VLMBatchedEngine(BaseEngine):
         logger.info("VLMBatchedEngine stopped")
 
     def _inject_tool_calling(self, tokenizer) -> None:
-        """Inject mlx-lm's tool calling attributes into VLM tokenizer.
+        """Inject tool calling attributes into VLM tokenizer.
 
         mlx-vlm's TokenizerWrapper lacks tool calling support (has_tool_calling,
-        tool_parser, etc). We reuse mlx-lm's _infer_tool_parser() to detect the
-        parser type from the chat template, then set the attributes directly on
-        the wrapper instance so parse_tool_calls() can use native tool parsing.
+        tool_parser, etc). We prefer mlx_vlm.tool_parsers which is a superset of
+        mlx_lm's — it recognises additional markers such as Gemma4's <|tool_call>
+        and loads the correct per-model parser.  Falls back to mlx_lm if the
+        mlx_vlm.tool_parsers package is not present.
         """
-        try:
-            from mlx_lm.tokenizer_utils import _infer_tool_parser
-        except ImportError:
-            return
-
         chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
             return
 
-        tool_parser_type = _infer_tool_parser(chat_template)
-        if tool_parser_type is None:
-            return
-
+        # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
         try:
-            import importlib
+            from mlx_vlm.tool_parsers import (
+                _infer_tool_parser,
+                load_tool_module,
+            )
 
-            tool_module = importlib.import_module(
-                f"mlx_lm.tool_parsers.{tool_parser_type}"
-            )
+            tool_parser_type = _infer_tool_parser(chat_template)
+            if tool_parser_type is None:
+                return
+            try:
+                tool_module = load_tool_module(tool_parser_type)
+            except ImportError:
+                logger.warning(f"VLM tool parser module not found: {tool_parser_type}")
+                return
         except ImportError:
-            logger.warning(
-                f"VLM tool parser module not found: {tool_parser_type}"
-            )
-            return
+            # Fallback: mlx_lm only (no Gemma4 support)
+            try:
+                import importlib
+
+                from mlx_lm.tokenizer_utils import (
+                    _infer_tool_parser as _mlx_lm_infer,
+                )
+            except ImportError:
+                return
+            tool_parser_type = _mlx_lm_infer(chat_template)
+            if tool_parser_type is None:
+                return
+            try:
+                tool_module = importlib.import_module(
+                    f"mlx_lm.tool_parsers.{tool_parser_type}"
+                )
+            except ImportError:
+                logger.warning(f"VLM tool parser module not found: {tool_parser_type}")
+                return
 
         tool_call_start = tool_module.tool_call_start
         tool_call_end = tool_module.tool_call_end

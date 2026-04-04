@@ -105,14 +105,14 @@ def _extract_text_from_content_list(content: list) -> str:
             item = item.model_dump()
         elif hasattr(item, "dict"):
             item = item.dict()
-        
+
         if isinstance(item, dict):
             if item.get("type") == "text":
                 text_parts.append(item.get("text", ""))
         elif isinstance(item, str):
             # Direct string in content list
             text_parts.append(item)
-    
+
     return "\n".join(text_parts) if text_parts else ""
 
 
@@ -180,6 +180,9 @@ def _drop_void_assistant_messages(messages: list[dict]) -> list[dict]:
     assistant message has empty content and no tool_calls.  These void messages
     carry no information and can appear when a client echoes back a response
     that had only tool calls which were not preserved in its history.
+
+    Messages with ``tool_responses`` (Gemma 4 format) are never dropped even
+    when content is empty — they carry tool result data.
     """
     return [
         msg
@@ -188,6 +191,7 @@ def _drop_void_assistant_messages(messages: list[dict]) -> list[dict]:
             msg.get("role") == "assistant"
             and not msg.get("content")
             and not msg.get("tool_calls")
+            and not msg.get("tool_responses")
         )
     ]
 
@@ -776,7 +780,9 @@ def extract_harmony_messages(
             processed_messages.append({"role": role, "content": content})
         elif isinstance(content, list):
             # Extract text parts from content array
-            processed_messages.append({"role": role, "content": _extract_text_from_content_list(content)})
+            processed_messages.append(
+                {"role": role, "content": _extract_text_from_content_list(content)}
+            )
         else:
             processed_messages.append({"role": role, "content": str(content)})
 
