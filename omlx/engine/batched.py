@@ -106,6 +106,26 @@ class BatchedEngine(BaseEngine):
         return None
 
     @property
+    def message_extractor(self):
+        """Return the model-specific message extractor function, or ``None``.
+
+        ``None`` means the server should use its default extractor
+        (``extract_text_content`` or ``extract_multimodal_content``).
+        """
+        try:
+            from ..adapter.output_parser import detect_message_extractor
+            model_config = None
+            if self._model is not None and hasattr(self._model, "config"):
+                cfg = self._model.config
+                if hasattr(cfg, "model_type"):
+                    model_config = {"model_type": cfg.model_type}
+                elif isinstance(cfg, dict):
+                    model_config = cfg
+            return detect_message_extractor(self._model_name, model_config)
+        except Exception:
+            return None
+
+    @property
     def grammar_compiler(self):
         """Lazily create and return a GrammarCompiler for this model.
 

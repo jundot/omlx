@@ -104,6 +104,29 @@ def is_harmony_model(model_name: str, config: dict[str, Any] | None = None) -> b
     return False
 
 
+def is_gemma4_model(model_name: str, config: dict[str, Any] | None = None) -> bool:
+    """
+    Check if the model is a Gemma 4 model.
+
+    Detection priority:
+    1. model_type == "gemma4" in config.json
+    2. Fallback: model_name contains "gemma-4" or "gemma4" (case-insensitive)
+    """
+    if config is not None:
+        model_type = config.get("model_type", "")
+        if model_type == "gemma4":
+            logger.debug(f"Gemma 4 model detected via config.model_type: {model_name}")
+            return True
+
+    if model_name:
+        name_lower = model_name.lower()
+        if "gemma-4" in name_lower or "gemma4" in name_lower:
+            logger.debug(f"Gemma 4 model detected via model name pattern: {model_name}")
+            return True
+
+    return False
+
+
 def is_qwen3_model(model_name: str) -> bool:
     """
     Check if the model is a Qwen3 model.

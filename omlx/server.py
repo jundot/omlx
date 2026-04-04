@@ -150,7 +150,7 @@ from .api.tool_calling import (
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
-from .api.utils import clean_output_text, clean_special_tokens, extract_harmony_messages, extract_multimodal_content, extract_text_content
+from .api.utils import clean_output_text, clean_special_tokens, extract_multimodal_content, extract_text_content
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -1857,10 +1857,9 @@ async def create_chat_completion(
 
     # Extract messages - different engines need different content handling
     is_vlm = isinstance(engine, VLMBatchedEngine)
-    if engine.model_type == "gpt_oss":
-        messages = extract_harmony_messages(
-            request.messages, max_tool_result_tokens, engine.tokenizer
-        )
+    extractor = getattr(engine, "message_extractor", None)
+    if extractor is not None:
+        messages = extractor(request.messages, max_tool_result_tokens, engine.tokenizer)
     elif is_vlm:
         # VLM: preserve image_url content parts for vision processing
         messages = extract_multimodal_content(

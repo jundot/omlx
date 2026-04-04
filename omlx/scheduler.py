@@ -84,17 +84,16 @@ try:
 except ImportError:
     NaiveStreamingDetokenizer = None
 
-# Import Harmony adapter for gpt-oss models
+# Import protocol-specific output parser support
 try:
-    from .adapter.harmony import HarmonyStreamingParser, parse_tool_calls_from_tokens
-    from .utils.tokenizer import is_harmony_model
+    from .adapter.output_parser import OutputParserFactory, OutputParserSession, detect_output_parser
 
-    HAS_HARMONY_ADAPTER = True
+    HAS_OUTPUT_PARSER = True
 except ImportError:
-    HarmonyStreamingParser = None
-    parse_tool_calls_from_tokens = None
-    is_harmony_model = None
-    HAS_HARMONY_ADAPTER = False
+    OutputParserFactory = None
+    OutputParserSession = None
+    detect_output_parser = None
+    HAS_OUTPUT_PARSER = False
 
 logger = logging.getLogger(__name__)
 
@@ -1331,13 +1330,12 @@ class Scheduler:
         # NOTE: No pooling - each request gets a fresh instance to prevent state contamination
         self._request_detokenizers: Dict[str, Any] = {}  # request_id → active detokenizer
 
-        # Harmony model support (gpt-oss)
-        self._harmony_parser: Optional["HarmonyStreamingParser"] = None
+        # Protocol-specific output parser support (e.g. Harmony, Gemma 4)
+        self._output_parser_factory: Optional["OutputParserFactory"] = None
+        self._output_parser_kind: Optional[str] = None
+        self._output_parser_sessions: Dict[str, "OutputParserSession"] = {}
         self._is_harmony_model: bool = False
-        self._harmony_parsers: Dict[str, "HarmonyStreamingParser"] = {}  # Per-request parsers
-        self._harmony_stop_tokens: Optional[Set[int]] = None  # Cached stop tokens
-        if HAS_HARMONY_ADAPTER and is_harmony_model is not None:
-            # Check if model uses Harmony format
+        if HAS_OUTPUT_PARSER and detect_output_parser is not None:
             try:
                 model_config = None
                 if hasattr(model, 'config'):
@@ -1363,18 +1361,24 @@ class Scheduler:
                     except Exception as e:
                         logger.debug(f"Failed to extract model.args: {e}")
 
-                if is_harmony_model(self.config.model_name, model_config):
-                    self._is_harmony_model = True
-                    # Cache Harmony stop tokens to avoid creating temporary parsers
-                    temp_parser = HarmonyStreamingParser(self.tokenizer)
-                    self._harmony_stop_tokens = temp_parser.get_stop_token_ids()
+                self._output_parser_factory = detect_output_parser(
+                    self.config.model_name,
+                    self.tokenizer,
+                    model_config,
+                )
+                if self._output_parser_factory is not None:
+                    self._output_parser_kind = self._output_parser_factory.kind
+                    self._is_harmony_model = self._output_parser_kind == "harmony"
                     logger.info(
-                        f"Harmony model detected: {self.config.model_name}, "
-                        f"stop_tokens={self._harmony_stop_tokens}, "
-                        "streaming parser will be used for each request"
+                        "Output parser detected: %s for %s, stop_tokens=%s",
+                        self._output_parser_kind,
+                        self.config.model_name,
+                        sorted(self._output_parser_factory.stop_token_ids),
                     )
             except Exception as e:
-                logger.warning(f"Error detecting Harmony model: {e}, assuming non-Harmony")
+                logger.warning(f"Error detecting output parser: {e}, assuming none")
+                self._output_parser_factory = None
+                self._output_parser_kind = None
                 self._is_harmony_model = False
 
         # Statistics
@@ -1654,9 +1658,9 @@ class Scheduler:
         if self._generation_config_eos is not None:
             stop_tokens.update(self._generation_config_eos)
 
-        # Add Harmony stop tokens for gpt-oss models (use cached tokens)
-        if self._is_harmony_model and self._harmony_stop_tokens:
-            stop_tokens.update(self._harmony_stop_tokens)
+        # Add protocol-specific stop tokens (e.g. Harmony action stops)
+        if self._output_parser_factory is not None:
+            stop_tokens.update(self._output_parser_factory.stop_token_ids)
 
         return stop_tokens
 
@@ -1714,52 +1718,22 @@ class Scheduler:
         detok = self._request_detokenizers.pop(request_id, None)
         # Let GC collect - no pooling to prevent state contamination
 
-    def _get_harmony_parser(self, request_id: str) -> Optional["HarmonyStreamingParser"]:
-        """Get or create a Harmony parser for a request.
-
-        Each request gets its own parser instance to maintain independent state.
-        """
-        if not self._is_harmony_model or not HAS_HARMONY_ADAPTER:
+    def _get_output_parser_session(
+        self, request_id: str
+    ) -> Optional["OutputParserSession"]:
+        """Get or create a protocol-specific output parser session."""
+        if self._output_parser_factory is None:
             return None
 
-        if request_id not in self._harmony_parsers:
-            self._harmony_parsers[request_id] = HarmonyStreamingParser(self.tokenizer)
-        return self._harmony_parsers[request_id]
+        if request_id not in self._output_parser_sessions:
+            self._output_parser_sessions[request_id] = (
+                self._output_parser_factory.create_session(self.tokenizer)
+            )
+        return self._output_parser_sessions[request_id]
 
-    def _get_harmony_detokenizer(self, request_id: str) -> Any:
-        """Get or create a streaming detokenizer for Harmony.
-
-        Uses a single detokenizer per request since we process tokens sequentially.
-        For final channel where stream_token == visible_token, we decode once
-        and reuse the result.
-
-        This ensures proper UTF-8 handling for multi-byte characters.
-        """
-        key = f"{request_id}_harmony"
-
-        if key not in self._request_detokenizers:
-            if NaiveStreamingDetokenizer is not None:
-                detok = NaiveStreamingDetokenizer(self.tokenizer)
-            elif hasattr(self.tokenizer, 'detokenizer'):
-                detok = self.tokenizer.detokenizer
-            else:
-                return None
-
-            detok.reset()
-            self._request_detokenizers[key] = detok
-
-        return self._request_detokenizers.get(key)
-
-    def _cleanup_harmony_parser(self, request_id: str):
-        """Clean up Harmony parser and detokenizer for a finished request."""
-        parser = self._harmony_parsers.pop(request_id, None)
-        if parser is not None:
-            try:
-                # Ensure parser is finalized before cleanup
-                parser.finalize()
-            except Exception as e:
-                logger.debug(f"Error finalizing Harmony parser for {request_id}: {e}")
-        self._request_detokenizers.pop(f"{request_id}_harmony", None)
+    def _cleanup_output_parser_session(self, request_id: str):
+        """Remove any per-request protocol parser session."""
+        self._output_parser_sessions.pop(request_id, None)
 
     def _get_xtc_special_tokens(self) -> list[int]:
         """Get special tokens to exclude from XTC sampling (newline + EOS).
@@ -3201,8 +3175,8 @@ class Scheduler:
         # Clean up streaming detokenizer to prevent state contamination
         self._cleanup_detokenizer(request_id)
 
-        # Clean up Harmony parser
-        self._cleanup_harmony_parser(request_id)
+        # Clean up protocol-specific output parser session
+        self._cleanup_output_parser_session(request_id)
 
         # Clean up VLM adapter state to prevent contamination
         if hasattr(self.model, 'clear_vlm_position_state'):
@@ -3691,57 +3665,30 @@ class Scheduler:
             # Only append token if not stopping due to EOS token
             new_text = ""
 
-            # Check if this request uses Harmony format
-            harmony_parser = self._get_harmony_parser(request_id)
+            # Check if this request uses a protocol-specific output parser
+            parser_session = self._get_output_parser_session(request_id)
 
-            if harmony_parser is not None:
-                # Harmony model: process token through parser
-                # Returns: (control_text, stream_token, visible_token, is_stop)
-                control_text, stream_token, visible_token, harmony_is_stop = (
-                    harmony_parser.process_token(response.token)
-                )
+            if parser_session is not None:
+                parser_result = parser_session.process_token(response.token)
+                new_text = parser_result.stream_text
+                if parser_result.visible_text:
+                    request.output_text += parser_result.visible_text
 
-                # Start with control text (e.g., <think>, </think>)
-                new_text = control_text
-
-                # Get Harmony detokenizer for proper UTF-8 handling
-                harmony_detok = self._get_harmony_detokenizer(request_id)
-
-                # Decode stream token if present
-                if stream_token is not None:
-                    if harmony_detok is not None:
-                        harmony_detok.add_token(stream_token)
-                        decoded_text = harmony_detok.last_segment
-                    else:
-                        # Fallback to single-token decode (may break UTF-8)
-                        decoded_text = self.tokenizer.decode([stream_token])
-
-                    new_text += decoded_text
-
-                    # For final channel, stream_token == visible_token
-                    # Reuse decoded text instead of decoding again
-                    if visible_token is not None:
-                        request.output_text += decoded_text
-                elif visible_token is not None:
-                    # This case shouldn't happen in current design but handle it
-                    if harmony_detok is not None:
-                        harmony_detok.add_token(visible_token)
-                        request.output_text += harmony_detok.last_segment
-                    else:
-                        request.output_text += self.tokenizer.decode([visible_token])
-
-                # Harmony stop token can override finish reason
-                if harmony_is_stop and not is_finished:
+                # Parser-defined stop token can override finish reason
+                if parser_result.is_stop and not is_finished:
                     is_finished = True
                     is_stop = True
 
-                # For Harmony, always track all tokens including stop tokens
-                # This is needed for tool call parsing (parse_tool_calls_from_tokens)
-                # which requires the complete token sequence including <|call|>/<|return|>
-                request.append_output_token(response.token)
+                should_record_token = (
+                    parser_result.record_token
+                    if parser_result.record_token is not None
+                    else not is_stop
+                )
+                if should_record_token:
+                    request.append_output_token(response.token)
 
             elif not is_stop:
-                # Non-Harmony: standard processing
+                # Standard processing without a protocol parser
                 request.append_output_token(response.token)
 
                 # Decode the new token using streaming detokenizer for proper UTF-8 handling
@@ -3754,8 +3701,8 @@ class Scheduler:
                     new_text = self.tokenizer.decode([response.token])
 
             # Prepend <think> tag for first chunk if this is a reasoning model
-            # (skip for Harmony models - parser handles <think> for analysis channel)
-            if harmony_parser is None and getattr(request, 'needs_think_prefix', False):
+            # (skip when a protocol parser already manages reasoning formatting)
+            if parser_session is None and getattr(request, 'needs_think_prefix', False):
                 if not getattr(request, 'think_prefix_sent', False):
                     think_tag = getattr(self.tokenizer, 'think_start', '<think>')
                     new_text = think_tag + "\n" + new_text
@@ -3795,43 +3742,19 @@ class Scheduler:
                 output.finish_reason = response.finish_reason
                 finished_ids.add(request_id)
 
-                if harmony_parser is not None:
-                    # Harmony: finalize parser and get any remaining stream output
-                    logger.info(
-                        f"Harmony finished: channel={harmony_parser.current_channel}, "
-                        f"output_text='{request.output_text[:100]}...'"
-                    )
-                    final_control = harmony_parser.finalize()
-                    if final_control:
-                        output.new_text += final_control
-
-                    # Finalize Harmony detokenizer to flush any remaining bytes
-                    harmony_detok = self._get_harmony_detokenizer(request_id)
-                    if harmony_detok is not None:
-                        harmony_detok.finalize()
-                        final_text = harmony_detok.last_segment
-                        if final_text:
-                            output.new_text += final_text
-                            # If we were in final channel, also add to output_text
-                            if harmony_parser.current_channel == "final":
-                                request.output_text += final_text
-
-                    # Extract tool calls using parse_tool_calls_from_tokens (non-streaming)
-                    if parse_tool_calls_from_tokens is not None:
-                        token_ids = list(request.output_token_ids)
-                        logger.info(
-                            f"Harmony parse_tool_calls_from_tokens: {len(token_ids)} tokens"
-                        )
-                        _, tool_calls = parse_tool_calls_from_tokens(token_ids)
-                        logger.info(f"Harmony tool_calls extracted: {tool_calls}")
-                        if tool_calls:
-                            output.tool_calls = tool_calls
-                            output.finish_reason = "tool_calls"
-
-                    # For Harmony, output_text is already accumulated (final channel only)
+                if parser_session is not None:
+                    final_result = parser_session.finalize()
+                    if final_result.stream_text:
+                        output.new_text += final_result.stream_text
+                    if final_result.visible_text:
+                        request.output_text += final_result.visible_text
+                    if final_result.tool_calls:
+                        output.tool_calls = final_result.tool_calls
+                    if final_result.finish_reason:
+                        output.finish_reason = final_result.finish_reason
                     output.output_text = request.output_text
                 else:
-                    # Non-Harmony: standard finalization
+                    # Standard finalization without a protocol parser
                     # Finalize detokenizer to flush any remaining bytes
                     detokenizer = self._get_detokenizer(request_id)
                     if detokenizer is not None:
@@ -4044,8 +3967,8 @@ class Scheduler:
             # Clean up streaming detokenizer
             self._cleanup_detokenizer(request_id)
 
-            # Clean up Harmony parser
-            self._cleanup_harmony_parser(request_id)
+            # Clean up protocol-specific output parser session
+            self._cleanup_output_parser_session(request_id)
 
             # Clean up VLM adapter state (position_ids, rope_deltas, pending embeddings)
             if hasattr(self.model, 'clear_vlm_position_state'):
@@ -4120,8 +4043,8 @@ class Scheduler:
         # Clear detokenizer state to prevent contamination after recovery
         self._request_detokenizers.clear()
 
-        # Clear Harmony parsers
-        self._harmony_parsers.clear()
+        # Clear protocol-specific output parser sessions
+        self._output_parser_sessions.clear()
 
         logger.info("Cache recovery completed")
 
@@ -4370,8 +4293,8 @@ class Scheduler:
         # Clear detokenizers
         self._request_detokenizers.clear()
 
-        # Clear Harmony parsers
-        self._harmony_parsers.clear()
+        # Clear protocol-specific output parser sessions
+        self._output_parser_sessions.clear()
 
         # Cancel any pending deferred Metal cache clear
         self._deferred_clear_steps = None
