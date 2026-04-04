@@ -183,7 +183,7 @@
         background: var(--bg-secondary);
         border: 1px solid var(--border-faint);
         border-radius: 0.75rem;
-        margin: 0.5em 0;
+        margin: 0.5em 0.75rem;
         overflow: hidden;
     }
     .thinking-header {
@@ -600,7 +600,7 @@
                             </div>
                             <!-- Thinking bubble (collapsed by default) -->
                             <template x-if="msg._thinking">
-                                <div class="thinking-container mx-3 mt-2">
+                                <div class="thinking-container mt-2">
                                     <div class="thinking-header" @click="msg._thinkingOpen = !msg._thinkingOpen">
                                         <svg class="thinking-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
                                         <span class="thinking-text">Thinking</span>
