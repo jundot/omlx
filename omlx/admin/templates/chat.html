@@ -560,7 +560,7 @@
                         </div>
 
                         <!-- Assistant Message -->
-                        <div x-show="msg.role === 'assistant'" class="assistant-message">
+                        <div x-show="msg.role === 'assistant' && msg._ui !== false" class="assistant-message">
                             <div class="message-header">
                                 <div class="flex items-center gap-2 text-sm font-medium" style="color: var(--text-primary);">
                                     <i data-lucide="cpu" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
@@ -887,7 +887,7 @@
             // VLM Detection State
             modelTypeMap: {},            // { modelId: "llm"|"vlm"|"embedding"|"reranker" }
 
-             // System Prompt
+            // System Prompt
             systemPrompt: localStorage.getItem('omlx_chat_system_prompt') || '',
             showSystemPromptModal: false,
             systemPromptDraft: '',
@@ -1212,7 +1212,7 @@
                         throw new Error('Failed to load models');
                     }
 
-                     const modelsData = await modelsResponse.json();
+                    const modelsData = await modelsResponse.json();
                     const allModels = modelsData.data || [];
 
                     // Fetch model types first (needed for filtering and VLM detection)
@@ -1401,7 +1401,7 @@
                         if (msg.tool_call_id) m.tool_call_id = msg.tool_call_id;
                         return m;
                     });
-                    // Prepend system prompt if set
+                // Prepend system prompt if set
                 if (this.systemPrompt.trim()) {
                     messagesForApi.unshift({
                         role: 'system',
@@ -1451,7 +1451,7 @@
                             if (line.trim() === '' || line.trim() === 'data: [DONE]') continue;
 
                             if (line.startsWith('data: ')) {
-                                 try {
+                                try {
                                     const data = JSON.parse(line.slice(6));
                                     const choice = data.choices?.[0];
                                     const delta = choice?.delta;
@@ -1650,10 +1650,10 @@
                     console.log('[streamResponse] catch error:', error.name, error.message);
                     if (error.name === 'AbortError') {
                         console.log('[streamResponse] AbortError caught - stream stopped by user');
-                        // Close unclosed thinking block
+                        // Reset thinking state (reasoning now lives in streamingThinking, not streamingContent)
                         if (this.thinkingState.isInThinking) {
-                            this.streamingContent += '</think>';
                             this.thinkingState.isInThinking = false;
+                            this.thinkingState.thinkingStartTime = null;
                         }
                         // Stream was stopped by user — push whatever was accumulated
                         if (this.streamingContent || this.streamingThinking) {
