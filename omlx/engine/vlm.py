@@ -358,8 +358,23 @@ class VLMBatchedEngine(BaseEngine):
         else:
             self._tokenizer = self._processor
 
+        # Load mlx-lm model for batched decode (mlx-vlm language models
+        # may not support batched decode correctly, e.g. gemma4).
+        # Both load from the same safetensors files so MLX shares memory.
+        self._lm_model = None
+        try:
+            from mlx_lm import load as mlx_lm_load
+
+            lm_model, _ = await loop.run_in_executor(
+                get_mlx_executor(), lambda: mlx_lm_load(self._model_name)
+            )
+            self._lm_model = lm_model
+            logger.info("Loaded mlx-lm decode model for VLM batching")
+        except Exception as e:
+            logger.debug("mlx-lm decode model not available: %s", e)
+
         # Create VLM model adapter wrapping language_model
-        self._adapter = VLMModelAdapter(self._vlm_model)
+        self._adapter = VLMModelAdapter(self._vlm_model, decode_model=self._lm_model)
 
         # Create scheduler config
         scheduler_config = (
