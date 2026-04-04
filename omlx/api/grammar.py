@@ -79,19 +79,45 @@ class GrammarConstraintProcessor:
     # Per-request mode (original interface)
     # ------------------------------------------------------------------
 
-    def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
+    def __call__(self, tokens, logits: mx.array) -> mx.array:
         if self._terminated:
             return logits
 
-        if self._first_call:
-            self._first_call = False
-        elif tokens.size > 0:
-            last_token = tokens[-1].item()
-            if not self._matcher.accept_token(last_token):
-                logger.warning("GrammarMatcher rejected token %d", last_token)
-            if self._matcher.is_terminated():
-                self._terminated = True
-                return logits
+        # In the new mlx-lm API, `tokens` is the full history
+        # (prompt + generated).  GenerationBatch._step() appends each
+        # input token to tokens[] at the END of _step(), so when the
+        # processor is called, tokens[-1] is the PREVIOUS step's input
+        # (not the current one being generated).
+        #
+        # Timeline:
+        #   _step() #0 (init): input=last_prompt_token → processor(tokens) → append(last_prompt_token)
+        #   _step() #1 (1st next): input=1st_gen_token → processor(tokens) → append(1st_gen_token)
+        #   _step() #2 (2nd next): input=2nd_gen_token → processor(tokens, has 1st_gen appended) → ...
+        #
+        # So at _step() #1, tokens[-1] = last_prompt_token (from _step() #0 append).
+        # We should NOT accept that. At _step() #2, tokens[-1] = 1st_gen_token → accept it.
+        # Solution: skip first TWO calls (baseline + first append of prompt token).
+        # In the new mlx-lm API, tokens is the full history list that grows
+        # by one element per _step() call.  We must accept each genuinely
+        # generated token exactly once.  The first element appended is the
+        # last prompt token (from init _step()), which we must NOT accept.
+        # After that, each new element is a generated token to accept.
+        n = len(tokens)
+        if not hasattr(self, "_accepted_up_to"):
+            # First call: tokens may be empty or contain prompt tokens.
+            # The next append will be the last prompt token — skip it.
+            # So we set _accepted_up_to = n + 1 (skip the next one).
+            self._accepted_up_to = n + 1
+        elif n > self._accepted_up_to:
+            # New token(s) appeared since last accept — accept them all.
+            for i in range(self._accepted_up_to, n):
+                tok = int(tokens[i])
+                if not self._matcher.accept_token(tok):
+                    logger.warning("GrammarMatcher rejected token %d", tok)
+                if self._matcher.is_terminated():
+                    self._terminated = True
+                    return logits
+            self._accepted_up_to = n
 
         self._bitmask.fill(-1)
         self._matcher.fill_next_token_bitmask(self._bitmask)
@@ -125,8 +151,8 @@ class GrammarConstraintProcessor:
 
         if self._first_call:
             self._first_call = False
-        elif tokens.size > 0:
-            last_token = tokens[-1].item()
+        elif len(tokens) > 0:
+            last_token = int(tokens[-1])
             if not self._matcher.accept_token(last_token):
                 logger.warning("GrammarMatcher rejected token %d", last_token)
             if self._matcher.is_terminated():

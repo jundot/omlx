@@ -36,8 +36,8 @@ pytestmark = [
 
 MODELS = {
     "kvcache": {
-        "path": "/Users/cryingneko/Workspace/models/MiniMax-M2.5-oQ3e",
-        "desc": "KVCache only (MiniMax-M2.5)",
+        "path": "/Users/cryingneko/Workspace/models/Qwen3-4B-Instruct-2507-4bit",
+        "desc": "KVCache only (Qwen3-4B)",
         "expect_on_off_match": True,
     },
     "arrayscache_dense": {

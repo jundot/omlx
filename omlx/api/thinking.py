@@ -257,12 +257,15 @@ class ThinkingBudgetProcessor:
         if self._suppress_end:
             return self._suppress_end_tokens(logits, mx)
 
-        # Skip state update on first call (tokens contains prompt tokens only)
-        if self._first_call:
-            self._first_call = False
-        elif tokens.size > 0:
-            last_token = tokens[-1].item()
-            self._update_state(last_token)
+        # In new mlx-lm API, tokens is the full history list.
+        # Accept each genuinely generated token exactly once (see grammar.py).
+        n = len(tokens)
+        if not hasattr(self, "_accepted_up_to"):
+            self._accepted_up_to = n + 1  # skip first append (prompt token)
+        elif n > self._accepted_up_to:
+            for i in range(self._accepted_up_to, n):
+                self._update_state(int(tokens[i]))
+            self._accepted_up_to = n
 
         # If state changed by _update_state, handle immediately
         if self._done:

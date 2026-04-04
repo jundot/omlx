@@ -739,84 +739,20 @@ class TestApplyBatchedGrammar:
         comp = xgr.GrammarCompiler(ti)
         return comp, len(vocab)
 
-    @staticmethod
-    def _bind_bg_methods(bg):
-        """Bind batched grammar methods onto a MagicMock BatchGenerator."""
-        from omlx.scheduler import _BoundarySnapshotBatchGenerator as BG
-        bg._apply_batched_grammar = BG._apply_batched_grammar.__get__(bg)
-        bg._apply_logits_processors = BG._apply_logits_processors.__get__(bg)
-        bg._get_batch_grammar_matcher = BG._get_batch_grammar_matcher.__get__(bg)
-        bg._get_grammar_bitmask = BG._get_grammar_bitmask.__get__(bg)
-        bg._BATCH_GRAMMAR_THRESHOLD = BG._BATCH_GRAMMAR_THRESHOLD
-        return bg
-
+    @pytest.mark.skip(reason="Batched grammar optimization removed in mlx-lm BatchGenerator refactor. Grammar now runs via per-request logits_processors in GenerationBatch._step().")
     def test_batched_grammar_masks_logits(self, setup):
         """Batched grammar correctly masks logits for multiple requests."""
-        from omlx.api.grammar import GrammarConstraintProcessor
-        from omlx.scheduler import _BoundarySnapshotBatchGenerator
+        pass
 
-        comp, vs = setup
-
-        proc_a = GrammarConstraintProcessor(comp.compile_grammar('root ::= "a"'), vs)
-        proc_b = GrammarConstraintProcessor(comp.compile_grammar('root ::= "b"'), vs)
-
-        bg = self._bind_bg_methods(MagicMock(spec=_BoundarySnapshotBatchGenerator))
-
-        logits = mx.zeros((2, vs))
-        tokens = [mx.array([]), mx.array([])]
-        grammar_procs = [(0, proc_a), (1, proc_b)]
-
-        result = bg._apply_batched_grammar(logits, grammar_procs, tokens, 2)
-        result_np = np.array(result)
-
-        assert result_np[0, ord("a")] == 0.0, "'a' should be allowed for proc_a"
-        assert result_np[0, ord("b")] == -np.inf, "'b' should be masked for proc_a"
-        assert result_np[1, ord("b")] == 0.0, "'b' should be allowed for proc_b"
-        assert result_np[1, ord("a")] == -np.inf, "'a' should be masked for proc_b"
-
+    @pytest.mark.skip(reason="Batched grammar optimization removed in mlx-lm BatchGenerator refactor. Grammar now runs via per-request logits_processors in GenerationBatch._step().")
     def test_non_grammar_processors_still_run(self, setup):
         """ThinkingBudgetProcessor and other processors still run per-request."""
-        from omlx.api.grammar import GrammarConstraintProcessor
-        from omlx.scheduler import _BoundarySnapshotBatchGenerator
+        pass
 
-        comp, vs = setup
-        proc_g = GrammarConstraintProcessor(comp.compile_grammar('root ::= "a"'), vs)
-
-        call_count = 0
-        def mock_other_proc(tokens, logits):
-            nonlocal call_count
-            call_count += 1
-            return logits
-
-        bg = self._bind_bg_methods(MagicMock(spec=_BoundarySnapshotBatchGenerator))
-
-        logits = mx.zeros((1, vs))
-        tokens = [mx.array([])]
-        logits_processors = [[proc_g, mock_other_proc]]
-
-        result = bg._apply_logits_processors(logits, logits_processors, tokens, 1)
-        assert call_count == 1, "Non-grammar processor should have been called"
-
+    @pytest.mark.skip(reason="Batched grammar optimization removed in mlx-lm BatchGenerator refactor. Grammar now runs via per-request logits_processors in GenerationBatch._step().")
     def test_terminated_processors_skipped(self, setup):
         """Terminated grammar processors don't participate in batch fill."""
-        from omlx.api.grammar import GrammarConstraintProcessor
-        from omlx.scheduler import _BoundarySnapshotBatchGenerator
-
-        comp, vs = setup
-        proc = GrammarConstraintProcessor(comp.compile_grammar('root ::= "a"'), vs)
-        proc._terminated = True
-
-        bg = self._bind_bg_methods(MagicMock(spec=_BoundarySnapshotBatchGenerator))
-
-        logits = mx.ones((1, vs))
-        tokens = [mx.array([])]
-        grammar_procs = [(0, proc)]
-
-        result = bg._apply_batched_grammar(logits, grammar_procs, tokens, 1)
-        np.testing.assert_array_equal(
-            np.array(result), np.array(logits),
-            err_msg="Terminated processor should pass logits through",
-        )
+        pass
 
 
 # =========================================================================
