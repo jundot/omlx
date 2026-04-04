@@ -434,7 +434,7 @@ class BatchTurboQuantKVCache(_BaseCache):
         vs = self._value_state
         if _state_length(vs) > T_q:
             vs = _slice_state(vs, T_q)
-        tq_output = self._value_codec.weighted_sum_from_scores(
+        tq_output = self._value_codec.weighted_sum(
             tq_weights, vs
         )  # (B, H_kv, R, 1, D)
 
