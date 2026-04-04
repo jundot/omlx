@@ -935,7 +935,7 @@ def _build_model_sanitizer(config: dict):
 
             def _vlm_sanitize(weights):
                 class _Proxy:
-                    pass
+                    audio_tower = None
                 proxy = _Proxy()
                 proxy.config = model_config
                 w = model_module.Model.sanitize(proxy, weights)
