@@ -33,6 +33,7 @@ import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..models.vlm import VLMModelAdapter
 from ..utils.image import (
     compute_image_hash,
@@ -176,6 +177,12 @@ SINGLE_IMAGE_ONLY_MODELS = {
     "mllama",
 }
 
+# Qwen-style VLMs: vision_tower takes (pixel_values, grid_thw)
+_QWEN_VISION_MODELS = {
+    "qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe",
+    "qwen2_vl", "qwen2_5_vl",
+}
+
 
 class VLMBatchedEngine(BaseEngine):
     """
@@ -210,6 +217,8 @@ class VLMBatchedEngine(BaseEngine):
         self._loaded = False
         self._grammar_compiler = None
         self._grammar_compiler_init_attempted = False
+        self._vision_cache = None
+        self._vision_cache_enabled = True
 
     @property
     def model_name(self) -> str:
@@ -319,6 +328,20 @@ class VLMBatchedEngine(BaseEngine):
             get_mlx_executor(), _load_vlm_sync
         )
 
+        # Initialize vision feature cache
+        vision_ssd_dir = None
+        if self._scheduler_config and getattr(
+            self._scheduler_config, "paged_ssd_cache_dir", None
+        ):
+            from pathlib import Path as _Path
+
+            vision_ssd_dir = _Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
+        self._vision_cache = VisionFeatureSSDCache(
+            cache_dir=vision_ssd_dir,
+            max_memory_entries=20,
+        )
+        logger.info("Vision feature cache enabled (SSD: %s)", vision_ssd_dir or "disabled")
+
         # Extract tokenizer from processor
         if hasattr(self._processor, "tokenizer"):
             self._tokenizer = self._processor.tokenizer
@@ -391,6 +414,9 @@ class VLMBatchedEngine(BaseEngine):
         if self._engine:
             await self._engine.stop()
             self._engine.engine.close()
+        if self._vision_cache is not None:
+            self._vision_cache.close()
+            self._vision_cache = None
         self._engine = None
         self._vlm_model = None
         self._processor = None
@@ -528,6 +554,69 @@ class VLMBatchedEngine(BaseEngine):
 
         return formatted_messages
 
+    def _compute_vision_features(
+        self, pixel_values: Any, extra_model_inputs: dict
+    ) -> Optional[mx.array]:
+        """Compute vision features for caching.
+
+        Tries multiple strategies based on model architecture:
+        1. model.encode_image() — upstream mlx-vlm API (e.g. gemma4)
+        2. Direct vision_tower call for qwen-style models
+        3. Direct vision_tower + projector for llava-style models
+        4. Returns None for unsupported models
+
+        Args:
+            pixel_values: Preprocessed image tensors from prepare_inputs().
+            extra_model_inputs: Additional model-specific inputs (e.g. image_grid_thw).
+
+        Returns:
+            Computed vision features (mx.array), or None if unsupported.
+        """
+        model = self._vlm_model
+        model_type = self.model_type or ""
+
+        # Strategy 1: upstream encode_image (gemma4 and future models)
+        if hasattr(model, "encode_image"):
+            return model.encode_image(pixel_values)
+
+        # Strategy 2: qwen-style (vision_tower + grid_thw)
+        if model_type in _QWEN_VISION_MODELS:
+            grid_thw = extra_model_inputs.get("image_grid_thw")
+            if grid_thw is None:
+                grid_thw = extra_model_inputs.get("video_grid_thw")
+            if grid_thw is None:
+                return None
+            dtype = model.vision_tower.patch_embed.proj.weight.dtype
+            pv = mx.array(pixel_values) if not isinstance(pixel_values, mx.array) else pixel_values
+            pv = pv.astype(dtype)
+            result = model.vision_tower(pv, grid_thw)
+            # qwen3_5 returns (hidden_states, _), qwen2_vl returns hidden_states
+            if isinstance(result, tuple):
+                return result[0]
+            return result
+
+        # Strategy 3: llava-style (vision_tower → layer select → projector)
+        if model_type == "llava":
+            pv = pixel_values
+            if not isinstance(pv, mx.array):
+                pv = mx.array(pv)
+            *_, hidden_states = model.vision_tower(
+                pv.transpose(0, 2, 3, 1), output_hidden_states=True
+            )
+            selected = hidden_states[model.vision_feature_layer]
+            if isinstance(model.vision_feature_layer, int):
+                if getattr(model, "vision_feature_select_strategy", "default") == "default":
+                    selected = selected[:, 1:]
+            else:
+                hs_pool = [hidden_states[idx] for idx in model.vision_feature_layer]
+                if getattr(model, "vision_feature_select_strategy", "default") == "default":
+                    hs_pool = [hs[:, 1:] for hs in hs_pool]
+                selected = mx.concatenate(hs_pool, axis=-1)
+            return model.multi_modal_projector(selected)
+
+        # Unsupported model: skip caching
+        return None
+
     def _prepare_vision_inputs(
         self,
         messages: list[dict[str, Any]],
@@ -661,12 +750,61 @@ class VLMBatchedEngine(BaseEngine):
         }
 
         if pixel_values is not None and num_images > 0:
+            # Compute image hash FIRST for vision feature cache lookup
+            image_hash = compute_image_hash(images)
+
+            # Build call kwargs from extra_model_inputs
+            call_kwargs = dict(extra_model_inputs)
+
+            # Try vision feature cache
+            if self._vision_cache is not None and self._vision_cache_enabled and image_hash:
+                cached_features = self._vision_cache.get(image_hash, self._model_name)
+                if cached_features is not None:
+                    call_kwargs["cached_image_features"] = cached_features
+                    logger.debug("Vision feature cache hit: %s", image_hash[:16])
+                else:
+                    try:
+                        features = self._compute_vision_features(
+                            pixel_values, extra_model_inputs
+                        )
+                        if features is not None:
+                            mx.eval(features)
+                            self._vision_cache.put(
+                                image_hash, self._model_name, features
+                            )
+                            call_kwargs["cached_image_features"] = features
+                            logger.debug(
+                                "Vision feature cache miss, stored: %s",
+                                image_hash[:16],
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Vision feature computation failed, using full pipeline",
+                            exc_info=True,
+                        )
+
             # Run vision encoder + embedding merge.
             # Pass attention_mask as 'mask' — mlx-vlm models (e.g. Gemma 3)
             # expect it as a positional/keyword arg named 'mask'.
-            embed_features = self._vlm_model.get_input_embeddings(
-                input_ids, pixel_values, mask=attention_mask, **extra_model_inputs
-            )
+            try:
+                embed_features = self._vlm_model.get_input_embeddings(
+                    input_ids, pixel_values, mask=attention_mask, **call_kwargs
+                )
+            except TypeError:
+                # cached_image_features kwarg not supported — disable and retry
+                if "cached_image_features" in call_kwargs:
+                    logger.warning(
+                        "cached_image_features not supported by %s, "
+                        "disabling vision feature cache",
+                        self.model_type,
+                    )
+                    self._vision_cache_enabled = False
+                    call_kwargs.pop("cached_image_features")
+                    embed_features = self._vlm_model.get_input_embeddings(
+                        input_ids, pixel_values, mask=attention_mask, **call_kwargs
+                    )
+                else:
+                    raise
             mx.eval(embed_features.inputs_embeds)
 
             # Convert InputEmbeddingsFeatures to dict for extra kwargs
@@ -679,9 +817,6 @@ class VLMBatchedEngine(BaseEngine):
 
             # Extract token IDs as list
             token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
-
-            # Compute image hash for prefix cache
-            image_hash = compute_image_hash(images)
 
             return token_ids, embed_features.inputs_embeds, extra_kwargs, image_hash
         else:

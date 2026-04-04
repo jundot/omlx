@@ -45,6 +45,12 @@ from .paged_ssd_cache import (
     parse_size,
 )
 
+# Vision feature cache
+from .vision_feature_cache import (
+    VisionFeatureSSDCache,
+    VisionFeatureSSDEntry,
+)
+
 # Managers
 from .tiered_manager import TieredCacheManager
 from .recovery import CacheRecoveryManager
@@ -99,6 +105,9 @@ __all__ = [
     "PagedSSDBlockMetadata",
     "PagedSSDCacheIndex",
     "parse_size",
+    # Vision feature cache
+    "VisionFeatureSSDCache",
+    "VisionFeatureSSDEntry",
     # Managers
     "TieredCacheManager",
     "CacheRecoveryManager",
