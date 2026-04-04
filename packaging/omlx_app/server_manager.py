@@ -105,7 +105,9 @@ class ServerManager:
 
     def check_health(self) -> bool:
         try:
-            response = requests.get(self._get_health_url(), timeout=2)
+            session = requests.Session()
+            session.trust_env = False
+            response = session.get(self._get_health_url(), timeout=2)
             return response.status_code == 200
         except requests.RequestException:
             return False
@@ -232,7 +234,9 @@ class ServerManager:
     def _is_omlx_server(self) -> bool:
         """Check if the process on the port is an oMLX server."""
         try:
-            resp = requests.get(self._get_health_url(), timeout=2)
+            session = requests.Session()
+            session.trust_env = False
+            resp = session.get(self._get_health_url(), timeout=2)
             return resp.status_code == 200
         except requests.RequestException:
             return False
