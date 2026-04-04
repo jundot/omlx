@@ -199,21 +199,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             args[0], offset=self.offset, left_padding=self.left_padding, **kwargs
         )
 
-    # ---- prefill attention (chunked prefill fallback) ----------------------
-
-    def prefill_attention(self, queries, keys_state=None, values_state=None,
-                          scale=1.0, mask=None) -> Optional[mx.array]:
-        return None
-
-    # ---- dequantize (prefill SDPA fallback) --------------------------------
-
-    def dequantize(self, keys_state=None, values_state=None):
-        ks, vs = self.state
-        if ks is None:
-            return None, None
-        keys = self.key_codec.dequantize(ks).astype(mx.float32)
-        values = self.value_codec.dequantize(vs).astype(mx.float32)
-        return keys, values
+    # prefill_attention and dequantize inherited from TurboQuantKVCache
 
     # ---- batch operations --------------------------------------------------
 
