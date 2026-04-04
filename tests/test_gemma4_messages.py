@@ -139,3 +139,32 @@ class TestExtractGemma4Messages:
         messages = [Message(role="developer", content="Be concise.")]
         result = extract_gemma4_messages(messages)
         assert result[0]["role"] == "system"
+
+    def test_image_url_preserved_in_user_message(self):
+        """User messages with image_url parts keep them for VLM processing."""
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                ],
+            ),
+        ]
+        result = extract_gemma4_messages(messages)
+        assert isinstance(result[0]["content"], list)
+        types = [p["type"] for p in result[0]["content"]]
+        assert "image_url" in types
+        assert "text" in types
+
+    def test_text_only_content_list_flattened(self):
+        """User messages with text-only content list are flattened to string."""
+        messages = [
+            Message(
+                role="user",
+                content=[{"type": "text", "text": "hello world"}],
+            ),
+        ]
+        result = extract_gemma4_messages(messages)
+        assert isinstance(result[0]["content"], str)
+        assert result[0]["content"] == "hello world"

@@ -216,9 +216,17 @@ def extract_gemma4_messages(
             continue
 
         # All other roles (user, system)
+        # Preserve image_url parts for VLM processing
         content = msg.get("content", "")
         if isinstance(content, list):
-            content = _extract_text_from_content_list(content)
+            from ..api.utils import _extract_multimodal_content_list
+
+            multimodal_parts = _extract_multimodal_content_list(content)
+            has_images = any(p.get("type") == "image_url" for p in multimodal_parts)
+            if has_images:
+                content = multimodal_parts
+            else:
+                content = _extract_text_from_content_list(content)
         out: dict = {"role": role, "content": content if content is not None else ""}
         processed.append(out)
         i += 1
