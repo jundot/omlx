@@ -152,6 +152,31 @@ def test_batch_tq_merge_extract():
     assert e2.offset == 4
 
 
+def test_batch_tq_continuous_batching_extend():
+    """Regression test for #559: extend changes batch size, decode buffer must adapt."""
+    # Start with B=1
+    b1 = BatchTurboQuantKVCache([0], bits=4.0)
+    b1.update_and_fetch(mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32)))
+    # Decode with B=1
+    b1.update_and_fetch(mx.random.normal((1, 2, 1, 32)), mx.random.normal((1, 2, 1, 32)))
+    assert b1._decode_buf_k.shape[0] == 1
+
+    # Second batch B=1
+    b2 = BatchTurboQuantKVCache([0], bits=4.0)
+    b2.update_and_fetch(mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32)))
+    b2.update_and_fetch(mx.random.normal((1, 2, 1, 32)), mx.random.normal((1, 2, 1, 32)))
+
+    # Extend: B=1+1=2
+    b1.extend(b2)
+    assert b1._decode_buf_k is None  # buffer reset after extend
+
+    # Decode with B=2 — should NOT crash
+    dk = mx.random.normal((2, 2, 1, 32))
+    dv = mx.random.normal((2, 2, 1, 32))
+    b1.update_and_fetch(dk, dv)
+    assert b1._decode_buf_k.shape[0] == 2
+
+
 def test_batch_tq_filter():
     batch = BatchTurboQuantKVCache([0, 0, 0], bits=4.0)
     keys = mx.random.normal((3, 2, 8, 32))

@@ -335,7 +335,9 @@ class BatchTurboQuantKVCache(_BaseCache):
             return keys, values
         else:
             # Decode: buffer fp16, batch-quantize every N tokens
-            if self._decode_buf_k is None:
+            if self._decode_buf_k is None or self._decode_buf_k.shape[0] != B:
+                if self._decode_buf_k is not None:
+                    self._flush_decode_buffer()
                 N = self._BATCH_QUANTIZE_SIZE
                 self._decode_buf_k = mx.zeros((B, H, N, D), dtype=keys.dtype)
                 self._decode_buf_v = mx.zeros((B, H, N, D), dtype=values.dtype)
@@ -519,6 +521,9 @@ class BatchTurboQuantKVCache(_BaseCache):
     def extend(self, other: "BatchTurboQuantKVCache"):
         self._flush_decode_buffer()
         other._flush_decode_buffer()
+        # Reset decode buffers — batch size changes after extend
+        self._decode_buf_k = None
+        self._decode_buf_v = None
         max_idx = max(self._idx, other._idx)
 
         def _pad_and_trim(c):
