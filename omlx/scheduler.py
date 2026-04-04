@@ -109,6 +109,42 @@ class _PrefillAbortedError(Exception):
         )
 
 
+# ---------------------------------------------------------------------------
+# Monkey-patch GenerationBatch._step to call grammar accept_token() after
+# sampling.  In the pipelined _step(), logits processors fill the bitmask
+# (constrain NEXT token) but can't know which token was just sampled.
+# After _original_step returns, self._next_tokens holds the freshly sampled
+# tokens.  We eval them synchronously and accept in grammar processors.
+# ---------------------------------------------------------------------------
+_original_generation_batch_step = GenerationBatch._step
+
+def _patched_generation_batch_step(self):
+    result = _original_generation_batch_step(self)
+
+    # self._next_tokens contains the just-sampled tokens (async eval pending).
+    # We need to accept them NOW so the next __call__ fills the correct bitmask.
+    if any(self.logits_processors):
+        from .api.grammar import GrammarConstraintProcessor
+
+        has_grammar = any(
+            isinstance(p, GrammarConstraintProcessor)
+            for procs in self.logits_processors
+            for p in procs
+        )
+        if has_grammar:
+            # Force eval of the sampled tokens so we can read them.
+            mx.eval(self._next_tokens)
+            sampled = self._next_tokens.tolist()
+            for e in range(len(self.uids)):
+                for proc in self.logits_processors[e]:
+                    if isinstance(proc, GrammarConstraintProcessor):
+                        proc.accept_token(sampled[e])
+
+    return result
+
+GenerationBatch._step = _patched_generation_batch_step
+
+
 # Cache class names known to be sliceable (no boundary snapshots needed).
 _KNOWN_SLICEABLE_CACHE_TYPES = frozenset({
     "KVCache", "BatchKVCache", "QuantizedKVCache",
