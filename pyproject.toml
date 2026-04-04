@@ -125,7 +125,7 @@ include = ["omlx*"]
 # mlx-lm is pinned to a git commit; override transitive pins
 # (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
 override-dependencies = [
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@564281f",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@4469ad4",
 ]
 
 [tool.black]
