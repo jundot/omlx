@@ -18,6 +18,7 @@ Note: BatchGenerator is mocked; step() is too complex for unit tests.
 from collections import deque
 from unittest.mock import MagicMock, patch, PropertyMock
 
+import mlx.core as mx
 import pytest
 
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
@@ -434,10 +435,10 @@ class TestSchedulerAbortRequest:
 
         scheduler.batch_generator.remove.assert_called_once_with([uid])
 
-    def test_abort_running_request_skips_remove_when_uid_not_in_active_batch(
+    def test_abort_running_request_always_calls_remove(
         self, mock_model, mock_tokenizer
     ):
-        """Abort must not call remove() when UID is already absent."""
+        """Abort always calls remove() — BatchGenerator handles unknown UIDs."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
         request = Request(
@@ -456,12 +457,11 @@ class TestSchedulerAbortRequest:
         scheduler.uid_to_request_id[uid] = "req-run-missing"
 
         scheduler.batch_generator = MagicMock()
-        scheduler.batch_generator.active_batch = MagicMock(uids=[999])
 
         scheduler.abort_request("req-run-missing")
         scheduler._process_pending_aborts()
 
-        scheduler.batch_generator.remove.assert_not_called()
+        scheduler.batch_generator.remove.assert_called_once_with([uid])
 
     def test_abort_cleans_all_scheduler_state(self, mock_model, mock_tokenizer):
         """Abort must clean running, uid mappings, and requests dict.
@@ -537,11 +537,12 @@ class TestPrefillAbortInterrupt:
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         scheduler.batch_generator = MagicMock()
 
-        # Make batch_generator.next() raise _PrefillAbortedError
-        scheduler.batch_generator.next.side_effect = _PrefillAbortedError(
+        # Make next_generated() raise _PrefillAbortedError
+        # (simulates abort during external prefill in _schedule_waiting)
+        scheduler.batch_generator.next_generated.side_effect = _PrefillAbortedError(
             [0], 1024
         )
-        # Need running requests for next() to be called
+        # Need running requests for next_generated() to be called
         request = Request(
             request_id="req-prefill",
             prompt="Hello",
@@ -809,18 +810,15 @@ class TestSchedulerBoundarySnapshots:
         scheduler.block_aware_cache = MagicMock()
         scheduler._boundary_snapshot_required = True
 
-        mock_batch = MagicMock()
-        mock_batch.uids = [123]
-        # Create a non-sliceable batch cache layer (e.g. ArraysCache)
-        # so the snapshot capture extracts it instead of replacing with None.
+        # New API: _extract_boundary_snapshot uses batch_generator.extract_cache()
+        # which returns {uid: (cache_list, tokens_list)}.
         mock_layer_cache = MagicMock()
         type(mock_layer_cache).__name__ = "BatchArraysCache"
-        extracted_cache = MagicMock()
-        mock_layer_cache.extract.return_value = extracted_cache
-        mock_batch.cache = [mock_layer_cache]
 
         scheduler.batch_generator = MagicMock()
-        scheduler.batch_generator.active_batch = mock_batch
+        scheduler.batch_generator.extract_cache.return_value = {
+            123: ([mock_layer_cache], [10, 11, 12, 13])
+        }
 
         request = Request(
             request_id="req-boundary",
@@ -835,8 +833,8 @@ class TestSchedulerBoundarySnapshots:
 
         assert 4 in scheduler._boundary_cache_snapshots["req-boundary"]
         snapshot = scheduler._boundary_cache_snapshots["req-boundary"][4]
-        assert snapshot == [extracted_cache]
-        mock_layer_cache.extract.assert_called_once_with(0)
+        # Non-sliceable cache layer is kept as-is in the snapshot
+        assert snapshot == [mock_layer_cache]
 
     def test_cleanup_finished_skips_output_tokens_for_reasoning_model(
         self, mock_model, mock_tokenizer
@@ -1119,10 +1117,12 @@ class TestSchedulerRotatingBlockAlignment:
         with pytest.raises(ValueError):
             scheduler._align_block_size_with_rotating_window()
 
-    def test_cleanup_finished_skips_remove_when_uid_not_in_active_batch(
+    def test_cleanup_finished_always_calls_remove_for_mapped_uid(
         self, mock_model, mock_tokenizer
     ):
-        """_cleanup_finished should not call remove() for already-filtered UIDs."""
+        """_cleanup_finished should always call remove() for UIDs with mapping,
+        regardless of whether the UID is in the active batch.
+        The new _remove_uid_from_active_batch unconditionally calls remove()."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
         request = Request(
@@ -1145,7 +1145,7 @@ class TestSchedulerRotatingBlockAlignment:
 
         scheduler._cleanup_finished({"req-skip-remove"})
 
-        scheduler.batch_generator.remove.assert_not_called()
+        scheduler.batch_generator.remove.assert_called_once_with([uid])
 
     def test_cleanup_finished_removes_uid_from_active_batch(
         self, mock_model, mock_tokenizer
@@ -1554,24 +1554,35 @@ class TestVLMPositionStateClearing:
     """
 
     def _make_vlm_model(self):
-        """Create a mock model with clear_vlm_position_state."""
+        """Create a mock model with clear_vlm_position_state.
+
+        Includes make_cache (returning empty list) so that
+        _do_external_prefill can call make_prompt_cache(model)
+        without hitting AttributeError on model.layers.
+        """
         model = MagicMock(spec=[
             "__call__", "clear_vlm_position_state", "parameters",
+            "make_cache",
         ])
         model.clear_vlm_position_state = MagicMock()
+        model.make_cache.return_value = []
         return model
 
     def test_schedule_waiting_preserves_vlm_position_state(
         self, mock_tokenizer
     ):
-        """VLM request in _schedule_waiting should NOT clear position state."""
+        """VLM request in _schedule_waiting should NOT clear position state.
+
+        With external prefill, clear_vlm_position_state is called inside
+        _do_external_prefill only for text-only requests (vlm_embeds is None).
+        VLM requests pass vlm_embeds, so the clear is skipped.
+        """
         model = self._make_vlm_model()
         scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
 
         # Minimal batch generator mock
         mock_bg = MagicMock()
-        mock_bg.add = MagicMock(return_value=[42])
-        mock_bg._vlm_pending = {}
+        mock_bg.insert = MagicMock(return_value=[42])
         scheduler.batch_generator = mock_bg
 
         request = Request(
@@ -1581,7 +1592,8 @@ class TestVLMPositionStateClearing:
         )
         request.prompt_token_ids = [1, 2, 3, 4, 5]
         request.num_prompt_tokens = 5
-        request.vlm_inputs_embeds = MagicMock()  # VLM request
+        # Use a real mx.array so _do_external_prefill can slice it
+        request.vlm_inputs_embeds = mx.zeros((1, 5, 64))
 
         scheduler.waiting.append(request)
         scheduler.requests[request.request_id] = request
@@ -1593,13 +1605,16 @@ class TestVLMPositionStateClearing:
     def test_schedule_waiting_clears_text_only_position_state(
         self, mock_tokenizer
     ):
-        """Text-only request in _schedule_waiting should clear position state."""
+        """Text-only request in _schedule_waiting should clear position state.
+
+        With external prefill, clear_vlm_position_state is called inside
+        _do_external_prefill when vlm_embeds is None (text-only).
+        """
         model = self._make_vlm_model()
         scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
 
         mock_bg = MagicMock()
-        mock_bg.add = MagicMock(return_value=[42])
-        mock_bg._vlm_pending = {}
+        mock_bg.insert = MagicMock(return_value=[42])
         scheduler.batch_generator = mock_bg
 
         request = Request(
