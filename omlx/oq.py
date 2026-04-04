@@ -97,6 +97,7 @@ def universal_quant_predicate(
         or tc.get("num_local_experts")
         or config.get("num_experts")
         or tc.get("num_experts", 0)
+        or 0
     )
     hidden_size = config.get("hidden_size") or tc.get("hidden_size", 0)
     is_moe = num_experts > 0

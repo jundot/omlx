@@ -267,6 +267,18 @@ class TestUniversalQuantPredicate:
         )
         assert result is True  # routed expert → base bits
 
+    def test_null_num_experts_dense_model(self, module):
+        """Gemma 4 dense models have explicit num_experts: null in config."""
+        config = {
+            "num_hidden_layers": 60,
+            "hidden_size": 6144,
+            "text_config": {"num_experts": None},
+        }
+        result = universal_quant_predicate(
+            "model.layers.10.self_attn.q_proj", module, config
+        )
+        assert result is True  # should not crash on None > 0
+
 
 # =============================================================================
 # Test helper functions

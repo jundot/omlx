@@ -496,10 +496,8 @@ class OQManager:
         if task is None:
             return
 
-        from ..oq import _QUANT_SECONDS_PER_GB
-
         source_gb = max(task.source_size / (1024**3), 0.1)
-        estimated_total = source_gb * _QUANT_SECONDS_PER_GB
+        estimated_total = source_gb * 3.0
         start = time.time()
 
         try:
