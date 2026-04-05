@@ -163,6 +163,7 @@ class GlobalSettingsRequest(BaseModel):
     integrations_codex_model: Optional[str] = None
     integrations_opencode_model: Optional[str] = None
     integrations_openclaw_model: Optional[str] = None
+    integrations_pi_model: Optional[str] = None
     integrations_openclaw_tools_profile: Optional[Literal["minimal", "coding", "messaging", "full"]] = None
 
     # UI settings
@@ -1779,6 +1780,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "codex_model": global_settings.integrations.codex_model,
             "opencode_model": global_settings.integrations.opencode_model,
             "openclaw_model": global_settings.integrations.openclaw_model,
+            "pi_model": global_settings.integrations.pi_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
         },
         "system": {
@@ -2074,6 +2076,9 @@ async def update_global_settings(
             request.integrations_openclaw_model
         )
         integrations_changed = True
+    if "integrations_pi_model" in request.model_fields_set:
+        global_settings.integrations.pi_model = request.integrations_pi_model
+        integrations_changed = True
     if "integrations_openclaw_tools_profile" in request.model_fields_set:
         global_settings.integrations.openclaw_tools_profile = (
             request.integrations_openclaw_tools_profile
@@ -2086,7 +2091,8 @@ async def update_global_settings(
             f"Integration settings updated: "
             f"codex={global_settings.integrations.codex_model}, "
             f"opencode={global_settings.integrations.opencode_model}, "
-            f"openclaw={global_settings.integrations.openclaw_model}"
+            f"openclaw={global_settings.integrations.openclaw_model}, "
+            f"pi={global_settings.integrations.pi_model}"
         )
 
     # Apply UI settings
