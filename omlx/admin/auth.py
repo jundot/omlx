@@ -27,8 +27,11 @@ SECRET_KEY = os.environ.get("OMLX_SECRET_KEY") or secrets.token_hex(32)
 # Initialize the serializer for creating and verifying session tokens
 _serializer = URLSafeTimedSerializer(SECRET_KEY)
 
+# Global settings getter (set by init_auth)
+_get_global_settings = None
 
-def init_auth(secret_key: str) -> None:
+
+def init_auth(secret_key: str, global_settings_getter=None) -> None:
     """Initialize authentication with a persistent secret key.
 
     Should be called during server startup with the secret key from settings.
@@ -36,12 +39,15 @@ def init_auth(secret_key: str) -> None:
 
     Args:
         secret_key: The secret key from settings.json for signing tokens.
+        global_settings_getter: Optional callable that returns GlobalSettings.
     """
-    global _serializer, SECRET_KEY
+    global _serializer, SECRET_KEY, _get_global_settings
     # Environment variable takes priority over settings
     key = os.environ.get("OMLX_SECRET_KEY") or secret_key
     SECRET_KEY = key
     _serializer = URLSafeTimedSerializer(key)
+    if global_settings_getter is not None:
+        _get_global_settings = global_settings_getter
 
 
 def create_session_token(remember: bool = False) -> str:
@@ -214,6 +220,16 @@ async def require_admin(request: Request) -> bool:
         ... async def get_settings(is_admin: bool = Depends(require_admin)):
         ...     return {"settings": "..."}
     """
+    # Skip admin auth when skip_api_key_verification is enabled on localhost
+    if _get_global_settings is not None:
+        gs = _get_global_settings()
+        if (
+            gs is not None
+            and gs.auth.skip_api_key_verification
+            and gs.server.host == "127.0.0.1"
+        ):
+            return True
+
     if not verify_session(request):
         # Browser requests (Accept: text/html) get redirected to login page
         accept = request.headers.get("accept", "")

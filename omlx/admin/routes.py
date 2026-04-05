@@ -897,6 +897,15 @@ async def login_page(request: Request):
         return RedirectResponse(url="/admin/dashboard", status_code=302)
 
     global_settings = _get_global_settings()
+
+    # Skip login page when skip_api_key_verification is enabled on localhost
+    if (
+        global_settings is not None
+        and global_settings.auth.skip_api_key_verification
+        and global_settings.server.host == "127.0.0.1"
+    ):
+        return RedirectResponse(url="/admin/dashboard", status_code=302)
+
     api_key_configured = bool(global_settings and global_settings.auth.api_key)
     return templates.TemplateResponse(
         request,
