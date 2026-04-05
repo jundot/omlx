@@ -59,7 +59,7 @@ class ModelSettings:
 
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool = False
-    turboquant_kv_bits: float = 4  # integer (3, 4) or fractional (3.5)
+    turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
