@@ -52,6 +52,48 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
+# Codec rebuild for SSD cache reconstruction
+# ---------------------------------------------------------------------------
+
+
+def _infer_head_dim(state, bits: int) -> int:
+    """Infer head_dim from a TQ quantized state's packed tensor width.
+
+    MSEState.indices has shape (..., packed_width) where
+    packed_width = ceil(head_dim * bits / 32).
+    """
+    if isinstance(state, TurboQuantMSEState):
+        packed_width = state.indices.shape[-1]
+    elif isinstance(state, TurboQuantProdState):
+        packed_width = state.mse_indices.shape[-1]
+        bits = max(bits - 1, 1)
+    else:
+        raise TypeError(f"Cannot infer head_dim from state type: {type(state).__name__}")
+    return packed_width * 32 // bits
+
+
+def _rebuild_codecs(tq_cache: TurboQuantKVCache, key_state, value_state) -> None:
+    """Rebuild TQ codecs deterministically from (head_dim, bits, seed).
+
+    TQ codecs (rotation matrices, codebooks) are fully determined by
+    (head_dim, bits, seed) for integer bit-widths — no data dependency.
+    This allows rebuilding codecs without the original fp16 tensors,
+    which is needed when reconstructing from SSD cache.
+    """
+    bits = tq_cache.bits
+    seed = tq_cache.seed
+    fractional = not math.isclose(bits, round(bits), abs_tol=1e-6)
+    key_bits = int(math.floor(bits) if fractional else bits)
+    val_bits = int(math.ceil(bits) if fractional else bits)
+
+    head_dim = _infer_head_dim(key_state, key_bits)
+
+    dummy = mx.zeros((1, 1, 1, head_dim))
+    tq_cache.key_codec = _build_codec(dummy, key_bits, mode="mse", seed=seed)
+    tq_cache.value_codec = _build_codec(dummy, val_bits, mode="mse", seed=seed + 1)
+
+
+# ---------------------------------------------------------------------------
 # Batch-level state helpers (axis-0 operations)
 # ---------------------------------------------------------------------------
 

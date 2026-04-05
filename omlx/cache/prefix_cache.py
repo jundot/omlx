@@ -1502,7 +1502,7 @@ class BlockAwarePrefixCache(CacheManager):
 
                 # === TurboQuantKVCache: concat NamedTuple states, reconstruct ===
                 if cache_type_name in ('TurboQuantKVCache', 'BatchTurboQuantKVCache'):
-                    from ..turboquant_kv import _concat_state, _state_length
+                    from ..turboquant_kv import _concat_state, _state_length, _rebuild_codecs
                     key_states, value_states = [], []
                     for block_data in all_block_data:
                         if layer_idx >= len(block_data):
@@ -1542,6 +1542,7 @@ class BlockAwarePrefixCache(CacheManager):
                         tq.keys = cat_ks
                         tq.values = cat_vs
                         tq.offset = _state_length(cat_ks)
+                        _rebuild_codecs(tq, cat_ks, cat_vs)
                         keys, values = tq.dequantize()
                         cache = KVCache()
                         cache.keys = keys

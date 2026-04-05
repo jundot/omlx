@@ -1228,6 +1228,9 @@ class PagedSSDCacheManager(CacheManager):
                 from ..turboquant_kv import (
                     TurboQuantMSEState,
                     TurboQuantProdState,
+                    TurboQuantPolarState,
+                    TurboQuantPolarProdState,
+                    TurboQuantSplitState,
                 )
                 key_type = file_metadata.get(f"layer_{i}_tq_key_type", "")
                 value_type = file_metadata.get(f"layer_{i}_tq_value_type", "")
@@ -1236,6 +1239,9 @@ class PagedSSDCacheManager(CacheManager):
                 _type_map = {
                     "TurboQuantMSEState": TurboQuantMSEState,
                     "TurboQuantProdState": TurboQuantProdState,
+                    "TurboQuantPolarState": TurboQuantPolarState,
+                    "TurboQuantPolarProdState": TurboQuantPolarProdState,
+                    "TurboQuantSplitState": TurboQuantSplitState,
                 }
                 try:
                     k_cls = _type_map[key_type]

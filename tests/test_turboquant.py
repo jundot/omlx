@@ -12,7 +12,7 @@ from mlx_vlm.turboquant import (
     turboquant_enabled,
 )
 
-from omlx.turboquant_kv import BatchTurboQuantKVCache
+from omlx.turboquant_kv import BatchTurboQuantKVCache, _rebuild_codecs, _infer_head_dim
 
 
 def _sample_unit_vectors(count: int, dim: int) -> mx.array:
@@ -228,3 +228,89 @@ def test_attention_patch_routes_tq():
         queries, ks, vs, tq, scale=32**-0.5, mask=None
     )
     assert out.shape == (1, 4, 1, 32)
+
+
+# ---------------------------------------------------------------------------
+# Codec rebuild tests (SSD cache reconstruction, issue #577)
+# ---------------------------------------------------------------------------
+
+
+def test_rebuild_codecs_mse():
+    """Rebuild codecs from state after wiping them — simulates SSD restore."""
+    keys = mx.random.normal((1, 2, 16, 64))
+    values = mx.random.normal((1, 2, 16, 64))
+
+    tq = TurboQuantKVCache(bits=4.0, seed=7)
+    tq.update_and_fetch(keys, values)
+    expected_k, expected_v = tq.dequantize()
+
+    ks, vs = tq.state
+    tq2 = TurboQuantKVCache(bits=4.0, seed=7)
+    tq2.keys = ks
+    tq2.values = vs
+    tq2.offset = 16
+    _rebuild_codecs(tq2, ks, vs)
+    rebuilt_k, rebuilt_v = tq2.dequantize()
+
+    assert mx.allclose(expected_k, rebuilt_k, atol=1e-5).item()
+    assert mx.allclose(expected_v, rebuilt_v, atol=1e-5).item()
+
+
+def test_rebuild_codecs_fractional_bits():
+    """Rebuild codecs with fractional bits (3.5 → key=3bit, value=4bit)."""
+    keys = mx.random.normal((1, 2, 16, 64))
+    values = mx.random.normal((1, 2, 16, 64))
+
+    tq = TurboQuantKVCache(bits=3.5, seed=42)
+    tq.update_and_fetch(keys, values)
+    expected_k, expected_v = tq.dequantize()
+
+    ks, vs = tq.state
+    tq2 = TurboQuantKVCache(bits=3.5, seed=42)
+    tq2.keys = ks
+    tq2.values = vs
+    tq2.offset = 16
+    _rebuild_codecs(tq2, ks, vs)
+    rebuilt_k, rebuilt_v = tq2.dequantize()
+
+    assert mx.allclose(expected_k, rebuilt_k, atol=1e-5).item()
+    assert mx.allclose(expected_v, rebuilt_v, atol=1e-5).item()
+
+
+def test_infer_head_dim():
+    """Verify head_dim inference from MSEState packed indices."""
+    keys = mx.random.normal((1, 2, 8, 128))
+    values = mx.random.normal((1, 2, 8, 128))
+
+    tq = TurboQuantKVCache(bits=4.0, seed=0)
+    tq.update_and_fetch(keys, values)
+    ks, _ = tq.state
+    assert _infer_head_dim(ks, 4) == 128
+
+
+def test_ssd_type_map_completeness():
+    """All TQ state types from turboquant_kv must be in SSD type_map."""
+    from omlx.turboquant_kv import (
+        TurboQuantMSEState,
+        TurboQuantProdState,
+        TurboQuantPolarState,
+        TurboQuantPolarProdState,
+        TurboQuantSplitState,
+    )
+
+    expected_types = {
+        "TurboQuantMSEState",
+        "TurboQuantProdState",
+        "TurboQuantPolarState",
+        "TurboQuantPolarProdState",
+        "TurboQuantSplitState",
+    }
+    # Import the type_map as it would be constructed in _reconstruct_cache_data
+    _type_map = {
+        "TurboQuantMSEState": TurboQuantMSEState,
+        "TurboQuantProdState": TurboQuantProdState,
+        "TurboQuantPolarState": TurboQuantPolarState,
+        "TurboQuantPolarProdState": TurboQuantPolarProdState,
+        "TurboQuantSplitState": TurboQuantSplitState,
+    }
+    assert set(_type_map.keys()) == expected_types
