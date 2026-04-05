@@ -66,14 +66,9 @@
                                     <select x-model="modelSettings.reasoning_parser"
                                             class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                         <option value="">None</option>
-                                        <option value="qwen">Qwen</option>
-                                        <option value="qwen_coder">Qwen Coder</option>
-                                        <option value="harmony">Harmony (gpt-oss)</option>
-                                        <option value="llama">Llama</option>
-                                        <option value="deepseek_r1">DeepSeek R1</option>
-                                        <option value="deepseek_v3_2">DeepSeek V3.2</option>
-                                        <option value="kimi">Kimi</option>
-                                        <option value="minimax">MiniMax</option>
+                                        <template x-for="p in reasoningParsers" :key="p.value">
+                                            <option :value="p.value" x-text="p.label + ' (' + p.models.join(', ') + ')'"></option>
+                                        </template>
                                     </select>
                                 </div>
                             </div>

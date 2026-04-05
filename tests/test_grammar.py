@@ -786,3 +786,38 @@ class TestGetModelVocabSize:
     def test_returns_none_when_unavailable(self):
         model = MagicMock(spec=[])
         assert self._call(model) is None
+
+
+class TestListGrammarParsers:
+    """Tests for GET /admin/api/grammar/parsers endpoint."""
+
+    @pytest.fixture()
+    def client(self):
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+        from omlx.admin.auth import require_admin
+        from omlx.admin.routes import router
+
+        app = FastAPI()
+        app.include_router(router)
+        app.dependency_overrides[require_admin] = lambda: True
+        yield TestClient(app)
+        app.dependency_overrides.clear()
+
+    def test_returns_list_from_xgrammar(self, client):
+        resp = client.get("/admin/api/grammar/parsers")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data, list)
+        assert len(data) > 0
+        for item in data:
+            assert "value" in item
+            assert "label" in item
+            assert "models" in item
+            assert isinstance(item["models"], list)
+
+    def test_returns_empty_when_xgrammar_unavailable(self, client):
+        with patch.dict("sys.modules", {"xgrammar": None}):
+            resp = client.get("/admin/api/grammar/parsers")
+        assert resp.status_code == 200
+        assert resp.json() == []

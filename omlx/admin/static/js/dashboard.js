@@ -102,6 +102,7 @@
             },
             savingModelSettings: false,
             loadingGenDefaults: false,
+            reasoningParsers: [],
 
             // Status tab state
             stats: {
@@ -880,7 +881,13 @@
                 }
             },
 
-            openModelSettings(model) {
+            async openModelSettings(model) {
+                if (this.reasoningParsers.length === 0) {
+                    try {
+                        const resp = await fetch('/admin/api/grammar/parsers');
+                        if (resp.ok) this.reasoningParsers = await resp.json();
+                    } catch (_) { /* xgrammar not installed */ }
+                }
                 this.selectedModel = model;
                 // Load existing settings if available
                 const settings = model.settings || {};
