@@ -3062,6 +3062,12 @@ async def create_anthropic_message(
             preserve_images=is_vlm,
         )
 
+    # Apply model-specific message extraction (e.g. Gemma 4 converts
+    # role=tool messages into tool_responses on assistant turns).
+    extractor = getattr(engine, "message_extractor", None)
+    if extractor is not None:
+        messages = extractor(messages, max_tool_result_tokens, engine.tokenizer)
+
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
