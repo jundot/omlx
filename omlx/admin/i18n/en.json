@@ -551,6 +551,7 @@
   "chat.welcome_description": "Start a conversation with your local MLX models. Select a model above to begin.",
   "chat.welcome_privacy": "All conversations run locally on your device.",
   "chat.input_placeholder": "Type a message... (Shift+Enter for new line)",
+  "chat.input_placeholder_mobile": "Type a message...",
   "chat.edit_cancel": "Cancel",
   "chat.edit_save": "Save & Resend",
   "chat.copy_tooltip": "Copy",

@@ -62,7 +62,7 @@
 
     body {
         background-color: var(--bg-primary) !important;
-        color: var(--text-primary);
+        color: var(--text-primary) !important;
     }
 
     /* Scrollbar */
@@ -274,6 +274,9 @@
         .sidebar-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 40; }
         .sidebar-overlay.hidden { display: none; }
         .user-edit-btn { left: -28px; }
+
+        /* Prevent iOS auto-zoom on input focus (requires >= 16px) */
+        textarea, input[type="text"], input[type="password"] { font-size: 16px !important; }
     }
 
     /* Image modal */
@@ -720,10 +723,10 @@
 
                         <textarea
                             x-model="inputMessage"
-                            @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); sendMessage(); }"
+                            @keydown.enter="if (!isMobile && !$event.shiftKey) { $event.preventDefault(); sendMessage(); }"
                             @input="autoResize($event.target)"
                             @paste="handlePaste($event)"
-                            placeholder="{{ t('chat.input_placeholder') }}"
+                            :placeholder="isMobile ? window.t('chat.input_placeholder_mobile') : window.t('chat.input_placeholder')"
                             :disabled="!apiKeySet || !currentModel || isStreaming"
                             rows="1"
                             class="flex-1 px-4 py-3 bg-transparent resize-none outline-none text-sm max-h-32"
@@ -830,6 +833,7 @@
             apiKeyInput: '',
 
             // UI State
+            isMobile: window.innerWidth < 768,
             sidebarOpen: window.innerWidth >= 768,
             theme: localStorage.getItem('omlx-chat-theme') || 'light',
 
@@ -1267,6 +1271,7 @@
                 this.messages = [];
                 this.uploadImages = [];
                 this.systemPrompt = localStorage.getItem('omlx_chat_system_prompt') || '';
+                this.isMobile = window.innerWidth < 768;
                 this.sidebarOpen = window.innerWidth >= 768;
             },
 
@@ -1280,6 +1285,7 @@
                         this.currentModel = chat.model;
                     }
                 }
+                this.isMobile = window.innerWidth < 768;
                 this.sidebarOpen = window.innerWidth >= 768;
             },
 

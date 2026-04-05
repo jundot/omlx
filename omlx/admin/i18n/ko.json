@@ -551,6 +551,7 @@
   "chat.welcome_description": "당신의 MLX 모델과 대화를 시작하세요. 위에서 모델을 선택하세요.",
   "chat.welcome_privacy": "모든 대화는 로컬 기기에서 실행됩니다.",
   "chat.input_placeholder": "메시지를 입력하세요... (Shift+Enter로 줄바꿈)",
+  "chat.input_placeholder_mobile": "메시지를 입력하세요...",
   "chat.edit_cancel": "취소",
   "chat.edit_save": "저장 후 재전송",
   "chat.copy_tooltip": "복사",

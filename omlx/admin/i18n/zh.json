@@ -551,6 +551,7 @@
   "chat.welcome_description": "开始与你的本地 MLX 模型对话。请在上方选择一个模型。",
   "chat.welcome_privacy": "所有对话均在本地设备上运行。",
   "chat.input_placeholder": "输入消息...（Shift+Enter 换行）",
+  "chat.input_placeholder_mobile": "输入消息...",
   "chat.edit_cancel": "取消",
   "chat.edit_save": "保存并重发",
   "chat.copy_tooltip": "复制",

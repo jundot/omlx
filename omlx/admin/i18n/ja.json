@@ -551,6 +551,7 @@
   "chat.welcome_description": "ローカルMLXモデルとの会話を始めましょう。上のメニューからモデルを選択してください。",
   "chat.welcome_privacy": "すべての会話はローカルデバイス上で実行されます。",
   "chat.input_placeholder": "メッセージを入力...（Shift+Enterで改行）",
+  "chat.input_placeholder_mobile": "メッセージを入力...",
   "chat.edit_cancel": "キャンセル",
   "chat.edit_save": "保存して再送信",
   "chat.copy_tooltip": "コピー",
