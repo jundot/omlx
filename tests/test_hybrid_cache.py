@@ -990,6 +990,69 @@ class TestReconstructCachePartialRestore:
         assert rot_cache.values.shape == (1, 8, 1024, 64)
         assert rot_cache._idx == 100
 
+    def test_undersized_rotating_cache_padded_on_reconstruct(
+        self, paged_cache, mock_ssd_cache
+    ):
+        """Undersized RotatingKVCache from BatchRotatingKVCache.extract()
+        should be zero-padded to max_size during reconstruction.
+
+        BatchRotatingKVCache.extract() strips left_padding, producing
+        keys.shape[2] < max_size while offset >= max_size. Without padding,
+        size() reports max_size but _temporal_order returns fewer entries,
+        causing broadcast_shapes errors in merge().
+        """
+        model = MockModel(num_layers=2)
+        prefix_cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd_cache,
+        )
+
+        block = paged_cache.allocate_block()
+        block.block_hash = b"block_hash"
+        block.token_count = 256
+
+        block_table = paged_cache.create_block_table("req-undersized")
+        block_table.block_ids = [block.block_id]
+        block_table.num_tokens = 256
+
+        # Simulate undersized buffer from extract(): 845 entries, not 1024
+        kv_keys = mx.zeros((1, 8, 256, 64))
+        kv_values = mx.zeros((1, 8, 256, 64))
+        rot_keys = mx.ones((1, 8, 845, 64))  # Undersized!
+        rot_values = mx.ones((1, 8, 845, 64))
+
+        block_data = [
+            (kv_keys, kv_values),
+            (rot_keys, rot_values),
+        ]
+        block_metadata = {
+            'layer_cache_types': ['KVCache', 'RotatingKVCache'],
+            'layer_meta_states': [
+                (256,),
+                (0, 1024, 44225, 845),  # keep=0, max_size=1024, offset=44225, _idx=845
+            ],
+            'model_name': 'test-model',
+            'num_layers': 2,
+        }
+
+        mock_ssd_cache.load_block_with_metadata.return_value = (block_data, block_metadata)
+
+        result = prefix_cache.reconstruct_cache(block_table)
+
+        assert result is not None
+        assert len(result) == 2
+
+        rot_cache = result[1]
+        assert rot_cache.max_size == 1024
+        # Buffer must be padded to max_size for merge safety
+        assert rot_cache.keys.shape[2] == 1024
+        assert rot_cache.values.shape[2] == 1024
+        # Offset preserved from meta_state
+        assert rot_cache.offset == 44225
+        # _idx should be max_size (data fills the buffer after padding)
+        assert rot_cache._idx == 1024
+
 
 class TestModelCacheConfigCacheList:
     """Tests for CacheList support in ModelCacheConfig."""

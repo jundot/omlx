@@ -433,6 +433,40 @@ class RotatingKVCacheHandler(CacheTypeHandler):
 
             _idx = min(max_size, keys.shape[2])
 
+        # Handle undersized buffers from BatchRotatingKVCache.extract().
+        # extract() strips left_padding, producing keys.shape[2] < max_size
+        # while offset >= max_size. size() then reports max_size but
+        # _temporal_order returns fewer entries, breaking merge.
+        elif (
+            hasattr(keys, "shape")
+            and len(keys.shape) >= 3
+            and max_size > 0
+            and keys.shape[2] < max_size
+            and offset >= max_size
+            and HAS_MLX
+            and mx is not None
+        ):
+            # extract() reorders to temporal order before slicing, so
+            # real data is contiguous at the end. Pad zeros at front
+            # (left_padding position) to restore merge-safe buffer size.
+            actual_len = keys.shape[2]
+            pad_len = max_size - actual_len
+            pad_k = mx.zeros(
+                (*keys.shape[:2], pad_len, keys.shape[3]), dtype=keys.dtype
+            )
+            pad_v = mx.zeros(
+                (*values.shape[:2], pad_len, values.shape[3]), dtype=values.dtype
+            )
+            keys = mx.concatenate([pad_k, keys], axis=2)
+            values = mx.concatenate([pad_v, values], axis=2)
+            _idx = max_size
+            logger.debug(
+                "Padded undersized RotatingKVCache: %d -> %d (max_size=%d)",
+                actual_len,
+                max_size,
+                max_size,
+            )
+
         if hasattr(keys, "shape") and len(keys.shape) >= 3:
             seq_len = keys.shape[2]
             _idx = min(max(0, int(_idx)), seq_len, max_size if max_size > 0 else seq_len)
