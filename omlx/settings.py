@@ -212,8 +212,7 @@ class ModelSettings:
 class SchedulerSettings:
     """Scheduler configuration settings."""
 
-    max_num_seqs: int = 8
-    completion_batch_size: int = 8
+    max_concurrent_requests: int = 8
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -222,10 +221,15 @@ class SchedulerSettings:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SchedulerSettings:
         """Create from dictionary."""
-        return cls(
-            max_num_seqs=data.get("max_num_seqs", 8),
-            completion_batch_size=data.get("completion_batch_size", 8),
-        )
+        # Backwards compatibility: migrate old keys
+        value = data.get("max_concurrent_requests")
+        if value is None:
+            value = data.get("max_num_seqs")
+        if value is None:
+            value = data.get("completion_batch_size")
+        if value is None:
+            value = 8
+        return cls(max_concurrent_requests=value)
 
 
 @dataclass
@@ -756,17 +760,15 @@ class GlobalSettings:
             self.memory.max_process_memory = max_process_memory
 
         # Scheduler settings
-        if max_num_seqs := os.getenv("OMLX_MAX_NUM_SEQS"):
+        max_concurrent = os.getenv("OMLX_MAX_CONCURRENT_REQUESTS") or os.getenv(
+            "OMLX_MAX_NUM_SEQS"
+        )
+        if max_concurrent:
             try:
-                self.scheduler.max_num_seqs = int(max_num_seqs)
-            except ValueError:
-                logger.warning(f"Invalid OMLX_MAX_NUM_SEQS value: {max_num_seqs}")
-        if completion_batch := os.getenv("OMLX_COMPLETION_BATCH_SIZE"):
-            try:
-                self.scheduler.completion_batch_size = int(completion_batch)
+                self.scheduler.max_concurrent_requests = int(max_concurrent)
             except ValueError:
                 logger.warning(
-                    f"Invalid OMLX_COMPLETION_BATCH_SIZE: {completion_batch}"
+                    f"Invalid OMLX_MAX_CONCURRENT_REQUESTS value: {max_concurrent}"
                 )
 
         # Cache settings
@@ -840,13 +842,11 @@ class GlobalSettings:
             self.memory.max_process_memory = args.max_process_memory
 
         # Scheduler settings
-        if hasattr(args, "max_num_seqs") and args.max_num_seqs is not None:
-            self.scheduler.max_num_seqs = args.max_num_seqs
         if (
-            hasattr(args, "completion_batch_size")
-            and args.completion_batch_size is not None
+            hasattr(args, "max_concurrent_requests")
+            and args.max_concurrent_requests is not None
         ):
-            self.scheduler.completion_batch_size = args.completion_batch_size
+            self.scheduler.max_concurrent_requests = args.max_concurrent_requests
 
         # Cache settings
         if hasattr(args, "cache_enabled") and args.cache_enabled is not None:
@@ -996,14 +996,10 @@ class GlobalSettings:
                     errors.append(f"Invalid max_process_memory: {e}")
 
         # Scheduler validation
-        if self.scheduler.max_num_seqs <= 0:
+        if self.scheduler.max_concurrent_requests <= 0:
             errors.append(
-                f"Invalid max_num_seqs: {self.scheduler.max_num_seqs} (must be > 0)"
-            )
-        if self.scheduler.completion_batch_size <= 0:
-            errors.append(
-                f"Invalid completion_batch_size: "
-                f"{self.scheduler.completion_batch_size} (must be > 0)"
+                f"Invalid max_concurrent_requests: "
+                f"{self.scheduler.max_concurrent_requests} (must be > 0)"
             )
 
         # Cache validation
@@ -1083,8 +1079,8 @@ class GlobalSettings:
         from .scheduler import SchedulerConfig
 
         return SchedulerConfig(
-            max_num_seqs=self.scheduler.max_num_seqs,
-            completion_batch_size=self.scheduler.completion_batch_size,
+            max_num_seqs=self.scheduler.max_concurrent_requests,
+            completion_batch_size=self.scheduler.max_concurrent_requests,
             initial_cache_blocks=self.cache.initial_cache_blocks,
         )
 

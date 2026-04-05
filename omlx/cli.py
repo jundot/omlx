@@ -435,13 +435,10 @@ Example directory structure:
 
     # Scheduler options (for BatchedEngine)
     serve_parser.add_argument(
-        "--max-num-seqs", type=int, default=None, help="Max concurrent sequences (default: 256)"
-    )
-    serve_parser.add_argument(
-        "--completion-batch-size",
+        "--max-concurrent-requests",
         type=int,
         default=None,
-        help="Max sequences for mlx-lm BatchGenerator completion phase (token generation). (default: 32)",
+        help="Max requests processed simultaneously. Higher values increase throughput but use more memory. (default: 8)",
     )
 
     # paged SSD cache options

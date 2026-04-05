@@ -483,6 +483,21 @@
                                         </span>
                                     </div>
                                 </div>
+                                <!-- Max Concurrent Requests -->
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <div class="flex items-center gap-2">
+                                            <label class="text-sm text-neutral-700">{{ t('settings.resource.max_concurrent_requests') }}</label>
+                                            <span class="px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+                                                {{ t('settings.resource.restart_badge') }}
+                                            </span>
+                                        </div>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.max_concurrent_requests_hint') }}</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.scheduler.max_concurrent_requests"
+                                           min="1"
+                                           class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
                             </div>
                         </div>
 
@@ -626,30 +641,6 @@
                             </button>
                             <div x-show="advancedOpen" x-collapse x-cloak>
                                 <div class="border-t border-neutral-200">
-                                    <div class="px-6 py-3 bg-neutral-50">
-                                        <div class="flex items-center gap-2">
-                                            <i data-lucide="layers" class="w-3.5 h-3.5 text-neutral-400"></i>
-                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.batching') }}</span>
-                                        </div>
-                                    </div>
-                                    <div class="divide-y divide-neutral-100">
-                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                            <div>
-                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.max_sequences') }}</label>
-                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.max_sequences_hint') }}</p>
-                                            </div>
-                                            <input type="number" x-model.number="globalSettings.scheduler.max_num_seqs"
-                                                   class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                        </div>
-                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                            <div>
-                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.completion_batch_size') }}</label>
-                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.completion_batch_size_hint') }}</p>
-                                            </div>
-                                            <input type="number" x-model.number="globalSettings.scheduler.completion_batch_size"
-                                                   class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                        </div>
-                                    </div>
                                     <!-- Cache subsection -->
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">

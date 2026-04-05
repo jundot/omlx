@@ -125,8 +125,7 @@ class GlobalSettingsRequest(BaseModel):
     memory_prefill_memory_guard: Optional[bool] = None
 
     # Scheduler settings
-    max_num_seqs: Optional[int] = None
-    completion_batch_size: Optional[int] = None
+    max_concurrent_requests: Optional[int] = None
 
     # Cache settings
     cache_enabled: Optional[bool] = None
@@ -1724,8 +1723,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "prefill_memory_guard": global_settings.memory.prefill_memory_guard,
         },
         "scheduler": {
-            "max_num_seqs": global_settings.scheduler.max_num_seqs,
-            "completion_batch_size": global_settings.scheduler.completion_batch_size,
+            "max_concurrent_requests": global_settings.scheduler.max_concurrent_requests,
         },
         "cache": {
             "enabled": global_settings.cache.enabled,
@@ -1911,10 +1909,10 @@ async def update_global_settings(
         )
 
     # Apply scheduler settings (restart required)
-    if request.max_num_seqs is not None:
-        global_settings.scheduler.max_num_seqs = request.max_num_seqs
-    if request.completion_batch_size is not None:
-        global_settings.scheduler.completion_batch_size = request.completion_batch_size
+    if request.max_concurrent_requests is not None:
+        global_settings.scheduler.max_concurrent_requests = (
+            request.max_concurrent_requests
+        )
 
     # Apply cache settings
     cache_changed = False

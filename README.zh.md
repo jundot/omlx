@@ -51,7 +51,7 @@
 
 ### macOS 应用
 
-从 [Releases](https://github.com/jundot/omlx/releases) 下载 `.dmg`，拖到 Applications 即可。应用支持自动更新，后续升级只需一键完成。
+从 [Releases](https://github.com/jundot/omlx/releases) 下载 `.dmg`，拖到 Applications 即可。应用支持自动更新，后续升级只需一键完成。macOS 应用不包含 `omlx` CLI 命令。如需在终端使用，请通过 Homebrew 或从源码安装。
 
 ### Homebrew
 
@@ -145,7 +145,7 @@ brew services info omlx     # 查看状态
 
 ### 连续批处理
 
-通过 mlx-lm 的 BatchGenerator 处理并发请求。预填充和补全批大小可配置。
+通过 mlx-lm 的 BatchGenerator 处理并发请求。最大并发请求数可通过 CLI 或管理面板配置。
 
 ### Claude Code 优化
 
@@ -281,8 +281,8 @@ omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache
 # 设置内存热缓存大小
 omlx serve --model-dir ~/models --hot-cache-max-size 20%
 
-# 调整批大小
-omlx serve --model-dir ~/models --prefill-batch-size 8 --completion-batch-size 32
+# 调整最大并发请求数（默认: 8）
+omlx serve --model-dir ~/models --max-concurrent-requests 16
 
 # 使用 MCP 工具
 omlx serve --model-dir ~/models --mcp-config mcp.json
@@ -311,7 +311,7 @@ FastAPI Server (OpenAI / Anthropic API)
     │
     ├── ProcessMemoryEnforcer (总内存限制、TTL 检查)
     │
-    ├── Scheduler (FCFS，可配置批大小)
+    ├── Scheduler (FCFS，可配置并发数)
     │   └── mlx-lm BatchGenerator
     │
     └── Cache Stack

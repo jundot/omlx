@@ -30,7 +30,7 @@
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info' },
                 model: { model_dirs: [''], max_model_memory: '' },
                 memory: { max_process_memory: 'auto', prefill_memory_guard: true },
-                scheduler: { max_num_seqs: 8, completion_batch_size: 8 },
+                scheduler: { max_concurrent_requests: 8 },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256 },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
@@ -626,8 +626,7 @@
                 if (!s.server.host) errors.push('Host');
                 if (!s.server.port) errors.push('Port');
                 if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
-                if (!s.scheduler.max_num_seqs) errors.push('Max Sequences');
-                if (!s.scheduler.completion_batch_size) errors.push('Completion Batch Size');
+                if (!s.scheduler.max_concurrent_requests) errors.push('Max Concurrent Requests');
                 if (!s.cache.ssd_cache_max_size) errors.push('Max Cache Size');
                 if (!s.sampling.max_context_window) errors.push('Max Context Window');
                 if (!s.sampling.max_tokens) errors.push('Max Tokens');
@@ -665,8 +664,7 @@
                             model_fallback: this.globalSettings.model.model_fallback,
                             max_process_memory: this.globalSettings.memory.max_process_memory,
                             memory_prefill_memory_guard: this.globalSettings.memory.prefill_memory_guard,
-                            max_num_seqs: this.globalSettings.scheduler.max_num_seqs,
-                            completion_batch_size: this.globalSettings.scheduler.completion_batch_size,
+                            max_concurrent_requests: this.globalSettings.scheduler.max_concurrent_requests,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,

@@ -54,7 +54,7 @@
 
 ### macOS App
 
-Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), drag to Applications, done. The app includes in-app auto-update, so future upgrades are just one click.
+Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), drag to Applications, done. The app includes in-app auto-update, so future upgrades are just one click. Note that the macOS app does not install the `omlx` CLI command. For terminal usage, install via Homebrew or from source.
 
 ### Homebrew
 
@@ -148,7 +148,7 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
 
 ### Continuous Batching
 
-Handles concurrent requests through mlx-lm's BatchGenerator. Prefill and completion batch sizes are configurable.
+Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requests is configurable via CLI or admin panel.
 
 ### Claude Code Optimization
 
@@ -284,8 +284,8 @@ omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache
 # Set in-memory hot cache size
 omlx serve --model-dir ~/models --hot-cache-max-size 20%
 
-# Adjust batch sizes
-omlx serve --model-dir ~/models --prefill-batch-size 8 --completion-batch-size 32
+# Adjust max concurrent requests (default: 8)
+omlx serve --model-dir ~/models --max-concurrent-requests 16
 
 # With MCP tools
 omlx serve --model-dir ~/models --mcp-config mcp.json
@@ -314,7 +314,7 @@ FastAPI Server (OpenAI / Anthropic API)
     │
     ├── ProcessMemoryEnforcer (total memory limit, TTL checks)
     │
-    ├── Scheduler (FCFS, configurable batch sizes)
+    ├── Scheduler (FCFS, configurable concurrency)
     │   └── mlx-lm BatchGenerator
     │
     └── Cache Stack
