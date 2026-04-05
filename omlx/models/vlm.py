@@ -113,10 +113,8 @@ class VLMModelAdapter(nn.Module):
         Args:
             vlm_model: The full VLM model loaded by mlx_vlm.utils.load()
             decode_model: Optional mlx-lm model for batched decode.
-                mlx-vlm language models may not support batched decode
-                correctly (e.g. gemma4 missing KV sharing in batch).
-                When provided, this model handles the decode path while
-                vlm_model handles VLM prefill with vision embeddings.
+                When provided, this model handles batched decode (batch > 1)
+                while vlm_model handles VLM prefill and single-request decode.
         """
         super().__init__()
         self._vlm_model = vlm_model
@@ -257,14 +255,12 @@ class VLMModelAdapter(nn.Module):
             # Legacy single-request path
             result = self._forward_with_embeddings(input_ids, wrapped_cache, **kwargs)
         else:
-            # Standard decode path: token IDs only.
-            if self._decode_model is not None:
-                # Use mlx-lm model for correct batched decode.
-                # mlx-vlm language models may produce degenerated output
-                # in batched decode due to missing KV sharing mechanisms.
+            # Standard decode/prefill path: token IDs only.
+            # Use mlx-lm decode model for batched decode (batch > 1)
+            # since mlx-vlm language models may not handle batching.
+            if self._decode_model is not None and input_ids.shape[0] > 1:
                 result = self._decode_model(input_ids, cache=cache, **kwargs)
             else:
-                # Fallback: mlx-vlm language model (single-request compatible)
                 if hasattr(self._vlm_model, "_set_position_state"):
                     self._vlm_model._set_position_state(input_ids)
                 result = self._language_model(input_ids, cache=wrapped_cache, **kwargs)
