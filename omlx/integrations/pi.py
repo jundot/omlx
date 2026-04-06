@@ -84,14 +84,17 @@ class PiIntegration(Integration):
         self._write_json_config(self.SETTINGS_PATH, update_settings)
 
     def launch(self, port: int, api_key: str, model: str, host: str = "127.0.0.1", **kwargs) -> None:
+        context_window = kwargs.pop("context_window", None)
+        max_tokens = kwargs.pop("max_tokens", None)
+        model_type = kwargs.pop("model_type", None)
         self.configure(
             port,
             api_key,
             model,
             host=host,
-            context_window=kwargs.get("context_window"),
-            max_tokens=kwargs.get("max_tokens"),
-            model_type=kwargs.get("model_type"),
+            context_window=context_window,
+            max_tokens=max_tokens,
+            model_type=model_type,
         )
 
         env = os.environ.copy()
