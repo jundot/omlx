@@ -719,9 +719,9 @@ class OMLXAppDelegate(NSObject):
 
         self.menu.addItem_(NSMenuItem.separatorItem())
 
-        # --- Preferences ---
+        # --- Settings ---
         prefs_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Preferences...", "openPreferences:", ","
+            "Settings…", "openPreferences:", ","
         )
         prefs_item.setTarget_(self)
         prefs_icon = self._create_menu_icon("gearshape")
@@ -976,9 +976,9 @@ class OMLXAppDelegate(NSObject):
             alert.setInformativeText_(
                 f"Port {self.server_manager.config.port} is in use by another "
                 f"application{pid_info}.\n\n"
-                f"Change the port in Preferences."
+                f"Change the port in Settings."
             )
-            alert.addButtonWithTitle_("Open Preferences")
+            alert.addButtonWithTitle_("Open Settings")
             alert.addButtonWithTitle_("Cancel")
 
             response = alert.runModal()
@@ -1054,7 +1054,7 @@ class OMLXAppDelegate(NSObject):
 
     @objc.IBAction
     def openPreferences_(self, sender):
-        """Open the Preferences window."""
+        """Open the Settings window."""
         from .preferences import PreferencesWindowController
 
         self.preferences_controller = (
@@ -1077,7 +1077,7 @@ class OMLXAppDelegate(NSObject):
         self.welcome_controller.showWindow()
 
     def _on_prefs_saved(self):
-        """Callback after preferences are saved."""
+        """Callback after settings are saved."""
         self.server_manager.update_config(self.config)
         self._build_menu()
 
