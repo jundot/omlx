@@ -233,7 +233,7 @@
                         <i data-lucide="moon" class="w-4 h-4" x-show="theme === 'dark'"></i>
                         <select
                             @change="setTheme($event.target.value)"
-                            class="bg-transparent border-none outline-none cursor-pointer appearance-none text-inherit text-sm w-8 pr-5"
+                            class="bg-transparent border-none outline-none cursor-pointer appearance-none text-inherit text-sm pr-5"
                             x-model="theme"
                             :title="theme === 'auto' ? window.t('navbar.theme.auto') : theme === 'light' ? window.t('navbar.theme.light_mode') : window.t('navbar.theme.dark_mode')"
                         >
