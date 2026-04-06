@@ -153,7 +153,7 @@ from .api.tool_calling import (
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
-from .api.utils import clean_output_text, clean_special_tokens, extract_multimodal_content, extract_text_content
+from .api.utils import clean_output_text, clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -2106,6 +2106,11 @@ async def create_chat_completion(
             native_reasoning_content=native_reasoning,
         )
 
+    # Detect and strip partial mode at the API boundary — exactly once,
+    # before any chat template application.  The boolean result is forwarded
+    # as an explicit parameter so the engine never has to re-derive it.
+    is_partial = detect_and_strip_partial(messages)
+
     # Compile grammar for structured output (logit-level enforcement).
     # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
     response_format = request.response_format
@@ -2140,6 +2145,7 @@ async def create_chat_completion(
         num_prompt_tokens = engine.count_chat_tokens(
             messages, tools_for_template,
             chat_template_kwargs=merged_ct_kwargs or None,
+            is_partial=is_partial,
         )
     except Exception as e:
         # Catch chat template rendering failures: Jinja2 TemplateError,
@@ -2229,6 +2235,9 @@ async def create_chat_completion(
     # Add chat template kwargs
     if merged_ct_kwargs:
         chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+
+    # Forward partial-mode decision to the engine explicitly
+    chat_kwargs["is_partial"] = is_partial
 
     # SpecPrefill: per-request overrides (fall back to model_settings)
     if request.specprefill is not None:
@@ -3409,6 +3418,9 @@ async def create_anthropic_message(
     if extractor is not None:
         messages = extractor(messages, max_tool_result_tokens, engine.tokenizer)
 
+    # Detect and strip partial mode at the API boundary — exactly once.
+    is_partial = detect_and_strip_partial(messages)
+
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
@@ -3477,11 +3489,15 @@ async def create_anthropic_message(
     if merged_ct_kwargs:
         chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
 
+    # Forward partial-mode decision to the engine explicitly
+    chat_kwargs["is_partial"] = is_partial
+
     # Validate context window before sending to model
     try:
         num_prompt_tokens = engine.count_chat_tokens(
             messages, internal_tools,
             chat_template_kwargs=merged_ct_kwargs or None,
+            is_partial=is_partial,
         )
     except Exception as e:
         err_name = type(e).__name__.lower()

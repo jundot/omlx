@@ -674,27 +674,6 @@ class TestApplyChatTemplatePartialMode:
         call_msgs = mock_tokenizer.apply_chat_template.call_args[0][0]
         assert "partial" not in call_msgs[-1]
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=TypeError,
-        reason=(
-            "Pre-fix: BatchedEngine.count_chat_tokens lacks the is_partial "
-            "parameter the API server forwards.  detect_and_strip_partial "
-            "(invoked internally by _apply_chat_template) mutates the "
-            "messages list in place by popping partial=True.  The chat "
-            "phase then sees stripped messages and re-detects False, "
-            "rendering with add_generation_prompt=True instead of "
-            "continue_final_message=True.  This produces a different "
-            "token sequence than the count phase produced, misaligning "
-            "with the cached prefix on subsequent turns and surfacing as "
-            "a TTFT regression on identical re-prompts.  The fix detects "
-            "partial once at the API boundary and forwards is_partial as "
-            "an explicit parameter, skipping re-detection in the engine. "
-            "When the fix lands, this xfail flips to XPASS and the strict "
-            "marker forces removal of the decorator -- converting this "
-            "into a positive regression guard."
-        ),
-    )
     def test_count_then_apply_chat_template_idempotent_under_partial_mode(self):
         """Server flow: count_chat_tokens then _apply_chat_template on the
         same messages list must render with identical partial-mode flags.

@@ -1207,11 +1207,22 @@ class VLMBatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
     ) -> str:
-        """Apply chat template for text-only messages (no images)."""
+        """Apply chat template for text-only messages (no images).
+
+        Args:
+            is_partial: Accepted for API parity with BatchedEngine but not
+                acted upon — VLM always uses ``add_generation_prompt=True``.
+                The ``partial`` key is still cleaned from message dicts.
+        """
         if hasattr(self._tokenizer, "apply_chat_template"):
             # Strip partial field (VLM always uses add_generation_prompt=True)
-            detect_and_strip_partial(messages)
+            if is_partial is None:
+                detect_and_strip_partial(messages)
+            else:
+                for msg in messages:
+                    msg.pop("partial", None)
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
@@ -1577,6 +1588,7 @@ class VLMBatchedEngine(BaseEngine):
         text_messages, images = extract_images_from_messages(messages)
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
+        partial = kwargs.pop("is_partial", None)
 
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
@@ -1613,6 +1625,7 @@ class VLMBatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
     ) -> int:
         """Count prompt tokens for chat messages (text-only approximation).
 
@@ -1625,7 +1638,9 @@ class VLMBatchedEngine(BaseEngine):
 
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(
-            text_messages, template_tools, chat_template_kwargs=chat_template_kwargs
+            text_messages, template_tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
         )
         return len(self._tokenizer.encode(prompt))
 
