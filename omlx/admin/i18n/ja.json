@@ -41,6 +41,7 @@
   "navbar.dropdown.uploader": "oQ Uploader",
   "navbar.dropdown.global_settings": "グローバル設定",
   "navbar.dropdown.model_settings": "モデル設定",
+  "navbar.theme.auto": "自動",
   "navbar.theme.dark_mode": "ダークモード",
   "navbar.theme.light_mode": "ライトモード",
   "navbar.logout": "ログアウト",
