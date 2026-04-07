@@ -1883,7 +1883,10 @@ async def update_global_settings(
         seen: set[str] = set()
         for alias in request.server_aliases:
             if not isinstance(alias, str):
-                continue
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid server alias: each alias must be a string",
+                )
             value = alias.strip()
             if not value or value in seen:
                 continue

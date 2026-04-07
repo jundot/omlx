@@ -30,22 +30,38 @@ def is_valid_hostname(value: str) -> bool:
 
 
 def is_valid_ip(value: str) -> bool:
-    """Return True if ``value`` is a parseable IPv4 or IPv6 address."""
+    """Return True if ``value`` is a usable IPv4 or IPv6 alias address.
+
+    Rejects unspecified bind addresses (``0.0.0.0`` and ``::``) since they
+    are not routable as client-facing URL hosts even though they parse as
+    valid IP addresses.
+    """
     try:
-        ipaddress.ip_address(value)
-        return True
+        ip = ipaddress.ip_address(value)
     except ValueError:
         return False
+    return not ip.is_unspecified
 
 
 def is_valid_alias(value: str) -> bool:
-    """Validate that ``value`` is a hostname or IP address."""
+    """Validate that ``value`` is a hostname or routable IP address.
+
+    If the value parses as an IP address at all, the IP validity check is
+    authoritative — we do not silently fall through to hostname matching.
+    Without this guard, an IP-shaped string like ``0.0.0.0`` would slip
+    through as a "valid hostname" (digit-only labels are legal) even after
+    being rejected as an unspecified bind address by :func:`is_valid_ip`.
+    """
     if not isinstance(value, str):
         return False
     value = value.strip()
     if not value:
         return False
-    return is_valid_ip(value) or is_valid_hostname(value)
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return is_valid_hostname(value)
+    return is_valid_ip(value)
 
 
 def _local_ipv4_addresses() -> list[str]:
