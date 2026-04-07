@@ -140,6 +140,10 @@
                 avg_generation_tps: 0.0,
                 total_requests: 0,
             },
+            // Server connectivity info (from /admin/api/server-info)
+            serverAliases: [],
+            selectedAlias: '',
+
             statsScope: 'session',
             selectedStatsModel: '',
             showClearStatsConfirm: false,
@@ -355,6 +359,7 @@
                 await Promise.all([
                     this.loadGlobalSettings(),
                     this.loadModels(),
+                    this.loadServerInfo(),
                     this.checkForUpdate()
                 ]);
 
@@ -1065,10 +1070,34 @@
 
             // Status tab functions
             get displayHost() {
+                if (this.selectedAlias) return this.selectedAlias;
                 const host = this.stats.host || '127.0.0.1';
                 if (host === '0.0.0.0') return 'your-ip-address';
                 if (host === 'localhost') return '127.0.0.1';
                 return host;
+            },
+
+            async loadServerInfo() {
+                try {
+                    const response = await fetch('/admin/api/server-info');
+                    if (response.ok) {
+                        const data = await response.json();
+                        const aliases = Array.isArray(data.aliases) ? data.aliases : [];
+                        this.serverAliases = aliases;
+                        // Preserve user selection across reloads if still valid;
+                        // otherwise default to the first alias when available.
+                        if (this.selectedAlias && !aliases.includes(this.selectedAlias)) {
+                            this.selectedAlias = '';
+                        }
+                        if (!this.selectedAlias && aliases.length > 0) {
+                            this.selectedAlias = aliases[0];
+                        }
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (err) {
+                    console.error('Failed to load server info:', err);
+                }
             },
 
             get llmModels() {
