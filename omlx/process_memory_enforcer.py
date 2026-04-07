@@ -14,10 +14,14 @@ model is mid-inference, the inference is aborted as part of engine shutdown.
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
+from enum import Enum
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
+
+from .engine_core import get_mlx_executor
 
 if TYPE_CHECKING:
     from .engine_pool import EnginePool
@@ -29,6 +33,32 @@ logger = logging.getLogger(__name__)
 def _format_gb(b: int) -> str:
     """Format bytes as GB string."""
     return f"{b / 1024**3:.1f}GB"
+
+
+class MemoryWatermark(Enum):
+    """Memory pressure levels for pre-load safety decisions."""
+    GREEN = "green"    # < 65% utilization
+    YELLOW = "yellow"  # 65-80% utilization
+    RED = "red"        # 80-90% utilization
+    FATAL = "fatal"    # > 90% utilization
+
+    @classmethod
+    def from_utilization(cls, utilization: float) -> "MemoryWatermark":
+        if utilization < 0.65:
+            return cls.GREEN
+        elif utilization < 0.80:
+            return cls.YELLOW
+        elif utilization < 0.90:
+            return cls.RED
+        else:
+            return cls.FATAL
+
+
+class WatermarkAction(Enum):
+    LOAD_DIRECTLY = "load_directly"
+    RECLAIM_THEN_LOAD = "reclaim_then_load"
+    RESTART_THEN_LOAD = "restart_then_load"
+    QUEUE_AND_WAIT = "queue_and_wait"
 
 
 class ProcessMemoryEnforcer:
@@ -300,13 +330,119 @@ class ProcessMemoryEnforcer:
     def get_status(self) -> dict:
         """Get enforcer status for monitoring endpoints."""
         current = mx.get_active_memory() if self._running else 0
+        utilization = current / self._max_bytes if self._max_bytes > 0 else 0.0
         return {
             "enabled": self._running,
             "max_bytes": self._max_bytes,
             "max_formatted": _format_gb(self._max_bytes),
             "current_bytes": current,
             "current_formatted": _format_gb(current),
-            "utilization": (
-                current / self._max_bytes if self._max_bytes > 0 else 0.0
-            ),
+            "utilization": utilization,
+            "watermark": MemoryWatermark.from_utilization(utilization).value,
         }
+
+    def get_watermark_level(self) -> MemoryWatermark:
+        """Get current memory watermark level."""
+        if self._max_bytes <= 0:
+            return MemoryWatermark.GREEN
+        current = mx.get_active_memory()
+        utilization = current / self._max_bytes
+        return MemoryWatermark.from_utilization(utilization)
+
+    def get_memory_diagnostics(self) -> dict:
+        """Get comprehensive memory diagnostics."""
+        current = mx.get_active_memory()
+        peak = mx.get_peak_memory()
+        cache = mx.get_cache_memory()
+        model_est = self._engine_pool.current_model_memory
+        utilization = current / self._max_bytes if self._max_bytes > 0 else 0.0
+        watermark = MemoryWatermark.from_utilization(utilization)
+        return {
+            "active_gb": round(current / 1024**3, 2),
+            "peak_gb": round(peak / 1024**3, 2),
+            "cache_gb": round(cache / 1024**3, 2),
+            "model_est_gb": round(model_est / 1024**3, 2),
+            "loaded_models": self._engine_pool.loaded_model_count,
+            "limit_gb": round(self._max_bytes / 1024**3, 2),
+            "utilization_pct": round(utilization * 100, 1),
+            "watermark": watermark.value,
+        }
+
+    async def pre_load_check(
+        self, new_model_size_bytes: int, engine_type: str = "batched",
+    ) -> tuple:
+        """
+        Pre-load memory safety check.
+
+        Deducts reclaimable Metal cache from current usage and scales
+        runtime overhead by engine type for more accurate projections.
+
+        Returns (WatermarkAction, diagnostics_dict).
+        """
+        current_active = mx.get_active_memory()
+        current_cache = mx.get_cache_memory()
+        effective_current = current_active - current_cache
+
+        if engine_type in ("embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"):
+            overhead_pct = 0.05
+        else:
+            overhead_pct = max(0.10, min(0.25, 0.30 - new_model_size_bytes / (200 * 1024**3)))
+        runtime_overhead = int(new_model_size_bytes * overhead_pct)
+
+        projected = effective_current + new_model_size_bytes + runtime_overhead
+        utilization = projected / self._max_bytes if self._max_bytes > 0 else 0.0
+        watermark = MemoryWatermark.from_utilization(utilization)
+
+        diagnostics = {
+            "current_gb": round(current_active / 1024**3, 2),
+            "cache_gb": round(current_cache / 1024**3, 2),
+            "effective_current_gb": round(effective_current / 1024**3, 2),
+            "new_model_gb": round(new_model_size_bytes / 1024**3, 2),
+            "overhead_gb": round(runtime_overhead / 1024**3, 2),
+            "overhead_pct": round(overhead_pct * 100, 1),
+            "projected_gb": round(projected / 1024**3, 2),
+            "limit_gb": round(self._max_bytes / 1024**3, 2),
+            "utilization_pct": round(utilization * 100, 1),
+            "watermark": watermark.value,
+            "loaded_model_count": self._engine_pool.loaded_model_count,
+        }
+
+        action_map = {
+            MemoryWatermark.GREEN: WatermarkAction.LOAD_DIRECTLY,
+            MemoryWatermark.YELLOW: WatermarkAction.RECLAIM_THEN_LOAD,
+            MemoryWatermark.RED: WatermarkAction.RESTART_THEN_LOAD,
+            MemoryWatermark.FATAL: WatermarkAction.QUEUE_AND_WAIT,
+        }
+        return action_map[watermark], diagnostics
+
+    async def emergency_reclaim(self) -> bool:
+        """
+        Emergency memory reclaim: aggressive GC + Metal cache clear.
+
+        Uses the dedicated MLX executor to avoid concurrent Metal operations.
+        Returns True if memory dropped.
+        """
+        logger.warning("Performing emergency memory reclaim...")
+        loop = asyncio.get_running_loop()
+        before = mx.get_active_memory()
+
+        for _i in range(3):
+            gc.collect()
+            await loop.run_in_executor(
+                get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+            )
+            await asyncio.sleep(1.0)
+
+        gc.collect()
+        await loop.run_in_executor(
+            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+        )
+        await asyncio.sleep(2.0)
+        after = mx.get_active_memory()
+
+        freed = before - after
+        logger.info(
+            f"Emergency reclaim complete: freed {_format_gb(freed)} "
+            f"({_format_gb(before)} -> {_format_gb(after)})"
+        )
+        return after < before

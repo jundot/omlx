@@ -625,3 +625,42 @@ class TestLifecycle:
             assert status["enabled"] is True
             assert status["current_bytes"] == 5 * 1024**3
             await enforcer.stop()
+
+
+class TestMemoryWatermark:
+    """Tests for MemoryWatermark enum."""
+
+    def test_green_zone(self):
+        from omlx.process_memory_enforcer import MemoryWatermark
+        assert MemoryWatermark.from_utilization(0.0) == MemoryWatermark.GREEN
+        assert MemoryWatermark.from_utilization(0.5) == MemoryWatermark.GREEN
+        assert MemoryWatermark.from_utilization(0.64) == MemoryWatermark.GREEN
+
+    def test_yellow_zone(self):
+        from omlx.process_memory_enforcer import MemoryWatermark
+        assert MemoryWatermark.from_utilization(0.65) == MemoryWatermark.YELLOW
+        assert MemoryWatermark.from_utilization(0.75) == MemoryWatermark.YELLOW
+        assert MemoryWatermark.from_utilization(0.79) == MemoryWatermark.YELLOW
+
+    def test_red_zone(self):
+        from omlx.process_memory_enforcer import MemoryWatermark
+        assert MemoryWatermark.from_utilization(0.80) == MemoryWatermark.RED
+        assert MemoryWatermark.from_utilization(0.85) == MemoryWatermark.RED
+        assert MemoryWatermark.from_utilization(0.89) == MemoryWatermark.RED
+
+    def test_fatal_zone(self):
+        from omlx.process_memory_enforcer import MemoryWatermark
+        assert MemoryWatermark.from_utilization(0.90) == MemoryWatermark.FATAL
+        assert MemoryWatermark.from_utilization(1.0) == MemoryWatermark.FATAL
+        assert MemoryWatermark.from_utilization(1.5) == MemoryWatermark.FATAL
+
+
+class TestWatermarkAction:
+    """Tests for WatermarkAction enum values."""
+
+    def test_action_values(self):
+        from omlx.process_memory_enforcer import WatermarkAction
+        assert WatermarkAction.LOAD_DIRECTLY.value == "load_directly"
+        assert WatermarkAction.RECLAIM_THEN_LOAD.value == "reclaim_then_load"
+        assert WatermarkAction.RESTART_THEN_LOAD.value == "restart_then_load"
+        assert WatermarkAction.QUEUE_AND_WAIT.value == "queue_and_wait"

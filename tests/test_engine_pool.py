@@ -523,6 +523,106 @@ class TestEnginePoolLRU:
         # model-a is skipped (pinned), model-b is selected
         assert victim == "model-b"
 
+    def test_find_lru_victim_skips_active_requests(self, pool_with_entries):
+        """Test that models with active requests are skipped during eviction."""
+        # model-a has active requests
+        mock_engine_a = MagicMock()
+        mock_engine_a.has_active_requests.return_value = True
+        pool_with_entries._entries["model-a"].engine = mock_engine_a
+        pool_with_entries._entries["model-a"].last_access = 50  # Older
+
+        # model-b has no active requests
+        mock_engine_b = MagicMock()
+        mock_engine_b.has_active_requests.return_value = False
+        pool_with_entries._entries["model-b"].engine = mock_engine_b
+        pool_with_entries._entries["model-b"].last_access = 200  # Newer
+
+        victim = pool_with_entries._find_lru_victim()
+        # model-a skipped (active requests), model-b selected
+        assert victim == "model-b"
+
+    def test_find_lru_victim_exclude_set(self, pool_with_entries):
+        """Test that excluded models are skipped during eviction."""
+        mock_engine_a = MagicMock()
+        mock_engine_a.has_active_requests.return_value = False
+        pool_with_entries._entries["model-a"].engine = mock_engine_a
+        pool_with_entries._entries["model-a"].last_access = 50
+
+        mock_engine_b = MagicMock()
+        mock_engine_b.has_active_requests.return_value = False
+        pool_with_entries._entries["model-b"].engine = mock_engine_b
+        pool_with_entries._entries["model-b"].last_access = 200
+
+        victim = pool_with_entries._find_lru_victim(exclude={"model-a"})
+        assert victim == "model-b"
+
+    def test_find_lru_victim_all_active(self, pool_with_entries):
+        """Test that None is returned when all models have active requests."""
+        for mid in ("model-a", "model-b"):
+            mock_engine = MagicMock()
+            mock_engine.has_active_requests.return_value = True
+            pool_with_entries._entries[mid].engine = mock_engine
+            pool_with_entries._entries[mid].last_access = 100
+
+        victim = pool_with_entries._find_lru_victim()
+        assert victim is None
+
+    def test_find_lru_victim_no_has_active_requests(self, pool_with_entries):
+        """Test graceful handling when engine lacks has_active_requests."""
+        mock_engine = MagicMock(spec=[])  # No has_active_requests
+        pool_with_entries._entries["model-a"].engine = mock_engine
+        pool_with_entries._entries["model-a"].last_access = 100
+
+        victim = pool_with_entries._find_lru_victim()
+        assert victim == "model-a"
+
+
+class TestEnginePoolRestartState:
+    """Tests for restart request tracking."""
+
+    @pytest.fixture
+    def pool(self, small_mock_model_dir):
+        pool = EnginePool()
+        pool.discover_models(str(small_mock_model_dir))
+        return pool
+
+    def test_restart_defaults(self, pool):
+        """Test that restart state starts clean."""
+        assert pool.restart_requested is False
+        assert pool.restart_reason == ""
+
+    def test_request_and_clear_restart(self, pool):
+        """Test request/clear restart cycle."""
+        pool.request_restart("memory barrier timeout")
+        assert pool.restart_requested is True
+        assert "memory barrier" in pool.restart_reason
+
+        pool.clear_restart_request()
+        assert pool.restart_requested is False
+        assert pool.restart_reason == ""
+
+    def test_last_eviction_default(self, pool):
+        """Test that last_eviction starts as None."""
+        assert pool.last_eviction is None
+
+    def test_get_loaded_model_details_empty(self, pool):
+        """Test model details when nothing loaded."""
+        details = pool.get_loaded_model_details()
+        assert details == []
+
+    def test_get_loaded_model_details_with_loaded(self, pool):
+        """Test model details with loaded models."""
+        mock_engine = MagicMock()
+        mock_engine.has_active_requests.return_value = False
+        pool._entries["model-a"].engine = mock_engine
+        pool._entries["model-a"].last_access = 1000.0
+
+        details = pool.get_loaded_model_details()
+        assert len(details) == 1
+        assert details[0]["id"] == "model-a"
+        assert "est_gb" in details[0]
+        assert details[0]["active_requests"] is False
+
 
 class TestEnginePoolAsync:
     """Async tests for EnginePool (mocked)."""

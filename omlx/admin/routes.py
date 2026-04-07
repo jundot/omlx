@@ -1393,6 +1393,72 @@ async def reload_models(is_admin: bool = Depends(require_admin)):
     raise HTTPException(status_code=500, detail=message)
 
 
+@router.get("/api/restart-status")
+async def get_restart_status(is_admin: bool = Depends(require_admin)):
+    """Get engine restart status and memory diagnostics."""
+    from datetime import datetime, timezone
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    import mlx.core as mx
+    active = mx.get_active_memory()
+    peak = mx.get_peak_memory()
+    cache = mx.get_cache_memory()
+    effective_active = active - cache
+
+    enforcer = getattr(engine_pool, '_process_memory_enforcer', None)
+    watermark_str = "unknown"
+    utilization_pct = 0.0
+    limit_gb = 0.0
+    if enforcer and hasattr(enforcer, '_max_bytes') and enforcer._max_bytes > 0:
+        utilization_pct = round(active / enforcer._max_bytes * 100, 1)
+        limit_gb = round(enforcer._max_bytes / 1024**3, 2)
+        from ..process_memory_enforcer import MemoryWatermark
+        watermark_str = MemoryWatermark.from_utilization(active / enforcer._max_bytes).value
+
+    return {
+        "restart_requested": engine_pool.restart_requested,
+        "restart_reason": engine_pool.restart_reason,
+        "memory": {
+            "active_gb": round(active / 1024**3, 2),
+            "peak_gb": round(peak / 1024**3, 2),
+            "cache_gb": round(cache / 1024**3, 2),
+            "effective_active_gb": round(effective_active / 1024**3, 2),
+            "model_est_gb": round(engine_pool.current_model_memory / 1024**3, 2),
+            "loaded_models": engine_pool.loaded_model_count,
+            "watermark": watermark_str,
+            "utilization_pct": utilization_pct,
+            "limit_gb": limit_gb,
+            "loaded_model_details": engine_pool.get_loaded_model_details(),
+        },
+        "last_eviction": engine_pool.last_eviction,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.post("/api/restart-engine")
+async def restart_engine(is_admin: bool = Depends(require_admin)):
+    """Request or clear engine restart flag."""
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    was_requested = engine_pool.restart_requested
+    reason = engine_pool.restart_reason
+
+    if was_requested:
+        logger.warning(f"Restart requested: {reason}")
+        engine_pool.clear_restart_request()
+
+    return {
+        "status": "ok",
+        "restart_was_requested": was_requested,
+        "reason": reason,
+        "message": "Restart flag cleared. For actual restart, terminate and restart omlx.",
+    }
+
+
 @router.put("/api/models/{model_id}/settings")
 async def update_model_settings(
     model_id: str,

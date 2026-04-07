@@ -95,6 +95,9 @@ class EnginePool:
         self._process_memory_enforcer: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
+        self._restart_requested: bool = False
+        self._restart_reason: str = ""
+        self._last_eviction: dict | None = None
 
     @property
     def max_model_memory(self) -> int | None:
@@ -115,6 +118,52 @@ class EnginePool:
     def loaded_model_count(self) -> int:
         """Number of currently loaded models."""
         return sum(1 for e in self._entries.values() if e.engine is not None)
+
+    @property
+    def restart_requested(self) -> bool:
+        """True if memory barrier timed out and restart is needed."""
+        return self._restart_requested
+
+    @property
+    def restart_reason(self) -> str:
+        """Reason for the last restart request."""
+        return self._restart_reason
+
+    @property
+    def last_eviction(self) -> dict | None:
+        """Last eviction event details."""
+        return self._last_eviction
+
+    def get_loaded_model_details(self) -> list[dict]:
+        """Get details of all currently loaded models."""
+        now = time.time()
+        details = []
+        for mid, e in self._entries.items():
+            if e.engine is not None:
+                has_active = False
+                try:
+                    has_active = e.engine.has_active_requests()
+                except AttributeError:
+                    pass
+                details.append({
+                    "id": mid,
+                    "est_gb": round(e.estimated_size / 1024**3, 2),
+                    "last_access_ago_s": round(now - e.last_access, 1) if e.last_access > 0 else None,
+                    "is_pinned": e.is_pinned,
+                    "engine_type": e.engine_type,
+                    "active_requests": has_active,
+                })
+        return details
+
+    def request_restart(self, reason: str = "manual") -> None:
+        """Request engine restart."""
+        self._restart_requested = True
+        self._restart_reason = reason
+
+    def clear_restart_request(self) -> None:
+        """Clear restart request after restart is completed."""
+        self._restart_requested = False
+        self._restart_reason = ""
 
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None
@@ -403,6 +452,113 @@ class EnginePool:
                             ),
                         )
 
+            # Pre-load watermark check with hot-cache LRU eviction
+            if self._process_memory_enforcer is not None:
+                enforcer = self._process_memory_enforcer
+                if hasattr(enforcer, 'pre_load_check'):
+                    action, diagnostics = await enforcer.pre_load_check(
+                        entry.estimated_size, engine_type=entry.engine_type,
+                    )
+                    watermark_before = diagnostics.get('watermark', 'unknown')
+                    logger.info(
+                        f"Pre-load check: model={model_id} "
+                        f"watermark={watermark_before} "
+                        f"projected={diagnostics.get('projected_gb', '?')}GB "
+                        f"effective={diagnostics.get('effective_current_gb', '?')}GB "
+                        f"overhead={diagnostics.get('overhead_pct', '?')}% "
+                        f"action={action.value}"
+                    )
+
+                    evicted_models = []
+                    freed_est_gb = 0.0
+
+                    # Phase 1: Evict LRU non-active models to lower watermark
+                    if action.value in (
+                        "reclaim_then_load", "restart_then_load", "queue_and_wait",
+                    ):
+                        candidates_info = []
+                        now = time.time()
+                        for mid, e in self._entries.items():
+                            if e.engine is None or e.is_pinned:
+                                continue
+                            has_active = False
+                            try:
+                                has_active = e.engine.has_active_requests()
+                            except AttributeError:
+                                pass
+                            candidates_info.append({
+                                "model": mid,
+                                "est_gb": round(e.estimated_size / 1024**3, 1),
+                                "idle_s": round(now - e.last_access, 0) if e.last_access > 0 else None,
+                                "active_reqs": has_active,
+                                "evictable": not has_active,
+                            })
+                        logger.info(f"Eviction candidates: {candidates_info}")
+
+                        while True:
+                            victim = self._find_lru_victim()
+                            if victim is None:
+                                break
+                            victim_entry = self._entries.get(victim)
+                            victim_gb = round(
+                                victim_entry.estimated_size / 1024**3, 2,
+                            ) if victim_entry else 0
+                            logger.info(
+                                f"Evicting LRU model '{victim}' "
+                                f"(est={victim_gb}GB) to lower watermark"
+                            )
+                            await self._unload_engine(victim)
+                            evicted_models.append(victim)
+                            freed_est_gb += victim_gb
+                            from datetime import datetime, timezone
+                            self._last_eviction = {
+                                "model": victim,
+                                "reason": f"watermark_{watermark_before}",
+                                "freed_est_gb": victim_gb,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            }
+                            action, diagnostics = await enforcer.pre_load_check(
+                                entry.estimated_size, engine_type=entry.engine_type,
+                            )
+                            new_wm = diagnostics.get('watermark', 'unknown')
+                            logger.info(
+                                f"After evicting '{victim}': "
+                                f"watermark={new_wm} "
+                                f"projected={diagnostics.get('projected_gb', '?')}GB"
+                            )
+                            if action.value in ("load_directly", "reclaim_then_load"):
+                                break
+
+                    # Phase 2: Lightweight emergency reclaim if still elevated
+                    if action.value in (
+                        "reclaim_then_load", "restart_then_load", "queue_and_wait",
+                    ):
+                        await enforcer.emergency_reclaim()
+                        action, diagnostics = await enforcer.pre_load_check(
+                            entry.estimated_size, engine_type=entry.engine_type,
+                        )
+
+                    # Phase 3: Flag restart only if still red/fatal after all efforts
+                    watermark_after = diagnostics.get('watermark', 'unknown')
+                    if action.value in ("restart_then_load", "queue_and_wait"):
+                        self._restart_requested = True
+                        self._restart_reason = (
+                            f"Watermark {watermark_after.upper()} for model {model_id}: "
+                            f"projected={diagnostics.get('projected_gb', '?')}GB"
+                        )
+                        logger.error(
+                            f"RESTART RECOMMENDED before loading {model_id}"
+                        )
+
+                    logger.info(
+                        f"Pre-load summary: "
+                        f"watermark_before={watermark_before} "
+                        f"watermark_after={watermark_after} "
+                        f"evicted={evicted_models} "
+                        f"freed_est_gb={freed_est_gb} "
+                        f"restart_requested={self._restart_requested}"
+                    )
+
             # Now load the model
             await self._load_engine(model_id, force_lm=force_lm)
 
@@ -435,18 +591,34 @@ class EnginePool:
                 )
             await self._unload_engine(victim)
 
-    def _find_lru_victim(self) -> str | None:
+    def _find_lru_victim(self, exclude: set[str] | None = None) -> str | None:
         """
         Find the least recently used non-pinned loaded model.
 
+        Skips models with active inference requests to avoid interrupting
+        in-flight generation.
+
+        Args:
+            exclude: Optional set of model IDs to skip
+
         Returns:
-            Model ID of the LRU victim, or None if all models are pinned
+            Model ID of the LRU victim, or None if no evictable model found
         """
-        candidates = [
-            (e.last_access, mid)
-            for mid, e in self._entries.items()
-            if e.engine is not None and not e.is_pinned
-        ]
+        candidates = []
+        for mid, e in self._entries.items():
+            if e.engine is None or e.is_pinned:
+                continue
+            if exclude and mid in exclude:
+                continue
+            try:
+                if e.engine.has_active_requests():
+                    logger.debug(
+                        f"Skipping victim '{mid}': has active requests"
+                    )
+                    continue
+            except AttributeError:
+                pass
+            candidates.append((e.last_access, mid))
         if not candidates:
             return None
         candidates.sort()  # Sort by last_access (oldest first)
@@ -454,9 +626,10 @@ class EnginePool:
 
     async def _unload_engine(self, model_id: str) -> None:
         """
-        Immediately stop and unload an engine.
+        Immediately stop and unload an engine with memory settle barrier.
 
-        This aborts any in-progress requests.
+        After stopping the engine, polls mx.get_active_memory() to verify
+        Metal buffers are actually reclaimed before proceeding.
 
         Args:
             model_id: The model ID to unload
@@ -466,34 +639,92 @@ class EnginePool:
             return
 
         logger.info(f"Unloading model: {model_id} (immediate abort)")
+        pre_unload_active = mx.get_active_memory()
 
         try:
             await entry.engine.stop()
         except Exception as e:
             logger.warning(f"Error stopping engine for {model_id}: {e}")
 
-        # Release memory tracking
-        self._current_model_memory -= entry.estimated_size
-
-        # Clear engine reference
+        # Clear engine reference before settle barrier
         entry.engine = None
         entry.last_access = 0.0
 
-        # Force garbage collection to release memory.
-        # Run mx.clear_cache on the global MLX executor to avoid concurrent
-        # Metal operations with running engines. See issue #85.
-        # Synchronize before clearing to prevent releasing Metal buffers
-        # still referenced by in-flight command buffers. See issue #300.
-        gc.collect()
+        # Force Metal memory cleanup
         loop = asyncio.get_running_loop()
+        gc.collect()
         await loop.run_in_executor(
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
 
-        logger.info(
-            f"Unloaded model: {model_id}, "
-            f"memory usage: {format_size(self._current_model_memory)}"
-        )
+        # Memory settle barrier: verify actual freed memory
+        settle_tolerance = 2 * 1024**3  # 2 GB tolerance
+        min_expected_freed = max(0, entry.estimated_size - settle_tolerance)
+        settled = False
+        for _settle_round in range(10):
+            active_now = mx.get_active_memory()
+            actual_freed = pre_unload_active - active_now
+            if actual_freed >= min_expected_freed:
+                settled = True
+                logger.debug(
+                    f"Settle round {_settle_round + 1} for '{model_id}': "
+                    f"freed={format_size(actual_freed)} "
+                    f"(need>={format_size(min_expected_freed)}) — settled"
+                )
+                break
+            logger.debug(
+                f"Settle round {_settle_round + 1} for '{model_id}': "
+                f"freed={format_size(actual_freed)} "
+                f"(need>={format_size(min_expected_freed)}) — retry"
+            )
+            await asyncio.sleep(0.5)
+            gc.collect()
+            await loop.run_in_executor(
+                get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+            )
+
+        # Release memory tracking AFTER barrier
+        self._current_model_memory -= entry.estimated_size
+
+        if settled:
+            logger.info(
+                f"Unloaded model: {model_id}, "
+                f"freed={format_size(actual_freed)} "
+                f"(expected>={format_size(min_expected_freed)}), "
+                f"active_memory: {format_size(active_now)} (settled)"
+            )
+        else:
+            logger.warning(
+                f"Settle barrier timed out for '{model_id}': "
+                f"freed={format_size(actual_freed)} "
+                f"(need>={format_size(min_expected_freed)}), "
+                f"pre_unload={format_size(pre_unload_active)}, "
+                f"active_now={format_size(active_now)}"
+            )
+            # Emergency reclaim: 3 more rounds of aggressive GC + clear
+            for _emergency_round in range(3):
+                gc.collect()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
+                await asyncio.sleep(1.0)
+            active_after_emergency = mx.get_active_memory()
+            if active_after_emergency > self._current_model_memory + 5 * 1024**3:
+                logger.error(
+                    f"Emergency reclaim failed: active_memory={format_size(active_after_emergency)} "
+                    f"still exceeds safe threshold. Setting restart_requested."
+                )
+                self._restart_requested = True
+                self._restart_reason = (
+                    f"Memory barrier timeout: active={format_size(active_after_emergency)}, "
+                    f"expected<={format_size(self._current_model_memory + 5 * 1024**3)}"
+                )
+            else:
+                logger.info(
+                    f"Emergency reclaim succeeded: "
+                    f"active_memory={format_size(active_after_emergency)}"
+                )
 
     async def _load_engine(self, model_id: str, force_lm: bool = False) -> None:
         """
