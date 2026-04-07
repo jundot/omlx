@@ -50,10 +50,10 @@ class _AttentionCapture:
         self._query_buffer = query_buffer
         self._query_extractor = query_extractor
 
-    def __call__(self, x, mask=None, cache=None):
+    def __call__(self, x, mask=None, cache=None, **kwargs):
         queries = self._query_extractor(self._original, x, cache)
         self._query_buffer[self._buf_idx].append(queries)
-        return self._original(x, mask=mask, cache=cache)
+        return self._original(x, mask=mask, cache=cache, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._original, name)
@@ -143,7 +143,16 @@ def _build_layer_to_cache_map(model) -> Dict[int, int]:
     """Build layer_idx → cache_idx mapping.
 
     Standard models: identity. Nemotron-H: compacted (only M/* layers).
+    Gemma 4: shared-KV layers reuse earlier cache owners via previous_kvs.
     """
+    gemma_previous_kvs = getattr(
+        getattr(getattr(model, "language_model", None), "model", None),
+        "previous_kvs",
+        None,
+    )
+    if gemma_previous_kvs is not None:
+        return {layer_idx: cache_idx for layer_idx, cache_idx in enumerate(gemma_previous_kvs)}
+
     has_block_type = any(hasattr(layer, "block_type") for layer in model.layers)
     if not has_block_type:
         return {i: i for i in range(len(model.layers))}
@@ -160,7 +169,10 @@ def _build_layer_to_cache_map(model) -> Dict[int, int]:
 
 def _detect_query_extractor(attn_obj) -> Callable:
     """Auto-detect the appropriate query extractor for the model architecture."""
-    if hasattr(attn_obj, "q_norm"):
+    # Qwen3.5 uses a gated q_proj layout with q_norm and num_attention_heads.
+    # Gemma also has q_norm, but follows the standard q_proj reshape path and
+    # exposes n_heads/n_kv_heads instead. Restrict the Qwen-specific branch.
+    if hasattr(attn_obj, "q_norm") and hasattr(attn_obj, "num_attention_heads"):
         return _qwen35_extract_queries
     elif not hasattr(attn_obj, "rope"):
         return _nemotron_h_extract_queries

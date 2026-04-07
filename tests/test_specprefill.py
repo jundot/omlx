@@ -180,6 +180,7 @@ class TestModelTopologyHelpers:
 
         attn = MagicMock()
         attn.q_norm = MagicMock()
+        attn.num_attention_heads = 32
         assert _detect_query_extractor(attn) is _qwen35_extract_queries
 
     def test_detect_query_extractor_llama(self):
@@ -192,6 +193,63 @@ class TestModelTopologyHelpers:
 
         attn = MagicMock(spec=["rope", "q_proj"])
         assert _detect_query_extractor(attn) is _llama_extract_queries
+
+    def test_detect_query_extractor_gemma_with_q_norm(self):
+        from unittest.mock import MagicMock
+
+        from omlx.patches.specprefill import (
+            _detect_query_extractor,
+            _llama_extract_queries,
+        )
+
+        attn = MagicMock(spec=["q_norm", "n_heads", "n_kv_heads", "rope"])
+        attn.q_norm = MagicMock()
+        attn.n_heads = 8
+        attn.n_kv_heads = 4
+        attn.rope = MagicMock()
+        assert _detect_query_extractor(attn) is _llama_extract_queries
+
+    def test_attention_capture_forwards_extra_kwargs(self):
+        from unittest.mock import MagicMock
+
+        from omlx.patches.specprefill import _AttentionCapture
+
+        captured = []
+
+        def _extractor(attn, x, cache=None):
+            return "queries"
+
+        original = MagicMock(return_value="result")
+        wrapper = _AttentionCapture(original, 0, [captured], _extractor)
+
+        out = wrapper("x", mask="m", cache="c", shared_kv="skv", offset=7)
+
+        assert out == "result"
+        assert captured == ["queries"]
+        original.assert_called_once_with(
+            "x", mask="m", cache="c", shared_kv="skv", offset=7
+        )
+
+    def test_build_layer_to_cache_map_gemma_shared_kv(self):
+        from types import SimpleNamespace
+
+        from omlx.patches.specprefill import _build_layer_to_cache_map
+
+        previous_kvs = [0, 1, 2, 2, 3]
+        model = SimpleNamespace(
+            layers=[object() for _ in previous_kvs],
+            language_model=SimpleNamespace(
+                model=SimpleNamespace(previous_kvs=previous_kvs)
+            ),
+        )
+
+        assert _build_layer_to_cache_map(model) == {
+            0: 0,
+            1: 1,
+            2: 2,
+            3: 2,
+            4: 3,
+        }
 
 
 class TestRoPEWrappers:
