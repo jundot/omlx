@@ -2168,6 +2168,8 @@ class Scheduler:
                 if request.vlm_cache_key_ranges
                 else None
             )
+            # Segmented VLM ranges take precedence when present; extra_keys is
+            # retained as the legacy whole-prompt fallback for non-segmented cases.
 
             block_table, remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
@@ -3325,6 +3327,8 @@ class Scheduler:
                                     if request.vlm_cache_key_ranges
                                     else None
                                 )
+                                # Segmented VLM ranges take precedence when present;
+                                # extra_keys remains the legacy fallback.
 
                                 block_table = self.block_aware_cache.store_cache(
                                     request_id,

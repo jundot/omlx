@@ -916,11 +916,21 @@ class VLMBatchedEngine(BaseEngine):
             images: List of PIL Image objects
 
         Returns:
-            Tuple of (token_ids, inputs_embeds, extra_kwargs, image_hash):
+            Tuple of (
+                token_ids,
+                inputs_embeds,
+                extra_kwargs,
+                image_hash,
+                image_cache_key_start,
+                image_cache_key_ranges,
+            ):
             - token_ids: List of token IDs for BatchGenerator
             - inputs_embeds: Merged vision+text embeddings (or None if text-only)
             - extra_kwargs: Model-specific kwargs for language model
             - image_hash: SHA256 hash of images for prefix cache
+            - image_cache_key_start: Token index where image-aware cache keying begins
+            - image_cache_key_ranges: Per-image-turn cache key boundaries with
+              cumulative image hashes
         """
         from mlx_vlm.prompt_utils import apply_chat_template
         from mlx_vlm.utils import prepare_inputs
