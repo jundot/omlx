@@ -1171,6 +1171,7 @@ class VLMBatchedEngine(BaseEngine):
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
+            seed=kwargs.get("seed", None),
         )
 
         output = await self._engine.generate(
@@ -1236,6 +1237,7 @@ class VLMBatchedEngine(BaseEngine):
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
+            seed=kwargs.get("seed", None),
         )
 
         # SpecPrefill: pass per-request overrides

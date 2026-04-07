@@ -3003,6 +3003,12 @@ class Scheduler:
             # Build per-request state machine for stop tokens
             sm = self._build_state_machine(request)
 
+            # Set random seed for reproducible generation (best-effort).
+            # This affects global MLX random state, so concurrent requests
+            # may interfere. Matches OpenAI's best-effort seed semantics.
+            if request.sampling_params.seed is not None:
+                mx.random.seed(request.sampling_params.seed)
+
             # Insert into BatchGenerator with pre-filled cache + last token.
             # BatchGenerator only handles decode from here.
             uids = self.batch_generator.insert(

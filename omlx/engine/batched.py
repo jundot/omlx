@@ -410,6 +410,7 @@ class BatchedEngine(BaseEngine):
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
+            seed=kwargs.get("seed", None),
         )
 
         output = await self._engine.generate(
@@ -478,6 +479,7 @@ class BatchedEngine(BaseEngine):
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
+            seed=kwargs.get("seed", None),
         )
 
         # SpecPrefill: pass per-request overrides to engine
