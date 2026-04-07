@@ -21,6 +21,7 @@ from omlx.oq import (
     _build_quant_plan,
     _extract_layer_index,
     _format_size,
+    _forward_layer,
     _get_predicate_bits,
     _is_moe_router,
     _normalize_quant_path,
@@ -708,6 +709,54 @@ class TestLevelBudgetPlan:
         # switch_mlp experts should NOT be boosted
         expert_boosts = [k for k in plan.boost_map if "switch_mlp" in k]
         assert len(expert_boosts) == 0, "Routed experts should stay at base bits"
+
+
+# =============================================================================
+# Test _forward_layer tuple unwrapping
+# =============================================================================
+
+
+class TestForwardLayer:
+    """Test _forward_layer tuple unwrapping for Gemma4/Hunyuan-style models."""
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_returns_tensor_when_block_returns_tensor(self):
+        tensor = mx.ones((2, 4, 8))
+        block = lambda x, mask, cache, pos: x * 2
+        result = _forward_layer(block, tensor, None, None)
+        assert isinstance(result, mx.array)
+        assert result.shape == (2, 4, 8)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_unwraps_3tuple_gemma4_style(self):
+        tensor = mx.ones((2, 4, 8))
+        block = lambda x, mask, cache, pos: (x * 2, None, 0)
+        result = _forward_layer(block, tensor, None, None)
+        assert isinstance(result, mx.array)
+        assert result.shape == (2, 4, 8)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_unwraps_2tuple_hunyuan_style(self):
+        tensor = mx.ones((2, 4, 8))
+        block = lambda x, mask, cache, pos: (x * 2, None)
+        result = _forward_layer(block, tensor, None, None)
+        assert isinstance(result, mx.array)
+        assert result.shape == (2, 4, 8)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_returns_none_when_all_signatures_fail(self):
+        def bad_block(*args, **kwargs):
+            raise TypeError("unsupported")
+        result = _forward_layer(bad_block, mx.ones((2, 4)), None, None)
+        assert result is None
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_fallback_signature_with_tuple(self):
+        tensor = mx.ones((2, 4, 8))
+        def block_only_one_arg(x):
+            return (x * 3, {"cache": True})
+        result = _forward_layer(block_only_one_arg, tensor, None, None)
+        assert isinstance(result, mx.array)
 
 
 # =============================================================================

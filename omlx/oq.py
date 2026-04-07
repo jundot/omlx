@@ -1580,7 +1580,10 @@ def _forward_layer(block, inputs, mask, position_ids):
         (inputs,),
     ]:
         try:
-            return block(*call_args)
+            result = block(*call_args)
+            if isinstance(result, tuple):
+                result = result[0]
+            return result
         except (TypeError, ValueError, RuntimeError, AttributeError) as e:
             last_exc = e
             continue
