@@ -10,7 +10,7 @@ request management system, simplified for MLX backend.
 import enum
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from .cache.paged_cache import BlockTable
@@ -140,6 +140,8 @@ class Request:
     vlm_inputs_embeds: Optional[Any] = None  # Pre-computed vision+text embeddings (mx.array)
     vlm_extra_kwargs: Optional[Dict[str, Any]] = None  # Model-specific kwargs (e.g., position_ids)
     vlm_image_hash: Optional[str] = None  # SHA256 hash of images for prefix cache
+    vlm_cache_key_start: int = 0  # Token index where image-specific cache keying starts
+    vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = None  # [(token_start, cumulative_image_hash)]
 
     # Metadata
     finish_reason: Optional[str] = None

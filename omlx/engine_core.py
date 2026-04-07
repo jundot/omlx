@@ -18,7 +18,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Set, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, Union
 
 import mlx.core as mx
 
@@ -253,6 +253,8 @@ class EngineCore:
         vlm_inputs_embeds: Optional[Any] = None,
         vlm_extra_kwargs: Optional[Dict[str, Any]] = None,
         vlm_image_hash: Optional[str] = None,
+        vlm_cache_key_start: int = 0,
+        vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = None,
         specprefill: Optional[bool] = None,
         specprefill_keep_pct: Optional[float] = None,
         specprefill_threshold: Optional[int] = None,
@@ -292,6 +294,8 @@ class EngineCore:
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
+            vlm_cache_key_start=vlm_cache_key_start,
+            vlm_cache_key_ranges=vlm_cache_key_ranges,
         )
 
         # SpecPrefill: resolve per-request settings.
