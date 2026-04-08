@@ -118,6 +118,8 @@ class TTSEngine(BaseNonStreamingEngine):
         voice: Optional[str] = None,
         speed: float = 1.0,
         instructions: Optional[str] = None,
+        ref_audio: Optional[str] = None,
+        ref_text: Optional[str] = None,
         **kwargs,
     ) -> bytes:
         """
@@ -139,8 +141,9 @@ class TTSEngine(BaseNonStreamingEngine):
         import time
 
         logger.info(
-            "TTS synthesize: model=%s, text_len=%d, voice=%s, speed=%.1f",
+            "TTS synthesize: model=%s, text_len=%d, voice=%s, speed=%.1f, ref_audio=%s",
             self._model_name, len(text), voice, speed,
+            "yes" if ref_audio else "no",
         )
 
         model = self._model
@@ -168,6 +171,9 @@ class TTSEngine(BaseNonStreamingEngine):
                 gen_kwargs["instruct"] = instructions
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
+            if ref_audio is not None and "ref_audio" in gen_params:
+                gen_kwargs["ref_audio"] = ref_audio
+                gen_kwargs["ref_text"] = ref_text
             gen_kwargs.update(kwargs)
 
             results = model.generate(**gen_kwargs)

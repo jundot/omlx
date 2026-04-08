@@ -411,6 +411,71 @@ class TestTTSVoiceRouting:
 
 
 # ---------------------------------------------------------------------------
+# TestTTSVoiceClonePassthrough — unit tests for ref_audio/ref_text passthrough
+# ---------------------------------------------------------------------------
+
+
+class TestTTSVoiceClonePassthrough:
+    """Verify ref_audio and ref_text are forwarded to model.generate()."""
+
+    @pytest.fixture
+    def _run_synthesize_clone(self):
+        """Helper: run TTSEngine.synthesize with ref_audio/ref_text and return generate() kwargs."""
+        import asyncio
+        from omlx.engine.tts import TTSEngine
+
+        def _run(ref_audio_path=None, ref_text=None):
+            engine = TTSEngine("test-model")
+
+            mock_model = MagicMock()
+            import inspect
+            sig_params = {
+                "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                "verbose": inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
+                "voice": inspect.Parameter("voice", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
+                "ref_audio": inspect.Parameter("ref_audio", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
+                "ref_text": inspect.Parameter("ref_text", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
+            }
+            mock_model.generate = MagicMock()
+            mock_model.generate.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
+            mock_model.generate.return_value = []
+
+            engine._model = mock_model
+
+            try:
+                asyncio.run(engine.synthesize(
+                    "Hello", ref_audio=ref_audio_path, ref_text=ref_text,
+                ))
+            except RuntimeError:
+                pass  # "no audio output" expected
+
+            return mock_model.generate.call_args
+
+        return _run
+
+    def test_ref_audio_passed_to_generate(self, _run_synthesize_clone):
+        """ref_audio path is forwarded to model.generate()."""
+        call = _run_synthesize_clone(ref_audio_path="/tmp/ref.wav", ref_text="hello")
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("ref_audio") == "/tmp/ref.wav"
+        assert kwargs.get("ref_text") == "hello"
+
+    def test_ref_audio_none_not_passed(self, _run_synthesize_clone):
+        """When ref_audio is None, neither ref_audio nor ref_text appear in kwargs."""
+        call = _run_synthesize_clone(ref_audio_path=None, ref_text=None)
+        kwargs = call.kwargs if call else {}
+        assert "ref_audio" not in kwargs
+        assert "ref_text" not in kwargs
+
+    def test_ref_audio_without_ref_text(self, _run_synthesize_clone):
+        """ref_audio without ref_text passes ref_audio and ref_text=None."""
+        call = _run_synthesize_clone(ref_audio_path="/tmp/ref.wav", ref_text=None)
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("ref_audio") == "/tmp/ref.wav"
+        assert kwargs.get("ref_text") is None
+
+
+# ---------------------------------------------------------------------------
 # Integration test (slow, requires mlx-audio)
 # ---------------------------------------------------------------------------
 
