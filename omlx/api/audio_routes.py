@@ -8,6 +8,7 @@ This module provides OpenAI-compatible audio endpoints:
 - POST /v1/audio/process         - Speech-to-Speech / audio processing
 """
 
+import base64
 import logging
 import tempfile
 import os
@@ -24,6 +25,9 @@ router = APIRouter()
 
 # Maximum upload size for audio files (100 MB).
 MAX_AUDIO_UPLOAD_BYTES = 100 * 1024 * 1024
+
+# Maximum base64-encoded ref_audio size (~15 MB raw audio, enough for ~60s).
+MAX_REF_AUDIO_BASE64_BYTES = 20 * 1024 * 1024
 
 # Video container extensions that should be routed through ffmpeg decoding.
 # mlx-audio only recognises audio-specific extensions (m4a, aac, ogg, opus),
@@ -172,6 +176,26 @@ async def create_speech(request: AudioSpeechRequest):
     if not request.input:
         raise HTTPException(status_code=400, detail="'input' field must not be empty")
 
+    # --- Validate and decode ref_audio (voice clone) ---
+    audio_bytes = None
+    if request.ref_audio is not None:
+        if len(request.ref_audio) > MAX_REF_AUDIO_BASE64_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"ref_audio exceeds maximum allowed size "
+                    f"({MAX_REF_AUDIO_BASE64_BYTES} bytes base64, "
+                    f"~60 seconds of audio)"
+                ),
+            )
+        try:
+            audio_bytes = base64.b64decode(request.ref_audio, validate=True)
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid base64 encoding in 'ref_audio' field",
+            )
+
     pool = _get_engine_pool()
     resolved_model = _resolve_model(request.model)
 
@@ -193,17 +217,33 @@ async def create_speech(request: AudioSpeechRequest):
             detail=f"Model '{resolved_model}' is not a text-to-speech model",
         )
 
+    ref_audio_path = None
     try:
+        # Write decoded audio to temp file if voice clone requested
+        if audio_bytes is not None:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            ref_audio_path = tmp.name
+            tmp.write(audio_bytes)
+            tmp.close()
+
         wav_bytes = await engine.synthesize(
             request.input,
             voice=request.voice,
             speed=request.speed,
             instructions=request.instructions,
+            ref_audio=ref_audio_path,
+            ref_text=request.ref_text,
         )
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if ref_audio_path and os.path.exists(ref_audio_path):
+            try:
+                os.unlink(ref_audio_path)
+            except OSError:
+                pass
 
     return Response(content=wav_bytes, media_type="audio/wav")
 
