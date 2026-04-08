@@ -239,6 +239,11 @@ async def create_speech(request: AudioSpeechRequest):
             instructions=request.instructions,
             ref_audio=ref_audio_path,
             ref_text=request.ref_text,
+            temperature=request.temperature,
+            top_k=request.top_k,
+            top_p=request.top_p,
+            repetition_penalty=request.repetition_penalty,
+            max_tokens=request.max_tokens,
         )
     except HTTPException:
         raise
