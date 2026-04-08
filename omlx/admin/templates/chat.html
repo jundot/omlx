@@ -735,7 +735,7 @@
 
                         <textarea
                             x-model="inputMessage"
-                            @keydown.enter="if (!isMobile && !$event.shiftKey) { $event.preventDefault(); sendMessage(); }"
+                            @keydown.enter="if (!isMobile && !$event.shiftKey && !$event.isComposing && $event.keyCode !== 229) { $event.preventDefault(); sendMessage(); }"
                             @input="autoResize($event.target)"
                             @paste="handlePaste($event)"
                             :placeholder="isMobile ? window.t('chat.input_placeholder_mobile') : window.t('chat.input_placeholder')"
