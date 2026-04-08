@@ -172,6 +172,11 @@
             hfMirrorEndpoint: '',
             hfMirrorSaving: false,
 
+            // Engine Package Management
+            showEnginePackageModal: false,
+            selectedEnginePackage: null,
+            selectedVersion: null,
+
             // Update check state
             updateAvailable: false,
             latestVersion: null,
@@ -1263,6 +1268,98 @@
                 } catch (err) {
                     console.error('Failed to clear SSD cache:', err);
                     this.showClearSsdCacheConfirm = false;
+                }
+            },
+
+            // Engine package management
+            enginePackageVersions: {},
+            enginePackageLoading: {},
+            enginePackageTask: null,
+            enginePackageTaskInterval: null,
+
+            async fetchAvailableVersions(packageName) {
+                if (this.enginePackageVersions[packageName]) {
+                    return this.enginePackageVersions[packageName];
+                }
+                try {
+                    const response = await fetch(`/admin/api/engine-packages/available?package=${encodeURIComponent(packageName)}`);
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.enginePackageVersions[packageName] = data;
+                        return data;
+                    }
+                } catch (err) {
+                    console.error(`Failed to fetch versions for ${packageName}:`, err);
+                }
+                return { versions: [], latest: '', error: 'Failed to fetch' };
+            },
+
+            async installEnginePackage(packageName, version) {
+                this.enginePackageLoading[packageName] = true;
+                this.enginePackageTask = null;
+                try {
+                    const response = await fetch('/admin/api/engine-packages/install', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ package: packageName, version }),
+                    });
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.enginePackageTask = data.task;
+                        this.startInstallTaskPolling();
+                    }
+                } catch (err) {
+                    console.error(`Failed to install ${packageName}:`, err);
+                } finally {
+                    this.enginePackageLoading[packageName] = false;
+                }
+            },
+
+            startInstallTaskPolling() {
+                if (this.enginePackageTaskInterval) {
+                    clearInterval(this.enginePackageTaskInterval);
+                }
+                this.enginePackageTaskInterval = setInterval(async () => {
+                    try {
+                        const response = await fetch('/admin/api/engine-packages/tasks');
+                        if (response.ok) {
+                            const data = await response.json();
+                            const task = data.tasks.find(t => t.id === this.enginePackageTask?.id);
+                            if (task) {
+                                this.enginePackageTask = task;
+                                if (task.status === 'completed' || task.status === 'failed') {
+                                    clearInterval(this.enginePackageTaskInterval);
+                                    this.enginePackageTaskInterval = null;
+                                    // Refresh stats to show updated versions
+                                    await this.loadStats();
+                                }
+                            }
+                        }
+                    } catch (err) {
+                        console.error('Failed to poll install task:', err);
+                    }
+                }, 1000);
+            },
+
+            closeEnginePackageModal() {
+                this.showEnginePackageModal = false;
+                this.selectedEnginePackage = null;
+                this.selectedVersion = null;
+                if (this.enginePackageTaskInterval) {
+                    clearInterval(this.enginePackageTaskInterval);
+                    this.enginePackageTaskInterval = null;
+                }
+                this.enginePackageTask = null;
+            },
+
+            async openEnginePackageModal(packageName) {
+                this.selectedEnginePackage = packageName;
+                this.selectedVersion = null;
+                this.showEnginePackageModal = true;
+                this.enginePackageTask = null;
+                // Fetch available versions if not cached
+                if (!this.enginePackageVersions[packageName]) {
+                    await this.fetchAvailableVersions(packageName);
                 }
             },
 

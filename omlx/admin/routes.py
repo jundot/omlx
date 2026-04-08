@@ -199,6 +199,13 @@ class MSRetryRequest(BaseModel):
     ms_token: str = ""
 
 
+class EnginePackageInstallRequest(BaseModel):
+    """Request model for installing/updating an engine package."""
+
+    package: str  # e.g., "mlx-vlm"
+    version: str  # e.g., "0.5.0" or "latest" or "git+https://...@commit"
+
+
 class OQStartRequest(BaseModel):
     """Request model for starting an oQ quantization task."""
 
@@ -2770,6 +2777,183 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 
     return {"status": "ok", "total_deleted": total_deleted}
+
+
+# =============================================================================
+# Engine Package Management API Routes
+# =============================================================================
+
+# Track ongoing install tasks
+_install_tasks: dict[str, dict] = {}
+
+
+class EnginePackageInstallTask:
+    """Represents an ongoing package installation task."""
+
+    def __init__(self, package: str, version: str):
+        self.id = f"{package}-{version}-{int(time.time())}"
+        self.package = package
+        self.version = version
+        self.status = "pending"  # pending, running, completed, failed
+        self.output = ""
+        self.error = ""
+        self.started_at: float | None = None
+        self.completed_at: float | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "package": self.package,
+            "version": self.version,
+            "status": self.status,
+            "output": self.output,
+            "error": self.error,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+        }
+
+
+def _fetch_pypi_versions(package_name: str) -> dict:
+    """Fetch available versions for a package from PyPI.
+
+    Returns:
+        dict with keys: "versions" (list), "latest" (str), "error" (str or None)
+    """
+    import requests
+
+    try:
+        resp = requests.get(
+            f"https://pypi.org/pypi/{package_name}/json",
+            timeout=10,
+            headers={"User-Agent": "omlx-admin/1.0"},
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            versions = sorted(
+                data.get("releases", {}).keys(),
+                key=lambda v: [int(x) if x.isdigit() else x for x in v.split(".")],
+                reverse=True,
+            )
+            return {
+                "versions": versions[:50],  # Limit to 50 most recent
+                "latest": data.get("info", {}).get("version", ""),
+                "error": None,
+            }
+        else:
+            return {"versions": [], "latest": "", "error": f"PyPI returned {resp.status_code}"}
+    except Exception as e:
+        return {"versions": [], "latest": "", "error": str(e)}
+
+
+@router.get("/api/engine-packages/available")
+async def get_available_versions(
+    package: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Get available versions for an engine package from PyPI.
+
+    Args:
+        package: Package name (e.g., "mlx-vlm", "mlx-lm")
+    """
+    # Validate package name
+    valid_packages = {"mlx-lm", "mlx-vlm", "mlx-embeddings", "mlx-audio"}
+    if package not in valid_packages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid package. Must be one of: {', '.join(sorted(valid_packages))}",
+        )
+
+    result = _fetch_pypi_versions(package)
+    return result
+
+
+@router.get("/api/engine-packages/tasks")
+async def list_install_tasks(is_admin: bool = Depends(require_admin)):
+    """List all package installation tasks (recent 20)."""
+    global _install_tasks
+    tasks = list(_install_tasks.values())[-20:]
+    return {"tasks": tasks}
+
+
+@router.post("/api/engine-packages/install")
+async def install_engine_package(
+    request: EnginePackageInstallRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Install or update an engine package.
+
+    Args:
+        request: Contains package name and version to install
+    """
+    import subprocess
+
+    valid_packages = {"mlx-lm", "mlx-vlm", "mlx-embeddings", "mlx-audio"}
+    if request.package not in valid_packages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid package. Must be one of: {', '.join(sorted(valid_packages))}",
+        )
+
+    # Create task
+    task = EnginePackageInstallTask(request.package, request.version)
+    global _install_tasks
+    _install_tasks[task.id] = task
+
+    # Run installation in background thread
+    def _run_install():
+        task.status = "running"
+        task.started_at = time.time()
+        _install_tasks[task.id] = task
+
+        try:
+            # Build pip install command
+            if request.version in ("latest", ""):
+                cmd = [sys.executable, "-m", "pip", "install", "-U", request.package]
+            elif request.version.startswith("git+"):
+                cmd = [sys.executable, "-m", "pip", "install", request.version]
+            else:
+                cmd = [sys.executable, "-m", "pip", "install", f"{request.package}=={request.version}"]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,  # 5 minute timeout
+            )
+
+            task.output = result.stdout
+            task.error = result.stderr
+
+            if result.returncode == 0:
+                task.status = "completed"
+            else:
+                task.status = "failed"
+        except subprocess.TimeoutExpired:
+            task.status = "failed"
+            task.error = "Installation timed out (5 minute limit)"
+        except Exception as e:
+            task.status = "failed"
+            task.error = str(e)
+        finally:
+            task.completed_at = time.time()
+            _install_tasks[task.id] = task
+
+    # Run in thread pool to not block the request
+    asyncio.create_task(asyncio.to_thread(_run_install))
+
+    return {"task": task.to_dict()}
+
+
+@router.delete("/api/engine-packages/task/{task_id}")
+async def delete_install_task(
+    task_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Delete a completed install task from history."""
+    global _install_tasks
+    if task_id in _install_tasks:
+        del _install_tasks[task_id]
+    return {"status": "ok"}
 
 
 # =============================================================================
