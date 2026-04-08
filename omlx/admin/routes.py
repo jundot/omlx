@@ -3047,12 +3047,12 @@ async def delete_hf_model(
 
     # Validate path traversal against parent model directory
     try:
-        if not model_path.resolve().is_relative_to(parent_model_dir.resolve()):
+        if not model_path.absolute().is_relative_to(parent_model_dir.absolute()):
             raise HTTPException(status_code=400, detail="Invalid model name")
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid model name")
 
-    if not model_path.is_dir():
+    if not model_path.is_dir() and not model_path.is_symlink():
         raise HTTPException(status_code=400, detail="Not a model directory")
 
     # Unload model if loaded
@@ -3082,11 +3082,15 @@ async def delete_hf_model(
         raise exc_info[1].with_traceback(exc_info[2])
 
     try:
-        if sys.version_info >= (3, 12):
+        if model_path.is_symlink():
+            model_path.unlink()
+            logger.info(f"Deleted model symlink: {model_path}")
+        elif sys.version_info >= (3, 12):
             shutil.rmtree(model_path, onexc=_handle_onexc)
+            logger.info(f"Deleted model directory: {model_path}")
         else:
             shutil.rmtree(model_path, onerror=_handle_onerror)
-        logger.info(f"Deleted model directory: {model_path}")
+            logger.info(f"Deleted model directory: {model_path}")
     except Exception as e:
         logger.error(f"Failed to delete model directory {model_path}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete model: {e}")
