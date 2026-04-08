@@ -1297,7 +1297,7 @@ def quantize_oq_streaming(
             json.dump(index, f, indent=2)
 
     output_config = dict(config)
-    for temp_key in ("_oq_sensitivity_map", "_oq_boost_map", "_oq_use_budget_plan"):
+    for temp_key in ("_oq_sensitivity_map", "_oq_boost_map", "_oq_use_budget_plan", "_oq_non_quantizable"):
         output_config.pop(temp_key, None)
     if text_only:
         for key in ("vision_config", "image_token_id", "video_token_id",
