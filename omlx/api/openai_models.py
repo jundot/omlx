@@ -183,6 +183,8 @@ class ChatCompletionRequest(BaseModel):
     specprefill_keep_pct: Optional[float] = None
     # SpecPrefill: per-request threshold override (min tokens to trigger, None = use model setting)
     specprefill_threshold: Optional[int] = None
+    # Seed for reproducible generation (best-effort)
+    seed: Optional[int] = None
 
     @field_validator("stop", mode="before")
     @classmethod
@@ -256,6 +258,8 @@ class CompletionRequest(BaseModel):
     xtc_threshold: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+    # Seed for reproducible generation (best-effort)
+    seed: Optional[int] = None
 
     @field_validator("stop", mode="before")
     @classmethod

@@ -90,6 +90,10 @@ def universal_quant_predicate(
     """
     path = _normalize_quant_path(path)
 
+    non_quantizable = config.get("_oq_non_quantizable", set())
+    if path in non_quantizable:
+        return False
+
     tc = config.get("text_config", {})
     num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
     num_experts = (
@@ -975,6 +979,40 @@ def _build_model_sanitizer(config: dict):
     return None
 
 
+def _build_non_quantizable_set(config: dict) -> set:
+    """Find module paths with 2D weights that lack to_quantized() support.
+
+    Loads the model class (without real weights) and walks the module tree.
+    Modules like ScaledLinear in Gemma 4 have a weight attribute but no
+    to_quantized(), so they cannot be loaded as QuantizedLinear after
+    quantization. Returns empty set if the model class cannot be loaded.
+    """
+    try:
+        from mlx_lm.utils import _get_classes
+
+        model_class, model_args_class = _get_classes(config)
+        args = model_args_class.from_dict(config)
+        model = model_class(args)
+
+        result = set()
+        for path, module in tree_flatten(
+            model.leaf_modules(), is_leaf=nn.Module.is_module
+        ):
+            if hasattr(module, "weight") and not hasattr(module, "to_quantized"):
+                if getattr(module.weight, "ndim", 0) >= 2:
+                    result.add(_normalize_quant_path(path))
+
+        if result:
+            logger.info(
+                "Non-quantizable modules (no to_quantized): "
+                + ", ".join(sorted(result))
+            )
+        return result
+    except Exception as e:
+        logger.debug(f"Could not build non-quantizable set: {e}")
+        return set()
+
+
 def _get_predicate_bits(tensor_name: str, config: dict, oq_level: int,
                         group_size: int) -> tuple:
     """Get quantization bits, group_size, and mode for a tensor.
@@ -1074,6 +1112,8 @@ def quantize_oq_streaming(
             logger.info(f"oQ{oq_level:g}: sanitize applied, {len(all_weights)} tensors")
         except Exception as e:
             logger.warning(f"Sanitize failed ({e}), using original names")
+
+    config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
 
     cb("loading", 15.0)
 
@@ -1257,7 +1297,7 @@ def quantize_oq_streaming(
             json.dump(index, f, indent=2)
 
     output_config = dict(config)
-    for temp_key in ("_oq_sensitivity_map", "_oq_boost_map", "_oq_use_budget_plan"):
+    for temp_key in ("_oq_sensitivity_map", "_oq_boost_map", "_oq_use_budget_plan", "_oq_non_quantizable"):
         output_config.pop(temp_key, None)
     if text_only:
         for key in ("vision_config", "image_token_id", "video_token_id",
@@ -1580,7 +1620,10 @@ def _forward_layer(block, inputs, mask, position_ids):
         (inputs,),
     ]:
         try:
-            return block(*call_args)
+            result = block(*call_args)
+            if isinstance(result, tuple):
+                result = result[0]
+            return result
         except (TypeError, ValueError, RuntimeError, AttributeError) as e:
             last_exc = e
             continue

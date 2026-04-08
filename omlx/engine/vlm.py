@@ -91,7 +91,6 @@ OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
 }
 
 _video_processor_patched = False
-_gemma4_vision_patched = False
 _gemma4_batched_decode_patched = False
 
 
@@ -118,52 +117,6 @@ def _patch_video_processor_bug():
             logger.debug("Removed video_processor from MODALITY_TO_AUTOPROCESSOR_MAPPING")
 
         _video_processor_patched = True
-    except (ImportError, AttributeError):
-        pass
-
-
-def _patch_gemma4_vision_tower(vlm_model):
-    """Patch Gemma 4 vision tower to handle multi-image with different resolutions.
-
-    mlx-vlm's Gemma 4 vision tower does mx.concatenate(pixel_values, axis=0)
-    when pixel_values is a list, but prepare_inputs() returns a list of numpy
-    ndarrays with different spatial dims when images have different resolutions.
-    This crashes because (a) they're not mx.arrays and (b) different H/W can't
-    be concatenated.
-
-    Fix: process each image through the vision tower individually, then
-    concatenate the output features (which are all (1, max_patches, hidden)).
-    """
-    global _gemma4_vision_patched
-    if _gemma4_vision_patched:
-        return
-
-    try:
-        import mlx.core as mx_local
-
-        from mlx_vlm.models.gemma4 import vision as gemma4_vision
-
-        VisionModel = gemma4_vision.VisionModel
-        original_call = VisionModel.__call__
-
-        def patched_call(self, pixel_values):
-            if isinstance(pixel_values, list):
-                features = []
-                for pv in pixel_values:
-                    if not isinstance(pv, mx_local.array):
-                        pv = mx_local.array(pv)
-                    if pv.ndim == 3:
-                        pv = pv[None]  # (C, H, W) → (1, C, H, W)
-                    features.append(original_call(self, pv))
-                # Concat along patch dim — masked_scatter flattens
-                # source sequentially, so patch order must match
-                # image token order in the input sequence.
-                return mx_local.concatenate(features, axis=1)
-            return original_call(self, pixel_values)
-
-        VisionModel.__call__ = patched_call
-        _gemma4_vision_patched = True
-        logger.debug("Applied Gemma 4 multi-image vision tower patch")
     except (ImportError, AttributeError):
         pass
 
@@ -582,7 +535,6 @@ class VLMBatchedEngine(BaseEngine):
             # when torchvision is not available (extractors is None, `in` fails).
             # oMLX does not support video input, so we skip video processing.
             _patch_video_processor_bug()
-            _patch_gemma4_vision_tower(None)  # patch class before model load
             return vlm_load(self._model_name)
 
         loop = asyncio.get_running_loop()
@@ -1219,6 +1171,7 @@ class VLMBatchedEngine(BaseEngine):
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
+            seed=kwargs.get("seed", None),
         )
 
         output = await self._engine.generate(
@@ -1284,6 +1237,7 @@ class VLMBatchedEngine(BaseEngine):
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
+            seed=kwargs.get("seed", None),
         )
 
         # SpecPrefill: pass per-request overrides
@@ -1292,6 +1246,8 @@ class VLMBatchedEngine(BaseEngine):
             specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
         if kwargs.get("specprefill_keep_pct") is not None:
             specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop("specprefill_keep_pct")
+        if kwargs.get("specprefill_threshold") is not None:
+            specprefill_kwargs["specprefill_threshold"] = kwargs.pop("specprefill_threshold")
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 

@@ -13,7 +13,9 @@
     function dashboard() {
         return {
             // Theme
-            theme: localStorage.getItem('omlx-chat-theme') || 'light',
+            theme: localStorage.getItem('omlx-chat-theme') || 'auto',
+            activeTheme: 'light', // Will be updated by applyTheme
+            systemThemeListener: null,
 
             // Mobile menu
             mobileMenuOpen: false,
@@ -2442,15 +2444,37 @@
                 }
             },
 
-            // Theme toggle
-            toggleTheme() {
-                this.theme = this.theme === 'light' ? 'dark' : 'light';
+            // Theme select
+            setTheme(theme) {
+                this.theme = theme;
                 localStorage.setItem('omlx-chat-theme', this.theme);
                 this.applyTheme();
             },
 
             applyTheme() {
-                document.documentElement.setAttribute('data-theme', this.theme);
+                // Clean up existing listener
+                if (this.systemThemeListener) {
+                    window.matchMedia('(prefers-color-scheme: dark)').removeEventListener('change', this.systemThemeListener);
+                    this.systemThemeListener = null;
+                }
+
+                if (this.theme === 'auto') {
+                    // Detect system theme
+                    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                    this.activeTheme = prefersDark ? 'dark' : 'light';
+                    document.documentElement.setAttribute('data-theme', this.activeTheme);
+
+                    // Add listener for system theme changes
+                    this.systemThemeListener = (e) => {
+                        this.activeTheme = e.matches ? 'dark' : 'light';
+                        document.documentElement.setAttribute('data-theme', this.activeTheme);
+                    };
+                    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', this.systemThemeListener);
+                } else {
+                    // Use explicit theme
+                    this.activeTheme = this.theme;
+                    document.documentElement.setAttribute('data-theme', this.activeTheme);
+                }
             },
 
             // =================================================================

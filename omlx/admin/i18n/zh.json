@@ -41,6 +41,7 @@
   "navbar.dropdown.uploader": "oQ Uploader",
   "navbar.dropdown.global_settings": "全局设置",
   "navbar.dropdown.model_settings": "模型设置",
+  "navbar.theme.auto": "自动",
   "navbar.theme.dark_mode": "深色模式",
   "navbar.theme.light_mode": "浅色模式",
   "navbar.logout": "退出登录",

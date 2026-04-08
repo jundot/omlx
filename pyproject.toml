@@ -29,8 +29,10 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.31.1",
-    # mlx-lm from latest commit (4469ad4)
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@4469ad4",
+    # mlx-lm from commit (dcbf6e3) - Gemma 4 tool call parser + multi-token think/tool support
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@dcbf6e33d135a1b7c6767ca0fe7ebbd23df814a7",
+    # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
+    "regex",
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # transformers version aligned with mlx-lm requirement
@@ -59,8 +61,8 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (90732bd) - optimized TurboQuant Metal kernels (0.85-1.90x baseline)
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@90732bdee6a361ae5003b180dc3c1b17b9d01a80",
+    # mlx-vlm from commit (23e1dff) - Gemma 4 multi-image fix + nested tool parser
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@23e1dffd224488141a4f022b6d21d6a730f11507",
     "Pillow>=9.0.0",
 ]
 
@@ -76,8 +78,11 @@ modelscope = [
     "modelscope>=1.10.0",
 ]
 audio = [
-    # mlx-audio from commit (6408d2a)
-    "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@6408d2a410eb8c57464e07725b92271860199250",
+    # mlx-audio from commit (6408d2a) with tts/stt/sts extras
+    # tts extra: misaki, num2words, spacy, phonemizer-fork, espeakng-loader, sentencepiece
+    # stt extra: tiktoken, mistral-common[audio]
+    # sts extra: tts deps + stt deps + webrtcvad
+    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@6408d2a410eb8c57464e07725b92271860199250",
     "python-multipart>=0.0.5",
 ]
 dev = [
@@ -125,7 +130,7 @@ include = ["omlx*"]
 # mlx-lm is pinned to a git commit; override transitive pins
 # (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
 override-dependencies = [
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@4469ad4",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@dcbf6e33d135a1b7c6767ca0fe7ebbd23df814a7",
 ]
 
 [tool.black]

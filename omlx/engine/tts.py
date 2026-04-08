@@ -71,7 +71,7 @@ class TTSEngine(BaseNonStreamingEngine):
         except ImportError as exc:
             raise ImportError(
                 "mlx-audio is required for TTS inference. "
-                "Install it with: pip install mlx-audio"
+                'Install it with: pip install "omlx[audio]"'
             ) from exc
 
         model_name = self._model_name

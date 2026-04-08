@@ -3,8 +3,8 @@
             <!-- Logo -->
             <div class="flex items-center gap-2">
                 <a href="/admin/dashboard" class="flex items-center gap-2">
-                    <img x-show="theme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX" class="w-9 h-9">
-                    <img x-show="theme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX" class="w-9 h-9" x-cloak>
+                    <img x-show="activeTheme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX" class="w-9 h-9">
+                    <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX" class="w-9 h-9" x-cloak>
                 </a>
                 <div class="flex flex-col gap-0">
                     <a href="/admin/dashboard" class="font-bold tracking-tight text-xl leading-none">oMLX</a>
@@ -220,20 +220,29 @@
                 </a>
             </div>
 
-            <!-- Right: Theme Toggle + Logout -->
+            <!-- Right: Theme Select + Logout -->
             <div class="hidden lg:flex items-center gap-2">
-                <!-- Theme Toggle -->
-                <button
-                    @click="toggleTheme()"
-                    class="p-2 rounded-full transition-all duration-200"
-                    :class="theme === 'dark'
-                        ? 'text-amber-400 hover:bg-neutral-700'
-                        : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
-                    :title="theme === 'light' ? window.t('navbar.theme.dark_mode') : window.t('navbar.theme.light_mode')"
-                >
-                    <i x-show="theme === 'light'" data-lucide="sun" class="w-4 h-4"></i>
-                    <i x-show="theme === 'dark'" data-lucide="moon" class="w-4 h-4" x-cloak></i>
-                </button>
+                <!-- Theme Select -->
+                <div class="relative">
+                    <div class="flex items-center gap-1 p-2 rounded-full transition-all duration-200"
+                         :class="activeTheme === 'dark'
+                            ? 'text-amber-400 hover:bg-neutral-700'
+                            : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'">
+                        <i data-lucide="sun-moon" class="w-4 h-4" x-show="theme === 'auto'"></i>
+                        <i data-lucide="sun" class="w-4 h-4" x-show="theme === 'light'"></i>
+                        <i data-lucide="moon" class="w-4 h-4" x-show="theme === 'dark'"></i>
+                        <select
+                            @change="setTheme($event.target.value)"
+                            class="bg-transparent border-none outline-none cursor-pointer appearance-none text-inherit text-sm pr-5"
+                            x-model="theme"
+                            :title="theme === 'auto' ? window.t('navbar.theme.auto') : theme === 'light' ? window.t('navbar.theme.light_mode') : window.t('navbar.theme.dark_mode')"
+                        >
+                            <option value="auto">{{ t('navbar.theme.auto') }}</option>
+                            <option value="light">{{ t('navbar.theme.light_mode') }}</option>
+                            <option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
+                        </select>
+                    </div>
+                </div>
 
                 <!-- Logout Button -->
                 <button
@@ -297,12 +306,26 @@
                     {{ t('navbar.tab.chat') }}
                 </a>
                 <div class="border-t border-neutral-100 pt-2 mt-2 flex items-center justify-between px-2">
-                    <button @click="toggleTheme()"
-                            class="p-2 rounded-full transition-all duration-200"
-                            :class="theme === 'dark' ? 'text-amber-400' : 'text-neutral-500 hover:text-neutral-900'">
-                        <i x-show="theme === 'light'" data-lucide="sun" class="w-4 h-4"></i>
-                        <i x-show="theme === 'dark'" data-lucide="moon" class="w-4 h-4" x-cloak></i>
-                    </button>
+                    <div class="flex items-center gap-1">
+                        <button @click="setTheme('auto')"
+                                class="p-2 rounded-full transition-all duration-200"
+                                :class="theme === 'auto' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
+                                :title="window.t('navbar.theme.auto')">
+                            <i data-lucide="sun-moon" class="w-4 h-4"></i>
+                        </button>
+                        <button @click="setTheme('light')"
+                                class="p-2 rounded-full transition-all duration-200"
+                                :class="theme === 'light' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
+                                :title="window.t('navbar.theme.light_mode')">
+                            <i data-lucide="sun" class="w-4 h-4"></i>
+                        </button>
+                        <button @click="setTheme('dark')"
+                                class="p-2 rounded-full transition-all duration-200"
+                                :class="theme === 'dark' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
+                                :title="window.t('navbar.theme.dark_mode')">
+                            <i data-lucide="moon" class="w-4 h-4"></i>
+                        </button>
+                    </div>
                     <button @click="logout"
                             class="inline-flex items-center px-4 py-2 text-sm font-medium text-neutral-600 hover:text-neutral-900 rounded-full transition-all">
                         <i data-lucide="log-out" class="w-4 h-4 mr-2"></i>

@@ -1261,7 +1261,10 @@ class Scheduler:
             if think_end_ids:
                 from .api.thinking import ThinkingBudgetProcessor
 
-                think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+                try:
+                    think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+                except ValueError:
+                    think_start_id = None
                 leading_ids, trailing_ids = self._resolve_think_close_pattern()
                 processor = ThinkingBudgetProcessor(
                     think_end_token_ids=think_end_ids,
@@ -1307,7 +1310,11 @@ class Scheduler:
         </think> and </longcat_think> automatically.
         """
         # Tier 1: mlx-lm tokenizer attribute (covers all known think variants)
-        think_end_id = getattr(self.tokenizer, 'think_end_id', None)
+        try:
+            think_end_id = getattr(self.tokenizer, 'think_end_id', None)
+        except ValueError:
+            # Multi-token think end (e.g. Gemma 4) - fall through to Tier 2
+            think_end_id = None
         if think_end_id is not None:
             return [think_end_id]
 
@@ -1416,7 +1423,12 @@ class Scheduler:
         Returns False for disabled-thinking patterns like <think></think>
         where </think> immediately follows <think> in the prompt tail.
         """
-        think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+        try:
+            think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+        except ValueError:
+            # Multi-token think start (e.g. Gemma 4 <|channel>thought) -
+            # single-token detection not applicable, handled by output parser
+            return False
         if think_start_id is None:
             try:
                 think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
@@ -2990,6 +3002,12 @@ class Scheduler:
 
             # Build per-request state machine for stop tokens
             sm = self._build_state_machine(request)
+
+            # Set random seed for reproducible generation (best-effort).
+            # This affects global MLX random state, so concurrent requests
+            # may interfere. Matches OpenAI's best-effort seed semantics.
+            if request.sampling_params.seed is not None:
+                mx.random.seed(request.sampling_params.seed)
 
             # Insert into BatchGenerator with pre-filled cache + last token.
             # BatchGenerator only handles decode from here.

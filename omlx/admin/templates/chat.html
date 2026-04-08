@@ -378,8 +378,8 @@
         <div class="p-4 border-b border-line flex-shrink-0">
             <div class="flex items-center justify-between">
                 <a href="/admin/dashboard" class="flex items-center gap-2 hover:opacity-80 transition-opacity">
-                    <img x-show="theme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX" class="w-[30px] h-[30px]">
-                    <img x-show="theme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX" class="w-[30px] h-[30px]" x-cloak>
+                    <img x-show="activeTheme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX" class="w-[30px] h-[30px]">
+                    <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX" class="w-[30px] h-[30px]" x-cloak>
                     <span class="font-semibold">{{ t('chat.brand') }}</span>
                 </a>
                 <button @click="sidebarOpen = false" class="p-1.5 hover:bg-surface-muted rounded-md" style="color: var(--text-primary);">
@@ -419,11 +419,23 @@
                 <i data-lucide="settings" class="w-3 h-3"></i>
                 {{ t('chat.admin_settings') }}
             </a>
-            <button @click="toggleTheme()" class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
-                <i data-lucide="sun" class="w-3 h-3" x-show="theme === 'light'"></i>
-                <i data-lucide="moon" class="w-3 h-3" x-show="theme === 'dark'" x-cloak></i>
-                <span x-text="theme === 'light' ? window.t('navbar.theme.dark_mode') : window.t('navbar.theme.light_mode')"></span>
-            </button>
+            <!-- Theme Select -->
+            <div class="relative w-full">
+                <div class="flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
+                    <i data-lucide="sun-moon" class="w-3 h-3" x-show="theme === 'auto'"></i>
+                    <i data-lucide="sun" class="w-3 h-3" x-show="theme === 'light'"></i>
+                    <i data-lucide="moon" class="w-3 h-3" x-show="theme === 'dark'"></i>
+                    <select
+                        @change="setTheme($event.target.value)"
+                        class="flex-1 bg-transparent border-none outline-none cursor-pointer appearance-none text-inherit"
+                        x-model="theme"
+                    >
+                        <option value="auto">{{ t('navbar.theme.auto') }}</option>
+                        <option value="light">{{ t('navbar.theme.light_mode') }}</option>
+                        <option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
+                    </select>
+                </div>
+            </div>
             <button @click="clearAllHistory()" x-show="chatHistory.length > 0"
                     class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-danger hover:bg-danger-bg rounded">
                 <i data-lucide="trash-2" class="w-3 h-3"></i>
@@ -487,8 +499,8 @@
             <div x-show="messages.length === 0" class="h-full flex items-center justify-center" x-cloak>
                 <div class="text-center max-w-lg px-4">
                     <div class="flex items-center justify-center gap-3 mb-4">
-                        <img x-show="theme === 'light'" src="/admin/static/logo-light.svg" alt="oMLX" class="w-[60px] h-[60px]">
-                        <img x-show="theme === 'dark'" src="/admin/static/logo-dark.svg" alt="oMLX" class="w-[60px] h-[60px]" x-cloak>
+                        <img x-show="activeTheme === 'light'" src="/admin/static/logo-light.svg" alt="oMLX" class="w-[60px] h-[60px]">
+                        <img x-show="activeTheme === 'dark'" src="/admin/static/logo-dark.svg" alt="oMLX" class="w-[60px] h-[60px]" x-cloak>
                         <h1 class="text-2xl font-bold">{{ t('chat.welcome_heading') }}</h1>
                     </div>
                     <p class="text-fg-tertiary mb-6">{{ t('chat.welcome_description') }}</p>
@@ -835,7 +847,9 @@
             // UI State
             isMobile: window.innerWidth < 768,
             sidebarOpen: window.innerWidth >= 768,
-            theme: localStorage.getItem('omlx-chat-theme') || 'light',
+            theme: localStorage.getItem('omlx-chat-theme') || 'auto',
+            activeTheme: 'light', // Will be updated by applyTheme
+            systemThemeListener: null,
 
             // Chat State
             currentChatId: null,
@@ -2173,21 +2187,49 @@
                 el.style.height = Math.min(el.scrollHeight, 128) + 'px';
             },
 
-            toggleTheme() {
-                this.theme = this.theme === 'light' ? 'dark' : 'light';
+            setTheme(theme) {
+                this.theme = theme;
                 localStorage.setItem('omlx-chat-theme', this.theme);
                 this.applyTheme();
             },
 
             applyTheme() {
-                document.documentElement.setAttribute('data-theme', this.theme);
+                // Clean up existing listener
+                if (this.systemThemeListener) {
+                    window.matchMedia('(prefers-color-scheme: dark)').removeEventListener('change', this.systemThemeListener);
+                    this.systemThemeListener = null;
+                }
+
+                if (this.theme === 'auto') {
+                    // Detect system theme
+                    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                    this.activeTheme = prefersDark ? 'dark' : 'light';
+
+                    // Add listener for system theme changes
+                    this.systemThemeListener = (e) => {
+                        this.activeTheme = e.matches ? 'dark' : 'light';
+                        document.documentElement.setAttribute('data-theme', this.activeTheme);
+
+                        const lightTheme = document.getElementById('hljs-light-theme');
+                        const darkTheme = document.getElementById('hljs-dark-theme');
+                        if (lightTheme && darkTheme) {
+                            lightTheme.disabled = this.activeTheme === 'dark';
+                            darkTheme.disabled = this.activeTheme === 'light';
+                        }
+                    };
+                    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', this.systemThemeListener);
+                } else {
+                    // Use explicit theme
+                    this.activeTheme = this.theme;
+                }
+
+                document.documentElement.setAttribute('data-theme', this.activeTheme);
 
                 const lightTheme = document.getElementById('hljs-light-theme');
                 const darkTheme = document.getElementById('hljs-dark-theme');
-
                 if (lightTheme && darkTheme) {
-                    lightTheme.disabled = this.theme === 'dark';
-                    darkTheme.disabled = this.theme === 'light';
+                    lightTheme.disabled = this.activeTheme === 'dark';
+                    darkTheme.disabled = this.activeTheme === 'light';
                 }
             }
         };
