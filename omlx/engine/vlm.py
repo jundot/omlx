@@ -1246,6 +1246,8 @@ class VLMBatchedEngine(BaseEngine):
             specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
         if kwargs.get("specprefill_keep_pct") is not None:
             specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop("specprefill_keep_pct")
+        if kwargs.get("specprefill_threshold") is not None:
+            specprefill_kwargs["specprefill_threshold"] = kwargs.pop("specprefill_threshold")
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
