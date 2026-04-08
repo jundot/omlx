@@ -1551,34 +1551,25 @@ class VLMBatchedEngine(BaseEngine):
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
 
-        if images:
-            # Apply OCR-specific prompt if applicable
-            ocr_messages = self._apply_ocr_prompt(messages)
-
-            # Convert tools for template format (same as text-only path)
-            template_tools = convert_tools_for_template(tools) if tools else None
-
-            # VLM path: prepare vision inputs
-            token_ids, vlm_embeds, vlm_kwargs, image_hash, image_cache_key_start, image_cache_key_ranges = self._prepare_vision_inputs(
-                ocr_messages, images,
-                chat_template_kwargs=ct_kwargs,
-                tools=template_tools,
-            )
-            return (
-                token_ids,
-                vlm_embeds,
-                vlm_kwargs,
-                image_hash,
-                image_cache_key_start,
-                image_cache_key_ranges,
-            )
-        else:
-            # Text-only path: standard chat template
-            template_tools = convert_tools_for_template(tools) if tools else None
-            prompt = self._apply_chat_template(
-                text_messages, template_tools, chat_template_kwargs=ct_kwargs
-            )
-            return prompt, None, None, None, 0, []
+        # Keep VLM-capable models on one prompt-rendering path, even before the
+        # first image arrives. Otherwise the conversation switches prompt families
+        # on the first image-bearing turn and invalidates early prefix blocks.
+        vlm_messages = self._apply_ocr_prompt(messages) if images else text_messages
+        template_tools = convert_tools_for_template(tools) if tools else None
+        token_ids, vlm_embeds, vlm_kwargs, image_hash, image_cache_key_start, image_cache_key_ranges = self._prepare_vision_inputs(
+            vlm_messages,
+            images,
+            chat_template_kwargs=ct_kwargs,
+            tools=template_tools,
+        )
+        return (
+            token_ids,
+            vlm_embeds,
+            vlm_kwargs,
+            image_hash,
+            image_cache_key_start,
+            image_cache_key_ranges,
+        )
 
     def count_chat_tokens(
         self,
