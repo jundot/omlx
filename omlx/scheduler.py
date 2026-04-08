@@ -2005,7 +2005,11 @@ class Scheduler:
         Returns False for disabled-thinking patterns like <think></think>
         where </think> immediately follows <think> in the prompt tail.
         """
-        think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+        think_start_id = None
+        try:
+            think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+        except (TypeError, AttributeError):
+            pass
         if think_start_id is None:
             try:
                 think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
