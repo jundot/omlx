@@ -15,8 +15,8 @@ runtime = "cpython-3.11"
 requirements = [
     # Core MLX
     "mlx==0.31.1",
-    # mlx-lm from commit (dcbf6e3) - aligned with pyproject.toml
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@dcbf6e33d135a1b7c6767ca0fe7ebbd23df814a7",
+    # mlx-lm from commit (d9c63ff) - aligned with pyproject.toml
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@d9c63fff67a96c1a1a32934fdf4c2c08c2bb9e7f",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa) - aligned with pyproject.toml
@@ -48,8 +48,8 @@ requirements = [
     "mcp>=1.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (23e1dff) - aligned with pyproject.toml
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@23e1dffd224488141a4f022b6d21d6a730f11507",
+    # mlx-vlm from commit (3472132) - aligned with pyproject.toml
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@3472132fe6ee7beeae2c2fc35923eaed2e734b3d",
     "Pillow>=9.0.0",
     # ModelScope SDK for downloading models from ModelScope Hub
     "modelscope>=1.10.0",

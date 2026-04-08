@@ -29,8 +29,8 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.31.1",
-    # mlx-lm from commit (dcbf6e3) - Gemma 4 tool call parser + multi-token think/tool support
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@dcbf6e33d135a1b7c6767ca0fe7ebbd23df814a7",
+    # mlx-lm from commit (d9c63ff) - v0.31.3 patch bump; retains Gemma 4 tool call parser + multi-token think/tool support
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@d9c63fff67a96c1a1a32934fdf4c2c08c2bb9e7f",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
@@ -61,8 +61,8 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (23e1dff) - Gemma 4 multi-image fix + nested tool parser
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@23e1dffd224488141a4f022b6d21d6a730f11507",
+    # mlx-vlm from commit (3472132) - Gemma 4 hyphenated tool names + audio preprocessing fixes + TurboQuant race fix + quantized projection loading + batched cache offset snapshot
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@3472132fe6ee7beeae2c2fc35923eaed2e734b3d",
     "Pillow>=9.0.0",
 ]
 
@@ -130,7 +130,7 @@ include = ["omlx*"]
 # mlx-lm is pinned to a git commit; override transitive pins
 # (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
 override-dependencies = [
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@dcbf6e33d135a1b7c6767ca0fe7ebbd23df814a7",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@d9c63fff67a96c1a1a32934fdf4c2c08c2bb9e7f",
 ]
 
 [tool.black]
