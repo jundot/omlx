@@ -179,6 +179,12 @@ async def create_speech(request: AudioSpeechRequest):
     # --- Validate and decode ref_audio (voice clone) ---
     audio_bytes = None
     if request.ref_audio is not None:
+        if not request.ref_text:
+            raise HTTPException(
+                status_code=400,
+                detail="'ref_text' is required when 'ref_audio' is provided "
+                "(must be the transcript of the reference audio)",
+            )
         if len(request.ref_audio) > MAX_REF_AUDIO_BASE64_BYTES:
             raise HTTPException(
                 status_code=413,

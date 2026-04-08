@@ -574,6 +574,7 @@ class TestTTSVoiceCloneEndpoint:
                 "model": "qwen3-tts",
                 "input": "Too big",
                 "ref_audio": huge_b64,
+                "ref_text": "some text",
             },
         )
         assert response.status_code == 413
@@ -597,21 +598,21 @@ class TestTTSVoiceCloneEndpoint:
                 import os
                 assert not os.path.exists(ref_path), "Temp file should be deleted"
 
-    def test_ref_text_none_when_omitted(self, clone_client):
-        """ref_text defaults to None when not provided."""
-        client, mock_pool = clone_client
+    def test_ref_audio_without_ref_text_returns_400(self, clone_client):
+        """ref_audio without ref_text returns 400."""
+        client, _ = clone_client
         wav_b64 = base64.b64encode(_make_wav_bytes(0.5)).decode()
-        client.post(
+        response = client.post(
             "/v1/audio/speech",
             json={
                 "model": "qwen3-tts",
-                "input": "No ref text",
+                "input": "Missing ref_text",
                 "ref_audio": wav_b64,
             },
         )
-        synthesize = mock_pool.get_engine.return_value.synthesize
-        if synthesize.called:
-            assert synthesize.call_args.kwargs.get("ref_text") is None
+        assert response.status_code == 400
+        detail = response.json().get("detail") or response.json().get("error", {}).get("message", "")
+        assert "ref_text" in detail.lower()
 
     def test_no_ref_audio_unchanged_behavior(self, clone_client):
         """Normal TTS (no ref_audio) still works as before."""
