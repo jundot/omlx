@@ -547,6 +547,11 @@ def build_venvstacks():
     # so it can't go through venvstacks' uv resolver.
     _install_mlx_audio(EXPORT_DIR)
 
+    # Bundle spacy language model for Kokoro TTS.
+    # misaki's en.G2P tries spacy.cli.download() at runtime, which fails in
+    # the code-signed app bundle (read-only site-packages).
+    _install_spacy_model(EXPORT_DIR)
+
     # Strip large packages that are only needed for model conversion / data
     # loading, not inference. Saves ~780 MB in the app bundle.
     _strip_unused_packages(EXPORT_DIR)
@@ -593,6 +598,50 @@ def _install_mlx_audio(export_dir: Path):
 
     shutil.rmtree(audio_wheels)
     print("  ✓ mlx-audio installed")
+
+
+# spacy language model — required by misaki (Kokoro TTS G2P)
+# Update version when spacy is bumped in venvstacks.toml
+_SPACY_MODEL = "en_core_web_sm"
+_SPACY_MODEL_VERSION = "3.8.0"
+_SPACY_MODEL_URL = (
+    "https://github.com/explosion/spacy-models/releases/download/"
+    f"{_SPACY_MODEL}-{_SPACY_MODEL_VERSION}/"
+    f"{_SPACY_MODEL}-{_SPACY_MODEL_VERSION}-py3-none-any.whl"
+)
+
+
+def _install_spacy_model(export_dir: Path):
+    """Download and install spacy en_core_web_sm into exported framework."""
+    import urllib.request
+    import zipfile
+
+    fw_site = (
+        export_dir
+        / "framework-mlx-framework"
+        / "lib"
+        / "python3.11"
+        / "site-packages"
+    )
+    if not fw_site.exists():
+        print(f"  ✗ site-packages not found: {fw_site}")
+        return
+
+    # Skip if already installed
+    if (fw_site / _SPACY_MODEL).exists():
+        print(f"  ✓ {_SPACY_MODEL} already installed, skipping")
+        return
+
+    print(f"\n  Installing {_SPACY_MODEL}-{_SPACY_MODEL_VERSION}...")
+    whl_path = SCRIPT_DIR / f"{_SPACY_MODEL}-{_SPACY_MODEL_VERSION}.whl"
+
+    try:
+        urllib.request.urlretrieve(_SPACY_MODEL_URL, whl_path)
+        with zipfile.ZipFile(whl_path) as zf:
+            zf.extractall(fw_site)
+        print(f"  ✓ {_SPACY_MODEL} installed")
+    finally:
+        whl_path.unlink(missing_ok=True)
 
 
 # Packages to strip from the app bundle. These are transitive dependencies

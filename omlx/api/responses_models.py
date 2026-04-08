@@ -121,6 +121,8 @@ class ResponsesRequest(BaseModel):
     conversation: Optional[Any] = None
     max_tool_calls: Optional[int] = None
     stream_options: Optional[Dict[str, Any]] = None
+    # Seed for reproducible generation (best-effort)
+    seed: Optional[int] = None
 
     model_config = {"extra": "allow"}
 

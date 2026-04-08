@@ -1260,6 +1260,7 @@ class VLMBatchedEngine(BaseEngine):
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
+            seed=kwargs.get("seed", None),
         )
 
         output = await self._engine.generate(
@@ -1329,6 +1330,7 @@ class VLMBatchedEngine(BaseEngine):
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
+            seed=kwargs.get("seed", None),
         )
 
         # SpecPrefill: pass per-request overrides
@@ -1337,6 +1339,8 @@ class VLMBatchedEngine(BaseEngine):
             specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
         if kwargs.get("specprefill_keep_pct") is not None:
             specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop("specprefill_keep_pct")
+        if kwargs.get("specprefill_threshold") is not None:
+            specprefill_kwargs["specprefill_threshold"] = kwargs.pop("specprefill_threshold")
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 

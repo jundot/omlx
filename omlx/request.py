@@ -77,6 +77,9 @@ class SamplingParams:
     # Typed as Any to avoid a hard dependency on xgrammar at import time.
     compiled_grammar: Any = None
 
+    # Seed for reproducible generation (best-effort, per OpenAI spec)
+    seed: Optional[int] = None
+
     def __post_init__(self):
         if self.stop is None:
             self.stop = []

@@ -76,6 +76,30 @@ class TestUniversalQuantPredicate:
         result = universal_quant_predicate("model.layers.0.shared_expert_gate", module, moe_config)
         assert isinstance(result, dict) and result["bits"] == 8
 
+    def test_non_quantizable_module_skipped(self, dense_config, module):
+        cfg = {**dense_config, "_oq_non_quantizable": {
+            "language_model.model.per_layer_model_projection",
+        }}
+        assert universal_quant_predicate(
+            "language_model.model.per_layer_model_projection.weight", module, cfg
+        ) is False
+
+    def test_non_quantizable_set_does_not_affect_other_paths(self, dense_config, module):
+        cfg = {**dense_config, "_oq_non_quantizable": {
+            "language_model.model.per_layer_model_projection",
+        }}
+        result = universal_quant_predicate(
+            "language_model.model.layers.0.per_layer_input_gate.weight", module, cfg
+        )
+        assert result is not False
+
+    def test_empty_non_quantizable_set_is_noop(self, dense_config, module):
+        cfg = {**dense_config, "_oq_non_quantizable": set()}
+        result = universal_quant_predicate(
+            "model.layers.0.self_attn.q_proj.weight", module, cfg
+        )
+        assert result is not False
+
     def test_vision_encoder_not_quantized(self, dense_config, module):
         assert universal_quant_predicate("visual.encoder.layers.0.self_attn.q_proj", module, dense_config) is False
 
