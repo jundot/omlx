@@ -162,6 +162,50 @@ class TestVLMModelAdapter:
         assert call_args[0][0] is input_ids
         assert len(call_args[1]["cache"]) == 1
 
+    def test_forward_uses_decode_model_at_batch_1(self):
+        """Test that decode_model is used for batch=1 decode (no proxy overhead)."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        decode_model = MagicMock()
+        decode_logits = MockMXArray(shape=(1, 10, 32000))
+        decode_model.return_value = decode_logits
+        adapter = VLMModelAdapter(vlm, decode_model=decode_model)
+
+        input_ids = MockMXArray(shape=(1, 10))
+        cache = [MagicMock()]
+
+        result = adapter(input_ids, cache=cache)
+
+        # decode_model should be called (fast path, no proxy wrapping)
+        decode_model.assert_called_once()
+        call_args = decode_model.call_args
+        assert call_args[0][0] is input_ids
+        # cache should be passed directly (no _IntOffsetCacheProxy wrapping)
+        assert call_args[1]["cache"] is cache
+        # language_model should NOT be called
+        vlm.language_model.assert_not_called()
+
+    def test_forward_without_decode_model_falls_back_to_language_model(self):
+        """Test that without decode_model, language_model is used with wrapped cache."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        adapter = VLMModelAdapter(vlm)  # no decode_model
+
+        input_ids = MockMXArray(shape=(1, 10))
+        cache = [MagicMock()]
+        vlm.language_model.__call__ = MagicMock(return_value=MagicMock())
+
+        adapter(input_ids, cache=cache)
+
+        # language_model should be called (fallback path)
+        vlm.language_model.assert_called_once()
+        # cache should be wrapped with _IntOffsetCacheProxy
+        call_args = vlm.language_model.call_args
+        from omlx.models.vlm import _IntOffsetCacheProxy
+        assert isinstance(call_args[1]["cache"][0], _IntOffsetCacheProxy)
+
     def test_forward_with_embeddings(self):
         """Test forward pass with pending embeddings injects inputs_embeds."""
         from omlx.models.vlm import VLMModelAdapter
