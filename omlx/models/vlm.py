@@ -256,9 +256,9 @@ class VLMModelAdapter(nn.Module):
             result = self._forward_with_embeddings(input_ids, wrapped_cache, **kwargs)
         else:
             # Standard decode/prefill path: token IDs only.
-            # Use mlx-lm decode model for batched decode (batch > 1)
-            # since mlx-vlm language models may not handle batching.
-            if self._decode_model is not None and input_ids.shape[0] > 1:
+            # Use mlx-lm decode model for ALL decode when available.
+            # Avoids _IntOffsetCacheProxy overhead (48 layers x 0.185ms/token). See #687.
+            if self._decode_model is not None and input_ids.shape[0] >= 1:
                 result = self._decode_model(input_ids, cache=cache, **kwargs)
             else:
                 if hasattr(self._vlm_model, "_set_position_state"):
