@@ -1279,7 +1279,14 @@ async def _with_sse_keepalive(
                     keepalive_elapsed = 0.0
                     yield ": keep-alive\n\n"
             if task.done():
-                result = task.result()
+                try:
+                    result = task.result()
+                except Exception as e:
+                    logger.error(f"SSE generator error: {e}")
+                    error_data = {"error": {"message": str(e), "type": "server_error"}}
+                    yield f"data: {json.dumps(error_data)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 if result is _KEEPALIVE_SENTINEL:
                     return
                 yield result
