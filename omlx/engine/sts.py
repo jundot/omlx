@@ -392,8 +392,12 @@ class STSEngine(BaseNonStreamingEngine):
             )
             return result
         finally:
-            with self._active_lock:
-                self._active_count -= 1
+            if self._decrement_active():
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

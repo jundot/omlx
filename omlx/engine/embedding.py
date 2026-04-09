@@ -126,8 +126,12 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(get_mlx_executor(), _embed_sync)
         finally:
-            with self._active_lock:
-                self._active_count -= 1
+            if self._decrement_active():
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
