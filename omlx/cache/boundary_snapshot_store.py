@@ -128,6 +128,9 @@ class BoundarySnapshotSSDStore:
         if not HAS_MLX:
             return False
 
+        # Ensure this request is no longer marked as cancelled
+        self._cancelled_requests.discard(request_id)
+
         try:
             # 1. Extract dict-format states on inference thread.
             extracted, model_cache_config = extract_cache_states_fn(snapshot_cache)
@@ -264,6 +267,11 @@ class BoundarySnapshotSSDStore:
 
     def cleanup_all(self) -> None:
         """Delete all snapshot files (for reset/startup)."""
+        # Mark all current requests as cancelled to stop in-flight writes
+        with self._registry_lock:
+            for req_id in self._file_registry:
+                self._cancelled_requests.add(req_id)
+
         # Drain write queue so the writer thread doesn't process stale
         # items after the directory is deleted.
         while True:
@@ -279,7 +287,6 @@ class BoundarySnapshotSSDStore:
             self._pending_writes.clear()
         with self._registry_lock:
             self._file_registry.clear()
-        self._cancelled_requests.clear()
 
         if self._snapshot_dir.exists():
             try:
@@ -324,6 +331,10 @@ class BoundarySnapshotSSDStore:
                 continue
 
             try:
+                # Check again right before creating directory to avoid race with cleanup
+                if pw_key[0] in self._cancelled_requests:
+                    continue
+
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 temp_path = file_path.with_name(
                     file_path.stem + "_tmp.safetensors"

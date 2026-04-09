@@ -1024,7 +1024,7 @@ def init_server(
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
     response_state_dir = None
-    if global_settings:
+    if global_settings and not global_settings.cache.hot_cache_only:
         response_state_dir = (
             global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
             / "response-state"

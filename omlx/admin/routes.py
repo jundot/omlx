@@ -132,6 +132,7 @@ class GlobalSettingsRequest(BaseModel):
     ssd_cache_dir: Optional[str] = None
     ssd_cache_max_size: Optional[str] = None
     hot_cache_max_size: Optional[str] = None  # "0" = disabled, "8GB", etc.
+    hot_cache_only: Optional[bool] = None
     initial_cache_blocks: Optional[int] = None  # Starting blocks (requires restart)
 
     # MCP settings
@@ -508,6 +509,7 @@ async def _apply_cache_settings_runtime(
     ssd_cache_max_size: Optional[str],
     global_settings,
     hot_cache_max_size: Optional[str] = None,
+    hot_cache_only: Optional[bool] = None,
 ) -> tuple[bool, str]:
     """
     Apply cache settings at runtime.
@@ -527,7 +529,10 @@ async def _apply_cache_settings_runtime(
     pool = _server_state.engine_pool
 
     # Update scheduler config based on cache settings
-    if enabled is False or (enabled is None and not global_settings.cache.enabled):
+    effective_enabled = enabled if enabled is not None else global_settings.cache.enabled
+    effective_hot_cache_only = hot_cache_only if hot_cache_only is not None else global_settings.cache.hot_cache_only
+
+    if not effective_enabled or effective_hot_cache_only:
         pool._scheduler_config.paged_ssd_cache_dir = None
         pool._scheduler_config.paged_ssd_cache_max_size = 0
     else:
@@ -1743,6 +1748,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             ),
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
+            "hot_cache_only": global_settings.cache.hot_cache_only,
         },
         "mcp": {
             "config_path": global_settings.mcp.config_path,
@@ -1940,6 +1946,10 @@ async def update_global_settings(
     if request.initial_cache_blocks is not None:
         global_settings.cache.initial_cache_blocks = request.initial_cache_blocks
 
+    if request.hot_cache_only is not None:
+        global_settings.cache.hot_cache_only = request.hot_cache_only
+        cache_changed = True
+
     if cache_changed:
         success, msg = await _apply_cache_settings_runtime(
             request.cache_enabled,
@@ -1947,6 +1957,7 @@ async def update_global_settings(
             request.ssd_cache_max_size,
             global_settings,
             hot_cache_max_size=request.hot_cache_max_size,
+            hot_cache_only=request.hot_cache_only,
         )
         if success:
             runtime_applied.append("cache")

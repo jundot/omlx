@@ -81,8 +81,10 @@ class VisionFeatureSSDCache:
         cache_dir: Optional[Path] = None,
         max_size_bytes: int = 10 * 1024**3,
         max_memory_entries: int = 20,
+        hot_cache_only: bool = False,
     ):
         self._cache_dir = cache_dir
+        self._hot_cache_only = hot_cache_only
         self._max_size_bytes = max_size_bytes
         self._max_memory_entries = max_memory_entries
 
@@ -111,15 +113,17 @@ class VisionFeatureSSDCache:
         }
 
         # Initialize SSD directory and scan existing files
-        if self._cache_dir is not None:
+        if self._cache_dir is not None and not self._hot_cache_only:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
             self._scan_existing_files()
 
         # Start background writer thread
-        self._writer_thread = threading.Thread(
-            target=self._writer_loop, daemon=True, name="vision-cache-writer"
-        )
-        self._writer_thread.start()
+        self._writer_thread = None
+        if not self._hot_cache_only:
+            self._writer_thread = threading.Thread(
+                target=self._writer_loop, daemon=True, name="vision-cache-writer"
+            )
+            self._writer_thread.start()
 
     def get(self, image_hash: str, model_name: str) -> Optional[Any]:
         """Look up cached vision features.
@@ -143,7 +147,7 @@ class VisionFeatureSSDCache:
                 return self._memory_cache[key]
 
         # Check SSD
-        if self._cache_dir is not None:
+        if self._cache_dir is not None and not self._hot_cache_only:
             features = self._load_from_ssd(key)
             if features is not None:
                 # Promote to memory cache
@@ -178,20 +182,21 @@ class VisionFeatureSSDCache:
             self._memory_put(key, features)
 
         # Enqueue SSD write
-        if self._cache_dir is not None:
+        if self._cache_dir is not None and not self._hot_cache_only:
             self._enqueue_ssd_write(key, image_hash, model_name, features)
 
         self._stats["saves"] += 1
 
     def close(self) -> None:
         """Shut down the background writer and flush pending writes."""
-        self._writer_shutdown.set()
-        # Send sentinel to unblock the writer
-        try:
-            self._write_queue.put_nowait(None)
-        except queue.Full:
-            pass
-        self._writer_thread.join(timeout=10.0)
+        if self._writer_thread:
+            self._writer_shutdown.set()
+            # Send sentinel to unblock the writer
+            try:
+                self._write_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            self._writer_thread.join(timeout=10.0)
         logger.debug(
             "Vision feature cache closed: %s",
             {k: v for k, v in self._stats.items() if v > 0},

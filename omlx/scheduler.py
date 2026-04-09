@@ -273,6 +273,7 @@ class SchedulerConfig:
     # When paged_ssd_cache_dir is set, oMLX stores KV cache on paged SSD for prefix reuse.
     # When None, no oMLX caching (mlx-lm BatchGenerator manages KV internally).
     paged_ssd_cache_dir: Optional[str] = None  # Path for paged SSD cache storage (None = disabled)
+    hot_cache_only: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
 
@@ -3860,17 +3861,21 @@ class Scheduler:
                 )
             return
 
-        # In paged SSD-only mode, paged_ssd_cache_dir is required
-        if not self.config.paged_ssd_cache_dir:
-            logger.debug("paged SSD cache not configured (no --ssd-cache-dir specified)")
+        # Allow initialization if Hot Cache is enabled, even if no SSD directory is provided.
+        if not self.config.paged_ssd_cache_dir and self.config.hot_cache_max_size == 0:
+            logger.debug("paged SSD cache not configured (no --ssd-cache-dir specified and hot cache disabled)")
             return
 
         try:
+            # Resolve directory to Path or None
+            cache_dir = Path(self.config.paged_ssd_cache_dir) if self.config.paged_ssd_cache_dir else None
+
             # Initialize paged SSD cache manager for SSD storage
             self.paged_ssd_cache_manager = PagedSSDCacheManager(
-                cache_dir=Path(self.config.paged_ssd_cache_dir),
+                cache_dir=cache_dir,
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
+                hot_cache_only=self.config.hot_cache_only,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager
@@ -3883,7 +3888,7 @@ class Scheduler:
 
             # Initialize boundary snapshot SSD store for offloading
             # non-sliceable cache snapshots during prefill.
-            if BoundarySnapshotSSDStore is not None:
+            if BoundarySnapshotSSDStore is not None and not self.config.hot_cache_only:
                 try:
                     self._boundary_snapshot_store = BoundarySnapshotSSDStore(
                         base_dir=Path(self.config.paged_ssd_cache_dir)

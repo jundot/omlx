@@ -544,15 +544,17 @@ class VLMBatchedEngine(BaseEngine):
 
         # Initialize vision feature cache
         vision_ssd_dir = None
-        if self._scheduler_config and getattr(
-            self._scheduler_config, "paged_ssd_cache_dir", None
-        ):
-            from pathlib import Path as _Path
+        hot_cache_only = False
+        if self._scheduler_config:
+            hot_cache_only = getattr(self._scheduler_config, "hot_cache_only", False)
+            if getattr(self._scheduler_config, "paged_ssd_cache_dir", None):
+                from pathlib import Path as _Path
 
-            vision_ssd_dir = _Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
+                vision_ssd_dir = _Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
         self._vision_cache = VisionFeatureSSDCache(
             cache_dir=vision_ssd_dir,
             max_memory_entries=20,
+            hot_cache_only=hot_cache_only,
         )
         logger.info("Vision feature cache enabled (SSD: %s)", vision_ssd_dir or "disabled")
 
