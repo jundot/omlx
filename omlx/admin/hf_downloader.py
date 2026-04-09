@@ -611,9 +611,12 @@ class HFDownloader:
                 model_name = task.repo_id.split("/")[-1]
                 target_dir = self._model_dir / model_name
 
-                # Get total repo size for progress estimation
+                api, endpoint = _get_hf_api()
+
+                # Skip pytorch format when safetensors exist to
+                # avoid downloading redundant weight files.
+                ignore_patterns = None
                 try:
-                    api, endpoint = _get_hf_api()
                     model_info = await asyncio.wait_for(
                         asyncio.to_thread(
                             api.model_info,
@@ -626,16 +629,41 @@ class HFDownloader:
                     if model_info.safetensors and model_info.safetensors.get(
                         "parameters"
                     ):
-                        task.total_size = _calc_safetensors_disk_size(
-                            dict(model_info.safetensors)
-                        )
-                    elif model_info.siblings:
-                        task.total_size = sum(
-                            s.size for s in model_info.siblings if s.size
-                        )
+                        ignore_patterns = [
+                            "*.bin",
+                            "original/**",
+                            "consolidated.*.pth",
+                        ]
                 except Exception as e:
                     logger.warning(
-                        f"Could not fetch repo info for {task.repo_id}: {e}. "
+                        f"Could not fetch repo info for {task.repo_id}: {e}"
+                    )
+
+                dl_kwargs: dict = {
+                    "repo_id": task.repo_id,
+                    "local_dir": str(target_dir),
+                    "token": hf_token or None,
+                    "endpoint": endpoint,
+                    "etag_timeout": 30,
+                }
+                if ignore_patterns:
+                    dl_kwargs["ignore_patterns"] = ignore_patterns
+
+                # Get accurate total size via dry run so the progress
+                # denominator matches what will actually be downloaded.
+                try:
+                    dry_result = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            snapshot_download,
+                            **dl_kwargs,
+                            dry_run=True,
+                        ),
+                        timeout=30,
+                    )
+                    task.total_size = sum(f.file_size for f in dry_result)
+                except Exception as e:
+                    logger.warning(
+                        f"Dry run failed for {task.repo_id}: {e}. "
                         "Progress estimation will be unavailable."
                     )
 
@@ -647,11 +675,7 @@ class HFDownloader:
                 # Run snapshot_download in a thread (blocking call)
                 await asyncio.to_thread(
                     snapshot_download,
-                    repo_id=task.repo_id,
-                    local_dir=str(target_dir),
-                    token=hf_token or None,
-                    endpoint=endpoint,
-                    etag_timeout=30,
+                    **dl_kwargs,
                 )
 
                 # Check if cancelled while downloading
