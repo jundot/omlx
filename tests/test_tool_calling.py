@@ -6,6 +6,7 @@ Tests JSON schema validation, JSON extraction, and tool conversion functions.
 """
 
 import json
+import logging
 import pytest
 
 from unittest.mock import MagicMock
@@ -1488,17 +1489,19 @@ class TestParseToolCallsGemma4Integration:
         assert "<|tool_call>" not in cleaned
         assert "<tool_call|>" not in cleaned
 
-    def test_markers_stripped_on_total_failure(self):
-        """Even when fallback fails, markers are stripped from cleaned_text."""
+    def test_markers_stripped_on_total_failure(self, caplog):
+        """Even when fallback fails, markers are stripped and warning is logged."""
         tok = self._make_gemma4_tokenizer()
         # Completely unparseable content between markers
         text = "<|tool_call>garbage that matches no format<tool_call|>"
 
-        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            cleaned, tool_calls = parse_tool_calls(text, tok, None)
 
         assert tool_calls is None
         assert "<|tool_call>" not in cleaned
         assert "<tool_call|>" not in cleaned
+        assert any("parsing failed" in msg for msg in caplog.messages)
 
     def test_function_gemma_fallback_not_triggered(self):
         """Fallback is NOT triggered for function_gemma (different markers)."""

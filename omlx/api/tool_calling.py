@@ -17,6 +17,7 @@ Also includes structured output (JSON Schema) utilities:
 """
 
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from jsonschema import validate, ValidationError
 
 from .openai_models import FunctionCall, ResponseFormat, ToolCall, ToolDefinition
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -489,12 +492,26 @@ def parse_tool_calls(
         if _start and _end:
             s_esc = re.escape(_start)
             e_esc = re.escape(_end)
+            stripped = re.findall(
+                rf"{s_esc}(.*?){e_esc}", cleaned_text, flags=re.DOTALL
+            )
+            if stripped:
+                logger.warning(
+                    "Tool call markers found but parsing failed, "
+                    "stripping markers. Raw content: %s",
+                    stripped,
+                )
             cleaned_text = re.sub(
                 rf"{s_esc}.*?{e_esc}", "", cleaned_text, flags=re.DOTALL
             ).strip()
         elif _start:
             idx = cleaned_text.find(_start)
             if idx >= 0:
+                logger.warning(
+                    "Tool call start marker found but parsing failed, "
+                    "stripping marker. Raw content: %s",
+                    cleaned_text[idx:],
+                )
                 cleaned_text = cleaned_text[:idx].strip()
 
     return cleaned_text, None
