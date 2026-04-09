@@ -238,7 +238,6 @@ class VLMModelAdapter(nn.Module):
         Returns:
             Model output (logits as mx.array)
         """
-        wrapped_cache = _wrap_caches(cache)
         inputs_embeds = kwargs.pop("inputs_embeds", None)
         vlm_extra = kwargs.pop("vlm_extra_kwargs", None) or {}
 
@@ -247,23 +246,23 @@ class VLMModelAdapter(nn.Module):
             result = self._language_model(
                 input_ids,
                 inputs_embeds=inputs_embeds,
-                cache=wrapped_cache,
+                cache=_wrap_caches(cache),
                 **vlm_extra,
                 **kwargs,
             )
         elif self._pending_embeds is not None:
             # Legacy single-request path
-            result = self._forward_with_embeddings(input_ids, wrapped_cache, **kwargs)
+            result = self._forward_with_embeddings(input_ids, _wrap_caches(cache), **kwargs)
         else:
             # Standard decode/prefill path: token IDs only.
-            # Use mlx-lm decode model for ALL decode when available.
-            # Avoids _IntOffsetCacheProxy overhead (48 layers x 0.185ms/token). See #687.
-            if self._decode_model is not None and input_ids.shape[0] >= 1:
+            # Use mlx-lm decode model when available to avoid
+            # _IntOffsetCacheProxy overhead (GPU→CPU sync per layer). See #687.
+            if self._decode_model is not None:
                 result = self._decode_model(input_ids, cache=cache, **kwargs)
             else:
                 if hasattr(self._vlm_model, "_set_position_state"):
                     self._vlm_model._set_position_state(input_ids)
-                result = self._language_model(input_ids, cache=wrapped_cache, **kwargs)
+                result = self._language_model(input_ids, cache=_wrap_caches(cache), **kwargs)
 
         # mlx-vlm models return LanguageModelOutput(logits=...) but
         # mlx-lm's BatchGenerator expects raw mx.array logits.

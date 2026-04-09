@@ -186,6 +186,23 @@ class TestVLMModelAdapter:
         # language_model should NOT be called
         vlm.language_model.assert_not_called()
 
+    def test_forward_text_only_prefill_uses_decode_model(self):
+        """Text-only prefill (batch=1, long seq) routes through decode_model."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        decode_model = MagicMock()
+        decode_model.return_value = MockMXArray(shape=(1, 512, 32000))
+        adapter = VLMModelAdapter(vlm, decode_model=decode_model)
+
+        input_ids = MockMXArray(shape=(1, 512))
+        cache = [MagicMock()]
+
+        adapter(input_ids, cache=cache)
+
+        decode_model.assert_called_once()
+        vlm.language_model.assert_not_called()
+
     def test_forward_without_decode_model_falls_back_to_language_model(self):
         """Test that without decode_model, language_model is used with wrapped cache."""
         from omlx.models.vlm import VLMModelAdapter
