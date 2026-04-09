@@ -10,6 +10,7 @@ from omlx.api.utils import (
     SPECIAL_TOKENS_PATTERN,
     _consolidate_system_messages,
     _drop_void_assistant_messages,
+    _extract_multimodal_content_list,
     _merge_consecutive_roles,
     clean_output_text,
     detect_and_strip_partial,
@@ -1219,6 +1220,72 @@ class TestExtractHarmonyMessages:
         assert content["result"] == "success"
 
 
+    # -- dict input tests (issue #683) --
+
+    def test_simple_dict_message(self):
+        """Plain dict messages should work (Anthropic endpoint path)."""
+        messages = [{"role": "user", "content": "Hello"}]
+
+        result = extract_harmony_messages(messages)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert result[0]["content"] == "Hello"
+
+    def test_tool_dict_message(self):
+        """Tool messages as dicts should preserve role and tool_call_id."""
+        messages = [
+            {
+                "role": "tool",
+                "content": '{"result": "ok"}',
+                "tool_call_id": "call_abc",
+            }
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert result[0]["role"] == "tool"
+        assert result[0]["tool_call_id"] == "call_abc"
+        assert isinstance(result[0]["content"], dict)
+
+    def test_assistant_tool_calls_dict(self):
+        """Assistant messages with tool_calls as dicts should work."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city": "Tokyo"}',
+                        },
+                    }
+                ],
+            }
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert "tool_calls" in result[0]
+        assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert isinstance(result[0]["tool_calls"][0]["function"]["arguments"], dict)
+
+    def test_mixed_pydantic_and_dict_messages(self):
+        """Mixed Pydantic Message and dict inputs should both work."""
+        messages = [
+            Message(role="system", content="You are helpful."),
+            {"role": "user", "content": "Hi"},
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert result[1]["role"] == "user"
+
+
 class TestConsolidateSystemMessages:
     """Tests for system message consolidation."""
 
@@ -1317,6 +1384,20 @@ class TestConsolidateSystemMessages:
         assert "Be helpful" in result[0]["content"]
         assert "Extra instruction" in result[0]["content"]
         assert result[1]["role"] == "user"
+
+    def test_system_message_with_list_content(self):
+        """System message with list content should extract text without crashing."""
+        msgs = [
+            {"role": "system", "content": [
+                {"type": "text", "text": "Be helpful"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]},
+            {"role": "user", "content": "Hello"},
+        ]
+        result = _consolidate_system_messages(msgs)
+        assert result[0]["role"] == "system"
+        assert isinstance(result[0]["content"], str)
+        assert "Be helpful" in result[0]["content"]
 
 
 class TestMergeConsecutiveRoles:
@@ -1438,6 +1519,70 @@ class TestMergeConsecutiveRoles:
         assert msgs[0]["content"] == original_first
         assert len(msgs) == 2
 
+    def test_merge_list_content_with_string(self):
+        """Merging list content (image) with string content should not crash."""
+        msgs = [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Look at this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]},
+            {"role": "user", "content": "What do you think?"},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        types = [p["type"] for p in content]
+        assert "image_url" in types
+        assert "text" in types
+        texts = [p["text"] for p in content if p["type"] == "text"]
+        assert "Look at this" in texts
+        assert "What do you think?" in texts
+
+    def test_merge_string_with_list_content(self):
+        """String content followed by list content should merge correctly."""
+        msgs = [
+            {"role": "user", "content": "Context text"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "See image"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,def"}},
+            ]},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        assert len(content) == 3  # text + text + image_url
+
+    def test_merge_two_list_contents(self):
+        """Two list contents should concatenate."""
+        msgs = [
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,def"}},
+            ]},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        assert len(content) == 2
+
+    def test_merge_empty_string_with_list_content(self):
+        """Empty string + list content should take the list content."""
+        msgs = [
+            {"role": "user", "content": ""},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+
     # --- Integration tests through extract_text_content ---
 
     def test_extract_text_content_merges_consecutive_user(self):
@@ -1540,6 +1685,45 @@ class TestExtractMultimodalContent:
         content = result[0]["content"]
         assert content[1]["type"] == "image_url"
         assert content[1]["image_url"]["url"] == "https://example.com/a.png"
+
+    def test_normalizes_image_url_from_model_dump(self):
+        """image_url items from model_dump should be normalized (strip extra keys)."""
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "What is this?"},
+                    {
+                        "type": "image_url",
+                        "text": None,
+                        "image_url": {"url": "data:image/png;base64,abc", "detail": "auto"},
+                    },
+                ],
+            )
+        ]
+        result = extract_multimodal_content(messages)
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        img_part = content[1]
+        assert img_part == {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+        assert "text" not in img_part
+        assert "detail" not in img_part.get("image_url", {})
+
+    def test_normalizes_image_url_string_form(self):
+        """image_url with string value (not nested dict) should be normalized."""
+        parts = _extract_multimodal_content_list([
+            {"type": "image_url", "image_url": "data:image/png;base64,abc"},
+        ])
+        assert len(parts) == 1
+        assert parts[0] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+
+    def test_image_url_missing_url_dropped(self):
+        """image_url item with no extractable URL should be dropped."""
+        parts = _extract_multimodal_content_list([
+            {"type": "image_url", "image_url": None},
+            {"type": "image_url"},
+        ])
+        assert len(parts) == 0
 
 
 # =============================================================================

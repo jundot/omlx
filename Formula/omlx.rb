@@ -18,7 +18,7 @@ class Omlx < Formula
   # mlx-lm. Fetch source separately so we can patch the pin before install.
   resource "mlx-audio" do
     url "https://github.com/Blaizzy/mlx-audio.git",
-      revision: "6408d2a410eb8c57464e07725b92271860199250"
+      revision: "51753266e0a4f766fd5e6fbc46652224efc23981"
   end
 
   service do

@@ -6,12 +6,15 @@ Tests JSON schema validation, JSON extraction, and tool conversion functions.
 """
 
 import json
+import logging
 import pytest
 
 from unittest.mock import MagicMock
 
 from omlx.api.tool_calling import (
     ToolCallStreamFilter,
+    _gemma4_args_to_json_robust,
+    _parse_gemma4_tool_call_fallback,
     build_json_system_prompt,
     convert_tools_for_template,
     extract_json_from_text,
@@ -1356,3 +1359,184 @@ class TestParseToolCallsWithThinkingFallback:
         assert result.tool_calls is not None
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].function.name == "get_weather"
+
+
+# ---------------------------------------------------------------------------
+# Gemma 4 robust fallback parser tests
+# ---------------------------------------------------------------------------
+
+
+class TestGemma4ArgsToJsonRobust:
+    """Tests for _gemma4_args_to_json_robust()."""
+
+    def test_gemma4_delimiters(self):
+        result = _gemma4_args_to_json_robust('{query: <|"|>test search<|"|>}')
+        assert result == {"query": "test search"}
+
+    def test_bare_string_value(self):
+        result = _gemma4_args_to_json_robust("{location: Tokyo}")
+        assert result == {"location": "Tokyo"}
+
+    def test_bare_multiword_value(self):
+        result = _gemma4_args_to_json_robust("{city: New York}")
+        assert result == {"city": "New York"}
+
+    def test_numeric_value(self):
+        result = _gemma4_args_to_json_robust("{count: 5}")
+        assert result == {"count": 5}
+
+    def test_boolean_value(self):
+        result = _gemma4_args_to_json_robust("{verbose: true}")
+        assert result == {"verbose": True}
+
+    def test_null_value(self):
+        result = _gemma4_args_to_json_robust("{data: null}")
+        assert result == {"data": None}
+
+    def test_mixed_types(self):
+        result = _gemma4_args_to_json_robust(
+            '{query: <|"|>hello<|"|>, count: 5}'
+        )
+        assert result == {"query": "hello", "count": 5}
+
+    def test_standard_json_passthrough(self):
+        result = _gemma4_args_to_json_robust('{"query": "hello"}')
+        assert result == {"query": "hello"}
+
+    def test_empty_object(self):
+        result = _gemma4_args_to_json_robust("{}")
+        assert result == {}
+
+
+class TestParseGemma4ToolCallFallback:
+    """Tests for _parse_gemma4_tool_call_fallback()."""
+
+    def test_bare_string_args(self):
+        result = _parse_gemma4_tool_call_fallback(
+            "call:get_weather{location: Tokyo}"
+        )
+        assert result["name"] == "get_weather"
+        assert result["arguments"] == {"location": "Tokyo"}
+
+    def test_gemma4_delimiters(self):
+        result = _parse_gemma4_tool_call_fallback(
+            'call:search{query: <|"|>test<|"|>}'
+        )
+        assert result["name"] == "search"
+        assert result["arguments"] == {"query": "test"}
+
+    def test_colon_in_function_name(self):
+        result = _parse_gemma4_tool_call_fallback(
+            'call:tavily:search{query: <|"|>test<|"|>}'
+        )
+        assert result["name"] == "tavily:search"
+        assert result["arguments"] == {"query": "test"}
+
+    def test_standard_json_args(self):
+        result = _parse_gemma4_tool_call_fallback(
+            'call:search{"query": "hello world"}'
+        )
+        assert result["name"] == "search"
+        assert result["arguments"] == {"query": "hello world"}
+
+    def test_empty_args(self):
+        result = _parse_gemma4_tool_call_fallback("call:get_time{}")
+        assert result["name"] == "get_time"
+        assert result["arguments"] == {}
+
+    def test_multiple_calls(self):
+        result = _parse_gemma4_tool_call_fallback(
+            "call:a{x: 1}\ncall:b{y: 2}"
+        )
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[0]["name"] == "a"
+        assert result[1]["name"] == "b"
+
+    def test_no_match_raises(self):
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback("not a tool call")
+
+
+class TestParseToolCallsGemma4Integration:
+    """Integration tests for parse_tool_calls() with Gemma 4 tokenizer."""
+
+    @staticmethod
+    def _make_gemma4_tokenizer():
+        """Create a mock tokenizer that mimics Gemma 4 configuration."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<|tool_call>"
+        tok.tool_call_end = "<tool_call|>"
+        tok.tool_parser = MagicMock(
+            side_effect=ValueError("mlx-lm parser failed")
+        )
+        return tok
+
+    def test_fallback_parses_bare_strings(self):
+        """Gemma 4 fallback succeeds when mlx-lm parser fails on bare strings."""
+        tok = self._make_gemma4_tokenizer()
+        text = "<|tool_call>\ncall:get_weather{location: Tokyo}\n<tool_call|>"
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_weather"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["location"] == "Tokyo"
+        # Markers should be stripped from cleaned_text
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+
+    def test_markers_stripped_on_total_failure(self, caplog):
+        """Even when fallback fails, markers are stripped and warning is logged."""
+        tok = self._make_gemma4_tokenizer()
+        # Completely unparseable content between markers
+        text = "<|tool_call>garbage that matches no format<tool_call|>"
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is None
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+        assert any("parsing failed" in msg for msg in caplog.messages)
+
+    def test_function_gemma_fallback_not_triggered(self):
+        """Fallback is NOT triggered for function_gemma (different markers)."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<start_function_call>"
+        tok.tool_call_end = "<end_function_call>"
+        tok.tool_parser = MagicMock(
+            side_effect=ValueError("parser failed")
+        )
+        text = (
+            "<start_function_call>"
+            "call:func{key:<escape>value<escape>}"
+            "<end_function_call>"
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        # Should NOT have parsed via Gemma4 fallback (gate check fails)
+        assert tool_calls is None
+
+    def test_xml_fallback_still_works(self):
+        """Models with <tool_call> markers still fall through to XML parser."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = MagicMock(
+            side_effect=ValueError("parser failed")
+        )
+        text = '<tool_call>{"name": "search", "arguments": {"q": "hi"}}</tool_call>'
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        # Should be parsed by _parse_xml_tool_calls fallback (Branch 2)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "search"

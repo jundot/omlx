@@ -254,6 +254,12 @@ class BaseNonStreamingEngine(ABC):
         """Check if the engine has active in-flight requests."""
         return self._active_count > 0
 
+    def _decrement_active(self) -> bool:
+        """Decrement active count and return True if cache should be cleared."""
+        with self._active_lock:
+            self._active_count -= 1
+            return self._active_count == 0
+
     @property
     @abstractmethod
     def model_name(self) -> str:

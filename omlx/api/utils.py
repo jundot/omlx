@@ -134,7 +134,19 @@ def _extract_multimodal_content_list(content: list) -> list:
                 text = item.get("text") or item.get("content") or ""
                 parts.append({"type": "text", "text": text})
             elif item_type == "image_url":
-                parts.append(item)
+                image_url_value = item.get("image_url")
+                url = None
+                if isinstance(image_url_value, str):
+                    url = image_url_value
+                elif isinstance(image_url_value, dict):
+                    url = image_url_value.get("url")
+                if url:
+                    parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": url},
+                        }
+                    )
             elif item_type == "input_image":
                 image_url_value = item.get("image_url", item.get("input_image"))
                 url = None
@@ -209,7 +221,12 @@ def _consolidate_system_messages(messages: list[dict]) -> list[dict]:
         if msg.get("role") == "system":
             content = msg.get("content", "")
             if content:
-                system_parts.append(content)
+                if isinstance(content, list):
+                    text = _extract_text_from_content_list(content)
+                    if text:
+                        system_parts.append(text)
+                else:
+                    system_parts.append(content)
         else:
             non_system.append(msg)
 
@@ -249,7 +266,17 @@ def _merge_consecutive_roles(messages: list[dict]) -> list[dict]:
             prev_content = prev.get("content", "")
             new_content = msg.get("content", "")
             if prev_content and new_content:
-                prev["content"] = prev_content + "\n\n" + new_content
+                prev_is_list = isinstance(prev_content, list)
+                new_is_list = isinstance(new_content, list)
+                if prev_is_list or new_is_list:
+                    # Convert both to list form for safe concatenation
+                    if not prev_is_list:
+                        prev_content = [{"type": "text", "text": prev_content}]
+                    if not new_is_list:
+                        new_content = [{"type": "text", "text": new_content}]
+                    prev["content"] = prev_content + new_content
+                else:
+                    prev["content"] = prev_content + "\n\n" + new_content
             elif new_content:
                 prev["content"] = new_content
         else:
@@ -634,7 +661,7 @@ def _wrap_truncated_for_harmony(truncated_text: str) -> dict:
 
 
 def extract_harmony_messages(
-    messages: List[Message],
+    messages: list,
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
 ) -> List[dict]:
@@ -666,9 +693,30 @@ def extract_harmony_messages(
     """
     processed_messages = []
 
+    # Normalize to plain dicts -- callers may pass Pydantic Message
+    # objects (OpenAI path) or plain dicts (Anthropic path).
+    raw: list[dict] = []
     for msg in messages:
-        role = msg.role
-        content = msg.content
+        if hasattr(msg, "model_dump"):
+            raw.append(msg.model_dump())
+        elif isinstance(msg, dict):
+            raw.append(dict(msg))
+        else:
+            d: dict = {
+                "role": getattr(msg, "role", "user"),
+                "content": getattr(msg, "content", ""),
+            }
+            tool_call_id = getattr(msg, "tool_call_id", None)
+            if tool_call_id is not None:
+                d["tool_call_id"] = tool_call_id
+            tool_calls = getattr(msg, "tool_calls", None)
+            if tool_calls is not None:
+                d["tool_calls"] = tool_calls
+            raw.append(d)
+
+    for msg in raw:
+        role = msg.get("role", "user")
+        content = msg.get("content")
 
         # Normalize "developer" role to "system" (OpenAI API compatibility)
         if role == "developer":
@@ -712,7 +760,7 @@ def extract_harmony_messages(
             processed_messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": getattr(msg, "tool_call_id", "") or "",
+                    "tool_call_id": msg.get("tool_call_id", "") or "",
                     "content": parsed_content,
                 }
             )
@@ -735,9 +783,9 @@ def extract_harmony_messages(
 
             # Preserve tool_calls field for chat_template
             # Parse arguments as JSON if possible (chat_template applies |tojson)
-            if hasattr(msg, "tool_calls") and msg.tool_calls:
+            if msg.get("tool_calls"):
                 tool_calls_list = []
-                for tc in msg.tool_calls:
+                for tc in msg["tool_calls"]:
                     if isinstance(tc, dict):
                         args_str = tc.get("function", {}).get("arguments", "{}")
                         tool_calls_list.append(

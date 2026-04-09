@@ -726,6 +726,30 @@ class TestEmbeddingEngine:
             assert engine.processor is mock_model.processor
             assert engine.hidden_size == 384
 
+    def test_engine_clears_metal_cache_after_embed(self):
+        """Metal cache should be cleared after the last active embed request (#684)."""
+        import asyncio
+        from omlx.engine.embedding import EmbeddingEngine
+        from omlx.models.embedding import EmbeddingOutput
+
+        engine = EmbeddingEngine("test-model")
+
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
+             patch("omlx.engine.embedding.mx") as mock_mx:
+            mock_model = MagicMock()
+            mock_model.embed.return_value = EmbeddingOutput(
+                embeddings=[[0.1, 0.2]],
+                total_tokens=5,
+                dimensions=2,
+            )
+            MockModel.return_value = mock_model
+
+            asyncio.run(engine.start())
+            asyncio.run(engine.embed(["Hello"]))
+
+            mock_mx.synchronize.assert_called()
+            mock_mx.clear_cache.assert_called()
+
 
 class TestEmbeddingModelsPydantic:
     """Additional Pydantic model tests."""

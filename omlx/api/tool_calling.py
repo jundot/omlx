@@ -17,6 +17,7 @@ Also includes structured output (JSON Schema) utilities:
 """
 
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from jsonschema import validate, ValidationError
 
 from .openai_models import FunctionCall, ResponseFormat, ToolCall, ToolDefinition
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -259,6 +262,92 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
     return cleaned, tool_calls
 
 
+# ---------------------------------------------------------------------------
+# Gemma 4 robust fallback parser
+# ---------------------------------------------------------------------------
+
+def _gemma4_args_to_json_robust(args_str: str) -> dict:
+    """Convert Gemma 4 tool call args to a Python dict.
+
+    Handles the common failure cases that mlx-lm's parser cannot:
+    - Bare string values without ``<|"|>`` delimiters (e.g. ``{location: Tokyo}``)
+    - Spaces after commas in key-value pairs
+    """
+    import regex
+
+    # 1. Extract <|"|>-delimited strings and replace with placeholders
+    strings: list[str] = []
+
+    def _capture(m):
+        strings.append(m.group(1))
+        return f"\x00{len(strings) - 1}\x00"
+
+    text = regex.sub(r'<\|"\|>(.*?)<\|"\|>', _capture, args_str, flags=regex.DOTALL)
+
+    # 2. Quote bare keys (allow whitespace after { or ,)
+    text = regex.sub(r"(?<=[{,])\s*(\w+)\s*:", r' "\1":', text)
+
+    # 3. Restore captured strings as properly escaped JSON strings
+    for i, s in enumerate(strings):
+        text = text.replace(f"\x00{i}\x00", json.dumps(s))
+
+    # 4. Try json.loads — works when all values are already valid JSON primitives
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 5. Quote bare string values that are not numbers, booleans, or null
+    def _quote_bare(m):
+        value = m.group(2).strip()
+        suffix = m.group(3)
+        if value.lower() in ("true", "false", "null"):
+            return f": {value}{suffix}"
+        try:
+            json.loads(value)
+            return f": {value}{suffix}"
+        except (json.JSONDecodeError, ValueError):
+            return f": {json.dumps(value)}{suffix}"
+
+    text = regex.sub(
+        r"(:\s*)([^\",\[\]{}\s][^,}]*?)(\s*[,}])", _quote_bare, text
+    )
+    return json.loads(text)
+
+
+def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
+    """Robust fallback parser for Gemma 4 ``call:name{args}`` format.
+
+    Activated only for Gemma 4 models (guarded by ``tool_call_start`` check).
+    Extends mlx-lm's parser to handle:
+    - Bare string values without ``<|"|>`` delimiters
+    - Colons / dots / hyphens in function names
+    """
+    import regex
+
+    pattern = regex.compile(
+        r"call:([\w:.-]+)(\{(?:[^{}]|(?2))*\})", regex.DOTALL
+    )
+    matches = list(pattern.finditer(text))
+    if not matches:
+        raise ValueError("No function call found in Gemma 4 format")
+
+    results = []
+    for match in matches:
+        func_name = match.group(1)
+        args_str = match.group(2)
+
+        # Try standard JSON first (model may emit valid JSON args)
+        try:
+            arguments = json.loads(args_str)
+        except json.JSONDecodeError:
+            arguments = _gemma4_args_to_json_robust(args_str)
+
+        results.append({"name": func_name, "arguments": arguments})
+
+    return results[0] if len(results) == 1 else results
+
+
 def parse_tool_calls(
     text: str,
     tokenizer: Any,
@@ -328,6 +417,39 @@ def parse_tool_calls(
                         )
                     )
                 except (ValueError, json.JSONDecodeError, AttributeError, KeyError):
+                    # Gemma 4 only: try robust fallback that handles bare
+                    # string values and colons in function names.
+                    if tool_call_start == "<|tool_call>":
+                        try:
+                            parsed = _parse_gemma4_tool_call_fallback(
+                                match.strip()
+                            )
+                            items = (
+                                parsed if isinstance(parsed, list) else [parsed]
+                            )
+                            for p in items:
+                                name = p.get("name", "")
+                                arguments = p.get("arguments", {})
+                                tool_calls.append(
+                                    ToolCall(
+                                        id=f"call_{uuid.uuid4().hex[:8]}",
+                                        type="function",
+                                        function=FunctionCall(
+                                            name=name,
+                                            arguments=json.dumps(
+                                                arguments, ensure_ascii=False
+                                            )
+                                            if isinstance(arguments, dict)
+                                            else str(arguments),
+                                        ),
+                                    )
+                                )
+                        except (
+                            ValueError,
+                            json.JSONDecodeError,
+                            KeyError,
+                        ):
+                            pass
                     continue
 
             if tool_calls:
@@ -358,6 +480,39 @@ def parse_tool_calls(
     # Fallback: bracket tool call formats (from text-formatted history)
     if "[Calling tool:" in cleaned_text or "[Tool call:" in cleaned_text:
         return _parse_bracket_tool_calls(cleaned_text)
+
+    # All parsing attempts exhausted. Strip known tool-call markers so raw
+    # control markup never leaks into the API response.  Models whose markers
+    # overlap with the generic ``<tool_call>`` tag already returned above via
+    # Branch 2 (_parse_xml_tool_calls), so this only affects models with
+    # unique markers (Gemma 4, Mistral, Pythonic, Kimi K2, Longcat, etc.).
+    if getattr(tokenizer, "has_tool_calling", False):
+        _start = getattr(tokenizer, "tool_call_start", None)
+        _end = getattr(tokenizer, "tool_call_end", None)
+        if _start and _end:
+            s_esc = re.escape(_start)
+            e_esc = re.escape(_end)
+            stripped = re.findall(
+                rf"{s_esc}(.*?){e_esc}", cleaned_text, flags=re.DOTALL
+            )
+            if stripped:
+                logger.warning(
+                    "Tool call markers found but parsing failed, "
+                    "stripping markers. Raw content: %s",
+                    stripped,
+                )
+            cleaned_text = re.sub(
+                rf"{s_esc}.*?{e_esc}", "", cleaned_text, flags=re.DOTALL
+            ).strip()
+        elif _start:
+            idx = cleaned_text.find(_start)
+            if idx >= 0:
+                logger.warning(
+                    "Tool call start marker found but parsing failed, "
+                    "stripping marker. Raw content: %s",
+                    cleaned_text[idx:],
+                )
+                cleaned_text = cleaned_text[:idx].strip()
 
     return cleaned_text, None
 

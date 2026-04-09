@@ -78,11 +78,11 @@ modelscope = [
     "modelscope>=1.10.0",
 ]
 audio = [
-    # mlx-audio from commit (6408d2a) with tts/stt/sts extras
+    # mlx-audio from commit (5175326) with tts/stt/sts extras
     # tts extra: misaki, num2words, spacy, phonemizer-fork, espeakng-loader, sentencepiece
     # stt extra: tiktoken, mistral-common[audio]
     # sts extra: tts deps + stt deps + webrtcvad
-    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@6408d2a410eb8c57464e07725b92271860199250",
+    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
     "python-multipart>=0.0.5",
 ]
 dev = [

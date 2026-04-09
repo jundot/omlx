@@ -1566,6 +1566,16 @@ class VLMBatchedEngine(BaseEngine):
             chat_template_kwargs=ct_kwargs,
             tools=template_tools,
         )
+
+        if images:
+            # Free Metal intermediates from vision encoding.
+            # Vision tower + projector produce large intermediate buffers
+            # that stay in the Metal cache pool until explicitly cleared.
+            # Without this, repeated VLM requests accumulate memory and
+            # eventually trigger ProcessMemoryEnforcer aborts (see #667).
+            mx.synchronize()
+            mx.clear_cache()
+
         return (
             token_ids,
             vlm_embeds,

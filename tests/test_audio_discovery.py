@@ -118,6 +118,37 @@ class TestDetectAudioModelType:
         })
         assert detect_model_type(tmp_path) == "audio_tts"
 
+    def test_qwen2_audio_model_type_returns_audio_stt(self, tmp_path):
+        """model_type='qwen2_audio' -> audio_stt."""
+        _write_config(tmp_path, {"model_type": "qwen2_audio"})
+        assert detect_model_type(tmp_path) == "audio_stt"
+
+    def test_qwen2_audio_architecture_returns_audio_stt(self, tmp_path):
+        """Qwen2AudioForConditionalGeneration architecture -> audio_stt."""
+        _write_config(tmp_path, {
+            "model_type": "qwen2_audio",
+            "architectures": ["Qwen2AudioForConditionalGeneration"],
+        })
+        assert detect_model_type(tmp_path) == "audio_stt"
+
+    def test_kugelaudio_model_type_returns_audio_tts(self, tmp_path):
+        """model_type='kugelaudio' -> audio_tts."""
+        _write_config(tmp_path, {"model_type": "kugelaudio"})
+        assert detect_model_type(tmp_path) == "audio_tts"
+
+    def test_kugelaudio_architecture_returns_audio_tts(self, tmp_path):
+        """KugelAudioForConditionalGeneration architecture -> audio_tts."""
+        _write_config(tmp_path, {
+            "model_type": "kugelaudio",
+            "architectures": ["KugelAudioForConditionalGeneration"],
+        })
+        assert detect_model_type(tmp_path) == "audio_tts"
+
+    def test_audiodit_model_type_returns_audio_tts(self, tmp_path):
+        """model_type='audiodit' (LongCat-AudioDiT) -> audio_tts."""
+        _write_config(tmp_path, {"model_type": "audiodit"})
+        assert detect_model_type(tmp_path) == "audio_tts"
+
 
 # ---------------------------------------------------------------------------
 # TestAudioNotUnsupported
