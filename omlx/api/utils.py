@@ -634,7 +634,7 @@ def _wrap_truncated_for_harmony(truncated_text: str) -> dict:
 
 
 def extract_harmony_messages(
-    messages: List[Message],
+    messages: list,
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
 ) -> List[dict]:
@@ -666,9 +666,30 @@ def extract_harmony_messages(
     """
     processed_messages = []
 
+    # Normalize to plain dicts -- callers may pass Pydantic Message
+    # objects (OpenAI path) or plain dicts (Anthropic path).
+    raw: list[dict] = []
     for msg in messages:
-        role = msg.role
-        content = msg.content
+        if hasattr(msg, "model_dump"):
+            raw.append(msg.model_dump())
+        elif isinstance(msg, dict):
+            raw.append(dict(msg))
+        else:
+            d: dict = {
+                "role": getattr(msg, "role", "user"),
+                "content": getattr(msg, "content", ""),
+            }
+            tool_call_id = getattr(msg, "tool_call_id", None)
+            if tool_call_id is not None:
+                d["tool_call_id"] = tool_call_id
+            tool_calls = getattr(msg, "tool_calls", None)
+            if tool_calls is not None:
+                d["tool_calls"] = tool_calls
+            raw.append(d)
+
+    for msg in raw:
+        role = msg.get("role", "user")
+        content = msg.get("content")
 
         # Normalize "developer" role to "system" (OpenAI API compatibility)
         if role == "developer":
@@ -712,7 +733,7 @@ def extract_harmony_messages(
             processed_messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": getattr(msg, "tool_call_id", "") or "",
+                    "tool_call_id": msg.get("tool_call_id", "") or "",
                     "content": parsed_content,
                 }
             )
@@ -735,9 +756,9 @@ def extract_harmony_messages(
 
             # Preserve tool_calls field for chat_template
             # Parse arguments as JSON if possible (chat_template applies |tojson)
-            if hasattr(msg, "tool_calls") and msg.tool_calls:
+            if msg.get("tool_calls"):
                 tool_calls_list = []
-                for tc in msg.tool_calls:
+                for tc in msg["tool_calls"]:
                     if isinstance(tc, dict):
                         args_str = tc.get("function", {}).get("arguments", "{}")
                         tool_calls_list.append(

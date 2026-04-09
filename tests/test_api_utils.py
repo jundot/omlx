@@ -1219,6 +1219,72 @@ class TestExtractHarmonyMessages:
         assert content["result"] == "success"
 
 
+    # -- dict input tests (issue #683) --
+
+    def test_simple_dict_message(self):
+        """Plain dict messages should work (Anthropic endpoint path)."""
+        messages = [{"role": "user", "content": "Hello"}]
+
+        result = extract_harmony_messages(messages)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert result[0]["content"] == "Hello"
+
+    def test_tool_dict_message(self):
+        """Tool messages as dicts should preserve role and tool_call_id."""
+        messages = [
+            {
+                "role": "tool",
+                "content": '{"result": "ok"}',
+                "tool_call_id": "call_abc",
+            }
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert result[0]["role"] == "tool"
+        assert result[0]["tool_call_id"] == "call_abc"
+        assert isinstance(result[0]["content"], dict)
+
+    def test_assistant_tool_calls_dict(self):
+        """Assistant messages with tool_calls as dicts should work."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city": "Tokyo"}',
+                        },
+                    }
+                ],
+            }
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert "tool_calls" in result[0]
+        assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert isinstance(result[0]["tool_calls"][0]["function"]["arguments"], dict)
+
+    def test_mixed_pydantic_and_dict_messages(self):
+        """Mixed Pydantic Message and dict inputs should both work."""
+        messages = [
+            Message(role="system", content="You are helpful."),
+            {"role": "user", "content": "Hi"},
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert result[1]["role"] == "user"
+
+
 class TestConsolidateSystemMessages:
     """Tests for system message consolidation."""
 
