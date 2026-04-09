@@ -1261,10 +1261,7 @@ class Scheduler:
             if think_end_ids:
                 from .api.thinking import ThinkingBudgetProcessor
 
-                try:
-                    think_start_id = getattr(self.tokenizer, 'think_start_id', None)
-                except ValueError:
-                    think_start_id = None
+                think_start_id = self._get_think_token_id('think_start_id')
                 leading_ids, trailing_ids = self._resolve_think_close_pattern()
                 processor = ThinkingBudgetProcessor(
                     think_end_token_ids=think_end_ids,
@@ -1303,6 +1300,21 @@ class Scheduler:
 
         return resolve_vocab_size(self.model)
 
+    def _get_think_token_id(self, attr: str) -> int | None:
+        """Safely read a think token id from the tokenizer.
+
+        mlx-lm tokenizers expose ``think_start_id`` / ``think_end_id`` as
+        properties that may raise ``ValueError`` (multi-token sequence) or
+        ``TypeError`` (``_think_start_tokens`` is ``None`` for models without
+        thinking support, e.g. context-1 / harmony parser).
+
+        Returns the token id, or ``None`` when unavailable.
+        """
+        try:
+            return getattr(self.tokenizer, attr, None)
+        except (ValueError, TypeError):
+            return None
+
     def _resolve_think_end_token_ids(self) -> list[int] | None:
         """Resolve token ID(s) for the close-think tag.
 
@@ -1310,11 +1322,7 @@ class Scheduler:
         </think> and </longcat_think> automatically.
         """
         # Tier 1: mlx-lm tokenizer attribute (covers all known think variants)
-        try:
-            think_end_id = getattr(self.tokenizer, 'think_end_id', None)
-        except ValueError:
-            # Multi-token think end (e.g. Gemma 4) - fall through to Tier 2
-            think_end_id = None
+        think_end_id = self._get_think_token_id('think_end_id')
         if think_end_id is not None:
             return [think_end_id]
 
@@ -1423,12 +1431,7 @@ class Scheduler:
         Returns False for disabled-thinking patterns like <think></think>
         where </think> immediately follows <think> in the prompt tail.
         """
-        try:
-            think_start_id = getattr(self.tokenizer, 'think_start_id', None)
-        except ValueError:
-            # Multi-token think start (e.g. Gemma 4 <|channel>thought) -
-            # single-token detection not applicable, handled by output parser
-            return False
+        think_start_id = self._get_think_token_id('think_start_id')
         if think_start_id is None:
             try:
                 think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")

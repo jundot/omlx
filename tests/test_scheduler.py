@@ -1545,6 +1545,23 @@ class TestDetectNeedsThinkPrefix:
         request = self._make_request([1, 2, 100, 101])
         assert scheduler._detect_needs_think_prefix(request) is True
 
+    def test_think_start_id_raises_type_error(self, mock_model):
+        """Tokenizer whose think_start_id raises TypeError -> False.
+
+        Models like context-1 (harmony parser) have _think_start_tokens=None
+        in their mlx-lm tokenizer, causing think_start_id to raise TypeError.
+        """
+        from unittest.mock import PropertyMock
+        from conftest import MockTokenizer
+
+        tokenizer = MockTokenizer()
+        type(tokenizer).think_start_id = PropertyMock(
+            side_effect=TypeError("object of type 'NoneType' has no len()")
+        )
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        request = self._make_request([1, 2, 3])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
 
 class TestOutputParserSmoke:
     """Smoke tests for scheduler output parser session integration."""
