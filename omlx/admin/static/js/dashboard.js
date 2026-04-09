@@ -338,6 +338,7 @@
                 { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
             ],
             accBatchSize: 1,
+            accEnableThinking: false,
             accRunning: false,
             accCurrentModel: '',
             accCurrentBenchId: null,
@@ -1686,6 +1687,7 @@
                                 selected.map(k => [k, this.accSampleSizes[k]])
                             ),
                             batch_size: this.accBatchSize,
+                            enable_thinking: this.accEnableThinking,
                         }),
                     });
                     if (!resp.ok) {
@@ -1896,15 +1898,16 @@
                 for (const m of models) {
                     lines.push('');
                     lines.push('Model: ' + m);
-                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10));
-                    lines.push('-'.repeat(54));
+                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10) + pad('Think', 8));
+                    lines.push('-'.repeat(62));
                     for (const r of this.accAllResults.filter(r => r.model_id === m)) {
                         lines.push(
                             rpad(r.benchmark.toUpperCase(), 16) +
                             pad((r.accuracy * 100).toFixed(1) + '%', 10) +
                             pad(r.correct, 10) +
                             pad(r.total, 8) +
-                            pad(r.time_s, 10)
+                            pad(r.time_s, 10) +
+                            pad(r.thinking_used ? 'Yes' : 'No', 8)
                         );
                     }
                 }
@@ -1942,6 +1945,7 @@
                         correct: r.correct,
                         total: r.total,
                         time_s: r.time_s,
+                        thinking_used: r.thinking_used || false,
                         category_scores: r.category_scores || null,
                         questions: qr,
                     }, null, 2);

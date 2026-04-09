@@ -277,6 +277,48 @@ class TestStripThinkTags:
         assert BaseBenchmark._strip_think_tags("<think>still thinking") == "<think>still thinking"
 
 
+# --- Thinking Mode Tests ---
+
+
+class TestThinkingMode:
+    def test_benchmark_result_thinking_used_default(self):
+        from omlx.eval.base import BenchmarkResult
+        result = BenchmarkResult(
+            benchmark_name="test",
+            accuracy=0.5,
+            total_questions=2,
+            correct_count=1,
+            time_seconds=1.0,
+        )
+        assert result.thinking_used is False
+
+    def test_benchmark_result_thinking_used_true(self):
+        from omlx.eval.base import BenchmarkResult
+        result = BenchmarkResult(
+            benchmark_name="test",
+            accuracy=0.5,
+            total_questions=2,
+            correct_count=1,
+            time_seconds=1.0,
+            thinking_used=True,
+        )
+        assert result.thinking_used is True
+
+    def test_thinking_token_constants(self):
+        from omlx.eval.base import THINKING_MIN_TOKENS, THINKING_MAX_TOKENS
+        assert THINKING_MIN_TOKENS == 8192
+        assert THINKING_MAX_TOKENS == 32768
+        assert THINKING_MIN_TOKENS < THINKING_MAX_TOKENS
+
+    def test_strip_think_tags_with_answer(self):
+        """Thinking content is stripped, leaving only the answer."""
+        from omlx.eval.base import BaseBenchmark
+        text = "<think>\nLet me analyze option A vs B.\nA seems correct.\n</think>\nThe answer is A"
+        result = BaseBenchmark._strip_think_tags(text)
+        assert "<think>" not in result
+        assert "The answer is A" in result
+
+
 # --- Dataset Sampling Tests ---
 
 

@@ -34,6 +34,38 @@
                                 </select>
                             </div>
 
+                            <!-- Thinking Mode -->
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.thinking') }}</label>
+                                <div class="flex items-center gap-3">
+                                    <button type="button"
+                                            @click="accEnableThinking = !accEnableThinking"
+                                            :class="accEnableThinking ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="accEnableThinking ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                    <span class="text-sm text-neutral-600" x-text="accEnableThinking ? '{{ t('acc_bench.config.thinking_on') }}' : '{{ t('acc_bench.config.thinking_off') }}'"></span>
+                                </div>
+                                <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.thinking_hint') }}</p>
+                            </div>
+
+                            <!-- Batch Size -->
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.batch_size') }}</label>
+                                <div class="flex items-center gap-4">
+                                    <template x-for="bs in [1, 2, 4, 8, 16, 32]" :key="bs">
+                                        <label class="flex items-center gap-2 cursor-pointer">
+                                            <input type="radio" name="accBatchSize"
+                                                   :value="bs" x-model.number="accBatchSize"
+                                                   class="w-4 h-4 border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                            <span class="text-sm text-neutral-600" x-text="bs + 'x'"></span>
+                                        </label>
+                                    </template>
+                                </div>
+                                <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.batch_size_hint') }}</p>
+                            </div>
+
                             <!-- Benchmark Selection — Card Grid -->
                             <div>
                                 <label class="block text-sm font-medium text-neutral-700 mb-3">{{ t('acc_bench.config.benchmarks') }}</label>
@@ -81,22 +113,6 @@
                                     </template>
                                 </div>
                                 <p class="text-xs text-neutral-400 mt-2">{{ t('acc_bench.config.benchmarks_hint') }}</p>
-                            </div>
-
-                            <!-- Batch Size -->
-                            <div>
-                                <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.batch_size') }}</label>
-                                <div class="flex items-center gap-4">
-                                    <template x-for="bs in [1, 2, 4, 8, 16, 32]" :key="bs">
-                                        <label class="flex items-center gap-2 cursor-pointer">
-                                            <input type="radio" name="accBatchSize"
-                                                   :value="bs" x-model.number="accBatchSize"
-                                                   class="w-4 h-4 border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                            <span class="text-sm text-neutral-600" x-text="bs + 'x'"></span>
-                                        </label>
-                                    </template>
-                                </div>
-                                <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.batch_size_hint') }}</p>
                             </div>
 
                             <!-- Add & Run Button -->
@@ -205,6 +221,9 @@
                                             <div class="flex items-center gap-2">
                                                 <h4 class="text-sm font-semibold text-neutral-900" x-text="r.benchmark.toUpperCase()"></h4>
                                                 <span class="text-xs font-medium text-neutral-400 bg-neutral-100 px-1.5 py-0.5 rounded" x-text="r.model_id"></span>
+                                                <template x-if="r.thinking_used">
+                                                    <span class="text-xs font-medium text-purple-600 bg-purple-50 px-1.5 py-0.5 rounded">{{ t('acc_bench.results.thinking_badge') }}</span>
+                                                </template>
                                             </div>
                                             <span class="text-xs text-neutral-400" x-text="r.correct + ' / ' + r.total + ' correct · ' + r.time_s + 's'"></span>
                                         </div>
