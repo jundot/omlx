@@ -229,7 +229,7 @@
                                     <div class="flex-1 relative">
                                         <input type="text" x-model="hfSearchQuery"
                                                @input="debounceSearch()"
-                                               @keydown.enter="immediateSearch()"
+                                               @keydown.enter="if (!$event.isComposing && $event.keyCode !== 229) immediateSearch()"
                                                @focus="hfSearchHistoryOpen = true"
                                                @blur="closeSearchHistory()"
                                                placeholder="{{ t('models.search.placeholder') }}"
@@ -674,7 +674,7 @@
                                                 <div class="flex-1 relative">
                                                     <input type="text" x-model="msSearchQuery"
                                                            @input="msDebounceSearch()"
-                                                           @keydown.enter="mImmediateSearch()"
+                                                           @keydown.enter="if (!$event.isComposing && $event.keyCode !== 229) mImmediateSearch()"
                                                            @focus="msSearchHistoryOpen = true"
                                                            @blur="closeMsSearchHistory()"
                                                            :placeholder="window.t('models.search.ms_placeholder')"

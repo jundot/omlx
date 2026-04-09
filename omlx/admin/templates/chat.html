@@ -560,7 +560,7 @@
                                         </div>
                                         <textarea
                                             x-model="editContent"
-                                            @keydown.enter.ctrl="saveEdit(index)"
+                                            @keydown.enter.ctrl="if (!$event.isComposing && $event.keyCode !== 229) saveEdit(index)"
                                             @keydown.escape="cancelEdit"
                                             class="inline-edit-textarea"
                                             x-init="$nextTick(() => { $el.focus(); $el.setSelectionRange($el.value.length, $el.value.length); })"
