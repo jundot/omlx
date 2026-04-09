@@ -168,3 +168,25 @@ class TestExtractGemma4Messages:
         result = extract_gemma4_messages(messages)
         assert isinstance(result[0]["content"], str)
         assert result[0]["content"] == "hello world"
+
+    def test_consecutive_user_with_image_merges_without_crash(self):
+        """Consecutive user messages where one has images should not crash.
+
+        Regression test for GitHub issue #671.
+        """
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "Look at this"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                ],
+            ),
+            Message(role="user", content="What is it?"),
+        ]
+        result = extract_gemma4_messages(messages)
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        types = [p["type"] for p in content]
+        assert "image_url" in types
