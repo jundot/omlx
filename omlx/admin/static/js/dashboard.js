@@ -1331,6 +1331,11 @@
                                     clearInterval(this.enginePackageTaskInterval);
                                     this.enginePackageTaskInterval = null;
                                     // Refresh stats to show updated versions
+                                    // Add delay to ensure pip install has fully written metadata
+                                    await new Promise(r => setTimeout(r, 500));
+                                    await this.loadStats();
+                                    // Load stats again after a short delay to ensure metadata is refreshed
+                                    await new Promise(r => setTimeout(r, 500));
                                     await this.loadStats();
                                 }
                             }
