@@ -209,8 +209,8 @@ def _build_audio_detection_sets():
     except Exception:
         logger.debug("mlx-audio not available — using static audio detection sets")
         # Static fallback so model discovery still works without mlx-audio
-        _stt = {"whisper", "qwen3_asr", "parakeet"}
-        _tts = {"qwen3_tts", "kokoro", "chatterbox", "vibevoice", "vibevoice_streaming"}
+        _stt = {"whisper", "qwen3_asr", "parakeet", "qwen2_audio"}
+        _tts = {"qwen3_tts", "kokoro", "chatterbox", "vibevoice", "vibevoice_streaming", "kugelaudio", "audiodit"}
         _sts = {"deepfilternet", "mossformer2_se", "sam_audio", "lfm_audio"}
         return _stt, _tts, _sts
 
@@ -225,6 +225,7 @@ AUDIO_STT_ARCHITECTURES = {
     "WhisperForConditionalGeneration",
     "Qwen3ASRForConditionalGeneration",
     "ParakeetForCTC",
+    "Qwen2AudioForConditionalGeneration",
 }
 
 AUDIO_TTS_ARCHITECTURES = {
@@ -233,6 +234,7 @@ AUDIO_TTS_ARCHITECTURES = {
     "ChatterboxForConditionalGeneration",
     "VibeVoiceForConditionalGeneration",
     "VibeVoiceStreamingForConditionalGenerationInference",
+    "KugelAudioForConditionalGeneration",
 }
 
 AUDIO_STS_ARCHITECTURES = {
