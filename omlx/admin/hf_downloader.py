@@ -613,9 +613,11 @@ class HFDownloader:
 
                 api, endpoint = _get_hf_api()
 
+                # Always ignore macOS metadata files and other unneeded files
+                ignore_patterns = ["*.DS_Store", ".DS_Store"]
+
                 # Skip pytorch format when safetensors exist to
                 # avoid downloading redundant weight files.
-                ignore_patterns = None
                 try:
                     model_info = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -629,11 +631,11 @@ class HFDownloader:
                     if model_info.safetensors and model_info.safetensors.get(
                         "parameters"
                     ):
-                        ignore_patterns = [
+                        ignore_patterns.extend([
                             "*.bin",
                             "original/**",
                             "consolidated.*.pth",
-                        ]
+                        ])
                 except Exception as e:
                     logger.warning(
                         f"Could not fetch repo info for {task.repo_id}: {e}"

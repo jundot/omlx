@@ -100,16 +100,6 @@ class ImageResponse(BaseModel):
     """List of generated images."""
 
 
-class ImageUsage(BaseModel):
-    """Token usage statistics for image generation."""
-
-    prompt_tokens: int
-    """Number of tokens in the prompt."""
-
-    total_tokens: int
-    """Total tokens used."""
-
-
 # Quality to inference steps mapping
 QUALITY_STEPS = {
     "standard": 20,

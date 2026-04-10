@@ -316,10 +316,13 @@ class ImageEngine(BaseNonStreamingEngine):
             logger.info(f"Stopping image engine: {self._model_name}")
             self._model = None
 
-            # Clear MLX cache
-            mx.synchronize()
-            mx.clear_cache()
+            # Clear MLX cache on the global executor to avoid Metal races
             gc.collect()
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+            )
+            logger.info(f"Image engine stopped: {self._model_name}")
 
     async def generate_image(
         self,

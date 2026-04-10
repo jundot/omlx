@@ -87,6 +87,11 @@ audio = [
     "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
     "python-multipart>=0.0.5",
 ]
+image = [
+    # mflux for image generation (Text-to-Image, Image-to-Image)
+    # Supports: FLUX.1, FLUX.2, Z-Image, FIBO, SeedVR2, Qwen Image
+    "mflux>=0.17.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
