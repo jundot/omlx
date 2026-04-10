@@ -37,6 +37,20 @@ def _has_cli_overrides(args) -> bool:
         return True
     if hasattr(args, "log_level") and args.log_level is not None:
         return True
+    if hasattr(args, "mcp_config") and args.mcp_config is not None:
+        return True
+    if hasattr(args, "hf_endpoint") and args.hf_endpoint is not None:
+        return True
+    if hasattr(args, "ms_endpoint") and args.ms_endpoint is not None:
+        return True
+    if hasattr(args, "http_proxy") and args.http_proxy is not None:
+        return True
+    if hasattr(args, "https_proxy") and args.https_proxy is not None:
+        return True
+    if hasattr(args, "no_proxy") and args.no_proxy is not None:
+        return True
+    if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
+        return True
     return False
 
 
@@ -103,6 +117,20 @@ def serve_command(args):
     # Apply ModelScope endpoint if configured
     if settings.modelscope.endpoint:
         os.environ["MODELSCOPE_DOMAIN"] = settings.modelscope.endpoint
+
+    # Apply proxy/TLS settings if configured
+    if settings.network.http_proxy:
+        os.environ["HTTP_PROXY"] = settings.network.http_proxy
+        os.environ["http_proxy"] = settings.network.http_proxy
+    if settings.network.https_proxy:
+        os.environ["HTTPS_PROXY"] = settings.network.https_proxy
+        os.environ["https_proxy"] = settings.network.https_proxy
+    if settings.network.no_proxy:
+        os.environ["NO_PROXY"] = settings.network.no_proxy
+        os.environ["no_proxy"] = settings.network.no_proxy
+    if settings.network.ca_bundle:
+        os.environ["REQUESTS_CA_BUNDLE"] = settings.network.ca_bundle
+        os.environ["SSL_CERT_FILE"] = settings.network.ca_bundle
 
     # Save CLI args to settings.json if non-default values provided
     if _has_cli_overrides(args):
@@ -495,6 +523,32 @@ Example directory structure:
         type=str,
         default=None,
         help="Custom ModelScope Hub endpoint URL",
+    )
+
+    # Network options
+    serve_parser.add_argument(
+        "--http-proxy",
+        type=str,
+        default=None,
+        help="HTTP proxy URL (e.g., http://proxy.company.com:8080)",
+    )
+    serve_parser.add_argument(
+        "--https-proxy",
+        type=str,
+        default=None,
+        help="HTTPS proxy URL (e.g., http://proxy.company.com:8080)",
+    )
+    serve_parser.add_argument(
+        "--no-proxy",
+        type=str,
+        default=None,
+        help="Comma-separated hosts/IPs to bypass proxy (e.g., localhost,127.0.0.1)",
+    )
+    serve_parser.add_argument(
+        "--ca-bundle",
+        type=str,
+        default=None,
+        help="Path to CA bundle PEM file for TLS interception environments",
     )
 
     # Base path and auth

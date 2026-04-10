@@ -20,6 +20,7 @@ from omlx.settings import (
     MCPSettings,
     MemorySettings,
     ModelSettings,
+    NetworkSettings,
     SamplingSettings,
     SchedulerSettings,
     ServerSettings,
@@ -492,6 +493,61 @@ class TestHuggingFaceSettings:
         """Test creation from empty dictionary uses defaults."""
         settings = HuggingFaceSettings.from_dict({})
         assert settings.endpoint == ""
+
+
+class TestNetworkSettings:
+    """Tests for NetworkSettings dataclass."""
+
+    def test_defaults(self):
+        """Test default values."""
+        settings = NetworkSettings()
+        assert settings.http_proxy == ""
+        assert settings.https_proxy == ""
+        assert settings.no_proxy == ""
+        assert settings.ca_bundle == ""
+
+    def test_custom_values(self):
+        """Test custom values."""
+        settings = NetworkSettings(
+            http_proxy="http://proxy:8080",
+            https_proxy="http://proxy:8080",
+            no_proxy="localhost,127.0.0.1",
+            ca_bundle="/tmp/corp-ca.pem",
+        )
+        assert settings.http_proxy == "http://proxy:8080"
+        assert settings.https_proxy == "http://proxy:8080"
+        assert settings.no_proxy == "localhost,127.0.0.1"
+        assert settings.ca_bundle == "/tmp/corp-ca.pem"
+
+    def test_to_dict(self):
+        """Test conversion to dictionary."""
+        settings = NetworkSettings(
+            http_proxy="http://proxy:8080",
+            https_proxy="http://proxy:8080",
+            no_proxy="localhost",
+            ca_bundle="/tmp/ca.pem",
+        )
+        result = settings.to_dict()
+        assert result == {
+            "http_proxy": "http://proxy:8080",
+            "https_proxy": "http://proxy:8080",
+            "no_proxy": "localhost",
+            "ca_bundle": "/tmp/ca.pem",
+        }
+
+    def test_from_dict(self):
+        """Test creation from dictionary."""
+        data = {
+            "http_proxy": "http://proxy:8080",
+            "https_proxy": "http://proxy:8080",
+            "no_proxy": "localhost",
+            "ca_bundle": "/tmp/ca.pem",
+        }
+        settings = NetworkSettings.from_dict(data)
+        assert settings.http_proxy == "http://proxy:8080"
+        assert settings.https_proxy == "http://proxy:8080"
+        assert settings.no_proxy == "localhost"
+        assert settings.ca_bundle == "/tmp/ca.pem"
 
 
 class TestLoggingSettings:
@@ -1076,6 +1132,25 @@ class TestGlobalSettings:
                 settings = GlobalSettings.load(base_path=tmpdir)
                 assert settings.huggingface.endpoint == "https://hf-mirror.com"
 
+    def test_env_override_network(self):
+        """Test environment variable override for network proxy settings."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {
+                    "OMLX_HTTP_PROXY": "http://proxy.company.com:8080",
+                    "OMLX_HTTPS_PROXY": "http://proxy.company.com:8443",
+                    "OMLX_NO_PROXY": "localhost,127.0.0.1",
+                    "OMLX_CA_BUNDLE": "/tmp/corp-ca.pem",
+                },
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.network.http_proxy == "http://proxy.company.com:8080"
+                assert settings.network.https_proxy == "http://proxy.company.com:8443"
+                assert settings.network.no_proxy == "localhost,127.0.0.1"
+                assert settings.network.ca_bundle == "/tmp/corp-ca.pem"
+
     def test_env_override_invalid_port_logs_warning(self):
         """Test invalid OMLX_PORT logs warning and keeps default."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1159,6 +1234,44 @@ class TestGlobalSettings:
             args = Namespace(mcp_config="/cli/mcp.json")
             settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
             assert settings.mcp.config_path == "/cli/mcp.json"
+
+    def test_cli_override_network(self):
+        """Test CLI override for network proxy settings."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = Namespace(
+                http_proxy="http://proxy.company.com:8080",
+                https_proxy="http://proxy.company.com:8443",
+                no_proxy="localhost,127.0.0.1",
+                ca_bundle="/tmp/corp-ca.pem",
+            )
+            settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
+            assert settings.network.http_proxy == "http://proxy.company.com:8080"
+            assert settings.network.https_proxy == "http://proxy.company.com:8443"
+            assert settings.network.no_proxy == "localhost,127.0.0.1"
+            assert settings.network.ca_bundle == "/tmp/corp-ca.pem"
+
+    def test_validate_invalid_http_proxy(self):
+        """Test invalid http_proxy fails validation."""
+        settings = GlobalSettings()
+        settings.network.http_proxy = "proxy.company.com:8080"
+        errors = settings.validate()
+        assert any("http_proxy" in e.lower() for e in errors)
+
+    def test_validate_invalid_https_proxy(self):
+        """Test invalid https_proxy fails validation."""
+        settings = GlobalSettings()
+        settings.network.https_proxy = "proxy.company.com:8443"
+        errors = settings.validate()
+        assert any("https_proxy" in e.lower() for e in errors)
+
+    def test_validate_valid_network_proxy(self):
+        """Test valid network proxy values pass validation."""
+        settings = GlobalSettings()
+        settings.network.http_proxy = "http://proxy.company.com:8080"
+        settings.network.https_proxy = "http://proxy.company.com:8443"
+        errors = settings.validate()
+        assert not any("http_proxy" in e.lower() for e in errors)
+        assert not any("https_proxy" in e.lower() for e in errors)
 
     def test_priority_cli_over_env_over_file(self):
         """Test that CLI > env > file > defaults priority is respected."""
