@@ -1083,6 +1083,9 @@ class GlobalSettings:
         """
         from .scheduler import SchedulerConfig
 
+        # Resolve SSD cache directory, but disable it if hot_cache_only is enabled
+        ssd_dir = None if self.cache.hot_cache_only else self.cache.get_ssd_cache_dir(self.base_path)
+
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
@@ -1091,7 +1094,7 @@ class GlobalSettings:
             hot_cache_only=self.cache.hot_cache_only,
             paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(
                 self.base_path
-            ),
+            ) if not self.cache.hot_cache_only else 0,
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
         )
 
