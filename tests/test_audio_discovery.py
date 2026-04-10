@@ -191,6 +191,7 @@ class TestNonAudioRegressions:
         _write_config(tmp_path, {
             "model_type": "qwen2_5_vl",
             "architectures": ["Qwen2_5_VLForConditionalGeneration"],
+            "vision_config": {"model_type": "siglip_vision_model"},
         })
         assert detect_model_type(tmp_path) == "vlm"
 

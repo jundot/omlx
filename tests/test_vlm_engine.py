@@ -160,15 +160,23 @@ class TestInjectToolCalling:
         assert getattr(tokenizer, "has_tool_calling", False) is False
 
     def test_skips_when_mlx_lm_not_available(self):
-        """ImportError from mlx_lm → silently skipped."""
+        """ImportError from both parser backends → silently skipped."""
         engine = _make_engine()
         tokenizer = MockVLMTokenizer(
             chat_template="<tool_call> tool_call.name",
             vocab={"<tool_call>": 100, "</tool_call>": 101},
         )
 
-        with patch.dict("sys.modules", {"mlx_lm": None, "mlx_lm.tokenizer_utils": None}):
-            # Import will fail
+        # Simulate environments where neither mlx_vlm.tool_parsers nor mlx_lm
+        # parser modules are importable.
+        with patch.dict(
+            "sys.modules",
+            {
+                "mlx_vlm.tool_parsers": None,
+                "mlx_lm": None,
+                "mlx_lm.tokenizer_utils": None,
+            },
+        ):
             engine._inject_tool_calling(tokenizer)
 
         # Should not crash, attributes not set

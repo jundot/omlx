@@ -158,8 +158,8 @@ class TestServeCommandOptions:
             text=True,
             timeout=10,
         )
-        assert "--max-num-seqs" in result.stdout
-        assert "--completion-batch-size" in result.stdout
+        assert "--max-concurrent-requests" in result.stdout
+        assert "--initial-cache-blocks" in result.stdout
 
     def test_serve_has_cache_options(self):
         """Test that serve command has cache options."""
