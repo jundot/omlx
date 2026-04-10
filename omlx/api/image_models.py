@@ -6,6 +6,8 @@ These models define the request and response schemas for:
 - /v1/images/generations endpoint (Text-to-Image, Image-to-Image)
 """
 
+import base64
+import re
 import time
 from typing import List, Literal, Optional, Tuple
 
@@ -75,6 +77,25 @@ class ImageRequest(BaseModel):
 
     strength: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     """Strength of transformation for I2I (0.0-1.0). Higher = more change."""
+
+    @field_validator("image")
+    @classmethod
+    def validate_image(cls, v: Optional[str]) -> Optional[str]:
+        """Validate that image field is valid base64 or None/empty."""
+        if v is None or v == "" or v == "string":
+            # None, empty string, or placeholder "string" -> treat as None
+            return None
+        # Strip data URI prefix if present
+        if v.startswith("data:"):
+            v = v.split(",", 1)[1]
+        # Validate base64 format (allow padding variants)
+        # Base64 chars: A-Z, a-z, 0-9, +, /, and optional = padding
+        if not re.match(r"^[A-Za-z0-9+/]+={0,2}$", v):
+            raise ValueError(
+                "image field must be valid base64-encoded data. "
+                "Leave empty or omit for text-to-image generation."
+            )
+        return v
 
 
 class ImageData(BaseModel):

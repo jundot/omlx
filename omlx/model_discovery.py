@@ -399,6 +399,17 @@ def detect_model_type(model_path: Path) -> ModelType:
         Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", or "image_t2i"
     """
     config_path = model_path / "config.json"
+
+    # Diffusers-style image models (Flux, etc.) have no top-level config.json
+    # Check for characteristic directory structure first
+    if _is_diffusers_image_dir(model_path):
+        return "image_t2i"
+
+    # Directory name heuristic for image models without config.json
+    name_lower = model_path.name.lower()
+    if any(hint in name_lower for hint in ["flux", "z-image", "zimage", "fibo", "seedvr"]):
+        return "image_t2i"
+
     if not config_path.exists():
         return "llm"
 
@@ -633,9 +644,42 @@ def _is_adapter_dir(path: Path) -> bool:
     return (path / "adapter_config.json").exists()
 
 
+def _is_diffusers_image_dir(path: Path) -> bool:
+    """Check if a directory is a diffusers-style image model (no top-level config.json).
+
+    mflux/Flux models use a diffusers-style structure:
+        model_dir/
+        ├── transformer/    (contains .safetensors weights)
+        ├── vae/
+        ├── text_encoder/
+        ├── text_encoder_2/
+        ├── tokenizer/
+        └── tokenizer_2/
+
+    These have no top-level config.json, but have characteristic subdirectories.
+    """
+    # Check for characteristic diffusers-style subdirectories
+    has_transformer = (path / "transformer").is_dir()
+    has_vae = (path / "vae").is_dir()
+
+    # Flux models also have dual text encoders
+    has_text_encoder = (path / "text_encoder").is_dir() or (path / "text_encoder_2").is_dir()
+
+    # Must have transformer and at least one of vae/text_encoder
+    return has_transformer and (has_vae or has_text_encoder)
+
+
 def _is_model_dir(path: Path) -> bool:
-    """Check if a directory contains a valid model (has config.json)."""
-    return (path / "config.json").exists() and not _is_adapter_dir(path)
+    """Check if a directory contains a valid model.
+
+    Supports:
+    - Standard models: has config.json
+    - Diffusers-style image models: transformer/ + vae/ or text_encoder/
+    - Not a LoRA adapter: no adapter_config.json
+    """
+    return (
+        (path / "config.json").exists() or _is_diffusers_image_dir(path)
+    ) and not _is_adapter_dir(path)
 
 
 def _resolve_hf_cache_entry(path: Path) -> tuple[Path, str] | None:

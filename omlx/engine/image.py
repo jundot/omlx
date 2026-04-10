@@ -36,8 +36,8 @@ class ImageGenerationOutput:
     Contains the generated PIL Image and generation parameters.
     """
 
-    image: Any  # PIL.Image.Image (avoid import at module level)
-    """The generated image as a PIL Image."""
+    image: Any  # mflux.GeneratedImage (contains PIL.Image in .image attribute)
+    """The generated image (mflux GeneratedImage with PIL.Image in .image attribute)."""
 
     prompt: str
     """The prompt used for generation."""
@@ -70,8 +70,10 @@ class ImageGenerationOutput:
         Returns:
             Base64-encoded image string
         """
+        # Extract PIL.Image from mflux GeneratedImage if needed
+        pil_image = self._get_pil_image()
         buffer = io.BytesIO()
-        self.image.save(buffer, format=format)
+        pil_image.save(buffer, format=format)
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
     def to_bytes(self, format: str = "PNG") -> bytes:
@@ -84,9 +86,26 @@ class ImageGenerationOutput:
         Returns:
             Image as bytes
         """
+        # Extract PIL.Image from mflux GeneratedImage if needed
+        pil_image = self._get_pil_image()
         buffer = io.BytesIO()
-        self.image.save(buffer, format=format)
+        pil_image.save(buffer, format=format)
         return buffer.getvalue()
+
+    def _get_pil_image(self) -> Any:
+        """
+        Extract PIL.Image from the stored image object.
+
+        mflux returns GeneratedImage which has .image attribute.
+        If already a PIL.Image, return directly.
+
+        Returns:
+            PIL.Image.Image object
+        """
+        # Check if it's a mflux GeneratedImage (has .image attribute)
+        if hasattr(self.image, "image") and hasattr(self.image, "model_config"):
+            return self.image.image
+        return self.image
 
 
 class ImageEngine(BaseNonStreamingEngine):

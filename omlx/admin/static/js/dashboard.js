@@ -1148,7 +1148,7 @@
             },
 
             get llmModels() {
-                return this.models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type);
+                return this.models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || m.model_type === 'image_t2i' || !m.model_type);
             },
 
             shellQuote(value) {

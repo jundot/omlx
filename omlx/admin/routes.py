@@ -3349,6 +3349,15 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 "size_formatted": format_size(total_size),
             }
         )
+    def is_model_dir(path: Path) -> bool:
+        """Check if directory is a valid model (config.json or diffusers-style image model)."""
+        if (path / "config.json").exists():
+            return True
+        # Diffusers-style image models (Flux, etc.)
+        has_transformer = (path / "transformer").is_dir()
+        has_vae = (path / "vae").is_dir()
+        has_text_encoder = (path / "text_encoder").is_dir() or (path / "text_encoder_2").is_dir()
+        return has_transformer and (has_vae or has_text_encoder)
 
     models = []
     seen_names: set[str] = set()
@@ -3359,7 +3368,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
 
-            if (subdir / "config.json").exists():
+            if is_model_dir(subdir):
                 # Level 1: direct model folder
                 _add_model(subdir, subdir.name)
             else:
@@ -3375,7 +3384,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 for child in sorted(subdir.iterdir()):
                     if not child.is_dir() or child.name.startswith("."):
                         continue
-                    if (child / "config.json").exists():
+                    if is_model_dir(child):
                         _add_model(child, child.name)
 
     return {"models": models}
