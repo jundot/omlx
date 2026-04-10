@@ -669,10 +669,6 @@ class PagedSSDCacheManager(CacheManager):
         file_path = blk_meta.file_path
         tensors_raw = entry.get('tensors_raw', {})
         if not tensors_raw:
-            # If we don't have raw bytes, check if it's already on SSD.
-            # If it is, we don't need to write it. If not, we can't write it.
-            if blk_meta.file_path.exists():
-                return False
             return False
         metadata = entry['file_metadata']
 
