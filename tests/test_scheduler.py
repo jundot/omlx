@@ -814,6 +814,8 @@ class TestSchedulerBoundarySnapshots:
         # which returns {uid: (cache_list, tokens_list)}.
         mock_layer_cache = MagicMock()
         type(mock_layer_cache).__name__ = "BatchArraysCache"
+        mock_layer_cache.state = ("keys", "values")
+        mock_layer_cache.meta_state = ("meta",)
 
         scheduler.batch_generator = MagicMock()
         scheduler.batch_generator.extract_cache.return_value = {
@@ -833,8 +835,48 @@ class TestSchedulerBoundarySnapshots:
 
         assert 4 in scheduler._boundary_cache_snapshots["req-boundary"]
         snapshot = scheduler._boundary_cache_snapshots["req-boundary"][4]
-        # Non-sliceable cache layer is kept as-is in the snapshot
-        assert snapshot == [mock_layer_cache]
+        # Verify core extracted fields; avoid strict dict equality due to potential cache_type overrides
+        assert snapshot[0]["state"] == ("keys", "values")
+        assert snapshot[0]["meta_state"] == ("meta",)
+        assert snapshot[0]["class_name"] == "BatchArraysCache"
+
+    def test_boundary_snapshot_is_frozen_state(self, mock_model, mock_tokenizer):
+        """Verify that mutating the cache after snapshotting does not change the snapshot."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_required = True
+
+        mock_layer_cache = MagicMock()
+        type(mock_layer_cache).__name__ = "BatchArraysCache"
+        mock_layer_cache.state = ("initial_state", "initial_state")
+        mock_layer_cache.meta_state = ("initial_meta",)
+
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.extract_cache.return_value = {
+            123: ([mock_layer_cache], [10, 11, 12, 13])
+        }
+
+        request = Request(
+            request_id="req-frozen",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [10, 11]
+        request.num_prompt_tokens = 2
+        request.output_token_ids = [12, 13]
+
+        scheduler._maybe_capture_boundary_snapshot(request, 123)
+        snapshot_before = scheduler._boundary_cache_snapshots["req-frozen"][4]
+
+        # Mutate the original cache object
+        mock_layer_cache.state = "mutated_state"
+
+        snapshot_after = scheduler._boundary_cache_snapshots["req-frozen"][4]
+
+        # The snapshot should remain "initial_state"
+        assert snapshot_after[0]["state"] == ("initial_state", "initial_state")
+        assert snapshot_after == snapshot_before
 
     def test_cleanup_finished_skips_output_tokens_for_reasoning_model(
         self, mock_model, mock_tokenizer

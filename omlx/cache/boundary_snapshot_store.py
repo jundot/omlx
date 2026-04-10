@@ -382,6 +382,9 @@ class BoundarySnapshotSSDStore:
         layer_info: List[Dict[str, str]] = []
 
         for i, layer_state in enumerate(extracted):
+            if layer_state is None:
+                layer_state = {}
+
             class_name = layer_state.get("class_name", "KVCache")
             cache_type = layer_state.get("cache_type", "KVCache")
             meta_state = layer_state.get("meta_state", ())

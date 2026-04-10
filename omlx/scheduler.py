@@ -1216,13 +1216,21 @@ class Scheduler:
         objects (not BatchKVCache). Extract non-sliceable layers for
         boundary snapshot storage.
         """
-        snapshot_cache = [
+        # Filter to keep only non-sliceable layers (to save RAM).
+        # _extract_cache_states converts None to placeholder dicts.
+        to_freeze = [
             c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES else None
             for c in prompt_cache
         ]
+
+        # Freeze the state immediately to avoid reference accumulation.
+        frozen_snapshot, _ = self._extract_cache_states(to_freeze)
+        if not frozen_snapshot:
+            return
+
         self._on_prefill_boundary_snapshot(
             self.request_id_to_uid.get(request.request_id, -1),
-            snapshot_cache,
+            frozen_snapshot,
             total_tokens,
         )
 
@@ -1479,6 +1487,9 @@ class Scheduler:
         # None placeholders from boundary snapshots (sliceable layers replaced).
         if cache_obj is None:
             return False
+        # Frozen state dictionaries are non-sliceable.
+        if isinstance(cache_obj, dict):
+            return False
 
         # CacheList nests multiple cache objects.
         sub_caches = getattr(cache_obj, "caches", None)
@@ -1638,13 +1649,20 @@ class Scheduler:
                 if uid not in result:
                     return None
                 cache_list, _tokens = result[uid]
-                # Only extract non-sliceable layers to avoid costly
-                # deep-copy accumulation (same rationale as prefill path).
-                return [
-                    c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES
-                    else None
+
+                # Filter to keep only non-sliceable layers (to save RAM).
+                # _extract_cache_states converts None to placeholder dicts.
+                to_freeze = [
+                    c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES else None
                     for c in cache_list
                 ]
+
+                # Freeze the state immediately to avoid reference accumulation.
+                frozen_snapshot, _ = self._extract_cache_states(to_freeze)
+                if not frozen_snapshot:
+                    return None
+
+                return frozen_snapshot
         except Exception as e:
             logger.debug(f"Failed to extract boundary cache snapshot for uid={uid}: {e}")
             return None
@@ -1975,6 +1993,12 @@ class Scheduler:
         """
         if not raw_cache:
             return [], None
+
+        # Check if already extracted (list of dicts or Nones) to avoid redundant work
+        if len(raw_cache) > 0:
+            first_non_none = next((x for x in raw_cache if x is not None), None)
+            if first_non_none is not None and isinstance(first_non_none, dict):
+                return raw_cache, None
 
         # Build ModelCacheConfig for type information.
         # Skip if raw_cache contains None entries (boundary snapshots with
