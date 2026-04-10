@@ -757,8 +757,10 @@ class PagedSSDCacheManager(CacheManager):
         Returns:
             Path to the safetensors file.
         """
+        if self._hot_cache_only:
+            return Path("")  # Dummy path for memory-only mode
         if self._cache_dir is None:
-            return Path(".")
+            raise RuntimeError("SSD cache directory is not configured; cannot resolve file path.")
         hash_hex = block_hash.hex()
         subdir = hash_hex[0]  # First character
         filename = f"{hash_hex}.safetensors"
@@ -766,8 +768,6 @@ class PagedSSDCacheManager(CacheManager):
 
     def _scan_existing_files(self) -> None:
         """Scan cache directory for existing files and build index."""
-        if self._cache_dir is None:
-            return
         logger.info(f"Scanning SSD cache directory: {self._cache_dir}")
 
         scanned = 0
