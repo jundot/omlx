@@ -1084,6 +1084,11 @@ class PagedSSDCacheManager(CacheManager):
                 mx.eval(*arrays.values())  # noqa: S307 — MLX tensor eval, not Python eval
 
             # Extract raw bytes from evaluated tensors on the inference thread.
+            # This is Metal-safe because it uses memoryview() on evaluated arrays.
+            # For bfloat16, we use view(uint16) trick since Python's buffer
+            # protocol doesn't support bfloat16 directly.
+            # The background writer thread then writes the safetensors file
+            # using pure Python I/O — no mx/Metal API calls needed.
             # Only do this if SSD is enabled to avoid unnecessary CPU/RAM usage.
             tensors_raw = {}
             if not self._hot_cache_only:
