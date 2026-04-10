@@ -23,8 +23,8 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "image_t2i"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "image"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -245,6 +245,32 @@ AUDIO_STS_ARCHITECTURES = {
     "LFM2AudioModel",
 }
 
+# ---------------------------------------------------------------------------
+# Image model detection — diffusion models for image generation (mflux)
+# ---------------------------------------------------------------------------
+
+IMAGE_MODEL_TYPES = {
+    "flux",
+    "flux1",
+    "flux_1",
+    "flux2",
+    "flux_2",
+    "z_image",
+    "zimage",
+    "fibo",
+    "seedvr",
+    "seedvr2",
+    "qwen_image",
+}
+
+IMAGE_ARCHITECTURES = {
+    "FluxPipeline",
+    "FluxTransformer2DModel",
+    "ZImagePipeline",
+    "FIBOPipeline",
+    "SeedVR2Pipeline",
+}
+
 
 @dataclass
 class DiscoveredModel:
@@ -364,12 +390,13 @@ def detect_model_type(model_path: Path) -> ModelType:
     5. model_type field against known embedding types (unambiguous only)
     6. VLM detection via architectures, model_type, or vision_config presence
     7. Audio model detection (STT/TTS/STS)
+    8. Image generation model detection (T2I)
 
     Args:
         model_path: Path to model directory
 
     Returns:
-        Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", or "audio_sts"
+        Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", or "image_t2i"
     """
     config_path = model_path / "config.json"
     if not config_path.exists():
@@ -489,6 +516,26 @@ def detect_model_type(model_path: Path) -> ModelType:
     # LFM2 audio: model_type starts with "lfm" and is not an embedding
     if normalized_type.startswith("lfm") and normalized_type not in EMBEDDING_MODEL_TYPES:
         return "audio_sts"
+
+    # Check for image generation models (diffusion models via mflux)
+    # Architecture check first (unambiguous):
+    for arch in architectures:
+        if arch in IMAGE_ARCHITECTURES:
+            return "image_t2i"
+
+    # model_type check for image models
+    if normalized_type in IMAGE_MODEL_TYPES or model_type in IMAGE_MODEL_TYPES:
+        return "image_t2i"
+
+    # Heuristic: model directory name suggests image generation
+    name_lower = model_path.name.lower()
+    if any(hint in name_lower for hint in ["flux", "z-image", "zimage", "fibo", "seedvr"]):
+        # Additional check: image models typically have unet or vae configs
+        if (model_path / "unet").exists() or (model_path / "vae").exists():
+            return "image_t2i"
+        # Or scheduler config (common in diffusers-format models)
+        if (model_path / "scheduler").exists():
+            return "image_t2i"
 
     return "llm"
 
@@ -639,6 +686,8 @@ def _register_model(
             engine_type = "audio_tts"
         elif model_type == "audio_sts":
             engine_type = "audio_sts"
+        elif model_type == "image_t2i":
+            engine_type = "image"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)

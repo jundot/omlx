@@ -113,3 +113,7 @@ omlx/admin/tailwindcss-*
 
 # Git worktrees
 .worktrees/
+# claude
+.claude/
+.omc/
+.omx/

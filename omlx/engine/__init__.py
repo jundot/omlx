@@ -7,6 +7,7 @@ Provides multiple engine implementations:
 - VLMBatchedEngine: Vision-language model engine with image support
 - EmbeddingEngine: Batch embedding generation using mlx-embeddings
 - RerankerEngine: Document reranking using SequenceClassification models
+- ImageEngine: Image generation (Text-to-Image, Image-to-Image)
 
 Also re-exports core engine components for backwards compatibility.
 """
@@ -18,6 +19,7 @@ from .batched import BatchedEngine
 from .embedding import EmbeddingEngine
 
 from .dflash import DFlashEngine
+from .image import ImageEngine, ImageGenerationOutput
 from .reranker import RerankerEngine
 from .stt import STTEngine
 from .sts import STSEngine
@@ -36,6 +38,8 @@ __all__ = [
     "STTEngine",
     "STSEngine",
     "TTSEngine",
+    "ImageEngine",
+    "ImageGenerationOutput",
     # Core engine components
     "EngineCore",
     "AsyncEngineCore",

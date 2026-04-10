@@ -423,6 +423,10 @@ try:
 except ImportError:
     pass
 
+# Include image generation routes (lazy import, mflux checked at runtime)
+from .api.image_routes import router as image_router
+app.include_router(image_router)
+
 # Include admin routes
 from .admin.routes import router as admin_router, set_admin_getters
 from .admin.auth import _RedirectToLogin
