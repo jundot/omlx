@@ -1487,9 +1487,6 @@ class Scheduler:
         # None placeholders from boundary snapshots (sliceable layers replaced).
         if cache_obj is None:
             return False
-        # Frozen state dictionaries are non-sliceable.
-        if isinstance(cache_obj, dict):
-            return False
 
         # CacheList nests multiple cache objects.
         sub_caches = getattr(cache_obj, "caches", None)
@@ -1499,28 +1496,18 @@ class Scheduler:
                 for sub_cache in sub_caches
             )
 
-        class_name = type(cache_obj).__name__
+        # Extract class name from either a frozen dict or a live object
+        if isinstance(cache_obj, dict):
+            class_name = cache_obj.get('class_name') or cache_obj.get('cache_type')
+        else:
+            class_name = type(cache_obj).__name__
 
-        # Known sliceable cache types — no boundary snapshots needed.
-        if class_name in (
-            "KVCache",
-            "BatchKVCache",
-            "QuantizedKVCache",
-        ):
+        if not class_name:
             return False
-
-        # Stateful non-sliceable caches require boundary-safe snapshots.
-        if class_name in (
-            "RotatingKVCache",
-            "BatchRotatingKVCache",
-            "ArraysCache",
-            "SizedArraysCache",
-        ):
-            return True
 
         if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
             handler = CacheTypeRegistry.get_handler_by_class_name(class_name)
-            if not handler.supports_block_slicing:
+            if handler and not handler.supports_block_slicing:
                 return True
 
         # Best-effort fallback for unknown recurrent cache structures.
