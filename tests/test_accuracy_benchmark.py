@@ -60,6 +60,21 @@ class TestAccuracyBenchmarkRequest:
         )
         assert len(req.benchmarks) == 12
 
+    def test_enable_thinking_default_false(self):
+        req = AccuracyBenchmarkRequest(
+            model_id="test-model",
+            benchmarks={"mmlu": 100},
+        )
+        assert req.enable_thinking is False
+
+    def test_enable_thinking_true(self):
+        req = AccuracyBenchmarkRequest(
+            model_id="test-model",
+            benchmarks={"mmlu": 100},
+            enable_thinking=True,
+        )
+        assert req.enable_thinking is True
+
 
 class TestQueueAndResults:
     def setup_method(self):
@@ -175,6 +190,7 @@ class TestRunAccuracyBenchmark:
         mock_result.correct_count = 3
         mock_result.time_seconds = 1.0
         mock_result.category_scores = None
+        mock_result.thinking_used = False
 
         mock_evaluator = MagicMock()
         mock_evaluator.load_dataset = AsyncMock(return_value=[{"id": "1"}])

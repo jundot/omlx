@@ -145,6 +145,7 @@ class Request:
     vlm_image_hash: Optional[str] = None  # SHA256 hash of images for prefix cache
     vlm_cache_key_start: int = 0  # Token index where image-specific cache keying starts
     vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = None  # [(token_start, cumulative_image_hash)]
+    rope_deltas: float = 0.0  # Per-request mRoPE position delta (set after VLM prefill)
 
     # Metadata
     finish_reason: Optional[str] = None

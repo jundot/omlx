@@ -217,6 +217,7 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
         on_progress: Optional[Callable[[int, int], Any]] = None,
         batch_size: int = 1,
         sampling_kwargs: Optional[dict] = None,
+        enable_thinking: bool = False,
     ) -> BenchmarkResult:
         """Override run: generation is batched, code execution is sequential."""
         results: list[QuestionResult] = []
@@ -231,14 +232,14 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
 
             # Batch the generation phase
             gen_tasks = [
-                self._eval_single(engine, item, batch_start + j, sampling_kwargs)
+                self._eval_single(engine, item, batch_start + j, sampling_kwargs, enable_thinking)
                 for j, item in enumerate(batch)
             ]
             gen_results = await asyncio.gather(*gen_tasks)
             gen_elapsed = time.time() - batch_time
 
             # Code execution is sequential (subprocess safety)
-            for idx, item, response_text, prompt_text in sorted(gen_results, key=lambda x: x[0]):
+            for idx, item, response_text, prompt_text, _raw in sorted(gen_results, key=lambda x: x[0]):
                 code = self.extract_answer(response_text, item)
                 is_correct = self.check_answer(code, item)
 
@@ -271,4 +272,5 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
             correct_count=correct,
             time_seconds=total_time,
             question_results=results,
+            thinking_used=enable_thinking,
         )

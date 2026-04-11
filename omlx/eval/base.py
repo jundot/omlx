@@ -11,6 +11,10 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# Token budget for thinking/reasoning models (industry reference: OpenCompass 8K~32K)
+THINKING_MIN_TOKENS = 8192
+THINKING_MAX_TOKENS = 32768
+
 
 @dataclass
 class QuestionResult:
@@ -36,6 +40,7 @@ class BenchmarkResult:
     time_seconds: float
     question_results: list[QuestionResult] = field(default_factory=list)
     category_scores: Optional[dict[str, float]] = None
+    thinking_used: bool = False
 
 
 class BaseBenchmark(ABC):
@@ -166,10 +171,14 @@ class BaseBenchmark(ABC):
     async def _eval_single(
         self, engine: Any, item: dict, index: int,
         sampling_kwargs: Optional[dict] = None,
-    ) -> tuple[int, dict, str, str]:
-        """Evaluate a single item. Returns (index, item, response_text, prompt_text)."""
+        enable_thinking: bool = False,
+    ) -> tuple[int, dict, str, str, str]:
+        """Evaluate a single item.
+
+        Returns (index, item, response_text, prompt_text, raw_text).
+        raw_text is the unstripped output for auto-detection of thinking tags.
+        """
         messages = self.format_prompt(item)
-        # Extract the full prompt text for logging
         prompt_text = "\n".join(m.get("content", "") for m in messages)
         kwargs = dict(sampling_kwargs or {})
         # Force benchmark-controlled params (override model settings)
@@ -178,24 +187,29 @@ class BaseBenchmark(ABC):
         # analysis can consume the entire budget before final is emitted
         if getattr(engine, "model_type", None) == "gpt_oss":
             max_tokens = max(max_tokens * 4, 8192)
+        elif enable_thinking:
+            max_tokens = min(
+                max(max_tokens, THINKING_MIN_TOKENS), THINKING_MAX_TOKENS
+            )
         kwargs["max_tokens"] = max_tokens
         kwargs["temperature"] = 0.0
         kwargs["presence_penalty"] = 0.0
         kwargs["repetition_penalty"] = 1.0
-        # Merge enable_thinking=False into any existing chat_template_kwargs
+        # Merge enable_thinking into any existing chat_template_kwargs
         ct_kwargs = kwargs.pop("chat_template_kwargs", {}) or {}
-        ct_kwargs["enable_thinking"] = False
+        ct_kwargs["enable_thinking"] = enable_thinking
         kwargs["chat_template_kwargs"] = ct_kwargs
         try:
             output = await engine.chat(
                 messages=messages,
                 **kwargs,
             )
-            text = self._strip_think_tags(output.text)
-            return index, item, text, prompt_text
+            raw_text = output.text
+            text = self._strip_think_tags(raw_text)
+            return index, item, text, prompt_text, raw_text
         except Exception as e:
             logger.warning(f"Engine error on question {index}: {e}")
-            return index, item, "", prompt_text
+            return index, item, "", prompt_text, ""
 
     async def run(
         self,
@@ -204,6 +218,7 @@ class BaseBenchmark(ABC):
         on_progress: Optional[Callable[[int, int], Any]] = None,
         batch_size: int = 1,
         sampling_kwargs: Optional[dict] = None,
+        enable_thinking: bool = False,
     ) -> BenchmarkResult:
         """Run the benchmark on all items.
 
@@ -212,6 +227,9 @@ class BaseBenchmark(ABC):
             items: Dataset items to evaluate.
             on_progress: Callback(current, total) for progress reporting.
             batch_size: Number of concurrent requests (1 = sequential).
+            enable_thinking: Enable thinking mode for reasoning models.
+                When False, auto-detects if the model outputs <think> tags
+                and re-runs the first batch with thinking enabled.
 
         Returns:
             BenchmarkResult with accuracy and per-question details.
@@ -223,6 +241,9 @@ class BaseBenchmark(ABC):
         start_time = time.time()
         completed = 0
 
+        thinking_used = enable_thinking
+        auto_switched = False
+
         # Process in batches
         for batch_start in range(0, len(items), batch_size):
             batch_end = min(batch_start + batch_size, len(items))
@@ -231,14 +252,38 @@ class BaseBenchmark(ABC):
 
             # Launch concurrent requests
             tasks = [
-                self._eval_single(engine, item, batch_start + j, sampling_kwargs)
+                self._eval_single(
+                    engine, item, batch_start + j, sampling_kwargs, thinking_used
+                )
                 for j, item in enumerate(batch)
             ]
             batch_results = await asyncio.gather(*tasks)
+
+            # Auto-detection: check first batch for <think> tags
+            if not thinking_used and not auto_switched and batch_start == 0:
+                auto_switched = True
+                has_think_tags = any(
+                    "<think>" in raw for _, _, _, _, raw in batch_results
+                )
+                if has_think_tags:
+                    logger.warning(
+                        f"{self.name}: model outputs <think> tags with "
+                        "enable_thinking=False, auto-switching to thinking mode"
+                    )
+                    thinking_used = True
+                    # Re-run first batch with increased token budget
+                    tasks = [
+                        self._eval_single(
+                            engine, item, batch_start + j, sampling_kwargs, True
+                        )
+                        for j, item in enumerate(batch)
+                    ]
+                    batch_results = await asyncio.gather(*tasks)
+
             batch_elapsed = time.time() - batch_start_time
 
             # Process results in order
-            for idx, item, response_text, prompt_text in sorted(batch_results, key=lambda x: x[0]):
+            for idx, item, response_text, prompt_text, _raw in sorted(batch_results, key=lambda x: x[0]):
                 predicted = self.extract_answer(response_text, item)
                 is_correct = self.check_answer(predicted, item)
 
@@ -291,4 +336,5 @@ class BaseBenchmark(ABC):
             time_seconds=total_time,
             question_results=results,
             category_scores=cat_scores,
+            thinking_used=thinking_used,
         )

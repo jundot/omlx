@@ -389,8 +389,17 @@ def detect_model_type(model_path: Path) -> ModelType:
         )
 
     # Check for VLM: architectures field
+    # Some text-only quants (e.g., unsloth/gemma-4-31b-it-MLX-8bit) keep the VLM
+    # architecture name but strip vision_config and vision weights.
+    # For model families known to have text-only variants, require vision_config.
     for arch in architectures:
         if arch in VLM_ARCHITECTURES:
+            if normalized_type in VLM_MODEL_TYPES and "vision_config" not in config:
+                logger.info(
+                    f"Architecture '{arch}' is a VLM architecture but no vision_config "
+                    "found — treating as LLM (text-only quant)"
+                )
+                break
             return "vlm"
 
     # Check for VLM: model_type field (only if vision capabilities are present)

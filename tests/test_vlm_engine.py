@@ -160,15 +160,21 @@ class TestInjectToolCalling:
         assert getattr(tokenizer, "has_tool_calling", False) is False
 
     def test_skips_when_mlx_lm_not_available(self):
-        """ImportError from mlx_lm → silently skipped."""
+        """When neither parser backend is available, injection is skipped."""
         engine = _make_engine()
         tokenizer = MockVLMTokenizer(
             chat_template="<tool_call> tool_call.name",
             vocab={"<tool_call>": 100, "</tool_call>": 101},
         )
 
-        with patch.dict("sys.modules", {"mlx_lm": None, "mlx_lm.tokenizer_utils": None}):
-            # Import will fail
+        with patch.dict(
+            "sys.modules",
+            {
+                "mlx_vlm.tool_parsers": None,
+                "mlx_lm": None,
+                "mlx_lm.tokenizer_utils": None,
+            },
+        ):
             engine._inject_tool_calling(tokenizer)
 
         # Should not crash, attributes not set
@@ -674,10 +680,13 @@ class TestFormatMessagesForVLMTemplate:
             },
         ]
 
-        formatted = engine._format_messages_for_vlm_template(messages, num_images=1)
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
 
         assert self._count_image_placeholders(formatted) == 1
         assert self._count_image_placeholders([formatted[-1]]) == 1
+        assert image_ranges == [(2, 1)]
 
     def test_caps_placeholders_by_loaded_image_count(self):
         """Do not add more placeholders than successfully loaded images."""
@@ -693,18 +702,24 @@ class TestFormatMessagesForVLMTemplate:
             },
         ]
 
-        formatted = engine._format_messages_for_vlm_template(messages, num_images=1)
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
 
         assert self._count_image_placeholders(formatted) == 1
+        assert image_ranges == [(0, 1)]
 
     def test_fallback_inserts_first_user_when_no_explicit_parts(self):
         """Legacy path: num_images without explicit image parts still injects once."""
         engine = _make_loaded_engine(model_type="qwen3_5")
         messages = [{"role": "user", "content": "Describe this"}]
 
-        formatted = engine._format_messages_for_vlm_template(messages, num_images=1)
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
 
         assert self._count_image_placeholders(formatted) == 1
+        assert image_ranges == [(0, 1)]
 
 
 # ---------------------------------------------------------------------------

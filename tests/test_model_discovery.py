@@ -137,6 +137,7 @@ class TestDetectModelType:
         config = {
             "model_type": "qwen2_5_vl",
             "architectures": ["Qwen2_5_VLForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1152},
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
@@ -165,6 +166,7 @@ class TestDetectModelType:
         config = {
             "model_type": "gemma3",
             "architectures": ["Gemma3ForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1152},
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
@@ -174,9 +176,28 @@ class TestDetectModelType:
         config = {
             "model_type": "gemma4",
             "architectures": ["Gemma4ForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1152},
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_text_only_gemma3_as_llm(self, tmp_path):
+        """Text-only quant of Gemma3 (no vision_config) should be LLM."""
+        config = {
+            "model_type": "gemma3",
+            "architectures": ["Gemma3ForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_text_only_gemma4_as_llm(self, tmp_path):
+        """Text-only quant of Gemma4 (no vision_config) should be LLM."""
+        config = {
+            "model_type": "gemma4",
+            "architectures": ["Gemma4ForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
 
     def test_detect_vlm_qwen3_5_moe(self, tmp_path):
         """Test detection of Qwen3.5 MoE as VLM."""

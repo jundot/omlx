@@ -1559,8 +1559,9 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
 @app.post("/v1/embeddings")
 async def create_embeddings(
     request: EmbeddingRequest,
+    http_request: FastAPIRequest,
     _: bool = Depends(verify_api_key),
-) -> EmbeddingResponse:
+):
     """
     Create embeddings for input text(s).
 
@@ -1599,48 +1600,50 @@ async def create_embeddings(
     if not embedding_inputs:
         raise HTTPException(status_code=400, detail="Input cannot be empty")
 
-    # Generate embeddings
-    start_time = time.perf_counter()
-    try:
-        output = await engine.embed(embedding_inputs)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except TypeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    async def _build_embeddings():
+        start_time = time.perf_counter()
+        try:
+            output = await engine.embed(embedding_inputs)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except TypeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
-    elapsed = time.perf_counter() - start_time
-    logger.info(
-        f"Embedding: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
-        f"{output.total_tokens} tokens in {elapsed:.3f}s"
-    )
-
-    # Format response
-    data = []
-    for i, embedding in enumerate(output.embeddings):
-        # Apply dimension truncation if specified
-        if request.dimensions and request.dimensions < len(embedding):
-            embedding = truncate_embedding(embedding, request.dimensions)
-
-        # Apply encoding format
-        if request.encoding_format == "base64":
-            formatted_embedding = encode_embedding_base64(embedding)
-        else:
-            formatted_embedding = embedding
-
-        data.append(
-            EmbeddingData(
-                index=i,
-                embedding=formatted_embedding,
-            )
+        elapsed = time.perf_counter() - start_time
+        logger.info(
+            f"Embedding: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
+            f"{output.total_tokens} tokens in {elapsed:.3f}s"
         )
 
-    return EmbeddingResponse(
-        data=data,
-        model=request.model,
-        usage=EmbeddingUsage(
-            prompt_tokens=output.total_tokens,
-            total_tokens=output.total_tokens,
-        ),
+        data = []
+        for i, embedding in enumerate(output.embeddings):
+            if request.dimensions and request.dimensions < len(embedding):
+                embedding = truncate_embedding(embedding, request.dimensions)
+
+            if request.encoding_format == "base64":
+                formatted_embedding = encode_embedding_base64(embedding)
+            else:
+                formatted_embedding = embedding
+
+            data.append(
+                EmbeddingData(
+                    index=i,
+                    embedding=formatted_embedding,
+                )
+            )
+
+        return EmbeddingResponse(
+            data=data,
+            model=request.model,
+            usage=EmbeddingUsage(
+                prompt_tokens=output.total_tokens,
+                total_tokens=output.total_tokens,
+            ),
+        ).model_dump_json()
+
+    return StreamingResponse(
+        _with_json_keepalive(http_request, _build_embeddings()),
+        media_type="application/json",
     )
 
 

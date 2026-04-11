@@ -45,6 +45,7 @@ class AccuracyBenchmarkRequest(BaseModel):
     model_id: str
     benchmarks: dict[str, int]  # name -> sample_size (0 = full dataset)
     batch_size: int = 1
+    enable_thinking: bool = False
 
     @field_validator("batch_size")
     @classmethod
@@ -403,6 +404,7 @@ async def run_accuracy_benchmark(
                     engine, items, on_progress,
                     batch_size=request.batch_size,
                     sampling_kwargs=sampling_kwargs,
+                    enable_thinking=request.enable_thinking,
                 )
             except asyncio.CancelledError:
                 run.status = "cancelled"
@@ -426,6 +428,7 @@ async def run_accuracy_benchmark(
                 "model_id": request.model_id,
                 "benchmark": result.benchmark_name,
                 "accuracy": round(result.accuracy, 4),
+                "thinking_used": result.thinking_used,
                 "total": result.total_questions,
                 "correct": result.correct_count,
                 "time_s": round(result.time_seconds, 1),

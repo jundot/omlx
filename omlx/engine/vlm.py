@@ -382,6 +382,26 @@ SINGLE_IMAGE_ONLY_MODELS = {
     "mllama",
 }
 
+def _uses_mrope(vlm_model) -> bool:
+    """Check if the VLM model uses multi-dimensional RoPE (mRoPE).
+
+    mRoPE models use 3D position IDs (temporal/height/width) that are
+    incompatible with the mlx-lm decode model's standard 1D RoPE.
+    """
+    config = getattr(vlm_model, "config", None)
+    if config is None:
+        return False
+    text_config = getattr(config, "text_config", None)
+    if text_config is None:
+        return False
+    rope_cfg = getattr(text_config, "rope_scaling", None) or getattr(
+        text_config, "rope_parameters", None
+    )
+    if isinstance(rope_cfg, dict):
+        return "mrope_section" in rope_cfg
+    return False
+
+
 # Qwen-style VLMs: vision_tower takes (pixel_values, grid_thw)
 _QWEN_VISION_MODELS = {
     "qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe",
@@ -1163,6 +1183,20 @@ class VLMBatchedEngine(BaseEngine):
                 for k, v in feat_dict.items():
                     if k != "inputs_embeds" and v is not None:
                         extra_kwargs[k] = v
+
+            # Capture per-request mRoPE state set by
+            # get_input_embeddings(). The language model stores these as
+            # global state that gets overwritten by subsequent calls.
+            # Storing per-request ensures correct position computation
+            # when multiple VLM requests are batched.
+            lm = getattr(self._vlm_model, "language_model", None)
+            if lm is not None:
+                pid = getattr(lm, "_position_ids", None)
+                if pid is not None and "position_ids" not in extra_kwargs:
+                    extra_kwargs["position_ids"] = pid
+                rd = getattr(lm, "_rope_deltas", None)
+                if rd is not None:
+                    extra_kwargs["_captured_rope_deltas"] = rd
 
             # Extract token IDs as list
             token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()

@@ -118,6 +118,15 @@ class _PrefillAbortedError(Exception):
 _original_generation_batch_step = GenerationBatch._step
 
 def _patched_generation_batch_step(self):
+    # Build per-batch mRoPE deltas from UID mapping before each step.
+    # This handles batch size changes during prompt split/generate.
+    model = self.model
+    if (getattr(model, "_uses_mrope", False)
+            and getattr(model, "_uid_rope_deltas", None)
+            and self.uids):
+        deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
+        model.set_batch_rope_deltas(mx.array(deltas))
+
     result = _original_generation_batch_step(self)
 
     # self._next_tokens contains the just-sampled tokens (async eval pending).
@@ -1056,6 +1065,21 @@ class Scheduler:
         )
         all_boundaries = boundary_enabled  # always stop at every boundary for hybrid models
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
+        # Sanity check: base_size from cache offsets should match the number
+        # of tokens actually cached. A mismatch indicates stale meta_state
+        # in a restored RotatingKVCache (e.g. shared layer_meta_states from
+        # an earlier store_cache bug). Use cached_tokens which is always
+        # derived from block_table.num_tokens and therefore trustworthy.
+        if boundary_enabled and hasattr(request, "cached_tokens") and request.cached_tokens > 0:
+            if base_size != request.cached_tokens:
+                logger.warning(
+                    "Cache base_size mismatch: computed %d, expected %d "
+                    "(cached_tokens). Using cached_tokens for boundary "
+                    "alignment.",
+                    base_size,
+                    request.cached_tokens,
+                )
+                base_size = request.cached_tokens
 
         # Prepare VLM embeddings for prefill
         embeds_array: Optional[mx.array] = None
@@ -1063,6 +1087,18 @@ class Scheduler:
         if vlm_embeds is not None:
             embeds_array, extra_kwargs, start_offset = vlm_embeds
             embeds_array = embeds_array[:, start_offset:]  # skip cached portion
+            if start_offset > 0 and extra_kwargs:
+                extra_kwargs = _advance_vlm_extra(extra_kwargs, start_offset)
+            # Force _position_ids path in language model for cached VLM
+            # prefill. Without this, the delta approach gives sequential
+            # positions to image tokens that need 3D mRoPE positions.
+            # Setting _rope_deltas=None makes the language model use
+            # _position_ids (set by get_input_embeddings) instead.
+            # Saved and restored after prefill for decode rope_deltas capture.
+            _saved_rope_deltas = None
+            if start_offset > 0 and hasattr(self.model, "_language_model"):
+                _saved_rope_deltas = self.model._language_model._rope_deltas
+                self.model._language_model._rope_deltas = None
 
         # Prefill tokens[0:N-1] (leave last token for insert())
         prefill_tokens = tokens[:-1]
@@ -1182,6 +1218,10 @@ class Scheduler:
 
         _sync_and_clear_cache()
 
+        # Restore _rope_deltas after cached VLM prefill (for decode capture)
+        if vlm_embeds is not None and _saved_rope_deltas is not None:
+            self.model._language_model._rope_deltas = _saved_rope_deltas
+
         return prompt_cache, last_token
 
     def _build_state_machine(self, request: "Request") -> SequenceStateMachine:
@@ -1261,10 +1301,7 @@ class Scheduler:
             if think_end_ids:
                 from .api.thinking import ThinkingBudgetProcessor
 
-                try:
-                    think_start_id = getattr(self.tokenizer, 'think_start_id', None)
-                except ValueError:
-                    think_start_id = None
+                think_start_id = self._get_think_token_id('think_start_id')
                 leading_ids, trailing_ids = self._resolve_think_close_pattern()
                 processor = ThinkingBudgetProcessor(
                     think_end_token_ids=think_end_ids,
@@ -1303,6 +1340,21 @@ class Scheduler:
 
         return resolve_vocab_size(self.model)
 
+    def _get_think_token_id(self, attr: str) -> int | None:
+        """Safely read a think token id from the tokenizer.
+
+        mlx-lm tokenizers expose ``think_start_id`` / ``think_end_id`` as
+        properties that may raise ``ValueError`` (multi-token sequence) or
+        ``TypeError`` (``_think_start_tokens`` is ``None`` for models without
+        thinking support, e.g. context-1 / harmony parser).
+
+        Returns the token id, or ``None`` when unavailable.
+        """
+        try:
+            return getattr(self.tokenizer, attr, None)
+        except (ValueError, TypeError):
+            return None
+
     def _resolve_think_end_token_ids(self) -> list[int] | None:
         """Resolve token ID(s) for the close-think tag.
 
@@ -1310,11 +1362,7 @@ class Scheduler:
         </think> and </longcat_think> automatically.
         """
         # Tier 1: mlx-lm tokenizer attribute (covers all known think variants)
-        try:
-            think_end_id = getattr(self.tokenizer, 'think_end_id', None)
-        except ValueError:
-            # Multi-token think end (e.g. Gemma 4) - fall through to Tier 2
-            think_end_id = None
+        think_end_id = self._get_think_token_id('think_end_id')
         if think_end_id is not None:
             return [think_end_id]
 
@@ -1423,12 +1471,7 @@ class Scheduler:
         Returns False for disabled-thinking patterns like <think></think>
         where </think> immediately follows <think> in the prompt tail.
         """
-        try:
-            think_start_id = getattr(self.tokenizer, 'think_start_id', None)
-        except ValueError:
-            # Multi-token think start (e.g. Gemma 4 <|channel>thought) -
-            # single-token detection not applicable, handled by output parser
-            return False
+        think_start_id = self._get_think_token_id('think_start_id')
         if think_start_id is None:
             try:
                 think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
@@ -2553,6 +2596,8 @@ class Scheduler:
             # can hit 'completeMemory() prepare count underflow'.
             mx.synchronize(generation_stream)
             self._remove_uid_from_active_batch(uid)
+            if hasattr(self.model, "unregister_rope_delta"):
+                self.model.unregister_rope_delta(uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
 
@@ -3015,6 +3060,21 @@ class Scheduler:
                 cache_to_use = prefilled_cache
                 tokens_to_process = last_token
 
+            # Capture per-request mRoPE rope_deltas for decode.
+            # Prefer _captured_rope_deltas from per-request extra_kwargs
+            # (set during get_input_embeddings), since the global
+            # _rope_deltas may be stale when explicit position_ids are used.
+            if request.vlm_inputs_embeds is not None:
+                extra = request.vlm_extra_kwargs or {}
+                captured = extra.get("_captured_rope_deltas")
+                if captured is not None:
+                    if hasattr(captured, "item"):
+                        request.rope_deltas = float(captured.item())
+                    else:
+                        request.rope_deltas = float(captured)
+                elif hasattr(self.model, "get_last_rope_deltas"):
+                    request.rope_deltas = self.model.get_last_rope_deltas()
+
             # Build per-request state machine for stop tokens
             sm = self._build_state_machine(request)
 
@@ -3043,6 +3103,10 @@ class Scheduler:
                 request.status = RequestStatus.RUNNING
                 self.running[request.request_id] = request
                 scheduled.append(request)
+
+                # Register per-UID rope_delta for mRoPE decode.
+                if hasattr(self.model, "register_rope_delta"):
+                    self.model.register_rope_delta(uid, request.rope_deltas)
 
                 self.total_prompt_tokens += request.num_prompt_tokens
                 cache_info = f", {request.cached_tokens} cached" if request.cached_tokens > 0 else ""
@@ -3396,6 +3460,8 @@ class Scheduler:
                 # (Mirrors the fix in _do_abort_request, commit 634603f)
                 mx.synchronize(generation_stream)
                 self._remove_uid_from_active_batch(uid)
+                if hasattr(self.model, "unregister_rope_delta"):
+                    self.model.unregister_rope_delta(uid)
                 if uid in self.uid_to_request_id:
                     del self.uid_to_request_id[uid]
                 del self.request_id_to_uid[request_id]
