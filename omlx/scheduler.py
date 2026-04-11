@@ -1053,6 +1053,7 @@ class Scheduler:
         boundary_enabled = (
             block_size > 0
             and self.block_aware_cache is not None
+            and self._boundary_snapshot_store is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
         all_boundaries = boundary_enabled  # always stop at every boundary for hybrid models
