@@ -35,8 +35,15 @@ class Omlx < Formula
     system "python3.11", "-m", "venv", libexec
 
     # Build Rust-based packages from source with headerpad to prevent
-    # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths)
+    # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths).
+    # RUSTFLAGS passes both headerpad and -undefined dynamic_lookup through
+    # cargo to the linker -- PyO3 extension modules leave Python C API symbols
+    # unresolved until runtime, and the macOS 26 linker rejects them without
+    # the dynamic_lookup flag.
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
+    ENV.append "RUSTFLAGS",
+      "-C link-args=-Wl,-undefined,dynamic_lookup " \
+      "-C link-args=-Wl,-headerpad_max_install_names"
 
     # Install omlx (with optional grammar extra for structured output)
     install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
