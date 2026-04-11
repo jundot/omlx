@@ -246,10 +246,26 @@ def _find_target_python() -> str:
     target_minor = match.group(1)  # e.g. "3.11"
     candidates = [
         shutil.which(f"python{target_minor}"),
+        # pyenv-managed interpreters (not on PATH by default)
+        str(Path.home() / ".pyenv" / "versions" / f"{target_minor}" / "bin" / f"python{target_minor}"),
         str(BUILD_DIR / f"cpython-{target_minor}" / "bin" / f"python{target_minor}"),
     ]
+    # Also check pyenv versions with patch numbers (e.g. 3.11.14)
+    pyenv_versions = Path.home() / ".pyenv" / "versions"
+    if pyenv_versions.is_dir():
+        for entry in sorted(pyenv_versions.iterdir(), reverse=True):
+            if entry.name.startswith(f"{target_minor}."):
+                candidates.insert(1, str(entry / "bin" / f"python{target_minor}"))
+                break
     for path in candidates:
-        if path and Path(path).exists():
+        if not path or not Path(path).exists():
+            continue
+        # Verify the interpreter has pip (venvstacks runtimes strip it)
+        check = subprocess.run(
+            [path, "-m", "pip", "--version"],
+            capture_output=True,
+        )
+        if check.returncode == 0:
             return path
 
     print(f"  Warning: python{target_minor} not found, using {sys.executable}")
