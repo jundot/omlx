@@ -143,6 +143,7 @@ class Request:
     vlm_inputs_embeds: Optional[Any] = None  # Pre-computed vision+text embeddings (mx.array)
     vlm_extra_kwargs: Optional[Dict[str, Any]] = None  # Model-specific kwargs (e.g., position_ids)
     vlm_image_hash: Optional[str] = None  # SHA256 hash of images for prefix cache
+    rope_deltas: float = 0.0  # Per-request mRoPE position delta (set after VLM prefill)
 
     # Metadata
     finish_reason: Optional[str] = None
