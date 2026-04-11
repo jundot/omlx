@@ -522,6 +522,31 @@ class BlockAwarePrefixCache(CacheManager):
                 )
 
                 if block_kv_data and block.block_hash:
+                    # Use per-block meta_states from boundary snapshot when
+                    # available. The shared layer_meta_states comes from the
+                    # final cache extraction and carries the end-of-request
+                    # offset (e.g. 4479) which is wrong for earlier blocks
+                    # whose tensor data was captured at an earlier boundary
+                    # (e.g. offset=512). Boundary snapshots record the
+                    # correct per-boundary meta_state synchronously during
+                    # prefill, so we prefer those.
+                    block_meta = layer_meta_states
+                    if snapshot_cache_data is not None and layer_meta_states is not None:
+                        per_block = []
+                        for lidx in range(len(layer_meta_states)):
+                            if (
+                                lidx < len(snapshot_cache_data)
+                                and isinstance(snapshot_cache_data[lidx], dict)
+                                and snapshot_cache_data[lidx].get("meta_state")
+                                and snapshot_cache_data[lidx]["meta_state"] != ()
+                            ):
+                                per_block.append(
+                                    snapshot_cache_data[lidx]["meta_state"]
+                                )
+                            else:
+                                per_block.append(layer_meta_states[lidx])
+                        block_meta = per_block
+
                     # Save to paged SSD via PagedSSDCacheManager with cache type info
                     saved = self.paged_ssd_cache.save_block(
                         block_hash=block.block_hash,
@@ -529,7 +554,7 @@ class BlockAwarePrefixCache(CacheManager):
                         token_count=block.token_count,
                         model_name=self.paged_cache.model_name,
                         layer_cache_types=layer_cache_types,
-                        layer_meta_states=layer_meta_states,
+                        layer_meta_states=block_meta,
                     )
                     if saved:
                         blocks_saved_to_ssd += 1
