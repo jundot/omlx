@@ -78,6 +78,7 @@ class EnginePool:
         self,
         max_model_memory: int | None,
         scheduler_config: SchedulerConfig | None = None,
+        single_model_mode: bool = False,
     ):
         """
         Initialize the engine pool.
@@ -86,6 +87,8 @@ class EnginePool:
             max_model_memory: Maximum memory for loaded models in bytes,
                 or None for no limit (disabled)
             scheduler_config: Configuration for BatchedEngine schedulers
+            single_model_mode: When True, unload all other models before
+                loading a new one, even if memory would allow coexistence
         """
         self._entries: dict[str, EngineEntry] = {}
         self._lock = asyncio.Lock()
@@ -95,11 +98,21 @@ class EnginePool:
         self._process_memory_enforcer: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
+        self._single_model_mode: bool = single_model_mode
 
     @property
     def max_model_memory(self) -> int | None:
         """Maximum memory for loaded models in bytes, or None if disabled."""
         return self._max_model_memory
+
+    @property
+    def single_model_mode(self) -> bool:
+        """Whether to unload all other models before loading a new one."""
+        return self._single_model_mode
+
+    @single_model_mode.setter
+    def single_model_mode(self, value: bool) -> None:
+        self._single_model_mode = value
 
     @property
     def current_model_memory(self) -> int:
@@ -341,6 +354,22 @@ class EnginePool:
                 raise ModelTooLargeError(
                     model_id, entry.estimated_size, self._max_model_memory
                 )
+
+            # Single-model mode: unload all other loaded models before
+            # loading the requested one, even if memory would allow
+            # coexistence. This minimizes peak memory during switches.
+            if self._single_model_mode:
+                loaded_others = [
+                    mid for mid, e in self._entries.items()
+                    if mid != model_id and e.engine is not None
+                ]
+                if loaded_others:
+                    logger.info(
+                        f"Single-model mode: evicting {loaded_others} "
+                        f"before loading {model_id}"
+                    )
+                    for victim_id in loaded_others:
+                        await self._unload_engine(victim_id)
 
             # Pre-load eviction: reserve 25% extra for KV cache headroom
             # so other models get evicted earlier, leaving room for context.
@@ -712,6 +741,7 @@ class EnginePool:
         """
         return {
             "max_model_memory": self._max_model_memory,
+            "single_model_mode": self._single_model_mode,
             "current_model_memory": self._current_model_memory,
             "model_count": len(self._entries),
             "loaded_count": sum(1 for e in self._entries.values() if e.engine is not None),

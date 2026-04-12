@@ -413,6 +413,12 @@ Example directory structure:
         help="Maximum memory for loaded models (e.g., 32GB, 'disabled'). Default: 80%% of system memory.",
     )
     serve_parser.add_argument(
+        "--single-model-mode",
+        action="store_true",
+        default=None,
+        help="Always unload other models before loading a new one, even if memory allows coexistence.",
+    )
+    serve_parser.add_argument(
         "--max-process-memory",
         type=str,
         default=None,
