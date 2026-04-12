@@ -1097,9 +1097,7 @@ def init_server(
             logger.warning(f"Model directory created (empty): {md}")
 
     # Create engine pool
-    single_model_mode = False
-    if global_settings and hasattr(global_settings, "model"):
-        single_model_mode = getattr(global_settings.model, "single_model_mode", False)
+    single_model_mode = global_settings.model.single_model_mode if global_settings else False
     _server_state.engine_pool = EnginePool(
         max_model_memory=max_model_memory,
         scheduler_config=scheduler_config,

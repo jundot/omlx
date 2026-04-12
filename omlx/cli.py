@@ -419,6 +419,13 @@ Example directory structure:
         help="Always unload other models before loading a new one, even if memory allows coexistence.",
     )
     serve_parser.add_argument(
+        "--no-single-model-mode",
+        dest="single_model_mode",
+        action="store_false",
+        default=None,
+        help="Allow multiple models to coexist in memory (disable single-model mode).",
+    )
+    serve_parser.add_argument(
         "--max-process-memory",
         type=str,
         default=None,

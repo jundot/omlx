@@ -358,10 +358,18 @@ class EnginePool:
             # Single-model mode: unload all other loaded models before
             # loading the requested one, even if memory would allow
             # coexistence. This minimizes peak memory during switches.
+            # Pinned models are skipped unless the incoming model is
+            # also pinned (explicit override).
             if self._single_model_mode:
                 loaded_others = [
                     mid for mid, e in self._entries.items()
                     if mid != model_id and e.engine is not None
+                    and (not e.is_pinned or entry.is_pinned)
+                ]
+                pinned_skipped = [
+                    mid for mid, e in self._entries.items()
+                    if mid != model_id and e.engine is not None
+                    and e.is_pinned and not entry.is_pinned
                 ]
                 if loaded_others:
                     logger.info(
@@ -370,6 +378,12 @@ class EnginePool:
                     )
                     for victim_id in loaded_others:
                         await self._unload_engine(victim_id)
+                if pinned_skipped:
+                    logger.info(
+                        f"Single-model mode: skipped pinned models "
+                        f"{pinned_skipped} (incoming model '{model_id}' "
+                        f"is not pinned)"
+                    )
 
             # Pre-load eviction: reserve 25% extra for KV cache headroom
             # so other models get evicted earlier, leaving room for context.

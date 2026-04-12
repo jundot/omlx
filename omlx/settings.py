@@ -757,6 +757,8 @@ class GlobalSettings:
             self.model.model_dir = dirs[0] if dirs else None
         if max_model_memory := os.getenv("OMLX_MAX_MODEL_MEMORY"):
             self.model.max_model_memory = max_model_memory
+        if single_model_mode := os.getenv("OMLX_SINGLE_MODEL_MODE"):
+            self.model.single_model_mode = single_model_mode.lower() in ("true", "1", "yes")
 
         # Memory enforcement settings
         if max_process_memory := os.getenv("OMLX_MAX_PROCESS_MEMORY"):
@@ -836,8 +838,8 @@ class GlobalSettings:
             self.model.model_dir = dirs[0] if dirs else None
         if hasattr(args, "max_model_memory") and args.max_model_memory is not None:
             self.model.max_model_memory = args.max_model_memory
-        if hasattr(args, "single_model_mode") and args.single_model_mode:
-            self.model.single_model_mode = True
+        if hasattr(args, "single_model_mode") and args.single_model_mode is not None:
+            self.model.single_model_mode = args.single_model_mode
 
         # Memory enforcement settings
         if (
