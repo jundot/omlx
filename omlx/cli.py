@@ -31,6 +31,8 @@ def _has_cli_overrides(args) -> bool:
         return True
     if hasattr(args, "max_model_memory") and args.max_model_memory is not None:
         return True
+    if hasattr(args, "single_model_mode") and args.single_model_mode is not None:
+        return True
     if hasattr(args, "max_process_memory") and args.max_process_memory is not None:
         return True
     if hasattr(args, "host") and args.host is not None:

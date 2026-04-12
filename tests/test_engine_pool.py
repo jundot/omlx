@@ -1171,8 +1171,8 @@ class TestSingleModelMode:
         assert pool._entries["model-b"].engine is not None
 
     @pytest.mark.asyncio
-    async def test_evicts_pinned_if_incoming_is_pinned(self, small_mock_model_dir):
-        """Test that pinned models ARE evicted when incoming model is also pinned."""
+    async def test_keeps_pinned_if_incoming_is_pinned(self, small_mock_model_dir):
+        """Test that pinned models are never evicted, even by another pinned model."""
         pool = EnginePool(max_model_memory=10 * 1024**3, single_model_mode=True)
         pool.discover_models(str(small_mock_model_dir))
 
@@ -1200,10 +1200,43 @@ class TestSingleModelMode:
             await pool.get_engine("model-a")
             await pool.get_engine("model-b")
 
-        # model-a should be evicted (both pinned overrides)
-        mock_engine_a.stop.assert_called_once()
-        assert pool._entries["model-a"].engine is None
+        # model-a should stay loaded because pinned models are never evicted
+        mock_engine_a.stop.assert_not_called()
+        assert pool._entries["model-a"].engine is not None
         assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_preload_pinned_models_keeps_all_pins(self, small_mock_model_dir):
+        """Test startup preload keeps multiple pinned models loaded."""
+        pool = EnginePool(max_model_memory=10 * 1024**3, single_model_mode=True)
+        pool.discover_models(
+            str(small_mock_model_dir), pinned_models=["model-a", "model-b"]
+        )
+
+        mock_engine_a = MagicMock()
+        mock_engine_a.start = AsyncMock()
+        mock_engine_a.stop = AsyncMock()
+
+        mock_engine_b = MagicMock()
+        mock_engine_b.start = AsyncMock()
+        mock_engine_b.stop = AsyncMock()
+
+        engines = {"model-a": mock_engine_a, "model-b": mock_engine_b}
+
+        def create_engine(*args, **kwargs):
+            model_name = kwargs.get("model_name", "")
+            for key, eng in engines.items():
+                if key in model_name:
+                    return eng
+            return mock_engine_a
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.preload_pinned_models()
+
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+        mock_engine_a.stop.assert_not_called()
+        mock_engine_b.stop.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_same_model_no_eviction(self, small_mock_model_dir):

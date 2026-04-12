@@ -1889,7 +1889,8 @@ async def update_global_settings(
 
     if request.single_model_mode is not None:
         global_settings.model.single_model_mode = request.single_model_mode
-        pool = _server_state.engine_pool
+        server_state = _get_server_state() if _get_server_state else None
+        pool = server_state.engine_pool if server_state is not None else None
         if pool is not None:
             pool.single_model_mode = request.single_model_mode
         runtime_applied.append("single_model_mode")
