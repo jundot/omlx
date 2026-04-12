@@ -254,6 +254,9 @@ class BatchedEngine(BaseEngine):
             if tq_enabled:
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
+                self._engine.engine.scheduler._turboquant_skip_last = getattr(
+                    self._model_settings, "turboquant_skip_last", True
+                )
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:

@@ -153,6 +153,16 @@ def _patched_generation_batch_step(self):
 GenerationBatch._step = _patched_generation_batch_step
 
 
+# Monkey-patch TurboQuantKVCache.merge so _merge_caches() works
+try:
+    from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
+    from .turboquant_kv import BatchTurboQuantKVCache as _BTQCache
+    if not hasattr(_TQCache, "merge"):
+        _TQCache.merge = _BTQCache.merge
+except ImportError:
+    pass
+
+
 # Cache class names known to be sliceable (no boundary snapshots needed).
 _KNOWN_SLICEABLE_CACHE_TYPES = frozenset({
     "KVCache", "BatchKVCache", "QuantizedKVCache",
@@ -414,6 +424,7 @@ class Scheduler:
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: Optional[float] = None
+        self._turboquant_skip_last: bool = True
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -973,17 +984,26 @@ class Scheduler:
     # External prefill (composition pattern — replaces _process_prompts)
     # ------------------------------------------------------------------
 
-    def _apply_turboquant_kv(self, prompt_cache: List[Any]) -> None:
-        """Convert individual KVCache layers to TurboQuantKVCache."""
-        from .turboquant_kv import BatchTurboQuantKVCache
+    def _apply_turboquant_kv_empty(self, prompt_cache: List[Any]) -> None:
+        """Replace KVCache with empty TurboQuantKVCache before prefill.
+
+        Tokens are quantized on the fly during update_and_fetch, avoiding
+        the peak memory spike from storing full-precision KV then converting.
+        Skips the last KVCache layer if turboquant_skip_last is set.
+        """
         from mlx_vlm.turboquant import TurboQuantKVCache
         from mlx_lm.models.cache import KVCache, CacheList
+
+        kv_indices = [i for i, c in enumerate(prompt_cache) if isinstance(c, KVCache)]
+        skip_last = self._turboquant_skip_last and len(kv_indices) > 1
+        last_kv_idx = kv_indices[-1] if skip_last else -1
 
         converted = 0
         bits = float(self._turboquant_kv_bits)
         for i, cache_obj in enumerate(prompt_cache):
-            cls_name = type(cache_obj).__name__
             if isinstance(cache_obj, KVCache):
+                if i == last_kv_idx:
+                    continue
                 prompt_cache[i] = TurboQuantKVCache(bits=bits)
                 converted += 1
             elif isinstance(cache_obj, CacheList):
@@ -996,9 +1016,47 @@ class Scheduler:
                         new_caches.append(c)
                 cache_obj.caches = tuple(new_caches)
         if converted > 0:
+            skip_msg = ", skipped last KVCache layer" if skip_last else ""
+            logger.info(
+                f"TurboQuant: {converted}/{len(prompt_cache)} "
+                f"cache layers set to {bits}-bit{skip_msg}"
+            )
+
+    def _apply_turboquant_kv_convert(self, prompt_cache: List[Any]) -> None:
+        """Convert existing KVCache data to TurboQuantKVCache via from_cache().
+
+        Used when an existing cache is provided (e.g. from SSD prefix cache).
+        Uses from_cache() to quantize the existing KV data.
+        """
+        from mlx_vlm.turboquant import TurboQuantKVCache
+        from mlx_lm.models.cache import KVCache, CacheList
+
+        kv_indices = [i for i, c in enumerate(prompt_cache) if isinstance(c, KVCache)]
+        skip_last = self._turboquant_skip_last and len(kv_indices) > 1
+        last_kv_idx = kv_indices[-1] if skip_last else -1
+
+        converted = 0
+        bits = float(self._turboquant_kv_bits)
+        for i, cache_obj in enumerate(prompt_cache):
+            if isinstance(cache_obj, KVCache):
+                if i == last_kv_idx:
+                    continue
+                prompt_cache[i] = TurboQuantKVCache.from_cache(cache_obj, bits=bits)
+                converted += 1
+            elif isinstance(cache_obj, CacheList):
+                new_caches = []
+                for c in cache_obj.caches:
+                    if isinstance(c, KVCache):
+                        new_caches.append(TurboQuantKVCache.from_cache(c, bits=bits))
+                        converted += 1
+                    else:
+                        new_caches.append(c)
+                cache_obj.caches = tuple(new_caches)
+        if converted > 0:
+            skip_msg = ", skipped last KVCache layer" if skip_last else ""
             logger.info(
                 f"TurboQuant: converted {converted}/{len(prompt_cache)} "
-                f"cache layers to {bits}-bit"
+                f"cache layers to {bits}-bit{skip_msg}"
             )
 
     def _do_external_prefill(
@@ -1046,11 +1104,15 @@ class Scheduler:
         else:
             prompt_cache = make_prompt_cache(self.model)
 
-        # NOTE: TurboQuant conversion is NOT applied during external prefill.
-        # TurboQuantKVCache.merge() is not implemented, so passing it to
-        # insert() would fail in _merge_caches(). Prefill runs with standard
-        # KVCache; TurboQuant can be applied later inside BatchGenerator if
-        # a monkey-patch on PromptProcessingBatch is desired.
+        # Replace KVCache with TurboQuantKVCache for on-the-fly quantization.
+        # - New cache: replace with empty TQ caches (tokens quantized during prefill)
+        # - Existing cache (from SSD prefix): convert via from_cache (preserves data)
+        # This follows the same pattern as mlx-lm's maybe_quantize_kv_cache.
+        if self._turboquant_kv_bits is not None:
+            if existing_cache is None:
+                self._apply_turboquant_kv_empty(prompt_cache)
+            else:
+                self._apply_turboquant_kv_convert(prompt_cache)
 
         # Clear stale mRoPE position state for text-only requests.
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
@@ -3068,6 +3130,9 @@ class Scheduler:
             # may interfere. Matches OpenAI's best-effort seed semantics.
             if request.sampling_params.seed is not None:
                 mx.random.seed(request.sampling_params.seed)
+
+            # TQ conversion now happens before prefill (in _do_external_prefill)
+            # so KV is quantized on the fly — no post-prefill conversion needed.
 
             # Insert into BatchGenerator with pre-filled cache + last token.
             # BatchGenerator only handles decode from here.
