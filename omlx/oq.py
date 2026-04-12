@@ -1043,6 +1043,404 @@ def _gs_for_mode(bits: int, default_gs: int) -> int:
     return default_gs
 
 
+
+# --- chunked-quantize helpers (added for Qwen3.5-397B) ---------------------
+import struct as _struct
+import numpy as _np
+
+def _metal_max_buffer_bytes() -> int:
+    try:
+        info = mx.device_info()
+    except AttributeError:
+        try:
+            info = mx.metal.device_info()
+        except Exception:
+            return 1 << 30
+    except Exception:
+        return 1 << 30
+    return int(info.get("max_buffer_length", 1 << 30))
+
+_METAL_MAX_BUFFER = _metal_max_buffer_bytes()
+_QUANTIZE_CHUNK_BYTES = max(1 << 20, _METAL_MAX_BUFFER // 4)
+_LOAD_CHUNK_BYTES     = max(1 << 20, _METAL_MAX_BUFFER // 2)
+
+
+class _LazyTensorIndex:
+    _DTYPE_BYTES = {"BF16":2,"F16":2,"F32":4,"F64":8,"I8":1,"U8":1,
+                    "I16":2,"U16":2,"I32":4,"U32":4,"I64":8,"U64":8,"BOOL":1}
+
+    def __init__(self, weight_files):
+        self._index = {}
+        for sf_path in weight_files:
+            with open(sf_path, "rb") as f:
+                hlen = _struct.unpack("<Q", f.read(8))[0]
+                header = json.loads(f.read(hlen))
+                data_offset = 8 + hlen
+                for k, meta in header.items():
+                    if k == "__metadata__":
+                        continue
+                    self._index[k] = (sf_path, data_offset,
+                                      meta["data_offsets"][0], meta["data_offsets"][1],
+                                      tuple(meta["shape"]), meta["dtype"])
+
+    def keys(self):
+        if hasattr(self, "_overrides"):
+            return list(self._index.keys()) + list(self._overrides.keys())
+        return self._index.keys()
+    def __len__(self):
+        n = len(self._index)
+        if hasattr(self, "_overrides"): n += len(self._overrides)
+        return n
+    def __contains__(self, k):
+        if k in self._index: return True
+        return hasattr(self, "_overrides") and k in self._overrides
+    def __iter__(self):       return iter(self._index)
+    def nbytes(self):         return sum(e - s for _,_,s,e,_,_ in self._index.values())
+
+    def __getitem__(self, key):
+        if key not in self._index:
+            raise KeyError(key)
+        sf_path, data_offset, start, end, shape, dtype = self._index[key]
+        lt = _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
+        # Materialize as a real mx.array; _load_rows handles chunking internally.
+        arr = lt[:]
+        return arr
+
+    def items(self):
+        # Materialize tensors one at a time so sanitize sees real arrays.
+        for k in list(self._index.keys()):
+            yield k, self[k]
+            mx.clear_cache()
+
+    def get(self, key, default=None):
+        if key in self._index:
+            return self[key]
+        return default
+
+    def __setitem__(self, key, value):
+        # Sanitize may write back transformed tensors. Store as in-memory
+        # override; remove from lazy index so we don't re-load from disk.
+        if not hasattr(self, "_overrides"):
+            self._overrides = {}
+        self._overrides[key] = value
+        self._index.pop(key, None)
+
+    def __delitem__(self, key):
+        self._index.pop(key, None)
+        if hasattr(self, "_overrides"):
+            self._overrides.pop(key, None)
+
+    def update(self, other):
+        if hasattr(other, "items"):
+            for k, v in other.items():
+                self[k] = v
+        else:
+            for k, v in other:
+                self[k] = v
+
+    def pop(self, key, *default):
+        if hasattr(self, "_overrides") and key in self._overrides:
+            return self._overrides.pop(key)
+        if key not in self._index:
+            if default: return default[0]
+            raise KeyError(key)
+        sf_path, data_offset, start, end, shape, dtype = self._index.pop(key)
+        return _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
+
+
+class _LazyTensor:
+    def __init__(self, sf_path, data_offset, start, end, shape, dtype):
+        self.shape = tuple(shape)
+        self.ndim = len(self.shape)
+        self._sf_path = sf_path
+        self._data_offset = data_offset
+        self._start = start
+        self._end = end
+        self._dtype = dtype
+        self._bpe = _LazyTensorIndex._DTYPE_BYTES.get(dtype, 2)
+        self._epr = 1
+        for d in self.shape[1:]:
+            self._epr *= d
+        self._bpr = self._epr * self._bpe
+
+    @property
+    def size(self):
+        s = 1
+        for d in self.shape: s *= d
+        return s
+
+    @property
+    def nbytes(self):
+        return self._end - self._start
+
+    def _mlx_dtype(self):
+        return {"BF16":mx.bfloat16,"F16":mx.float16,"F32":mx.float32}.get(self._dtype, mx.bfloat16)
+
+    def _np_view_dtype(self):
+        if self._bpe == 2: return _np.uint16
+        return _np.dtype({"F32":"<f4","F64":"<f8","I32":"<i4","I64":"<i8"}.get(self._dtype, "<u2"))
+
+    def _load_rows(self, r0, r1):
+        n = r1 - r0
+        if n <= 0:
+            return mx.zeros((0, *self.shape[1:]), dtype=self._mlx_dtype())
+        b0 = self._start + r0 * self._bpr
+        b1 = self._start + r1 * self._bpr
+        with open(self._sf_path, "rb") as f:
+            f.seek(self._data_offset + b0)
+            raw = f.read(b1 - b0)
+        arr = _np.frombuffer(raw, dtype=self._np_view_dtype())
+        chunk_shape = (n, *self.shape[1:])
+        # Two ceilings: device buffer bytes, and MLX's int32 element count.
+        _MLX_MAX_ELEMS = 1 << 30
+        max_rows_bytes = max(1, _LOAD_CHUNK_BYTES // max(self._bpr, 1))
+        max_rows_elems = max(1, _MLX_MAX_ELEMS // max(self._epr, 1))
+        max_rows = min(max_rows_bytes, max_rows_elems)
+        dt = self._mlx_dtype()
+        if n <= max_rows:
+            t = mx.array(arr).view(dt).reshape(chunk_shape)
+            mx.eval(t)
+            return t
+        parts = []
+        epc = max_rows * self._epr
+        for s in range(0, arr.size, epc):
+            sub = arr[s:s+epc]
+            sr = sub.size // self._epr
+            t = mx.array(sub).view(dt).reshape((sr, *self.shape[1:]))
+            mx.eval(t)
+            parts.append(t)
+            mx.clear_cache()
+        result = mx.concatenate(parts, axis=0)
+        mx.eval(result)
+        return result
+
+    def __getitem__(self, idx):
+        if isinstance(idx, tuple):
+            return self._load_rows(0, self.shape[0])[idx]
+        if isinstance(idx, slice):
+            start = idx.start or 0
+            stop = self.shape[0] if idx.stop is None else idx.stop
+            return self._load_rows(start, stop)
+        return self._load_rows(idx, idx + 1)
+
+
+def _row_chunks(t, max_elems):
+    rows = t.shape[0]
+    if rows == 0: return
+    epr = max(1, t.size // rows)
+    rpc = max(1, max_elems // epr)
+    for r0 in range(0, rows, rpc):
+        r1 = min(rows, r0 + rpc)
+        if isinstance(t, _LazyTensor):
+            chunk = t._load_rows(r0, r1)
+        else:
+            chunk = t[r0:r1]
+            mx.eval(chunk)
+        yield chunk
+
+
+def _quantize_chunked(w, group_size, bits, mode):
+    _MLX_MAX_ELEMS = 1 << 30
+    max_elems = max(group_size, min(_QUANTIZE_CHUNK_BYTES // 2, _MLX_MAX_ELEMS))
+    if not isinstance(w, _LazyTensor) and w.size <= max_elems:
+        qw, scales, *rest = mx.quantize(w, group_size=group_size, bits=bits, mode=mode)
+        return qw, scales, (rest[0] if rest else None)
+    orig = tuple(w.shape)
+    qws, scs, bis = [], [], []
+    for chunk in _row_chunks(w, max_elems):
+        flat = chunk.reshape(-1, chunk.shape[-1])
+        mx.eval(flat)
+        cqw, csc, *crest = mx.quantize(flat, group_size=group_size, bits=bits, mode=mode)
+        mx.eval(cqw, csc)
+        qws.append(cqw); scs.append(csc)
+        if crest: bis.append(crest[0])
+        mx.synchronize(); mx.clear_cache()
+    qw = mx.concatenate(qws, axis=0)
+    scales = mx.concatenate(scs, axis=0)
+    biases = mx.concatenate(bis, axis=0) if bis else None
+    mx.eval(qw, scales)
+    flat_rows = 1
+    for d in orig[:-1]: flat_rows *= d
+    if qw.shape[0] == flat_rows and len(orig) > 2:
+        qw = qw.reshape(*orig[:-1], -1)
+        scales = scales.reshape(*orig[:-1], -1)
+        if biases is not None:
+            biases = biases.reshape(*orig[:-1], -1)
+    return qw, scales, biases
+# --- end chunked-quantize helpers ---
+
+class _StreamingPlan:
+    """Streaming sanitizer for VLM models. Builds a transformation plan from
+    a _LazyTensorIndex without materializing tensors. Materializes one entry
+    at a time via pop().
+
+    Each plan entry is (output_key, source_key, transform).
+    transform is one of:
+      "passthrough" -- just rename
+      "split_gate"  -- split fused gate_up_proj on axis -2, take first half
+      "split_up"    -- split fused gate_up_proj on axis -2, take second half
+      "norm_add1"   -- add 1.0 to a 1D norm weight
+      "conv1d_perm" -- moveaxis(2, 1) when last dim != 1
+    Multiple transforms can stack via list.
+    """
+
+    NORM_SUFFIXES = (
+        ".input_layernorm.weight",
+        ".post_attention_layernorm.weight",
+        "model.norm.weight",
+        ".q_norm.weight",
+        ".k_norm.weight",
+    )
+
+    def __init__(self, lazy_index, config):
+        self._lazy = lazy_index
+        self._config = config
+        self._plan = {}     # output_key -> (source_key, [transforms])
+        self._shapes = {}   # output_key -> output_shape (post-transform)
+        self._build()
+
+    def _rename_key(self, key):
+        if "model" in key:
+            if "model.language_model" in key:
+                return key.replace("model.language_model", "language_model.model")
+            if "model.visual" in key:
+                return key.replace("model.visual", "vision_tower")
+        if "lm_head" in key and not key.startswith("language_model."):
+            return key.replace("lm_head", "language_model.lm_head")
+        return key
+
+    def _transforms_for(self, src_key, src_shape):
+        ts = []
+        if "conv1d.weight" in src_key and src_shape[-1] != 1:
+            ts.append("conv1d_perm")
+        if src_key.endswith("visual.patch_embed.proj.weight") and len(src_shape) == 5:
+            ts.append("patch_embed_perm")
+        # norm_add1 only for 1D weights matching norm suffixes
+        renamed = self._rename_key(src_key)
+        if any(renamed.endswith(s) for s in self.NORM_SUFFIXES) and len(src_shape) == 1:
+            ts.append("norm_add1")
+        return ts
+
+    def _output_shape(self, src_shape, transforms, gate_split=False):
+        sh = list(src_shape)
+        if gate_split:
+            sh[-2] = sh[-2] // 2
+        for t in transforms:
+            if t == "conv1d_perm":
+                sh[1], sh[2] = sh[2], sh[1]
+            elif t == "patch_embed_perm":
+                sh = [sh[0], sh[2], sh[3], sh[4], sh[1]]
+        return tuple(sh)
+
+    def _build(self):
+        text_cfg = self._config.get("text_config", {})
+        n_layers = text_cfg.get("num_hidden_layers", 0)
+        tie_emb = text_cfg.get("tie_word_embeddings", False)
+
+        src_keys = list(self._lazy._index.keys())
+        consumed = set()
+
+        # Per-layer expert split rules
+        for l in range(n_layers):
+            prefix = f"model.language_model.layers.{l}.mlp"
+            fused = f"{prefix}.experts.gate_up_proj"
+            down = f"{prefix}.experts.down_proj"
+
+            new_prefix = f"language_model.model.layers.{l}.mlp"
+            if fused in src_keys:
+                src_meta = self._lazy._index[fused]
+                src_shape = src_meta[4]
+                gate_key = f"{new_prefix}.switch_mlp.gate_proj.weight"
+                up_key = f"{new_prefix}.switch_mlp.up_proj.weight"
+                self._plan[gate_key] = (fused, ["split_gate"])
+                self._plan[up_key] = (fused, ["split_up"])
+                self._shapes[gate_key] = self._output_shape(src_shape, [], gate_split=True)
+                self._shapes[up_key] = self._output_shape(src_shape, [], gate_split=True)
+                consumed.add(fused)
+            if down in src_keys:
+                new_key = f"{new_prefix}.switch_mlp.down_proj.weight"
+                self._plan[new_key] = (down, ["passthrough"])
+                self._shapes[new_key] = self._lazy._index[down][4]
+                consumed.add(down)
+
+        # Everything else: rename + per-tensor transforms; drop mtp.*
+        for k in src_keys:
+            if k in consumed:
+                continue
+            if "mtp." in k:
+                continue
+            if tie_emb and k == "lm_head.weight":
+                continue
+            new_key = self._rename_key(k)
+            src_shape = self._lazy._index[k][4]
+            ts = self._transforms_for(k, src_shape) or ["passthrough"]
+            self._plan[new_key] = (k, ts)
+            self._shapes[new_key] = self._output_shape(src_shape, ts)
+
+    # dict-ish surface for quantize loop -------------------------------------
+    def keys(self):
+        return self._plan.keys()
+
+    def __len__(self):
+        return len(self._plan)
+
+    def __contains__(self, k):
+        return k in self._plan
+
+    def __iter__(self):
+        return iter(self._plan)
+
+    def items(self):
+        class _SP:
+            __slots__ = ("shape", "ndim")
+            def __init__(self, sh):
+                self.shape = sh
+                self.ndim = len(sh)
+        return ((k, _SP(self._shapes[k])) for k in self._plan)
+
+    def nbytes(self):
+        return self._lazy.nbytes()
+
+    def pop(self, key, *default):
+        if key not in self._plan:
+            if default:
+                return default[0]
+            raise KeyError(key)
+        src_key, transforms = self._plan.pop(key)
+        # Materialize source via the lazy index (chunked internally)
+        meta = self._lazy._index.get(src_key)
+        if meta is None:
+            raise KeyError(f"source tensor {src_key} for {key} not in lazy index")
+        sf_path, data_offset, start, end, shape, dtype = meta
+        lt = _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
+        arr = lt[:]
+        # Apply transforms in order
+        for t in transforms:
+            if t == "passthrough":
+                pass
+            elif t == "split_gate":
+                arr = mx.split(arr, 2, axis=-2)[0]
+                mx.eval(arr)
+            elif t == "split_up":
+                arr = mx.split(arr, 2, axis=-2)[1]
+                mx.eval(arr)
+            elif t == "conv1d_perm":
+                arr = mx.moveaxis(arr, 2, 1)
+                mx.eval(arr)
+            elif t == "norm_add1":
+                arr = arr + 1.0
+                mx.eval(arr)
+            elif t == "patch_embed_perm":
+                arr = mx.transpose(arr, (0, 2, 3, 4, 1))
+                mx.eval(arr)
+        # Don't try to free source from lazy index here -- gate_split needs it twice.
+        # The source stays in _lazy._index; that's just the file pointer, not data.
+        mx.clear_cache()
+        return arr
+
+
+
+
 def quantize_oq_streaming(
     model_path: str,
     output_path: str,
@@ -1092,11 +1490,7 @@ def quantize_oq_streaming(
 
     cb("loading", 8.0)
 
-    all_weights = {}
-    for sf_path in weight_files:
-        shard = mx.load(str(sf_path), return_metadata=False)
-        all_weights.update(shard)
-        del shard
+    all_weights = _LazyTensorIndex(weight_files)
 
     logger.info(
         f"oQ{oq_level:g} streaming: {len(all_weights)} tensors in "
@@ -1105,13 +1499,23 @@ def quantize_oq_streaming(
 
     cb("loading", 12.0)
 
-    sanitize_fn = _build_model_sanitizer(config)
-    if sanitize_fn is not None:
+    architectures = config.get("architectures", [])
+    is_vlm = any("ForConditionalGeneration" in a for a in architectures)
+    if is_vlm:
         try:
-            all_weights = sanitize_fn(all_weights)
-            logger.info(f"oQ{oq_level:g}: sanitize applied, {len(all_weights)} tensors")
+            all_weights = _StreamingPlan(all_weights, config)
+            logger.info(f"oQ{oq_level:g}: streaming sanitize plan built, {len(all_weights)} output tensors")
         except Exception as e:
-            logger.warning(f"Sanitize failed ({e}), using original names")
+            import traceback; traceback.print_exc()
+            logger.warning(f"Streaming sanitize plan failed ({e}), using original names")
+    else:
+        sanitize_fn = _build_model_sanitizer(config)
+        if sanitize_fn is not None:
+            try:
+                all_weights = sanitize_fn(all_weights)
+                logger.info(f"oQ{oq_level:g}: sanitize applied, {len(all_weights)} tensors")
+            except Exception as e:
+                logger.warning(f"Sanitize failed ({e}), using original names")
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
 
@@ -1174,6 +1578,8 @@ def quantize_oq_streaming(
 
     for i, tensor_name in enumerate(tensor_names):
         w_mx = all_weights.pop(tensor_name)
+        if isinstance(w_mx, _LazyTensor):
+            w_mx = w_mx[:]
         tensor_bytes = w_mx.nbytes
         shape = w_mx.shape
 
@@ -1188,10 +1594,7 @@ def quantize_oq_streaming(
             )
 
             if bits is not None and len(shape) >= 2 and shape[-1] % gs == 0:
-                qw, scales, *rest = mx.quantize(
-                    w_mx, group_size=gs, bits=bits, mode=qmode
-                )
-                biases = rest[0] if rest else None
+                qw, scales, biases = _quantize_chunked(w_mx, gs, bits, qmode)
 
                 base = tensor_name
                 if base.endswith(".weight"):
