@@ -1171,8 +1171,8 @@ class TestSingleModelMode:
         assert pool._entries["model-b"].engine is not None
 
     @pytest.mark.asyncio
-    async def test_keeps_pinned_if_incoming_is_pinned(self, small_mock_model_dir):
-        """Test that pinned models are never evicted, even by another pinned model."""
+    async def test_never_evicts_pinned_even_if_incoming_pinned(self, small_mock_model_dir):
+        """Test that pinned models are never evicted, even when incoming model is also pinned."""
         pool = EnginePool(max_model_memory=10 * 1024**3, single_model_mode=True)
         pool.discover_models(str(small_mock_model_dir))
 
@@ -1200,7 +1200,7 @@ class TestSingleModelMode:
             await pool.get_engine("model-a")
             await pool.get_engine("model-b")
 
-        # model-a should stay loaded because pinned models are never evicted
+        # model-a should still be loaded — pinned models are never evicted
         mock_engine_a.stop.assert_not_called()
         assert pool._entries["model-a"].engine is not None
         assert pool._entries["model-b"].engine is not None

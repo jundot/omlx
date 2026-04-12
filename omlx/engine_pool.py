@@ -357,9 +357,7 @@ class EnginePool:
 
             # Single-model mode: unload all other non-pinned loaded
             # models before loading the requested one, even if memory
-            # would allow coexistence. This minimizes peak memory
-            # during switches while preserving the pinned-model
-            # "never evict" contract.
+            # would allow coexistence. Pinned models are never evicted.
             if self._single_model_mode:
                 loaded_others = [
                     mid for mid, e in self._entries.items()
@@ -381,7 +379,7 @@ class EnginePool:
                 if pinned_skipped:
                     logger.info(
                         f"Single-model mode: skipped pinned models "
-                        f"{pinned_skipped} before loading {model_id}"
+                        f"{pinned_skipped}"
                     )
 
             # Pre-load eviction: reserve 25% extra for KV cache headroom
