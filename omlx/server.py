@@ -143,6 +143,7 @@ from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
     convert_tools_for_template,
+    enrich_tool_params_for_gemma4,
     extract_tool_calls_with_thinking,
     parse_json_output,
     parse_tool_calls,
@@ -1990,6 +1991,9 @@ async def create_chat_completion(
 
     # Validate context window before sending to model
     tools_for_template = convert_tools_for_template(effective_tools) if effective_tools else None
+    # Gemma 4 drops required params that lack descriptions — enrich them
+    if tools_for_template and "gemma" in (resolved_model or "").lower():
+        tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
     try:
         num_prompt_tokens = engine.count_chat_tokens(
             messages, tools_for_template,

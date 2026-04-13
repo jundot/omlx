@@ -980,6 +980,43 @@ def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:
     return converted if converted else None
 
 
+def enrich_tool_params_for_gemma4(tools: list[dict]) -> list[dict]:
+    """Enrich tool parameter descriptions for Gemma 4 models.
+
+    Gemma 4's chat template renders tool definitions in a way that can
+    confuse the model when required parameters lack explicit descriptions,
+    especially when parameter names collide with schema keywords like
+    ``description``.  This ensures every required parameter has a non-empty
+    description that clearly labels it as a required argument, which
+    dramatically improves tool-call reliability.
+
+    This is a no-op for parameters that already have descriptions.
+    """
+    enriched = []
+    for tool in tools:
+        tool = dict(tool)
+        func = dict(tool.get("function", {}))
+        params = func.get("parameters", {})
+        if isinstance(params, dict) and "properties" in params:
+            params = dict(params)
+            props = dict(params.get("properties", {}))
+            required = set(params.get("required", []))
+            for pname, pdef in props.items():
+                pdef = dict(pdef)
+                if not pdef.get("description"):
+                    label = "REQUIRED. " if pname in required else ""
+                    pdef["description"] = (
+                        f"{label}The '{pname}' parameter"
+                        f" (type: {pdef.get('type', 'string')})"
+                    )
+                props[pname] = pdef
+            params["properties"] = props
+            func["parameters"] = params
+        tool["function"] = func
+        enriched.append(tool)
+    return enriched
+
+
 def format_tool_call_for_message(tool_call: ToolCall) -> dict:
     """
     Format a ToolCall object for inclusion in a message.
