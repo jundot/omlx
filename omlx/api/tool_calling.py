@@ -980,17 +980,24 @@ def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:
     return converted if converted else None
 
 
+# Parameter names that collide with JSON Schema keywords.
+# Gemma 4 confuses these with schema-level fields and drops them from
+# tool call output.  We rename them before the chat template and restore
+# them after parsing the model's response.
+_GEMMA4_COLLIDING_PARAMS = {"description", "type", "name", "properties", "required"}
+_GEMMA4_RENAME_PREFIX = "param_"
+
+
 def enrich_tool_params_for_gemma4(tools: list[dict]) -> list[dict]:
-    """Enrich tool parameter descriptions for Gemma 4 models.
+    """Fix tool schemas for Gemma 4 models.
 
-    Gemma 4's chat template renders tool definitions in a way that can
-    confuse the model when required parameters lack explicit descriptions,
-    especially when parameter names collide with schema keywords like
-    ``description``.  This ensures every required parameter has a non-empty
-    description that clearly labels it as a required argument, which
-    dramatically improves tool-call reliability.
+    1. Renames parameters whose names collide with JSON Schema keywords
+       (e.g. ``description`` -> ``param_description``) so Gemma 4 doesn't
+       confuse them with schema-level fields.
+    2. Adds explicit descriptions to required parameters that lack them.
 
-    This is a no-op for parameters that already have descriptions.
+    Use :func:`restore_gemma4_param_names` on tool call arguments to
+    reverse the renaming before returning them to the caller.
     """
     enriched = []
     for tool in tools:
@@ -999,22 +1006,41 @@ def enrich_tool_params_for_gemma4(tools: list[dict]) -> list[dict]:
         params = func.get("parameters", {})
         if isinstance(params, dict) and "properties" in params:
             params = dict(params)
-            props = dict(params.get("properties", {}))
-            required = set(params.get("required", []))
-            for pname, pdef in props.items():
+            old_props = params.get("properties", {})
+            required = list(params.get("required", []))
+            new_props = {}
+            new_required = []
+            for pname, pdef in old_props.items():
                 pdef = dict(pdef)
+                if pname in _GEMMA4_COLLIDING_PARAMS:
+                    new_name = _GEMMA4_RENAME_PREFIX + pname
+                else:
+                    new_name = pname
                 if not pdef.get("description"):
                     label = "REQUIRED. " if pname in required else ""
                     pdef["description"] = (
-                        f"{label}The '{pname}' parameter"
+                        f"{label}The '{pname}' value"
                         f" (type: {pdef.get('type', 'string')})"
                     )
-                props[pname] = pdef
-            params["properties"] = props
+                new_props[new_name] = pdef
+                new_required.append(new_name if pname in required else None)
+            params["properties"] = new_props
+            params["required"] = [r for r in new_required if r]
             func["parameters"] = params
         tool["function"] = func
         enriched.append(tool)
     return enriched
+
+
+def restore_gemma4_param_names(arguments: dict) -> dict:
+    """Reverse the parameter renaming done by :func:`enrich_tool_params_for_gemma4`."""
+    restored = {}
+    for k, v in arguments.items():
+        if k.startswith(_GEMMA4_RENAME_PREFIX):
+            restored[k[len(_GEMMA4_RENAME_PREFIX):]] = v
+        else:
+            restored[k] = v
+    return restored
 
 
 def format_tool_call_for_message(tool_call: ToolCall) -> dict:
