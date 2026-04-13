@@ -2475,6 +2475,24 @@ def _build_runtime_cache_observability(
         elif not isinstance(ssd_stats, dict):
             ssd_stats = {}
 
+        ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+        scheduler_model_name = getattr(getattr(scheduler, "config", None), "model_name", "")
+        if ssd_manager is not None and hasattr(ssd_manager, "get_stats_for_model"):
+            try:
+                scoped_ssd_stats = ssd_manager.get_stats_for_model(
+                    scheduler_model_name or model_id
+                )
+                if is_dataclass(scoped_ssd_stats):
+                    ssd_stats = asdict(scoped_ssd_stats)
+                elif isinstance(scoped_ssd_stats, dict):
+                    ssd_stats = scoped_ssd_stats
+            except Exception as exc:
+                logger.warning(
+                    "Failed to collect model-scoped SSD cache stats for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+
         prefix_stats = runtime_stats.get("prefix_cache")
         if is_dataclass(prefix_stats):
             prefix_stats = asdict(prefix_stats)

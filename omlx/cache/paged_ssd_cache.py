@@ -501,6 +501,11 @@ class PagedSSDCacheIndex:
         with self._lock:
             return list(self._index.keys())
 
+    def get_all_metadata(self) -> List[PagedSSDBlockMetadata]:
+        """Get a snapshot of all indexed block metadata."""
+        with self._lock:
+            return list(self._index.values())
+
 
 class PagedSSDCacheManager(CacheManager):
     """
@@ -1736,6 +1741,64 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
             )
 
+    def get_stats_for_model(self, model_name: str) -> PagedSSDCacheStats:
+        """Get model-scoped SSD cache statistics.
+
+        The SSD cache directory can be shared across multiple loaded models, so
+        dashboard per-model rows must be filtered by block metadata rather than
+        reusing the global cache totals.
+        """
+        normalized_name = model_name.rstrip("/")
+        basename = os.path.basename(normalized_name) if normalized_name else ""
+
+        def _matches(candidate: str) -> bool:
+            candidate = candidate.rstrip("/")
+            if not candidate:
+                return False
+            if candidate == normalized_name:
+                return True
+            if basename and os.path.basename(candidate) == basename:
+                return True
+            return False
+
+        with self._lock:
+            indexed_entries = [
+                metadata
+                for metadata in self._index.get_all_metadata()
+                if _matches(metadata.model_name)
+            ]
+            indexed_size = sum(metadata.file_size for metadata in indexed_entries)
+            indexed_count = len(indexed_entries)
+
+            with self._hot_cache_lock:
+                hot_entries = []
+                hot_size = 0
+                for entry in self._hot_cache.values():
+                    blk_meta = entry.get("block_metadata")
+                    if blk_meta is None or not _matches(blk_meta.model_name):
+                        continue
+                    hot_entries.append(entry)
+                    hot_size += self._hot_cache_entry_size(entry["tensors_raw"])
+
+            return PagedSSDCacheStats(
+                hits=self._stats["hits"],
+                misses=self._stats["misses"],
+                evictions=self._stats["evictions"],
+                saves=self._stats["saves"],
+                loads=self._stats["loads"],
+                errors=self._stats["errors"],
+                total_size_bytes=indexed_size,
+                max_size_bytes=self._get_effective_max_size(),
+                configured_max_size_bytes=self._max_size,
+                num_files=indexed_count,
+                hot_cache_entries=len(hot_entries),
+                hot_cache_size_bytes=hot_size,
+                hot_cache_max_bytes=self._hot_cache_max_bytes,
+                hot_cache_hits=self._stats["hot_cache_hits"],
+                hot_cache_evictions=self._stats["hot_cache_evictions"],
+                hot_cache_promotions=self._stats["hot_cache_promotions"],
+            )
+
     def get_stats_dict(self) -> Dict[str, Any]:
         """
         Get SSD cache statistics as a dictionary.
@@ -1918,5 +1981,4 @@ class PagedSSDCacheManager(CacheManager):
             Configured maximum cache size in bytes.
         """
         return self._max_size
-
 
