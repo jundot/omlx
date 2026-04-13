@@ -144,6 +144,7 @@ from .api.tool_calling import (
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
+    restore_gemma4_param_names,
     extract_tool_calls_with_thinking,
     parse_json_output,
     parse_tool_calls,
@@ -2159,6 +2160,17 @@ async def create_chat_completion(
             if not is_valid:
                 logger.warning(f"JSON validation failed: {error}")
 
+        # Reverse Gemma 4 parameter renaming (param_description -> description)
+        if tool_calls and "gemma" in (resolved_model or "").lower():
+            for tc in tool_calls:
+                if tc.function and tc.function.arguments:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                        args = restore_gemma4_param_names(args)
+                        tc.function.arguments = json.dumps(args, ensure_ascii=False)
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+
         finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
         return ChatCompletionResponse(
@@ -2733,6 +2745,17 @@ async def stream_chat_completion(
                     )],
                 )
                 yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
+    # Reverse Gemma 4 parameter renaming for streaming path
+    if tool_calls and "gemma" in (request.model or "").lower():
+        for tc in tool_calls:
+            if tc.function and tc.function.arguments:
+                try:
+                    args = json.loads(tc.function.arguments)
+                    args = restore_gemma4_param_names(args)
+                    tc.function.arguments = json.dumps(args, ensure_ascii=False)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
 
     # Emit tool call chunks if found
     if tool_calls:
