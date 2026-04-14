@@ -109,6 +109,16 @@ class OMLXAppDelegate(NSObject):
             logger.error(f"Launch failed: {e}", exc_info=True)
             self._show_fatal_error_and_quit(str(e))
 
+    def applicationShouldTerminateAfterLastWindowClosed_(self, app):
+        """Prevent termination when the last window closes."""
+        return False
+
+    def applicationShouldHandleReopen_hasVisibleWindows_(self, app, flag):
+        """Respond when user clicks the app icon while already running."""
+        if self.server_manager.is_running():
+            self.openDashboard_(None)
+        return True
+
     def _show_fatal_error_and_quit(self, message: str):
         """Show a fatal error dialog and terminate the application."""
         from AppKit import NSAlert
