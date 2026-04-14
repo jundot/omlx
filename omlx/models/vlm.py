@@ -378,22 +378,41 @@ class VLMModelAdapter(nn.Module):
                     position_ids = mx.broadcast_to(
                         positions[None, :, None], (3, B, L)
                     )
-                    # Pass position_ids for correct mRoPE positions.
-                    # Keep original cache (mx.array offsets) so the
-                    # attention mask is computed per-request correctly.
                     result = self._language_model(
                         input_ids, cache=cache, position_ids=position_ids, **kwargs
                     )
                 else:
-                    # Offset not yet batched — let language model compute
-                    # positions from its internal _rope_deltas state.
                     result = self._language_model(
                         input_ids, cache=_wrap_caches(cache), **kwargs
                     )
             else:
-                if hasattr(self._vlm_model, "_set_position_state"):
-                    self._vlm_model._set_position_state(input_ids)
-                result = self._language_model(input_ids, cache=_wrap_caches(cache), **kwargs)
+                if self._uses_mrope and cache is not None:
+                    # mRoPE fallback: use batch offsets directly as position_ids
+                    # instead of _wrap_caches which collapses per-request offsets
+                    # to a scalar max(). This path is hit when _batch_rope_deltas
+                    # is not yet set (e.g. PromptProcessingBatch before first
+                    # GenerationBatch._step).
+                    offsets = None
+                    for c in cache:
+                        if hasattr(c, "offset") and isinstance(c.offset, mx.array) and c.offset.ndim > 0:
+                            offsets = c.offset
+                            break
+                    if offsets is not None:
+                        B, L = input_ids.shape
+                        position_ids = mx.broadcast_to(
+                            offsets[None, :, None], (3, B, L)
+                        )
+                        result = self._language_model(
+                            input_ids, cache=cache, position_ids=position_ids, **kwargs
+                        )
+                    else:
+                        result = self._language_model(
+                            input_ids, cache=_wrap_caches(cache), **kwargs
+                        )
+                else:
+                    if hasattr(self._vlm_model, "_set_position_state"):
+                        self._vlm_model._set_position_state(input_ids)
+                    result = self._language_model(input_ids, cache=_wrap_caches(cache), **kwargs)
 
         # mlx-vlm models return LanguageModelOutput(logits=...) but
         # mlx-lm's BatchGenerator expects raw mx.array logits.
