@@ -4,11 +4,13 @@ from omlx.integrations.base import Integration
 from omlx.integrations.codex import CodexIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
+from omlx.integrations.pi import PiIntegration
 
 INTEGRATIONS: dict[str, Integration] = {
     "codex": CodexIntegration(),
     "opencode": OpenCodeIntegration(),
     "openclaw": OpenClawIntegration(),
+    "pi": PiIntegration(),
 }
 
 
