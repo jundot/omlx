@@ -672,7 +672,14 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         max_batch = max(request.batch_sizes) if request.batch_sizes else 0
         batch_prompts = [_generate_prompt(tokenizer, 1024) for _ in range(max_batch)]
 
-        for batch_size in request.batch_sizes:
+        # Skip batch tests for engines without scheduler core (e.g. DFlashEngine)
+        if request.batch_sizes and not hasattr(engine, "_engine"):
+            logger.info(
+                "Batch test skipped: engine does not support concurrent batching"
+            )
+            current_test += len(request.batch_sizes)
+
+        for batch_size in request.batch_sizes if hasattr(engine, "_engine") else []:
             current_test += 1
             await _send_event(run, {
                 "type": "progress",
