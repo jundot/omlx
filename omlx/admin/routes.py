@@ -91,6 +91,7 @@ class ModelSettingsRequest(BaseModel):
     forced_ct_kwargs: Optional[list[str]] = None
     ttl_seconds: Optional[int] = None
     index_cache_freq: Optional[int] = None
+    enable_thinking: Optional[bool] = None
     thinking_budget_enabled: Optional[bool] = None
     thinking_budget_tokens: Optional[int] = None
     # TurboQuant KV cache (mlx-vlm backend)
@@ -1330,6 +1331,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),
+            "thinking_default": model_info.get("thinking_default"),
             "last_access": model_info.get("last_access"),
         }
 
@@ -1348,6 +1350,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "presence_penalty": settings.presence_penalty,
                 "force_sampling": settings.force_sampling,
                 "max_tool_result_tokens": settings.max_tool_result_tokens,
+                "enable_thinking": settings.enable_thinking,
                 "thinking_budget_enabled": settings.thinking_budget_enabled,
                 "thinking_budget_tokens": settings.thinking_budget_tokens,
                 "reasoning_parser": settings.reasoning_parser,
@@ -1548,6 +1551,8 @@ async def update_model_settings(
         current_settings.max_tool_result_tokens = (
             request.max_tool_result_tokens if request.max_tool_result_tokens and request.max_tool_result_tokens > 0 else None
         )
+    if "enable_thinking" in sent:
+        current_settings.enable_thinking = request.enable_thinking
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = request.thinking_budget_enabled or False
     if "thinking_budget_tokens" in sent:

@@ -56,6 +56,7 @@ class EngineEntry:
     engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
+    thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
@@ -156,6 +157,7 @@ class EnginePool:
                     engine_type=info.engine_type,
                     estimated_size=info.estimated_size,
                     config_model_type=getattr(info, "config_model_type", ""),
+                    thinking_default=getattr(info, "thinking_default", None),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -801,6 +803,7 @@ class EnginePool:
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
                     "config_model_type": e.config_model_type,
+                    "thinking_default": e.thinking_default,
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
                 for mid, e in sorted(self._entries.items())

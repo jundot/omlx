@@ -14,6 +14,7 @@ Supports:
 - Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
 """
 
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
@@ -255,6 +256,7 @@ class DiscoveredModel:
     engine_type: EngineType  # "batched", "vlm", "embedding", or "reranker"
     estimated_size: int  # Estimated memory usage in bytes
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
+    thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
 
 
 def _is_unsupported_model(model_path: Path) -> bool:
@@ -449,6 +451,52 @@ def detect_model_type(model_path: Path) -> ModelType:
     return "llm"
 
 
+def detect_thinking_default(model_path: Path) -> bool | None:
+    """Detect whether a model's chat template enables thinking by default.
+
+    Inspects the Jinja chat template for ``enable_thinking`` references and
+    determines the default behaviour:
+
+    * **True** — model thinks by default (e.g. Qwen 3.x: only suppresses
+      thinking when ``enable_thinking is false``).
+    * **False** — model suppresses thinking by default (e.g. Gemma 4: only
+      enables thinking when ``enable_thinking`` is truthy,
+      ``default(false)``).
+    * **None** — template does not reference ``enable_thinking`` (model has
+      no thinking toggle).
+    """
+    # Try standalone Jinja file first, then tokenizer_config.json
+    template_text = None
+    jinja_path = model_path / "chat_template.jinja"
+    if jinja_path.exists():
+        with contextlib.suppress(OSError):
+            template_text = jinja_path.read_text(encoding="utf-8")
+
+    if template_text is None:
+        tc_path = model_path / "tokenizer_config.json"
+        if tc_path.exists():
+            try:
+                with open(tc_path) as f:
+                    tc = json.load(f)
+                template_text = tc.get("chat_template")
+            except Exception:
+                pass
+
+    if not template_text or "enable_thinking" not in template_text:
+        return None
+
+    # Heuristic: if the template only disables thinking when explicitly
+    # ``enable_thinking is false``, then thinking is ON by default.
+    # If the template requires ``enable_thinking`` to be truthy or uses
+    # ``default(false)``, then thinking is OFF by default.
+    if "enable_thinking is false" in template_text:
+        return True  # ON by default (Qwen pattern)
+    if "default(false)" in template_text or "enable_thinking)" in template_text:
+        return False  # OFF by default (Gemma pattern)
+
+    return None
+
+
 def estimate_model_size(model_path: Path) -> int:
     """
     Estimate model memory usage from safetensors/bin file sizes.
@@ -562,6 +610,8 @@ def _register_model(
         except Exception:
             pass
 
+        thinking_default = detect_thinking_default(model_dir)
+
         models[model_id] = DiscoveredModel(
             model_id=model_id,
             model_path=str(model_dir),
@@ -569,6 +619,7 @@ def _register_model(
             engine_type=engine_type,
             estimated_size=estimated_size,
             config_model_type=config_model_type,
+            thinking_default=thinking_default,
         )
 
         size_gb = estimated_size / (1024**3)

@@ -933,6 +933,8 @@
                     min_p: settings.min_p ?? null,
                     presence_penalty: settings.presence_penalty ?? null,
                     force_sampling: settings.force_sampling || false,
+                    enable_thinking: settings.enable_thinking ?? null,
+                    thinking_default: model.thinking_default ?? null,
                     enableThinkingBudget: !!(settings.thinking_budget_tokens),
                     thinking_budget_tokens: settings.thinking_budget_tokens || null,
                     enableToolResultLimit: !!(settings.max_tool_result_tokens),
@@ -1001,6 +1003,7 @@
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)
                                     : 0,
+                                enable_thinking: this.modelSettings.enable_thinking,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)
