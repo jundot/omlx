@@ -190,3 +190,39 @@ class TestOutputParserFactory:
         assert "<think>\n" in "".join(stream)
         assert "</think>\n" in "".join(stream)
         assert "".join(visible) == "Answer"
+
+    def test_harmony_non_streaming_preserves_reasoning(self):
+        """Non-streaming output_text retains analysis-channel reasoning."""
+        from omlx.api.thinking import extract_thinking
+
+        encoding = load_harmony_encoding("HarmonyGptOss")
+        tokenizer = HarmonyTokenizer(encoding)
+        factory = detect_output_parser(
+            "gpt-oss-20b",
+            tokenizer,
+            {"model_type": "gpt_oss"},
+        )
+        session = factory.create_session(tokenizer)
+
+        tokens = encoding.encode(
+            "<|channel|>analysis<|message|>Let me think about this<|end|>"
+            "<|start|>assistant<|channel|>final<|message|>Four<|return|>",
+            allowed_special="all",
+        )
+
+        visible_parts = []
+        for token in tokens:
+            result = session.process_token(token)
+            visible_parts.append(result.visible_text)
+
+        final = session.finalize()
+        visible_parts.append(final.visible_text)
+
+        # Mirror scheduler aggregation: prepend any parser-provided prefix
+        # to the accumulated visible_text before exposing as output_text.
+        prefix = getattr(final, "output_text_prefix", "")
+        output_text = prefix + "".join(visible_parts)
+
+        thinking, content = extract_thinking(output_text)
+        assert thinking == "Let me think about this"
+        assert content == "Four"

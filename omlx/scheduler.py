@@ -3244,6 +3244,10 @@ class Scheduler:
                         output.new_text += final_result.stream_text
                     if final_result.visible_text:
                         request.output_text += final_result.visible_text
+                    if final_result.output_text_prefix:
+                        request.output_text = (
+                            final_result.output_text_prefix + request.output_text
+                        )
                     if final_result.tool_calls:
                         output.tool_calls = final_result.tool_calls
                     if final_result.finish_reason:
