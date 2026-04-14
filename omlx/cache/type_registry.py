@@ -53,6 +53,10 @@ class CacheTypeRegistry:
         # checks the class name first and routes to TQ-specific handling)
         "TurboQuantKVCache": CacheType.KVCACHE,
         "BatchTurboQuantKVCache": CacheType.KVCACHE,
+        # PlanarQuant: same rationale as TurboQuant — treated as KVCache-shaped
+        # so supports_block_slicing = True; prefix_cache special-cases by name.
+        "PlanarQuantKVCache": CacheType.KVCACHE,
+        "BatchPlanarQuantKVCache": CacheType.KVCACHE,
     }
 
     # Default handler instance

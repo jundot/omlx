@@ -40,16 +40,56 @@ def apply_turboquant_attention_patch() -> bool:
         sinks: Optional[mx.array] = None,
     ) -> mx.array:
         from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
+
+        from ..cache.planarquant.kv_cache import (
+            BatchPlanarQuantKVCache,
+            PlanarQuantKVCache,
+        )
         from ..turboquant_kv import BatchTurboQuantKVCache
 
-        # Detect underlying TQ cache (may be wrapped by proxy objects)
+        pq_types = (PlanarQuantKVCache, BatchPlanarQuantKVCache)
+        tq_types = (_TQCache, BatchTurboQuantKVCache)
+
+        # Unwrap VLM _IntOffsetCacheProxy to detect underlying TQ/PQ cache
         real_cache = cache
-        if hasattr(cache, "_cache") and not isinstance(
-            cache, (_TQCache, BatchTurboQuantKVCache)
-        ):
+        if hasattr(cache, "_cache") and not isinstance(cache, tq_types + pq_types):
             real_cache = cache._cache
 
-        if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
+        # DFlash: RecurrentRollbackCache uses its own verify/rollback path.
+        try:
+            from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
+            if isinstance(real_cache, RecurrentRollbackCache):
+                return original_sdpa(queries, keys, values, cache, scale, mask, sinks)
+        except ImportError:
+            pass
+
+        if isinstance(real_cache, pq_types):
+            # Auto-finalize prefill: if cache has not been finalized yet
+            # and we're now in decode (L=1), finalize the prefill buffer.
+            if not real_cache._finalized and queries.shape[-2] == 1:
+                real_cache.finalize_prefill()
+
+            if queries.shape[-2] == 1:
+                return real_cache.decode_attention(
+                    queries,
+                    keys_state=keys,
+                    values_state=values,
+                    scale=scale,
+                    mask=mask,
+                )
+            # Prefill: always dequantize + SDPA (cache stores FP16 during prefill)
+            dequantized_keys, dequantized_values = real_cache.dequantize(
+                keys_state=keys, values_state=values
+            )
+            return mx.fast.scaled_dot_product_attention(
+                queries,
+                dequantized_keys.astype(queries.dtype),
+                dequantized_values.astype(queries.dtype),
+                scale=scale,
+                mask=mask,
+            )
+
+        if isinstance(real_cache, tq_types):
             if queries.shape[-2] == 1:
                 return real_cache.decode_attention(
                     queries,
