@@ -1189,6 +1189,7 @@
                 const container = document.getElementById('messagesContainer');
                 if (!container) return;
 
+                let lastScrollTop = container.scrollTop;
                 container.addEventListener('scroll', () => {
                     // Detect if user is manually scrolling
                     clearTimeout(this.scrollTimeout);
@@ -1197,12 +1198,14 @@
                     // Check if at bottom (with threshold)
                     const threshold = 50;
                     const isAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
+                    const scrolledUp = container.scrollTop < lastScrollTop;
+                    lastScrollTop = container.scrollTop;
 
                     if (isAtBottom) {
                         // User scrolled to bottom, re-enable auto-scroll
                         this.autoScrollEnabled = true;
-                    } else if (this.isStreaming) {
-                        // User scrolled away from bottom during streaming, disable auto-scroll
+                    } else if (scrolledUp) {
+                        // User scrolled up - disable auto-scroll until they reach the bottom again
                         this.autoScrollEnabled = false;
                     }
 
