@@ -138,6 +138,7 @@ class ModelSettings:
     model_dir: str | None = None  # Deprecated: kept for backward compatibility
     max_model_memory: str = "auto"  # "auto" means 80% of RAM
     model_fallback: bool = False  # Use default model when requested model not found
+    single_model_mode: bool = False  # Unload all other models before loading a new one
 
     def get_model_dirs(self, base_path: Path) -> list[Path]:
         """
@@ -191,6 +192,7 @@ class ModelSettings:
             "model_dir": self.model_dirs[0] if self.model_dirs else self.model_dir,
             "max_model_memory": self.max_model_memory,
             "model_fallback": self.model_fallback,
+            "single_model_mode": self.single_model_mode,
         }
 
     @classmethod
@@ -205,6 +207,7 @@ class ModelSettings:
             model_dir=data.get("model_dir"),
             max_model_memory=data.get("max_model_memory", "auto"),
             model_fallback=data.get("model_fallback", False),
+            single_model_mode=data.get("single_model_mode", False),
         )
 
 
@@ -754,6 +757,8 @@ class GlobalSettings:
             self.model.model_dir = dirs[0] if dirs else None
         if max_model_memory := os.getenv("OMLX_MAX_MODEL_MEMORY"):
             self.model.max_model_memory = max_model_memory
+        if single_model_mode := os.getenv("OMLX_SINGLE_MODEL_MODE"):
+            self.model.single_model_mode = single_model_mode.lower() in ("true", "1", "yes")
 
         # Memory enforcement settings
         if max_process_memory := os.getenv("OMLX_MAX_PROCESS_MEMORY"):
@@ -833,6 +838,8 @@ class GlobalSettings:
             self.model.model_dir = dirs[0] if dirs else None
         if hasattr(args, "max_model_memory") and args.max_model_memory is not None:
             self.model.max_model_memory = args.max_model_memory
+        if hasattr(args, "single_model_mode") and args.single_model_mode is not None:
+            self.model.single_model_mode = args.single_model_mode
 
         # Memory enforcement settings
         if (

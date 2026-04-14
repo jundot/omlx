@@ -1024,3 +1024,232 @@ class TestResolveModelId:
         # Exact match should be returned directly
         result = pool.resolve_model_id("model-a", settings_manager=None)
         assert result == "model-a"
+
+
+class TestSingleModelMode:
+    """Tests for single_model_mode eviction behavior."""
+
+    def test_default_off(self, small_mock_model_dir):
+        """Test that single_model_mode defaults to False."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        assert pool.single_model_mode is False
+
+    def test_enabled_via_constructor(self, small_mock_model_dir):
+        """Test that single_model_mode can be enabled via constructor."""
+        pool = EnginePool(max_model_memory=10 * 1024**3, single_model_mode=True)
+        assert pool.single_model_mode is True
+
+    def test_setter(self, small_mock_model_dir):
+        """Test runtime toggle via setter."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.single_model_mode = True
+        assert pool.single_model_mode is True
+        pool.single_model_mode = False
+        assert pool.single_model_mode is False
+
+    def test_status_includes_single_model_mode(self, small_mock_model_dir):
+        """Test that get_status includes single_model_mode."""
+        pool = EnginePool(max_model_memory=10 * 1024**3, single_model_mode=True)
+        pool.discover_models(str(small_mock_model_dir))
+
+        status = pool.get_status()
+        assert status["single_model_mode"] is True
+
+    def test_status_default_false(self, small_mock_model_dir):
+        """Test that get_status shows False by default."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        status = pool.get_status()
+        assert status["single_model_mode"] is False
+
+    @pytest.mark.asyncio
+    async def test_evicts_other_model_before_load(self, small_mock_model_dir):
+        """Test that single_model_mode unloads other models before loading."""
+        # Large memory limit so both would normally coexist
+        pool = EnginePool(max_model_memory=10 * 1024**3, single_model_mode=True)
+        pool.discover_models(str(small_mock_model_dir))
+
+        mock_engine_a = MagicMock()
+        mock_engine_a.start = AsyncMock()
+        mock_engine_a.stop = AsyncMock()
+
+        mock_engine_b = MagicMock()
+        mock_engine_b.start = AsyncMock()
+        mock_engine_b.stop = AsyncMock()
+
+        engines = {"model-a": mock_engine_a, "model-b": mock_engine_b}
+
+        def create_engine(*args, **kwargs):
+            model_name = kwargs.get("model_name", "")
+            for key, eng in engines.items():
+                if key in model_name:
+                    return eng
+            return mock_engine_a
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            # Load model-a
+            await pool.get_engine("model-a")
+            assert pool._entries["model-a"].engine is not None
+            assert pool._entries["model-b"].engine is None
+
+            # Load model-b — should evict model-a first
+            await pool.get_engine("model-b")
+
+        # model-a should have been unloaded
+        mock_engine_a.stop.assert_called_once()
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_no_eviction_when_disabled(self, small_mock_model_dir):
+        """Test that models coexist when single_model_mode is off."""
+        pool = EnginePool(max_model_memory=10 * 1024**3, single_model_mode=False)
+        pool.discover_models(str(small_mock_model_dir))
+
+        mock_engine_a = MagicMock()
+        mock_engine_a.start = AsyncMock()
+        mock_engine_a.stop = AsyncMock()
+
+        mock_engine_b = MagicMock()
+        mock_engine_b.start = AsyncMock()
+
+        engines = {"model-a": mock_engine_a, "model-b": mock_engine_b}
+
+        def create_engine(*args, **kwargs):
+            model_name = kwargs.get("model_name", "")
+            for key, eng in engines.items():
+                if key in model_name:
+                    return eng
+            return mock_engine_a
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+
+        # Both should be loaded
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+        mock_engine_a.stop.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_pinned_models(self, small_mock_model_dir):
+        """Test that pinned models are not evicted in single_model_mode."""
+        pool = EnginePool(max_model_memory=10 * 1024**3, single_model_mode=True)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Pin model-a
+        pool._entries["model-a"].is_pinned = True
+
+        mock_engine_a = MagicMock()
+        mock_engine_a.start = AsyncMock()
+        mock_engine_a.stop = AsyncMock()
+
+        mock_engine_b = MagicMock()
+        mock_engine_b.start = AsyncMock()
+        mock_engine_b.stop = AsyncMock()
+
+        engines = {"model-a": mock_engine_a, "model-b": mock_engine_b}
+
+        def create_engine(*args, **kwargs):
+            model_name = kwargs.get("model_name", "")
+            for key, eng in engines.items():
+                if key in model_name:
+                    return eng
+            return mock_engine_a
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            # Load pinned model-a
+            await pool.get_engine("model-a")
+
+            # Load model-b — model-a should NOT be evicted (pinned)
+            await pool.get_engine("model-b")
+
+        # model-a should still be loaded (pinned)
+        assert pool._entries["model-a"].engine is not None
+        mock_engine_a.stop.assert_not_called()
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_never_evicts_pinned_even_if_incoming_pinned(self, small_mock_model_dir):
+        """Test that pinned models are never evicted, even when incoming model is also pinned."""
+        pool = EnginePool(max_model_memory=10 * 1024**3, single_model_mode=True)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Pin model-a, incoming model-b is also pinned
+        pool._entries["model-a"].is_pinned = True
+        pool._entries["model-b"].is_pinned = True
+
+        mock_engine_a = MagicMock()
+        mock_engine_a.start = AsyncMock()
+        mock_engine_a.stop = AsyncMock()
+
+        mock_engine_b = MagicMock()
+        mock_engine_b.start = AsyncMock()
+
+        engines = {"model-a": mock_engine_a, "model-b": mock_engine_b}
+
+        def create_engine(*args, **kwargs):
+            model_name = kwargs.get("model_name", "")
+            for key, eng in engines.items():
+                if key in model_name:
+                    return eng
+            return mock_engine_a
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+
+        # model-a should still be loaded — pinned models are never evicted
+        mock_engine_a.stop.assert_not_called()
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_preload_pinned_models_keeps_all_pins(self, small_mock_model_dir):
+        """Test startup preload keeps multiple pinned models loaded."""
+        pool = EnginePool(max_model_memory=10 * 1024**3, single_model_mode=True)
+        pool.discover_models(
+            str(small_mock_model_dir), pinned_models=["model-a", "model-b"]
+        )
+
+        mock_engine_a = MagicMock()
+        mock_engine_a.start = AsyncMock()
+        mock_engine_a.stop = AsyncMock()
+
+        mock_engine_b = MagicMock()
+        mock_engine_b.start = AsyncMock()
+        mock_engine_b.stop = AsyncMock()
+
+        engines = {"model-a": mock_engine_a, "model-b": mock_engine_b}
+
+        def create_engine(*args, **kwargs):
+            model_name = kwargs.get("model_name", "")
+            for key, eng in engines.items():
+                if key in model_name:
+                    return eng
+            return mock_engine_a
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.preload_pinned_models()
+
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+        mock_engine_a.stop.assert_not_called()
+        mock_engine_b.stop.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_same_model_no_eviction(self, small_mock_model_dir):
+        """Test that requesting the already-loaded model doesn't trigger eviction."""
+        pool = EnginePool(max_model_memory=10 * 1024**3, single_model_mode=True)
+        pool.discover_models(str(small_mock_model_dir))
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-a")  # Same model again
+
+        # start should only be called once
+        assert mock_engine.start.call_count == 1

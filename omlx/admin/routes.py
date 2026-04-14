@@ -123,6 +123,7 @@ class GlobalSettingsRequest(BaseModel):
     model_dir: Optional[str] = None  # Deprecated: kept for backward compatibility
     max_model_memory: Optional[str] = None
     model_fallback: Optional[bool] = None
+    single_model_mode: Optional[bool] = None
 
     # Memory enforcement
     max_process_memory: Optional[str] = None  # "auto", "disabled", or "XX%"
@@ -1742,6 +1743,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "model_dir": str(global_settings.model.get_model_dir(global_settings.base_path)),
             "max_model_memory": global_settings.model.max_model_memory,
             "model_fallback": global_settings.model.model_fallback,
+            "single_model_mode": global_settings.model.single_model_mode,
         },
         "memory": {
             "max_process_memory": global_settings.memory.max_process_memory,
@@ -1900,6 +1902,14 @@ async def update_global_settings(
     if request.model_fallback is not None:
         global_settings.model.model_fallback = request.model_fallback
         runtime_applied.append("model_fallback")
+
+    if request.single_model_mode is not None:
+        global_settings.model.single_model_mode = request.single_model_mode
+        server_state = _get_server_state() if _get_server_state else None
+        pool = server_state.engine_pool if server_state is not None else None
+        if pool is not None:
+            pool.single_model_mode = request.single_model_mode
+        runtime_applied.append("single_model_mode")
 
     # Apply process memory enforcement settings (Live)
     if request.max_process_memory is not None:
@@ -2698,6 +2708,7 @@ def _build_active_models_data() -> dict:
         "models": models,
         "model_memory_used": status.get("current_model_memory", 0),
         "model_memory_max": status.get("max_model_memory", 0),
+        "single_model_mode": status.get("single_model_mode", False),
         "total_active_requests": total_active,
         "total_waiting_requests": total_waiting,
     }

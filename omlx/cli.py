@@ -31,6 +31,8 @@ def _has_cli_overrides(args) -> bool:
         return True
     if hasattr(args, "max_model_memory") and args.max_model_memory is not None:
         return True
+    if hasattr(args, "single_model_mode") and args.single_model_mode is not None:
+        return True
     if hasattr(args, "max_process_memory") and args.max_process_memory is not None:
         return True
     if hasattr(args, "host") and args.host is not None:
@@ -411,6 +413,19 @@ Example directory structure:
         type=str,
         default=None,
         help="Maximum memory for loaded models (e.g., 32GB, 'disabled'). Default: 80%% of system memory.",
+    )
+    serve_parser.add_argument(
+        "--single-model-mode",
+        action="store_true",
+        default=None,
+        help="Always unload other models before loading a new one, even if memory allows coexistence.",
+    )
+    serve_parser.add_argument(
+        "--no-single-model-mode",
+        dest="single_model_mode",
+        action="store_false",
+        default=None,
+        help="Allow multiple models to coexist in memory (disable single-model mode).",
     )
     serve_parser.add_argument(
         "--max-process-memory",
