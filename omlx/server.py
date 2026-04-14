@@ -2698,6 +2698,16 @@ async def stream_chat_completion(
         tool_calls = extraction.tool_calls
         cleaned_thinking = extraction.cleaned_thinking
 
+        # Process response_format if specified
+        if request.response_format and not tool_calls:
+            cleaned_text, parsed_json, is_valid, error = parse_json_output(
+                cleaned_text, request.response_format
+            )
+            if parsed_json is not None:
+                cleaned_text = json.dumps(parsed_json)
+            if not is_valid:
+                logger.warning(f"JSON validation failed: {error}")
+
         # Buffered mode: emit thinking and cleaned content now
         if not stream_content:
             if cleaned_thinking:
@@ -3627,6 +3637,7 @@ async def create_response(
                     input_messages=current_input_messages,
                     store_response=_should_store_response(request.store),
                     model_load_duration=model_load_duration,
+                    response_format=response_format,
                     **chat_kwargs,
                 ),
                 http_request=http_request,
@@ -3672,6 +3683,17 @@ async def create_response(
             )
             cleaned_text = extraction.cleaned_text
             tool_calls = extraction.tool_calls
+
+        # Process response_format if specified
+        if response_format and not tool_calls:
+            cleaned_text, parsed_json, is_valid, error = parse_json_output(
+                cleaned_text or regular_content,
+                response_format
+            )
+            if parsed_json is not None:
+                cleaned_text = json.dumps(parsed_json)
+            if not is_valid:
+                logger.warning(f"JSON validation failed: {error}")
 
         # Build output items
         output_items: list[OutputItem] = []
@@ -3736,6 +3758,7 @@ async def stream_responses_api(
     input_messages: Optional[list[dict]] = None,
     store_response: bool = True,
     model_load_duration: float = 0.0,
+    response_format=None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
@@ -3915,6 +3938,16 @@ async def stream_responses_api(
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
     final_text = cleaned_text.strip() if cleaned_text else ""
+
+    # Process response_format if specified
+    if response_format and not tool_calls:
+        _, parsed_json, is_valid, error = parse_json_output(
+            final_text, response_format
+        )
+        if parsed_json is not None:
+            final_text = json.dumps(parsed_json)
+        if not is_valid:
+            logger.warning(f"JSON validation failed: {error}")
 
     # 6. response.output_text.done
     seq += 1

@@ -163,6 +163,9 @@ class MockBaseEngine:
     def model_type(self) -> Optional[str]:
         return self._model_type
 
+    async def start(self) -> None:
+        pass
+
     async def generate(self, prompt: str, **kwargs) -> MockGenerationOutput:
         return MockGenerationOutput(text="Generated response.")
 
@@ -1109,3 +1112,113 @@ class TestErrorHandling:
         )
 
         assert response.status_code == 422
+
+
+class TestJsonOutputParsing:
+    """Tests for parse_json_output in non-streaming endpoints."""
+
+    def test_chat_completion_parses_markdown_json(self, client, mock_llm_engine):
+        """Markdown-wrapped JSON should be parsed when response_format=json_object."""
+        import json
+
+        mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
+            text='```json\n{"name": "test", "age": 25}\n```',
+            prompt_tokens=10,
+            completion_tokens=8,
+            finish_reason="stop",
+            finished=True,
+        ))
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Return JSON"}],
+                "response_format": {"type": "json_object"},
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+        assert parsed == {"name": "test", "age": 25}
+
+    def test_chat_completion_clean_json_unchanged(self, client, mock_llm_engine):
+        """Already-clean JSON should pass through without corruption."""
+        import json
+
+        mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
+            text='{"key": "value"}',
+            prompt_tokens=10,
+            completion_tokens=5,
+            finish_reason="stop",
+            finished=True,
+        ))
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Return JSON"}],
+                "response_format": {"type": "json_object"},
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+        assert parsed == {"key": "value"}
+
+    def test_responses_parses_markdown_json(self, client, mock_llm_engine):
+        """Responses API should parse markdown-wrapped JSON with text.format."""
+        import json
+
+        mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
+            text='```json\n{"city": "Seoul", "temp": 15}\n```',
+            prompt_tokens=10,
+            completion_tokens=8,
+            finish_reason="stop",
+            finished=True,
+        ))
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Return weather JSON",
+                "text": {
+                    "format": {"type": "json_object"},
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        output_text = data["output"][0]["content"][0]["text"]
+        parsed = json.loads(output_text)
+        assert parsed == {"city": "Seoul", "temp": 15}
+
+    def test_responses_without_format_unchanged(self, client, mock_llm_engine):
+        """Responses API without text.format should return raw text."""
+        mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
+            text="Hello, how can I help?",
+            prompt_tokens=10,
+            completion_tokens=5,
+            finish_reason="stop",
+            finished=True,
+        ))
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Hi",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        output_text = data["output"][0]["content"][0]["text"]
+        assert "Hello" in output_text
