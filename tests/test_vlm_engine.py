@@ -160,15 +160,21 @@ class TestInjectToolCalling:
         assert getattr(tokenizer, "has_tool_calling", False) is False
 
     def test_skips_when_mlx_lm_not_available(self):
-        """ImportError from mlx_lm → silently skipped."""
+        """When neither parser backend is available, injection is skipped."""
         engine = _make_engine()
         tokenizer = MockVLMTokenizer(
             chat_template="<tool_call> tool_call.name",
             vocab={"<tool_call>": 100, "</tool_call>": 101},
         )
 
-        with patch.dict("sys.modules", {"mlx_lm": None, "mlx_lm.tokenizer_utils": None}):
-            # Import will fail
+        with patch.dict(
+            "sys.modules",
+            {
+                "mlx_vlm.tool_parsers": None,
+                "mlx_lm": None,
+                "mlx_lm.tokenizer_utils": None,
+            },
+        ):
             engine._inject_tool_calling(tokenizer)
 
         # Should not crash, attributes not set
@@ -426,25 +432,44 @@ class TestApplyOcrPrompt:
 class TestProcessChatMessages:
     """Tests for VLMBatchedEngine._process_chat_messages()."""
 
-    def test_text_only_uses_chat_template(self):
-        """Text-only messages → _apply_chat_template() called."""
+    @patch("omlx.engine.vlm.extract_images_from_messages")
+    def test_text_only_uses_vlm_prepare_path(self, mock_extract):
+        """Text-only turns on a VLM model still use _prepare_vision_inputs()."""
+        text_msgs = [{"role": "user", "content": "Hello"}]
+        mock_extract.return_value = (text_msgs, [])
+
         engine = _make_loaded_engine()
-        engine._apply_chat_template = MagicMock(return_value="<prompt>")
+        engine._prepare_vision_inputs = MagicMock(
+            return_value=([1, 2, 3], None, None, None, 0, [])
+        )
 
         messages = [{"role": "user", "content": "Hello"}]
         result = engine._process_chat_messages(messages, tools=None, kwargs={})
 
-        prompt, vlm_embeds, vlm_kwargs, image_hash = result
-        assert prompt == "<prompt>"
+        token_ids, vlm_embeds, vlm_kwargs, image_hash, image_cache_key_start, image_cache_key_ranges = result
+        assert token_ids == [1, 2, 3]
         assert vlm_embeds is None
         assert vlm_kwargs is None
         assert image_hash is None
-        engine._apply_chat_template.assert_called_once()
+        assert image_cache_key_start == 0
+        assert image_cache_key_ranges == []
+        engine._prepare_vision_inputs.assert_called_once_with(
+            text_msgs,
+            [],
+            chat_template_kwargs=None,
+            tools=None,
+        )
 
-    def test_text_only_passes_tools(self):
-        """Text-only + tools → convert_tools_for_template() called."""
+    @patch("omlx.engine.vlm.extract_images_from_messages")
+    def test_text_only_passes_tools_to_prepare_vision(self, mock_extract):
+        """Text-only + tools still convert and pass tools through VLM path."""
+        text_msgs = [{"role": "user", "content": "Hello"}]
+        mock_extract.return_value = (text_msgs, [])
+
         engine = _make_loaded_engine()
-        engine._apply_chat_template = MagicMock(return_value="<prompt>")
+        engine._prepare_vision_inputs = MagicMock(
+            return_value=([1, 2, 3], None, None, None, 0, [])
+        )
 
         tools = [{"type": "function", "function": {"name": "test", "parameters": {}}}]
         messages = [{"role": "user", "content": "Hello"}]
@@ -454,6 +479,8 @@ class TestProcessChatMessages:
             engine._process_chat_messages(messages, tools=tools, kwargs={})
 
         mock_convert.assert_called_once_with(tools)
+        call_kwargs = engine._prepare_vision_inputs.call_args[1]
+        assert call_kwargs["tools"] == [{"converted": True}]
 
     @patch("omlx.engine.vlm.extract_images_from_messages")
     def test_image_path_calls_prepare_vision(self, mock_extract):
@@ -467,7 +494,7 @@ class TestProcessChatMessages:
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
         engine._prepare_vision_inputs = MagicMock(
-            return_value=([1, 2, 3], MagicMock(), {}, "hash123")
+            return_value=([1, 2, 3], MagicMock(), {}, "hash123", 12, [(12, "hash123")])
         )
 
         messages = [{"role": "user", "content": [
@@ -478,9 +505,11 @@ class TestProcessChatMessages:
         result = engine._process_chat_messages(messages, tools=None, kwargs={})
 
         engine._prepare_vision_inputs.assert_called_once()
-        token_ids, vlm_embeds, vlm_kwargs, image_hash = result
+        token_ids, vlm_embeds, vlm_kwargs, image_hash, image_cache_key_start, image_cache_key_ranges = result
         assert token_ids == [1, 2, 3]
         assert image_hash == "hash123"
+        assert image_cache_key_start == 12
+        assert image_cache_key_ranges == [(12, "hash123")]
 
     @patch("omlx.engine.vlm.extract_images_from_messages")
     def test_image_path_passes_tools(self, mock_extract):
@@ -494,7 +523,7 @@ class TestProcessChatMessages:
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
         engine._prepare_vision_inputs = MagicMock(
-            return_value=([1, 2, 3], None, None, None)
+            return_value=([1, 2, 3], None, None, None, 0, [])
         )
 
         tools = [{"type": "function", "function": {"name": "analyze", "parameters": {}}}]
@@ -521,7 +550,7 @@ class TestProcessChatMessages:
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
         engine._prepare_vision_inputs = MagicMock(
-            return_value=([1, 2, 3], None, None, None)
+            return_value=([1, 2, 3], None, None, None, 0, [])
         )
 
         messages = [{"role": "user", "content": "Describe"}]
@@ -651,10 +680,13 @@ class TestFormatMessagesForVLMTemplate:
             },
         ]
 
-        formatted = engine._format_messages_for_vlm_template(messages, num_images=1)
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
 
         assert self._count_image_placeholders(formatted) == 1
         assert self._count_image_placeholders([formatted[-1]]) == 1
+        assert image_ranges == [(2, 1)]
 
     def test_caps_placeholders_by_loaded_image_count(self):
         """Do not add more placeholders than successfully loaded images."""
@@ -670,18 +702,24 @@ class TestFormatMessagesForVLMTemplate:
             },
         ]
 
-        formatted = engine._format_messages_for_vlm_template(messages, num_images=1)
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
 
         assert self._count_image_placeholders(formatted) == 1
+        assert image_ranges == [(0, 1)]
 
     def test_fallback_inserts_first_user_when_no_explicit_parts(self):
         """Legacy path: num_images without explicit image parts still injects once."""
         engine = _make_loaded_engine(model_type="qwen3_5")
         messages = [{"role": "user", "content": "Describe this"}]
 
-        formatted = engine._format_messages_for_vlm_template(messages, num_images=1)
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
 
         assert self._count_image_placeholders(formatted) == 1
+        assert image_ranges == [(0, 1)]
 
 
 # ---------------------------------------------------------------------------

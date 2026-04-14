@@ -1015,6 +1015,69 @@ class TestArraysCacheLastBlockOnly:
         assert len(result.block_ids) == 2
         assert result.num_tokens == 8
 
+    def test_fetch_cache_with_segmented_extra_key_ranges(self):
+        """Later image changes should preserve reuse before their boundary."""
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+        )
+
+        tokens = list(range(12))
+        original_ranges = [
+            (5, ("image-1",)),
+            (9, ("image-1", "image-2")),
+        ]
+
+        stored = cache.store_cache(
+            "req-store",
+            tokens,
+            [],
+            extra_key_ranges=original_ranges,
+        )
+        assert stored is not None
+        assert stored.num_tokens == 12
+
+        exact_table, exact_remaining = cache.fetch_cache(
+            "req-exact",
+            tokens,
+            extra_key_ranges=original_ranges,
+        )
+        assert exact_table is not None
+        assert exact_table.num_tokens == 12
+        assert exact_remaining == []
+
+        changed_later_image_table, changed_later_image_remaining = cache.fetch_cache(
+            "req-later-image",
+            tokens,
+            extra_key_ranges=[
+                (5, ("image-1",)),
+                (9, ("image-1", "image-3")),
+            ],
+        )
+        assert changed_later_image_table is not None
+        assert changed_later_image_table.num_tokens == 8
+        assert changed_later_image_remaining == tokens[8:]
+
+        changed_earlier_image_table, changed_earlier_image_remaining = cache.fetch_cache(
+            "req-earlier-image",
+            tokens,
+            extra_key_ranges=[
+                (5, ("image-x",)),
+                (9, ("image-x", "image-2")),
+            ],
+        )
+        assert changed_earlier_image_table is not None
+        assert changed_earlier_image_table.num_tokens == 4
+        assert changed_earlier_image_remaining == tokens[4:]
+
     def test_store_cache_with_existing_prefix_uses_global_cache_indices(self, mx):
         """Store new blocks from full-sequence cache slices after cache hit.
 

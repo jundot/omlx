@@ -20,6 +20,7 @@ from omlx.cache.paged_cache import (
     FreeKVCacheBlockQueue,
     PagedCacheManager,
     compute_block_hash,
+    resolve_block_extra_keys,
 )
 
 
@@ -83,6 +84,48 @@ class TestComputeBlockHash:
 
         # Each hash should be unique
         assert len({hash1, hash2, hash3}) == 3
+
+
+class TestResolveBlockExtraKeys:
+    """Tests for segmented cache-key resolution."""
+
+    def test_returns_none_before_first_range(self):
+        """Blocks before the first multimodal boundary should be unsalted."""
+        ranges = [
+            (5, ("image-1",)),
+            (9, ("image-1", "image-2")),
+        ]
+
+        assert resolve_block_extra_keys(4, extra_key_ranges=ranges) is None
+
+    def test_selects_latest_matching_range(self):
+        """Blocks should use the latest applicable segmented cache key."""
+        ranges = [
+            (5, ("image-1",)),
+            (9, ("image-1", "image-2")),
+        ]
+
+        assert resolve_block_extra_keys(8, extra_key_ranges=ranges) == ("image-1",)
+        assert resolve_block_extra_keys(12, extra_key_ranges=ranges) == (
+            "image-1",
+            "image-2",
+        )
+
+    def test_ranges_take_precedence_over_legacy_extra_keys(self):
+        """Segmented cache keys should override the legacy whole-request salt."""
+        ranges = [(5, ("image-1",))]
+
+        assert resolve_block_extra_keys(
+            8,
+            extra_keys=("legacy-image",),
+            extra_key_ranges=ranges,
+        ) == ("image-1",)
+
+    def test_range_start_at_zero_applies_from_first_block(self):
+        """A first-image boundary at token 0 should salt the entire sequence."""
+        ranges = [(0, ("image-1",))]
+
+        assert resolve_block_extra_keys(4, extra_key_ranges=ranges) == ("image-1",)
 
 
 class TestCacheBlock:

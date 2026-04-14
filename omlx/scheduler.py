@@ -2209,11 +2209,26 @@ class Scheduler:
             extra_keys = None
             if request.vlm_image_hash:
                 extra_keys = (request.vlm_image_hash,)
+            extra_key_token_start = (
+                request.vlm_cache_key_start if request.vlm_image_hash else None
+            )
+            extra_key_ranges = (
+                [
+                    (start, (image_hash,))
+                    for start, image_hash in request.vlm_cache_key_ranges
+                ]
+                if request.vlm_cache_key_ranges
+                else None
+            )
+            # Segmented VLM ranges take precedence when present; extra_keys is
+            # retained as the legacy whole-prompt fallback for non-segmented cases.
 
             block_table, remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
                 request.prompt_token_ids,
                 extra_keys=extra_keys,
+                extra_key_token_start=extra_key_token_start,
+                extra_key_ranges=extra_key_ranges,
             )
             if block_table and block_table.num_tokens > 0:
                 # Reconstruct actual KVCache objects from stored tensor data
@@ -3392,6 +3407,21 @@ class Scheduler:
                                 store_extra_keys = None
                                 if request.vlm_image_hash:
                                     store_extra_keys = (request.vlm_image_hash,)
+                                store_extra_key_token_start = (
+                                    request.vlm_cache_key_start
+                                    if request.vlm_image_hash
+                                    else None
+                                )
+                                store_extra_key_ranges = (
+                                    [
+                                        (start, (image_hash,))
+                                        for start, image_hash in request.vlm_cache_key_ranges
+                                    ]
+                                    if request.vlm_cache_key_ranges
+                                    else None
+                                )
+                                # Segmented VLM ranges take precedence when present;
+                                # extra_keys remains the legacy fallback.
 
                                 block_table = self.block_aware_cache.store_cache(
                                     request_id,
@@ -3400,6 +3430,8 @@ class Scheduler:
                                     model_cache_config=model_cache_config,
                                     boundary_snapshots=intermediate_snapshots,
                                     extra_keys=store_extra_keys,
+                                    extra_key_token_start=store_extra_key_token_start,
+                                    extra_key_ranges=store_extra_key_ranges,
                                 )
                             logger.debug(
                                 f"Stored paged cache for request {request_id} "

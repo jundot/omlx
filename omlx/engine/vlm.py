@@ -787,7 +787,7 @@ class VLMBatchedEngine(BaseEngine):
         self,
         messages: list[dict[str, Any]],
         num_images: int,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[tuple[int, int]]]:
         """Format VLM messages with image tokens on image-bearing user turns."""
         from mlx_vlm.prompt_utils import extract_text_from_content, get_message_json
 
@@ -805,8 +805,9 @@ class VLMBatchedEngine(BaseEngine):
         remaining_images = num_images
         assigned_fallback_images = False
         formatted_messages: list[dict[str, Any]] = []
+        image_message_ranges: list[tuple[int, int]] = []
 
-        for msg in messages:
+        for idx, msg in enumerate(messages):
             if not isinstance(msg, dict):
                 msg = {"role": "user", "content": str(msg)}
 
@@ -829,6 +830,9 @@ class VLMBatchedEngine(BaseEngine):
                     remaining_images = 0
                     assigned_fallback_images = True
 
+            if msg_num_images > 0:
+                image_message_ranges.append((idx, msg_num_images))
+
             formatted_messages.append(
                 get_message_json(
                     model_type,
@@ -841,7 +845,7 @@ class VLMBatchedEngine(BaseEngine):
                 )
             )
 
-        return formatted_messages
+        return formatted_messages, image_message_ranges
 
     def _compute_vision_features(
         self, pixel_values: Any, extra_model_inputs: dict
@@ -912,7 +916,14 @@ class VLMBatchedEngine(BaseEngine):
         images: list[Any],
         chat_template_kwargs: dict[str, Any] | None = None,
         tools: list[dict] | None = None,
-    ) -> Tuple[List[int], Optional[mx.array], Optional[Dict[str, Any]], Optional[str]]:
+    ) -> Tuple[
+        List[int],
+        Optional[mx.array],
+        Optional[Dict[str, Any]],
+        Optional[str],
+        int,
+        List[Tuple[int, str]],
+    ]:
         """
         Run the full VLM preprocessing pipeline:
         1. Apply chat template with image placeholders
@@ -925,11 +936,21 @@ class VLMBatchedEngine(BaseEngine):
             images: List of PIL Image objects
 
         Returns:
-            Tuple of (token_ids, inputs_embeds, extra_kwargs, image_hash):
+            Tuple of (
+                token_ids,
+                inputs_embeds,
+                extra_kwargs,
+                image_hash,
+                image_cache_key_start,
+                image_cache_key_ranges,
+            ):
             - token_ids: List of token IDs for BatchGenerator
             - inputs_embeds: Merged vision+text embeddings (or None if text-only)
             - extra_kwargs: Model-specific kwargs for language model
             - image_hash: SHA256 hash of images for prefix cache
+            - image_cache_key_start: Token index where image-aware cache keying begins
+            - image_cache_key_ranges: Per-image-turn cache key boundaries with
+              cumulative image hashes
         """
         from mlx_vlm.prompt_utils import apply_chat_template
         from mlx_vlm.utils import prepare_inputs
@@ -948,7 +969,7 @@ class VLMBatchedEngine(BaseEngine):
         # Build per-message placeholders in oMLX so image-bearing turns always
         # receive image tokens, regardless of conversation history shape.
         try:
-            formatted_messages = self._format_messages_for_vlm_template(
+            formatted_messages, image_message_ranges = self._format_messages_for_vlm_template(
                 messages, num_images=num_images
             )
         except Exception as e:
@@ -964,6 +985,15 @@ class VLMBatchedEngine(BaseEngine):
                 num_images=num_images,
                 return_messages=True,
             )
+            image_message_ranges = []
+            for idx, msg in enumerate(messages):
+                if not isinstance(msg, dict):
+                    continue
+                image_count = self._count_content_parts(
+                    msg.get("content"), {"image", "image_url", "input_image"}
+                )
+                if image_count > 0:
+                    image_message_ranges.append((idx, image_count))
 
         # Strip partial field from messages (VLM always uses add_generation_prompt=True)
         detect_and_strip_partial(formatted_messages)
@@ -1028,6 +1058,56 @@ class VLMBatchedEngine(BaseEngine):
         input_ids = inputs["input_ids"]
         pixel_values = inputs.get("pixel_values")
         attention_mask = inputs.get("attention_mask")
+
+        image_cache_key_start = 0
+        image_cache_key_ranges: list[Tuple[int, str]] = []
+        if image_message_ranges:
+            prefix_template_kwargs = {
+                "tokenize": False,
+                "add_generation_prompt": False,
+            }
+            if self._enable_thinking is not None:
+                prefix_template_kwargs["enable_thinking"] = self._enable_thinking
+            if tools:
+                prefix_template_kwargs["tools"] = tools
+            if chat_template_kwargs:
+                prefix_template_kwargs.update(chat_template_kwargs)
+
+            images_consumed = 0
+            for msg_idx, msg_num_images in image_message_ranges:
+                prefix_messages = formatted_messages[:msg_idx]
+                boundary_tokens = 0
+                if prefix_messages:
+                    try:
+                        prefix_prompt = template_target.apply_chat_template(
+                            prefix_messages, **prefix_template_kwargs
+                        )
+                    except TypeError:
+                        local_kwargs = dict(prefix_template_kwargs)
+                        if chat_template_kwargs:
+                            for key in chat_template_kwargs:
+                                local_kwargs.pop(key, None)
+                        local_kwargs.pop("enable_thinking", None)
+                        prefix_prompt = template_target.apply_chat_template(
+                            prefix_messages, **local_kwargs
+                        )
+                    prefix_inputs = prepare_inputs(
+                        self._processor,
+                        images=images[:images_consumed] if images_consumed > 0 else None,
+                        prompts=[prefix_prompt] if isinstance(prefix_prompt, str) else prefix_prompt,
+                    )
+                    prefix_ids = prefix_inputs["input_ids"]
+                    boundary_tokens = (
+                        len(prefix_ids[0].tolist())
+                        if prefix_ids.ndim > 1
+                        else len(prefix_ids.tolist())
+                    )
+
+                images_consumed += msg_num_images
+                cumulative_hash = compute_image_hash(images[:images_consumed])
+                image_cache_key_ranges.append((boundary_tokens, cumulative_hash))
+
+            image_cache_key_start = image_cache_key_ranges[0][0]
 
         # Extract additional model-specific inputs (filter None values
         # since prepare_inputs may include them after mlx-vlm 348466f)
@@ -1121,11 +1201,18 @@ class VLMBatchedEngine(BaseEngine):
             # Extract token IDs as list
             token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
 
-            return token_ids, embed_features.inputs_embeds, extra_kwargs, image_hash
+            return (
+                token_ids,
+                embed_features.inputs_embeds,
+                extra_kwargs,
+                image_hash,
+                image_cache_key_start,
+                image_cache_key_ranges,
+            )
         else:
             # Text-only (no images in this message)
             token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
-            return token_ids, None, None, None
+            return token_ids, None, None, None, 0, []
 
     def _apply_chat_template(
         self,
@@ -1175,6 +1262,8 @@ class VLMBatchedEngine(BaseEngine):
         vlm_inputs_embeds: Any = None,
         vlm_extra_kwargs: dict[str, Any] | None = None,
         vlm_image_hash: str | None = None,
+        vlm_cache_key_start: int = 0,
+        vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = None,
         **kwargs,
     ) -> GenerationOutput:
         """Generate a complete response (non-streaming)."""
@@ -1214,6 +1303,8 @@ class VLMBatchedEngine(BaseEngine):
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
+            vlm_cache_key_start=vlm_cache_key_start,
+            vlm_cache_key_ranges=vlm_cache_key_ranges,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -1241,6 +1332,8 @@ class VLMBatchedEngine(BaseEngine):
         vlm_inputs_embeds: Any = None,
         vlm_extra_kwargs: dict[str, Any] | None = None,
         vlm_image_hash: str | None = None,
+        vlm_cache_key_start: int = 0,
+        vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """Stream generation token by token."""
@@ -1291,6 +1384,8 @@ class VLMBatchedEngine(BaseEngine):
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
+            vlm_cache_key_start=vlm_cache_key_start,
+            vlm_cache_key_ranges=vlm_cache_key_ranges,
             **specprefill_kwargs,
         )
 
@@ -1337,7 +1432,7 @@ class VLMBatchedEngine(BaseEngine):
             await self.start()
 
         loop = asyncio.get_running_loop()
-        prompt, vlm_embeds, vlm_kwargs, image_hash = await loop.run_in_executor(
+        prompt, vlm_embeds, vlm_kwargs, image_hash, image_cache_key_start, image_cache_key_ranges = await loop.run_in_executor(
             self._engine._mlx_executor,
             self._process_chat_messages, messages, tools, kwargs,
         )
@@ -1354,6 +1449,8 @@ class VLMBatchedEngine(BaseEngine):
             vlm_inputs_embeds=vlm_embeds,
             vlm_extra_kwargs=vlm_kwargs,
             vlm_image_hash=image_hash,
+            vlm_cache_key_start=image_cache_key_start,
+            vlm_cache_key_ranges=image_cache_key_ranges,
             **kwargs,
         )
 
@@ -1379,7 +1476,7 @@ class VLMBatchedEngine(BaseEngine):
         # uvicorn from managing HTTP keep-alive connections, causing
         # TransferEncodingError on the next request (issue #80).
         loop = asyncio.get_running_loop()
-        prompt, vlm_embeds, vlm_kwargs, image_hash = await loop.run_in_executor(
+        prompt, vlm_embeds, vlm_kwargs, image_hash, image_cache_key_start, image_cache_key_ranges = await loop.run_in_executor(
             self._engine._mlx_executor,
             self._process_chat_messages, messages, tools, kwargs,
         )
@@ -1414,6 +1511,8 @@ class VLMBatchedEngine(BaseEngine):
             vlm_inputs_embeds=vlm_embeds,
             vlm_extra_kwargs=vlm_kwargs,
             vlm_image_hash=image_hash,
+            vlm_cache_key_start=image_cache_key_start,
+            vlm_cache_key_ranges=image_cache_key_ranges,
             **kwargs,
         ):
             yield output
@@ -1478,7 +1577,7 @@ class VLMBatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None,
         kwargs: dict,
-    ) -> Tuple[str | list[int], Any, dict | None, str | None]:
+    ) -> Tuple[str | list[int], Any, dict | None, str | None, int, List[Tuple[int, str]]]:
         """
         Process chat messages, extracting images and preparing VLM inputs.
 
@@ -1490,19 +1589,19 @@ class VLMBatchedEngine(BaseEngine):
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
 
+        # Keep VLM-capable models on one prompt-rendering path, even before the
+        # first image arrives. Otherwise the conversation switches prompt families
+        # on the first image-bearing turn and invalidates early prefix blocks.
+        vlm_messages = self._apply_ocr_prompt(messages) if images else text_messages
+        template_tools = convert_tools_for_template(tools) if tools else None
+        token_ids, vlm_embeds, vlm_kwargs, image_hash, image_cache_key_start, image_cache_key_ranges = self._prepare_vision_inputs(
+            vlm_messages,
+            images,
+            chat_template_kwargs=ct_kwargs,
+            tools=template_tools,
+        )
+
         if images:
-            # Apply OCR-specific prompt if applicable
-            ocr_messages = self._apply_ocr_prompt(messages)
-
-            # Convert tools for template format (same as text-only path)
-            template_tools = convert_tools_for_template(tools) if tools else None
-
-            # VLM path: prepare vision inputs
-            token_ids, vlm_embeds, vlm_kwargs, image_hash = self._prepare_vision_inputs(
-                ocr_messages, images,
-                chat_template_kwargs=ct_kwargs,
-                tools=template_tools,
-            )
             # Free Metal intermediates from vision encoding.
             # Vision tower + projector produce large intermediate buffers
             # that stay in the Metal cache pool until explicitly cleared.
@@ -1510,14 +1609,15 @@ class VLMBatchedEngine(BaseEngine):
             # eventually trigger ProcessMemoryEnforcer aborts (see #667).
             mx.synchronize()
             mx.clear_cache()
-            return token_ids, vlm_embeds, vlm_kwargs, image_hash
-        else:
-            # Text-only path: standard chat template
-            template_tools = convert_tools_for_template(tools) if tools else None
-            prompt = self._apply_chat_template(
-                text_messages, template_tools, chat_template_kwargs=ct_kwargs
-            )
-            return prompt, None, None, None
+
+        return (
+            token_ids,
+            vlm_embeds,
+            vlm_kwargs,
+            image_hash,
+            image_cache_key_start,
+            image_cache_key_ranges,
+        )
 
     def count_chat_tokens(
         self,
