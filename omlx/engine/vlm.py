@@ -1321,7 +1321,8 @@ class VLMBatchedEngine(BaseEngine):
         # SpecPrefill: compute system prompt token count for protection.
         # Can't template system-only messages (most templates require user),
         # so compute by subtracting non-system from full prompt tokens.
-        if kwargs.get("specprefill") is not False:
+        specprefill_model_enabled = getattr(self._model_settings, "specprefill_enabled", False) if self._model_settings else False
+        if specprefill_model_enabled and kwargs.get("specprefill") is not False:
             non_system = [m for m in messages if m.get("role") not in ("system", "developer")]
             if len(non_system) < len(messages) and non_system:
                 try:
