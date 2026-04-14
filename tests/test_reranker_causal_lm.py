@@ -263,6 +263,69 @@ class TestJinaReranker:
             model._load_jina_projector(tmp_path)
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_get_jina_hidden_states_accepts_3d_tensor(self):
+        """_get_jina_hidden_states should return 3D backbone outputs unchanged."""
+        model = MLXRerankerModel("unused")
+        expected = mx.array(np.zeros((1, 4, 8), dtype=np.float32))
+
+        model.model = MagicMock()
+        model.model.model = MagicMock(return_value=expected)
+
+        input_ids = mx.array([[1, 2, 3, 4]])
+        actual = model._get_jina_hidden_states(input_ids)
+
+        assert actual.shape == (1, 4, 8)
+        assert np.allclose(np.array(actual.tolist()), np.array(expected.tolist()))
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_get_jina_hidden_states_expands_2d_tensor(self):
+        """_get_jina_hidden_states should expand 2D backbone outputs to batch form."""
+        model = MLXRerankerModel("unused")
+        returned = mx.array(np.zeros((4, 8), dtype=np.float32))
+
+        model.model = MagicMock()
+        model.model.model = MagicMock(return_value=returned)
+
+        input_ids = mx.array([[1, 2, 3, 4]])
+        actual = model._get_jina_hidden_states(input_ids)
+
+        assert actual.shape == (1, 4, 8)
+
+    def test_get_jina_hidden_states_missing_backbone_raises_clear_error(self):
+        """_get_jina_hidden_states should fail clearly when model.model is missing."""
+        model = MLXRerankerModel("unused")
+        model.model = object()
+
+        with pytest.raises(ValueError, match="Could not find Jina model backbone"):
+            model._get_jina_hidden_states("input_ids")
+
+    def test_get_jina_hidden_states_rejects_unsupported_output(self):
+        """_get_jina_hidden_states should reject non-tensor backbone outputs."""
+        model = MLXRerankerModel("unused")
+
+        class _UnsupportedOutput:
+            pass
+
+        model.model = MagicMock()
+        model.model.model = MagicMock(return_value=_UnsupportedOutput())
+
+        with pytest.raises(
+            ValueError, match="did not return hidden states as a tensor"
+        ):
+            model._get_jina_hidden_states("input_ids")
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_get_jina_hidden_states_rejects_invalid_tensor_rank(self):
+        """_get_jina_hidden_states should reject tensor outputs with unsupported rank."""
+        model = MLXRerankerModel("unused")
+        invalid = mx.array(np.zeros((1, 2, 3, 4), dtype=np.float32))
+        model.model = MagicMock()
+        model.model.model = MagicMock(return_value=invalid)
+        input_ids = mx.array([[1, 2, 3, 4]])
+        with pytest.raises(ValueError, match="Jina hidden states must be rank 2 or 3"):
+            model._get_jina_hidden_states(input_ids)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_load_jina_projector_two_layer_mlp(self, tmp_path):
         """Projector should apply linear1 -> ReLU -> linear2 exactly."""
         model_dir = self._make_jina_model_dir(tmp_path)

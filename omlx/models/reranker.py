@@ -435,117 +435,31 @@ class MLXRerankerModel:
         )
 
     def _get_jina_hidden_states(self, input_ids):
-        """Extract final hidden states from mlx-lm wrappers/backbones."""
+        """Extract final hidden states from the Jina mlx-lm backbone."""
 
-        def _extract_hidden_states(outputs):
-            if outputs is None:
-                return None
-
-            hidden_states = getattr(outputs, "hidden_states", None)
-            if hidden_states is not None:
-                if isinstance(hidden_states, (list, tuple)):
-                    return hidden_states[-1]
-                return hidden_states
-
-            last_hidden_state = getattr(outputs, "last_hidden_state", None)
-            if last_hidden_state is not None:
-                return last_hidden_state
-
-            if isinstance(outputs, tuple):
-                for item in reversed(outputs):
-                    if isinstance(item, (list, tuple)) and item:
-                        candidate = item[-1]
-                        candidate_shape = getattr(candidate, "shape", None)
-                        if candidate_shape is not None and len(candidate_shape) >= 2:
-                            return candidate
-                    item_shape = getattr(item, "shape", None)
-                    if item_shape is not None and len(item_shape) == 3:
-                        return item
-
-            return None
-
-        def _try_call(target, use_hidden_states_flag: bool):
-            if target is None or not callable(target):
-                return None
-            try:
-                if use_hidden_states_flag:
-                    return target(input_ids, output_hidden_states=True)
-                return target(input_ids)
-            except TypeError:
-                return None
-            except Exception:
-                return None
-
-        errors = []
-
-        # Prefer backbone path first (upstream-equivalent call shape).
         backbone = getattr(self.model, "model", None)
-        if callable(backbone):
-            for call_name, args in (
-                ("model.model([input_ids])", ([input_ids],)),
-                ("model.model(input_ids)", (input_ids,)),
-            ):
-                try:
-                    outputs = backbone(*args)
-                except Exception as exc:
-                    errors.append(f"{call_name}: {exc}")
-                    continue
+        if backbone is None or not callable(backbone):
+            model_type = type(self.model).__name__ if self.model is not None else "None"
+            raise ValueError(
+                "Could not find Jina model backbone (model.model). "
+                f"The mlx-lm model wrapper may have changed: {model_type}."
+            )
 
-                hidden_states = _extract_hidden_states(outputs)
-                if (
-                    hidden_states is None
-                    and hasattr(outputs, "shape")
-                    and len(outputs.shape) == 3
-                ):
-                    hidden_states = outputs
-                if hidden_states is not None:
-                    if len(hidden_states.shape) == 2:
-                        return mx.expand_dims(hidden_states, axis=0)
-                    return hidden_states
-                errors.append(f"{call_name}: outputs did not include hidden states")
+        hidden_states = backbone(input_ids)
 
-        candidate_targets = [self.model]
-        for attr in (
-            "backbone",
-            "transformer",
-            "language_model",
-            "base_model",
-        ):
-            candidate = getattr(self.model, attr, None)
-            if candidate is not None and candidate not in candidate_targets:
-                candidate_targets.append(candidate)
+        if not hasattr(hidden_states, "shape"):
+            raise ValueError("Jina backbone did not return hidden states as a tensor.")
 
-        for target in candidate_targets:
-            outputs = _try_call(target, use_hidden_states_flag=True)
-            hidden_states = _extract_hidden_states(outputs)
-            if hidden_states is not None:
-                if len(hidden_states.shape) == 2:
-                    return mx.expand_dims(hidden_states, axis=0)
-                return hidden_states
-            if outputs is None:
-                errors.append(f"{target!r}: call failed with output_hidden_states=True")
+        if len(hidden_states.shape) == 2:
+            return mx.expand_dims(hidden_states, axis=0)
 
-        for target in candidate_targets[1:]:
-            outputs = _try_call(target, use_hidden_states_flag=False)
-            hidden_states = _extract_hidden_states(outputs)
-            if (
-                hidden_states is None
-                and hasattr(outputs, "shape")
-                and len(outputs.shape) == 3
-            ):
-                hidden_states = outputs
-            if hidden_states is not None:
-                if len(hidden_states.shape) == 2:
-                    return mx.expand_dims(hidden_states, axis=0)
-                return hidden_states
-            if outputs is None:
-                errors.append(f"{target!r}: call failed without output_hidden_states")
+        if len(hidden_states.shape) != 3:
+            raise ValueError(
+                "Jina hidden states must be rank 2 or 3. "
+                f"Got shape: {hidden_states.shape}"
+            )
 
-        raise ValueError(
-            "Could not extract Jina hidden states from mlx-lm model wrapper/backbone. "
-            "Expected hidden_states or last_hidden_state from model outputs. "
-            f"Attempted paths: {'; '.join(errors)}"
-        )
+        return hidden_states
 
     def _cosine_similarity(self, query_vec, doc_vecs, eps: float = 1e-8):
         """Compute cosine similarity between one query vector and many docs."""
