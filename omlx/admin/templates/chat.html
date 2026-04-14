@@ -2200,7 +2200,6 @@
                 for (let i = 0; i < text.length; i++) {
                     const ch = text[i];
                     const prev = i > 0 ? text[i - 1] : '';
-                    const next = i + 1 < text.length ? text[i + 1] : '';
                     const nextTwo = text.slice(i, i + 2);
                     const nextThree = text.slice(i, i + 3);
                     const escaped = prev === '\\';
