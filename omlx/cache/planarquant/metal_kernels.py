@@ -610,3 +610,224 @@ def quantize_fused(
     packed = packed_out.reshape((*batch_shape, packed_last))
     norms = norms_out.reshape((*batch_shape, 1))
     return packed, norms
+
+
+# ---------------------------------------------------------------------------
+# 5. Flash-attention-style fused SDPA (reads packed K/V, online softmax)
+# ---------------------------------------------------------------------------
+
+_FLASH_KERNEL = None
+
+_FLASH_SOURCE = """
+    // One threadgroup per (batch, query_head). Grid: (1, 1, BH_q).
+    // Threadgroup: (n_pairs, 1, 1). Each thread handles rotation pair `pair`
+    // → 2 elements of the D-dim per K/V row.
+    //
+    // Online-softmax flash attention for L_q=1 (decode):
+    //   Running max M, running softmax sum S, running output accumulator O.
+    //   For each K row k:
+    //     1. Dequant K[k] for this pair.
+    //     2. Compute partial dot q·k for this pair; sum across threads → full score.
+    //     3. Update (M, S, correction = exp(old_M - new_M)).
+    //     4. Scale O by correction, dequant V[k], accumulate O += exp_score * V_dq.
+    //   Finally: out = O / S.
+
+    threadgroup float q_shared[256];
+    threadgroup float o_shared[256];
+    threadgroup float partials[128];     // score partials across pairs (max n_pairs)
+    threadgroup float state[4];          // [M, S, exp_score, correction]
+
+    uint pair = thread_position_in_threadgroup.x;
+    uint bh_q = thread_position_in_grid.z;
+    uint b = bh_q / n_q_heads;
+    uint q_head = bh_q % n_q_heads;
+    uint kv_head = q_head / gqa_ratio;
+    uint bh_kv = b * n_kv_heads + kv_head;
+
+    uint j0 = pair * 2;
+    uint j1 = j0 + 1;
+
+    // Load Q into shared memory (pre-scaled by scale[0])
+    float s_scale = float(scale_buf[0]);
+    q_shared[j0] = float(Q[bh_q * D + j0]) * s_scale;
+    q_shared[j1] = float(Q[bh_q * D + j1]) * s_scale;
+    o_shared[j0] = 0.0f;
+    o_shared[j1] = 0.0f;
+    if (pair == 0) {
+        state[0] = -1e30f;  // M
+        state[1] = 0.0f;    // S
+    }
+    float c = cos_tab[pair];
+    float s = sin_tab[pair];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint k = 0; k < T_dim; k++) {
+        // -------- Dequant K[k] for this pair --------
+        uint k_base = (bh_kv * T_dim + k) * packed_last;
+        uint byte0 = j0 >> 2;
+        uint shift0 = (j0 & 3u) * 2u;
+        uint low0 = (uint(K_packed[k_base + byte0]) >> shift0) & 3u;
+        uint sb0 = j0 >> 3;
+        uint ss0 = j0 & 7u;
+        uint hi0 = (uint(K_packed[k_base + qs_size + sb0]) >> ss0) & 1u;
+        uint k_idx0 = low0 | (hi0 << 2u);
+
+        uint byte1 = j1 >> 2;
+        uint shift1 = (j1 & 3u) * 2u;
+        uint low1 = (uint(K_packed[k_base + byte1]) >> shift1) & 3u;
+        uint sb1 = j1 >> 3;
+        uint ss1 = j1 & 7u;
+        uint hi1 = (uint(K_packed[k_base + qs_size + sb1]) >> ss1) & 1u;
+        uint k_idx1 = low1 | (hi1 << 2u);
+
+        float k_norm = K_norms[bh_kv * T_dim + k];
+        float k0 = (c * centroids[k_idx0] + s * centroids[k_idx1]) * k_norm;
+        float k1 = (-s * centroids[k_idx0] + c * centroids[k_idx1]) * k_norm;
+
+        // Partial dot Q·K for this pair
+        partials[pair] = q_shared[j0] * k0 + q_shared[j1] * k1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Thread 0: sum partials, update online softmax state
+        if (pair == 0) {
+            float full_score = 0.0f;
+            for (uint p = 0; p < n_pairs; p++) full_score += partials[p];
+
+            float new_M = max(state[0], full_score);
+            float correction = exp(state[0] - new_M);
+            float exp_score = exp(full_score - new_M);
+
+            state[1] = state[1] * correction + exp_score;
+            state[0] = new_M;
+            state[2] = exp_score;
+            state[3] = correction;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float exp_score = state[2];
+        float correction = state[3];
+
+        // Apply correction to O (scale prior accumulations by exp(old_M - new_M))
+        o_shared[j0] *= correction;
+        o_shared[j1] *= correction;
+
+        // -------- Dequant V[k] for this pair --------
+        uint v_base = (bh_kv * T_dim + k) * packed_last;
+        uint v_low0 = (uint(V_packed[v_base + byte0]) >> shift0) & 3u;
+        uint v_hi0 = (uint(V_packed[v_base + qs_size + sb0]) >> ss0) & 1u;
+        uint v_idx0 = v_low0 | (v_hi0 << 2u);
+        uint v_low1 = (uint(V_packed[v_base + byte1]) >> shift1) & 3u;
+        uint v_hi1 = (uint(V_packed[v_base + qs_size + sb1]) >> ss1) & 1u;
+        uint v_idx1 = v_low1 | (v_hi1 << 2u);
+
+        float v_norm = V_norms[bh_kv * T_dim + k];
+        float v0 = (c * centroids[v_idx0] + s * centroids[v_idx1]) * v_norm;
+        float v1 = (-s * centroids[v_idx0] + c * centroids[v_idx1]) * v_norm;
+
+        // Accumulate O += exp_score * V_dq
+        o_shared[j0] += exp_score * v0;
+        o_shared[j1] += exp_score * v1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Normalize and write output
+    float inv_S = 1.0f / state[1];
+    out[bh_q * D + j0] = (T)(o_shared[j0] * inv_S);
+    out[bh_q * D + j1] = (T)(o_shared[j1] * inv_S);
+"""
+
+
+def _build_flash_kernel():
+    global _FLASH_KERNEL
+    if _FLASH_KERNEL is None:
+        _FLASH_KERNEL = mx.fast.metal_kernel(
+            name="planarquant3_flash_sdpa_decode",
+            input_names=[
+                "Q", "K_packed", "K_norms", "V_packed", "V_norms",
+                "cos_tab", "sin_tab", "centroids", "scale_buf",
+            ],
+            output_names=["out"],
+            source=_FLASH_SOURCE,
+        )
+    return _FLASH_KERNEL
+
+
+def fused_flash_sdpa(
+    queries: mx.array,
+    k_packed: mx.array,
+    k_norms: mx.array,
+    v_packed: mx.array,
+    v_norms: mx.array,
+    scale: float,
+) -> mx.array:
+    """Flash-attention-style fused decode SDPA over packed K/V.
+
+    Reads packed K/V directly from global memory (5x less bandwidth vs FP16),
+    dequantizes inline in registers, uses online softmax — never materializes
+    the T×D score matrix or the dequantized K/V.
+
+    Only supports decode (L_q=1) with no mask. For prefill or masked paths,
+    fall back to dequant + MPS SDPA.
+
+    Args:
+        queries:   ``(B, H_q, 1, D)`` float16/32
+        k_packed:  ``(B, H_kv, T, packed_last)`` uint8
+        k_norms:   ``(B, H_kv, T, 1)`` or ``(B, H_kv, T)`` float
+        v_packed:  ``(B, H_kv, T, packed_last)`` uint8
+        v_norms:   ``(B, H_kv, T, 1)`` or ``(B, H_kv, T)`` float
+        scale:     attention scale
+    """
+    if queries.shape[-2] != 1:
+        raise ValueError("fused_flash_sdpa only supports L_q=1 (decode path)")
+
+    b, h_q, _, d = queries.shape
+    packed_last = k_packed.shape[-1]
+    _, h_kv, t, _ = k_packed.shape
+    n_pairs = d // 2
+    qs_size = d // 4
+    if h_q % h_kv != 0:
+        raise ValueError(f"n_q_heads ({h_q}) must be divisible by n_kv_heads ({h_kv})")
+    gqa_ratio = h_q // h_kv
+    bh_q = b * h_q
+
+    # Strip trailing dim from norms if present (B, H, T, 1) → (B, H, T)
+    if k_norms.ndim == 4 and k_norms.shape[-1] == 1:
+        k_norms = k_norms[..., 0]
+    if v_norms.ndim == 4 and v_norms.shape[-1] == 1:
+        v_norms = v_norms[..., 0]
+
+    q_flat = queries.reshape((bh_q, d)).astype(mx.float16)
+    k_pack_flat = k_packed.reshape((b * h_kv, t, packed_last)).astype(mx.uint8)
+    k_norm_flat = k_norms.reshape((b * h_kv, t)).astype(mx.float32)
+    v_pack_flat = v_packed.reshape((b * h_kv, t, packed_last)).astype(mx.uint8)
+    v_norm_flat = v_norms.reshape((b * h_kv, t)).astype(mx.float32)
+
+    cos_tab, sin_tab = cos_sin_mx(n_pairs)
+    centroids = centroids_mx()
+
+    out_dtype = queries.dtype if queries.dtype in (mx.float16, mx.float32) else mx.float16
+    scale_buf = mx.array([float(scale)], dtype=mx.float32)
+    kernel = _build_flash_kernel()
+    out_flat = kernel(
+        inputs=[
+            q_flat, k_pack_flat, k_norm_flat, v_pack_flat, v_norm_flat,
+            cos_tab, sin_tab, centroids, scale_buf,
+        ],
+        template=[
+            ("T", out_dtype),
+            ("D", d),
+            ("n_pairs", n_pairs),
+            ("n_q_heads", h_q),
+            ("n_kv_heads", h_kv),
+            ("gqa_ratio", gqa_ratio),
+            ("T_dim", t),
+            ("qs_size", qs_size),
+            ("packed_last", packed_last),
+        ],
+        grid=(n_pairs, 1, bh_q),
+        threadgroup=(n_pairs, 1, 1),
+        output_shapes=[(bh_q, d)],
+        output_dtypes=[out_dtype],
+    )[0]
+
+    return out_flat.reshape((b, h_q, 1, d)).astype(queries.dtype)

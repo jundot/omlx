@@ -10,7 +10,6 @@ from omlx.cache.planarquant.constants import PLANAR_D
 from omlx.cache.planarquant.kv_cache import (
     FP16State,
     PlanarQuantKVCache,
-    PlanarQuantState,
 )
 
 
@@ -57,8 +56,10 @@ def test_finalize_prefill_converts_to_packed(seeded_inputs):
     assert cache._k_packed is not None  # Now packed
 
 
-def test_decode_after_finalize_returns_packed_state(seeded_inputs):
-    """After finalize_prefill + decode, state should be PlanarQuantState."""
+def test_decode_after_finalize_returns_fp16_via_dequant_cache(seeded_inputs):
+    """After finalize_prefill + decode, update_and_fetch returns FP16 states
+    backed by the dequant cache. Per-token quantization is deferred; the
+    packed buffers are populated lazily on state-save via _flush_unpacked."""
     cache = PlanarQuantKVCache()
     cache.update_and_fetch(seeded_inputs, seeded_inputs)
     cache.finalize_prefill()
@@ -66,9 +67,16 @@ def test_decode_after_finalize_returns_packed_state(seeded_inputs):
     # Decode token
     t = mx.random.normal((1, 8, 1, PLANAR_D)) * 0.1
     ks, vs = cache.update_and_fetch(t, t)
-    assert isinstance(ks, PlanarQuantState)
-    assert isinstance(vs, PlanarQuantState)
+    assert isinstance(ks, FP16State)
+    assert isinstance(vs, FP16State)
     assert cache.offset == 5  # 4 prefill + 1 decode
+    # Decode row is unpacked until state serialization flushes it
+    assert cache._k_unpacked_start == 4
+    assert cache._k_unpacked_end == 5
+    # Accessing state triggers lazy pack of the unpacked decode rows
+    _ = cache.state
+    assert cache._k_unpacked_start is None
+    assert cache._k_unpacked_end is None
 
 
 def test_multi_step_growth(seeded_inputs):
@@ -164,7 +172,10 @@ def test_nbytes_nonzero_after_write(seeded_inputs):
 
 
 def test_asymmetric_v_fp16(seeded_inputs):
-    """quantize_v=False should keep V as FP16 while K is PlanarQuant3."""
+    """quantize_v=False keeps V as FP16 while K is PlanarQuant3 on disk.
+    During decode, update_and_fetch returns FP16States (K via dequant cache,
+    V from the FP16 buffer). The persisted K state is still packed — see the
+    roundtrip test for serialization semantics."""
     cache = PlanarQuantKVCache(quantize_v=False)
     ks, vs = cache.update_and_fetch(seeded_inputs, seeded_inputs)
     assert isinstance(ks, FP16State)
@@ -172,11 +183,14 @@ def test_asymmetric_v_fp16(seeded_inputs):
 
     cache.finalize_prefill()
 
-    # Decode with mixed state
+    # Decode: fast path returns FP16 states pointing at the dequant K cache
+    # and the FP16 V buffer, so Apple's MPS SDPA can be called directly.
     t = mx.random.normal((1, 8, 1, PLANAR_D)) * 0.1
     ks, vs = cache.update_and_fetch(t, t)
-    assert isinstance(ks, PlanarQuantState)
+    assert isinstance(ks, FP16State)
     assert isinstance(vs, FP16State)
+    # Packed K is still maintained on disk (lazy-flushed on state save)
+    assert cache._k_packed is not None
 
     # Decode attention should work with mixed state
     q = (mx.random.normal((1, 8, 1, PLANAR_D)) * 0.1).astype(mx.float16)
