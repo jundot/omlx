@@ -17,12 +17,14 @@ from omlx.api.tool_calling import (
     _parse_gemma4_tool_call_fallback,
     build_json_system_prompt,
     convert_tools_for_template,
+    enrich_tool_params_for_gemma4,
     extract_json_from_text,
     extract_tool_calls_with_thinking,
     format_tool_call_for_message,
     parse_json_output,
     parse_tool_calls,
     parse_tool_calls_with_thinking_fallback,
+    restore_gemma4_param_names,
     validate_json_schema,
 )
 from omlx.api.openai_models import (
@@ -1540,3 +1542,136 @@ class TestParseToolCallsGemma4Integration:
         assert tool_calls is not None
         assert len(tool_calls) == 1
         assert tool_calls[0].function.name == "search"
+
+
+class TestEnrichToolParamsForGemma4:
+    """Tests for enrich_tool_params_for_gemma4()."""
+
+    def test_renames_description_param(self):
+        """Parameter named 'description' gets renamed to 'param_description'."""
+        tools = [{"function": {"name": "delegate", "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "prompt": {"type": "string"},
+            },
+            "required": ["description", "prompt"],
+        }}}]
+        result = enrich_tool_params_for_gemma4(tools)
+        props = result[0]["function"]["parameters"]["properties"]
+        assert "param_description" in props
+        assert "description" not in props
+        required = result[0]["function"]["parameters"]["required"]
+        assert "param_description" in required
+        assert "description" not in required
+
+    def test_does_not_rename_non_colliding_params(self):
+        """Parameters like 'name' and 'type' are NOT renamed (not in colliding set)."""
+        tools = [{"function": {"name": "create", "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "type": {"type": "string"},
+                "count": {"type": "integer"},
+            },
+            "required": ["name", "type", "count"],
+        }}}]
+        result = enrich_tool_params_for_gemma4(tools)
+        props = result[0]["function"]["parameters"]["properties"]
+        assert "name" in props
+        assert "type" in props
+        assert "count" in props
+
+    def test_adds_description_to_required_params(self):
+        """Required params without descriptions get auto-generated ones."""
+        tools = [{"function": {"name": "search", "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+            },
+            "required": ["query"],
+        }}}]
+        result = enrich_tool_params_for_gemma4(tools)
+        prop = result[0]["function"]["parameters"]["properties"]["query"]
+        assert "description" in prop
+        assert "REQUIRED" in prop["description"]
+        assert "'query'" in prop["description"]
+
+    def test_preserves_existing_descriptions(self):
+        """Params that already have descriptions are left unchanged."""
+        tools = [{"function": {"name": "search", "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query text"},
+            },
+            "required": ["query"],
+        }}}]
+        result = enrich_tool_params_for_gemma4(tools)
+        prop = result[0]["function"]["parameters"]["properties"]["query"]
+        assert prop["description"] == "Search query text"
+
+    def test_does_not_mutate_input(self):
+        """Original tool definitions are not modified."""
+        tools = [{"function": {"name": "delegate", "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+            },
+            "required": ["description"],
+        }}}]
+        original_props = list(tools[0]["function"]["parameters"]["properties"].keys())
+        enrich_tool_params_for_gemma4(tools)
+        assert list(tools[0]["function"]["parameters"]["properties"].keys()) == original_props
+
+    def test_empty_tools_list(self):
+        """Empty tools list returns empty list."""
+        assert enrich_tool_params_for_gemma4([]) == []
+
+    def test_tool_without_parameters(self):
+        """Tools without parameters are passed through unchanged."""
+        tools = [{"function": {"name": "get_time"}}]
+        result = enrich_tool_params_for_gemma4(tools)
+        assert result[0]["function"]["name"] == "get_time"
+
+
+class TestRestoreGemma4ParamNames:
+    """Tests for restore_gemma4_param_names()."""
+
+    def test_restores_renamed_description(self):
+        """param_description is restored to description."""
+        args = {"param_description": "audit the code", "prompt": "check for bugs"}
+        result = restore_gemma4_param_names(args)
+        assert result == {"description": "audit the code", "prompt": "check for bugs"}
+
+    def test_does_not_strip_non_colliding_prefix(self):
+        """param_count should NOT be renamed to count (not a colliding param)."""
+        args = {"param_count": 5, "query": "test"}
+        result = restore_gemma4_param_names(args)
+        assert result == {"param_count": 5, "query": "test"}
+
+    def test_leaves_regular_params_unchanged(self):
+        """Regular params pass through unchanged."""
+        args = {"prompt": "hello", "count": 3}
+        result = restore_gemma4_param_names(args)
+        assert result == {"prompt": "hello", "count": 3}
+
+    def test_empty_dict(self):
+        """Empty dict returns empty dict."""
+        assert restore_gemma4_param_names({}) == {}
+
+    def test_round_trip(self):
+        """Enrich then restore produces original param names."""
+        tools = [{"function": {"name": "delegate", "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "prompt": {"type": "string"},
+            },
+            "required": ["description", "prompt"],
+        }}}]
+        enriched = enrich_tool_params_for_gemma4(tools)
+        # Simulate model output using enriched param names
+        enriched_props = enriched[0]["function"]["parameters"]["properties"]
+        model_args = {k: "test" for k in enriched_props}
+        restored = restore_gemma4_param_names(model_args)
+        assert set(restored.keys()) == {"description", "prompt"}
