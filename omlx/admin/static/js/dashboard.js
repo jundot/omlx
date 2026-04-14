@@ -39,6 +39,7 @@
                 mcp: { config_path: '' },
                 huggingface: { endpoint: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
+                download: { max_simultaneous_downloads: 2, max_workers: 8 },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
                 integrations: { codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
@@ -177,6 +178,8 @@
             // HF Mirror settings modal
             showHfMirrorModal: false,
             hfMirrorEndpoint: '',
+            hfMirrorMaxSimultaneousDownloads: 2,
+            hfMirrorMaxWorkers: 8,
             hfMirrorSaving: false,
 
             // Update check state
@@ -573,6 +576,7 @@
                             mcp: { ...this.globalSettings.mcp, ...data.mcp },
                             huggingface: { ...this.globalSettings.huggingface, ...data.huggingface },
                             network: { ...this.globalSettings.network, ...data.network },
+                            download: { ...this.globalSettings.download, ...data.download },
                             auth: { ...this.globalSettings.auth, ...data.auth },
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
@@ -2559,6 +2563,10 @@
 
             openHfMirrorModal() {
                 this.hfMirrorEndpoint = this.globalSettings.huggingface.endpoint || '';
+                this.hfMirrorMaxSimultaneousDownloads =
+                    this.globalSettings.download.max_simultaneous_downloads || 2;
+                this.hfMirrorMaxWorkers =
+                    this.globalSettings.download.max_workers || 8;
                 this.showHfMirrorModal = true;
             },
 
@@ -2568,10 +2576,18 @@
                     const response = await fetch('/admin/api/global-settings', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ hf_endpoint: this.hfMirrorEndpoint }),
+                        body: JSON.stringify({
+                            hf_endpoint: this.hfMirrorEndpoint,
+                            download_max_simultaneous_downloads: this.hfMirrorMaxSimultaneousDownloads,
+                            download_max_workers: this.hfMirrorMaxWorkers,
+                        }),
                     });
                     if (response.ok) {
                         this.globalSettings.huggingface.endpoint = this.hfMirrorEndpoint;
+                        this.globalSettings.download.max_simultaneous_downloads =
+                            this.hfMirrorMaxSimultaneousDownloads;
+                        this.globalSettings.download.max_workers =
+                            this.hfMirrorMaxWorkers;
                         this.showHfMirrorModal = false;
                     } else if (response.status === 401) {
                         window.location.href = '/admin';

@@ -21,17 +21,14 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
+    from .engine import BaseEngine, BatchedEngine
+    from .engine.embedding import EmbeddingEngine
+    from .engine.reranker import RerankerEngine
+    from .engine.stt import STTEngine
+    from .engine.sts import STSEngine
+    from .engine.tts import TTSEngine
+    from .engine.vlm import VLMBatchedEngine
     from .model_settings import ModelSettingsManager
-
-import mlx.core as mx
-
-from .engine import BaseEngine, BatchedEngine
-from .engine.embedding import EmbeddingEngine
-from .engine.reranker import RerankerEngine
-from .engine.stt import STTEngine
-from .engine.sts import STSEngine
-from .engine.tts import TTSEngine
-from .engine.vlm import VLMBatchedEngine
 from .exceptions import (
     EnginePoolError,
     InsufficientMemoryError,
@@ -40,10 +37,15 @@ from .exceptions import (
     ModelTooLargeError,
 )
 from .model_discovery import DiscoveredModel, discover_models, format_size
-from .engine_core import get_mlx_executor
-from .scheduler import SchedulerConfig
+from .scheduler_config import SchedulerConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _mx():
+    import mlx.core as mx
+
+    return mx
 
 
 @dataclass
@@ -325,7 +327,7 @@ class EnginePool:
             # Already loaded - just update access time
             if entry.engine is not None:
                 # If force_lm requested but current engine is VLM, unload and reload
-                if force_lm and isinstance(entry.engine, VLMBatchedEngine):
+                if force_lm and type(entry.engine).__name__ == "VLMBatchedEngine":
                     logger.info(
                         f"Unloading VLM engine for {model_id} "
                         f"(force_lm=True, reloading as LM)"
@@ -376,6 +378,7 @@ class EnginePool:
             if self._process_memory_enforcer is not None:
                 enforcer = self._process_memory_enforcer
                 if enforcer.max_bytes > 0:
+                    mx = _mx()
                     while True:
                         current_active = mx.get_active_memory()
                         projected = current_active + entry.estimated_size
@@ -481,6 +484,9 @@ class EnginePool:
             return
 
         logger.info(f"Unloading model: {model_id} (immediate abort)")
+        mx = _mx()
+        from .engine_core import get_mlx_executor
+
         pre_unload_active = mx.get_active_memory()
 
         try:
@@ -590,6 +596,16 @@ class EnginePool:
         entry.abort_loading = False
         try:
             effective_type = entry.engine_type
+            from .engine import BatchedEngine
+            from .engine.embedding import EmbeddingEngine
+            from .engine.reranker import RerankerEngine
+            from .engine.stt import STTEngine
+            from .engine.sts import STSEngine
+            from .engine.tts import TTSEngine
+            from .engine.vlm import VLMBatchedEngine
+            from .engine_core import get_mlx_executor
+            mx = _mx()
+
             if force_lm and effective_type == "vlm":
                 effective_type = "batched"
                 logger.info(f"Loading model as LM (force_lm=True): {model_id}")

@@ -51,6 +51,16 @@ def _has_cli_overrides(args) -> bool:
         return True
     if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
         return True
+    if (
+        hasattr(args, "download_max_simultaneous")
+        and args.download_max_simultaneous is not None
+    ):
+        return True
+    if (
+        hasattr(args, "download_max_workers")
+        and args.download_max_workers is not None
+    ):
+        return True
     return False
 
 
@@ -523,6 +533,18 @@ Example directory structure:
         type=str,
         default=None,
         help="Custom ModelScope Hub endpoint URL",
+    )
+    serve_parser.add_argument(
+        "--download-max-simultaneous",
+        type=int,
+        default=None,
+        help="Maximum number of model downloads that can run at once (default: 2)",
+    )
+    serve_parser.add_argument(
+        "--download-max-workers",
+        type=int,
+        default=None,
+        help="Maximum worker threads per model download (default: 8)",
     )
 
     # Network options

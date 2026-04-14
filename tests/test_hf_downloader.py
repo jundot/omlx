@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from omlx.admin.hf_downloader import DownloadStatus, DownloadTask, HFDownloader
+from omlx.settings import DownloadSettings
 
 
 # =============================================================================
@@ -1513,6 +1514,39 @@ class TestHFEndpointPassthrough:
             await downloader.shutdown()
 
     @pytest.mark.asyncio
+    async def test_snapshot_download_receives_max_workers(self, model_dir):
+        """snapshot_download should receive max_workers from download settings."""
+        target_dir = model_dir / "model"
+        target_dir.mkdir()
+        (target_dir / "config.json").write_text("{}")
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.siblings = []
+        mock_api.model_info.return_value = mock_info
+
+        with patch(
+            "omlx.admin.hf_downloader._get_download_settings",
+            return_value=DownloadSettings(
+                max_simultaneous_downloads=2,
+                max_workers=12,
+            ),
+        ), patch(
+            "omlx.admin.hf_downloader.HfApi",
+            return_value=mock_api,
+        ), patch("omlx.admin.hf_downloader.snapshot_download") as mock_download:
+            downloader = HFDownloader(model_dir=str(model_dir))
+            await downloader.start_download("owner/model")
+            await asyncio.sleep(0.5)
+
+            assert mock_download.call_count == 2
+            call_kwargs = mock_download.call_args[1]
+            assert "dry_run" not in call_kwargs
+            assert call_kwargs["max_workers"] == 12
+
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
     async def test_hf_hub_download_receives_endpoint(self):
         """hf_hub_download for README should receive endpoint= when mirror is configured."""
         mock_api = MagicMock()
@@ -1781,7 +1815,7 @@ class TestStallDetection:
 
 
 class TestSequentialDownloadQueue:
-    """Test that only one download runs at a time."""
+    """Test queueing when downloads are limited to one at a time."""
 
     @pytest.fixture
     def model_dir(self, tmp_path):
@@ -1792,7 +1826,14 @@ class TestSequentialDownloadQueue:
     @pytest.mark.asyncio
     async def test_second_download_stays_pending(self, model_dir):
         """When two downloads are started, only the first should be DOWNLOADING."""
-        downloader = HFDownloader(model_dir=str(model_dir))
+        with patch(
+            "omlx.admin.hf_downloader._get_download_settings",
+            return_value=DownloadSettings(
+                max_simultaneous_downloads=1,
+                max_workers=8,
+            ),
+        ):
+            downloader = HFDownloader(model_dir=str(model_dir))
 
         with patch(
             "omlx.admin.hf_downloader.HfApi"
@@ -1820,7 +1861,14 @@ class TestSequentialDownloadQueue:
     @pytest.mark.asyncio
     async def test_queued_download_starts_after_first_completes(self, model_dir):
         """Second download should start after first one finishes."""
-        downloader = HFDownloader(model_dir=str(model_dir))
+        with patch(
+            "omlx.admin.hf_downloader._get_download_settings",
+            return_value=DownloadSettings(
+                max_simultaneous_downloads=1,
+                max_workers=8,
+            ),
+        ):
+            downloader = HFDownloader(model_dir=str(model_dir))
 
         with patch(
             "omlx.admin.hf_downloader.HfApi"
@@ -1841,6 +1889,52 @@ class TestSequentialDownloadQueue:
 
             assert task1.status == DownloadStatus.COMPLETED
             assert task2.status == DownloadStatus.COMPLETED
+
+            await downloader.shutdown()
+
+
+class TestConfiguredDownloadConcurrency:
+    """Test configurable concurrent download limits."""
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        d = tmp_path / "models"
+        d.mkdir()
+        return d
+
+    @pytest.mark.asyncio
+    async def test_third_download_waits_when_limit_is_two(self, model_dir):
+        """With a concurrency limit of two, the third task should remain pending."""
+        with patch(
+            "omlx.admin.hf_downloader._get_download_settings",
+            return_value=DownloadSettings(
+                max_simultaneous_downloads=2,
+                max_workers=8,
+            ),
+        ):
+            downloader = HFDownloader(model_dir=str(model_dir))
+
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=lambda **kwargs: time.sleep(30),
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.safetensors = {"parameters": {"BF16": 5000}}
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            task1 = await downloader.start_download("owner/model-a")
+            task2 = await downloader.start_download("owner/model-b")
+            task3 = await downloader.start_download("owner/model-c")
+
+            await asyncio.sleep(1)
+
+            assert task1.status == DownloadStatus.DOWNLOADING
+            assert task2.status == DownloadStatus.DOWNLOADING
+            assert task3.status == DownloadStatus.PENDING
 
             await downloader.shutdown()
 

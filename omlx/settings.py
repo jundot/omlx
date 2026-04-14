@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 from .config import parse_size
 
 if TYPE_CHECKING:
-    from .scheduler import SchedulerConfig
+    from .scheduler_config import SchedulerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -488,6 +488,26 @@ class NetworkSettings:
 
 
 @dataclass
+class DownloadSettings:
+    """Downloader configuration settings."""
+
+    max_simultaneous_downloads: int = 2
+    max_workers: int = 8
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DownloadSettings":
+        """Create from dictionary."""
+        return cls(
+            max_simultaneous_downloads=data.get("max_simultaneous_downloads", 2),
+            max_workers=data.get("max_workers", 8),
+        )
+
+
+@dataclass
 class SamplingSettings:
     """Default sampling parameters for generation."""
 
@@ -667,6 +687,7 @@ class GlobalSettings:
     huggingface: HuggingFaceSettings = field(default_factory=HuggingFaceSettings)
     modelscope: ModelScopeSettings = field(default_factory=ModelScopeSettings)
     network: NetworkSettings = field(default_factory=NetworkSettings)
+    download: DownloadSettings = field(default_factory=DownloadSettings)
     sampling: SamplingSettings = field(default_factory=SamplingSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
@@ -753,6 +774,8 @@ class GlobalSettings:
                 self.modelscope = ModelScopeSettings.from_dict(data["modelscope"])
             if "network" in data:
                 self.network = NetworkSettings.from_dict(data["network"])
+            if "download" in data:
+                self.download = DownloadSettings.from_dict(data["download"])
             if "sampling" in data:
                 self.sampling = SamplingSettings.from_dict(data["sampling"])
             if "logging" in data:
@@ -849,6 +872,25 @@ class GlobalSettings:
         if ca_bundle := os.getenv("OMLX_CA_BUNDLE"):
             self.network.ca_bundle = ca_bundle
 
+        # Download settings
+        if download_max_simultaneous := os.getenv("OMLX_DOWNLOAD_MAX_SIMULTANEOUS"):
+            try:
+                self.download.max_simultaneous_downloads = int(
+                    download_max_simultaneous
+                )
+            except ValueError:
+                logger.warning(
+                    "Invalid OMLX_DOWNLOAD_MAX_SIMULTANEOUS value: "
+                    f"{download_max_simultaneous}"
+                )
+        if download_max_workers := os.getenv("OMLX_DOWNLOAD_MAX_WORKERS"):
+            try:
+                self.download.max_workers = int(download_max_workers)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_DOWNLOAD_MAX_WORKERS value: {download_max_workers}"
+                )
+
         # Logging settings
         if log_dir := os.getenv("OMLX_LOG_DIR"):
             self.logging.log_dir = log_dir
@@ -934,6 +976,18 @@ class GlobalSettings:
         if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
             self.network.ca_bundle = args.ca_bundle
 
+        # Download settings
+        if (
+            hasattr(args, "download_max_simultaneous")
+            and args.download_max_simultaneous is not None
+        ):
+            self.download.max_simultaneous_downloads = args.download_max_simultaneous
+        if (
+            hasattr(args, "download_max_workers")
+            and args.download_max_workers is not None
+        ):
+            self.download.max_workers = args.download_max_workers
+
     def save(self) -> None:
         """Save current settings to the settings file."""
         self.ensure_directories()
@@ -951,6 +1005,7 @@ class GlobalSettings:
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),
             "network": self.network.to_dict(),
+            "download": self.download.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
@@ -1075,6 +1130,17 @@ class GlobalSettings:
                 f"{self.cache.initial_cache_blocks} (must be > 0)"
             )
 
+        # Download validation
+        if self.download.max_simultaneous_downloads <= 0:
+            errors.append(
+                "Invalid max_simultaneous_downloads: "
+                f"{self.download.max_simultaneous_downloads} (must be > 0)"
+            )
+        if self.download.max_workers <= 0:
+            errors.append(
+                f"Invalid max_workers: {self.download.max_workers} (must be > 0)"
+            )
+
         # Sampling validation
         if self.sampling.max_tokens <= 0:
             errors.append(
@@ -1150,7 +1216,7 @@ class GlobalSettings:
         Returns:
             SchedulerConfig instance with values from settings.
         """
-        from .scheduler import SchedulerConfig
+        from .scheduler_config import SchedulerConfig
 
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
@@ -1173,6 +1239,7 @@ class GlobalSettings:
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),
             "network": self.network.to_dict(),
+            "download": self.download.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),

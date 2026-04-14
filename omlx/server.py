@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
 """
 OpenAI-compatible API server for oMLX.
 
@@ -49,7 +51,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
@@ -153,10 +155,6 @@ from .api.tool_calling import (
 )
 from .api.thinking import ThinkingParser, extract_thinking
 from .api.utils import clean_output_text, clean_special_tokens, extract_multimodal_content, extract_text_content
-from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
-from .engine.embedding import EmbeddingEngine
-from .engine.reranker import RerankerEngine
-from .engine_pool import EnginePool
 from .exceptions import (
     EnginePoolError,
     InsufficientMemoryError,
@@ -166,6 +164,12 @@ from .exceptions import (
 )
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
+
+if TYPE_CHECKING:
+    from .engine.base import BaseEngine
+    from .engine.embedding import EmbeddingEngine
+    from .engine.reranker import RerankerEngine
+    from .engine_pool import EnginePool
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -679,6 +683,8 @@ async def get_engine(
 
     # Validate engine type
     if engine_type == EngineType.EMBEDDING:
+        from .engine.embedding import EmbeddingEngine
+
         if not isinstance(engine, EmbeddingEngine):
             raise HTTPException(
                 status_code=400,
@@ -686,6 +692,8 @@ async def get_engine(
                 f"Use /v1/chat/completions for LLM models."
             )
     elif engine_type == EngineType.RERANKER:
+        from .engine.reranker import RerankerEngine
+
         if not isinstance(engine, RerankerEngine):
             raise HTTPException(
                 status_code=400,
@@ -1125,6 +1133,8 @@ def init_server(
             logger.warning(f"Model directory created (empty): {md}")
 
     # Create engine pool
+    from .engine_pool import EnginePool
+
     _server_state.engine_pool = EnginePool(
         max_model_memory=max_model_memory,
         scheduler_config=scheduler_config,
@@ -1212,16 +1222,22 @@ def init_server(
     except ImportError:
         logger.info("ModelScope support not available")
 
-    # Initialize oQ Quantizer
-    from .admin.oq_manager import OQManager
-    from .admin.routes import set_oq_manager
+    # Initialize oQ Quantizer only when models are present.
+    # This keeps empty-directory startup import-safe in test environments
+    # where MLX/Metal runtime initialization is unavailable.
+    if _server_state.engine_pool.model_count > 0:
+        from .admin.oq_manager import OQManager
+        from .admin.routes import set_oq_manager
 
-    _server_state.oq_manager = OQManager(
-        model_dirs=[str(d) for d in dir_list],
-        on_complete=_refresh_models_after_download,
-    )
-    set_oq_manager(_server_state.oq_manager)
-    logger.info("oQ Quantizer initialized")
+        _server_state.oq_manager = OQManager(
+            model_dirs=[str(d) for d in dir_list],
+            on_complete=_refresh_models_after_download,
+        )
+        set_oq_manager(_server_state.oq_manager)
+        logger.info("oQ Quantizer initialized")
+    else:
+        _server_state.oq_manager = None
+        logger.info("oQ Quantizer skipped (no models discovered)")
 
     # Initialize HuggingFace uploader
     from .admin.hf_uploader import HFUploader
@@ -1951,7 +1967,7 @@ async def create_chat_completion(
                 merged_ct_kwargs[k] = v
 
     # Extract messages - different engines need different content handling
-    is_vlm = isinstance(engine, VLMBatchedEngine)
+    is_vlm = type(engine).__name__ == "VLMBatchedEngine"
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
         messages = extractor(request.messages, max_tool_result_tokens, engine.tokenizer)
@@ -3204,7 +3220,7 @@ async def create_anthropic_message(
 
     # Convert Anthropic format to internal format
     # Harmony models need special handling to preserve tool format
-    is_vlm = isinstance(engine, VLMBatchedEngine)
+    is_vlm = type(engine).__name__ == "VLMBatchedEngine"
     if engine.model_type == "gpt_oss":
         messages = convert_anthropic_to_internal_harmony(
             request, max_tool_result_tokens, engine.tokenizer

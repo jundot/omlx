@@ -182,6 +182,17 @@ class TestServeCommandOptions:
         )
         assert "--mcp-config" in result.stdout
 
+    def test_serve_has_download_options(self):
+        """Test that serve command has downloader options."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "serve", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert "--download-max-simultaneous" in result.stdout
+        assert "--download-max-workers" in result.stdout
+
     def test_serve_has_base_path_option(self):
         """Test that serve command has --base-path option."""
         result = subprocess.run(
@@ -323,6 +334,8 @@ class TestHasCliOverrides:
             "max_process_memory": None,
             "host": None,
             "log_level": None,
+            "download_max_simultaneous": None,
+            "download_max_workers": None,
         }
         defaults.update(kwargs)
         return argparse.Namespace(**defaults)
@@ -359,6 +372,14 @@ class TestHasCliOverrides:
         from omlx.cli import _has_cli_overrides
         assert _has_cli_overrides(self._make_args(log_level="info")) is True
         assert _has_cli_overrides(self._make_args(log_level="debug")) is True
+
+    def test_download_max_simultaneous_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(download_max_simultaneous=2)) is True
+
+    def test_download_max_workers_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(download_max_workers=8)) is True
 
     def test_multiple_overrides(self):
         from omlx.cli import _has_cli_overrides

@@ -49,6 +49,18 @@ def _get_hf_api() -> tuple[HfApi, str | None]:
     return HfApi(), None
 
 
+def _get_download_settings():
+    """Return download settings, falling back to defaults if unavailable."""
+    try:
+        from ..settings import DownloadSettings, get_settings
+
+        return get_settings().download
+    except (ImportError, RuntimeError, AttributeError):
+        from ..settings import DownloadSettings
+
+        return DownloadSettings()
+
+
 class DownloadStatus(str, enum.Enum):
     """Status of a download task."""
 
@@ -411,13 +423,17 @@ class HFDownloader:
         model_dir: str,
         on_complete: Optional[Callable] = None,
     ):
+        download_settings = _get_download_settings()
         self._model_dir = Path(model_dir)
         self._tasks: dict[str, DownloadTask] = {}
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._progress_tasks: dict[str, asyncio.Task] = {}
         self._on_complete = on_complete
         self._cancelled: set[str] = set()
-        self._download_sem = asyncio.Semaphore(1)
+        self._max_workers = download_settings.max_workers
+        self._download_sem = asyncio.Semaphore(
+            download_settings.max_simultaneous_downloads
+        )
 
     @property
     def model_dir(self) -> Path:
@@ -426,6 +442,26 @@ class HFDownloader:
     def update_model_dir(self, new_dir: str) -> None:
         """Update the model directory path."""
         self._model_dir = Path(new_dir)
+
+    def update_download_settings(
+        self,
+        max_simultaneous_downloads: int | None = None,
+        max_workers: int | None = None,
+    ) -> None:
+        """Update download limits for subsequent downloads."""
+        if max_simultaneous_downloads is None or max_workers is None:
+            download_settings = _get_download_settings()
+            if max_simultaneous_downloads is None:
+                max_simultaneous_downloads = (
+                    download_settings.max_simultaneous_downloads
+                )
+            if max_workers is None:
+                max_workers = download_settings.max_workers
+
+        assert max_simultaneous_downloads is not None
+        assert max_workers is not None
+        self._max_workers = max_workers
+        self._download_sem = asyncio.Semaphore(max_simultaneous_downloads)
 
     async def start_download(
         self, repo_id: str, hf_token: str = ""
@@ -644,6 +680,7 @@ class HFDownloader:
                     "local_dir": str(target_dir),
                     "token": hf_token or None,
                     "endpoint": endpoint,
+                    "max_workers": self._max_workers,
                     "etag_timeout": 30,
                 }
                 if ignore_patterns:

@@ -17,7 +17,6 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import mlx.core as mx
@@ -37,6 +36,7 @@ from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .exceptions import is_cache_corruption_error
+from .scheduler_config import SchedulerConfig, SchedulingPolicy
 
 
 def _sync_and_clear_cache():
@@ -282,50 +282,6 @@ def _advance_vlm_extra(
         else:
             advanced[key] = val
     return advanced
-
-
-
-
-class SchedulingPolicy(Enum):
-    """Scheduling policy for request ordering."""
-
-    FCFS = "fcfs"  # First-Come-First-Served
-    PRIORITY = "priority"  # Priority-based
-
-
-@dataclass
-class SchedulerConfig:
-    """Configuration for the scheduler."""
-
-    # Maximum number of concurrent requests in the batch
-    max_num_seqs: int = 256
-    # Maximum tokens to process per step (for prefill chunking)
-    max_num_batched_tokens: int = 8192
-    # Scheduling policy
-    policy: SchedulingPolicy = SchedulingPolicy.FCFS
-    # BatchGenerator settings (passed directly to mlx-lm)
-    completion_batch_size: int = 32
-    prefill_step_size: int = 2048
-
-    # Paged cache settings (internal defaults)
-    paged_cache_block_size: int = 256  # Tokens per block
-    max_cache_blocks: Optional[int] = None  # Auto-calculated from available KV cache memory
-    initial_cache_blocks: int = 256  # Starting blocks (grows dynamically to max_cache_blocks)
-
-    # paged SSD cache settings (oMLX only supports paged SSD-based caching)
-    # When paged_ssd_cache_dir is set, oMLX stores KV cache on paged SSD for prefix reuse.
-    # When None, no oMLX caching (mlx-lm BatchGenerator manages KV internally).
-    paged_ssd_cache_dir: Optional[str] = None  # Path for paged SSD cache storage (None = disabled)
-    paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
-    hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
-
-    # Model identification (for cache isolation between different models)
-    model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
-
-    # GC/cleanup settings (memory optimization)
-    gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
-    mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
-
 
 @dataclass
 class SchedulerOutput:

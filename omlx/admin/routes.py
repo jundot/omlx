@@ -171,6 +171,10 @@ class GlobalSettingsRequest(BaseModel):
     network_no_proxy: Optional[str] = None
     network_ca_bundle: Optional[str] = None
 
+    # Download settings
+    download_max_simultaneous_downloads: Optional[int] = None
+    download_max_workers: Optional[int] = None
+
     # Sampling defaults
     sampling_max_context_window: Optional[int] = None
     sampling_max_tokens: Optional[int] = None
@@ -1862,6 +1866,12 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "no_proxy": global_settings.network.no_proxy,
             "ca_bundle": global_settings.network.ca_bundle,
         },
+        "download": {
+            "max_simultaneous_downloads": (
+                global_settings.download.max_simultaneous_downloads
+            ),
+            "max_workers": global_settings.download.max_workers,
+        },
         "sampling": {
             "max_context_window": global_settings.sampling.max_context_window,
             "max_tokens": global_settings.sampling.max_tokens,
@@ -2160,6 +2170,32 @@ async def update_global_settings(
     if network_changed:
         runtime_applied.append("network")
         logger.info("Network settings updated")
+
+    # Apply downloader settings (Live for newly started downloads)
+    download_changed = False
+    if request.download_max_simultaneous_downloads is not None:
+        global_settings.download.max_simultaneous_downloads = (
+            request.download_max_simultaneous_downloads
+        )
+        download_changed = True
+    if request.download_max_workers is not None:
+        global_settings.download.max_workers = request.download_max_workers
+        download_changed = True
+
+    if download_changed:
+        if _hf_downloader is not None:
+            _hf_downloader.update_download_settings(
+                max_simultaneous_downloads=(
+                    global_settings.download.max_simultaneous_downloads
+                ),
+                max_workers=global_settings.download.max_workers,
+            )
+        runtime_applied.append("download")
+        logger.info(
+            "HF downloader settings updated: simultaneous=%s, workers=%s",
+            global_settings.download.max_simultaneous_downloads,
+            global_settings.download.max_workers,
+        )
 
     # Apply sampling settings (Live - immediately applied)
     sampling_changed = False
