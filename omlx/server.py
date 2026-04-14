@@ -2056,7 +2056,7 @@ async def create_chat_completion(
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
-                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, **chat_kwargs),
+                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, **chat_kwargs),
                 http_request=http_request,
             ),
             media_type="text/event-stream",
@@ -2499,6 +2499,7 @@ async def stream_chat_completion(
     messages: list,
     request: ChatCompletionRequest,
     model_load_duration: float = 0.0,
+    resolved_model: Optional[str] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
@@ -2701,7 +2702,7 @@ async def stream_chat_completion(
                 yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Reverse Gemma 4 parameter renaming for streaming path
-    if tool_calls and "gemma" in (request.model or "").lower():
+    if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
         for tc in tool_calls:
             if tc.function and tc.function.arguments:
                 try:
@@ -2798,6 +2799,7 @@ async def stream_anthropic_messages(
     engine: BaseEngine,
     messages: list,
     request: AnthropicMessagesRequest,
+    resolved_model: Optional[str] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """
@@ -3017,6 +3019,17 @@ async def stream_anthropic_messages(
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
 
+    # Reverse Gemma 4 parameter renaming
+    if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
+        for tc in tool_calls:
+            if tc.function and tc.function.arguments:
+                try:
+                    args = json.loads(tc.function.arguments)
+                    args = restore_gemma4_param_names(args)
+                    tc.function.arguments = json.dumps(args, ensure_ascii=False)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
     # Emit tool_use blocks if present
     tool_block_start = block_index + 1
     if tool_calls:
@@ -3199,6 +3212,9 @@ async def create_anthropic_message(
             internal_tools = None
     else:
         internal_tools = user_internal
+    # Gemma 4 drops required params that lack descriptions — enrich them
+    if internal_tools and "gemma" in (resolved_model or "").lower():
+        internal_tools = enrich_tool_params_for_gemma4(internal_tools)
     if internal_tools:
         chat_kwargs["tools"] = internal_tools
 
@@ -3233,7 +3249,7 @@ async def create_anthropic_message(
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
-                stream_anthropic_messages(engine, messages, request, **chat_kwargs),
+                stream_anthropic_messages(engine, messages, request, resolved_model=resolved_model, **chat_kwargs),
                 http_request=http_request,
             ),
             media_type="text/event-stream",
@@ -3292,6 +3308,17 @@ async def create_anthropic_message(
             cleaned_text = extraction.cleaned_text
             tool_calls = extraction.tool_calls
             cleaned_thinking = extraction.cleaned_thinking
+
+        # Reverse Gemma 4 parameter renaming
+        if tool_calls and "gemma" in (resolved_model or "").lower():
+            for tc in tool_calls:
+                if tc.function and tc.function.arguments:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                        args = restore_gemma4_param_names(args)
+                        tc.function.arguments = json.dumps(args, ensure_ascii=False)
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
 
         response = convert_internal_to_anthropic_response(
             text=cleaned_text.strip() if cleaned_text else regular_content,
@@ -3527,6 +3554,9 @@ async def create_response(
     tools_for_template = (
         convert_tools_for_template(effective_tools) if effective_tools else None
     )
+    # Gemma 4 drops required params that lack descriptions — enrich them
+    if tools_for_template and "gemma" in (resolved_model or "").lower():
+        tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
 
     # Validate context window
     try:
@@ -3601,6 +3631,7 @@ async def create_response(
                     input_messages=current_input_messages,
                     store_response=_should_store_response(request.store),
                     model_load_duration=model_load_duration,
+                    resolved_model=resolved_model,
                     **chat_kwargs,
                 ),
                 http_request=http_request,
@@ -3646,6 +3677,18 @@ async def create_response(
             )
             cleaned_text = extraction.cleaned_text
             tool_calls = extraction.tool_calls
+
+        # Reverse Gemma 4 parameter renaming
+        if tool_calls and "gemma" in (resolved_model or "").lower():
+            for tc in tool_calls:
+                fn = getattr(tc, "function", None)
+                if fn and fn.arguments:
+                    try:
+                        args = json.loads(fn.arguments)
+                        args = restore_gemma4_param_names(args)
+                        fn.arguments = json.dumps(args, ensure_ascii=False)
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
 
         # Build output items
         output_items: list[OutputItem] = []
@@ -3710,6 +3753,7 @@ async def stream_responses_api(
     input_messages: Optional[list[dict]] = None,
     store_response: bool = True,
     model_load_duration: float = 0.0,
+    resolved_model: Optional[str] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
@@ -3887,6 +3931,18 @@ async def stream_responses_api(
         # No tools — use raw accumulated text minus thinking
         thinking_content, regular_content = extract_thinking(accumulated_text)
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
+
+    # Reverse Gemma 4 parameter renaming
+    if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
+        for tc in tool_calls:
+            fn = getattr(tc, "function", None)
+            if fn and fn.arguments:
+                try:
+                    args = json.loads(fn.arguments)
+                    args = restore_gemma4_param_names(args)
+                    fn.arguments = json.dumps(args, ensure_ascii=False)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
 
     final_text = cleaned_text.strip() if cleaned_text else ""
 

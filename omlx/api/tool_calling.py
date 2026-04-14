@@ -984,7 +984,7 @@ def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:
 # Gemma 4 confuses these with schema-level fields and drops them from
 # tool call output.  We rename them before the chat template and restore
 # them after parsing the model's response.
-_GEMMA4_COLLIDING_PARAMS = {"description", "type", "name", "properties", "required"}
+_GEMMA4_COLLIDING_PARAMS = {"description"}
 _GEMMA4_RENAME_PREFIX = "param_"
 
 
@@ -1037,9 +1037,11 @@ def restore_gemma4_param_names(arguments: dict) -> dict:
     restored = {}
     for k, v in arguments.items():
         if k.startswith(_GEMMA4_RENAME_PREFIX):
-            restored[k[len(_GEMMA4_RENAME_PREFIX):]] = v
-        else:
-            restored[k] = v
+            original = k[len(_GEMMA4_RENAME_PREFIX):]
+            if original in _GEMMA4_COLLIDING_PARAMS:
+                restored[original] = v
+                continue
+        restored[k] = v
     return restored
 
 
