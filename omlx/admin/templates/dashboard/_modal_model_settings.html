@@ -419,6 +419,44 @@
                                         </div>
                                     </div>
                                 </div>
+
+                                <!-- DFlash -->
+                                <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                                    <div class="flex items-start justify-between gap-3">
+                                        <div class="min-w-0">
+                                            <span class="text-sm font-medium text-neutral-700">DFlash</span>
+                                            <p class="text-xs text-neutral-500 mt-0.5">Block diffusion speculative decoding for 3-4x faster generation. Requires a DFlash draft model checkpoint. (MLX impl by bstnxbt: <a href="https://github.com/bstnxbt/dflash-mlx" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">GitHub</a>) (<a href="https://arxiv.org/abs/2602.06036" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">Paper</a>)</p>
+                                        </div>
+                                        <button type="button" @click="modelSettings.dflash_enabled = !modelSettings.dflash_enabled"
+                                                :class="modelSettings.dflash_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                                class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            <span :class="modelSettings.dflash_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
+                                    </div>
+                                    <div x-show="modelSettings.dflash_enabled" x-transition class="space-y-3 pt-1">
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft Model</label>
+                                            <select x-model="modelSettings.dflash_draft_model"
+                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                <option value="">Select draft model...</option>
+                                                <template x-for="m in models.filter(m => m.id !== selectedModel?.id)" :key="m.id">
+                                                    <option :value="m.model_path || m.id" x-text="m.id" :selected="modelSettings.dflash_draft_model === (m.model_path || m.id)"></option>
+                                                </template>
+                                            </select>
+                                            <p class="text-xs text-neutral-400 mt-1">DFlash draft checkpoint (e.g. z-lab/Qwen3-4B-DFlash-b16)</p>
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft Quantization</label>
+                                            <select x-model="modelSettings.dflash_draft_quant_bits"
+                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                <option value="">bf16 (default)</option>
+                                                <option value="4">4-bit</option>
+                                                <option value="8">8-bit</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                </div>
                         </div>
                     </div>
                 </div>

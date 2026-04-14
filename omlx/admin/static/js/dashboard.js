@@ -927,6 +927,9 @@
                     specprefill_draft_model: settings.specprefill_draft_model || '',
                     specprefill_keep_pct: settings.specprefill_keep_pct ? String(settings.specprefill_keep_pct) : '0.2',
                     specprefill_threshold: settings.specprefill_threshold || null,
+                    dflash_enabled: settings.dflash_enabled || false,
+                    dflash_draft_model: settings.dflash_draft_model || '',
+                    dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
@@ -1000,6 +1003,11 @@
                                     : null,
                                 specprefill_threshold: this.modelSettings.specprefill_enabled
                                     ? (this.modelSettings.specprefill_threshold || null)
+                                    : null,
+                                dflash_enabled: this.modelSettings.dflash_enabled,
+                                dflash_draft_model: this.modelSettings.dflash_draft_model || null,
+                                dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
+                                    ? parseInt(this.modelSettings.dflash_draft_quant_bits)
                                     : null,
                             };
                         })()),

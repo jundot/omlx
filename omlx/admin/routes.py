@@ -101,6 +101,10 @@ class ModelSettingsRequest(BaseModel):
     specprefill_draft_model: Optional[str] = None
     specprefill_keep_pct: Optional[float] = None
     specprefill_threshold: Optional[int] = None
+    # DFlash (block diffusion speculative decoding)
+    dflash_enabled: Optional[bool] = None
+    dflash_draft_model: Optional[str] = None
+    dflash_draft_quant_bits: Optional[int] = None
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
@@ -1325,6 +1329,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "specprefill_draft_model": settings.specprefill_draft_model,
                 "specprefill_keep_pct": settings.specprefill_keep_pct,
                 "specprefill_threshold": settings.specprefill_threshold,
+                "dflash_enabled": settings.dflash_enabled,
+                "dflash_draft_model": settings.dflash_draft_model,
+                "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
@@ -1542,6 +1549,13 @@ async def update_model_settings(
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
         current_settings.specprefill_threshold = request.specprefill_threshold or None
+    # DFlash settings
+    if "dflash_enabled" in sent:
+        current_settings.dflash_enabled = request.dflash_enabled or False
+    if "dflash_draft_model" in sent:
+        current_settings.dflash_draft_model = request.dflash_draft_model or None
+    if "dflash_draft_quant_bits" in sent:
+        current_settings.dflash_draft_quant_bits = request.dflash_draft_quant_bits or None
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -1564,6 +1578,8 @@ async def update_model_settings(
         and (
             ("model_type_override" in sent and entry.engine_type != prev_engine_type)
             or "index_cache_freq" in sent
+            or "dflash_enabled" in sent
+            or "dflash_draft_model" in sent
         )
     )
     if requires_reload:

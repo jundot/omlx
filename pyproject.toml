@@ -77,6 +77,10 @@ mcp = [
 modelscope = [
     "modelscope>=1.10.0",
 ]
+dflash = [
+    # dflash-mlx from commit (fc7101b) — block diffusion speculative decoding
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@fc7101b0aa70c60f0754f50a7a10a82c2cdc1a92",
+]
 audio = [
     # mlx-audio from commit (5175326) with tts/stt/sts extras
     # tts extra: misaki, num2words, spacy, phonemizer-fork, espeakng-loader, sentencepiece

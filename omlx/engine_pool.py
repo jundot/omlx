@@ -525,41 +525,105 @@ class EnginePool:
             if self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
 
-            # Create engine based on engine type
-            if effective_type == "embedding":
-                # EmbeddingEngine for embedding models
-                engine = EmbeddingEngine(model_name=entry.model_path)
-            elif effective_type == "reranker":
-                # RerankerEngine for reranker models
-                engine = RerankerEngine(model_name=entry.model_path)
-            elif effective_type == "vlm":
-                # VLMBatchedEngine for vision-language models
-                engine = VLMBatchedEngine(
-                    model_name=entry.model_path,
-                    scheduler_config=self._scheduler_config,
-                    model_settings=model_settings,
-                )
-            elif entry.engine_type == "audio_stt":
-                engine = STTEngine(model_name=entry.model_path)
-            elif entry.engine_type == "audio_tts":
-                engine = TTSEngine(model_name=entry.model_path)
-            elif entry.engine_type == "audio_sts":
-                engine = STSEngine(
-                    model_name=entry.model_path,
-                    config_model_type=entry.config_model_type,
-                )
-            else:
-                # BatchedEngine with continuous batching (default)
-                engine = BatchedEngine(
-                    model_name=entry.model_path,
-                    scheduler_config=self._scheduler_config,
-                    model_settings=model_settings,
-                )
+            # Check if DFlash is enabled — takes priority over engine type
+            # since DFlash has its own model loading pipeline
+            engine = None
+            if model_settings is not None:
+                dflash_enabled = getattr(model_settings, "dflash_enabled", False)
+                dflash_draft = getattr(model_settings, "dflash_draft_model", None)
+                if dflash_enabled and dflash_draft:
+                    try:
+                        from .engine.dflash import DFlashEngine
+                        engine = DFlashEngine(
+                            model_name=entry.model_path,
+                            draft_model_path=dflash_draft,
+                            draft_quant_bits=getattr(model_settings, "dflash_draft_quant_bits", None),
+                            model_settings=model_settings,
+                            fallback_engine_type=effective_type,
+                            scheduler_config=self._scheduler_config,
+                        )
+                        logger.info(f"DFlash enabled for {model_id}, draft={dflash_draft}")
+                    except ImportError:
+                        logger.warning(
+                            f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
+                            f"Falling back to default engine."
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"DFlash init failed for {model_id}: {e}. "
+                            f"Falling back to default engine."
+                        )
+
+            # Create engine based on engine type (if DFlash not active)
+            if engine is None:
+                if effective_type == "embedding":
+                    engine = EmbeddingEngine(model_name=entry.model_path)
+                elif effective_type == "reranker":
+                    engine = RerankerEngine(model_name=entry.model_path)
+                elif effective_type == "vlm":
+                    engine = VLMBatchedEngine(
+                        model_name=entry.model_path,
+                        scheduler_config=self._scheduler_config,
+                        model_settings=model_settings,
+                    )
+                elif entry.engine_type == "audio_stt":
+                    engine = STTEngine(model_name=entry.model_path)
+                elif entry.engine_type == "audio_tts":
+                    engine = TTSEngine(model_name=entry.model_path)
+                elif entry.engine_type == "audio_sts":
+                    engine = STSEngine(
+                        model_name=entry.model_path,
+                        config_model_type=entry.config_model_type,
+                    )
+                else:
+                    engine = BatchedEngine(
+                        model_name=entry.model_path,
+                        scheduler_config=self._scheduler_config,
+                        model_settings=model_settings,
+                    )
+
+            _is_dflash_engine = engine is not None and type(engine).__name__ == "DFlashEngine"
 
             try:
                 await engine.start()
             except Exception as start_error:
-                if force_lm and entry.engine_type == "vlm":
+                if _is_dflash_engine:
+                    # DFlash engine failed to start — fall back to the
+                    # model's natural engine type (VLM or Batched)
+                    logger.warning(
+                        f"DFlash start failed for {model_id}: {start_error}. "
+                        f"Falling back to {effective_type} engine."
+                    )
+                    try:
+                        await engine.stop()
+                    except Exception:
+                        pass
+                    gc.collect()
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        get_mlx_executor(),
+                        lambda: (mx.synchronize(), mx.clear_cache()),
+                    )
+
+                    if effective_type == "vlm":
+                        engine = VLMBatchedEngine(
+                            model_name=entry.model_path,
+                            scheduler_config=self._scheduler_config,
+                            model_settings=model_settings,
+                        )
+                    else:
+                        engine = BatchedEngine(
+                            model_name=entry.model_path,
+                            scheduler_config=self._scheduler_config,
+                            model_settings=model_settings,
+                        )
+                    await engine.start()
+                    logger.info(
+                        f"Successfully loaded {model_id} as {effective_type} "
+                        f"(fallback from DFlash)"
+                    )
+
+                elif force_lm and entry.engine_type == "vlm":
                     # force_lm created a BatchedEngine but mlx-lm can't
                     # load this VLM model — fall back to VLMBatchedEngine.
                     logger.warning(

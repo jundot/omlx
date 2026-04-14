@@ -67,6 +67,11 @@ class ModelSettings:
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
 
+    # DFlash (block diffusion speculative decoding)
+    dflash_enabled: bool = False
+    dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
+    dflash_draft_quant_bits: Optional[int] = None  # Draft model quantization (None=bf16, 4)
+
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default
