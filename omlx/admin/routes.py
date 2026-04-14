@@ -148,6 +148,12 @@ class GlobalSettingsRequest(BaseModel):
     # ModelScope settings
     ms_endpoint: Optional[str] = None
 
+    # Network settings
+    network_http_proxy: Optional[str] = None
+    network_https_proxy: Optional[str] = None
+    network_no_proxy: Optional[str] = None
+    network_ca_bundle: Optional[str] = None
+
     # Sampling defaults
     sampling_max_context_window: Optional[int] = None
     sampling_max_tokens: Optional[int] = None
@@ -1779,6 +1785,35 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
+    # Defensive hydration: if runtime network settings are empty but disk has
+    # values, hydrate from disk so UI/API round-trips do not wipe them.
+    if (
+        not global_settings.network.http_proxy
+        and not global_settings.network.https_proxy
+        and not global_settings.network.no_proxy
+        and not global_settings.network.ca_bundle
+    ):
+        try:
+            settings_file = global_settings.base_path / "settings.json"
+            if settings_file.exists():
+                with open(settings_file, encoding="utf-8") as f:
+                    disk_data = json.load(f)
+                disk_network = disk_data.get("network")
+                if isinstance(disk_network, dict):
+                    hydrated = type(global_settings.network).from_dict(disk_network)
+                    if (
+                        hydrated.http_proxy
+                        or hydrated.https_proxy
+                        or hydrated.no_proxy
+                        or hydrated.ca_bundle
+                    ):
+                        global_settings.network = hydrated
+                        logger.info(
+                            "Hydrated network settings from disk for admin API response"
+                        )
+        except (OSError, json.JSONDecodeError, TypeError) as e:
+            logger.warning(f"Failed to hydrate network settings from disk: {e}")
+
     # Get system memory info for auto calculation
     memory_info = get_system_memory_info()
 
@@ -1829,6 +1864,12 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "modelscope": {
             "endpoint": global_settings.modelscope.endpoint,
+        },
+        "network": {
+            "http_proxy": global_settings.network.http_proxy,
+            "https_proxy": global_settings.network.https_proxy,
+            "no_proxy": global_settings.network.no_proxy,
+            "ca_bundle": global_settings.network.ca_bundle,
         },
         "sampling": {
             "max_context_window": global_settings.sampling.max_context_window,
@@ -1900,6 +1941,45 @@ async def update_global_settings(
 
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
+
+    # Defensive hydration: if runtime network settings are empty and request
+    # does not explicitly carry network fields, recover from disk before save.
+    network_fields = {
+        "network_http_proxy",
+        "network_https_proxy",
+        "network_no_proxy",
+        "network_ca_bundle",
+    }
+    has_network_fields = any(f in request.model_fields_set for f in network_fields)
+    if (
+        not has_network_fields
+        and not global_settings.network.http_proxy
+        and not global_settings.network.https_proxy
+        and not global_settings.network.no_proxy
+        and not global_settings.network.ca_bundle
+    ):
+        try:
+            settings_file = global_settings.base_path / "settings.json"
+            if settings_file.exists():
+                with open(settings_file, encoding="utf-8") as f:
+                    disk_data = json.load(f)
+                disk_network = disk_data.get("network")
+                if isinstance(disk_network, dict):
+                    hydrated = type(global_settings.network).from_dict(disk_network)
+                    if (
+                        hydrated.http_proxy
+                        or hydrated.https_proxy
+                        or hydrated.no_proxy
+                        or hydrated.ca_bundle
+                    ):
+                        global_settings.network = hydrated
+                        logger.info(
+                            "Hydrated network settings from disk before admin save"
+                        )
+        except (OSError, json.JSONDecodeError, TypeError) as e:
+            logger.warning(
+                f"Failed to hydrate network settings from disk before save: {e}"
+            )
 
     # Track which settings were applied at runtime
     runtime_applied: List[str] = []
@@ -2085,6 +2165,52 @@ async def update_global_settings(
             f"ModelScope endpoint updated to: "
             f"{request.ms_endpoint or '(default)'}"
         )
+
+    # Apply network settings (Live - immediately applied via env vars)
+    network_changed = False
+    if request.network_http_proxy is not None:
+        global_settings.network.http_proxy = request.network_http_proxy
+        if request.network_http_proxy:
+            os.environ["HTTP_PROXY"] = request.network_http_proxy
+            os.environ["http_proxy"] = request.network_http_proxy
+        else:
+            os.environ.pop("HTTP_PROXY", None)
+            os.environ.pop("http_proxy", None)
+        network_changed = True
+
+    if request.network_https_proxy is not None:
+        global_settings.network.https_proxy = request.network_https_proxy
+        if request.network_https_proxy:
+            os.environ["HTTPS_PROXY"] = request.network_https_proxy
+            os.environ["https_proxy"] = request.network_https_proxy
+        else:
+            os.environ.pop("HTTPS_PROXY", None)
+            os.environ.pop("https_proxy", None)
+        network_changed = True
+
+    if request.network_no_proxy is not None:
+        global_settings.network.no_proxy = request.network_no_proxy
+        if request.network_no_proxy:
+            os.environ["NO_PROXY"] = request.network_no_proxy
+            os.environ["no_proxy"] = request.network_no_proxy
+        else:
+            os.environ.pop("NO_PROXY", None)
+            os.environ.pop("no_proxy", None)
+        network_changed = True
+
+    if request.network_ca_bundle is not None:
+        global_settings.network.ca_bundle = request.network_ca_bundle
+        if request.network_ca_bundle:
+            os.environ["REQUESTS_CA_BUNDLE"] = request.network_ca_bundle
+            os.environ["SSL_CERT_FILE"] = request.network_ca_bundle
+        else:
+            os.environ.pop("REQUESTS_CA_BUNDLE", None)
+            os.environ.pop("SSL_CERT_FILE", None)
+        network_changed = True
+
+    if network_changed:
+        runtime_applied.append("network")
+        logger.info("Network settings updated")
 
     # Apply sampling settings (Live - immediately applied)
     sampling_changed = False

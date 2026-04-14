@@ -459,6 +459,35 @@ class ModelScopeSettings:
 
 
 @dataclass
+class NetworkSettings:
+    """Network proxy and TLS trust settings."""
+
+    http_proxy: str = ""
+    https_proxy: str = ""
+    no_proxy: str = ""
+    ca_bundle: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "http_proxy": self.http_proxy,
+            "https_proxy": self.https_proxy,
+            "no_proxy": self.no_proxy,
+            "ca_bundle": self.ca_bundle,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "NetworkSettings":
+        """Create from dictionary."""
+        return cls(
+            http_proxy=data.get("http_proxy", ""),
+            https_proxy=data.get("https_proxy", ""),
+            no_proxy=data.get("no_proxy", ""),
+            ca_bundle=data.get("ca_bundle", ""),
+        )
+
+
+@dataclass
 class SamplingSettings:
     """Default sampling parameters for generation."""
 
@@ -637,6 +666,7 @@ class GlobalSettings:
     mcp: MCPSettings = field(default_factory=MCPSettings)
     huggingface: HuggingFaceSettings = field(default_factory=HuggingFaceSettings)
     modelscope: ModelScopeSettings = field(default_factory=ModelScopeSettings)
+    network: NetworkSettings = field(default_factory=NetworkSettings)
     sampling: SamplingSettings = field(default_factory=SamplingSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
@@ -721,6 +751,8 @@ class GlobalSettings:
                 self.huggingface = HuggingFaceSettings.from_dict(data["huggingface"])
             if "modelscope" in data:
                 self.modelscope = ModelScopeSettings.from_dict(data["modelscope"])
+            if "network" in data:
+                self.network = NetworkSettings.from_dict(data["network"])
             if "sampling" in data:
                 self.sampling = SamplingSettings.from_dict(data["sampling"])
             if "logging" in data:
@@ -807,6 +839,16 @@ class GlobalSettings:
         if ms_endpoint := os.getenv("OMLX_MS_ENDPOINT"):
             self.modelscope.endpoint = ms_endpoint
 
+        # Network settings
+        if http_proxy := os.getenv("OMLX_HTTP_PROXY"):
+            self.network.http_proxy = http_proxy
+        if https_proxy := os.getenv("OMLX_HTTPS_PROXY"):
+            self.network.https_proxy = https_proxy
+        if no_proxy := os.getenv("OMLX_NO_PROXY"):
+            self.network.no_proxy = no_proxy
+        if ca_bundle := os.getenv("OMLX_CA_BUNDLE"):
+            self.network.ca_bundle = ca_bundle
+
         # Logging settings
         if log_dir := os.getenv("OMLX_LOG_DIR"):
             self.logging.log_dir = log_dir
@@ -882,6 +924,16 @@ class GlobalSettings:
         if hasattr(args, "ms_endpoint") and args.ms_endpoint is not None:
             self.modelscope.endpoint = args.ms_endpoint
 
+        # Network settings
+        if hasattr(args, "http_proxy") and args.http_proxy is not None:
+            self.network.http_proxy = args.http_proxy
+        if hasattr(args, "https_proxy") and args.https_proxy is not None:
+            self.network.https_proxy = args.https_proxy
+        if hasattr(args, "no_proxy") and args.no_proxy is not None:
+            self.network.no_proxy = args.no_proxy
+        if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
+            self.network.ca_bundle = args.ca_bundle
+
     def save(self) -> None:
         """Save current settings to the settings file."""
         self.ensure_directories()
@@ -898,6 +950,7 @@ class GlobalSettings:
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),
+            "network": self.network.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
@@ -1072,6 +1125,22 @@ class GlobalSettings:
                     "(must start with http:// or https://)"
                 )
 
+        # Network proxy validation
+        if self.network.http_proxy:
+            proxy = self.network.http_proxy.strip()
+            if proxy and not proxy.startswith(("http://", "https://")):
+                errors.append(
+                    f"Invalid http_proxy: '{proxy}' "
+                    "(must start with http:// or https://)"
+                )
+        if self.network.https_proxy:
+            proxy = self.network.https_proxy.strip()
+            if proxy and not proxy.startswith(("http://", "https://")):
+                errors.append(
+                    f"Invalid https_proxy: '{proxy}' "
+                    "(must start with http:// or https://)"
+                )
+
         return errors
 
     def to_scheduler_config(self) -> SchedulerConfig:
@@ -1103,6 +1172,7 @@ class GlobalSettings:
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),
+            "network": self.network.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),

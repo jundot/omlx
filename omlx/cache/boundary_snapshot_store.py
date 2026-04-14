@@ -321,15 +321,48 @@ class BoundarySnapshotSSDStore:
             if pw_key[0] in self._cancelled_requests:
                 with self._pending_lock:
                     self._pending_writes.pop(pw_key, None)
+                try:
+                    req_dir = file_path.parent
+                    if req_dir.exists():
+                        shutil.rmtree(req_dir)
+                except Exception:
+                    pass
                 continue
 
+            temp_path = None
             try:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 temp_path = file_path.with_name(
                     file_path.stem + "_tmp.safetensors"
                 )
                 _write_safetensors_no_mx(str(temp_path), tensors_raw, metadata)
+
+                # Request may have been cleaned up while serializing.
+                if pw_key[0] in self._cancelled_requests:
+                    try:
+                        if temp_path.exists():
+                            temp_path.unlink()
+                    except Exception:
+                        pass
+                    with self._pending_lock:
+                        self._pending_writes.pop(pw_key, None)
+                    continue
+
                 os.rename(str(temp_path), str(file_path))
+
+                # Cleanup may race with a queued write; remove any late file.
+                if pw_key[0] in self._cancelled_requests:
+                    try:
+                        if file_path.exists():
+                            file_path.unlink()
+                    except Exception:
+                        pass
+                    req_dir = file_path.parent
+                    try:
+                        if req_dir.exists():
+                            shutil.rmtree(req_dir)
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.debug("Background snapshot write failed: %s", e)
                 for p in (temp_path, file_path):
