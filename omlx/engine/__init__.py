@@ -17,11 +17,7 @@ from .base import BaseEngine, BaseNonStreamingEngine, GenerationOutput
 from .batched import BatchedEngine
 from .embedding import EmbeddingEngine
 
-# DFlash engine (optional: requires dflash-mlx)
-try:
-    from .dflash import DFlashEngine
-except ImportError:
-    DFlashEngine = None  # type: ignore
+from .dflash import DFlashEngine
 from .reranker import RerankerEngine
 from .stt import STTEngine
 from .sts import STSEngine
