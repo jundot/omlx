@@ -323,6 +323,25 @@ class MLXEmbeddingModel:
             None,
         )
 
+    def _adapt_model_inputs_for_call(
+        self, model_inputs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Rename prepared inputs to match the embedding model call signature."""
+        try:
+            call_parameters = inspect.signature(self.model.__call__).parameters
+        except (TypeError, ValueError):
+            return dict(model_inputs)
+
+        adapted_inputs = dict(model_inputs)
+        if (
+            "input_ids" in adapted_inputs
+            and "input_ids" not in call_parameters
+            and "inputs" in call_parameters
+        ):
+            adapted_inputs["inputs"] = adapted_inputs.pop("input_ids")
+
+        return adapted_inputs
+
     def _try_compile(self) -> bool:
         """
         Compile a primitive-output embedding forward function.
@@ -336,7 +355,7 @@ class MLXEmbeddingModel:
 
         try:
             def _compiled_embed(inputs):
-                outputs = base_model(**inputs)
+                outputs = base_model(**self._adapt_model_inputs_for_call(inputs))
                 return self._extract_embeddings_array(outputs)
 
             self._compiled_embed = mx.compile(_compiled_embed)
@@ -459,7 +478,7 @@ class MLXEmbeddingModel:
                     )
                     if not isinstance(inputs, dict):
                         inputs = dict(inputs)
-                    outputs = self.model(**inputs)
+                    outputs = self.model(**self._adapt_model_inputs_for_call(inputs))
                     total_tokens = self._count_prepared_tokens(inputs)
                 else:
                     from mlx_embeddings import generate

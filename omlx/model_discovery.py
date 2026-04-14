@@ -316,6 +316,42 @@ def _is_causal_lm_embedding(model_path: Path) -> bool:
     return "embedding" in name_lower or "embed" in name_lower
 
 
+def _has_sentence_transformers_embedding_pipeline(model_path: Path) -> bool:
+    """
+    Detect sentence-transformers style embedding exports via modules.json.
+
+    This allows oMLX to recognize embedding exports whose base transformer
+    architecture is ambiguous (for example gemma3_text) but which include
+    sentence-transformers pooling/normalization modules.
+    """
+    modules_path = model_path / "modules.json"
+    if not modules_path.exists():
+        return False
+
+    try:
+        with open(modules_path) as f:
+            modules = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return False
+
+    if not isinstance(modules, list):
+        return False
+
+    module_types = {
+        module.get("type", "")
+        for module in modules
+        if isinstance(module, dict)
+    }
+    if "sentence_transformers.models.Transformer" not in module_types:
+        return False
+
+    return any(
+        module_type.startswith("sentence_transformers.models.")
+        and module_type != "sentence_transformers.models.Transformer"
+        for module_type in module_types
+    )
+
+
 def detect_model_type(model_path: Path) -> ModelType:
     """
     Detect model type from config.json.
@@ -363,6 +399,9 @@ def detect_model_type(model_path: Path) -> ModelType:
         if arch in CAUSAL_LM_EMBEDDING_ARCHITECTURES:
             if _is_causal_lm_embedding(model_path):
                 return "embedding"
+
+    if _has_sentence_transformers_embedding_pipeline(model_path):
+        return "embedding"
 
     # Check architectures field for embedding (before model_type to avoid
     # false positives from ambiguous model types like qwen3, gemma3-text)

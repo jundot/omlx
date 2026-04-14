@@ -254,6 +254,45 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
 
+    def test_detect_gemma3_text_model_without_sentence_transformers_modules_is_llm(self, tmp_path):
+        """gemma3_text base transformer without sentence-transformers modules stays LLM."""
+        config = {
+            "model_type": "gemma3_text",
+            "architectures": ["Gemma3TextModel"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_sentence_transformers_gemma3_text_as_embedding(self, tmp_path):
+        """gemma3_text sentence-transformers exports should be detected as embeddings."""
+        config = {
+            "model_type": "gemma3_text",
+            "architectures": ["Gemma3TextModel"],
+        }
+        modules = [
+            {
+                "idx": 0,
+                "name": "0",
+                "path": "",
+                "type": "sentence_transformers.models.Transformer",
+            },
+            {
+                "idx": 1,
+                "name": "1",
+                "path": "1_Pooling",
+                "type": "sentence_transformers.models.Pooling",
+            },
+            {
+                "idx": 2,
+                "name": "2",
+                "path": "2_Normalize",
+                "type": "sentence_transformers.models.Normalize",
+            },
+        ]
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "modules.json").write_text(json.dumps(modules))
+        assert detect_model_type(tmp_path) == "embedding"
+
     def test_detect_vlm_model_type_requires_vision_config(self, tmp_path):
         """VLM_MODEL_TYPES match without vision_config should fall back to LLM."""
         config = {

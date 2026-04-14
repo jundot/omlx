@@ -532,6 +532,43 @@ class TestEmbeddingCompileFallback:
         model.model.assert_called_once()
         assert result.embeddings[0] == pytest.approx([0.3, 0.4, 0.5], abs=1e-5)
 
+    def test_custom_processor_eager_path_remaps_input_ids_for_inputs_signature(self):
+        """Models that accept `inputs` instead of `input_ids` should still work."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        class InputsOnlyModel:
+            def __call__(self, inputs, attention_mask=None):
+                assert inputs.tolist() == [[4, 5, 6]]
+                assert attention_mask.tolist() == [[1, 1, 1]]
+
+                outputs = MagicMock(spec=[])
+                outputs.text_embeds = mx.array([[0.7, 0.8, 0.9]])
+                outputs.pooler_output = None
+                outputs.last_hidden_state = None
+                return outputs
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = InputsOnlyModel()
+
+        processor = MagicMock(spec=[])
+        processor.prepare_embedding_inputs = MagicMock(
+            return_value={
+                "input_ids": mx.array([[4, 5, 6]]),
+                "attention_mask": mx.array([[1, 1, 1]]),
+            }
+        )
+        model.processor = processor
+
+        with patch("mlx_embeddings.generate") as mock_generate:
+            result = model.embed(["hello world"])
+
+        mock_generate.assert_not_called()
+        assert result.embeddings[0] == pytest.approx([0.7, 0.8, 0.9], abs=1e-5)
+
     def test_custom_processor_receives_image_items_unchanged(self):
         """Custom processors should receive raw image strings unchanged."""
         import mlx.core as mx
