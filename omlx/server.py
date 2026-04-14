@@ -1913,6 +1913,9 @@ async def create_chat_completion(
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
         forced_keys = set(ms.forced_ct_kwargs or [])
+        # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
+        if ms.enable_thinking is not None and "enable_thinking" not in merged_ct_kwargs:
+            merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
     # Per-request kwargs override model settings (except forced keys)
     if request.chat_template_kwargs:
         for k, v in request.chat_template_kwargs.items():
@@ -3100,6 +3103,9 @@ async def create_anthropic_message(
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
         forced_keys = set(ms.forced_ct_kwargs or [])
+        # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
+        if ms.enable_thinking is not None and "enable_thinking" not in merged_ct_kwargs:
+            merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
     # Per-request kwargs override model settings (except forced keys)
     if request.chat_template_kwargs:
         for k, v in request.chat_template_kwargs.items():
@@ -3465,6 +3471,9 @@ async def create_response(
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
         forced_keys = set(ms.forced_ct_kwargs or [])
+        # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
+        if ms.enable_thinking is not None and "enable_thinking" not in merged_ct_kwargs:
+            merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
 
     # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
     # are NOT called here because convert_responses_input_to_messages() already

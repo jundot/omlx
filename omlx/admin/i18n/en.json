@@ -387,6 +387,8 @@
   "modal.model_settings.load_defaults": "Load Defaults",
   "modal.model_settings.loading_defaults": "Loading...",
   "modal.model_settings.placeholder_default": "Default",
+  "modal.model_settings.enable_thinking": "Enable Thinking",
+  "modal.model_settings.enable_thinking_hint": "Enable reasoning/thinking mode. Required for models like Gemma 4 that suppress thinking by default.",
   "modal.model_settings.thinking_budget": "Thinking Budget",
   "modal.model_settings.thinking_budget_hint": "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded.",
   "modal.model_settings.thinking_budget_placeholder": "e.g. 4096",
