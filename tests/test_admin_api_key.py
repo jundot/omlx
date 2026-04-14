@@ -580,6 +580,126 @@ class TestStatsSecurity:
 class TestRuntimeCacheObservability:
     """Tests for runtime cache observability robustness."""
 
+    def test_runtime_cache_uses_model_scoped_ssd_stats(self):
+        """Per-model rows should not repeat the shared SSD cache total."""
+        cache_dir = Path("/tmp/omlx-cache")
+
+        mock_settings = MagicMock()
+        mock_settings.base_path = Path("/tmp/omlx-base")
+        mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+
+        shared_ssd_stats = {
+            "num_files": 999,
+            "total_size_bytes": 999_999_999,
+            "hot_cache_max_bytes": 0,
+            "hot_cache_size_bytes": 0,
+            "hot_cache_entries": 0,
+        }
+
+        manager_a = MagicMock()
+        manager_a.get_stats_for_model.return_value = {
+            "num_files": 3,
+            "total_size_bytes": 4096,
+            "hot_cache_max_bytes": 0,
+            "hot_cache_size_bytes": 0,
+            "hot_cache_entries": 0,
+        }
+        scheduler_a = MagicMock()
+        scheduler_a.config.model_name = "/models/model-a"
+        scheduler_a.paged_ssd_cache_manager = manager_a
+        scheduler_a.get_ssd_cache_stats.return_value = {
+            "block_size": 1024,
+            "indexed_blocks": 12,
+            "ssd_cache": shared_ssd_stats,
+        }
+
+        manager_b = MagicMock()
+        manager_b.get_stats_for_model.return_value = {
+            "num_files": 7,
+            "total_size_bytes": 8192,
+            "hot_cache_max_bytes": 0,
+            "hot_cache_size_bytes": 0,
+            "hot_cache_entries": 0,
+        }
+        scheduler_b = MagicMock()
+        scheduler_b.config.model_name = "/models/model-b"
+        scheduler_b.paged_ssd_cache_manager = manager_b
+        scheduler_b.get_ssd_cache_stats.return_value = {
+            "block_size": 2048,
+            "indexed_blocks": 4,
+            "ssd_cache": shared_ssd_stats,
+        }
+
+        entry_a = SimpleNamespace(
+            engine=SimpleNamespace(
+                _engine=SimpleNamespace(
+                    engine=SimpleNamespace(scheduler=scheduler_a)
+                )
+            )
+        )
+        entry_b = SimpleNamespace(
+            engine=SimpleNamespace(
+                _engine=SimpleNamespace(
+                    engine=SimpleNamespace(scheduler=scheduler_b)
+                )
+            )
+        )
+
+        engine_pool = MagicMock()
+        engine_pool.get_status.return_value = {
+            "models": [
+                {"id": "model-a", "loaded": True},
+                {"id": "model-b", "loaded": True},
+            ]
+        }
+        engine_pool._entries = {
+            "model-a": entry_a,
+            "model-b": entry_b,
+        }
+
+        with patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool):
+            payload = admin_routes._build_runtime_cache_observability(mock_settings)
+
+        assert payload["total_num_files"] == 10
+        assert payload["total_size_bytes"] == 12288
+        assert payload["effective_block_sizes"] == [1024, 2048]
+        assert payload["models"] == [
+            {
+                "id": "model-a",
+                "block_size": 1024,
+                "indexed_blocks": 12,
+                "indexed_blocks_display": "12",
+                "has_sub_block_cache": False,
+                "partial_block_skips": 0,
+                "partial_tokens_skipped": 0,
+                "last_partial_tokens_skipped": 0,
+                "last_tokens_to_next_block": 0,
+                "num_files": 3,
+                "total_size_bytes": 4096,
+                "hot_cache_max_bytes": 0,
+                "hot_cache_size_bytes": 0,
+                "hot_cache_entries": 0,
+            },
+            {
+                "id": "model-b",
+                "block_size": 2048,
+                "indexed_blocks": 4,
+                "indexed_blocks_display": "4",
+                "has_sub_block_cache": False,
+                "partial_block_skips": 0,
+                "partial_tokens_skipped": 0,
+                "last_partial_tokens_skipped": 0,
+                "last_tokens_to_next_block": 0,
+                "num_files": 7,
+                "total_size_bytes": 8192,
+                "hot_cache_max_bytes": 0,
+                "hot_cache_size_bytes": 0,
+                "hot_cache_entries": 0,
+            },
+        ]
+        manager_a.get_stats_for_model.assert_called_once_with("/models/model-a")
+        manager_b.get_stats_for_model.assert_called_once_with("/models/model-b")
+
     def test_runtime_cache_ignores_single_model_stats_failure(self):
         """One model failing stats collection should not break the whole payload."""
         cache_dir = Path("/tmp/omlx-cache")
