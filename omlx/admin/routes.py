@@ -2970,6 +2970,24 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
     model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
 
+    from ..model_discovery import _resolve_hf_cache_entry
+
+    def _add_model(model_path: Path, model_name: str) -> None:
+        if model_name in seen_names:
+            return
+        seen_names.add(model_name)
+        total_size = sum(
+            f.stat().st_size for f in model_path.rglob("*") if f.is_file()
+        )
+        models.append(
+            {
+                "name": model_name,
+                "path": str(model_path),
+                "size": total_size,
+                "size_formatted": format_size(total_size),
+            }
+        )
+
     models = []
     seen_names: set[str] = set()
     for model_dir in model_dirs:
@@ -2981,44 +2999,22 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
             if (subdir / "config.json").exists():
                 # Level 1: direct model folder
-                if subdir.name in seen_names:
-                    continue
-                seen_names.add(subdir.name)
-                total_size = sum(
-                    f.stat().st_size for f in subdir.rglob("*") if f.is_file()
-                )
-                models.append(
-                    {
-                        "name": subdir.name,
-                        "path": str(subdir),
-                        "size": total_size,
-                        "size_formatted": format_size(total_size),
-                    }
-                )
+                _add_model(subdir, subdir.name)
             else:
+                # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
+                hf_resolved = _resolve_hf_cache_entry(subdir)
+                if hf_resolved is not None:
+                    snapshot_path, model_name = hf_resolved
+                    if (snapshot_path / "config.json").exists():
+                        _add_model(snapshot_path, model_name)
+                    continue
+
                 # Level 2: organization folder — scan children
                 for child in sorted(subdir.iterdir()):
                     if not child.is_dir() or child.name.startswith("."):
                         continue
-                    if not (child / "config.json").exists():
-                        continue
-                    if child.name in seen_names:
-                        continue
-                    seen_names.add(child.name)
-
-                    total_size = sum(
-                        f.stat().st_size
-                        for f in child.rglob("*")
-                        if f.is_file()
-                    )
-                    models.append(
-                        {
-                            "name": child.name,
-                            "path": str(child),
-                            "size": total_size,
-                            "size_formatted": format_size(total_size),
-                        }
-                    )
+                    if (child / "config.json").exists():
+                        _add_model(child, child.name)
 
     return {"models": models}
 
