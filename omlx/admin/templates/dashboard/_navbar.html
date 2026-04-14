@@ -1,5 +1,5 @@
     <nav class="w-full py-5 px-6 md:px-12 border-b border-neutral-100 bg-white/80 backdrop-blur-md sticky top-0 z-50">
-        <div class="max-w-7xl mx-auto flex justify-between items-center">
+        <div class="max-w-7xl mx-auto flex items-center relative">
             <!-- Logo -->
             <div class="flex items-center gap-2">
                 <a href="/admin/dashboard" class="flex items-center gap-2">
@@ -31,7 +31,7 @@
             </button>
 
             <!-- Center Navigation -->
-            <div class="hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1">
+            <div class="hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1 absolute left-1/2 -translate-x-1/2">
                 <button
                     @click="setMainTab('status')"
                     :class="mainTab === 'status'
@@ -221,26 +221,59 @@
             </div>
 
             <!-- Right: Theme Select + Logout -->
-            <div class="hidden lg:flex items-center gap-2">
+            <div class="hidden lg:flex items-center gap-2 ml-auto">
                 <!-- Theme Select -->
-                <div class="relative">
-                    <div class="flex items-center gap-1 p-2 rounded-full transition-all duration-200"
-                         :class="activeTheme === 'dark'
-                            ? 'text-amber-400 hover:bg-neutral-700'
-                            : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'">
+                <div class="relative" @mouseenter="themeDropdown = true" @mouseleave="themeDropdown = false">
+                    <button class="p-2 rounded-full transition-all duration-200 cursor-pointer"
+                            :class="activeTheme === 'dark'
+                                ? 'text-amber-400 hover:bg-neutral-700'
+                                : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
+                            :title="theme === 'auto' ? window.t('navbar.theme.auto') : theme === 'light' ? window.t('navbar.theme.light_mode') : window.t('navbar.theme.dark_mode')">
                         <i data-lucide="sun-moon" class="w-4 h-4" x-show="theme === 'auto'"></i>
                         <i data-lucide="sun" class="w-4 h-4" x-show="theme === 'light'"></i>
                         <i data-lucide="moon" class="w-4 h-4" x-show="theme === 'dark'"></i>
-                        <select
-                            @change="setTheme($event.target.value)"
-                            class="bg-transparent border-none outline-none cursor-pointer appearance-none text-inherit text-sm pr-5"
-                            x-model="theme"
-                            :title="theme === 'auto' ? window.t('navbar.theme.auto') : theme === 'light' ? window.t('navbar.theme.light_mode') : window.t('navbar.theme.dark_mode')"
+                    </button>
+                    <div
+                        x-show="themeDropdown"
+                        x-transition:enter="transition ease-out duration-150"
+                        x-transition:enter-start="opacity-0 translate-y-1"
+                        x-transition:enter-end="opacity-100 translate-y-0"
+                        x-transition:leave="transition ease-in duration-100"
+                        x-transition:leave-start="opacity-100 translate-y-0"
+                        x-transition:leave-end="opacity-0 translate-y-1"
+                        class="absolute right-0 mt-1.5 w-40 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
+                        x-cloak
+                    >
+                        <button
+                            @click="setTheme('auto'); themeDropdown = false"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="theme === 'auto'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
                         >
-                            <option value="auto">{{ t('navbar.theme.auto') }}</option>
-                            <option value="light">{{ t('navbar.theme.light_mode') }}</option>
-                            <option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
-                        </select>
+                            <i data-lucide="sun-moon" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.theme.auto') }}
+                        </button>
+                        <button
+                            @click="setTheme('light'); themeDropdown = false"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="theme === 'light'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="sun" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.theme.light_mode') }}
+                        </button>
+                        <button
+                            @click="setTheme('dark'); themeDropdown = false"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="theme === 'dark'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="moon" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.theme.dark_mode') }}
+                        </button>
                     </div>
                 </div>
 

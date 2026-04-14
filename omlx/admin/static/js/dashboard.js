@@ -25,6 +25,7 @@
 
             activeTab: 'global',
             settingsDropdown: false,
+            themeDropdown: false,
 
             // Global settings
             globalSettings: {
