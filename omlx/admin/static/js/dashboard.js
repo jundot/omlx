@@ -914,6 +914,7 @@
                     presence_penalty: settings.presence_penalty ?? null,
                     force_sampling: settings.force_sampling || false,
                     enable_thinking: settings.enable_thinking ?? null,
+                    thinking_default: model.thinking_default ?? null,
                     enableThinkingBudget: !!(settings.thinking_budget_tokens),
                     thinking_budget_tokens: settings.thinking_budget_tokens || null,
                     enableToolResultLimit: !!(settings.max_tool_result_tokens),
