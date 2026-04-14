@@ -23,8 +23,24 @@ import mlx.core as mx
 from .constants import PLANAR_D, PLANAR_QS_SIZE, PLANAR_SIGNS_SIZE, PLANAR_BLOCK_BYTES
 from .metal_kernels import dequantize_fused, fused_quantized_sdpa
 from .reference import dequantize_block, quantize_block
+from .metal_kernels import quantize_fused
 
 logger = logging.getLogger(__name__)
+
+
+def _has_metal() -> bool:
+    try:
+        return mx.metal.is_available()
+    except Exception:
+        return False
+
+
+def _quantize(x: mx.array) -> tuple[mx.array, mx.array]:
+    """Quantize using Metal kernel if available, else Python fallback."""
+    if _has_metal():
+        return quantize_fused(x)
+    return quantize_block(x)
+
 
 try:
     from mlx_lm.models.cache import _BaseCache, create_attention_mask
@@ -221,8 +237,8 @@ class PlanarQuantKVCache(_BaseCache):
         assert self._packed_last_k is not None
 
         # Quantize K
-        k_packed, k_norms = quantize_block(self._k_fp16[..., :self.offset, :])
-        # Reshape: quantize_block returns (B, H, T, packed_last) and (B, H, T, 1)
+        k_packed, k_norms = _quantize(self._k_fp16[..., :self.offset, :])
+        # Reshape: _quantize returns (B, H, T, packed_last) and (B, H, T, 1)
         cap = self._cap
         B, H_k = self._B, self._H_k
         self._k_packed = mx.zeros((B, H_k, cap, self._packed_last_k), dtype=mx.uint8)
@@ -234,7 +250,7 @@ class PlanarQuantKVCache(_BaseCache):
             assert self._v_fp16 is not None
             assert self._packed_last_v is not None
             _, H_v = self._B, self._H_v
-            v_packed, v_norms = quantize_block(self._v_fp16[..., :self.offset, :])
+            v_packed, v_norms = _quantize(self._v_fp16[..., :self.offset, :])
             self._v_packed = mx.zeros((B, H_v, cap, self._packed_last_v), dtype=mx.uint8)
             self._v_norms = mx.zeros((B, H_v, cap, 1), dtype=mx.float16)
             self._v_packed[..., :self.offset, :] = v_packed.astype(mx.uint8)
@@ -290,14 +306,14 @@ class PlanarQuantKVCache(_BaseCache):
         assert self._k_packed is not None
         assert self._k_norms is not None
 
-        k_packed, k_norm = quantize_block(keys)
+        k_packed, k_norm = _quantize(keys)
         self._k_packed = self._write_slice(self._k_packed, k_packed, self.offset)
         self._k_norms = self._write_slice(self._k_norms, k_norm, self.offset)
 
         if self.quantize_v:
             assert self._v_packed is not None
             assert self._v_norms is not None
-            v_packed, v_norm = quantize_block(values)
+            v_packed, v_norm = _quantize(values)
             self._v_packed = self._write_slice(self._v_packed, v_packed, self.offset)
             self._v_norms = self._write_slice(self._v_norms, v_norm, self.offset)
             self.offset = new_end

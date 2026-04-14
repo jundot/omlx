@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from .constants import centroids_mx, cos_sin_mx
+from .constants import centroids_mx, cos_sin_mx, midpoints_mx
 
 _DEQUANT_KERNEL = None
 _QK_KERNEL = None
 _AV_KERNEL = None
+_QUANT_KERNEL = None
 
 # ---------------------------------------------------------------------------
 # 1. Fused dequant kernel (packed layout)
@@ -260,8 +261,142 @@ def _build_av_kernel():
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# 4. Fused quantize kernel (packed layout)
 # ---------------------------------------------------------------------------
+
+_QUANT_SOURCE = """
+    // Grid: (n_pairs, 1, N),  Threadgroup: (n_pairs, 1, 1)
+    // Each threadgroup handles one row (token). Each thread handles one pair.
+    //
+    // Pipeline:
+    //   Phase 1: Each thread computes pair_sq = v0^2 + v1^2. Thread 0 reduces.
+    //   Phase 2: Thread 0 writes inv_norm to shared. Barrier.
+    //   Phase 3: Each thread normalizes, applies Givens, does midpoint lookup.
+    //   Phase 4: Each thread writes idx0, idx1 to shared. Thread 0 packs + writes norm.
+
+    threadgroup uint idx_shared[256];     // max D=256
+    threadgroup float inv_norm_shared[1];
+
+    uint pair = thread_position_in_threadgroup.x;
+    uint row = thread_position_in_grid.z;
+    uint j0 = pair * 2;
+    uint j1 = j0 + 1;
+
+    float v0 = float(input_row[row * D + j0]);
+    float v1 = float(input_row[row * D + j1]);
+
+    // --- Phase 1: Compute L2 norm (reduction) ---
+    // Each thread computes its pair's contribution
+    float pair_sq = v0 * v0 + v1 * v1;
+    // Store in idx_shared as float (reuse memory — it'll be overwritten)
+    // Actually, we need shared float slots. Use a different approach:
+    // Thread 0 does a serial reduction after barrier.
+
+    // Write pair_sq to shared as uint (bit_cast) — too tricky.
+    // Instead: just have thread 0 loop over all input values.
+    // This is D reads which is fast (128 or 256 floats).
+
+    if (pair == 0) {
+        float total_norm_sq = 0.0f;
+        for (uint j = 0; j < D; j++) {
+            float v = float(input_row[row * D + j]);
+            total_norm_sq += v * v;
+        }
+        float grp_norm = sqrt(max(total_norm_sq, 1e-20f));
+        inv_norm_shared[0] = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Phase 2: Read inv_norm, normalize ---
+    float inv_norm = inv_norm_shared[0];
+    float v0n = v0 * inv_norm;
+    float v1n = v1 * inv_norm;
+
+    // --- Phase 3: Forward Givens rotation on normalized vector ---
+    float c = cos_tab[pair];
+    float s = sin_tab[pair];
+    float r0 = c * v0n - s * v1n;
+    float r1 = s * v0n + c * v1n;
+
+    // 7-comparison midpoint lookup for idx0
+    uint idx0 = 0;
+    if (r0 > midpoints[0]) idx0++;
+    if (r0 > midpoints[1]) idx0++;
+    if (r0 > midpoints[2]) idx0++;
+    if (r0 > midpoints[3]) idx0++;
+    if (r0 > midpoints[4]) idx0++;
+    if (r0 > midpoints[5]) idx0++;
+    if (r0 > midpoints[6]) idx0++;
+
+    // 7-comparison midpoint lookup for idx1
+    uint idx1 = 0;
+    if (r1 > midpoints[0]) idx1++;
+    if (r1 > midpoints[1]) idx1++;
+    if (r1 > midpoints[2]) idx1++;
+    if (r1 > midpoints[3]) idx1++;
+    if (r1 > midpoints[4]) idx1++;
+    if (r1 > midpoints[5]) idx1++;
+    if (r1 > midpoints[6]) idx1++;
+
+    // Write indices to shared memory
+    idx_shared[j0] = idx0;
+    idx_shared[j1] = idx1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Phase 4: Thread 0 computes corrected norm, packs, writes output ---
+    if (pair == 0) {
+        float grp_norm = (inv_norm_shared[0] > 1e-10f) ? 1.0f / inv_norm_shared[0] : 0.0f;
+
+        // Compute recon norm from indices
+        float total_recon_sq = 0.0f;
+        for (uint p2 = 0; p2 < n_pairs; p2++) {
+            uint i0 = idx_shared[p2 * 2];
+            uint i1 = idx_shared[p2 * 2 + 1];
+            total_recon_sq += centroids[i0] * centroids[i0] + centroids[i1] * centroids[i1];
+        }
+        float recon_norm = sqrt(max(total_recon_sq, 1e-20f));
+        float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+
+        // Pack indices: qs[] + signs[]
+        uint out_base = row * packed_last;
+        for (uint b4 = 0; b4 < qs_size; b4++) {
+            uint byte_val = 0;
+            uint base_j = b4 * 4;
+            byte_val |= (idx_shared[base_j + 0] & 3u) << 0u;
+            byte_val |= (idx_shared[base_j + 1] & 3u) << 2u;
+            byte_val |= (idx_shared[base_j + 2] & 3u) << 4u;
+            byte_val |= (idx_shared[base_j + 3] & 3u) << 6u;
+            packed_out[out_base + b4] = byte_val;
+        }
+        for (uint b8 = 0; b8 < signs_size; b8++) {
+            uint byte_val = 0;
+            uint base_j = b8 * 8;
+            byte_val |= ((idx_shared[base_j + 0] >> 2u) & 1u) << 0u;
+            byte_val |= ((idx_shared[base_j + 1] >> 2u) & 1u) << 1u;
+            byte_val |= ((idx_shared[base_j + 2] >> 2u) & 1u) << 2u;
+            byte_val |= ((idx_shared[base_j + 3] >> 2u) & 1u) << 3u;
+            byte_val |= ((idx_shared[base_j + 4] >> 2u) & 1u) << 4u;
+            byte_val |= ((idx_shared[base_j + 5] >> 2u) & 1u) << 5u;
+            byte_val |= ((idx_shared[base_j + 6] >> 2u) & 1u) << 6u;
+            byte_val |= ((idx_shared[base_j + 7] >> 2u) & 1u) << 7u;
+            packed_out[out_base + qs_size + b8] = byte_val;
+        }
+
+        norms_out[row] = (NT)(corrected_norm);
+    }
+"""
+
+
+def _build_quant_kernel():
+    global _QUANT_KERNEL
+    if _QUANT_KERNEL is None:
+        _QUANT_KERNEL = mx.fast.metal_kernel(
+            name="planarquant3_quantize_packed",
+            input_names=["input_row", "cos_tab", "sin_tab", "centroids", "midpoints"],
+            output_names=["packed_out", "norms_out"],
+            source=_QUANT_SOURCE,
+        )
+    return _QUANT_KERNEL
 
 
 def dequantize_fused(
@@ -414,3 +549,64 @@ def fused_quantized_sdpa(
     )[0]
 
     return out_flat.reshape((b, h_q, 1, d)).astype(queries.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Public API: quantize_fused
+# ---------------------------------------------------------------------------
+
+
+def quantize_fused(
+    x: mx.array,
+    out_dtype: mx.Dtype = mx.float16,
+) -> tuple[mx.array, mx.array]:
+    """Fused Metal kernel quantize for PlanarQuant3.
+
+    Args:
+        x: shape ``(..., D)``, any float dtype.
+        out_dtype: norm dtype (fp16 or fp32).
+
+    Returns:
+        packed: shape ``(..., packed_last)``, dtype ``uint8``.
+        norms:  shape ``(..., 1)``, dtype ``out_dtype``.
+    """
+    d = x.shape[-1]
+    if d % 2 != 0:
+        raise ValueError(f"Last dim {d} must be even for PlanarQuant")
+    n_pairs = d // 2
+    qs_size = d // 4
+    signs_size = d // 8
+    packed_last = qs_size + signs_size
+
+    batch_shape = tuple(x.shape[:-1])
+    n = 1
+    for s in batch_shape:
+        n *= int(s)
+
+    input_flat = x.astype(mx.float32).reshape((n, d))
+
+    cos_tab, sin_tab = cos_sin_mx(n_pairs)
+    centroids = centroids_mx()
+    midpoints = midpoints_mx()
+
+    kernel = _build_quant_kernel()
+
+    packed_out, norms_out = kernel(
+        inputs=[input_flat, cos_tab, sin_tab, centroids, midpoints],
+        template=[
+            ("NT", out_dtype),
+            ("D", d),
+            ("n_pairs", n_pairs),
+            ("qs_size", qs_size),
+            ("signs_size", signs_size),
+            ("packed_last", packed_last),
+        ],
+        grid=(n_pairs, 1, n),
+        threadgroup=(n_pairs, 1, 1),
+        output_shapes=[(n, packed_last), (n, 1)],
+        output_dtypes=[mx.uint8, out_dtype],
+    )
+
+    packed = packed_out.reshape((*batch_shape, packed_last))
+    norms = norms_out.reshape((*batch_shape, 1))
+    return packed, norms
