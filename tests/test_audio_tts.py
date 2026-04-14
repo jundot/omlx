@@ -329,15 +329,18 @@ class TestTTSVoiceRouting:
 
     @pytest.fixture
     def _run_synthesize(self):
-        """Helper: run TTSEngine.synthesize and return the kwargs passed to generate()."""
+        """Helper: run TTSEngine.synthesize and return the kwargs passed to generate().
+
+        Uses a plain FakeModel (not MagicMock) so that hasattr() checks for
+        generate_voice_design work correctly — MagicMock auto-creates attributes.
+        """
         import asyncio
         from omlx.engine.tts import TTSEngine
 
-        def _run(generate_sig_params, voice_value=None, instructions_value=None):
+        def _run(generate_sig_params, voice_value=None, instructions_value=None,
+                 has_voice_design=False, **synth_kwargs):
             engine = TTSEngine("test-model")
 
-            # Build a mock model whose generate() has the requested signature
-            mock_model = MagicMock()
             import inspect
             sig_params = {
                 "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
@@ -345,20 +348,35 @@ class TestTTSVoiceRouting:
             }
             for p in generate_sig_params:
                 sig_params[p] = inspect.Parameter(p, inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None)
-            mock_model.generate = MagicMock()
-            mock_model.generate.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
-            mock_model.generate.return_value = []  # no audio chunks
 
-            engine._model = mock_model
+            generate_mock = MagicMock()
+            generate_mock.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
+            generate_mock.return_value = []  # no audio chunks
+
+            # Plain object — hasattr only returns True for explicitly set attrs
+            class FakeModel:
+                pass
+
+            fake_model = FakeModel()
+            fake_model.generate = generate_mock
+
+            if has_voice_design:
+                vd_mock = MagicMock(return_value=[])
+                fake_model.generate_voice_design = vd_mock
+
+            engine._model = fake_model
 
             try:
                 asyncio.run(engine.synthesize(
                     "Hello", voice=voice_value, instructions=instructions_value,
+                    **synth_kwargs,
                 ))
             except RuntimeError:
                 pass  # "no audio output" is expected with empty generate
 
-            return mock_model.generate.call_args
+            if has_voice_design and instructions_value is not None:
+                return fake_model.generate_voice_design.call_args
+            return fake_model.generate.call_args
 
         return _run
 
@@ -428,7 +446,6 @@ class TestTTSVoiceClonePassthrough:
         def _run(ref_audio_path=None, ref_text=None):
             engine = TTSEngine("test-model")
 
-            mock_model = MagicMock()
             import inspect
             sig_params = {
                 "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
@@ -437,11 +454,18 @@ class TestTTSVoiceClonePassthrough:
                 "ref_audio": inspect.Parameter("ref_audio", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
                 "ref_text": inspect.Parameter("ref_text", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
             }
-            mock_model.generate = MagicMock()
-            mock_model.generate.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
-            mock_model.generate.return_value = []
 
-            engine._model = mock_model
+            generate_mock = MagicMock()
+            generate_mock.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
+            generate_mock.return_value = []
+
+            class FakeModel:
+                pass
+
+            fake_model = FakeModel()
+            fake_model.generate = generate_mock
+
+            engine._model = fake_model
 
             try:
                 asyncio.run(engine.synthesize(
@@ -450,7 +474,7 @@ class TestTTSVoiceClonePassthrough:
             except RuntimeError:
                 pass  # "no audio output" expected
 
-            return mock_model.generate.call_args
+            return fake_model.generate.call_args
 
         return _run
 
@@ -626,6 +650,213 @@ class TestTTSVoiceCloneEndpoint:
         if synthesize.called:
             call_kwargs = synthesize.call_args.kwargs
             assert call_kwargs.get("ref_audio") is None
+
+
+# ---------------------------------------------------------------------------
+# TestTTSVoiceDesign — VoiceDesign path detection and routing
+# ---------------------------------------------------------------------------
+
+
+class TestTTSVoiceDesign:
+    """Verify VoiceDesign path: generate_voice_design() is called when available."""
+
+    def test_voicedesign_path_called(self, _run_synthesize_vd):
+        """When model has generate_voice_design and instructions given, use VD path."""
+        call = _run_synthesize_vd(instructions="female, calm, slow")
+        assert call is not None
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("text") == "Hello"
+        assert kwargs.get("instruct") == "female, calm, slow"
+
+    def test_voicedesign_not_called_without_instructions(self, _run_synthesize_vd):
+        """Without instructions, standard generate() is used even with VD model."""
+        call = _run_synthesize_vd(instructions=None)
+        # Should be None because generate_voice_design was not called
+        assert call is None
+
+    def test_voicedesign_gen_params_forwarded(self, _run_synthesize_vd):
+        """Generation params are forwarded to generate_voice_design()."""
+        call = _run_synthesize_vd(
+            instructions="male, deep",
+            temperature=0.8,
+            top_k=30,
+        )
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("temperature") == 0.8
+        assert kwargs.get("top_k") == 30
+
+    @pytest.fixture
+    def _run_synthesize_vd(self):
+        """Helper: run synthesize on a VoiceDesign-capable model."""
+        import asyncio
+        from omlx.engine.tts import TTSEngine
+
+        def _run(instructions=None, **gen_params):
+            engine = TTSEngine("test-vd-model")
+
+            class FakeModel:
+                pass
+
+            fake_model = FakeModel()
+
+            # Standard generate with basic sig
+            import inspect
+            sig_params = {
+                "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                "verbose": inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
+            }
+            gen_mock = MagicMock()
+            gen_mock.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
+            gen_mock.return_value = []
+            fake_model.generate = gen_mock
+
+            # VoiceDesign method
+            vd_mock = MagicMock(return_value=[])
+            fake_model.generate_voice_design = vd_mock
+
+            engine._model = fake_model
+
+            try:
+                asyncio.run(engine.synthesize(
+                    "Hello", instructions=instructions, **gen_params,
+                ))
+            except RuntimeError:
+                pass
+
+            if vd_mock.called:
+                return vd_mock.call_args
+            return None
+
+        return _run
+
+
+# ---------------------------------------------------------------------------
+# TestTTSGenerationParams — generation param passthrough to standard path
+# ---------------------------------------------------------------------------
+
+
+class TestTTSGenerationParams:
+    """Verify generation params are forwarded to model.generate()."""
+
+    def test_temperature_forwarded(self, _run_synthesize):
+        """temperature is passed to generate()."""
+        call = _run_synthesize(["voice"], temperature=0.9)
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("temperature") == 0.9
+
+    def test_top_k_forwarded(self, _run_synthesize):
+        """top_k is passed to generate()."""
+        call = _run_synthesize(["voice"], top_k=50)
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("top_k") == 50
+
+    def test_top_p_forwarded(self, _run_synthesize):
+        """top_p is passed to generate()."""
+        call = _run_synthesize(["voice"], top_p=0.95)
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("top_p") == 0.95
+
+    def test_repetition_penalty_forwarded(self, _run_synthesize):
+        """repetition_penalty is passed to generate()."""
+        call = _run_synthesize(["voice"], repetition_penalty=1.05)
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("repetition_penalty") == 1.05
+
+    def test_max_tokens_forwarded(self, _run_synthesize):
+        """max_tokens is passed to generate()."""
+        call = _run_synthesize(["voice"], max_tokens=2048)
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("max_tokens") == 2048
+
+    def test_none_params_not_forwarded(self, _run_synthesize):
+        """None generation params are not included in kwargs."""
+        call = _run_synthesize(["voice"])
+        kwargs = call.kwargs if call else {}
+        for key in ("temperature", "top_k", "top_p", "repetition_penalty", "max_tokens"):
+            assert key not in kwargs
+
+    @pytest.fixture
+    def _run_synthesize(self):
+        """Reuse voice routing fixture pattern for gen param tests."""
+        import asyncio
+        from omlx.engine.tts import TTSEngine
+
+        def _run(generate_sig_params, **synth_kwargs):
+            engine = TTSEngine("test-model")
+
+            import inspect
+            sig_params = {
+                "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                "verbose": inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
+            }
+            for p in generate_sig_params:
+                sig_params[p] = inspect.Parameter(p, inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None)
+
+            generate_mock = MagicMock()
+            generate_mock.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
+            generate_mock.return_value = []
+
+            class FakeModel:
+                pass
+
+            fake_model = FakeModel()
+            fake_model.generate = generate_mock
+            engine._model = fake_model
+
+            try:
+                asyncio.run(engine.synthesize("Hello", **synth_kwargs))
+            except RuntimeError:
+                pass
+
+            return fake_model.generate.call_args
+
+        return _run
+
+
+# ---------------------------------------------------------------------------
+# TestTTSGenParamsEndpoint — generation params accepted via API
+# ---------------------------------------------------------------------------
+
+
+class TestTTSGenParamsEndpoint:
+    """Verify generation params are accepted and forwarded by the endpoint."""
+
+    def test_gen_params_forwarded_to_synthesize(self, server_tts_client):
+        """Generation params from request body reach engine.synthesize()."""
+        client, mock_pool = server_tts_client
+        client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Hello",
+                "temperature": 0.8,
+                "top_k": 30,
+                "top_p": 0.95,
+                "repetition_penalty": 1.1,
+                "max_tokens": 1024,
+            },
+        )
+        synthesize: AsyncMock = mock_pool.get_engine.return_value.synthesize
+        assert synthesize.called
+        call_kwargs = synthesize.call_args.kwargs
+        assert call_kwargs.get("temperature") == 0.8
+        assert call_kwargs.get("top_k") == 30
+        assert call_kwargs.get("top_p") == 0.95
+        assert call_kwargs.get("repetition_penalty") == 1.1
+        assert call_kwargs.get("max_tokens") == 1024
+
+    def test_gen_params_default_none(self, server_tts_client):
+        """Without gen params in request, they're passed as None."""
+        client, mock_pool = server_tts_client
+        client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hello"},
+        )
+        synthesize: AsyncMock = mock_pool.get_engine.return_value.synthesize
+        assert synthesize.called
+        call_kwargs = synthesize.call_args.kwargs
+        assert call_kwargs.get("temperature") is None
+        assert call_kwargs.get("top_k") is None
 
 
 # ---------------------------------------------------------------------------
