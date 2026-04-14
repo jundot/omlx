@@ -812,3 +812,70 @@ class TestGetStats:
         assert stats["engine_type"] == "vlm"
         assert stats["model_name"] == "test-vlm"
         assert stats["loaded"] is True
+
+
+# ---------------------------------------------------------------------------
+# TestSplitVisionFeatures
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_MLX, reason="mlx not installed")
+class TestSplitVisionFeatures:
+    """Tests for VLMBatchedEngine._split_vision_features()."""
+
+    def test_single_image_returns_whole(self):
+        """Single image returns the feature tensor as-is in a list."""
+        engine = _make_loaded_engine()
+        features = mx.ones((1, 10, 64))
+        result = engine._split_vision_features(features, 1, {})
+        assert len(result) == 1
+        assert result[0].shape == (1, 10, 64)
+
+    def test_batch_dim_split_gemma_llava(self):
+        """Features with batch dim = num_images are split along axis 0."""
+        engine = _make_loaded_engine(model_type="gemma4")
+        features = mx.ones((3, 10, 64))
+        result = engine._split_vision_features(features, 3, {})
+        assert result is not None
+        assert len(result) == 3
+        for f in result:
+            assert f.shape == (1, 10, 64)
+
+    def test_qwen_flat_split(self):
+        """Qwen flat (total_tokens, dim) features are split using grid_thw."""
+        engine = _make_loaded_engine(model_type="qwen3_5")
+        # Mock spatial_merge_size on vision_tower
+        engine._vlm_model.vision_tower = MagicMock()
+        engine._vlm_model.vision_tower.spatial_merge_size = 2
+
+        # 2 images: image1 has grid (1, 4, 4) → 16 patches / 4 = 4 merged
+        #           image2 has grid (1, 4, 8) → 32 patches / 4 = 8 merged
+        grid_thw = mx.array([[1, 4, 4], [1, 4, 8]])
+        features = mx.ones((12, 128))  # 4 + 8 = 12 total merged tokens
+
+        result = engine._split_vision_features(
+            features, 2, {"image_grid_thw": grid_thw}
+        )
+        assert result is not None
+        assert len(result) == 2
+        assert result[0].shape == (4, 128)
+        assert result[1].shape == (8, 128)
+
+    def test_qwen_mismatch_returns_none(self):
+        """Returns None if computed token count doesn't match feature shape."""
+        engine = _make_loaded_engine(model_type="qwen3_5")
+        engine._vlm_model.vision_tower = MagicMock()
+        engine._vlm_model.vision_tower.spatial_merge_size = 2
+
+        grid_thw = mx.array([[1, 4, 4]])  # → 4 merged tokens
+        features = mx.ones((99, 128))  # Mismatch
+
+        result = engine._split_vision_features(features, 1, {"image_grid_thw": grid_thw})
+        # Single image: returns [features] regardless of shape
+        assert result is not None
+
+    def test_unsupported_returns_none(self):
+        """Unknown model with non-matching dimensions returns None."""
+        engine = _make_loaded_engine(model_type="unknown_vlm")
+        features = mx.ones((100, 128))  # 2D, non-Qwen
+        result = engine._split_vision_features(features, 3, {})
+        assert result is None

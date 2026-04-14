@@ -37,6 +37,7 @@ from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..models.vlm import VLMModelAdapter
 from ..utils.image import (
     compute_image_hash,
+    compute_per_image_hashes,
     extract_images_from_messages,
 )
 from ..utils.tokenizer import get_tokenizer_config
@@ -910,6 +911,55 @@ class VLMBatchedEngine(BaseEngine):
         # Unsupported model: skip caching
         return None
 
+    def _split_vision_features(
+        self,
+        features: mx.array,
+        num_images: int,
+        extra_model_inputs: dict,
+    ) -> Optional[List[mx.array]]:
+        """Split batched vision features into per-image tensors for caching.
+
+        Returns a list of per-image feature tensors, or None if the model
+        architecture does not support splitting.
+        """
+        if num_images <= 1:
+            return [features]
+
+        model_type = self.model_type or ""
+
+        # Gemma4 / LLaVA: batch dimension = number of images
+        if features.ndim >= 3 and features.shape[0] == num_images:
+            return [features[i : i + 1] for i in range(num_images)]
+
+        # Qwen: flat (total_merged_tokens, dim) → split using grid_thw
+        if model_type in _QWEN_VISION_MODELS and features.ndim == 2:
+            grid_thw = extra_model_inputs.get("image_grid_thw")
+            if grid_thw is None:
+                return None
+            spatial_merge_size = getattr(
+                self._vlm_model.vision_tower, "spatial_merge_size", 2
+            )
+            merge_sq = spatial_merge_size ** 2
+            per_image_tokens = []
+            for i in range(num_images):
+                t, h, w = int(grid_thw[i, 0]), int(grid_thw[i, 1]), int(grid_thw[i, 2])
+                per_image_tokens.append((t * h * w) // merge_sq)
+            if sum(per_image_tokens) != features.shape[0]:
+                logger.debug(
+                    "Per-image token count mismatch: expected %d, got %d",
+                    sum(per_image_tokens),
+                    features.shape[0],
+                )
+                return None
+            result = []
+            offset = 0
+            for count in per_image_tokens:
+                result.append(features[offset : offset + count])
+                offset += count
+            return result
+
+        return None
+
     def _prepare_vision_inputs(
         self,
         messages: list[dict[str, Any]],
@@ -1062,52 +1112,61 @@ class VLMBatchedEngine(BaseEngine):
         image_cache_key_start = 0
         image_cache_key_ranges: list[Tuple[int, str]] = []
         if image_message_ranges:
-            prefix_template_kwargs = {
-                "tokenize": False,
-                "add_generation_prompt": False,
-            }
-            if self._enable_thinking is not None:
-                prefix_template_kwargs["enable_thinking"] = self._enable_thinking
-            if tools:
-                prefix_template_kwargs["tools"] = tools
-            if chat_template_kwargs:
-                prefix_template_kwargs.update(chat_template_kwargs)
+            try:
+                prefix_template_kwargs = {
+                    "tokenize": False,
+                    "add_generation_prompt": False,
+                }
+                if self._enable_thinking is not None:
+                    prefix_template_kwargs["enable_thinking"] = self._enable_thinking
+                if tools:
+                    prefix_template_kwargs["tools"] = tools
+                if chat_template_kwargs:
+                    prefix_template_kwargs.update(chat_template_kwargs)
 
-            images_consumed = 0
-            for msg_idx, msg_num_images in image_message_ranges:
-                prefix_messages = formatted_messages[:msg_idx]
-                boundary_tokens = 0
-                if prefix_messages:
-                    try:
-                        prefix_prompt = template_target.apply_chat_template(
-                            prefix_messages, **prefix_template_kwargs
+                images_consumed = 0
+                for msg_idx, msg_num_images in image_message_ranges:
+                    prefix_messages = formatted_messages[:msg_idx]
+                    boundary_tokens = 0
+                    if prefix_messages:
+                        try:
+                            prefix_prompt = template_target.apply_chat_template(
+                                prefix_messages, **prefix_template_kwargs
+                            )
+                        except TypeError:
+                            local_kwargs = dict(prefix_template_kwargs)
+                            if chat_template_kwargs:
+                                for key in chat_template_kwargs:
+                                    local_kwargs.pop(key, None)
+                            local_kwargs.pop("enable_thinking", None)
+                            prefix_prompt = template_target.apply_chat_template(
+                                prefix_messages, **local_kwargs
+                            )
+                        prefix_inputs = prepare_inputs(
+                            self._processor,
+                            images=images[:images_consumed] if images_consumed > 0 else None,
+                            prompts=[prefix_prompt] if isinstance(prefix_prompt, str) else prefix_prompt,
                         )
-                    except TypeError:
-                        local_kwargs = dict(prefix_template_kwargs)
-                        if chat_template_kwargs:
-                            for key in chat_template_kwargs:
-                                local_kwargs.pop(key, None)
-                        local_kwargs.pop("enable_thinking", None)
-                        prefix_prompt = template_target.apply_chat_template(
-                            prefix_messages, **local_kwargs
+                        prefix_ids = prefix_inputs["input_ids"]
+                        boundary_tokens = (
+                            len(prefix_ids[0].tolist())
+                            if prefix_ids.ndim > 1
+                            else len(prefix_ids.tolist())
                         )
-                    prefix_inputs = prepare_inputs(
-                        self._processor,
-                        images=images[:images_consumed] if images_consumed > 0 else None,
-                        prompts=[prefix_prompt] if isinstance(prefix_prompt, str) else prefix_prompt,
-                    )
-                    prefix_ids = prefix_inputs["input_ids"]
-                    boundary_tokens = (
-                        len(prefix_ids[0].tolist())
-                        if prefix_ids.ndim > 1
-                        else len(prefix_ids.tolist())
-                    )
 
-                images_consumed += msg_num_images
-                cumulative_hash = compute_image_hash(images[:images_consumed])
-                image_cache_key_ranges.append((boundary_tokens, cumulative_hash))
+                    images_consumed += msg_num_images
+                    cumulative_hash = compute_image_hash(images[:images_consumed])
+                    image_cache_key_ranges.append((boundary_tokens, cumulative_hash))
 
-            image_cache_key_start = image_cache_key_ranges[0][0]
+                image_cache_key_start = image_cache_key_ranges[0][0]
+            except Exception:
+                logger.debug(
+                    "Failed to compute segmented VLM cache boundaries, "
+                    "falling back to whole-request keying",
+                    exc_info=True,
+                )
+                image_cache_key_start = 0
+                image_cache_key_ranges = []
 
         # Extract additional model-specific inputs (filter None values
         # since prepare_inputs may include them after mlx-vlm 348466f)
@@ -1119,33 +1178,56 @@ class VLMBatchedEngine(BaseEngine):
         }
 
         if pixel_values is not None and num_images > 0:
-            # Compute image hash FIRST for vision feature cache lookup
+            # Compute whole-request image hash (used for KV prefix cache keying)
             image_hash = compute_image_hash(images)
 
             # Build call kwargs from extra_model_inputs
             call_kwargs = dict(extra_model_inputs)
 
-            # Try vision feature cache
-            if self._vision_cache is not None and self._vision_cache_enabled and image_hash:
-                cached_features = self._vision_cache.get(image_hash, self._model_name)
-                if cached_features is not None:
-                    call_kwargs["cached_image_features"] = cached_features
-                    logger.debug("Vision feature cache hit: %s", image_hash[:16])
+            # Try per-image vision feature cache
+            if self._vision_cache is not None and self._vision_cache_enabled:
+                per_hashes = compute_per_image_hashes(images)
+                cached_per_image = [
+                    self._vision_cache.get(h, self._model_name) for h in per_hashes
+                ]
+
+                if all(f is not None for f in cached_per_image):
+                    # All images cached individually — combine and use
+                    combined = mx.concatenate(cached_per_image, axis=0)
+                    call_kwargs["cached_image_features"] = combined
+                    logger.debug(
+                        "Vision feature cache hit (per-image): all %d images cached",
+                        num_images,
+                    )
                 else:
+                    # Some or all uncached — compute all, then cache per-image
                     try:
                         features = self._compute_vision_features(
                             pixel_values, extra_model_inputs
                         )
                         if features is not None:
                             mx.eval(features)
-                            self._vision_cache.put(
-                                image_hash, self._model_name, features
-                            )
                             call_kwargs["cached_image_features"] = features
-                            logger.debug(
-                                "Vision feature cache miss, stored: %s",
-                                image_hash[:16],
+                            # Split and cache each image individually
+                            per_features = self._split_vision_features(
+                                features, num_images, extra_model_inputs
                             )
+                            if per_features is not None:
+                                for h, f in zip(per_hashes, per_features):
+                                    self._vision_cache.put(h, self._model_name, f)
+                                logger.debug(
+                                    "Vision feature cache miss, stored %d per-image entries",
+                                    len(per_features),
+                                )
+                            else:
+                                # Split unsupported for this model — store whole-request
+                                self._vision_cache.put(
+                                    image_hash, self._model_name, features
+                                )
+                                logger.debug(
+                                    "Vision feature cache miss, stored whole-request: %s",
+                                    image_hash[:16],
+                                )
                     except Exception:
                         logger.debug(
                             "Vision feature computation failed, using full pipeline",

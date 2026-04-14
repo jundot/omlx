@@ -147,6 +147,29 @@ class Request:
     vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = None  # [(token_start, cumulative_image_hash)]
     rope_deltas: float = 0.0  # Per-request mRoPE position delta (set after VLM prefill)
 
+    @property
+    def vlm_extra_keys_for_cache(self) -> Optional[Tuple[str, ...]]:
+        """Whole-request image hash wrapped as extra_keys tuple."""
+        if self.vlm_image_hash:
+            return (self.vlm_image_hash,)
+        return None
+
+    @property
+    def vlm_extra_key_token_start_for_cache(self) -> Optional[int]:
+        """Token index where image-specific cache keying begins."""
+        if self.vlm_image_hash:
+            return self.vlm_cache_key_start
+        return None
+
+    @property
+    def vlm_extra_key_ranges_for_cache(
+        self,
+    ) -> Optional[List[Tuple[int, Tuple[str, ...]]]]:
+        """Segmented VLM cache key ranges for per-image-turn keying."""
+        if not self.vlm_cache_key_ranges:
+            return None
+        return [(start, (image_hash,)) for start, image_hash in self.vlm_cache_key_ranges]
+
     # Metadata
     finish_reason: Optional[str] = None
 

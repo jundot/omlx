@@ -10,6 +10,7 @@ from PIL import Image
 
 from omlx.utils.image import (
     compute_image_hash,
+    compute_per_image_hashes,
     extract_images_from_messages,
     load_image,
 )
@@ -296,3 +297,31 @@ class TestComputeImageHash:
         result = compute_image_hash(images)
         assert isinstance(result, str)
         assert len(result) == 64
+
+
+class TestComputePerImageHashes:
+    """Tests for compute_per_image_hashes()."""
+
+    def test_returns_one_hash_per_image(self):
+        """Returns a list with the same length as the input."""
+        images = [_make_test_image(4, 4, c) for c in ("red", "green", "blue")]
+        hashes = compute_per_image_hashes(images)
+        assert len(hashes) == 3
+        assert all(isinstance(h, str) and len(h) == 64 for h in hashes)
+
+    def test_per_image_matches_single_compute(self):
+        """Each per-image hash matches compute_image_hash([single_image])."""
+        images = [_make_test_image(4, 4, c) for c in ("red", "green")]
+        per_hashes = compute_per_image_hashes(images)
+        for img, h in zip(images, per_hashes):
+            assert h == compute_image_hash([img])
+
+    def test_different_images_different_hashes(self):
+        """Different images produce different per-image hashes."""
+        images = [_make_test_image(4, 4, "red"), _make_test_image(4, 4, "blue")]
+        hashes = compute_per_image_hashes(images)
+        assert hashes[0] != hashes[1]
+
+    def test_empty_returns_empty(self):
+        """Empty list returns empty list."""
+        assert compute_per_image_hashes([]) == []
