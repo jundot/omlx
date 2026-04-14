@@ -1249,6 +1249,30 @@ async def delete_sub_key(
 
 
 # =============================================================================
+# Grammar API Routes
+# =============================================================================
+
+
+@router.get("/api/grammar/parsers")
+async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
+    """Return available reasoning parser names from xgrammar.
+
+    Queries ``xgrammar.get_builtin_structural_tag_supported_models()`` at
+    runtime so the list stays in sync with the installed xgrammar version.
+    """
+    try:
+        from xgrammar import get_builtin_structural_tag_supported_models
+
+        supported = get_builtin_structural_tag_supported_models()
+        return [
+            {"value": style, "label": style, "models": models}
+            for style, models in supported.items()
+        ]
+    except ImportError:
+        return []
+
+
+# =============================================================================
 # Models API Routes
 # =============================================================================
 
