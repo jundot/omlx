@@ -140,6 +140,10 @@ class PlanarQuantKVCache(_BaseCache):
         self._v_packed: mx.array | None = None
         self._v_norms: mx.array | None = None
 
+        # Cached dequantized K for fast decode (avoids re-dequant per step)
+        self._k_dequant_cache: mx.array | None = None  # (B, H_k, offset, D_k) fp16
+        self._k_dequant_offset: int = 0  # how many rows are in the cache
+
         # Shape memo
         self._B: int | None = None
         self._H_k: int | None = None
@@ -152,6 +156,10 @@ class PlanarQuantKVCache(_BaseCache):
     # ------------------------------------------------------------------
     # Buffer management
     # ------------------------------------------------------------------
+
+    def _invalidate_dequant_cache(self) -> None:
+        self._k_dequant_cache = None
+        self._k_dequant_offset = 0
 
     def _init_buffers(self, keys: mx.array, values: mx.array) -> None:
         B, H_k, _, D_k = keys.shape
@@ -266,6 +274,7 @@ class PlanarQuantKVCache(_BaseCache):
 
         self._k_fp16 = None  # Free FP16 K buffer
         self._finalized = True
+        self._invalidate_dequant_cache()
         logger.info("PlanarQuant: finalized prefill, converted to packed layout")
 
     # ------------------------------------------------------------------
@@ -301,7 +310,7 @@ class PlanarQuantKVCache(_BaseCache):
                 FP16State(self._v_fp16[..., :self.offset, :]),
             )
 
-        # Quantized mode: pack on insertion
+        # Quantized mode: pack K on insertion + update dequant cache
         self._grow_packed(new_end)
         assert self._k_packed is not None
         assert self._k_norms is not None
@@ -309,6 +318,20 @@ class PlanarQuantKVCache(_BaseCache):
         k_packed, k_norm = _quantize(keys)
         self._k_packed = self._write_slice(self._k_packed, k_packed, self.offset)
         self._k_norms = self._write_slice(self._k_norms, k_norm, self.offset)
+
+        # Update dequant cache: append new FP16 K rows
+        if self._k_dequant_cache is not None and self._k_dequant_offset == self.offset:
+            # Cache is current — just append
+            L = keys.shape[2]
+            k_new = keys.astype(mx.float16)
+            if self._k_dequant_cache.shape[2] < new_end:
+                # Need to grow the cache buffer
+                B, H_k, _, D_k = self._k_dequant_cache.shape
+                new_cache = mx.zeros((B, H_k, self._cap, D_k), dtype=mx.float16)
+                new_cache[..., :self.offset, :] = self._k_dequant_cache[..., :self.offset, :]
+                self._k_dequant_cache = new_cache
+            self._k_dequant_cache[..., self.offset:new_end, :] = k_new
+            self._k_dequant_offset = new_end
 
         if self.quantize_v:
             assert self._v_packed is not None
@@ -397,6 +420,32 @@ class PlanarQuantKVCache(_BaseCache):
 
         return keys, values
 
+    def _get_dequant_k(self, out_dtype: mx.Dtype = mx.float16) -> mx.array:
+        """Get dequantized K, using cache if available to avoid re-dequant."""
+        if self._k_dequant_cache is not None and self._k_dequant_offset == self.offset:
+            return self._k_dequant_cache[..., :self.offset, :].astype(out_dtype)
+
+        # Cache miss: dequantize from packed storage
+        assert self._k_packed is not None
+        assert self._k_norms is not None
+        assert self._D_k is not None
+        B, H_k = self._B, self._H_k
+        cap = self._cap
+
+        k_dq = dequantize_fused(
+            self._k_packed[..., :self.offset, :],
+            self._k_norms[..., :self.offset, :],
+            out_dtype=mx.float16,
+        )
+
+        # Cache the result in a growable buffer
+        cache = mx.zeros((B, H_k, cap, self._D_k), dtype=mx.float16)
+        cache[..., :self.offset, :] = k_dq.astype(mx.float16)
+        self._k_dequant_cache = cache
+        self._k_dequant_offset = self.offset
+
+        return k_dq.astype(out_dtype)
+
     def decode_attention(
         self,
         queries: mx.array,
@@ -423,10 +472,10 @@ class PlanarQuantKVCache(_BaseCache):
                 scale=scale,
             )
 
-        # Mixed: K=PlanarQuant, V=FP16 → dequant K only, then SDPA
+        # Mixed: K=PlanarQuant, V=FP16 → use cached dequant K for fast decode
         if isinstance(keys_state, PlanarQuantState) and isinstance(values_state, FP16State):
             out_dtype = queries.dtype if queries.dtype in (mx.float16, mx.float32) else mx.float16
-            keys, _ = self.dequantize(keys_state, values_state, out_dtype=out_dtype)
+            keys = self._get_dequant_k(out_dtype=out_dtype)
             values = values_state.tensor
             if queries.dtype != out_dtype:
                 keys = keys.astype(queries.dtype)
@@ -478,6 +527,7 @@ class PlanarQuantKVCache(_BaseCache):
     def trim(self, n: int) -> int:
         n = min(self.offset, max(0, int(n)))
         self.offset -= n
+        self._invalidate_dequant_cache()
         return n
 
     def make_mask(self, *args, **kwargs):
@@ -531,6 +581,7 @@ class PlanarQuantKVCache(_BaseCache):
             self._v_norms = None
             self.offset = 0
             self._finalized = True
+            self._invalidate_dequant_cache()
             return
         k_tensor, v_tensor = value
         if k_tensor is None:
