@@ -249,7 +249,14 @@ def _find_target_python() -> str:
         str(BUILD_DIR / f"cpython-{target_minor}" / "bin" / f"python{target_minor}"),
     ]
     for path in candidates:
-        if path and Path(path).exists():
+        if not path or not Path(path).exists():
+            continue
+        # Skip interpreters without pip (e.g. venvstacks runtimes strip it)
+        check = subprocess.run(
+            [path, "-m", "pip", "--version"],
+            capture_output=True,
+        )
+        if check.returncode == 0:
             return path
 
     print(f"  Warning: python{target_minor} not found, using {sys.executable}")
