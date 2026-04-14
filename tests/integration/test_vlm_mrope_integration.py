@@ -843,11 +843,6 @@ def test_vlm_mrope_integration(model_path):
     from omlx.patches.gated_delta_advance import apply_gated_delta_advance_patch
 
     _patch_video_processor_bug()
-    try:
-        from omlx.engine.vlm import _patch_gemma4_batched_decode
-        _patch_gemma4_batched_decode()
-    except ImportError:
-        pass
 
     try:
         from mlx_vlm.utils import load as vlm_load

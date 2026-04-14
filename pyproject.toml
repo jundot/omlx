@@ -61,8 +61,8 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (23e1dff) - Gemma 4 multi-image fix + nested tool parser
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@23e1dffd224488141a4f022b6d21d6a730f11507",
+    # mlx-vlm from commit (3472132) - TQ race fix, Gemma 4 offset/projection/audio fixes
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@3472132fe6ee7beeae2c2fc35923eaed2e734b3d",
     "Pillow>=9.0.0",
     # dflash-mlx from commit (fc7101b) — block diffusion speculative decoding
     "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@fc7101b0aa70c60f0754f50a7a10a82c2cdc1a92",

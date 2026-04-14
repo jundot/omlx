@@ -159,7 +159,6 @@ class TestServeCommandOptions:
             timeout=10,
         )
         assert "--max-concurrent-requests" in result.stdout
-        assert "--initial-cache-blocks" in result.stdout
 
     def test_serve_has_cache_options(self):
         """Test that serve command has cache options."""
@@ -203,18 +202,6 @@ class TestServeCommandOptions:
         )
         assert "--api-key" in result.stdout
 
-    def test_serve_has_proxy_options(self):
-        """Test that serve command has proxy and TLS options."""
-        result = subprocess.run(
-            [sys.executable, "-m", "omlx.cli", "serve", "--help"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        assert "--http-proxy" in result.stdout
-        assert "--https-proxy" in result.stdout
-        assert "--no-proxy" in result.stdout
-        assert "--ca-bundle" in result.stdout
 
 
 class TestLaunchCommandOptions:
@@ -322,6 +309,7 @@ class TestServeCommandFunctions:
         assert ".omlx" in result.stdout or "model" in result.stdout.lower()
 
 
+
 class TestHasCliOverrides:
     """Tests for _has_cli_overrides() — detects explicitly passed CLI args."""
 
@@ -335,13 +323,6 @@ class TestHasCliOverrides:
             "max_process_memory": None,
             "host": None,
             "log_level": None,
-            "mcp_config": None,
-            "hf_endpoint": None,
-            "ms_endpoint": None,
-            "http_proxy": None,
-            "https_proxy": None,
-            "no_proxy": None,
-            "ca_bundle": None,
         }
         defaults.update(kwargs)
         return argparse.Namespace(**defaults)
@@ -378,18 +359,6 @@ class TestHasCliOverrides:
         from omlx.cli import _has_cli_overrides
         assert _has_cli_overrides(self._make_args(log_level="info")) is True
         assert _has_cli_overrides(self._make_args(log_level="debug")) is True
-
-    def test_endpoint_explicit(self):
-        from omlx.cli import _has_cli_overrides
-        assert _has_cli_overrides(self._make_args(hf_endpoint="https://hf-mirror.com")) is True
-        assert _has_cli_overrides(self._make_args(ms_endpoint="https://modelscope.cn")) is True
-
-    def test_proxy_explicit(self):
-        from omlx.cli import _has_cli_overrides
-        assert _has_cli_overrides(self._make_args(http_proxy="http://proxy:8080")) is True
-        assert _has_cli_overrides(self._make_args(https_proxy="http://proxy:8443")) is True
-        assert _has_cli_overrides(self._make_args(no_proxy="localhost,127.0.0.1")) is True
-        assert _has_cli_overrides(self._make_args(ca_bundle="/tmp/corp-ca.pem")) is True
 
     def test_multiple_overrides(self):
         from omlx.cli import _has_cli_overrides

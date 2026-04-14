@@ -261,7 +261,7 @@ class ThinkingBudgetProcessor:
         # Accept each genuinely generated token exactly once (see grammar.py).
         n = len(tokens)
         if not hasattr(self, "_accepted_up_to"):
-            self._accepted_up_to = n + 1  # skip first append (prompt token)
+            self._accepted_up_to = n  # skip prompt tokens
         elif n > self._accepted_up_to:
             for i in range(self._accepted_up_to, n):
                 self._update_state(int(tokens[i]))

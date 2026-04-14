@@ -1,7 +1,7 @@
 """Regression tests for SpecPrefill parameter forwarding in VLM engine."""
 
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -13,6 +13,8 @@ async def test_vlm_chat_forwards_specprefill_threshold_and_keep_pct():
     """VLM chat must pass both SpecPrefill overrides through to add_request()."""
     engine = VLMBatchedEngine(model_name="test-vlm")
     engine._loaded = True
+    engine._vlm_model = MagicMock()
+    engine._vlm_model.config.model_type = "test"
     engine._tokenizer = MagicMock()
     engine._tokenizer.apply_chat_template.return_value = "<prompt>"
     engine._tokenizer.encode.side_effect = lambda text, **kwargs: list(range(max(1, len(text.split()))))
@@ -35,14 +37,19 @@ async def test_vlm_chat_forwards_specprefill_threshold_and_keep_pct():
 
     engine._engine.stream_outputs = _one_output_stream
 
-    async for _ in engine.stream_chat(
-        messages=[{"role": "user", "content": "Hello"}],
-        max_tokens=1,
-        specprefill=True,
-        specprefill_keep_pct=0.2,
-        specprefill_threshold=1024,
-    ):
-        pass
+    # Mock _process_chat_messages to skip mlx-vlm template processing
+    def _mock_process(messages, tools, kwargs):
+        return "<prompt>", None, {}, None, None, []
+
+    with patch.object(engine, "_process_chat_messages", side_effect=_mock_process):
+        async for _ in engine.stream_chat(
+            messages=[{"role": "user", "content": "Hello"}],
+            max_tokens=1,
+            specprefill=True,
+            specprefill_keep_pct=0.2,
+            specprefill_threshold=1024,
+        ):
+            pass
 
     try:
         _, kwargs = engine._engine.add_request.call_args

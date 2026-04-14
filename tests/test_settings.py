@@ -66,6 +66,7 @@ class TestServerSettings:
             "port": 8000,
             "log_level": "info",
             "cors_origins": ["*"],
+            "server_aliases": [],
         }
 
     def test_from_dict(self):
