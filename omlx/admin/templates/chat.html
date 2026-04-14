@@ -111,6 +111,8 @@
         font-size: 14px;
         line-height: 1.6;
         color: var(--text-primary);
+        overflow-x: auto;
+        min-width: 0;
     }
 
     .user-message {
@@ -141,7 +143,7 @@
     @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
 
     /* Markdown content */
-    .markdown-content { line-height: 1.6; color: var(--text-primary); }
+    .markdown-content { line-height: 1.6; color: var(--text-primary); min-width: 0; overflow-wrap: break-word; }
     .markdown-content h1, .markdown-content h2, .markdown-content h3 { font-weight: 600; margin-top: 1.5em; margin-bottom: 0.5em; color: var(--text-primary); }
     .markdown-content h1 { font-size: 1.5em; }
     .markdown-content h2 { font-size: 1.3em; }
@@ -152,6 +154,10 @@
     .markdown-content code { background-color: var(--code-bg); padding: 0.125em 0.25em; border-radius: 0.25em; font-size: 0.875em; color: var(--text-primary); }
     .markdown-content pre { background-color: var(--code-bg); border-radius: 0.5em; padding: 1em; margin: 1em 0; overflow-x: auto; }
     .markdown-content pre code { background: none; padding: 0; color: var(--text-primary); }
+    .markdown-content table { border-collapse: collapse; margin: 1em 0; font-size: 0.875em; display: block; overflow-x: auto; max-width: 100%; }
+    .markdown-content th, .markdown-content td { border: 1px solid var(--border-faint); padding: 0.5em 0.75em; text-align: left; white-space: nowrap; }
+    .markdown-content th { background: var(--bg-secondary); font-weight: 600; }
+    .markdown-content tr:nth-child(even) { background: var(--bg-secondary); }
 
     /* Code block copy button */
     .code-block-wrapper { position: relative; }
@@ -457,7 +463,7 @@
     </div>
 
     <!-- Main Content -->
-    <div class="flex-1 flex flex-col bg-surface overflow-hidden">
+    <div class="flex-1 flex flex-col bg-surface overflow-hidden min-w-0">
         <!-- Header -->
         <header class="h-14 px-4 border-b border-line flex items-center justify-between bg-surface flex-shrink-0">
             <button @click="sidebarOpen = true" class="p-2 hover:bg-surface-muted rounded-lg md:hidden" style="color: var(--text-primary);">
@@ -502,7 +508,7 @@
         </header>
 
         <!-- Messages Area -->
-        <div class="flex-1 min-h-0 overflow-y-auto custom-scrollbar" id="messagesContainer">
+        <div class="flex-1 min-h-0 overflow-y-auto overflow-x-hidden custom-scrollbar" id="messagesContainer">
             <!-- Welcome Screen -->
             <div x-show="messages.length === 0" class="h-full flex items-center justify-center" x-cloak>
                 <div class="text-center max-w-lg px-4">
