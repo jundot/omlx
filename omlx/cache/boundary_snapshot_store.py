@@ -383,6 +383,12 @@ class BoundarySnapshotSSDStore:
                     if file_path.exists():
                         self._pending_writes.pop(pw_key, None)
 
+                # Prevent unbounded growth of the cancelled set.  By the time
+                # 10 000 entries accumulate, the oldest requests' queue items
+                # have long been processed.
+                if len(self._cancelled_requests) > 10000:
+                    self._cancelled_requests.clear()
+
     def _serialize_extracted(
         self,
         extracted: List[Dict[str, Any]],
