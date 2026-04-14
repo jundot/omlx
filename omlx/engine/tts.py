@@ -162,8 +162,31 @@ class TTSEngine(BaseNonStreamingEngine):
         t0 = time.monotonic()
 
         def _synthesize_sync():
-            # Build generation kwargs from non-None params
-            gen_kwargs: Dict[str, Any] = {}
+            # model.generate() returns an iterable of results,
+            # each with .audio (array) and .sample_rate (int).
+            gen_kwargs: Dict[str, Any] = {
+                "text": text,
+                "verbose": False,
+            }
+            import inspect
+            gen_params = inspect.signature(model.generate).parameters
+            if voice is not None:
+                # Route voice to the correct generate() kwarg.
+                # Models with 'voice' param (CustomVoice, Kokoro) get it as
+                # a speaker name. Models with only 'instruct' (non-Qwen TTS)
+                # get it as a voice description fallback.
+                if "voice" in gen_params:
+                    gen_kwargs["voice"] = voice
+                elif "instruct" in gen_params:
+                    gen_kwargs["instruct"] = voice
+            if instructions is not None and "instruct" in gen_params:
+                gen_kwargs["instruct"] = instructions
+            if speed != 1.0:
+                gen_kwargs["speed"] = speed
+            if ref_audio is not None and "ref_audio" in gen_params:
+                gen_kwargs["ref_audio"] = ref_audio
+                gen_kwargs["ref_text"] = ref_text
+            # Generation params (only add non-None values)
             if temperature is not None:
                 gen_kwargs["temperature"] = temperature
             if top_k is not None:
@@ -176,39 +199,7 @@ class TTSEngine(BaseNonStreamingEngine):
                 gen_kwargs["max_tokens"] = max_tokens
             gen_kwargs.update(kwargs)
 
-            # VoiceDesign path: model has generate_voice_design() and
-            # instructions were provided (voice description).
-            if (
-                hasattr(model, "generate_voice_design")
-                and instructions is not None
-            ):
-                logger.info("Using VoiceDesign path for %s", self._model_name)
-                results = model.generate_voice_design(
-                    text=text, instruct=instructions, **gen_kwargs
-                )
-            else:
-                # Standard generate() path with param introspection
-                std_kwargs: Dict[str, Any] = {
-                    "text": text,
-                    "verbose": False,
-                }
-                import inspect
-                gen_params = inspect.signature(model.generate).parameters
-                if voice is not None:
-                    if "voice" in gen_params:
-                        std_kwargs["voice"] = voice
-                    elif "instruct" in gen_params:
-                        std_kwargs["instruct"] = voice
-                if instructions is not None and "instruct" in gen_params:
-                    std_kwargs["instruct"] = instructions
-                if speed != 1.0:
-                    std_kwargs["speed"] = speed
-                if ref_audio is not None and "ref_audio" in gen_params:
-                    std_kwargs["ref_audio"] = ref_audio
-                    std_kwargs["ref_text"] = ref_text
-                std_kwargs.update(gen_kwargs)
-
-                results = model.generate(**std_kwargs)
+            results = model.generate(**gen_kwargs)
 
             # Use model.sample_rate if available (e.g. Qwen3-TTS)
             sample_rate = getattr(model, "sample_rate", _DEFAULT_SAMPLE_RATE)
@@ -216,8 +207,6 @@ class TTSEngine(BaseNonStreamingEngine):
 
             for result in results:
                 audio_chunks.append(np.array(result.audio))
-                if hasattr(result, "sample_rate"):
-                    sample_rate = result.sample_rate
 
             if not audio_chunks:
                 raise RuntimeError("TTS model produced no audio output")

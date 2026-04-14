@@ -338,7 +338,7 @@ class TestTTSVoiceRouting:
         from omlx.engine.tts import TTSEngine
 
         def _run(generate_sig_params, voice_value=None, instructions_value=None,
-                 has_voice_design=False, **synth_kwargs):
+                 **synth_kwargs):
             engine = TTSEngine("test-model")
 
             import inspect
@@ -360,10 +360,6 @@ class TestTTSVoiceRouting:
             fake_model = FakeModel()
             fake_model.generate = generate_mock
 
-            if has_voice_design:
-                vd_mock = MagicMock(return_value=[])
-                fake_model.generate_voice_design = vd_mock
-
             engine._model = fake_model
 
             try:
@@ -374,8 +370,6 @@ class TestTTSVoiceRouting:
             except RuntimeError:
                 pass  # "no audio output" is expected with empty generate
 
-            if has_voice_design and instructions_value is not None:
-                return fake_model.generate_voice_design.call_args
             return fake_model.generate.call_args
 
         return _run
@@ -650,84 +644,6 @@ class TestTTSVoiceCloneEndpoint:
         if synthesize.called:
             call_kwargs = synthesize.call_args.kwargs
             assert call_kwargs.get("ref_audio") is None
-
-
-# ---------------------------------------------------------------------------
-# TestTTSVoiceDesign — VoiceDesign path detection and routing
-# ---------------------------------------------------------------------------
-
-
-class TestTTSVoiceDesign:
-    """Verify VoiceDesign path: generate_voice_design() is called when available."""
-
-    def test_voicedesign_path_called(self, _run_synthesize_vd):
-        """When model has generate_voice_design and instructions given, use VD path."""
-        call = _run_synthesize_vd(instructions="female, calm, slow")
-        assert call is not None
-        kwargs = call.kwargs if call else {}
-        assert kwargs.get("text") == "Hello"
-        assert kwargs.get("instruct") == "female, calm, slow"
-
-    def test_voicedesign_not_called_without_instructions(self, _run_synthesize_vd):
-        """Without instructions, standard generate() is used even with VD model."""
-        call = _run_synthesize_vd(instructions=None)
-        # Should be None because generate_voice_design was not called
-        assert call is None
-
-    def test_voicedesign_gen_params_forwarded(self, _run_synthesize_vd):
-        """Generation params are forwarded to generate_voice_design()."""
-        call = _run_synthesize_vd(
-            instructions="male, deep",
-            temperature=0.8,
-            top_k=30,
-        )
-        kwargs = call.kwargs if call else {}
-        assert kwargs.get("temperature") == 0.8
-        assert kwargs.get("top_k") == 30
-
-    @pytest.fixture
-    def _run_synthesize_vd(self):
-        """Helper: run synthesize on a VoiceDesign-capable model."""
-        import asyncio
-        from omlx.engine.tts import TTSEngine
-
-        def _run(instructions=None, **gen_params):
-            engine = TTSEngine("test-vd-model")
-
-            class FakeModel:
-                pass
-
-            fake_model = FakeModel()
-
-            # Standard generate with basic sig
-            import inspect
-            sig_params = {
-                "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
-                "verbose": inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
-            }
-            gen_mock = MagicMock()
-            gen_mock.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
-            gen_mock.return_value = []
-            fake_model.generate = gen_mock
-
-            # VoiceDesign method
-            vd_mock = MagicMock(return_value=[])
-            fake_model.generate_voice_design = vd_mock
-
-            engine._model = fake_model
-
-            try:
-                asyncio.run(engine.synthesize(
-                    "Hello", instructions=instructions, **gen_params,
-                ))
-            except RuntimeError:
-                pass
-
-            if vd_mock.called:
-                return vd_mock.call_args
-            return None
-
-        return _run
 
 
 # ---------------------------------------------------------------------------
