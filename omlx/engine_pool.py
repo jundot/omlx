@@ -439,14 +439,25 @@ class EnginePool:
         """
         Find the least recently used non-pinned loaded model.
 
+        Skips models with active inference requests to avoid interrupting
+        in-flight generation.
+
         Returns:
-            Model ID of the LRU victim, or None if all models are pinned
+            Model ID of the LRU victim, or None if no evictable model found
         """
-        candidates = [
-            (e.last_access, mid)
-            for mid, e in self._entries.items()
-            if e.engine is not None and not e.is_pinned
-        ]
+        candidates = []
+        for mid, e in self._entries.items():
+            if e.engine is None or e.is_pinned:
+                continue
+            try:
+                if e.engine.has_active_requests():
+                    logger.debug(
+                        f"Skipping victim '{mid}': has active requests"
+                    )
+                    continue
+            except AttributeError:
+                pass
+            candidates.append((e.last_access, mid))
         if not candidates:
             return None
         candidates.sort()  # Sort by last_access (oldest first)
