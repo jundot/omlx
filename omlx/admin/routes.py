@@ -1785,35 +1785,6 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    # Defensive hydration: if runtime network settings are empty but disk has
-    # values, hydrate from disk so UI/API round-trips do not wipe them.
-    if (
-        not global_settings.network.http_proxy
-        and not global_settings.network.https_proxy
-        and not global_settings.network.no_proxy
-        and not global_settings.network.ca_bundle
-    ):
-        try:
-            settings_file = global_settings.base_path / "settings.json"
-            if settings_file.exists():
-                with open(settings_file, encoding="utf-8") as f:
-                    disk_data = json.load(f)
-                disk_network = disk_data.get("network")
-                if isinstance(disk_network, dict):
-                    hydrated = type(global_settings.network).from_dict(disk_network)
-                    if (
-                        hydrated.http_proxy
-                        or hydrated.https_proxy
-                        or hydrated.no_proxy
-                        or hydrated.ca_bundle
-                    ):
-                        global_settings.network = hydrated
-                        logger.info(
-                            "Hydrated network settings from disk for admin API response"
-                        )
-        except (OSError, json.JSONDecodeError, TypeError) as e:
-            logger.warning(f"Failed to hydrate network settings from disk: {e}")
-
     # Get system memory info for auto calculation
     memory_info = get_system_memory_info()
 
@@ -1941,45 +1912,6 @@ async def update_global_settings(
 
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
-
-    # Defensive hydration: if runtime network settings are empty and request
-    # does not explicitly carry network fields, recover from disk before save.
-    network_fields = {
-        "network_http_proxy",
-        "network_https_proxy",
-        "network_no_proxy",
-        "network_ca_bundle",
-    }
-    has_network_fields = any(f in request.model_fields_set for f in network_fields)
-    if (
-        not has_network_fields
-        and not global_settings.network.http_proxy
-        and not global_settings.network.https_proxy
-        and not global_settings.network.no_proxy
-        and not global_settings.network.ca_bundle
-    ):
-        try:
-            settings_file = global_settings.base_path / "settings.json"
-            if settings_file.exists():
-                with open(settings_file, encoding="utf-8") as f:
-                    disk_data = json.load(f)
-                disk_network = disk_data.get("network")
-                if isinstance(disk_network, dict):
-                    hydrated = type(global_settings.network).from_dict(disk_network)
-                    if (
-                        hydrated.http_proxy
-                        or hydrated.https_proxy
-                        or hydrated.no_proxy
-                        or hydrated.ca_bundle
-                    ):
-                        global_settings.network = hydrated
-                        logger.info(
-                            "Hydrated network settings from disk before admin save"
-                        )
-        except (OSError, json.JSONDecodeError, TypeError) as e:
-            logger.warning(
-                f"Failed to hydrate network settings from disk before save: {e}"
-            )
 
     # Track which settings were applied at runtime
     runtime_applied: List[str] = []
