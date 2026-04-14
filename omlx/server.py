@@ -2014,6 +2014,13 @@ async def create_chat_completion(
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
 
+    # Auto-set enable_thinking in chat template kwargs when a thinking
+    # budget is active (from request or model settings).  Some chat
+    # templates (e.g. Gemma 4) explicitly suppress thinking unless this
+    # kwarg is True.
+    if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["enable_thinking"] = True
+
     # Add compiled grammar for logit-level structured output.
     # When a reasoning_parser is configured, the structural tag includes
     # a thinking phase — auto-set a thinking_budget so the model exits
@@ -3156,6 +3163,12 @@ async def create_anthropic_message(
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
 
+    # Auto-set enable_thinking in chat template kwargs when a thinking
+    # budget is active but enable_thinking was not already set (e.g. via
+    # the Anthropic thinking.type field above or model settings).
+    if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["enable_thinking"] = True
+
     # Merge MCP tools with user-provided Anthropic tools
     user_internal = convert_anthropic_tools_to_internal(request.tools)
     if _server_state.mcp_manager:
@@ -3547,6 +3560,10 @@ async def create_response(
     thinking_budget = _resolve_thinking_budget(request, request.model)
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
+
+    # Auto-set enable_thinking when thinking budget is active.
+    if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["enable_thinking"] = True
 
     # Add compiled grammar for logit-level structured output.
     if compiled_grammar is not None:
