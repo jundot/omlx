@@ -117,6 +117,7 @@ class GlobalSettingsRequest(BaseModel):
     host: Optional[str] = None
     port: Optional[int] = None
     log_level: Optional[str] = None
+    server_aliases: Optional[List[str]] = None
 
     # Model settings
     model_dirs: Optional[List[str]] = None
@@ -1725,6 +1726,40 @@ async def get_generation_config(
 # =============================================================================
 
 
+@router.get("/api/server-info")
+async def get_server_info(is_admin: bool = Depends(require_admin)):
+    """Return server connectivity metadata for the dashboard.
+
+    Provides the configured host, port, and the list of user-facing
+    aliases (hostnames/IPs) that the dashboard can use to render
+    selectable API URL hints.
+
+    Returns:
+        JSON object with ``host``, ``port``, and ``aliases``.
+
+    Raises:
+        HTTPException: 401 if not authenticated, 503 if server not initialized.
+    """
+    from ..utils.network import detect_server_aliases
+
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    configured = list(global_settings.server.server_aliases)
+    if configured:
+        aliases = configured
+    else:
+        # Fall back to live detection if persisted list is empty.
+        aliases = detect_server_aliases(host=global_settings.server.host)
+
+    return {
+        "host": global_settings.server.host,
+        "port": global_settings.server.port,
+        "aliases": aliases,
+    }
+
+
 @router.get("/api/global-settings")
 async def get_global_settings(is_admin: bool = Depends(require_admin)):
     """
@@ -1759,6 +1794,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "host": global_settings.server.host,
             "port": global_settings.server.port,
             "log_level": global_settings.server.log_level,
+            "server_aliases": list(global_settings.server.server_aliases),
         },
         "model": {
             "model_dirs": [
@@ -1881,6 +1917,30 @@ async def update_global_settings(
         # Apply log level at runtime
         _apply_log_level_runtime(request.log_level)
         runtime_applied.append("log_level")
+
+    if request.server_aliases is not None:
+        from ..utils.network import is_valid_alias
+
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for alias in request.server_aliases:
+            if not isinstance(alias, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid server alias: each alias must be a string",
+                )
+            value = alias.strip()
+            if not value or value in seen:
+                continue
+            if not is_valid_alias(value):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid server alias: {value!r} (must be a hostname or IP address)",
+                )
+            seen.add(value)
+            cleaned.append(value)
+        global_settings.server.server_aliases = cleaned
+        runtime_applied.append("server_aliases")
 
     # Apply model settings
     new_dirs = None

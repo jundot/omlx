@@ -114,6 +114,7 @@ class ServerSettings:
     port: int = 8000
     log_level: str = "info"
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
+    server_aliases: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -127,6 +128,7 @@ class ServerSettings:
             port=data.get("port", 8000),
             log_level=data.get("log_level", "info"),
             cors_origins=data.get("cors_origins", ["*"]),
+            server_aliases=data.get("server_aliases", []),
         )
 
 

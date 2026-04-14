@@ -143,6 +143,10 @@
                 avg_generation_tps: 0.0,
                 total_requests: 0,
             },
+            // Server connectivity info (from /admin/api/server-info)
+            serverAliases: [],
+            selectedAlias: '',
+
             statsScope: 'session',
             selectedStatsModel: '',
             showClearStatsConfirm: false,
@@ -359,6 +363,7 @@
                 await Promise.all([
                     this.loadGlobalSettings(),
                     this.loadModels(),
+                    this.loadServerInfo(),
                     this.checkForUpdate()
                 ]);
 
@@ -1083,11 +1088,52 @@
             },
 
             // Status tab functions
+            // Normalizes a host string for safe URL embedding:
+            //  - unwraps existing IPv6 brackets so we can re-bracket consistently
+            //  - maps unspecified bind addresses (0.0.0.0, ::) to a placeholder
+            //    since they are not routable from a client
+            //  - maps `localhost` to 127.0.0.1 for consistency with other URLs
+            //  - bracket-wraps IPv6 addresses per RFC 3986 (`http://[::1]:8000/v1`)
+            formatDisplayHost(host) {
+                const value = (host || '').trim();
+                if (!value) return '127.0.0.1';
+
+                const unwrapped = value.startsWith('[') && value.endsWith(']')
+                    ? value.slice(1, -1)
+                    : value;
+
+                if (unwrapped === '0.0.0.0' || unwrapped === '::') return 'your-ip-address';
+                if (unwrapped === 'localhost') return '127.0.0.1';
+                if (unwrapped.includes(':')) return `[${unwrapped}]`;
+                return unwrapped;
+            },
+
             get displayHost() {
-                const host = this.stats.host || '127.0.0.1';
-                if (host === '0.0.0.0') return 'your-ip-address';
-                if (host === 'localhost') return '127.0.0.1';
-                return host;
+                const host = this.selectedAlias || this.stats.host || '127.0.0.1';
+                return this.formatDisplayHost(host);
+            },
+
+            async loadServerInfo() {
+                try {
+                    const response = await fetch('/admin/api/server-info');
+                    if (response.ok) {
+                        const data = await response.json();
+                        const aliases = Array.isArray(data.aliases) ? data.aliases : [];
+                        this.serverAliases = aliases;
+                        // Preserve user selection across reloads if still valid;
+                        // otherwise default to the first alias when available.
+                        if (this.selectedAlias && !aliases.includes(this.selectedAlias)) {
+                            this.selectedAlias = '';
+                        }
+                        if (!this.selectedAlias && aliases.length > 0) {
+                            this.selectedAlias = aliases[0];
+                        }
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (err) {
+                    console.error('Failed to load server info:', err);
+                }
             },
 
             get llmModels() {
