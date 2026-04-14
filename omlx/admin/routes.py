@@ -101,6 +101,10 @@ class ModelSettingsRequest(BaseModel):
     specprefill_draft_model: Optional[str] = None
     specprefill_keep_pct: Optional[float] = None
     specprefill_threshold: Optional[int] = None
+    # DFlash (block diffusion speculative decoding)
+    dflash_enabled: Optional[bool] = None
+    dflash_draft_model: Optional[str] = None
+    dflash_draft_quant_bits: Optional[int] = None
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
@@ -113,6 +117,7 @@ class GlobalSettingsRequest(BaseModel):
     host: Optional[str] = None
     port: Optional[int] = None
     log_level: Optional[str] = None
+    server_aliases: Optional[List[str]] = None
 
     # Model settings
     model_dirs: Optional[List[str]] = None
@@ -169,6 +174,7 @@ class GlobalSettingsRequest(BaseModel):
     integrations_codex_model: Optional[str] = None
     integrations_opencode_model: Optional[str] = None
     integrations_openclaw_model: Optional[str] = None
+    integrations_pi_model: Optional[str] = None
     integrations_openclaw_tools_profile: Optional[Literal["minimal", "coding", "messaging", "full"]] = None
 
     # UI settings
@@ -1250,6 +1256,30 @@ async def delete_sub_key(
 
 
 # =============================================================================
+# Grammar API Routes
+# =============================================================================
+
+
+@router.get("/api/grammar/parsers")
+async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
+    """Return available reasoning parser names from xgrammar.
+
+    Queries ``xgrammar.get_builtin_structural_tag_supported_models()`` at
+    runtime so the list stays in sync with the installed xgrammar version.
+    """
+    try:
+        from xgrammar import get_builtin_structural_tag_supported_models
+
+        supported = get_builtin_structural_tag_supported_models()
+        return [
+            {"value": style, "label": style, "models": models}
+            for style, models in supported.items()
+        ]
+    except ImportError:
+        return []
+
+
+# =============================================================================
 # Models API Routes
 # =============================================================================
 
@@ -1331,6 +1361,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "specprefill_draft_model": settings.specprefill_draft_model,
                 "specprefill_keep_pct": settings.specprefill_keep_pct,
                 "specprefill_threshold": settings.specprefill_threshold,
+                "dflash_enabled": settings.dflash_enabled,
+                "dflash_draft_model": settings.dflash_draft_model,
+                "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
@@ -1548,6 +1581,13 @@ async def update_model_settings(
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
         current_settings.specprefill_threshold = request.specprefill_threshold or None
+    # DFlash settings
+    if "dflash_enabled" in sent:
+        current_settings.dflash_enabled = request.dflash_enabled or False
+    if "dflash_draft_model" in sent:
+        current_settings.dflash_draft_model = request.dflash_draft_model or None
+    if "dflash_draft_quant_bits" in sent:
+        current_settings.dflash_draft_quant_bits = request.dflash_draft_quant_bits or None
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -1570,6 +1610,8 @@ async def update_model_settings(
         and (
             ("model_type_override" in sent and entry.engine_type != prev_engine_type)
             or "index_cache_freq" in sent
+            or "dflash_enabled" in sent
+            or "dflash_draft_model" in sent
         )
     )
     if requires_reload:
@@ -1690,6 +1732,40 @@ async def get_generation_config(
 # =============================================================================
 
 
+@router.get("/api/server-info")
+async def get_server_info(is_admin: bool = Depends(require_admin)):
+    """Return server connectivity metadata for the dashboard.
+
+    Provides the configured host, port, and the list of user-facing
+    aliases (hostnames/IPs) that the dashboard can use to render
+    selectable API URL hints.
+
+    Returns:
+        JSON object with ``host``, ``port``, and ``aliases``.
+
+    Raises:
+        HTTPException: 401 if not authenticated, 503 if server not initialized.
+    """
+    from ..utils.network import detect_server_aliases
+
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    configured = list(global_settings.server.server_aliases)
+    if configured:
+        aliases = configured
+    else:
+        # Fall back to live detection if persisted list is empty.
+        aliases = detect_server_aliases(host=global_settings.server.host)
+
+    return {
+        "host": global_settings.server.host,
+        "port": global_settings.server.port,
+        "aliases": aliases,
+    }
+
+
 @router.get("/api/global-settings")
 async def get_global_settings(is_admin: bool = Depends(require_admin)):
     """
@@ -1753,6 +1829,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "host": global_settings.server.host,
             "port": global_settings.server.port,
             "log_level": global_settings.server.log_level,
+            "server_aliases": list(global_settings.server.server_aliases),
         },
         "model": {
             "model_dirs": [
@@ -1820,6 +1897,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "codex_model": global_settings.integrations.codex_model,
             "opencode_model": global_settings.integrations.opencode_model,
             "openclaw_model": global_settings.integrations.openclaw_model,
+            "pi_model": global_settings.integrations.pi_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
         },
         "system": {
@@ -1919,6 +1997,30 @@ async def update_global_settings(
         # Apply log level at runtime
         _apply_log_level_runtime(request.log_level)
         runtime_applied.append("log_level")
+
+    if request.server_aliases is not None:
+        from ..utils.network import is_valid_alias
+
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for alias in request.server_aliases:
+            if not isinstance(alias, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid server alias: each alias must be a string",
+                )
+            value = alias.strip()
+            if not value or value in seen:
+                continue
+            if not is_valid_alias(value):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid server alias: {value!r} (must be a hostname or IP address)",
+                )
+            seen.add(value)
+            cleaned.append(value)
+        global_settings.server.server_aliases = cleaned
+        runtime_applied.append("server_aliases")
 
     # Apply model settings
     new_dirs = None
@@ -2200,6 +2302,9 @@ async def update_global_settings(
             request.integrations_openclaw_model
         )
         integrations_changed = True
+    if "integrations_pi_model" in request.model_fields_set:
+        global_settings.integrations.pi_model = request.integrations_pi_model
+        integrations_changed = True
     if "integrations_openclaw_tools_profile" in request.model_fields_set:
         global_settings.integrations.openclaw_tools_profile = (
             request.integrations_openclaw_tools_profile
@@ -2212,7 +2317,8 @@ async def update_global_settings(
             f"Integration settings updated: "
             f"codex={global_settings.integrations.codex_model}, "
             f"opencode={global_settings.integrations.opencode_model}, "
-            f"openclaw={global_settings.integrations.openclaw_model}"
+            f"openclaw={global_settings.integrations.openclaw_model}, "
+            f"pi={global_settings.integrations.pi_model}"
         )
 
     # Apply UI settings
@@ -3080,6 +3186,24 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
     model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
 
+    from ..model_discovery import _resolve_hf_cache_entry
+
+    def _add_model(model_path: Path, model_name: str) -> None:
+        if model_name in seen_names:
+            return
+        seen_names.add(model_name)
+        total_size = sum(
+            f.stat().st_size for f in model_path.rglob("*") if f.is_file()
+        )
+        models.append(
+            {
+                "name": model_name,
+                "path": str(model_path),
+                "size": total_size,
+                "size_formatted": format_size(total_size),
+            }
+        )
+
     models = []
     seen_names: set[str] = set()
     for model_dir in model_dirs:
@@ -3091,44 +3215,22 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
             if (subdir / "config.json").exists():
                 # Level 1: direct model folder
-                if subdir.name in seen_names:
-                    continue
-                seen_names.add(subdir.name)
-                total_size = sum(
-                    f.stat().st_size for f in subdir.rglob("*") if f.is_file()
-                )
-                models.append(
-                    {
-                        "name": subdir.name,
-                        "path": str(subdir),
-                        "size": total_size,
-                        "size_formatted": format_size(total_size),
-                    }
-                )
+                _add_model(subdir, subdir.name)
             else:
+                # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
+                hf_resolved = _resolve_hf_cache_entry(subdir)
+                if hf_resolved is not None:
+                    snapshot_path, model_name = hf_resolved
+                    if (snapshot_path / "config.json").exists():
+                        _add_model(snapshot_path, model_name)
+                    continue
+
                 # Level 2: organization folder — scan children
                 for child in sorted(subdir.iterdir()):
                     if not child.is_dir() or child.name.startswith("."):
                         continue
-                    if not (child / "config.json").exists():
-                        continue
-                    if child.name in seen_names:
-                        continue
-                    seen_names.add(child.name)
-
-                    total_size = sum(
-                        f.stat().st_size
-                        for f in child.rglob("*")
-                        if f.is_file()
-                    )
-                    models.append(
-                        {
-                            "name": child.name,
-                            "path": str(child),
-                            "size": total_size,
-                            "size_formatted": format_size(total_size),
-                        }
-                    )
+                    if (child / "config.json").exists():
+                        _add_model(child, child.name)
 
     return {"models": models}
 

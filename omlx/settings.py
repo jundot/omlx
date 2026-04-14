@@ -114,6 +114,7 @@ class ServerSettings:
     port: int = 8000
     log_level: str = "info"
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
+    server_aliases: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -127,6 +128,7 @@ class ServerSettings:
             port=data.get("port", 8000),
             log_level=data.get("log_level", "info"),
             cors_origins=data.get("cors_origins", ["*"]),
+            server_aliases=data.get("server_aliases", []),
         )
 
 
@@ -612,11 +614,12 @@ class ClaudeCodeSettings:
 
 @dataclass
 class IntegrationSettings:
-    """Other integrations settings (Codex, OpenCode, OpenClaw)."""
+    """Other integrations settings (Codex, OpenCode, OpenClaw, Pi)."""
 
     codex_model: str | None = None
     opencode_model: str | None = None
     openclaw_model: str | None = None
+    pi_model: str | None = None
     openclaw_tools_profile: str = "coding"
 
     def to_dict(self) -> dict[str, Any]:
@@ -625,6 +628,7 @@ class IntegrationSettings:
             "codex_model": self.codex_model,
             "opencode_model": self.opencode_model,
             "openclaw_model": self.openclaw_model,
+            "pi_model": self.pi_model,
             "openclaw_tools_profile": self.openclaw_tools_profile,
         }
 
@@ -635,6 +639,7 @@ class IntegrationSettings:
             codex_model=data.get("codex_model", None),
             opencode_model=data.get("opencode_model", None),
             openclaw_model=data.get("openclaw_model", None),
+            pi_model=data.get("pi_model", None),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
         )
 

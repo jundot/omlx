@@ -499,10 +499,14 @@ class TestEnginePoolLRU:
     def test_find_lru_victim_oldest_first(self, pool_with_entries):
         """Test that oldest (lowest last_access) is selected."""
         # Simulate loaded state with different access times
-        pool_with_entries._entries["model-a"].engine = MagicMock()
+        mock_a = MagicMock()
+        mock_a.has_active_requests.return_value = False
+        pool_with_entries._entries["model-a"].engine = mock_a
         pool_with_entries._entries["model-a"].last_access = 100  # Older
 
-        pool_with_entries._entries["model-b"].engine = MagicMock()
+        mock_b = MagicMock()
+        mock_b.has_active_requests.return_value = False
+        pool_with_entries._entries["model-b"].engine = mock_b
         pool_with_entries._entries["model-b"].last_access = 200  # Newer
 
         victim = pool_with_entries._find_lru_victim()
@@ -512,16 +516,58 @@ class TestEnginePoolLRU:
         """Test that pinned models are skipped during eviction."""
         # model-a is pinned and older
         pool_with_entries._entries["model-a"].is_pinned = True
-        pool_with_entries._entries["model-a"].engine = MagicMock()
+        mock_a = MagicMock()
+        mock_a.has_active_requests.return_value = False
+        pool_with_entries._entries["model-a"].engine = mock_a
         pool_with_entries._entries["model-a"].last_access = 50
 
         # model-b is not pinned and newer
-        pool_with_entries._entries["model-b"].engine = MagicMock()
+        mock_b = MagicMock()
+        mock_b.has_active_requests.return_value = False
+        pool_with_entries._entries["model-b"].engine = mock_b
         pool_with_entries._entries["model-b"].last_access = 200
 
         victim = pool_with_entries._find_lru_victim()
         # model-a is skipped (pinned), model-b is selected
         assert victim == "model-b"
+
+    def test_find_lru_victim_skips_active_requests(self, pool_with_entries):
+        """Test that models with active requests are skipped during eviction."""
+        # model-a has active requests
+        mock_engine_a = MagicMock()
+        mock_engine_a.has_active_requests.return_value = True
+        pool_with_entries._entries["model-a"].engine = mock_engine_a
+        pool_with_entries._entries["model-a"].last_access = 50  # Older
+
+        # model-b has no active requests
+        mock_engine_b = MagicMock()
+        mock_engine_b.has_active_requests.return_value = False
+        pool_with_entries._entries["model-b"].engine = mock_engine_b
+        pool_with_entries._entries["model-b"].last_access = 200  # Newer
+
+        victim = pool_with_entries._find_lru_victim()
+        # model-a skipped (active requests), model-b selected
+        assert victim == "model-b"
+
+    def test_find_lru_victim_all_active(self, pool_with_entries):
+        """Test that None is returned when all models have active requests."""
+        for mid in ("model-a", "model-b"):
+            mock_engine = MagicMock()
+            mock_engine.has_active_requests.return_value = True
+            pool_with_entries._entries[mid].engine = mock_engine
+            pool_with_entries._entries[mid].last_access = 100
+
+        victim = pool_with_entries._find_lru_victim()
+        assert victim is None
+
+    def test_find_lru_victim_no_has_active_requests(self, pool_with_entries):
+        """Test graceful handling when engine lacks has_active_requests."""
+        mock_engine = MagicMock(spec=[])  # No has_active_requests
+        pool_with_entries._entries["model-a"].engine = mock_engine
+        pool_with_entries._entries["model-a"].last_access = 100
+
+        victim = pool_with_entries._find_lru_victim()
+        assert victim == "model-a"
 
 
 class TestEnginePoolAsync:
@@ -640,9 +686,11 @@ class TestEnginePoolEviction:
         mock_engine_a = MagicMock()
         mock_engine_a.start = AsyncMock()
         mock_engine_a.stop = AsyncMock()
+        mock_engine_a.has_active_requests.return_value = False
 
         mock_engine_b = MagicMock()
         mock_engine_b.start = AsyncMock()
+        mock_engine_b.has_active_requests.return_value = False
 
         call_count = [0]
 

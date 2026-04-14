@@ -50,6 +50,8 @@ requirements = [
     "openai-harmony",
     # mlx-vlm from commit (23e1dff) - aligned with pyproject.toml
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@23e1dffd224488141a4f022b6d21d6a730f11507",
+    # dflash-mlx from commit (fc7101b) — block diffusion speculative decoding
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@fc7101b0aa70c60f0754f50a7a10a82c2cdc1a92",
     "Pillow>=9.0.0",
     # ModelScope SDK for downloading models from ModelScope Hub
     "modelscope>=1.10.0",

@@ -64,6 +64,14 @@
         background-color: var(--bg-primary) !important;
         color: var(--text-primary) !important;
     }
+    html, body {
+        height: 100%;
+        overflow: hidden;
+    }
+    .chat-shell {
+        height: 100dvh;
+        min-height: 100vh;
+    }
 
     /* Scrollbar */
     .custom-scrollbar::-webkit-scrollbar { width: 6px; }
@@ -103,6 +111,8 @@
         font-size: 14px;
         line-height: 1.6;
         color: var(--text-primary);
+        overflow-x: auto;
+        min-width: 0;
     }
 
     .user-message {
@@ -133,7 +143,7 @@
     @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
 
     /* Markdown content */
-    .markdown-content { line-height: 1.6; color: var(--text-primary); }
+    .markdown-content { line-height: 1.6; color: var(--text-primary); min-width: 0; overflow-wrap: break-word; }
     .markdown-content h1, .markdown-content h2, .markdown-content h3 { font-weight: 600; margin-top: 1.5em; margin-bottom: 0.5em; color: var(--text-primary); }
     .markdown-content h1 { font-size: 1.5em; }
     .markdown-content h2 { font-size: 1.3em; }
@@ -144,6 +154,10 @@
     .markdown-content code { background-color: var(--code-bg); padding: 0.125em 0.25em; border-radius: 0.25em; font-size: 0.875em; color: var(--text-primary); }
     .markdown-content pre { background-color: var(--code-bg); border-radius: 0.5em; padding: 1em; margin: 1em 0; overflow-x: auto; }
     .markdown-content pre code { background: none; padding: 0; color: var(--text-primary); }
+    .markdown-content table { border-collapse: collapse; margin: 1em 0; font-size: 0.875em; display: block; overflow-x: auto; max-width: 100%; }
+    .markdown-content th, .markdown-content td { border: 1px solid var(--border-faint); padding: 0.5em 0.75em; text-align: left; white-space: nowrap; }
+    .markdown-content th { background: var(--bg-secondary); font-weight: 600; }
+    .markdown-content tr:nth-child(even) { background: var(--bg-secondary); }
 
     /* Code block copy button */
     .code-block-wrapper { position: relative; }
@@ -348,7 +362,7 @@
         document.documentElement.setAttribute('data-theme', theme);
     })();
 </script>
-<div class="h-screen flex overflow-hidden" x-data="chatApp()" x-init="init()">
+<div class="chat-shell flex overflow-hidden" x-data="chatApp()" x-init="init()">
     <!-- API Key Modal -->
     <div class="api-key-modal fixed inset-0 bg-black/50 flex items-center justify-center z-[1000]" :class="{ 'hidden': apiKeySet }" x-cloak>
         <div class="bg-surface rounded-2xl p-8 max-w-[400px] w-[90%] shadow-2xl">
@@ -449,7 +463,7 @@
     </div>
 
     <!-- Main Content -->
-    <div class="flex-1 flex flex-col bg-surface overflow-hidden">
+    <div class="flex-1 flex flex-col bg-surface overflow-hidden min-w-0">
         <!-- Header -->
         <header class="h-14 px-4 border-b border-line flex items-center justify-between bg-surface flex-shrink-0">
             <button @click="sidebarOpen = true" class="p-2 hover:bg-surface-muted rounded-lg md:hidden" style="color: var(--text-primary);">
@@ -494,7 +508,7 @@
         </header>
 
         <!-- Messages Area -->
-        <div class="flex-1 min-h-0 overflow-y-auto custom-scrollbar" id="messagesContainer">
+        <div class="flex-1 min-h-0 overflow-y-auto overflow-x-hidden custom-scrollbar" id="messagesContainer">
             <!-- Welcome Screen -->
             <div x-show="messages.length === 0" class="h-full flex items-center justify-center" x-cloak>
                 <div class="text-center max-w-lg px-4">
@@ -621,10 +635,17 @@
                                         <span class="thinking-text">Thinking</span>
                                         <svg class="thinking-toggle" :class="{ collapsed: !msg._thinkingOpen }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg>
                                     </div>
-                                    <div class="thinking-content markdown-content thinking-markdown" :class="{ collapsed: !msg._thinkingOpen }" x-html="renderMarkdown(msg._thinking)"></div>
+                                    <div class="thinking-content markdown-content thinking-markdown"
+                                         :class="{ collapsed: !msg._thinkingOpen }"
+                                         data-math-pending="true"
+                                         :data-math-version="msg._thinking ? String(msg._thinking.length) : '0'"
+                                         x-html="renderMarkdown(msg._thinking)"></div>
                                 </div>
                             </template>
-                            <div class="message-body markdown-content" x-html="renderMarkdown(msg.content)"></div>
+                            <div class="message-body markdown-content"
+                                 data-math-pending="true"
+                                 :data-math-version="typeof msg.content === 'string' ? String(msg.content.length) : '0'"
+                                 x-html="renderMarkdown(msg.content)"></div>
                         </div>
 
                     </div>
@@ -690,7 +711,11 @@
                                 <span class="thinking-text" x-text="finalContent ? 'Thinking' : 'Thinking...'"></span>
                                 <svg class="thinking-toggle" :class="{ collapsed: !streamingThinkingOpen }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg>
                             </div>
-                            <div class="thinking-content markdown-content thinking-markdown" :class="{ collapsed: !streamingThinkingOpen }" x-html="renderMarkdown(streamingThinking)"></div>
+                            <div class="thinking-content markdown-content thinking-markdown"
+                                 :class="{ collapsed: !streamingThinkingOpen }"
+                                 data-math-pending="true"
+                                 :data-math-version="String(streamingThinking.length)"
+                                 x-html="renderMarkdown(streamingThinking)"></div>
                         </div>
                         <div x-show="streamingContent" class="markdown-content" x-ref="streamingOutput" x-effect="updateStreamingDOM()"></div>
                     </div>
@@ -878,6 +903,10 @@
             // Live thinking bubble state (shown during streaming)
             streamingThinking: '',          // accumulated reasoning_content for current stream
             streamingThinkingOpen: false,   // whether the live thinking bubble is expanded
+            streamRenderState: {
+                stableIndex: 0,
+                stableText: ''
+            },
 
             // Scroll state
             autoScrollEnabled: true,
@@ -1287,6 +1316,7 @@
                 this.systemPrompt = localStorage.getItem('omlx_chat_system_prompt') || '';
                 this.isMobile = window.innerWidth < 768;
                 this.sidebarOpen = window.innerWidth >= 768;
+                this.resetStreamRenderState();
             },
 
             loadChat(chatId) {
@@ -1298,6 +1328,7 @@
                     if (chat.model) {
                         this.currentModel = chat.model;
                     }
+                    this.scheduleEnhanceMessages();
                 }
                 this.isMobile = window.innerWidth < 768;
                 this.sidebarOpen = window.innerWidth >= 768;
@@ -1404,6 +1435,7 @@
                     this.statusTimelineVisible = false;
                     this.streamingThinking = '';
                     this.streamingThinkingOpen = false;
+                    this.resetStreamRenderState();
                 }
                 this.isStreaming = true;
                 this.streamingContent = '';
@@ -1646,6 +1678,7 @@
                         }
 
                         this.streamingContent = '';
+                        this.resetStreamRenderState();
 
                         // Recurse — model synthesises final answer using tool results
                         await this.streamResponse(depth + 1);
@@ -1665,6 +1698,7 @@
                         _thinkingOpen: false,
                     });
                     this.saveCurrentChat();
+                    this.scheduleEnhanceMessages();
 
                 } catch (error) {
                     console.log('[streamResponse] catch error:', error.name, error.message);
@@ -1686,6 +1720,7 @@
                                 _thinkingOpen: false,
                             });
                             this.saveCurrentChat();
+                            this.scheduleEnhanceMessages();
                         }
                     } else {
                         console.error('Streaming error:', error);
@@ -1695,6 +1730,7 @@
                             model: this.currentModel,
                             _perfVisible: false,
                         });
+                        this.scheduleEnhanceMessages();
                     }
                 } finally {
                     // Attach performance timeline and thinking to the final assistant message, once per prompt
@@ -1716,6 +1752,7 @@
                     }
                     this.isStreaming = false;
                     this.streamingContent = '';
+                    this.resetStreamRenderState();
                     this.engineStatus = null;
                     // Don't reset finalContent here — keeps the status block hidden after completion
                     // It gets reset at the start of the next depth=0 streamResponse call
@@ -1743,6 +1780,7 @@
                 // Find the user message before this assistant message
                 const messagesToKeep = this.messages.slice(0, index);
                 this.messages = messagesToKeep;
+                this.scheduleEnhanceMessages();
 
                 await this.streamResponse();
             },
@@ -1802,6 +1840,7 @@
 
                 // Remove all messages from this index onwards
                 this.messages = this.messages.slice(0, index);
+                this.scheduleEnhanceMessages();
 
                 // Build message content, preserving images
                 let content;
@@ -1932,11 +1971,6 @@
                         html = thinkingHtml + html;
                     }
 
-                    // Schedule code copy buttons and math rendering after DOM update
-                    this.$nextTick(() => {
-                        this.addCodeCopyButtons();
-                        this.renderMath();
-                    });
                     return html;
                 } catch (e) {
                     return text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -2009,43 +2043,71 @@
 
                 if (!this.streamingContent) {
                     container.innerHTML = '';
+                    this.resetStreamRenderState();
                     return;
                 }
 
                 const text = this.streamingContent;
 
-                // Detect if we're in an incomplete think block
-                const lastOpenThink = text.lastIndexOf('<think>');
-                const lastCloseThink = text.lastIndexOf('</think>');
-                const isInIncompleteThink = lastOpenThink !== -1 && lastCloseThink < lastOpenThink;
+                if (text.includes('<think>')) {
+                    container.innerHTML = this.renderStreamingMarkdown(text);
 
-                // Fast path: thinking container already exists, just update its text
-                if (isInIncompleteThink) {
-                    const existingEl = container.querySelector('#streaming-thinking-content');
-                    if (existingEl) {
-                        const thinkingText = text.substring(lastOpenThink + 7);
-                        existingEl.innerHTML = this.escapeHtml(thinkingText).replace(/\n/g, '<br>');
-                        this.scrollThinkingContent();
+                    this.$nextTick(() => {
+                        this.addCodeCopyButtons(container);
+                        this.renderMathInRoot(container);
                         this.scrollToBottom();
-                        return;
-                    }
+                    });
+                    return;
                 }
 
-                // Full render path (first render or structural change)
-                container.innerHTML = this.renderStreamingMarkdown(text);
+                const { stableRoot, tailRoot } = this.ensureStreamingRoots(container);
+                const cutoff = this.findStableRenderCutoff(text);
+                const safeCutoff = Math.max(cutoff, this.streamRenderState.stableIndex);
+
+                if (safeCutoff > this.streamRenderState.stableIndex) {
+                    this.streamRenderState.stableText = text.slice(0, safeCutoff);
+                    stableRoot.innerHTML = this.streamRenderState.stableText
+                        ? DOMPurify.sanitize(marked.parse(this.streamRenderState.stableText))
+                        : '';
+                    this.addCodeCopyButtons(stableRoot);
+                    this.renderMathInRoot(stableRoot);
+                    this.streamRenderState.stableIndex = safeCutoff;
+                }
+
+                const tailText = text.slice(this.streamRenderState.stableIndex);
+                tailRoot.innerHTML = tailText ? DOMPurify.sanitize(marked.parse(tailText)) : '';
 
                 this.$nextTick(() => {
-                    this.addCodeCopyButtons();
-                    this.renderMath();
-                    if (isInIncompleteThink) {
-                        this.scrollThinkingContent();
-                    }
                     this.scrollToBottom();
                 });
             },
 
-            addCodeCopyButtons() {
-                const container = document.getElementById('messagesContainer');
+            ensureStreamingRoots(container) {
+                let stableRoot = container.querySelector('[data-streaming-stable-root]');
+                let tailRoot = container.querySelector('[data-streaming-tail-root]');
+                if (!stableRoot || !tailRoot) {
+                    this.resetStreamingRoots(container);
+                    stableRoot = container.querySelector('[data-streaming-stable-root]');
+                    tailRoot = container.querySelector('[data-streaming-tail-root]');
+                }
+                return { stableRoot, tailRoot };
+            },
+
+            resetStreamingRoots(container) {
+                container.innerHTML = `
+                    <div data-streaming-stable-root="true"></div>
+                    <div data-streaming-tail-root="true"></div>
+                `;
+                this.resetStreamRenderState();
+            },
+
+            resetStreamRenderState() {
+                this.streamRenderState.stableIndex = 0;
+                this.streamRenderState.stableText = '';
+            },
+
+            addCodeCopyButtons(root = null) {
+                const container = root || document.getElementById('messagesContainer');
                 if (!container) return;
 
                 const codeBlocks = container.querySelectorAll('pre code');
@@ -2079,19 +2141,17 @@
                 });
             },
 
-            renderMath(retries = 0) {
+            renderMathInRoot(root, retries = 0) {
+                if (!root) return;
                 if (typeof renderMathInElement === 'undefined') {
                     if (retries < 20) {
-                        setTimeout(() => this.renderMath(retries + 1), 100);
+                        setTimeout(() => this.renderMathInRoot(root, retries + 1), 100);
                     }
                     return;
                 }
 
-                const container = document.getElementById('messagesContainer');
-                if (!container) return;
-
                 try {
-                    renderMathInElement(container, {
+                    renderMathInElement(root, {
                         delimiters: [
                             {left: '$$', right: '$$', display: true},
                             {left: '$', right: '$', display: false},
@@ -2106,6 +2166,122 @@
                 } catch (e) {
                     console.error('Math rendering error:', e);
                 }
+            },
+
+            renderPendingMath(root = null) {
+                const container = root || document.getElementById('messagesContainer');
+                if (!container) return;
+
+                const targets = container.querySelectorAll('[data-math-pending="true"]');
+                targets.forEach((element) => {
+                    const version = element.dataset.mathVersion || '0';
+                    if (element.dataset.mathRenderedVersion === version) return;
+                    this.renderMathInRoot(element);
+                    element.dataset.mathRenderedVersion = version;
+                });
+            },
+
+            scheduleEnhanceMessages() {
+                this.$nextTick(() => {
+                    const container = document.getElementById('messagesContainer');
+                    if (!container) return;
+                    this.addCodeCopyButtons(container);
+                    this.renderPendingMath(container);
+                });
+            },
+
+            findStableRenderCutoff(text) {
+                if (!text) return 0;
+
+                let inFence = false;
+                let inInlineCode = false;
+                let inInlineMath = false;
+                let inDisplayMath = false;
+                let inParenMath = false;
+                let inBracketMath = false;
+                let lastSafeBoundary = 0;
+                let lastWasNewline = false;
+                let lastPromotedBoundary = 0;
+
+                for (let i = 0; i < text.length; i++) {
+                    const ch = text[i];
+                    const prev = i > 0 ? text[i - 1] : '';
+                    const nextTwo = text.slice(i, i + 2);
+                    const nextThree = text.slice(i, i + 3);
+                    const escaped = prev === '\\';
+
+                    if (!inInlineCode && !inInlineMath && !inDisplayMath && !inParenMath && !inBracketMath && nextThree === '```') {
+                        inFence = !inFence;
+                        i += 2;
+                        lastWasNewline = false;
+                        continue;
+                    }
+
+                    if (!inFence && !inInlineMath && !inDisplayMath && !inParenMath && !inBracketMath && ch === '`' && !escaped) {
+                        inInlineCode = !inInlineCode;
+                        lastWasNewline = false;
+                        continue;
+                    }
+
+                    if (!inFence && !inInlineCode) {
+                        if (!inInlineMath && !inParenMath && !inBracketMath && nextTwo === '$$' && !escaped) {
+                            inDisplayMath = !inDisplayMath;
+                            i += 1;
+                            lastWasNewline = false;
+                            continue;
+                        }
+
+                        if (!inDisplayMath && !inInlineMath && !inBracketMath && nextTwo === '\\(' && !escaped) {
+                            inParenMath = true;
+                            i += 1;
+                            lastWasNewline = false;
+                            continue;
+                        }
+
+                        if (inParenMath && nextTwo === '\\)' && !escaped) {
+                            inParenMath = false;
+                            i += 1;
+                            lastWasNewline = false;
+                            continue;
+                        }
+
+                        if (!inDisplayMath && !inInlineMath && !inParenMath && nextTwo === '\\[' && !escaped) {
+                            inBracketMath = true;
+                            i += 1;
+                            lastWasNewline = false;
+                            continue;
+                        }
+
+                        if (inBracketMath && nextTwo === '\\]' && !escaped) {
+                            inBracketMath = false;
+                            i += 1;
+                            lastWasNewline = false;
+                            continue;
+                        }
+
+                        if (!inDisplayMath && !inParenMath && !inBracketMath && ch === '$' && !escaped) {
+                            inInlineMath = !inInlineMath;
+                            lastWasNewline = false;
+                            continue;
+                        }
+                    }
+
+                    const balanced = !inFence && !inInlineCode && !inInlineMath && !inDisplayMath && !inParenMath && !inBracketMath;
+
+                    if (balanced) {
+                        if (ch === '\n' && lastWasNewline) {
+                            lastSafeBoundary = i + 1;
+                            lastPromotedBoundary = lastSafeBoundary;
+                        } else if ((ch === '.' || ch === '!' || ch === '?' || ch === '\n') && (i + 1 - lastPromotedBoundary) >= 240) {
+                            lastSafeBoundary = i + 1;
+                            lastPromotedBoundary = lastSafeBoundary;
+                        }
+                    }
+
+                    lastWasNewline = ch === '\n';
+                }
+
+                return lastSafeBoundary;
             },
 
             // Check if scroll is at bottom

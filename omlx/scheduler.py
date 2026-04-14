@@ -24,6 +24,7 @@ import mlx.core as mx
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationBatch,
+    PromptProcessingBatch,
     SequenceStateMachine,
     generation_stream,
 )
@@ -118,6 +119,15 @@ class _PrefillAbortedError(Exception):
 _original_generation_batch_step = GenerationBatch._step
 
 def _patched_generation_batch_step(self):
+    # Build per-batch mRoPE deltas from UID mapping before each step.
+    # This handles batch size changes during prompt split/generate.
+    model = self.model
+    if (getattr(model, "_uses_mrope", False)
+            and getattr(model, "_uid_rope_deltas", None)
+            and self.uids):
+        deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
+        model.set_batch_rope_deltas(mx.array(deltas))
+
     result = _original_generation_batch_step(self)
 
     # self._next_tokens contains the just-sampled tokens (async eval pending).
@@ -142,6 +152,29 @@ def _patched_generation_batch_step(self):
     return result
 
 GenerationBatch._step = _patched_generation_batch_step
+
+
+# ---------------------------------------------------------------------------
+# Monkey-patch PromptProcessingBatch.prompt to set mRoPE deltas before the
+# prompt processing loop.  Without this, batched VLM prompt processing
+# (e.g. the 1-token final prompt after external prefill) falls into the
+# _wrap_caches fallback which collapses per-request offsets to a scalar,
+# corrupting attention masks for concurrent VLM requests.
+# ---------------------------------------------------------------------------
+_original_ppb_prompt = PromptProcessingBatch.prompt
+
+
+def _patched_ppb_prompt(self, tokens):
+    model = self.model
+    if (getattr(model, "_uses_mrope", False)
+            and getattr(model, "_uid_rope_deltas", None)
+            and self.uids):
+        deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
+        model.set_batch_rope_deltas(mx.array(deltas))
+    return _original_ppb_prompt(self, tokens)
+
+
+PromptProcessingBatch.prompt = _patched_ppb_prompt
 
 
 # Cache class names known to be sliceable (no boundary snapshots needed).
@@ -553,8 +586,17 @@ class Scheduler:
         # IOKit's asynchronous completeMemory() callbacks, causing
         # 'prepare count underflow' kernel panics. Deferring the clear
         # by a few generation steps gives IOKit time to process callbacks.
-        # None = no deferred clear pending; int = steps since last finish.
-        self._deferred_clear_steps: Optional[int] = None
+        #
+        # Stored as the absolute step number at which the clear should fire,
+        # rather than a countdown integer.  This avoids the burst-completion
+        # bug (#557): with max_num_seqs > 1 two requests can finish in the
+        # same batch.  The old "only set if None" guard meant the second
+        # completion never extended the window, so the first request's KV
+        # cache blocks could be re-allocated before IOKit finished its
+        # completeMemory() callbacks.  Using max() ensures the window always
+        # covers the *latest* completion.
+        # None = no deferred clear pending; int = step at which to fire.
+        self._deferred_clear_at: Optional[int] = None
 
         # Cache XTC special tokens (newline + EOS) — stable per tokenizer.
         # Must be after _is_harmony_model / _generation_config_eos init
@@ -1056,6 +1098,21 @@ class Scheduler:
         )
         all_boundaries = boundary_enabled  # always stop at every boundary for hybrid models
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
+        # Sanity check: base_size from cache offsets should match the number
+        # of tokens actually cached. A mismatch indicates stale meta_state
+        # in a restored RotatingKVCache (e.g. shared layer_meta_states from
+        # an earlier store_cache bug). Use cached_tokens which is always
+        # derived from block_table.num_tokens and therefore trustworthy.
+        if boundary_enabled and hasattr(request, "cached_tokens") and request.cached_tokens > 0:
+            if base_size != request.cached_tokens:
+                logger.warning(
+                    "Cache base_size mismatch: computed %d, expected %d "
+                    "(cached_tokens). Using cached_tokens for boundary "
+                    "alignment.",
+                    base_size,
+                    request.cached_tokens,
+                )
+                base_size = request.cached_tokens
 
         # Prepare VLM embeddings for prefill
         embeds_array: Optional[mx.array] = None
@@ -1063,6 +1120,18 @@ class Scheduler:
         if vlm_embeds is not None:
             embeds_array, extra_kwargs, start_offset = vlm_embeds
             embeds_array = embeds_array[:, start_offset:]  # skip cached portion
+            if start_offset > 0 and extra_kwargs:
+                extra_kwargs = _advance_vlm_extra(extra_kwargs, start_offset)
+            # Force _position_ids path in language model for cached VLM
+            # prefill. Without this, the delta approach gives sequential
+            # positions to image tokens that need 3D mRoPE positions.
+            # Setting _rope_deltas=None makes the language model use
+            # _position_ids (set by get_input_embeddings) instead.
+            # Saved and restored after prefill for decode rope_deltas capture.
+            _saved_rope_deltas = None
+            if start_offset > 0 and hasattr(self.model, "_language_model"):
+                _saved_rope_deltas = self.model._language_model._rope_deltas
+                self.model._language_model._rope_deltas = None
 
         # Prefill tokens[0:N-1] (leave last token for insert())
         prefill_tokens = tokens[:-1]
@@ -1181,6 +1250,10 @@ class Scheduler:
                 )
 
         _sync_and_clear_cache()
+
+        # Restore _rope_deltas after cached VLM prefill (for decode capture)
+        if vlm_embeds is not None and _saved_rope_deltas is not None:
+            self.model._language_model._rope_deltas = _saved_rope_deltas
 
         return prompt_cache, last_token
 
@@ -2156,15 +2229,12 @@ class Scheduler:
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
             # Use paged cache
-            # Build extra_keys for VLM image hash prefix cache isolation
-            extra_keys = None
-            if request.vlm_image_hash:
-                extra_keys = (request.vlm_image_hash,)
-
             block_table, remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
                 request.prompt_token_ids,
-                extra_keys=extra_keys,
+                extra_keys=request.vlm_extra_keys_for_cache,
+                extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
             )
             if block_table and block_table.num_tokens > 0:
                 # Reconstruct actual KVCache objects from stored tensor data
@@ -2415,9 +2485,12 @@ class Scheduler:
                 except Exception as e:
                     logger.debug(f"SpecPrefill: draft cache store failed: {e}")
 
-            # Free draft cache from memory
+            # Free draft cache from memory.  Use _sync_and_clear_cache() so
+            # the generation_stream is drained before Metal buffers are
+            # returned to the pool — a bare mx.clear_cache() here can race
+            # with in-flight async evals and trigger a kernel panic (#557).
             del used_cache
-            mx.clear_cache()
+            _sync_and_clear_cache()
 
         except Exception as e:
             logger.error(f"SpecPrefill scoring failed, falling back to normal path: {e}")
@@ -2541,6 +2614,8 @@ class Scheduler:
             # can hit 'completeMemory() prepare count underflow'.
             mx.synchronize(generation_stream)
             self._remove_uid_from_active_batch(uid)
+            if hasattr(self.model, "unregister_rope_delta"):
+                self.model.unregister_rope_delta(uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
 
@@ -2609,11 +2684,11 @@ class Scheduler:
 
         Also returns True when a deferred Metal cache clear is pending,
         so that the engine loop keeps calling step() until the clear fires.
-        Without this, an idle server would never increment the deferred
-        counter and stale buffers would accumulate indefinitely.
+        Without this, an idle server would never reach the target step and
+        stale buffers would accumulate indefinitely.
         """
         return bool(self.waiting or self.running
-                     or self._deferred_clear_steps is not None)
+                     or self._deferred_clear_at is not None)
 
     def fail_all_requests(self) -> List[str]:
         """Remove all running and waiting requests after unrecoverable error.
@@ -2910,7 +2985,14 @@ class Scheduler:
                             self.model(sys_arr[:step][None], cache=sp_cache)
                             mx.eval([c.state for c in sp_cache])
                             sys_arr = sys_arr[step:]
-                            mx.clear_cache()
+                            # Use _sync_and_clear_cache() instead of bare
+                            # mx.clear_cache() to flush the generation_stream
+                            # before releasing Metal buffers.  A bare call here
+                            # can race with in-flight command buffers submitted
+                            # by the preceding mx.eval(), triggering the same
+                            # 'completeMemory() prepare count underflow' kernel
+                            # panic that #435 fixed elsewhere (#557).
+                            _sync_and_clear_cache()
                         if sys_arr.size > 0:
                             self.model(sys_arr[None], cache=sp_cache)
                             mx.eval([c.state for c in sp_cache])
@@ -3003,6 +3085,21 @@ class Scheduler:
                 cache_to_use = prefilled_cache
                 tokens_to_process = last_token
 
+            # Capture per-request mRoPE rope_deltas for decode.
+            # Prefer _captured_rope_deltas from per-request extra_kwargs
+            # (set during get_input_embeddings), since the global
+            # _rope_deltas may be stale when explicit position_ids are used.
+            if request.vlm_inputs_embeds is not None:
+                extra = request.vlm_extra_kwargs or {}
+                captured = extra.get("_captured_rope_deltas")
+                if captured is not None:
+                    if hasattr(captured, "item"):
+                        request.rope_deltas = float(captured.item())
+                    else:
+                        request.rope_deltas = float(captured)
+                elif hasattr(self.model, "get_last_rope_deltas"):
+                    request.rope_deltas = self.model.get_last_rope_deltas()
+
             # Build per-request state machine for stop tokens
             sm = self._build_state_machine(request)
 
@@ -3031,6 +3128,10 @@ class Scheduler:
                 request.status = RequestStatus.RUNNING
                 self.running[request.request_id] = request
                 scheduled.append(request)
+
+                # Register per-UID rope_delta for mRoPE decode.
+                if hasattr(self.model, "register_rope_delta"):
+                    self.model.register_rope_delta(uid, request.rope_deltas)
 
                 self.total_prompt_tokens += request.num_prompt_tokens
                 cache_info = f", {request.cached_tokens} cached" if request.cached_tokens > 0 else ""
@@ -3164,6 +3265,10 @@ class Scheduler:
                         output.new_text += final_result.stream_text
                     if final_result.visible_text:
                         request.output_text += final_result.visible_text
+                    if final_result.output_text_prefix:
+                        request.output_text = (
+                            final_result.output_text_prefix + request.output_text
+                        )
                     if final_result.tool_calls:
                         output.tool_calls = final_result.tool_calls
                     if final_result.finish_reason:
@@ -3304,18 +3409,15 @@ class Scheduler:
                                         f"intermediate snapshots)"
                                     )
 
-                                # Build extra_keys for VLM image hash
-                                store_extra_keys = None
-                                if request.vlm_image_hash:
-                                    store_extra_keys = (request.vlm_image_hash,)
-
                                 block_table = self.block_aware_cache.store_cache(
                                     request_id,
                                     token_sequence_to_store,
                                     cache_to_store,
                                     model_cache_config=model_cache_config,
                                     boundary_snapshots=intermediate_snapshots,
-                                    extra_keys=store_extra_keys,
+                                    extra_keys=request.vlm_extra_keys_for_cache,
+                                    extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                                    extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
                                 )
                             logger.debug(
                                 f"Stored paged cache for request {request_id} "
@@ -3367,6 +3469,8 @@ class Scheduler:
                 # (Mirrors the fix in _do_abort_request, commit 634603f)
                 mx.synchronize(generation_stream)
                 self._remove_uid_from_active_batch(uid)
+                if hasattr(self.model, "unregister_rope_delta"):
+                    self.model.unregister_rope_delta(uid)
                 if uid in self.uid_to_request_id:
                     del self.uid_to_request_id[uid]
                 del self.request_id_to_uid[request_id]
@@ -3408,10 +3512,16 @@ class Scheduler:
             # Deferring by _DEFERRED_CLEAR_DELAY generation steps (~10-40 ms) gives
             # IOKit time to process callbacks while still reclaiming buffers fast
             # enough to prevent TTFT spikes from pool bloat (#411).
-            # Only set if not already pending — otherwise burst completions
-            # would keep resetting the counter and indefinitely postpone clearing.
-            if self._deferred_clear_steps is None:
-                self._deferred_clear_steps = 0
+            #
+            # Use max() so that concurrent completions (max_num_seqs > 1) each get
+            # a full _DEFERRED_CLEAR_DELAY window counted from *their own* finish
+            # step.  The old "only set if None" guard meant the second request's
+            # window was anchored to the first request's finish step, allowing the
+            # second request's KV cache blocks to be re-allocated before IOKit
+            # finished their completeMemory() callbacks (#557).
+            target = self._step_counter + self._DEFERRED_CLEAR_DELAY
+            if self._deferred_clear_at is None or target > self._deferred_clear_at:
+                self._deferred_clear_at = target
 
     def _is_cache_corruption_error(self, error: Exception) -> bool:
         """Check if an error indicates cache corruption."""
@@ -3444,7 +3554,7 @@ class Scheduler:
         self.uid_to_request_id.clear()
 
         # Cancel any pending deferred Metal cache clear
-        self._deferred_clear_steps = None
+        self._deferred_clear_at = None
 
         # Clear detokenizer state to prevent contamination after recovery
         self._request_detokenizers.clear()
@@ -3626,14 +3736,11 @@ class Scheduler:
             and self._step_counter % self.config.mlx_cache_cleanup_interval == 0
         ):
             should_clear = True
-        # Deferred post-completion cleanup: wait _DEFERRED_CLEAR_DELAY steps
-        # after the last request completion to give IOKit time to process
-        # completeMemory() callbacks before releasing Metal buffers (#435).
-        if self._deferred_clear_steps is not None:
-            self._deferred_clear_steps += 1
-            if self._deferred_clear_steps >= self._DEFERRED_CLEAR_DELAY:
-                should_clear = True
-                self._deferred_clear_steps = None
+        # Deferred post-completion cleanup: fire once the step counter reaches
+        # the target set by _cleanup_finished() (#435, #557).
+        if self._deferred_clear_at is not None and self._step_counter >= self._deferred_clear_at:
+            should_clear = True
+            self._deferred_clear_at = None
         if should_clear:
             _sync_and_clear_cache()
         if (
@@ -3705,7 +3812,7 @@ class Scheduler:
         self._output_parser_sessions.clear()
 
         # Cancel any pending deferred Metal cache clear
-        self._deferred_clear_steps = None
+        self._deferred_clear_at = None
 
     def deep_reset(self) -> None:
         """

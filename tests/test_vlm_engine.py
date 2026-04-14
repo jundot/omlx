@@ -160,15 +160,13 @@ class TestInjectToolCalling:
         assert getattr(tokenizer, "has_tool_calling", False) is False
 
     def test_skips_when_mlx_lm_not_available(self):
-        """ImportError from both parser backends → silently skipped."""
+        """When neither parser backend is available, injection is skipped."""
         engine = _make_engine()
         tokenizer = MockVLMTokenizer(
             chat_template="<tool_call> tool_call.name",
             vocab={"<tool_call>": 100, "</tool_call>": 101},
         )
 
-        # Simulate environments where neither mlx_vlm.tool_parsers nor mlx_lm
-        # parser modules are importable.
         with patch.dict(
             "sys.modules",
             {
@@ -434,25 +432,44 @@ class TestApplyOcrPrompt:
 class TestProcessChatMessages:
     """Tests for VLMBatchedEngine._process_chat_messages()."""
 
-    def test_text_only_uses_chat_template(self):
-        """Text-only messages → _apply_chat_template() called."""
+    @patch("omlx.engine.vlm.extract_images_from_messages")
+    def test_text_only_uses_vlm_prepare_path(self, mock_extract):
+        """Text-only turns on a VLM model still use _prepare_vision_inputs()."""
+        text_msgs = [{"role": "user", "content": "Hello"}]
+        mock_extract.return_value = (text_msgs, [])
+
         engine = _make_loaded_engine()
-        engine._apply_chat_template = MagicMock(return_value="<prompt>")
+        engine._prepare_vision_inputs = MagicMock(
+            return_value=([1, 2, 3], None, None, None, 0, [])
+        )
 
         messages = [{"role": "user", "content": "Hello"}]
         result = engine._process_chat_messages(messages, tools=None, kwargs={})
 
-        prompt, vlm_embeds, vlm_kwargs, image_hash = result
-        assert prompt == "<prompt>"
+        token_ids, vlm_embeds, vlm_kwargs, image_hash, image_cache_key_start, image_cache_key_ranges = result
+        assert token_ids == [1, 2, 3]
         assert vlm_embeds is None
         assert vlm_kwargs is None
         assert image_hash is None
-        engine._apply_chat_template.assert_called_once()
+        assert image_cache_key_start == 0
+        assert image_cache_key_ranges == []
+        engine._prepare_vision_inputs.assert_called_once_with(
+            text_msgs,
+            [],
+            chat_template_kwargs=None,
+            tools=None,
+        )
 
-    def test_text_only_passes_tools(self):
-        """Text-only + tools → convert_tools_for_template() called."""
+    @patch("omlx.engine.vlm.extract_images_from_messages")
+    def test_text_only_passes_tools_to_prepare_vision(self, mock_extract):
+        """Text-only + tools still convert and pass tools through VLM path."""
+        text_msgs = [{"role": "user", "content": "Hello"}]
+        mock_extract.return_value = (text_msgs, [])
+
         engine = _make_loaded_engine()
-        engine._apply_chat_template = MagicMock(return_value="<prompt>")
+        engine._prepare_vision_inputs = MagicMock(
+            return_value=([1, 2, 3], None, None, None, 0, [])
+        )
 
         tools = [{"type": "function", "function": {"name": "test", "parameters": {}}}]
         messages = [{"role": "user", "content": "Hello"}]
@@ -462,6 +479,8 @@ class TestProcessChatMessages:
             engine._process_chat_messages(messages, tools=tools, kwargs={})
 
         mock_convert.assert_called_once_with(tools)
+        call_kwargs = engine._prepare_vision_inputs.call_args[1]
+        assert call_kwargs["tools"] == [{"converted": True}]
 
     @patch("omlx.engine.vlm.extract_images_from_messages")
     def test_image_path_calls_prepare_vision(self, mock_extract):
@@ -475,7 +494,7 @@ class TestProcessChatMessages:
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
         engine._prepare_vision_inputs = MagicMock(
-            return_value=([1, 2, 3], MagicMock(), {}, "hash123")
+            return_value=([1, 2, 3], MagicMock(), {}, "hash123", 12, [(12, "hash123")])
         )
 
         messages = [{"role": "user", "content": [
@@ -486,9 +505,11 @@ class TestProcessChatMessages:
         result = engine._process_chat_messages(messages, tools=None, kwargs={})
 
         engine._prepare_vision_inputs.assert_called_once()
-        token_ids, vlm_embeds, vlm_kwargs, image_hash = result
+        token_ids, vlm_embeds, vlm_kwargs, image_hash, image_cache_key_start, image_cache_key_ranges = result
         assert token_ids == [1, 2, 3]
         assert image_hash == "hash123"
+        assert image_cache_key_start == 12
+        assert image_cache_key_ranges == [(12, "hash123")]
 
     @patch("omlx.engine.vlm.extract_images_from_messages")
     def test_image_path_passes_tools(self, mock_extract):
@@ -502,7 +523,7 @@ class TestProcessChatMessages:
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
         engine._prepare_vision_inputs = MagicMock(
-            return_value=([1, 2, 3], None, None, None)
+            return_value=([1, 2, 3], None, None, None, 0, [])
         )
 
         tools = [{"type": "function", "function": {"name": "analyze", "parameters": {}}}]
@@ -529,7 +550,7 @@ class TestProcessChatMessages:
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
         engine._prepare_vision_inputs = MagicMock(
-            return_value=([1, 2, 3], None, None, None)
+            return_value=([1, 2, 3], None, None, None, 0, [])
         )
 
         messages = [{"role": "user", "content": "Describe"}]
@@ -659,10 +680,13 @@ class TestFormatMessagesForVLMTemplate:
             },
         ]
 
-        formatted = engine._format_messages_for_vlm_template(messages, num_images=1)
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
 
         assert self._count_image_placeholders(formatted) == 1
         assert self._count_image_placeholders([formatted[-1]]) == 1
+        assert image_ranges == [(2, 1)]
 
     def test_caps_placeholders_by_loaded_image_count(self):
         """Do not add more placeholders than successfully loaded images."""
@@ -678,18 +702,24 @@ class TestFormatMessagesForVLMTemplate:
             },
         ]
 
-        formatted = engine._format_messages_for_vlm_template(messages, num_images=1)
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
 
         assert self._count_image_placeholders(formatted) == 1
+        assert image_ranges == [(0, 1)]
 
     def test_fallback_inserts_first_user_when_no_explicit_parts(self):
         """Legacy path: num_images without explicit image parts still injects once."""
         engine = _make_loaded_engine(model_type="qwen3_5")
         messages = [{"role": "user", "content": "Describe this"}]
 
-        formatted = engine._format_messages_for_vlm_template(messages, num_images=1)
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
 
         assert self._count_image_placeholders(formatted) == 1
+        assert image_ranges == [(0, 1)]
 
 
 # ---------------------------------------------------------------------------
@@ -782,3 +812,70 @@ class TestGetStats:
         assert stats["engine_type"] == "vlm"
         assert stats["model_name"] == "test-vlm"
         assert stats["loaded"] is True
+
+
+# ---------------------------------------------------------------------------
+# TestSplitVisionFeatures
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_MLX, reason="mlx not installed")
+class TestSplitVisionFeatures:
+    """Tests for VLMBatchedEngine._split_vision_features()."""
+
+    def test_single_image_returns_whole(self):
+        """Single image returns the feature tensor as-is in a list."""
+        engine = _make_loaded_engine()
+        features = mx.ones((1, 10, 64))
+        result = engine._split_vision_features(features, 1, {})
+        assert len(result) == 1
+        assert result[0].shape == (1, 10, 64)
+
+    def test_batch_dim_split_gemma_llava(self):
+        """Features with batch dim = num_images are split along axis 0."""
+        engine = _make_loaded_engine(model_type="gemma4")
+        features = mx.ones((3, 10, 64))
+        result = engine._split_vision_features(features, 3, {})
+        assert result is not None
+        assert len(result) == 3
+        for f in result:
+            assert f.shape == (1, 10, 64)
+
+    def test_qwen_flat_split(self):
+        """Qwen flat (total_tokens, dim) features are split using grid_thw."""
+        engine = _make_loaded_engine(model_type="qwen3_5")
+        # Mock spatial_merge_size on vision_tower
+        engine._vlm_model.vision_tower = MagicMock()
+        engine._vlm_model.vision_tower.spatial_merge_size = 2
+
+        # 2 images: image1 has grid (1, 4, 4) → 16 patches / 4 = 4 merged
+        #           image2 has grid (1, 4, 8) → 32 patches / 4 = 8 merged
+        grid_thw = mx.array([[1, 4, 4], [1, 4, 8]])
+        features = mx.ones((12, 128))  # 4 + 8 = 12 total merged tokens
+
+        result = engine._split_vision_features(
+            features, 2, {"image_grid_thw": grid_thw}
+        )
+        assert result is not None
+        assert len(result) == 2
+        assert result[0].shape == (4, 128)
+        assert result[1].shape == (8, 128)
+
+    def test_qwen_mismatch_returns_none(self):
+        """Returns None if computed token count doesn't match feature shape."""
+        engine = _make_loaded_engine(model_type="qwen3_5")
+        engine._vlm_model.vision_tower = MagicMock()
+        engine._vlm_model.vision_tower.spatial_merge_size = 2
+
+        grid_thw = mx.array([[1, 4, 4]])  # → 4 merged tokens
+        features = mx.ones((99, 128))  # Mismatch
+
+        result = engine._split_vision_features(features, 1, {"image_grid_thw": grid_thw})
+        # Single image: returns [features] regardless of shape
+        assert result is not None
+
+    def test_unsupported_returns_none(self):
+        """Unknown model with non-matching dimensions returns None."""
+        engine = _make_loaded_engine(model_type="unknown_vlm")
+        features = mx.ones((100, 128))  # 2D, non-Qwen
+        result = engine._split_vision_features(features, 3, {})
+        assert result is None

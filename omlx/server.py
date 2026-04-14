@@ -293,6 +293,33 @@ async def verify_api_key(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
+    # Startup: Auto-populate server aliases for the admin dashboard
+    # so users get sensible hostname/IP options for API URL hints
+    # without manual configuration. Only runs when the persisted list
+    # is empty so user-curated aliases are never overwritten.
+    if (
+        _server_state.global_settings is not None
+        and not _server_state.global_settings.server.server_aliases
+    ):
+        try:
+            from .utils.network import detect_server_aliases
+
+            detected = detect_server_aliases(
+                host=_server_state.global_settings.server.host
+            )
+            if detected:
+                _server_state.global_settings.server.server_aliases = detected
+                try:
+                    _server_state.global_settings.save()
+                except Exception as save_exc:  # pragma: no cover - filesystem race
+                    logger.warning(
+                        "Auto-detected server aliases but could not persist: %s",
+                        save_exc,
+                    )
+                logger.info("Auto-detected server aliases: %s", detected)
+        except Exception as exc:  # pragma: no cover - never block startup
+            logger.warning("Server alias auto-detection failed: %s", exc)
+
     # Startup: Preload pinned models
     if _server_state.engine_pool is not None:
         await _server_state.engine_pool.preload_pinned_models()

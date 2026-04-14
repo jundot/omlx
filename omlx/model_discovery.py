@@ -501,6 +501,30 @@ def _is_model_dir(path: Path) -> bool:
     return (path / "config.json").exists() and not _is_adapter_dir(path)
 
 
+def _resolve_hf_cache_entry(path: Path) -> tuple[Path, str] | None:
+    """Resolve an HF Hub cache entry (models--Org--Name/) to its active snapshot.
+
+    Returns (snapshot_path, model_name) or None if not a valid HF cache entry.
+    """
+    name = path.name
+    if not name.startswith("models--") or name.count("--") < 2:
+        return None
+
+    # "models--Org--Name" → "Name"
+    model_name = name.split("--", 2)[2]
+
+    try:
+        commit_hash = (path / "refs" / "main").read_text().strip()
+    except OSError:
+        return None
+
+    snapshot = path / "snapshots" / commit_hash
+    if not snapshot.is_dir():
+        return None
+
+    return snapshot, model_name
+
+
 def _register_model(
     models: dict[str, DiscoveredModel],
     model_dir: Path,
@@ -607,6 +631,14 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
             # Level 1: direct model folder
             _register_model(models, subdir, subdir.name)
         else:
+            # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
+            hf_resolved = _resolve_hf_cache_entry(subdir)
+            if hf_resolved is not None:
+                snapshot_path, model_name = hf_resolved
+                if _is_model_dir(snapshot_path):
+                    _register_model(models, snapshot_path, model_name)
+                continue
+
             # Level 2: organization folder — scan children
             has_children = False
             for child in sorted(subdir.iterdir()):

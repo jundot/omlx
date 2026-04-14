@@ -194,7 +194,7 @@ Search and download MLX models from HuggingFace directly in the admin dashboard.
 
 ### Integrations
 
-Set up OpenClaw, OpenCode, and Codex directly from the admin dashboard with a single click. No manual config editing required.
+Set up OpenClaw, OpenCode, Codex, and Pi directly from the admin dashboard with a single click. No manual config editing required.
 
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
@@ -374,4 +374,4 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX started from vllm-mlx v0.1.0 and evolved significantly with multi-model serving, tiered KV caching, VLM with full paged cache support, an admin panel, and a macOS menu bar app
 - [venvstacks](https://venvstacks.lmstudio.ai) - Portable Python environment layering for the macOS app bundle
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
-- [llm-compressor](https://github.com/vllm-project/llm-compressor) - Reference AWQ implementation for MoE models, used as design reference for oQ weight equalization
+- [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
