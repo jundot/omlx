@@ -254,6 +254,8 @@ class ChatCompletionRequest(BaseModel):
     specprefill_keep_pct: Optional[float] = None
     # SpecPrefill: per-request threshold override (min tokens to trigger, None = use model setting)
     specprefill_threshold: Optional[int] = None
+    # DFlash: per-request enable/disable (None = use model setting)
+    dflash: Optional[bool] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
 

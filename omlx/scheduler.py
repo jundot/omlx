@@ -464,6 +464,9 @@ class Scheduler:
         self._turboquant_kv_bits: Optional[float] = None
         self._turboquant_skip_last: bool = True
 
+        # PlanarQuant KV cache (set by engine if model_settings has it enabled)
+        self._planarquant_kv_bits: Optional[int] = None
+
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
         self.running: Dict[str, Request] = {}  # Running requests by ID
@@ -484,6 +487,14 @@ class Scheduler:
         self._specprefill_draft_model: Optional[Any] = None
         # Track active specprefill request for RoPE cleanup
         self._specprefill_active_request_id: Optional[str] = None
+
+        # DFlash: draft model for block-diffusion speculative decoding
+        self._dflash_draft_model: Optional[Any] = None
+        self._dflash_draft_ref: Optional[str] = None
+        self._dflash_block_tokens: int = 16
+        self._dflash_quantize_kv_cache: bool = False
+        # Track active DFlash request for cache coherence
+        self._dflash_active_request_id: Optional[str] = None
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: Dict[str, int] = {}
@@ -2458,6 +2469,36 @@ class Scheduler:
                 logger.info("SpecPrefill: draft model set (no SSD cache)")
         else:
             logger.info("SpecPrefill: draft model set (no SSD cache)")
+
+    def set_dflash_draft_model(
+        self,
+        draft_model: Any,
+        draft_ref: Optional[str] = None,
+        block_tokens: int = 16,
+        quantize_kv_cache: bool = False,
+        target_model: Optional[Any] = None,
+    ) -> None:
+        """Set the draft model for DFlash speculative decoding.
+
+        Installs speculative hooks on the target model (hybrid GDN attention
+        split, recurrent rollback cache, weight packing) when applicable.
+        """
+        self._dflash_draft_model = draft_model
+        self._dflash_draft_ref = draft_ref
+        self._dflash_block_tokens = max(1, min(int(block_tokens), 16))
+        self._dflash_quantize_kv_cache = bool(quantize_kv_cache)
+
+        if target_model is not None:
+            try:
+                from .patches.dflash import install_dflash_hooks
+                install_dflash_hooks(target_model)
+            except ImportError:
+                logger.warning("DFlash: dflash-mlx not installed, hooks skipped")
+
+        logger.info(
+            f"DFlash: draft model set (ref={draft_ref}, "
+            f"block_tokens={self._dflash_block_tokens})"
+        )
 
     def _try_specprefill_scoring(self, request: Request) -> None:
         """Score tokens with draft model if SpecPrefill is applicable.

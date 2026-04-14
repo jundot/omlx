@@ -1801,6 +1801,11 @@ async def create_completion(
             status_code=503,
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
+
+    # Record request start for queue time metrics
+    from omlx.server_metrics import get_server_metrics
+    get_server_metrics().record_request_start(model_id=request.model)
+
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
@@ -1942,6 +1947,12 @@ async def create_chat_completion(
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
+
+    # Record request start for queue time metrics
+    # We don't have accurate queue time here, but we can track the request arrival
+    # The actual queue time would be between request arrival and start of processing
+    from omlx.server_metrics import get_server_metrics
+    get_server_metrics().record_request_start(model_id=request.model)
 
     # Resolve alias to real model ID for settings lookups
     resolved_model = resolve_model_id(request.model) or request.model
@@ -2131,6 +2142,10 @@ async def create_chat_completion(
         chat_kwargs["specprefill_threshold"] = request.specprefill_threshold
     elif _server_state.settings_manager and ms.specprefill_threshold is not None:
         chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
+
+    # DFlash: per-request override
+    if getattr(request, "dflash", None) is not None:
+        chat_kwargs["dflash"] = request.dflash
 
     if request.stream:
         return StreamingResponse(

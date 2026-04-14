@@ -427,6 +427,12 @@ class VLMBatchedEngine(BaseEngine):
         # TurboQuant KV cache
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            pq_enabled = getattr(self._model_settings, "planarquant_kv_enabled", False)
+            if tq_enabled and pq_enabled:
+                raise ValueError(
+                    "turboquant_kv_enabled and planarquant_kv_enabled are "
+                    "mutually exclusive — both patch SDPA dispatch"
+                )
             if tq_enabled:
                 from ..patches.turboquant_attention import apply_turboquant_attention_patch
                 apply_turboquant_attention_patch()
@@ -436,6 +442,14 @@ class VLMBatchedEngine(BaseEngine):
                     self._model_settings, "turboquant_skip_last", True
                 )
                 logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+            if pq_enabled:
+                from ..patches.planarquant_cache import enable_planarquant_cache
+                from ..patches.turboquant_attention import apply_turboquant_attention_patch
+                apply_turboquant_attention_patch()
+                pq_bits = int(getattr(self._model_settings, "planarquant_kv_bits", 3))
+                enable_planarquant_cache(bits=pq_bits)
+                self._engine.engine.scheduler._planarquant_kv_bits = pq_bits
+                logger.info(f"PlanarQuant KV cache enabled for VLM: {pq_bits} bits")
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
@@ -455,6 +469,48 @@ class VLMBatchedEngine(BaseEngine):
                     logger.info(f"SpecPrefill: draft model loaded ({specprefill_draft})")
                 except Exception as e:
                     logger.error(f"SpecPrefill: draft model load failed: {e}")
+
+        # DFlash speculative decoding: load draft model and install hooks
+        if self._model_settings is not None:
+            dflash_enabled = getattr(self._model_settings, "dflash_enabled", False)
+            if dflash_enabled:
+                try:
+                    from ..patches.dflash import load_dflash_draft
+                    dflash_draft_ref = getattr(
+                        self._model_settings, "dflash_draft_model", None
+                    )
+                    dflash_block_tokens = int(
+                        getattr(self._model_settings, "dflash_block_tokens", 16)
+                    )
+                    dflash_quantize_kv = bool(
+                        getattr(self._model_settings, "dflash_quantize_kv_cache", False)
+                    )
+                    draft_model, resolved_ref = await loop.run_in_executor(
+                        get_mlx_executor(),
+                        lambda: load_dflash_draft(
+                            self._model_name,
+                            draft_ref_override=dflash_draft_ref,
+                        ),
+                    )
+                    if draft_model is not None:
+                        self._engine.engine.scheduler.set_dflash_draft_model(
+                            draft_model,
+                            draft_ref=resolved_ref,
+                            block_tokens=dflash_block_tokens,
+                            quantize_kv_cache=dflash_quantize_kv,
+                            target_model=self._model,
+                        )
+                        logger.info(
+                            f"DFlash: draft model loaded ({resolved_ref}), "
+                            f"block_tokens={dflash_block_tokens}"
+                        )
+                    else:
+                        logger.warning(
+                            f"DFlash: no draft model found for {self._model_name}, "
+                            f"falling back to AR decode"
+                        )
+                except Exception as e:
+                    logger.error(f"DFlash: draft model load failed: {e}")
 
         # Inject mlx-lm tool calling support into VLM tokenizer
         self._inject_tool_calling(self._tokenizer)

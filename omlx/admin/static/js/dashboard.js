@@ -178,6 +178,7 @@
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
             showClearSsdCacheConfirm: false,
+            showLatencyDetails: false,
             _statsRefreshTimer: null,
 
             // Log viewer state
@@ -1548,7 +1549,8 @@
                     specprefill_threshold: settings.specprefill_threshold || null,
                     dflash_enabled: settings.dflash_enabled || false,
                     dflash_draft_model: settings.dflash_draft_model || '',
-                    dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
+                    dflash_block_tokens: settings.dflash_block_tokens || 16,
+                    dflash_quantize_kv_cache: settings.dflash_quantize_kv_cache || false,
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
@@ -1626,8 +1628,11 @@
                                     : null,
                                 dflash_enabled: this.modelSettings.dflash_enabled,
                                 dflash_draft_model: this.modelSettings.dflash_draft_model || null,
-                                dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_bits)
+                                dflash_block_tokens: this.modelSettings.dflash_enabled
+                                    ? (this.modelSettings.dflash_block_tokens || 16)
+                                    : null,
+                                dflash_quantize_kv_cache: this.modelSettings.dflash_enabled
+                                    ? this.modelSettings.dflash_quantize_kv_cache
                                     : null,
                             };
                         })()),
@@ -2038,6 +2043,14 @@
                     console.error('Failed to copy:', err);
                 }
                 document.body.removeChild(textarea);
+            },
+
+            copyJsonStats() {
+                const statsToCopy = {
+                    ...this.stats,
+                    alltimeStats: this.alltimeStats,
+                };
+                this.copyToClipboard(JSON.stringify(statsToCopy, null, 2));
             },
 
             async logout() {

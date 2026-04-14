@@ -35,6 +35,9 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     """
     # GatedDeltaNet advance patch: always applied for qwen3_5 models
     # (no settings needed — auto-detected by model type)
+    # NOTE: Must be applied BEFORE DFlash speculative hooks, which wrap
+    # GatedDeltaNet.__call__ further. The advance() call must be present
+    # in the base __call__ so DFlash's speculative_call delegates to it.
     from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
 
     if apply_gated_delta_advance_patch(model):

@@ -117,15 +117,19 @@ class ModelSettingsRequest(BaseModel):
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: Optional[bool] = None
     turboquant_kv_bits: Optional[float] = None
+    # PlanarQuant KV cache (omlx-native, 3-bit Givens rotation)
+    planarquant_kv_enabled: Optional[bool] = None
+    planarquant_kv_bits: Optional[int] = None
     # SpecPrefill (experimental)
     specprefill_enabled: Optional[bool] = None
     specprefill_draft_model: Optional[str] = None
     specprefill_keep_pct: Optional[float] = None
     specprefill_threshold: Optional[int] = None
-    # DFlash (block diffusion speculative decoding)
+    # DFlash speculative decoding
     dflash_enabled: Optional[bool] = None
     dflash_draft_model: Optional[str] = None
-    dflash_draft_quant_bits: Optional[int] = None
+    dflash_block_tokens: Optional[int] = None
+    dflash_quantize_kv_cache: Optional[bool] = None
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
@@ -1421,13 +1425,16 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "index_cache_freq": settings.index_cache_freq,
                 "turboquant_kv_enabled": settings.turboquant_kv_enabled,
                 "turboquant_kv_bits": settings.turboquant_kv_bits,
+                "planarquant_kv_enabled": settings.planarquant_kv_enabled,
+                "planarquant_kv_bits": settings.planarquant_kv_bits,
                 "specprefill_enabled": settings.specprefill_enabled,
                 "specprefill_draft_model": settings.specprefill_draft_model,
                 "specprefill_keep_pct": settings.specprefill_keep_pct,
                 "specprefill_threshold": settings.specprefill_threshold,
                 "dflash_enabled": settings.dflash_enabled,
                 "dflash_draft_model": settings.dflash_draft_model,
-                "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
+                "dflash_block_tokens": settings.dflash_block_tokens,
+                "dflash_quantize_kv_cache": settings.dflash_quantize_kv_cache,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
@@ -1639,6 +1646,16 @@ async def update_model_settings(
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
     if "turboquant_kv_bits" in sent:
         current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+    # PlanarQuant KV cache settings (mutually exclusive with TurboQuant)
+    if "planarquant_kv_enabled" in sent:
+        current_settings.planarquant_kv_enabled = request.planarquant_kv_enabled or False
+    if "planarquant_kv_bits" in sent:
+        current_settings.planarquant_kv_bits = request.planarquant_kv_bits or 3
+    if current_settings.turboquant_kv_enabled and current_settings.planarquant_kv_enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="turboquant_kv_enabled and planarquant_kv_enabled are mutually exclusive",
+        )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
@@ -1648,13 +1665,15 @@ async def update_model_settings(
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
         current_settings.specprefill_threshold = request.specprefill_threshold or None
-    # DFlash settings
+    # DFlash speculative decoding
     if "dflash_enabled" in sent:
         current_settings.dflash_enabled = request.dflash_enabled or False
     if "dflash_draft_model" in sent:
         current_settings.dflash_draft_model = request.dflash_draft_model or None
-    if "dflash_draft_quant_bits" in sent:
-        current_settings.dflash_draft_quant_bits = request.dflash_draft_quant_bits or None
+    if "dflash_block_tokens" in sent:
+        current_settings.dflash_block_tokens = request.dflash_block_tokens or 16
+    if "dflash_quantize_kv_cache" in sent:
+        current_settings.dflash_quantize_kv_cache = request.dflash_quantize_kv_cache or False
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -3117,8 +3136,14 @@ async def get_server_stats(
     from ..server_metrics import get_server_metrics
 
     metrics = get_server_metrics()
-    resolved_model = resolve_model_id(model) or model if model else ""
-    snapshot = metrics.get_snapshot(model_id=resolved_model, scope=scope)
+
+    # Get comprehensive stats for the main snapshot
+    # For model-specific queries, use the filtered snapshot
+    if model:
+        resolved_model = resolve_model_id(model) or model
+        snapshot = metrics.get_snapshot(model_id=resolved_model, scope=scope)
+    else:
+        snapshot = metrics.get_comprehensive_stats()
 
     global_settings = _get_global_settings()
     host = global_settings.server.host if global_settings else "127.0.0.1"
@@ -3136,7 +3161,7 @@ async def get_server_stats(
         model_filter=model,
     )
 
-    return {
+    response = {
         **snapshot,
         "host": host,
         "port": port,
@@ -3156,6 +3181,15 @@ async def get_server_stats(
         "active_models": active_models_data,
         "runtime_cache": runtime_cache_data,
     }
+
+    # For model-specific queries, remove model-agnostic stats
+    if model:
+        response.pop("request_counts", None)
+        response.pop("latency_stats", None)
+        response.pop("batching_speedup", None)
+        response.pop("per_model_stats", None)
+
+    return response
 
 
 def _build_active_models_data() -> dict:

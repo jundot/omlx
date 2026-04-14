@@ -53,30 +53,76 @@
                         </div>
                     </div>
 
-                    <!-- Three Stat Cards -->
+                    <!-- Request Stats -->
                     <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 sm:gap-6 mb-8">
-                        <!-- Total Prefill Tokens -->
+                        <!-- Total Requests -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
+                            <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.total_requests') }}</p>
+                            <p class="font-bold tracking-tight text-neutral-900 transition-all"
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_requests)"
+                               x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_requests)"></p>
+                        </div>
+
+                        <!-- Requests Per Minute -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
+                            <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.req_per_minute') }}</p>
+                            <p class="font-bold tracking-tight text-neutral-900 transition-all"
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).requests_per_minute || 0)"
+                               x-text="((statsScope === 'alltime' ? alltimeStats : stats).requests_per_minute || 0).toFixed(1) + ' /min'"></p>
+                        </div>
+
+                        <!-- Total Tokens In/Out -->
                         <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.total_tokens') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
-                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"
-                               x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"></p>
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens + (statsScope === 'alltime' ? alltimeStats : stats).total_completion_tokens)"
+                               x-text="formatNumber(((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens || 0) + ((statsScope === 'alltime' ? alltimeStats : stats).total_completion_tokens || 0))"></p>
+                        </div>
+                    </div>
+
+                    <!-- Token and Cache Stats -->
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 sm:gap-6 mb-8">
+                        <!-- Total Tokens In (Prompt) -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
+                            <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.tokens_in') }}</p>
+                            <p class="font-bold tracking-tight text-neutral-900 transition-all"
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens || 0)"
+                               x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens || 0)"></p>
+                        </div>
+
+                        <!-- Total Tokens Out (Completion) -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
+                            <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.tokens_out') }}</p>
+                            <p class="font-bold tracking-tight text-neutral-900 transition-all"
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_completion_tokens || 0)"
+                               x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_completion_tokens || 0)"></p>
                         </div>
 
                         <!-- Cached Tokens Served -->
                         <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cached_tokens') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
-                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"
-                               x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"></p>
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens || 0)"
+                               x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens || 0)"></p>
                         </div>
+                    </div>
 
+                    <!-- Cache Efficiency and Speed Stats -->
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6 mb-8">
                         <!-- Cache Efficiency -->
                         <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cache_efficiency') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
-                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency)"
-                               x-text="(statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency.toFixed(1) + '%'"></p>
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency || 0)"
+                               x-text="((statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency || 0).toFixed(1) + '%'"></p>
+                        </div>
+
+                        <!-- Tokens Per Second Total -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
+                            <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.tps_total') }}</p>
+                            <p class="font-bold tracking-tight text-neutral-900 transition-all"
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).tokens_per_second_total || 0)"
+                               x-text="((statsScope === 'alltime' ? alltimeStats : stats).tokens_per_second_total || 0).toFixed(1) + ' tok/s'"></p>
                         </div>
                     </div>
 
@@ -96,6 +142,63 @@
                             <div class="p-6">
                                 <p class="text-xs text-neutral-500 mb-1">{{ t('status.speed.token_generation') }}</p>
                                 <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_generation_tps.toFixed(1) + ' tok/s'"></p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Latency and Batching Stats -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.latency.section_label') }}</span>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <button @click="showLatencyDetails = !showLatencyDetails"
+                                        class="px-3 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-200 rounded-lg transition-all"
+                                        x-text="showLatencyDetails ? 'Hide details' : 'Show details'"></button>
+                                <button @click="copyJsonStats()"
+                                        class="px-3 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-200 rounded-lg transition-all flex items-center gap-1.5"
+                                        :title="window.t('status.copy_json_tooltip')">
+                                    <i data-lucide="copy" class="w-3.5 h-3.5"></i>
+                                    {{ t('status.copy_json') }}
+                                </button>
+                            </div>
+                        </div>
+                        <div x-show="showLatencyDetails" class="divide-y divide-neutral-100">
+                            <div class="grid grid-cols-1 sm:grid-cols-2 sm:divide-x divide-neutral-100">
+                                <div class="p-6">
+                                    <p class="text-xs text-neutral-500 mb-2">{{ t('status.latency.prefill_duration') }}</p>
+                                    <p class="text-sm text-neutral-700 mb-1">
+                                        <span class="font-medium">{{ t('status.latency.avg') }}</span>
+                                        <span x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_prefill_duration.toFixed(3) + 's'"></span>
+                                    </p>
+                                    <p class="text-sm text-neutral-700">
+                                        <span class="font-medium">{{ t('status.latency.p95') }}</span>
+                                        <span x-text="(statsScope === 'alltime' ? alltimeStats : stats).prefill_p95.toFixed(3) + 's'"></span>
+                                    </p>
+                                </div>
+                                <div class="p-6">
+                                    <p class="text-xs text-neutral-500 mb-2">{{ t('status.latency.generation_duration') }}</p>
+                                    <p class="text-sm text-neutral-700 mb-1">
+                                        <span class="font-medium">{{ t('status.latency.avg') }}</span>
+                                        <span x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_generation_duration.toFixed(3) + 's'"></span>
+                                    </p>
+                                    <p class="text-sm text-neutral-700">
+                                        <span class="font-medium">{{ t('status.latency.p95') }}</span>
+                                        <span x-text="(statsScope === 'alltime' ? alltimeStats : stats).generation_p95.toFixed(3) + 's'"></span>
+                                    </p>
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 sm:divide-x divide-neutral-100">
+                                <div class="p-6">
+                                    <p class="text-xs text-neutral-500 mb-1">{{ t('status.latency.batching_speedup') }}</p>
+                                    <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).batching_speedup.toFixed(2) + 'x'"></p>
+                                </div>
+                                <div class="p-6">
+                                    <p class="text-xs text-neutral-500 mb-1">{{ t('status.latency.total_requests') }}</p>
+                                    <p class="text-2xl font-bold text-neutral-900" x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_requests)"></p>
+                                </div>
                             </div>
                         </div>
                     </div>
