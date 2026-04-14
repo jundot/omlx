@@ -1003,7 +1003,9 @@ class TestSchedulerBoundarySnapshots:
             # generation steps to avoid IOKit completeMemory() race (#435).
             # It should NOT be called immediately in _cleanup_finished.
             mock_mx.clear_cache.assert_not_called()
-            assert scheduler._deferred_clear_steps == 0
+            assert scheduler._deferred_clear_at == (
+                scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
+            )
 
     def test_prefill_boundary_snapshot_records_rotating_cache(
         self, mock_model, mock_tokenizer
@@ -1182,7 +1184,7 @@ class TestSchedulerRotatingBlockAlignment:
 
         Immediate mx.clear_cache() after request completion races with
         IOKit's asynchronous completeMemory() callbacks. Instead,
-        _cleanup_finished sets _deferred_clear_steps so the clear happens
+        _cleanup_finished sets _deferred_clear_at so the clear happens
         after _DEFERRED_CLEAR_DELAY generation steps.
         """
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
@@ -1203,8 +1205,10 @@ class TestSchedulerRotatingBlockAlignment:
             scheduler._cleanup_finished({"req-clear-cache"})
             # Should NOT clear immediately — deferred to avoid IOKit race
             mock_mx.clear_cache.assert_not_called()
-            # Counter should be set for deferred clearing
-            assert scheduler._deferred_clear_steps == 0
+            # Target step should be set for deferred clearing
+            assert scheduler._deferred_clear_at == (
+                scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
+            )
 
     def test_cleanup_finished_skips_clear_cache_when_no_finished(
         self, mock_model, mock_tokenizer
@@ -1215,7 +1219,60 @@ class TestSchedulerRotatingBlockAlignment:
         with patch("omlx.scheduler.mx") as mock_mx:
             scheduler._cleanup_finished(set())
             mock_mx.clear_cache.assert_not_called()
-            assert scheduler._deferred_clear_steps is None
+            assert scheduler._deferred_clear_at is None
+
+    def test_cleanup_finished_extends_deferred_clear_for_concurrent_completions(
+        self, mock_model, mock_tokenizer
+    ):
+        """Concurrent completions must extend the deferred clear window (#557).
+
+        With max_num_seqs > 1, two requests can finish in the same batch
+        or in consecutive steps. Each completion must get a full
+        _DEFERRED_CLEAR_DELAY window from its own finish step, otherwise
+        the second request's KV cache blocks can be re-allocated before
+        IOKit finishes completeMemory() callbacks.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        # Simulate first completion at step 0
+        req1 = Request(
+            request_id="req-concurrent-1",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        req1.prompt_token_ids = [1, 2]
+        req1.num_prompt_tokens = 2
+        req1.output_token_ids = [3]
+        scheduler.running["req-concurrent-1"] = req1
+        scheduler.requests["req-concurrent-1"] = req1
+
+        with patch("omlx.scheduler.mx"):
+            scheduler._cleanup_finished({"req-concurrent-1"})
+        first_target = scheduler._deferred_clear_at
+        assert first_target == scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
+
+        # Advance step counter to simulate a later step
+        scheduler._step_counter += 3
+
+        # Simulate second completion at step 3
+        req2 = Request(
+            request_id="req-concurrent-2",
+            prompt="world",
+            sampling_params=SamplingParams(),
+        )
+        req2.prompt_token_ids = [4, 5]
+        req2.num_prompt_tokens = 2
+        req2.output_token_ids = [6]
+        scheduler.running["req-concurrent-2"] = req2
+        scheduler.requests["req-concurrent-2"] = req2
+
+        with patch("omlx.scheduler.mx"):
+            scheduler._cleanup_finished({"req-concurrent-2"})
+
+        # Target must be extended to cover the second completion's full window
+        second_target = scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
+        assert scheduler._deferred_clear_at == second_target
+        assert scheduler._deferred_clear_at > first_target
 
 
 class TestExtractCacheStatesCacheList:
