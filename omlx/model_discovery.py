@@ -14,6 +14,7 @@ Supports:
 - Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
 """
 
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
@@ -468,10 +469,8 @@ def detect_thinking_default(model_path: Path) -> bool | None:
     template_text = None
     jinja_path = model_path / "chat_template.jinja"
     if jinja_path.exists():
-        try:
+        with contextlib.suppress(OSError):
             template_text = jinja_path.read_text(encoding="utf-8")
-        except Exception:
-            pass
 
     if template_text is None:
         tc_path = model_path / "tokenizer_config.json"
