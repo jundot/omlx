@@ -805,6 +805,7 @@ class TestListGrammarParsers:
         app.dependency_overrides.clear()
 
     def test_returns_list_from_xgrammar(self, client):
+        pytest.importorskip("xgrammar")
         resp = client.get("/admin/api/grammar/parsers")
         assert resp.status_code == 200
         data = resp.json()

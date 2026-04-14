@@ -889,7 +889,8 @@
                     try {
                         const resp = await fetch('/admin/api/grammar/parsers');
                         if (resp.ok) this.reasoningParsers = await resp.json();
-                    } catch (_) { /* xgrammar not installed */ }
+                        else if (resp.status === 401) window.location.href = '/admin';
+                    } catch (_) { /* network error */ }
                 }
                 this.selectedModel = model;
                 // Load existing settings if available
