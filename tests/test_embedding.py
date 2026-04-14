@@ -553,6 +553,7 @@ class TestEmbeddingCompileFallback:
         model._is_compiled = False
         model._compiled_embed = None
         model.model = InputsOnlyModel()
+        model._detect_input_key_remapping()
 
         processor = MagicMock(spec=[])
         processor.prepare_embedding_inputs = MagicMock(

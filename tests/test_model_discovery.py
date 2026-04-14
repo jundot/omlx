@@ -293,6 +293,24 @@ class TestDetectModelType:
         (tmp_path / "modules.json").write_text(json.dumps(modules))
         assert detect_model_type(tmp_path) == "embedding"
 
+    def test_transformer_only_modules_json_is_not_embedding(self, tmp_path):
+        """modules.json with only Transformer (no Pooling/Normalize) should not be embedding."""
+        config = {
+            "model_type": "gemma3_text",
+            "architectures": ["Gemma3TextModel"],
+        }
+        modules = [
+            {
+                "idx": 0,
+                "name": "0",
+                "path": "",
+                "type": "sentence_transformers.models.Transformer",
+            },
+        ]
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "modules.json").write_text(json.dumps(modules))
+        assert detect_model_type(tmp_path) == "llm"
+
     def test_detect_vlm_model_type_requires_vision_config(self, tmp_path):
         """VLM_MODEL_TYPES match without vision_config should fall back to LLM."""
         config = {

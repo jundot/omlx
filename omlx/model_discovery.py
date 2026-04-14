@@ -358,9 +358,12 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     Checks:
     1. architectures field for reranker-specific classes (SequenceClassification)
-    2. architectures field for embedding-specific classes
-    3. model_type field against known embedding types (unambiguous only)
-    4. VLM detection via architectures, model_type, or vision_config presence
+    2. CausalLM-based reranker/embedding detection (architecture + directory name)
+    3. sentence-transformers pipeline detection via modules.json
+    4. architectures field for embedding-specific classes
+    5. model_type field against known embedding types (unambiguous only)
+    6. VLM detection via architectures, model_type, or vision_config presence
+    7. Audio model detection (STT/TTS/STS)
 
     Args:
         model_path: Path to model directory
