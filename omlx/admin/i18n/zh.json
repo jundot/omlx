@@ -104,6 +104,7 @@
   "status.integrations.copy_command_tooltip": "复制命令",
   "status.integrations.opencode_desc": "终端 AI 编程助手",
   "status.integrations.openclaw_desc": "消息集成 AI 助手",
+  "status.integrations.pi_desc": "Terminal AI coding agent",
   "status.integrations.openclaw_tools_profile": "工具",
   "status.engines.section_label": "引擎版本",
   "status.engines.unknown_version": "未知",
