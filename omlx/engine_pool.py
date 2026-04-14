@@ -467,9 +467,11 @@ class EnginePool:
 
     async def _unload_engine(self, model_id: str) -> None:
         """
-        Immediately stop and unload an engine.
+        Immediately stop and unload an engine with memory settle barrier.
 
-        This aborts any in-progress requests.
+        After stopping the engine, polls mx.get_active_memory() to verify
+        Metal buffers are actually reclaimed before updating the memory
+        tracking counter.
 
         Args:
             model_id: The model ID to unload
@@ -479,16 +481,14 @@ class EnginePool:
             return
 
         logger.info(f"Unloading model: {model_id} (immediate abort)")
+        pre_unload_active = mx.get_active_memory()
 
         try:
             await entry.engine.stop()
         except Exception as e:
             logger.warning(f"Error stopping engine for {model_id}: {e}")
 
-        # Release memory tracking
-        self._current_model_memory -= entry.estimated_size
-
-        # Clear engine reference
+        # Clear engine reference before settle barrier
         entry.engine = None
         entry.last_access = 0.0
 
@@ -503,10 +503,70 @@ class EnginePool:
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
 
-        logger.info(
-            f"Unloaded model: {model_id}, "
-            f"memory usage: {format_size(self._current_model_memory)}"
-        )
+        # Memory settle barrier: poll actual freed memory instead of
+        # trusting the cumulative _current_model_memory estimate.
+        settle_tolerance = 2 * 1024**3  # 2 GB
+        min_expected_freed = max(0, entry.estimated_size - settle_tolerance)
+        settled = False
+        for _settle_round in range(10):
+            active_now = mx.get_active_memory()
+            actual_freed = pre_unload_active - active_now
+            if actual_freed >= min_expected_freed:
+                settled = True
+                logger.debug(
+                    f"Settle round {_settle_round + 1} for '{model_id}': "
+                    f"freed={format_size(actual_freed)} "
+                    f"(need>={format_size(min_expected_freed)}) - settled"
+                )
+                break
+            logger.debug(
+                f"Settle round {_settle_round + 1} for '{model_id}': "
+                f"freed={format_size(actual_freed)} "
+                f"(need>={format_size(min_expected_freed)}) - retry"
+            )
+            await asyncio.sleep(0.5)
+            gc.collect()
+            await loop.run_in_executor(
+                get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+            )
+
+        # Release memory tracking AFTER barrier
+        self._current_model_memory -= entry.estimated_size
+
+        if settled:
+            logger.info(
+                f"Unloaded model: {model_id}, "
+                f"freed={format_size(actual_freed)} "
+                f"(expected>={format_size(min_expected_freed)}), "
+                f"active_memory: {format_size(active_now)} (settled)"
+            )
+        else:
+            # Barrier timed out - try emergency reclaim
+            logger.warning(
+                f"Settle barrier timed out for '{model_id}': "
+                f"freed={format_size(actual_freed)} "
+                f"(need>={format_size(min_expected_freed)})"
+            )
+            for _ in range(3):
+                gc.collect()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
+                await asyncio.sleep(1.0)
+            active_after = mx.get_active_memory()
+            if active_after > self._current_model_memory + 5 * 1024**3:
+                logger.error(
+                    f"Emergency reclaim failed for '{model_id}': "
+                    f"active_memory={format_size(active_after)} "
+                    f"exceeds safe threshold "
+                    f"({format_size(self._current_model_memory + 5 * 1024**3)})"
+                )
+            else:
+                logger.info(
+                    f"Emergency reclaim succeeded: "
+                    f"active_memory={format_size(active_after)}"
+                )
 
     async def _load_engine(self, model_id: str, force_lm: bool = False) -> None:
         """

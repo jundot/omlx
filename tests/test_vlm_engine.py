@@ -7,10 +7,11 @@ Tests cover:
 - Message processing (image vs text-only paths)
 - Vision input preparation with tools
 - Token counting
+- Engine stop safety (close() exception guard)
 """
 
 import copy
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -879,3 +880,52 @@ class TestSplitVisionFeatures:
         features = mx.ones((100, 128))  # 2D, non-Qwen
         result = engine._split_vision_features(features, 3, {})
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# TestStopSafety
+# ---------------------------------------------------------------------------
+
+class TestStopSafety:
+    """Tests for VLMBatchedEngine.stop() exception safety."""
+
+    @pytest.mark.asyncio
+    async def test_stop_completes_when_close_raises(self):
+        """stop() should complete even if engine.close() raises an exception."""
+        engine = _make_loaded_engine()
+
+        mock_inner_engine = MagicMock()
+        mock_inner_engine.close.side_effect = RuntimeError("close failed")
+        engine._engine.stop = AsyncMock()
+        engine._engine.engine = mock_inner_engine
+
+        await engine.stop()
+
+        assert engine._engine is None
+        assert engine._vlm_model is None
+        assert engine._tokenizer is None
+        assert engine._loaded is False
+
+    @pytest.mark.asyncio
+    async def test_stop_completes_when_engine_has_no_engine_attr(self):
+        """stop() should complete when _engine has no 'engine' attribute."""
+        engine = _make_loaded_engine()
+        engine._engine = MagicMock(spec=["stop"])
+        engine._engine.stop = AsyncMock()
+
+        await engine.stop()
+
+        assert engine._engine is None
+        assert engine._loaded is False
+
+    @pytest.mark.asyncio
+    async def test_stop_calls_close_on_success(self):
+        """stop() calls engine.close() when no exception occurs."""
+        engine = _make_loaded_engine()
+        mock_inner_engine = MagicMock()
+        engine._engine.stop = AsyncMock()
+        engine._engine.engine = mock_inner_engine
+
+        await engine.stop()
+
+        mock_inner_engine.close.assert_called_once()

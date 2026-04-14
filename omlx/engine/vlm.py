@@ -438,7 +438,11 @@ class VLMBatchedEngine(BaseEngine):
         """Stop the engine and cleanup resources."""
         if self._engine:
             await self._engine.stop()
-            self._engine.engine.close()
+            if hasattr(self._engine, 'engine') and self._engine.engine is not None:
+                try:
+                    self._engine.engine.close()
+                except Exception as e:
+                    logger.warning(f"Error closing engine: {e}")
         if self._vision_cache is not None:
             self._vision_cache.close()
             self._vision_cache = None

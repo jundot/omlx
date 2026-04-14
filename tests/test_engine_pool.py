@@ -1072,3 +1072,187 @@ class TestResolveModelId:
         # Exact match should be returned directly
         result = pool.resolve_model_id("model-a", settings_manager=None)
         assert result == "model-a"
+
+
+class TestMemorySettleBarrier:
+    """Tests for memory settle barrier in _unload_engine()."""
+
+    @pytest.fixture
+    def pool_with_loaded_model(self, small_mock_model_dir):
+        """Create pool with a mock-loaded model for settle barrier testing.
+
+        Sets estimated_size to 5GB so the settle tolerance (2GB) doesn't
+        make the barrier trivially pass.
+        """
+        pool = EnginePool(max_model_memory=100 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool._entries["model-a"]
+        entry.estimated_size = 5 * 1024**3  # 5GB (> 2GB tolerance)
+        mock_engine = MagicMock()
+        mock_engine.stop = AsyncMock()
+        mock_engine.has_active_requests = MagicMock(return_value=False)
+        entry.engine = mock_engine
+        entry.last_access = 100.0
+        pool._current_model_memory = entry.estimated_size
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_settle_succeeds_first_round(self, pool_with_loaded_model):
+        """Test that settle barrier passes on first round when memory is freed."""
+        pool = pool_with_loaded_model
+        est_size = pool._entries["model-a"].estimated_size  # 5GB
+        initial_memory = pool._current_model_memory
+
+        # Pre-unload: 10GB active. After GC: drops to 5GB (5GB freed >= 3GB needed).
+        active_memory_values = [10 * 1024**3, 5 * 1024**3]
+        call_idx = [0]
+
+        def mock_get_active():
+            val = active_memory_values[min(call_idx[0], len(active_memory_values) - 1)]
+            call_idx[0] += 1
+            return val
+
+        with patch("omlx.engine_pool.mx") as mock_mx, \
+             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            mock_mx.get_active_memory = mock_get_active
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        assert pool._entries["model-a"].engine is None
+        assert pool._current_model_memory == initial_memory - est_size
+
+    @pytest.mark.asyncio
+    async def test_settle_takes_multiple_rounds(self, pool_with_loaded_model):
+        """Test settle barrier succeeds after multiple rounds of GC."""
+        pool = pool_with_loaded_model
+        # est_size = 5GB, tolerance = 2GB, so need >= 3GB freed
+        # Pre-unload: 10GB. Need active <= 7GB to settle.
+        # Round 1: 9GB (freed=1GB < 3GB), Round 2: 8GB (freed=2GB < 3GB),
+        # Round 3: 5GB (freed=5GB >= 3GB) → settled
+        active_memory_values = [10 * 1024**3, 9 * 1024**3, 8 * 1024**3, 5 * 1024**3]
+        call_idx = [0]
+
+        def mock_get_active():
+            val = active_memory_values[min(call_idx[0], len(active_memory_values) - 1)]
+            call_idx[0] += 1
+            return val
+
+        sleep_calls = []
+
+        async def mock_sleep(duration):
+            sleep_calls.append(duration)
+
+        with patch("omlx.engine_pool.mx") as mock_mx, \
+             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
+             patch("asyncio.sleep", side_effect=mock_sleep):
+            mock_mx.get_active_memory = mock_get_active
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        # Should have slept at least once (0.5s between rounds)
+        assert any(d == 0.5 for d in sleep_calls)
+        assert pool._entries["model-a"].engine is None
+        assert pool._current_model_memory == 0
+
+    @pytest.mark.asyncio
+    async def test_settle_timeout_triggers_emergency(self, pool_with_loaded_model):
+        """Test emergency reclaim is triggered when settle barrier times out."""
+        pool = pool_with_loaded_model
+        # est_size = 5GB, tolerance = 2GB, need >= 3GB freed
+        # Memory stays at 10GB during all 10 settle rounds (0GB freed < 3GB)
+        # After emergency reclaim: drops to safe level
+        settle_calls = [0]
+
+        def mock_get_active():
+            settle_calls[0] += 1
+            # 1 pre-unload + 10 settle rounds (each calls once) = 11
+            # After emergency: return safe level
+            if settle_calls[0] <= 11:
+                return 10 * 1024**3
+            return 0
+
+        sleep_calls = []
+
+        async def mock_sleep(duration):
+            sleep_calls.append(duration)
+
+        with patch("omlx.engine_pool.mx") as mock_mx, \
+             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
+             patch("asyncio.sleep", side_effect=mock_sleep):
+            mock_mx.get_active_memory = mock_get_active
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        # Emergency reclaim uses 1.0s sleeps (3 rounds)
+        assert sleep_calls.count(1.0) == 3
+        assert pool._entries["model-a"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_emergency_reclaim_failure_logs_error(self, pool_with_loaded_model):
+        """Test error is logged when emergency reclaim fails to free enough memory."""
+        pool = pool_with_loaded_model
+
+        # Memory never drops — stays at 10GB throughout (well above 5GB threshold)
+        with patch("omlx.engine_pool.mx") as mock_mx, \
+             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            mock_mx.get_active_memory = MagicMock(return_value=10 * 1024**3)
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            with patch("omlx.engine_pool.logger") as mock_logger:
+                await pool._unload_engine("model-a")
+
+            # Should have logged an error about emergency reclaim failure
+            error_calls = [
+                str(c) for c in mock_logger.error.call_args_list
+            ]
+            assert any("Emergency reclaim failed" in s for s in error_calls)
+
+    @pytest.mark.asyncio
+    async def test_memory_counter_decremented_after_barrier(
+        self, pool_with_loaded_model
+    ):
+        """Regression test: _current_model_memory must not be decremented
+        before the settle barrier completes."""
+        pool = pool_with_loaded_model
+        est_size = pool._entries["model-a"].estimated_size  # 5GB
+        original_memory = pool._current_model_memory
+
+        memory_during_settle = []
+
+        def mock_get_active():
+            # Record the pool's memory counter state during settle polling
+            memory_during_settle.append(pool._current_model_memory)
+            # Return high value for 3 rounds, then settle
+            # Need >= 3GB freed (5GB - 2GB tolerance)
+            if len(memory_during_settle) <= 3:
+                return 10 * 1024**3  # 0GB freed
+            return 5 * 1024**3  # 5GB freed >= 3GB needed
+
+        with patch("omlx.engine_pool.mx") as mock_mx, \
+             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            mock_mx.get_active_memory = mock_get_active
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        # During settle barrier, memory counter should NOT have been decremented
+        for mem in memory_during_settle[:-1]:
+            assert mem == original_memory, (
+                f"Memory counter was {mem} during settle, expected {original_memory}. "
+                "Counter must not be decremented before barrier completes."
+            )
+
+        # After barrier, it should be decremented
+        assert pool._current_model_memory == original_memory - est_size
