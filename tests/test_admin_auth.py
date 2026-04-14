@@ -17,6 +17,7 @@ def _mock_global_settings(api_key=None):
     """Create a mock GlobalSettings with the given API key."""
     mock = MagicMock()
     mock.auth.api_key = api_key
+    mock.auth.skip_api_key_verification = False
     return mock
 
 
@@ -238,7 +239,7 @@ class TestSkipAdminAuth:
         return mock
 
     def test_require_admin_skipped_on_localhost(self):
-        """require_admin should pass when skip_api_key_verification=True and host=127.0.0.1."""
+        """require_admin should pass when skip_api_key_verification=True."""
         gs = self._mock_gs(skip=True, host="127.0.0.1")
         original = admin_auth._get_global_settings
         admin_auth._get_global_settings = lambda: gs
@@ -250,18 +251,16 @@ class TestSkipAdminAuth:
         finally:
             admin_auth._get_global_settings = original
 
-    def test_require_admin_not_skipped_on_remote_host(self):
-        """require_admin should still require auth when host is not localhost."""
+    def test_require_admin_skipped_on_any_host(self):
+        """require_admin should skip auth when skip_api_key_verification=True regardless of host."""
         gs = self._mock_gs(skip=True, host="0.0.0.0")
         original = admin_auth._get_global_settings
         admin_auth._get_global_settings = lambda: gs
         try:
             mock_request = MagicMock()
             mock_request.cookies.get.return_value = None
-            mock_request.headers.get.return_value = "application/json"
-            with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_auth.require_admin(mock_request))
-            assert exc_info.value.status_code == 401
+            result = asyncio.run(admin_auth.require_admin(mock_request))
+            assert result is True
         finally:
             admin_auth._get_global_settings = original
 

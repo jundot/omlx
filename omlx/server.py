@@ -260,11 +260,10 @@ async def verify_api_key(
     if _server_state.api_key is None:
         return True
 
-    # Skip verification if enabled and host is localhost
+    # Skip verification if enabled
     if (
         _server_state.global_settings is not None
         and _server_state.global_settings.auth.skip_api_key_verification
-        and _server_state.global_settings.server.host == "127.0.0.1"
     ):
         return True
 

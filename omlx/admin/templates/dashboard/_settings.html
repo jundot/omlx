@@ -98,11 +98,12 @@
                                         </button>
                                     </div>
                                 </div>
-                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4"
-                                     x-show="globalSettings.server.host === '127.0.0.1'" x-cloak>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.auth.skip_verification') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.auth.skip_verification_hint') }}</p>
+                                        <p class="text-xs text-red-500 mt-0.5"
+                                           x-show="globalSettings.server.host !== '127.0.0.1'" x-cloak>{{ t('settings.auth.skip_verification_warning') }}</p>
                                     </div>
                                     <button type="button"
                                             @click="globalSettings.auth.skip_api_key_verification = !globalSettings.auth.skip_api_key_verification"
@@ -211,8 +212,8 @@
                                          },
                                          setHostMode(mode) {
                                              if (mode === 'localhost') { this._mode = null; globalSettings.server.host = '127.0.0.1'; }
-                                             else if (mode === 'public') { this._mode = null; globalSettings.server.host = '0.0.0.0'; globalSettings.auth.skip_api_key_verification = false; }
-                                             else { this._mode = 'custom'; globalSettings.server.host = ''; globalSettings.auth.skip_api_key_verification = false; }
+                                             else if (mode === 'public') { this._mode = null; globalSettings.server.host = '0.0.0.0'; }
+                                             else { this._mode = 'custom'; globalSettings.server.host = ''; }
                                          }
                                      }">
                                     <div class="flex items-center gap-2">
