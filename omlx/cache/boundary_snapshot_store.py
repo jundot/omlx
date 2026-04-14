@@ -79,9 +79,10 @@ class BoundarySnapshotSSDStore:
         self._pending_writes: Dict[Tuple[str, int], Dict] = {}
         self._pending_lock = threading.Lock()
 
-        # Requests whose snapshots have been cleaned up — writer thread
-        # skips queued items for these request IDs.
-        self._cancelled_requests: set[str] = set()
+        # Cancelled requests with remaining queue item counts.  Writer
+        # thread decrements on each skip; entry is deleted when count
+        # reaches zero, preventing unbounded growth.
+        self._cancelled_requests: dict[str, int] = {}
 
         # Background writer thread.
         self._write_queue: queue.Queue = queue.Queue(maxsize=_MAX_PENDING_WRITES)
@@ -238,17 +239,15 @@ class BoundarySnapshotSSDStore:
 
     def cleanup_request(self, request_id: str) -> None:
         """Delete all snapshot files and pending writes for a request."""
-        # Mark as cancelled so the writer thread skips queued items.
-        self._cancelled_requests.add(request_id)
-
-        # Remove from pending writes.
-        keys_to_remove = []
+        # Count remaining queue items and mark as cancelled.  The writer
+        # thread decrements the count on each skip and removes the entry
+        # when it reaches zero.
         with self._pending_lock:
-            for key in self._pending_writes:
-                if key[0] == request_id:
-                    keys_to_remove.append(key)
+            count = sum(1 for k in self._pending_writes if k[0] == request_id)
+            keys_to_remove = [k for k in self._pending_writes if k[0] == request_id]
             for key in keys_to_remove:
                 del self._pending_writes[key]
+        self._cancelled_requests[request_id] = count
 
         # Remove from registry.
         with self._registry_lock:
@@ -301,6 +300,14 @@ class BoundarySnapshotSSDStore:
     # Internal
     # ------------------------------------------------------------------
 
+    def _dec_cancelled(self, request_id: str) -> None:
+        """Decrement cancelled counter; remove entry when exhausted."""
+        remaining = self._cancelled_requests.get(request_id, 0) - 1
+        if remaining <= 0:
+            self._cancelled_requests.pop(request_id, None)
+        else:
+            self._cancelled_requests[request_id] = remaining
+
     def _file_path(self, request_id: str, token_count: int) -> Path:
         return self._snapshot_dir / request_id / f"{token_count}.safetensors"
 
@@ -327,6 +334,7 @@ class BoundarySnapshotSSDStore:
                         shutil.rmtree(req_dir)
                 except Exception:
                     pass
+                self._dec_cancelled(pw_key[0])
                 continue
 
             temp_path = None
@@ -346,6 +354,7 @@ class BoundarySnapshotSSDStore:
                         pass
                     with self._pending_lock:
                         self._pending_writes.pop(pw_key, None)
+                    self._dec_cancelled(pw_key[0])
                     continue
 
                 os.rename(str(temp_path), str(file_path))
@@ -363,6 +372,7 @@ class BoundarySnapshotSSDStore:
                             shutil.rmtree(req_dir)
                     except Exception:
                         pass
+                    self._dec_cancelled(pw_key[0])
             except Exception as e:
                 logger.debug("Background snapshot write failed: %s", e)
                 for p in (temp_path, file_path):
@@ -383,11 +393,6 @@ class BoundarySnapshotSSDStore:
                     if file_path.exists():
                         self._pending_writes.pop(pw_key, None)
 
-                # Prevent unbounded growth of the cancelled set.  By the time
-                # 10 000 entries accumulate, the oldest requests' queue items
-                # have long been processed.
-                if len(self._cancelled_requests) > 10000:
-                    self._cancelled_requests.clear()
 
     def _serialize_extracted(
         self,
