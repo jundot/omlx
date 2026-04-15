@@ -64,8 +64,8 @@ dependencies = [
     # mlx-vlm from commit (3472132) - TQ race fix, Gemma 4 offset/projection/audio fixes
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@3472132fe6ee7beeae2c2fc35923eaed2e734b3d",
     "Pillow>=9.0.0",
-    # dflash-mlx from commit (8e1df22) — block diffusion speculative decoding + temperature sampling
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@8e1df22",
+    # dflash-mlx v0.1.3 (814c4a1) — block diffusion speculative decoding + temperature sampling
+    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@814c4a1",
 ]
 
 [project.optional-dependencies]
