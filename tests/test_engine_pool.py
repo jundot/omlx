@@ -383,9 +383,9 @@ class TestVLMFallback:
         mock_batched_engine.start = AsyncMock()
 
         with patch(
-            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
+            "omlx.engine.vlm.VLMBatchedEngine", return_value=mock_vlm_engine
         ), patch(
-            "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
+            "omlx.engine.batched.BatchedEngine", return_value=mock_batched_engine
         ):
             await pool._load_engine("model-a")
 
@@ -407,7 +407,7 @@ class TestVLMFallback:
         mock_engine.start = AsyncMock(side_effect=Exception("Load failed"))
 
         with patch(
-            "omlx.engine_pool.BatchedEngine", return_value=mock_engine
+            "omlx.engine.batched.BatchedEngine", return_value=mock_engine
         ), pytest.raises(Exception, match="Load failed"):
             await pool._load_engine("model-a")
 
@@ -439,9 +439,9 @@ class TestVLMFallback:
         mock_vlm_engine.start = AsyncMock()
 
         with patch(
-            "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
+            "omlx.engine.batched.BatchedEngine", return_value=mock_batched_engine
         ), patch(
-            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
+            "omlx.engine.vlm.VLMBatchedEngine", return_value=mock_vlm_engine
         ):
             await pool._load_engine("model-a", force_lm=True)
 
@@ -463,7 +463,7 @@ class TestVLMFallback:
         mock_engine.start = AsyncMock(side_effect=Exception("Load failed"))
 
         with patch(
-            "omlx.engine_pool.BatchedEngine", return_value=mock_engine
+            "omlx.engine.batched.BatchedEngine", return_value=mock_engine
         ), pytest.raises(Exception, match="Load failed"):
             await pool._load_engine("model-a", force_lm=True)
 
@@ -590,7 +590,7 @@ class TestEnginePoolAsync:
         mock_engine.start = AsyncMock()
         mock_engine.stop = AsyncMock()
 
-        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+        with patch("omlx.engine.batched.BatchedEngine", return_value=mock_engine):
             engine = await pool.get_engine("model-a")
 
         assert engine == mock_engine
@@ -606,7 +606,7 @@ class TestEnginePoolAsync:
         mock_engine = MagicMock()
         mock_engine.start = AsyncMock()
 
-        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+        with patch("omlx.engine.batched.BatchedEngine", return_value=mock_engine):
             engine1 = await pool.get_engine("model-a")
             engine2 = await pool.get_engine("model-a")
 
@@ -623,7 +623,7 @@ class TestEnginePoolAsync:
         mock_engine.start = AsyncMock()
         mock_engine.stop = AsyncMock()
 
-        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+        with patch("omlx.engine.batched.BatchedEngine", return_value=mock_engine):
             await pool.get_engine("model-a")
             initial_memory = pool.current_model_memory
 
@@ -654,7 +654,7 @@ class TestEnginePoolAsync:
             engine_idx[0] += 1
             return engine
 
-        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+        with patch("omlx.engine.batched.BatchedEngine", side_effect=create_engine):
             await pool.get_engine("model-a")
             await pool.get_engine("model-b")
 
@@ -700,7 +700,7 @@ class TestEnginePoolEviction:
                 return mock_engine_a
             return mock_engine_b
 
-        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+        with patch("omlx.engine.batched.BatchedEngine", side_effect=create_engine):
             # Load model-a first
             await pool.get_engine("model-a")
             assert pool.loaded_model_count == 1
@@ -724,7 +724,7 @@ class TestEnginePoolEviction:
         mock_engine = MagicMock()
         mock_engine.start = AsyncMock()
 
-        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+        with patch("omlx.engine.batched.BatchedEngine", return_value=mock_engine):
             # Load pinned model-a
             await pool.get_engine("model-a")
 

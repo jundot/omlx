@@ -113,6 +113,7 @@ class ModelSettingsRequest(BaseModel):
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: Optional[bool] = None
     turboquant_kv_bits: Optional[float] = None
+    turboquant_skip_last: Optional[bool] = None
     # SpecPrefill (experimental)
     specprefill_enabled: Optional[bool] = None
     specprefill_draft_model: Optional[str] = None
@@ -1379,6 +1380,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "index_cache_freq": settings.index_cache_freq,
                 "turboquant_kv_enabled": settings.turboquant_kv_enabled,
                 "turboquant_kv_bits": settings.turboquant_kv_bits,
+                "turboquant_skip_last": settings.turboquant_skip_last,
                 "specprefill_enabled": settings.specprefill_enabled,
                 "specprefill_draft_model": settings.specprefill_draft_model,
                 "specprefill_keep_pct": settings.specprefill_keep_pct,
@@ -1596,6 +1598,8 @@ async def update_model_settings(
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
     if "turboquant_kv_bits" in sent:
         current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+    if "turboquant_skip_last" in sent:
+        current_settings.turboquant_skip_last = request.turboquant_skip_last if request.turboquant_skip_last is not None else True
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
@@ -1636,6 +1640,7 @@ async def update_model_settings(
             or "index_cache_freq" in sent
             or "dflash_enabled" in sent
             or "dflash_draft_model" in sent
+            or "turboquant_skip_last" in sent
         )
     )
     if requires_reload:
