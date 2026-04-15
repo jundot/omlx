@@ -505,7 +505,10 @@ class EnginePool:
 
         # Memory settle barrier: poll actual freed memory instead of
         # trusting the cumulative _current_model_memory estimate.
-        settle_tolerance = 2 * 1024**3  # 2 GB
+        # Scale tolerance with model size: estimated_size includes a 5%
+        # overhead factor (model_discovery.py) that may not be reflected in
+        # actual freed memory. Use 2 GB floor for small models. See #768.
+        settle_tolerance = max(2 * 1024**3, int(entry.estimated_size * 0.05))
         min_expected_freed = max(0, entry.estimated_size - settle_tolerance)
         settled = False
         for _settle_round in range(10):

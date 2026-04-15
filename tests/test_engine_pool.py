@@ -1081,8 +1081,9 @@ class TestMemorySettleBarrier:
     def pool_with_loaded_model(self, small_mock_model_dir):
         """Create pool with a mock-loaded model for settle barrier testing.
 
-        Sets estimated_size to 5GB so the settle tolerance (2GB) doesn't
-        make the barrier trivially pass.
+        Sets estimated_size to 5GB. With scaled tolerance
+        (max(2GB, 5% of 5GB) = max(2GB, 0.25GB) = 2GB), the barrier
+        requires at least 3GB freed.
         """
         pool = EnginePool(max_model_memory=100 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
@@ -1256,3 +1257,96 @@ class TestMemorySettleBarrier:
 
         # After barrier, it should be decremented
         assert pool._current_model_memory == original_memory - est_size
+
+    @pytest.mark.asyncio
+    async def test_settle_large_model_proportional_tolerance(
+        self, small_mock_model_dir
+    ):
+        """Test that settle tolerance scales with model size for large models.
+
+        For a 60GB model, 5% = 3GB > 2GB floor, so tolerance = 3GB.
+        min_expected_freed = 60GB - 3GB = 57GB.
+        """
+        pool = EnginePool(max_model_memory=200 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool._entries["model-a"]
+        entry.estimated_size = 60 * 1024**3  # 60GB
+        mock_engine = MagicMock()
+        mock_engine.stop = AsyncMock()
+        mock_engine.has_active_requests = MagicMock(return_value=False)
+        entry.engine = mock_engine
+        entry.last_access = 100.0
+        pool._current_model_memory = entry.estimated_size
+
+        # Freed = 80 - 23 = 57GB. With proportional tolerance (3GB) this
+        # settles, but would fail with the old fixed 2GB tolerance (needed 58GB).
+        active_memory_values = [80 * 1024**3, 23 * 1024**3]
+        call_idx = [0]
+
+        def mock_get_active():
+            val = active_memory_values[
+                min(call_idx[0], len(active_memory_values) - 1)
+            ]
+            call_idx[0] += 1
+            return val
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_mx.get_active_memory = mock_get_active
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        assert pool._entries["model-a"].engine is None
+        assert pool._current_model_memory == 0
+
+    @pytest.mark.asyncio
+    async def test_settle_small_model_uses_floor_tolerance(
+        self, small_mock_model_dir
+    ):
+        """Test that 2GB floor tolerance applies for small models.
+
+        For a 1GB model, 5% = 0.05GB << 2GB, so tolerance = 2GB floor.
+        min_expected_freed = max(0, 1GB - 2GB) = 0, settle is trivially true.
+        """
+        pool = EnginePool(max_model_memory=100 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool._entries["model-a"]
+        entry.estimated_size = 1 * 1024**3  # 1GB
+        mock_engine = MagicMock()
+        mock_engine.stop = AsyncMock()
+        mock_engine.has_active_requests = MagicMock(return_value=False)
+        entry.engine = mock_engine
+        entry.last_access = 100.0
+        pool._current_model_memory = entry.estimated_size
+
+        # Even 0 freed should settle (min_expected_freed = 0)
+        active_memory_values = [10 * 1024**3, 10 * 1024**3]
+        call_idx = [0]
+
+        def mock_get_active():
+            val = active_memory_values[
+                min(call_idx[0], len(active_memory_values) - 1)
+            ]
+            call_idx[0] += 1
+            return val
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_mx.get_active_memory = mock_get_active
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        assert pool._entries["model-a"].engine is None
+        assert pool._current_model_memory == 0
