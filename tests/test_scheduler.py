@@ -137,7 +137,9 @@ class TestSchedulerInitialization:
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
         assert scheduler.model is mock_model
-        assert scheduler.tokenizer is mock_tokenizer
+        # Scheduler deep-copies tokenizer for thread safety (Rust RefCell
+        # isolation between event loop and MLX executor threads).
+        assert scheduler.tokenizer is not mock_tokenizer
         assert isinstance(scheduler.config, SchedulerConfig)
         assert isinstance(scheduler.waiting, deque)
         assert len(scheduler.waiting) == 0

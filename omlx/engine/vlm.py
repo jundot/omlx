@@ -325,11 +325,17 @@ class VLMBatchedEngine(BaseEngine):
         )
         logger.info("Vision feature cache enabled (SSD: %s)", vision_ssd_dir or "disabled")
 
-        # Extract tokenizer from processor
+        # Extract tokenizer from processor with deep-copy for thread safety.
+        # The processor keeps the original tokenizer for executor-thread work
+        # (_prepare_vision_inputs / prepare_inputs), while this deep copy is
+        # used exclusively on the event loop (apply_chat_template, encode).
+        # Without separate Rust tokenizer backends, concurrent access causes
+        # "RuntimeError: Already borrowed".
+        # See: https://github.com/huggingface/tokenizers/issues/537
         if hasattr(self._processor, "tokenizer"):
-            self._tokenizer = self._processor.tokenizer
+            self._tokenizer = copy.deepcopy(self._processor.tokenizer)
         else:
-            self._tokenizer = self._processor
+            self._tokenizer = copy.deepcopy(self._processor)
 
         # Build mlx-lm decode model for batched decode by sharing VLM weights.
         # mlx-vlm language models may produce degenerated output in batched
