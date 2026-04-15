@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-typecheck:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install uv
+        run: |
+          brew install uv
+          
+      - name: Setup Python
+        run: |
+          uv python install 3.13
+          
+      - name: Cache uv dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+            
+      - name: Install dependencies
+        run: |
+          uv sync --dev
+          
+      - name: Check formatting with black
+        run: |
+          uv run black --check omlx tests
+          
+      - name: Lint with ruff
+        run: |
+          uv run ruff check omlx tests
+          
+      - name: Type check with mypy
+        run: |
+          uv run mypy omlx
+          
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install uv
+        run: |
+          brew install uv
+          
+      - name: Setup Python
+        run: |
+          uv python install 3.13
+          
+      - name: Cache uv dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+            
+      - name: Install dependencies
+        run: |
+          uv sync --dev
+          
+      - name: Run tests
+        run: |
+          uv run pytest tests/ -x --tb=short -v
+          
+      - name: Run downloader tests (with longer timeout)
+        run: |
+          uv run pytest tests/test_hf_downloader.py -x --tb=short -v
