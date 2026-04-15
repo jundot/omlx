@@ -385,7 +385,7 @@ class TestVLMFallback:
         with (
             patch("omlx.engine.vlm.VLMBatchedEngine", return_value=mock_vlm_engine),
             patch(
-                "omlx.engine.batched.BatchedEngine", return_value=mock_batched_engine
+                "omlx.engine.BatchedEngine", return_value=mock_batched_engine
             ),
         ):
             await pool._load_engine("model-a")
@@ -408,7 +408,7 @@ class TestVLMFallback:
         mock_engine.start = AsyncMock(side_effect=Exception("Load failed"))
 
         with (
-            patch("omlx.engine.batched.BatchedEngine", return_value=mock_engine),
+            patch("omlx.engine.BatchedEngine", return_value=mock_engine),
             pytest.raises(Exception, match="Load failed"),
         ):
             await pool._load_engine("model-a")
@@ -442,7 +442,7 @@ class TestVLMFallback:
 
         with (
             patch(
-                "omlx.engine.batched.BatchedEngine", return_value=mock_batched_engine
+                "omlx.engine.BatchedEngine", return_value=mock_batched_engine
             ),
             patch("omlx.engine.vlm.VLMBatchedEngine", return_value=mock_vlm_engine),
         ):
@@ -466,7 +466,7 @@ class TestVLMFallback:
         mock_engine.start = AsyncMock(side_effect=Exception("Load failed"))
 
         with (
-            patch("omlx.engine.batched.BatchedEngine", return_value=mock_engine),
+            patch("omlx.engine.BatchedEngine", return_value=mock_engine),
             pytest.raises(Exception, match="Load failed"),
         ):
             await pool._load_engine("model-a", force_lm=True)
@@ -594,7 +594,7 @@ class TestEnginePoolAsync:
         mock_engine.start = AsyncMock()
         mock_engine.stop = AsyncMock()
 
-        with patch("omlx.engine.batched.BatchedEngine", return_value=mock_engine):
+        with patch("omlx.engine.BatchedEngine", return_value=mock_engine):
             engine = await pool.get_engine("model-a")
 
         assert engine == mock_engine
@@ -610,7 +610,7 @@ class TestEnginePoolAsync:
         mock_engine = MagicMock()
         mock_engine.start = AsyncMock()
 
-        with patch("omlx.engine.batched.BatchedEngine", return_value=mock_engine):
+        with patch("omlx.engine.BatchedEngine", return_value=mock_engine):
             engine1 = await pool.get_engine("model-a")
             engine2 = await pool.get_engine("model-a")
 
@@ -627,7 +627,7 @@ class TestEnginePoolAsync:
         mock_engine.start = AsyncMock()
         mock_engine.stop = AsyncMock()
 
-        with patch("omlx.engine.batched.BatchedEngine", return_value=mock_engine):
+        with patch("omlx.engine.BatchedEngine", return_value=mock_engine):
             await pool.get_engine("model-a")
             initial_memory = pool.current_model_memory
 
@@ -658,7 +658,7 @@ class TestEnginePoolAsync:
             engine_idx[0] += 1
             return engine
 
-        with patch("omlx.engine.batched.BatchedEngine", side_effect=create_engine):
+        with patch("omlx.engine.BatchedEngine", side_effect=create_engine):
             await pool.get_engine("model-a")
             await pool.get_engine("model-b")
 
@@ -704,7 +704,7 @@ class TestEnginePoolEviction:
                 return mock_engine_a
             return mock_engine_b
 
-        with patch("omlx.engine.batched.BatchedEngine", side_effect=create_engine):
+        with patch("omlx.engine.BatchedEngine", side_effect=create_engine):
             # Load model-a first
             await pool.get_engine("model-a")
             assert pool.loaded_model_count == 1
@@ -728,7 +728,7 @@ class TestEnginePoolEviction:
         mock_engine = MagicMock()
         mock_engine.start = AsyncMock()
 
-        with patch("omlx.engine.batched.BatchedEngine", return_value=mock_engine):
+        with patch("omlx.engine.BatchedEngine", return_value=mock_engine):
             # Load pinned model-a
             await pool.get_engine("model-a")
 
@@ -1123,13 +1123,15 @@ class TestMemorySettleBarrier:
             return val
 
         with (
-            patch("omlx.engine_pool.mx") as mock_mx,
-            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("omlx.engine_pool._mx") as mock_mx_func,
+            patch("omlx.engine_core.get_mlx_executor", return_value=None),
             patch("asyncio.sleep", new_callable=AsyncMock),
         ):
+            mock_mx = MagicMock()
             mock_mx.get_active_memory = mock_get_active
             mock_mx.synchronize = MagicMock()
             mock_mx.clear_cache = MagicMock()
+            mock_mx_func.return_value = mock_mx
 
             await pool._unload_engine("model-a")
 
@@ -1158,13 +1160,15 @@ class TestMemorySettleBarrier:
             sleep_calls.append(duration)
 
         with (
-            patch("omlx.engine_pool.mx") as mock_mx,
-            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("omlx.engine_pool._mx") as mock_mx_func,
+            patch("omlx.engine_core.get_mlx_executor", return_value=None),
             patch("asyncio.sleep", side_effect=mock_sleep),
         ):
+            mock_mx = MagicMock()
             mock_mx.get_active_memory = mock_get_active
             mock_mx.synchronize = MagicMock()
             mock_mx.clear_cache = MagicMock()
+            mock_mx_func.return_value = mock_mx
 
             await pool._unload_engine("model-a")
 
@@ -1196,13 +1200,15 @@ class TestMemorySettleBarrier:
             sleep_calls.append(duration)
 
         with (
-            patch("omlx.engine_pool.mx") as mock_mx,
-            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("omlx.engine_pool._mx") as mock_mx_func,
+            patch("omlx.engine_core.get_mlx_executor", return_value=None),
             patch("asyncio.sleep", side_effect=mock_sleep),
         ):
+            mock_mx = MagicMock()
             mock_mx.get_active_memory = mock_get_active
             mock_mx.synchronize = MagicMock()
             mock_mx.clear_cache = MagicMock()
+            mock_mx_func.return_value = mock_mx
 
             await pool._unload_engine("model-a")
 
@@ -1216,14 +1222,19 @@ class TestMemorySettleBarrier:
         pool = pool_with_loaded_model
 
         # Memory never drops — stays at 10GB throughout (well above 5GB threshold)
+        def mock_get_active():
+            return 10 * 1024**3
+
         with (
-            patch("omlx.engine_pool.mx") as mock_mx,
-            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("omlx.engine_pool._mx") as mock_mx_func,
+            patch("omlx.engine_core.get_mlx_executor", return_value=None),
             patch("asyncio.sleep", new_callable=AsyncMock),
         ):
-            mock_mx.get_active_memory = MagicMock(return_value=10 * 1024**3)
+            mock_mx = MagicMock()
+            mock_mx.get_active_memory = mock_get_active
             mock_mx.synchronize = MagicMock()
             mock_mx.clear_cache = MagicMock()
+            mock_mx_func.return_value = mock_mx
 
             with patch("omlx.engine_pool.logger") as mock_logger:
                 await pool._unload_engine("model-a")
@@ -1254,13 +1265,15 @@ class TestMemorySettleBarrier:
             return 5 * 1024**3  # 5GB freed >= 3GB needed
 
         with (
-            patch("omlx.engine_pool.mx") as mock_mx,
-            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("omlx.engine_pool._mx") as mock_mx_func,
+            patch("omlx.engine_core.get_mlx_executor", return_value=None),
             patch("asyncio.sleep", new_callable=AsyncMock),
         ):
+            mock_mx = MagicMock()
             mock_mx.get_active_memory = mock_get_active
             mock_mx.synchronize = MagicMock()
             mock_mx.clear_cache = MagicMock()
+            mock_mx_func.return_value = mock_mx
 
             await pool._unload_engine("model-a")
 
@@ -1308,13 +1321,15 @@ class TestMemorySettleBarrier:
             return val
 
         with (
-            patch("omlx.engine_pool.mx") as mock_mx,
-            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("omlx.engine_pool._mx") as mock_mx_func,
+            patch("omlx.engine_core.get_mlx_executor", return_value=None),
             patch("asyncio.sleep", new_callable=AsyncMock),
         ):
+            mock_mx = MagicMock()
             mock_mx.get_active_memory = mock_get_active
             mock_mx.synchronize = MagicMock()
             mock_mx.clear_cache = MagicMock()
+            mock_mx_func.return_value = mock_mx
 
             await pool._unload_engine("model-a")
 
@@ -1354,13 +1369,15 @@ class TestMemorySettleBarrier:
             return val
 
         with (
-            patch("omlx.engine_pool.mx") as mock_mx,
-            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("omlx.engine_pool._mx") as mock_mx_func,
+            patch("omlx.engine_core.get_mlx_executor", return_value=None),
             patch("asyncio.sleep", new_callable=AsyncMock),
         ):
+            mock_mx = MagicMock()
             mock_mx.get_active_memory = mock_get_active
             mock_mx.synchronize = MagicMock()
             mock_mx.clear_cache = MagicMock()
+            mock_mx_func.return_value = mock_mx
 
             await pool._unload_engine("model-a")
 
