@@ -4,16 +4,19 @@ DFlash engine for block diffusion speculative decoding.
 
 This engine wraps dflash-mlx to provide 3-4x faster decoding on Apple Silicon.
 For short/medium contexts it uses speculative decoding; for long contexts
-(>DFLASH_MAX_CTX) it automatically falls back to omlx's BatchedEngine or
-VLMBatchedEngine which have paged cache, SSD cache, and continuous batching.
+(>DFLASH_MAX_CTX) it evicts dflash models and switches to omlx's BatchedEngine
+or VLMBatchedEngine which have paged cache, SSD cache, and continuous batching.
 """
 
 import asyncio
 import copy
+import gc
 import logging
 import os
 from collections.abc import AsyncIterator
 from typing import Any
+
+import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
@@ -29,9 +32,10 @@ class DFlashEngine(BaseEngine):
     DFlash speculative decoding engine with automatic fallback.
 
     For prompts within max_dflash_ctx tokens, uses block diffusion speculative
-    decoding for 3-4x faster generation. For longer prompts, delegates to a
-    fallback engine (BatchedEngine or VLMBatchedEngine) that provides paged
-    cache, SSD cache, and continuous batching.
+    decoding for 3-4x faster generation. For longer prompts, evicts dflash
+    models from memory and delegates to a fallback engine (BatchedEngine or
+    VLMBatchedEngine) that provides paged cache, SSD cache, and continuous
+    batching.
     """
 
     def __init__(
@@ -53,10 +57,12 @@ class DFlashEngine(BaseEngine):
         self._target_model = None
         self._draft_model = None
         self._tokenizer_obj = None
+        self._executor_tokenizer = None
         self._loaded = False
         self._active_request = False
         self._model_type_str = None
         self._fallback_engine: BaseEngine | None = None
+        self._in_fallback_mode = False
 
         raw = os.environ.get("DFLASH_MAX_CTX", str(DEFAULT_MAX_DFLASH_CTX)).strip()
         try:
@@ -110,10 +116,8 @@ class DFlashEngine(BaseEngine):
         elif hasattr(config, "model_type"):
             self._model_type_str = config.model_type
 
-        # Start fallback engine for long context requests
-        await self._start_fallback_engine()
-
         self._loaded = True
+        self._in_fallback_mode = False
         logger.info(
             f"DFlashEngine loaded: target={self._model_name}, "
             f"draft={self._draft_model_path}, "
@@ -121,27 +125,64 @@ class DFlashEngine(BaseEngine):
             f"fallback={self._fallback_engine_type}"
         )
 
-    async def _start_fallback_engine(self) -> None:
-        try:
-            if self._fallback_engine_type == "vlm":
-                from .vlm import VLMBatchedEngine
-                self._fallback_engine = VLMBatchedEngine(
-                    model_name=self._model_name,
-                    scheduler_config=self._scheduler_config,
-                    model_settings=self._model_settings,
+    async def _evict_dflash_and_start_fallback(self) -> None:
+        """Evict dflash models from memory, verify release, then start fallback engine."""
+        from ..engine_core import get_mlx_executor
+
+        loop = asyncio.get_running_loop()
+        pre_active = mx.get_active_memory()
+
+        # Release dflash model references
+        self._target_model = None
+        self._draft_model = None
+        self._executor_tokenizer = None
+
+        # Force memory reclaim with settle barrier
+        gc.collect()
+        await loop.run_in_executor(
+            get_mlx_executor(),
+            lambda: (mx.synchronize(), mx.clear_cache()),
+        )
+
+        # Poll for actual memory release (same pattern as engine_pool._unload_engine)
+        for settle_round in range(10):
+            active_now = mx.get_active_memory()
+            freed = pre_active - active_now
+            if freed > 0:
+                logger.info(
+                    f"DFlash models evicted: freed={freed / 1024**3:.2f}GB "
+                    f"(round {settle_round + 1})"
                 )
-            else:
-                from .batched import BatchedEngine
-                self._fallback_engine = BatchedEngine(
-                    model_name=self._model_name,
-                    scheduler_config=self._scheduler_config,
-                    model_settings=self._model_settings,
-                )
-            await self._fallback_engine.start()
-            logger.info(f"DFlash fallback engine ready: {self._fallback_engine_type}")
-        except Exception as e:
-            logger.warning(f"DFlash fallback engine failed to start: {e}")
-            self._fallback_engine = None
+                break
+            await asyncio.sleep(0.5)
+            gc.collect()
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                lambda: (mx.synchronize(), mx.clear_cache()),
+            )
+        else:
+            logger.warning("DFlash model eviction: memory settle timed out")
+
+        # Start fallback engine
+        if self._fallback_engine_type == "vlm":
+            from .vlm import VLMBatchedEngine
+            self._fallback_engine = VLMBatchedEngine(
+                model_name=self._model_name,
+                scheduler_config=self._scheduler_config,
+                model_settings=self._model_settings,
+            )
+        else:
+            from .batched import BatchedEngine
+            self._fallback_engine = BatchedEngine(
+                model_name=self._model_name,
+                scheduler_config=self._scheduler_config,
+                model_settings=self._model_settings,
+            )
+        await self._fallback_engine.start()
+        self._in_fallback_mode = True
+        logger.info(
+            f"DFlash fallback engine started: {self._fallback_engine_type}"
+        )
 
     async def stop(self) -> None:
         if self._fallback_engine is not None:
@@ -151,6 +192,7 @@ class DFlashEngine(BaseEngine):
         self._draft_model = None
         self._tokenizer_obj = None
         self._executor_tokenizer = None
+        self._in_fallback_mode = False
         self._loaded = False
         logger.info("DFlashEngine stopped")
 
@@ -303,12 +345,24 @@ class DFlashEngine(BaseEngine):
 
         prompt_tokens = self._tokenizer_obj.encode(prompt)
 
-        # Fallback to LLM/VLM engine for long contexts
-        if self._should_fallback(prompt_tokens) and self._fallback_engine is not None:
-            logger.info(
-                f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
-                f"using {self._fallback_engine_type} engine"
+        # Fallback: evict dflash models, start LLM/VLM engine
+        if self._should_fallback(prompt_tokens):
+            if not self._in_fallback_mode:
+                logger.info(
+                    f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
+                    f"evicting dflash models and switching to {self._fallback_engine_type} engine"
+                )
+                await self._evict_dflash_and_start_fallback()
+            return await self._fallback_engine.generate(
+                prompt=prompt, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty, stop=stop, **kwargs,
             )
+
+        # Already in fallback mode but short context came in.
+        # Stay in fallback mode (reloading dflash models is expensive).
+        if self._in_fallback_mode:
             return await self._fallback_engine.generate(
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, min_p=min_p,
@@ -367,12 +421,25 @@ class DFlashEngine(BaseEngine):
 
         prompt_tokens = self._tokenizer_obj.encode(prompt)
 
-        # Fallback to LLM/VLM engine for long contexts
-        if self._should_fallback(prompt_tokens) and self._fallback_engine is not None:
-            logger.info(
-                f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
-                f"using {self._fallback_engine_type} engine"
-            )
+        # Fallback: evict dflash models, start LLM/VLM engine
+        if self._should_fallback(prompt_tokens):
+            if not self._in_fallback_mode:
+                logger.info(
+                    f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
+                    f"evicting dflash models and switching to {self._fallback_engine_type} engine"
+                )
+                await self._evict_dflash_and_start_fallback()
+            async for output in self._fallback_engine.stream_generate(
+                prompt=prompt, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty, stop=stop, **kwargs,
+            ):
+                yield output
+            return
+
+        # Already in fallback mode — stay there
+        if self._in_fallback_mode:
             async for output in self._fallback_engine.stream_generate(
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, min_p=min_p,
@@ -490,15 +557,15 @@ class DFlashEngine(BaseEngine):
         return self._active_request
 
     def get_stats(self) -> dict[str, Any]:
-        stats = {
+        return {
             "engine_type": "dflash",
             "model_name": self._model_name,
             "draft_model": self._draft_model_path,
             "max_dflash_ctx": self._max_dflash_ctx,
             "fallback_engine_type": self._fallback_engine_type,
+            "in_fallback_mode": self._in_fallback_mode,
             "loaded": self._loaded,
         }
-        return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:
         if self._fallback_engine is not None:
