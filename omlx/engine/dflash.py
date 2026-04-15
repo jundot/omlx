@@ -9,6 +9,7 @@ VLMBatchedEngine which have paged cache, SSD cache, and continuous batching.
 """
 
 import asyncio
+import copy
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -96,6 +97,12 @@ class DFlashEngine(BaseEngine):
         result = await loop.run_in_executor(get_mlx_executor(), _load_models)
         self._target_model, self._tokenizer_obj, target_meta, self._draft_model = result
 
+        # Deep-copy tokenizer for executor-thread usage (dflash generation).
+        # The original self._tokenizer_obj stays for event-loop operations
+        # (encode, apply_chat_template, count_chat_tokens).
+        # See: https://github.com/huggingface/tokenizers/issues/537
+        self._executor_tokenizer = copy.deepcopy(self._tokenizer_obj)
+
         # Extract model_type from config
         config = target_meta.get("config", {})
         if isinstance(config, dict):
@@ -143,6 +150,7 @@ class DFlashEngine(BaseEngine):
         self._target_model = None
         self._draft_model = None
         self._tokenizer_obj = None
+        self._executor_tokenizer = None
         self._loaded = False
         logger.info("DFlashEngine stopped")
 
@@ -209,19 +217,19 @@ class DFlashEngine(BaseEngine):
         from dflash_mlx.runtime import stream_dflash_generate
 
         try:
-            stop_ids = get_stop_token_ids(self._tokenizer_obj)
+            stop_ids = get_stop_token_ids(self._executor_tokenizer)
 
             # Use streaming detokenizer for proper UTF-8 handling (CJK etc.)
             detokenizer = None
             try:
                 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
-                detokenizer = NaiveStreamingDetokenizer(self._tokenizer_obj)
+                detokenizer = NaiveStreamingDetokenizer(self._executor_tokenizer)
             except ImportError:
                 pass
 
             for event in stream_dflash_generate(
                 target_model=self._target_model,
-                tokenizer=self._tokenizer_obj,
+                tokenizer=self._executor_tokenizer,
                 draft_model=self._draft_model,
                 prompt="",
                 max_new_tokens=max_tokens,
@@ -240,7 +248,7 @@ class DFlashEngine(BaseEngine):
                         detokenizer.add_token(token_id)
                         text = detokenizer.last_segment
                     else:
-                        text = self._tokenizer_obj.decode([token_id])
+                        text = self._executor_tokenizer.decode([token_id])
                     asyncio.run_coroutine_threadsafe(
                         queue.put((text, [token_id], False, None)), loop
                     )
@@ -318,7 +326,7 @@ class DFlashEngine(BaseEngine):
         def _run():
             return generate_dflash_once(
                 target_model=self._target_model,
-                tokenizer=self._tokenizer_obj,
+                tokenizer=self._executor_tokenizer,
                 draft_model=self._draft_model,
                 prompt="",
                 max_new_tokens=max_tokens,
