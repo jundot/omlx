@@ -20,13 +20,14 @@ from collections import deque
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
+from ..settings import SubKeyEntry
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
@@ -35,7 +36,6 @@ from .auth import (
     validate_api_key,
     verify_api_key,
 )
-from ..settings import SubKeyEntry
 
 logger = logging.getLogger(__name__)
 
@@ -83,130 +83,128 @@ class CacheProbeRequest(BaseModel):
     """
 
     model_id: str
-    messages: List[Dict[str, Any]]
-    tools: Optional[List[Dict[str, Any]]] = None
-    chat_template_kwargs: Optional[Dict[str, Any]] = None
+    messages: list[dict[str, Any]]
+    tools: list[dict[str, Any]] | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
 
 
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
-    model_alias: Optional[str] = None
-    model_type_override: Optional[str] = None
-    max_context_window: Optional[int] = None
-    max_tokens: Optional[int] = None
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    top_k: Optional[int] = None
-    repetition_penalty: Optional[float] = None
-    min_p: Optional[float] = None
-    presence_penalty: Optional[float] = None
-    force_sampling: Optional[bool] = None
-    max_tool_result_tokens: Optional[int] = None
-    chat_template_kwargs: Optional[Dict[str, Any]] = None
-    forced_ct_kwargs: Optional[list[str]] = None
-    ttl_seconds: Optional[int] = None
-    index_cache_freq: Optional[int] = None
-    enable_thinking: Optional[bool] = None
-    thinking_budget_enabled: Optional[bool] = None
-    thinking_budget_tokens: Optional[int] = None
+    model_alias: str | None = None
+    model_type_override: str | None = None
+    max_context_window: int | None = None
+    max_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    force_sampling: bool | None = None
+    max_tool_result_tokens: int | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
+    forced_ct_kwargs: list[str] | None = None
+    ttl_seconds: int | None = None
+    index_cache_freq: int | None = None
+    enable_thinking: bool | None = None
+    thinking_budget_enabled: bool | None = None
+    thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
-    turboquant_kv_enabled: Optional[bool] = None
-    turboquant_kv_bits: Optional[float] = None
-    turboquant_skip_last: Optional[bool] = None
+    turboquant_kv_enabled: bool | None = None
+    turboquant_kv_bits: float | None = None
+    turboquant_skip_last: bool | None = None
     # SpecPrefill (experimental)
-    specprefill_enabled: Optional[bool] = None
-    specprefill_draft_model: Optional[str] = None
-    specprefill_keep_pct: Optional[float] = None
-    specprefill_threshold: Optional[int] = None
+    specprefill_enabled: bool | None = None
+    specprefill_draft_model: str | None = None
+    specprefill_keep_pct: float | None = None
+    specprefill_threshold: int | None = None
     # DFlash (block diffusion speculative decoding)
-    dflash_enabled: Optional[bool] = None
-    dflash_draft_model: Optional[str] = None
-    dflash_draft_quant_bits: Optional[int] = None
-    reasoning_parser: Optional[str] = None
-    is_pinned: Optional[bool] = None
-    is_default: Optional[bool] = None
+    dflash_enabled: bool | None = None
+    dflash_draft_model: str | None = None
+    dflash_draft_quant_bits: int | None = None
+    reasoning_parser: str | None = None
+    is_pinned: bool | None = None
+    is_default: bool | None = None
 
 
 class GlobalSettingsRequest(BaseModel):
     """Request model for updating global server settings."""
 
     # Server settings
-    host: Optional[str] = None
-    port: Optional[int] = None
-    log_level: Optional[str] = None
-    server_aliases: Optional[List[str]] = None
+    host: str | None = None
+    port: int | None = None
+    log_level: str | None = None
+    server_aliases: list[str] | None = None
 
     # Model settings
-    model_dirs: Optional[List[str]] = None
-    model_dir: Optional[str] = None  # Deprecated: kept for backward compatibility
-    max_model_memory: Optional[str] = None
-    model_fallback: Optional[bool] = None
+    model_dirs: list[str] | None = None
+    model_dir: str | None = None  # Deprecated: kept for backward compatibility
+    max_model_memory: str | None = None
+    model_fallback: bool | None = None
 
     # Memory enforcement
-    max_process_memory: Optional[str] = None  # "auto", "disabled", or "XX%"
-    memory_prefill_memory_guard: Optional[bool] = None
+    max_process_memory: str | None = None  # "auto", "disabled", or "XX%"
+    memory_prefill_memory_guard: bool | None = None
 
     # Scheduler settings
-    max_concurrent_requests: Optional[int] = None
+    max_concurrent_requests: int | None = None
 
     # Cache settings
-    cache_enabled: Optional[bool] = None
-    ssd_cache_dir: Optional[str] = None
-    ssd_cache_max_size: Optional[str] = None
-    hot_cache_max_size: Optional[str] = None  # "0" = disabled, "8GB", etc.
-    initial_cache_blocks: Optional[int] = None  # Starting blocks (requires restart)
+    cache_enabled: bool | None = None
+    ssd_cache_dir: str | None = None
+    ssd_cache_max_size: str | None = None
+    hot_cache_max_size: str | None = None  # "0" = disabled, "8GB", etc.
+    initial_cache_blocks: int | None = None  # Starting blocks (requires restart)
 
     # MCP settings
-    mcp_config: Optional[str] = None
+    mcp_config: str | None = None
 
     # HuggingFace settings
-    hf_endpoint: Optional[str] = None
+    hf_endpoint: str | None = None
 
     # ModelScope settings
-    ms_endpoint: Optional[str] = None
+    ms_endpoint: str | None = None
 
     # Network settings
-    network_http_proxy: Optional[str] = None
-    network_https_proxy: Optional[str] = None
-    network_no_proxy: Optional[str] = None
-    network_ca_bundle: Optional[str] = None
+    network_http_proxy: str | None = None
+    network_https_proxy: str | None = None
+    network_no_proxy: str | None = None
+    network_ca_bundle: str | None = None
 
     # Download settings
-    download_max_simultaneous_downloads: Optional[int] = None
-    download_max_workers: Optional[int] = None
+    download_max_simultaneous_downloads: int | None = None
+    download_max_workers: int | None = None
 
     # Sampling defaults
-    sampling_max_context_window: Optional[int] = None
-    sampling_max_tokens: Optional[int] = None
-    sampling_temperature: Optional[float] = None
-    sampling_top_p: Optional[float] = None
-    sampling_top_k: Optional[int] = None
-    sampling_repetition_penalty: Optional[float] = None
+    sampling_max_context_window: int | None = None
+    sampling_max_tokens: int | None = None
+    sampling_temperature: float | None = None
+    sampling_top_p: float | None = None
+    sampling_top_k: int | None = None
+    sampling_repetition_penalty: float | None = None
 
     # Claude Code settings
-    claude_code_context_scaling_enabled: Optional[bool] = None
-    claude_code_target_context_size: Optional[int] = None
-    claude_code_mode: Optional[str] = None
-    claude_code_opus_model: Optional[str] = None
-    claude_code_sonnet_model: Optional[str] = None
-    claude_code_haiku_model: Optional[str] = None
+    claude_code_context_scaling_enabled: bool | None = None
+    claude_code_target_context_size: int | None = None
+    claude_code_mode: str | None = None
+    claude_code_opus_model: str | None = None
+    claude_code_sonnet_model: str | None = None
+    claude_code_haiku_model: str | None = None
 
     # Other integrations settings
-    integrations_codex_model: Optional[str] = None
-    integrations_opencode_model: Optional[str] = None
-    integrations_openclaw_model: Optional[str] = None
-    integrations_pi_model: Optional[str] = None
-    integrations_openclaw_tools_profile: Optional[
-        Literal["minimal", "coding", "messaging", "full"]
-    ] = None
+    integrations_codex_model: str | None = None
+    integrations_opencode_model: str | None = None
+    integrations_openclaw_model: str | None = None
+    integrations_pi_model: str | None = None
+    integrations_openclaw_tools_profile: Literal["minimal", "coding", "messaging", "full"] | None = None
 
     # UI settings
-    ui_language: Optional[str] = None
+    ui_language: str | None = None
 
     # Auth settings
-    api_key: Optional[str] = None
-    skip_api_key_verification: Optional[bool] = None
+    api_key: str | None = None
+    skip_api_key_verification: bool | None = None
 
 
 class HFDownloadRequest(BaseModel):
@@ -328,6 +326,7 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
         Tuple of (success, message)
     """
     from pathlib import Path
+
     from ..server import _server_state
 
     if _server_state.engine_pool is None:
@@ -439,8 +438,8 @@ async def _apply_max_model_memory_runtime(
     Returns:
         Tuple of (success, message)
     """
-    from ..server import _server_state
     from ..model_discovery import format_size
+    from ..server import _server_state
 
     if _server_state.engine_pool is None:
         return False, "Engine pool not initialized"
@@ -540,11 +539,11 @@ async def _apply_max_process_memory_runtime(
 
 
 async def _apply_cache_settings_runtime(
-    enabled: Optional[bool],
-    ssd_cache_dir: Optional[str],
-    ssd_cache_max_size: Optional[str],
+    enabled: bool | None,
+    ssd_cache_dir: str | None,
+    ssd_cache_max_size: str | None,
     global_settings,
-    hot_cache_max_size: Optional[str] = None,
+    hot_cache_max_size: str | None = None,
 ) -> tuple[bool, str]:
     """
     Apply cache settings at runtime.
@@ -555,8 +554,8 @@ async def _apply_cache_settings_runtime(
     Returns:
         Tuple of (success, message)
     """
-    from ..server import _server_state
     from ..config import parse_size
+    from ..server import _server_state
 
     if _server_state.engine_pool is None:
         return False, "Engine pool not initialized"
@@ -633,12 +632,12 @@ async def _apply_cache_settings_runtime(
 
 
 def _apply_sampling_settings_runtime(
-    max_context_window: Optional[int],
-    max_tokens: Optional[int],
-    temperature: Optional[float],
-    top_p: Optional[float],
-    top_k: Optional[int],
-    repetition_penalty: Optional[float] = None,
+    max_context_window: int | None,
+    max_tokens: int | None,
+    temperature: float | None,
+    top_p: float | None,
+    top_k: int | None,
+    repetition_penalty: float | None = None,
 ) -> tuple[bool, str]:
     """
     Apply sampling default settings at runtime.
@@ -1503,7 +1502,6 @@ async def update_model_settings(
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
     # Get current settings
-    from ..model_settings import ModelSettings
 
     current_settings = settings_manager.get_settings(model_id)
 
@@ -1728,7 +1726,7 @@ async def get_generation_config(
     gen_config_path = model_path / "generation_config.json"
     if gen_config_path.exists():
         try:
-            with open(gen_config_path, "r", encoding="utf-8") as f:
+            with open(gen_config_path, encoding="utf-8") as f:
                 gen_config = json_module.load(f)
 
             # Temperature: if do_sample is false, effective temperature is 0
@@ -1756,7 +1754,7 @@ async def get_generation_config(
     config_path = model_path / "config.json"
     if config_path.exists():
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(config_path, encoding="utf-8") as f:
                 model_config = json_module.load(f)
 
             max_pos = (
@@ -1990,7 +1988,7 @@ async def update_global_settings(
         raise HTTPException(status_code=503, detail="Server not initialized")
 
     # Track which settings were applied at runtime
-    runtime_applied: List[str] = []
+    runtime_applied: list[str] = []
 
     # Apply server settings
     if request.host is not None:
@@ -2427,7 +2425,7 @@ def _tail_file(file_path: Path, num_lines: int) -> tuple[str, int]:
     lines = deque(maxlen=num_lines)
     total_lines = 0
 
-    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+    with open(file_path, encoding="utf-8", errors="replace") as f:
         for line in f:
             lines.append(line)
             total_lines += 1
@@ -2435,7 +2433,7 @@ def _tail_file(file_path: Path, num_lines: int) -> tuple[str, int]:
     return "".join(lines), total_lines
 
 
-def _get_available_log_files(log_dir: Path) -> List[str]:
+def _get_available_log_files(log_dir: Path) -> list[str]:
     """
     Get list of available log files sorted by modification time.
 
@@ -2462,7 +2460,7 @@ def _get_available_log_files(log_dir: Path) -> List[str]:
 @router.get("/api/logs")
 async def get_logs(
     lines: int = 100,
-    file: Optional[str] = None,
+    file: str | None = None,
     is_admin: bool = Depends(require_admin),
 ):
     """
@@ -2856,8 +2854,6 @@ async def get_server_stats(
     port = global_settings.server.port if global_settings else 8000
     api_key = global_settings.auth.api_key if global_settings else ""
 
-    from ..model_discovery import format_size
-    from ..prefill_progress import get_prefill_tracker
     from ..utils.install import get_cli_prefix
 
     # Build active_models data for the dashboard card.
@@ -3382,9 +3378,9 @@ async def get_hf_model_info(
             status_code=400, detail="Query parameter 'repo_id' is required"
         )
 
-    from .hf_downloader import HFDownloader
-
     from huggingface_hub.utils import RepositoryNotFoundError
+
+    from .hf_downloader import HFDownloader
 
     try:
         result = await HFDownloader.get_model_info(repo_id=repo_id.strip())
@@ -4098,7 +4094,7 @@ async def get_device_info(
 # Update Check
 # =============================================================================
 
-_update_cache: Optional[Dict[str, Any]] = None
+_update_cache: dict[str, Any] | None = None
 _update_cache_time: float = 0.0
 _UPDATE_CACHE_TTL = 3600  # 1 hour
 

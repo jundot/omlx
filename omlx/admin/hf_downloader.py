@@ -11,13 +11,12 @@ import logging
 import shutil
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
 
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import (
-    EntryNotFoundError,
     GatedRepoError,
     RepositoryNotFoundError,
 )
@@ -432,7 +431,7 @@ class HFDownloader:
     def __init__(
         self,
         model_dir: str,
-        on_complete: Optional[Callable] = None,
+        on_complete: Callable | None = None,
     ):
         download_settings = _get_download_settings()
         self._model_dir = Path(model_dir)
