@@ -787,6 +787,7 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
         super().__init__(bits=bits, quantize_v=quantize_v)
         self.left_padding = left_padding or [0]
         self._batch_size = len(self.left_padding)
+        self._right_padding: mx.array | None = None
         if self._batch_size > 1:
             self.offset = mx.array([-lp for lp in self.left_padding])
         else:
@@ -809,10 +810,697 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
             **kwargs,
         )
 
+    # ------------------------------------------------------------------
+    # Batch-aware overrides for array offset
+    # ------------------------------------------------------------------
+
+    def _max_offset(self) -> int:
+        """Return max offset across batch (int)."""
+        if isinstance(self.offset, mx.array):
+            return int(self.offset.max().item())
+        return self.offset
+
+    def _ensure_k_dequant_cache(self) -> None:
+        max_off = self._max_offset()
+        if self._k_dequant_cache is not None and self._k_dequant_offset == max_off:
+            return
+        assert self._B is not None and self._H_k is not None and self._D_k is not None
+        cache = mx.zeros((self._B, self._H_k, self._cap, self._D_k), dtype=mx.float16)
+        if max_off > 0:
+            assert self._k_packed is not None
+            assert self._k_norms is not None
+            k_dq = dequantize_fused(
+                self._k_packed[..., :max_off, :],
+                self._k_norms[..., :max_off, :],
+                out_dtype=mx.float16,
+            )
+            cache[..., :max_off, :] = k_dq.astype(mx.float16)
+        self._k_dequant_cache = cache
+        self._k_dequant_offset = max_off
+
+    def _ensure_v_dequant_cache(self) -> None:
+        max_off = self._max_offset()
+        if self._v_dequant_cache is not None and self._v_dequant_offset == max_off:
+            return
+        assert self._B is not None and self._H_v is not None and self._D_v is not None
+        cache = mx.zeros((self._B, self._H_v, self._cap, self._D_v), dtype=mx.float16)
+        if max_off > 0 and self._v_packed is not None and self._v_norms is not None:
+            v_dq = dequantize_fused(
+                self._v_packed[..., :max_off, :],
+                self._v_norms[..., :max_off, :],
+                out_dtype=mx.float16,
+            )
+            cache[..., :max_off, :] = v_dq.astype(mx.float16)
+        self._v_dequant_cache = cache
+        self._v_dequant_offset = max_off
+
+    def finalize_prefill(self) -> None:
+        if self._finalized:
+            return
+        if self._k_fp16 is None:
+            return
+        max_off = self._max_offset()
+        assert self._D_k is not None
+        assert self._packed_last_k is not None
+
+        B, H_k = self._B, self._H_k
+        cap = self._cap
+
+        # Quantize K — use max_off for the packed slice
+        k_packed, k_norms = _quantize(self._k_fp16[..., :max_off, :])
+        self._k_packed = mx.zeros((B, H_k, cap, self._packed_last_k), dtype=mx.uint8)
+        self._k_norms = mx.zeros((B, H_k, cap, 1), dtype=mx.float16)
+        self._k_packed[..., :max_off, :] = k_packed.astype(mx.uint8)
+        self._k_norms[..., :max_off, :] = k_norms.astype(mx.float16)
+
+        if self.quantize_v:
+            assert self._v_fp16 is not None
+            assert self._packed_last_v is not None
+            _, H_v = self._B, self._H_v
+            v_packed, v_norms = _quantize(self._v_fp16[..., :max_off, :])
+            self._v_packed = mx.zeros((B, H_v, cap, self._packed_last_v), dtype=mx.uint8)
+            self._v_norms = mx.zeros((B, H_v, cap, 1), dtype=mx.float16)
+            self._v_packed[..., :max_off, :] = v_packed.astype(mx.uint8)
+            self._v_norms[..., :max_off, :] = v_norms.astype(mx.float16)
+            self._v_fp16 = None
+        else:
+            v_fp16 = self._v_fp16[..., :max_off, :]
+            self._v_packed = None
+            self._v_norms = None
+            self._v_fp16 = mx.zeros((B, self._H_v, cap, self._D_v), dtype=mx.float16)
+            self._v_fp16[..., :max_off, :] = v_fp16
+
+        self._k_fp16 = None
+        self._finalized = True
+        self._invalidate_dequant_cache()
+        logger.info("PlanarQuant batch: finalized prefill, converted to packed layout")
+
+    # ------------------------------------------------------------------
+    # Packed-state batch helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _filter_packed_state(
+        state: PlanarQuantState, indices
+    ) -> PlanarQuantState:
+        packed = state.packed[indices]
+        norms = state.norms[indices]
+        return PlanarQuantState(packed, norms)
+
+    @staticmethod
+    def _concat_packed_batch(
+        states: list[PlanarQuantState],
+    ) -> PlanarQuantState:
+        packed = mx.concatenate([s.packed for s in states], axis=0)
+        norms = mx.concatenate([s.norms for s in states], axis=0)
+        return PlanarQuantState(packed, norms)
+
+    @staticmethod
+    def _pad_packed_left(
+        state: PlanarQuantState, pad: int
+    ) -> PlanarQuantState:
+        if pad == 0:
+            return state
+        B, H, T, C = state.packed.shape
+        packed_pad = mx.zeros((B, H, pad, C), dtype=mx.uint8)
+        norms_pad = mx.zeros((B, H, pad, state.norms.shape[-1]), dtype=mx.float16)
+        packed = mx.concatenate([packed_pad, state.packed], axis=2)
+        norms = mx.concatenate([norms_pad, state.norms], axis=2)
+        return PlanarQuantState(packed, norms)
+
+    @staticmethod
+    def _slice_packed_range(
+        state: PlanarQuantState, start: int, end: int
+    ) -> PlanarQuantState:
+        packed = state.packed[..., start:end, :]
+        norms = state.norms[..., start:end, :]
+        return PlanarQuantState(packed, norms)
+
+    @staticmethod
+    def _packed_state_length(state: PlanarQuantState) -> int:
+        return state.packed.shape[2]
+
+    # ------------------------------------------------------------------
+    # update_and_fetch (batch override)
+    # ------------------------------------------------------------------
+
+    def update_and_fetch(
+        self, keys: mx.array, values: mx.array
+    ) -> tuple:
+        B = keys.shape[0]
+        L = keys.shape[2]
+
+        if self._k_fp16 is None and self._k_packed is None:
+            self._init_buffers(keys, values)
+            # Override offset to array for B>1
+            if self._batch_size > 1 and not isinstance(self.offset, mx.array):
+                # Already set as array in __init__
+                pass
+            elif B > 1 and isinstance(self.offset, int):
+                self.offset = mx.array([self.offset] * B)
+
+        max_off = self._max_offset()
+        new_max = max_off + L
+
+        if not self._finalized:
+            self._grow_fp16(new_max)
+            assert self._k_fp16 is not None
+            assert self._v_fp16 is not None
+            if isinstance(self.offset, mx.array):
+                for b in range(B):
+                    off = int(self.offset[b].item())
+                    # Skip left-padded slots
+                    if off < 0:
+                        continue
+                    end = off + L
+                    self._k_fp16[b, :, off:end, :] = keys[b].astype(mx.float16)
+                    self._v_fp16[b, :, off:end, :] = values[b].astype(mx.float16)
+                self.offset = self.offset + L
+            else:
+                self._k_fp16 = self._write_slice(self._k_fp16, keys, self.offset)
+                self._v_fp16 = self._write_slice(self._v_fp16, values, self.offset)
+                self.offset = self.offset + L
+
+            # Return full buffer up to max valid position
+            max_valid = self._max_offset()
+            return (
+                FP16State(self._k_fp16[..., :max_valid, :]),
+                FP16State(self._v_fp16[..., :max_valid, :]),
+            )
+
+        # Quantized mode — batch variant
+        self._grow_packed(new_max)
+        self._ensure_k_dequant_cache()
+        self._grow_k_dequant_cache(new_max)
+
+        assert self._k_dequant_cache is not None
+        if isinstance(self.offset, mx.array):
+            for b in range(B):
+                off = int(self.offset[b].item())
+                if off < 0:
+                    continue
+                end = off + L
+                self._k_dequant_cache[b, :, off:end, :] = keys[b].astype(mx.float16)
+            if self._k_unpacked_start is None:
+                self._k_unpacked_start = int(self.offset.min().item())
+            self._k_unpacked_end = new_max
+        else:
+            k_fp16 = keys.astype(mx.float16)
+            self._k_dequant_cache[..., self.offset:new_max, :] = k_fp16
+            if self._k_unpacked_start is None:
+                self._k_unpacked_start = self.offset
+            self._k_unpacked_end = new_max
+
+        self._k_dequant_offset = new_max
+
+        if self.quantize_v:
+            self._ensure_v_dequant_cache()
+            self._grow_v_dequant_cache(new_max)
+            assert self._v_dequant_cache is not None
+            if isinstance(self.offset, mx.array):
+                for b in range(B):
+                    off = int(self.offset[b].item())
+                    if off < 0:
+                        continue
+                    end = off + L
+                    self._v_dequant_cache[b, :, off:end, :] = values[b].astype(mx.float16)
+                if self._v_unpacked_start is None:
+                    self._v_unpacked_start = int(self.offset.min().item())
+                self._v_unpacked_end = new_max
+            else:
+                v_fp16 = values.astype(mx.float16)
+                self._v_dequant_cache[..., self.offset:new_max, :] = v_fp16
+                if self._v_unpacked_start is None:
+                    self._v_unpacked_start = self.offset
+                self._v_unpacked_end = new_max
+            self._v_dequant_offset = new_max
+
+            if isinstance(self.offset, mx.array):
+                self.offset = self.offset + L
+            else:
+                self.offset = new_max
+
+            max_valid = self._max_offset()
+            return (
+                FP16State(self._k_dequant_cache[..., :max_valid, :]),
+                FP16State(self._v_dequant_cache[..., :max_valid, :]),
+            )
+
+        # Asymmetric V
+        assert self._v_fp16 is not None
+        if isinstance(self.offset, mx.array):
+            for b in range(B):
+                off = int(self.offset[b].item())
+                if off < 0:
+                    continue
+                end = off + L
+                self._v_fp16[b, :, off:end, :] = values[b].astype(mx.float16)
+            self.offset = self.offset + L
+        else:
+            self._v_fp16 = self._write_slice(self._v_fp16, values, self.offset)
+            self.offset = new_max
+
+        max_valid = self._max_offset()
+        return (
+            FP16State(self._k_dequant_cache[..., :max_valid, :]),
+            FP16State(self._v_fp16[..., :max_valid, :]),
+        )
+
+    # ------------------------------------------------------------------
+    # Batch operations
+    # ------------------------------------------------------------------
+
+    def prepare(self, left_padding=None, right_padding=None) -> None:
+        if left_padding is not None:
+            left_padding = mx.array(left_padding)
+            cur_max = self._max_offset() if isinstance(self.offset, mx.array) else self.offset
+            if cur_max > 0:
+                raise ValueError("left_padding prepare only allowed on empty cache")
+            self.left_padding = left_padding
+            self._batch_size = len(left_padding)
+            self.offset = -left_padding
+        if right_padding is not None:
+            if isinstance(right_padding, (list, tuple)):
+                self._right_padding = mx.array(right_padding)
+            else:
+                self._right_padding = right_padding
+
+    def finalize(self) -> None:
+        if self._right_padding is not None:
+            rp = self._right_padding
+
+            def _roll_b(t: mx.array, b: int, n: int, T: int) -> mx.array:
+                # Roll [0:T] left by n, preserve unused tail [T:cap]
+                cap = t.shape[2]
+                return mx.concatenate([
+                    t[b, :, n:T, :],
+                    t[b, :, :n, :],
+                    t[b, :, T:cap, :],
+                ], axis=1)
+
+            def _off(b: int) -> int:
+                return (
+                    int(self.offset[b].item())
+                    if isinstance(self.offset, mx.array)
+                    else int(self.offset)
+                )
+
+            if not self._finalized:
+                # Deferred mode: roll FP16 buffers
+                if self._k_fp16 is not None and self._v_fp16 is not None:
+                    B = self._k_fp16.shape[0]
+                    for b in range(B):
+                        n = int(rp[b].item())
+                        if n > 0:
+                            T = _off(b)
+                            self._k_fp16[b] = _roll_b(self._k_fp16, b, n, T)
+                            self._v_fp16[b] = _roll_b(self._v_fp16, b, n, T)
+                    self.left_padding = mx.array(self.left_padding) + rp
+            else:
+                # Quantized mode: roll packed+norms
+                B = self._k_packed.shape[0] if self._k_packed is not None else 0
+                for b in range(B):
+                    n = int(rp[b].item())
+                    if n > 0:
+                        T = _off(b)
+                        if self._k_packed is not None and self._k_norms is not None:
+                            self._k_packed[b] = _roll_b(self._k_packed, b, n, T)
+                            self._k_norms[b] = _roll_b(self._k_norms, b, n, T)
+                        if self.quantize_v and self._v_packed is not None and self._v_norms is not None:
+                            self._v_packed[b] = _roll_b(self._v_packed, b, n, T)
+                            self._v_norms[b] = _roll_b(self._v_norms, b, n, T)
+                        elif not self.quantize_v and self._v_fp16 is not None:
+                            self._v_fp16[b] = _roll_b(self._v_fp16, b, n, T)
+                self.left_padding = mx.array(self.left_padding) + rp
+                self._invalidate_dequant_cache()
+            self._right_padding = None
+        else:
+            # No right padding — just finalize prefill if needed
+            if not self._finalized:
+                self.finalize_prefill()
+
+    def filter(self, indices: list[int]) -> None:
+        if not self._finalized:
+            # Deferred mode: filter FP16 buffers
+            idx = mx.array(indices)
+            if self._k_fp16 is not None:
+                self._k_fp16 = self._k_fp16[idx]
+            if self._v_fp16 is not None:
+                self._v_fp16 = self._v_fp16[idx]
+        else:
+            # Quantized mode: filter packed buffers
+            idx = mx.array(indices)
+            if self._k_packed is not None:
+                self._k_packed = self._k_packed[idx]
+            if self._k_norms is not None:
+                self._k_norms = self._k_norms[idx]
+            if self.quantize_v:
+                if self._v_packed is not None:
+                    self._v_packed = self._v_packed[idx]
+                if self._v_norms is not None:
+                    self._v_norms = self._v_norms[idx]
+            else:
+                if self._v_fp16 is not None:
+                    self._v_fp16 = self._v_fp16[idx]
+
+        # Filter dequant caches
+        if self._k_dequant_cache is not None:
+            idx_mx = mx.array(indices)
+            self._k_dequant_cache = self._k_dequant_cache[idx_mx]
+        if self._v_dequant_cache is not None:
+            idx_mx = mx.array(indices)
+            self._v_dequant_cache = self._v_dequant_cache[idx_mx]
+
+        # Reset unpacked ranges
+        self._k_unpacked_start = None
+        self._k_unpacked_end = None
+        self._v_unpacked_start = None
+        self._v_unpacked_end = None
+
+        # Update offset, left_padding, batch_size
+        if isinstance(self.offset, mx.array):
+            self.offset = self.offset[idx]
+        if not isinstance(self.left_padding, mx.array):
+            self.left_padding = mx.array(self.left_padding)
+        self.left_padding = self.left_padding[idx]
+        self._batch_size = len(indices)
+        if self._B is not None:
+            self._B = self._batch_size
+
+    def extend(self, other: BatchPlanarQuantKVCache) -> None:
+        def _pad_cap(a: mx.array, b: mx.array) -> tuple[mx.array, mx.array]:
+            # Pad axis=2 (seq/cap dim) to max(a, b) with zeros so axis=0 concat works
+            ca, cb = a.shape[2], b.shape[2]
+            if ca == cb:
+                return a, b
+            target = max(ca, cb)
+
+            def _pad(t: mx.array) -> mx.array:
+                if t.shape[2] == target:
+                    return t
+                shp = list(t.shape)
+                shp[2] = target - t.shape[2]
+                return mx.concatenate([t, mx.zeros(shp, dtype=t.dtype)], axis=2)
+
+            return _pad(a), _pad(b)
+
+        def _cat0(a: mx.array, b: mx.array) -> mx.array:
+            a2, b2 = _pad_cap(a, b)
+            return mx.concatenate([a2, b2], axis=0)
+
+        if not self._finalized and not other._finalized:
+            # Both deferred — concat FP16 buffers
+            if self._k_fp16 is not None and other._k_fp16 is not None:
+                self._k_fp16 = _cat0(self._k_fp16, other._k_fp16)
+            if self._v_fp16 is not None and other._v_fp16 is not None:
+                self._v_fp16 = _cat0(self._v_fp16, other._v_fp16)
+        else:
+            # At least one finalized — ensure both are finalized
+            if not self._finalized:
+                self.finalize_prefill()
+            if not other._finalized:
+                other.finalize_prefill()
+            # Concat packed buffers
+            if self._k_packed is not None and other._k_packed is not None:
+                self._k_packed = _cat0(self._k_packed, other._k_packed)
+            if self._k_norms is not None and other._k_norms is not None:
+                self._k_norms = _cat0(self._k_norms, other._k_norms)
+            if self.quantize_v:
+                if self._v_packed is not None and other._v_packed is not None:
+                    self._v_packed = _cat0(self._v_packed, other._v_packed)
+                if self._v_norms is not None and other._v_norms is not None:
+                    self._v_norms = _cat0(self._v_norms, other._v_norms)
+            else:
+                if self._v_fp16 is not None and other._v_fp16 is not None:
+                    self._v_fp16 = _cat0(self._v_fp16, other._v_fp16)
+
+        # Extend dequant caches
+        if self._k_dequant_cache is not None and other._k_dequant_cache is not None:
+            self._k_dequant_cache = mx.concatenate(
+                [self._k_dequant_cache, other._k_dequant_cache], axis=0
+            )
+        if self._v_dequant_cache is not None and other._v_dequant_cache is not None:
+            self._v_dequant_cache = mx.concatenate(
+                [self._v_dequant_cache, other._v_dequant_cache], axis=0
+            )
+
+        # Merge offsets
+        if isinstance(self.offset, mx.array) and isinstance(other.offset, mx.array):
+            self.offset = mx.concatenate([self.offset, other.offset])
+        elif isinstance(self.offset, int) and isinstance(other.offset, int):
+            self.offset = mx.array([self.offset, other.offset])
+        elif isinstance(self.offset, int) and isinstance(other.offset, mx.array):
+            self.offset = mx.concatenate([mx.array([self.offset]), other.offset])
+        elif isinstance(self.offset, mx.array) and isinstance(other.offset, int):
+            self.offset = mx.concatenate([self.offset, mx.array([other.offset])])
+
+        # Merge left_padding
+        lp1 = self.left_padding if isinstance(self.left_padding, mx.array) else mx.array(self.left_padding)
+        lp2 = other.left_padding if isinstance(other.left_padding, mx.array) else mx.array(other.left_padding)
+        self.left_padding = mx.concatenate([lp1, lp2])
+        self._batch_size = len(self.left_padding)
+        if self._B is not None:
+            self._B = self._batch_size
+
+        # Reset unpacked ranges
+        self._k_unpacked_start = None
+        self._k_unpacked_end = None
+        self._v_unpacked_start = None
+        self._v_unpacked_end = None
+
+    @classmethod
+    def merge(
+        cls,
+        caches: list[PlanarQuantKVCache],
+    ) -> BatchPlanarQuantKVCache:
+        if not caches:
+            raise ValueError("Cannot merge empty list of caches")
+        # Auto-finalize any deferred caches
+        for c in caches:
+            if not c._finalized:
+                c.finalize_prefill()
+        # Find max length
+        max_len = max(c.offset for c in caches)
+        # Build merged batch
+        merged = cls(
+            left_padding=[0] * len(caches),
+            bits=caches[0].bits,
+            quantize_v=caches[0].quantize_v,
+        )
+        merged._finalized = True
+        first = caches[0]
+        merged._B = len(caches)
+        merged._H_k = first._H_k
+        merged._H_v = first._H_v
+        merged._D_k = first._D_k
+        merged._D_v = first._D_v
+        merged._packed_last_k = first._packed_last_k
+        merged._packed_last_v = first._packed_last_v
+        merged._cap = max_len
+        merged._batch_size = len(caches)
+
+        # Concatenate K packed states
+        k_packed_list = []
+        k_norms_list = []
+        offsets = []
+        left_pads = []
+        for c in caches:
+            left_pad = max_len - c.offset
+            left_pads.append(left_pad)
+            offsets.append(c.offset)
+            if left_pad > 0 and c._k_packed is not None:
+                state = PlanarQuantState(
+                    c._k_packed[..., :c.offset, :],
+                    c._k_norms[..., :c.offset, :],
+                )
+                state = cls._pad_packed_left(state, left_pad)
+                k_packed_list.append(state.packed)
+                k_norms_list.append(state.norms)
+            elif c._k_packed is not None:
+                k_packed_list.append(c._k_packed[..., :c.offset, :])
+                k_norms_list.append(c._k_norms[..., :c.offset, :])
+
+        merged._k_packed = mx.concatenate(k_packed_list, axis=0)
+        merged._k_norms = mx.concatenate(k_norms_list, axis=0)
+
+        # V state
+        if first.quantize_v:
+            v_packed_list = []
+            v_norms_list = []
+            for c in caches:
+                left_pad = max_len - c.offset
+                if left_pad > 0 and c._v_packed is not None:
+                    state = PlanarQuantState(
+                        c._v_packed[..., :c.offset, :],
+                        c._v_norms[..., :c.offset, :],
+                    )
+                    state = cls._pad_packed_left(state, left_pad)
+                    v_packed_list.append(state.packed)
+                    v_norms_list.append(state.norms)
+                elif c._v_packed is not None:
+                    v_packed_list.append(c._v_packed[..., :c.offset, :])
+                    v_norms_list.append(c._v_norms[..., :c.offset, :])
+            merged._v_packed = mx.concatenate(v_packed_list, axis=0)
+            merged._v_norms = mx.concatenate(v_norms_list, axis=0)
+        else:
+            v_fp16_list = []
+            for c in caches:
+                left_pad = max_len - c.offset
+                if left_pad > 0 and c._v_fp16 is not None:
+                    pad_shape = list(c._v_fp16.shape)
+                    pad_shape[2] = left_pad
+                    v_pad = mx.zeros(tuple(pad_shape), dtype=mx.float16)
+                    v_fp16_list.append(mx.concatenate(
+                        [v_pad, c._v_fp16[..., :c.offset, :]], axis=2
+                    ))
+                elif c._v_fp16 is not None:
+                    v_fp16_list.append(c._v_fp16[..., :c.offset, :])
+            merged._v_fp16 = mx.concatenate(v_fp16_list, axis=0)
+
+        merged.left_padding = mx.array(left_pads)
+        merged.offset = mx.array(offsets)
+
+        # Carry dequant caches
+        k_dq_list = [c._k_dequant_cache for c in caches if c._k_dequant_cache is not None]
+        if k_dq_list:
+            merged._k_dequant_cache = mx.concatenate(k_dq_list, axis=0)
+            merged._k_dequant_offset = max_len
+        v_dq_list = [c._v_dequant_cache for c in caches if c._v_dequant_cache is not None]
+        if v_dq_list:
+            merged._v_dequant_cache = mx.concatenate(v_dq_list, axis=0)
+            merged._v_dequant_offset = max_len
+
+        return merged
+
+    def extract(self, index: int) -> PlanarQuantKVCache:
+        single = PlanarQuantKVCache(bits=self.bits, quantize_v=self.quantize_v)
+        single._finalized = self._finalized
+        single._B = 1
+        single._H_k = self._H_k
+        single._H_v = self._H_v
+        single._D_k = self._D_k
+        single._D_v = self._D_v
+        single._packed_last_k = self._packed_last_k
+        single._packed_last_v = self._packed_last_v
+
+        if isinstance(self.offset, mx.array):
+            single.offset = int(self.offset[index].item())
+        else:
+            single.offset = self.offset
+
+        lp = int(self.left_padding[index].item()) if isinstance(self.left_padding, mx.array) else 0
+        T = single.offset
+
+        if self._k_packed is not None:
+            # Extract row, removing left padding
+            k_p = self._k_packed[index:index + 1]
+            k_n = self._k_norms[index:index + 1]
+            if lp > 0:
+                k_p = k_p[:, :, lp:, :]
+                k_n = k_n[:, :, lp:, :]
+            single._k_packed = k_p
+            single._k_norms = k_n
+            single._cap = k_p.shape[2]
+        else:
+            single._cap = T
+
+        if self.quantize_v and self._v_packed is not None:
+            v_p = self._v_packed[index:index + 1]
+            v_n = self._v_norms[index:index + 1]
+            if lp > 0:
+                v_p = v_p[:, :, lp:, :]
+                v_n = v_n[:, :, lp:, :]
+            single._v_packed = v_p
+            single._v_norms = v_n
+        elif self._v_fp16 is not None:
+            v_f = self._v_fp16[index:index + 1]
+            if lp > 0:
+                v_f = v_f[:, :, lp:, :]
+            single._v_fp16 = mx.zeros((1, self._H_v, single._cap, self._D_v), dtype=mx.float16)
+            single._v_fp16[..., :T, :] = v_f[:, :, :T, :]
+
+        return single
+
+    def evict_dequant_caches(self) -> int:
+        freed = 0
+        if self._k_dequant_cache is not None:
+            freed += int(self._k_dequant_cache.nbytes)
+            self._k_dequant_cache = None
+            self._k_dequant_offset = 0
+        if self._v_dequant_cache is not None:
+            freed += int(self._v_dequant_cache.nbytes)
+            self._v_dequant_cache = None
+            self._v_dequant_offset = 0
+        return freed
+
+    def _check_invariants(self) -> list[str]:
+        violations = []
+        if self._k_packed is not None and self._k_norms is not None:
+            if self._k_packed.shape[2] != self._k_norms.shape[2]:
+                violations.append(
+                    f"K: packed T={self._k_packed.shape[2]} vs norms T={self._k_norms.shape[2]}"
+                )
+            if self._k_packed.shape[0] != self._batch_size:
+                violations.append(
+                    f"K: packed B={self._k_packed.shape[0]} vs batch_size={self._batch_size}"
+                )
+        if self.quantize_v and self._v_packed is not None and self._v_norms is not None:
+            if self._v_packed.shape[2] != self._v_norms.shape[2]:
+                violations.append(
+                    f"V: packed T={self._v_packed.shape[2]} vs norms T={self._v_norms.shape[2]}"
+                )
+        if isinstance(self.offset, mx.array) and self.offset.shape[0] != self._batch_size:
+            violations.append(
+                f"offset len={self.offset.shape[0]} vs batch_size={self._batch_size}"
+            )
+        if isinstance(self.left_padding, mx.array) and self.left_padding.shape[0] != self._batch_size:
+            violations.append(
+                f"left_padding len={self.left_padding.shape[0]} vs batch_size={self._batch_size}"
+            )
+        return violations
+
+    def decode_attention(
+        self,
+        queries: mx.array,
+        scale: float = 1.0,
+        mask: mx.array | None = None,
+    ) -> mx.array:
+        self._ensure_k_dequant_cache()
+        keys = self._k_dequant_cache[..., :self._k_dequant_offset, :].astype(queries.dtype)
+        if self.quantize_v:
+            self._ensure_v_dequant_cache()
+            values = self._v_dequant_cache[..., :self._v_dequant_offset, :].astype(queries.dtype)
+        else:
+            assert self._v_fp16 is not None
+            if isinstance(self.offset, mx.array):
+                max_off = int(self.offset.max().item())
+            else:
+                max_off = self.offset
+            values = self._v_fp16[..., :max_off, :].astype(queries.dtype)
+        return mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=scale, mask=mask
+        )
+
+
+# ---------------------------------------------------------------------------
+# Module-level helper aliases (exported for test access)
+# ---------------------------------------------------------------------------
+
+_concat_packed_batch = BatchPlanarQuantKVCache._concat_packed_batch
+_filter_packed_state = BatchPlanarQuantKVCache._filter_packed_state
+_pad_packed_left = BatchPlanarQuantKVCache._pad_packed_left
+_packed_state_length = BatchPlanarQuantKVCache._packed_state_length
+_slice_packed_range = BatchPlanarQuantKVCache._slice_packed_range
+
 
 __all__ = [
     "PlanarQuantKVCache",
     "BatchPlanarQuantKVCache",
     "PlanarQuantState",
     "FP16State",
+    "_concat_packed_batch",
+    "_filter_packed_state",
+    "_pad_packed_left",
+    "_packed_state_length",
+    "_slice_packed_range",
 ]
