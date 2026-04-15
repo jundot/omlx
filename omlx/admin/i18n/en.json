@@ -433,6 +433,8 @@
   "modal.model_settings.planarquant_kv": "PlanarQuant3 KV Cache",
   "modal.model_settings.planarquant_kv_hint": "10x KV memory compression via 2D Givens rotation + 3-bit Lloyd-Max quantization. Apple Silicon native (MLX). Mutually exclusive with TurboQuant. Requires model reload.",
   "modal.model_settings.planarquant_kv_bits_label": "Bits per channel",
+  "modal.model_settings.planarquant_quantize_v": "Quantize V",
+  "modal.model_settings.planarquant_quantize_v_hint": "Also quantize V state (13x packed vs 4x for K-only).",
   "modal.model_settings.index_cache": "Index Cache",
   "modal.model_settings.index_cache_hint": "Skip redundant indexer computation in DSA layers (DeepSeek V3/GLM-5).",
   "modal.model_settings.index_cache_freq": "Frequency (every Nth layer keeps indexer)",

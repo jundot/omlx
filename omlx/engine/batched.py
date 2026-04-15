@@ -251,8 +251,11 @@ class BatchedEngine(BaseEngine):
                 # The SDPA patch handles BOTH TQ and PQ dispatch
                 apply_turboquant_attention_patch()
                 pq_bits = int(getattr(self._model_settings, "planarquant_kv_bits", 3))
-                enable_planarquant_cache(bits=pq_bits)
-                logger.info(f"PlanarQuant KV cache enabled: {pq_bits} bits")
+                pq_quant_v = bool(getattr(self._model_settings, "planarquant_quantize_v", True))
+                enable_planarquant_cache(bits=pq_bits, quantize_v=pq_quant_v)
+                logger.info(
+                    f"PlanarQuant3 KV cache enabled: {pq_bits}-bit, quantize_v={pq_quant_v}"
+                )
 
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()

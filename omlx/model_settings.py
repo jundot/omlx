@@ -102,6 +102,7 @@ class ModelSettings:
     # Mutually exclusive with TurboQuant — both patch SDPA dispatch.
     planarquant_kv_enabled: bool = False
     planarquant_kv_bits: int = 3  # only 3 supported in v1; reserved for planar4/iso3/iso4
+    planarquant_quantize_v: bool = True  # True = K+V quantized, False = K only
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False

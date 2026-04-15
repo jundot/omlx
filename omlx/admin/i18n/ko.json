@@ -433,6 +433,8 @@
   "modal.model_settings.planarquant_kv": "PlanarQuant3 KV 캐시",
   "modal.model_settings.planarquant_kv_hint": "2D Givens 회전 + 3비트 Lloyd-Max 양자화로 KV 메모리 10배 압축. Apple Silicon 네이티브 (MLX). TurboQuant와 상호 배타적. 모델 재로드 필요.",
   "modal.model_settings.planarquant_kv_bits_label": "채널당 비트",
+  "modal.model_settings.planarquant_quantize_v": "V 양자화",
+  "modal.model_settings.planarquant_quantize_v_hint": "V 상태도 양자화합니다 (K 전용 4x 대비 패킹 13x).",
   "modal.model_settings.index_cache": "인덱스 캐시",
   "modal.model_settings.index_cache_hint": "DSA 레이어에서 중복 인덱서 연산을 건너뜁니다 (DeepSeek V3/GLM-5).",
   "modal.model_settings.index_cache_freq": "빈도 (N번째 레이어마다 인덱서 유지)",

@@ -424,7 +424,7 @@ class VLMBatchedEngine(BaseEngine):
 
         await self._engine.engine.start()
 
-        # TurboQuant KV cache
+        # TurboQuant / PlanarQuant KV cache (mutually exclusive)
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             pq_enabled = getattr(self._model_settings, "planarquant_kv_enabled", False)
@@ -447,9 +447,13 @@ class VLMBatchedEngine(BaseEngine):
                 from ..patches.turboquant_attention import apply_turboquant_attention_patch
                 apply_turboquant_attention_patch()
                 pq_bits = int(getattr(self._model_settings, "planarquant_kv_bits", 3))
-                enable_planarquant_cache(bits=pq_bits)
+                pq_quant_v = bool(getattr(self._model_settings, "planarquant_quantize_v", True))
+                enable_planarquant_cache(bits=pq_bits, quantize_v=pq_quant_v)
                 self._engine.engine.scheduler._planarquant_kv_bits = pq_bits
-                logger.info(f"PlanarQuant KV cache enabled for VLM: {pq_bits} bits")
+                logger.info(
+                    f"PlanarQuant3 KV cache enabled for VLM: {pq_bits}-bit, "
+                    f"quantize_v={pq_quant_v}"
+                )
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:

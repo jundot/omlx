@@ -73,3 +73,33 @@ def test_quantize_v_flag_propagated():
     model = _make_fake_model()
     wrapped = mlx_cache.make_prompt_cache(model)
     assert all(not c.quantize_v for c in wrapped)
+
+
+def test_model_settings_round_trip():
+    """ModelSettings round-trips PQ fields through to_dict / from_dict."""
+    from omlx.model_settings import ModelSettings
+
+    s = ModelSettings(
+        planarquant_kv_enabled=True,
+        planarquant_kv_bits=3,
+        planarquant_quantize_v=False,
+    )
+    d = s.to_dict()
+    assert d["planarquant_kv_enabled"] is True
+    assert d["planarquant_kv_bits"] == 3
+    assert d["planarquant_quantize_v"] is False
+
+    s2 = ModelSettings.from_dict(d)
+    assert s2.planarquant_kv_enabled is True
+    assert s2.planarquant_kv_bits == 3
+    assert s2.planarquant_quantize_v is False
+
+
+def test_model_settings_defaults():
+    """Default PQ fields are off / 3-bit / V-quantized."""
+    from omlx.model_settings import ModelSettings
+
+    s = ModelSettings()
+    assert s.planarquant_kv_enabled is False
+    assert s.planarquant_kv_bits == 3
+    assert s.planarquant_quantize_v is True

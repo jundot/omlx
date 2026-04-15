@@ -433,6 +433,8 @@
   "modal.model_settings.planarquant_kv": "PlanarQuant3 KV 缓存",
   "modal.model_settings.planarquant_kv_hint": "通过2D Givens旋转 + 3位Lloyd-Max量化实现KV内存10倍压缩。Apple Silicon原生（MLX）。与TurboQuant互斥。需要重新加载模型。",
   "modal.model_settings.planarquant_kv_bits_label": "每通道位数",
+  "modal.model_settings.planarquant_quantize_v": "量化V",
+  "modal.model_settings.planarquant_quantize_v_hint": "同时量化V状态（打包13x，仅K为4x）。",
   "modal.model_settings.index_cache": "索引缓存",
   "modal.model_settings.index_cache_hint": "跳过DSA层中的冗余索引器计算（DeepSeek V3/GLM-5）。",
   "modal.model_settings.index_cache_freq": "频率（每N层保留索引器）",
