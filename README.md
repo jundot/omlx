@@ -17,6 +17,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
+  <img src="https://github.com/jundot/omlx/actions/workflows/ci.yml/badge.svg" alt="CI">
 </p>
 
 <p align="center">
