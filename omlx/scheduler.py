@@ -1020,6 +1020,9 @@ class Scheduler:
     def _apply_turboquant_kv_empty(self, prompt_cache: List[Any]) -> None:
         """Replace KVCache with empty TurboQuantKVCache before prefill.
 
+        NOTE: Not currently called -- see #771. Kept for future use when
+        TurboQuantKVCache implements merge()/maybe_trim_front().
+
         Tokens are quantized on the fly during update_and_fetch, avoiding
         the peak memory spike from storing full-precision KV then converting.
         Skips the last KVCache layer if turboquant_skip_last is set.
@@ -1057,6 +1060,9 @@ class Scheduler:
 
     def _apply_turboquant_kv_convert(self, prompt_cache: List[Any]) -> None:
         """Convert existing KVCache data to TurboQuantKVCache via from_cache().
+
+        NOTE: Not currently called -- see #771. Kept for future use when
+        TurboQuantKVCache implements merge()/maybe_trim_front().
 
         Used when an existing cache is provided (e.g. from SSD prefix cache).
         Uses from_cache() to quantize the existing KV data.
@@ -1137,15 +1143,14 @@ class Scheduler:
         else:
             prompt_cache = make_prompt_cache(self.model)
 
-        # Replace KVCache with TurboQuantKVCache for on-the-fly quantization.
-        # - New cache: replace with empty TQ caches (tokens quantized during prefill)
-        # - Existing cache (from SSD prefix): convert via from_cache (preserves data)
-        # This follows the same pattern as mlx-lm's maybe_quantize_kv_cache.
-        if self._turboquant_kv_bits is not None:
-            if existing_cache is None:
-                self._apply_turboquant_kv_empty(prompt_cache)
-            else:
-                self._apply_turboquant_kv_convert(prompt_cache)
+        # NOTE: TurboQuant conversion is NOT applied during external prefill.
+        # TurboQuantKVCache does not support merge() or maybe_trim_front(),
+        # so passing it to insert() would fail in _merge_caches() or cause
+        # AttributeError in chunked-attention models (e.g. Llama-4-Scout).
+        # Additionally, on-the-fly quantization during prefill causes
+        # precision loss that corrupts hidden states across layers (#771).
+        # Prefill runs with standard KVCache; TurboQuant quantization
+        # happens inside BatchGenerator during the decode phase.
 
         # Clear stale mRoPE position state for text-only requests.
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
@@ -3171,8 +3176,8 @@ class Scheduler:
             if request.sampling_params.seed is not None:
                 mx.random.seed(request.sampling_params.seed)
 
-            # TQ conversion now happens before prefill (in _do_external_prefill)
-            # so KV is quantized on the fly — no post-prefill conversion needed.
+            # NOTE: TurboQuant KV conversion is not applied during prefill.
+            # See _do_external_prefill() comment for rationale (#771).
 
             # Insert into BatchGenerator with pre-filled cache + last token.
             # BatchGenerator only handles decode from here.
