@@ -374,10 +374,13 @@ class BlockAwarePrefixCache(CacheManager):
         elif is_tensor_data:
             # Try to extract type info from cache_data itself
             layer_cache_types = [
-                # Prefer class_name for TurboQuant (cache_type maps to 'KVCache'),
-                # fall back to cache_type for all standard mlx-lm types.
+                # Prefer class_name for TurboQuant/PlanarQuant (cache_type maps
+                # to 'KVCache'); fall back to cache_type for standard mlx-lm types.
                 layer_state.get('class_name', layer_state.get('cache_type', 'KVCache'))
-                if layer_state.get('class_name', '') in ('TurboQuantKVCache', 'BatchTurboQuantKVCache')
+                if layer_state.get('class_name', '') in (
+                    'TurboQuantKVCache', 'BatchTurboQuantKVCache',
+                    'PlanarQuantKVCache', 'BatchPlanarQuantKVCache',
+                )
                 else layer_state.get('cache_type', 'KVCache')
                 for layer_state in cache_data
             ]
@@ -1600,6 +1603,89 @@ class BlockAwarePrefixCache(CacheManager):
                         reconstructed_caches.append(cache)
                     except Exception as e:
                         logger.error(f"TQ layer {layer_idx}: reconstruction failed: {e}")
+                        return None
+                    continue
+
+                # === PlanarQuantKVCache: concat packed uint16 / fp16 states ===
+                if cache_type_name in ('PlanarQuantKVCache', 'BatchPlanarQuantKVCache'):
+                    # Collect per-block (k_slice, v_slice) tuples. k is always
+                    # packed uint16 (after finalize); v is packed uint16 when
+                    # quantize_v=True, else fp16. Both are 4D with axis=2 = seq.
+                    k_slices, v_slices = [], []
+                    for block_data in all_block_data:
+                        if layer_idx >= len(block_data):
+                            continue
+                        bd = block_data[layer_idx]
+                        if not (isinstance(bd, tuple) and len(bd) == 2):
+                            continue
+                        ks, vs = bd
+                        if ks is None or vs is None:
+                            continue
+                        k_slices.append(ks)
+                        v_slices.append(vs)
+                    if not k_slices:
+                        logger.debug(f"PQ layer {layer_idx}: no block data")
+                        return None
+                    try:
+                        from .planarquant.kv_cache import (
+                            PlanarQuantKVCache,
+                            _unpack_state,
+                        )
+                        cat_k = (
+                            k_slices[0] if len(k_slices) == 1
+                            else mx.concatenate(k_slices, axis=2)
+                        )
+                        cat_v = (
+                            v_slices[0] if len(v_slices) == 1
+                            else mx.concatenate(v_slices, axis=2)
+                        )
+
+                        # meta_state = (offset, bits, quantize_v, D_k, D_v,
+                        #               packed_last_k, packed_last_v) as strings
+                        ms = None
+                        if first_block_meta_states and layer_idx < len(first_block_meta_states):
+                            ms = first_block_meta_states[layer_idx]
+                        if not (isinstance(ms, (list, tuple)) and len(ms) >= 7):
+                            logger.error(
+                                f"PQ layer {layer_idx}: meta_state missing/short "
+                                f"(got {ms!r})"
+                            )
+                            return None
+                        bits = float(ms[1])
+                        quantize_v = bool(int(ms[2]))
+                        D_k = int(ms[3]) or None
+                        D_v = int(ms[4]) or None
+                        packed_last_k = int(ms[5]) or None
+                        packed_last_v = int(ms[6]) or None
+
+                        cache = PlanarQuantKVCache(bits=bits, quantize_v=quantize_v)
+                        cache._D_k = D_k
+                        cache._D_v = D_v
+                        cache._packed_last_k = packed_last_k
+                        cache._packed_last_v = packed_last_v
+
+                        k_idx, k_norm = _unpack_state(cat_k, D_k, packed_last_k)
+                        B, H_k, T, pl_k = k_idx.shape
+                        cache._B = B
+                        cache._H_k = H_k
+                        cache._k_packed = k_idx
+                        cache._k_norms = k_norm
+                        cache.offset = T
+                        cache._cap = T
+                        cache._finalized = True
+
+                        if quantize_v:
+                            v_idx, v_norm = _unpack_state(cat_v, D_v, packed_last_v)
+                            cache._H_v = v_idx.shape[1]
+                            cache._v_packed = v_idx
+                            cache._v_norms = v_norm
+                        else:
+                            # cat_v is fp16 shaped (B, H_v, T, D_v_full)
+                            cache._H_v = cat_v.shape[1]
+                            cache._v_fp16 = cat_v
+                        reconstructed_caches.append(cache)
+                    except Exception as e:
+                        logger.error(f"PQ layer {layer_idx}: reconstruction failed: {e}")
                         return None
                     continue
 
