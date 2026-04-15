@@ -687,6 +687,317 @@ def resolve_output_name(model_name: str, oq_level: int) -> str:
     return f"{base}-oQ{level_str}"
 
 
+
+# ── Auto-discovery streaming sanitizer ──────────────────────────────────
+
+class _TrackedTensor:
+    """Fake tensor proxy that records shape, dtype, lineage, and transforms
+    applied during a sanitize() dry run. Holds no GPU data."""
+
+    __slots__ = ("shape", "ndim", "dtype", "sources", "transform", "axis")
+
+    def __init__(self, shape, dtype, sources=None, transform="passthrough", axis=None):
+        self.shape = tuple(shape)
+        self.ndim = len(self.shape)
+        self.dtype = dtype
+        self.sources = sources or []
+        self.transform = transform
+        self.axis = axis
+
+    # Support `weight + 1.0` patterns (norm adjustments)
+    def __add__(self, other):
+        return _TrackedTensor(self.shape, self.dtype, list(self.sources), "add")
+    def __radd__(self, other):
+        return self.__add__(other)
+    def __sub__(self, other):
+        return _TrackedTensor(self.shape, self.dtype, list(self.sources), "sub")
+
+    # Support indexing like tensor[..., :half] for split patterns
+    def __getitem__(self, idx):
+        # Rough shape tracking for common slice patterns
+        return _TrackedTensor(self.shape, self.dtype, list(self.sources), "slice")
+
+    # Support .T, .reshape, transpose, moveaxis etc
+    @property
+    def T(self):
+        return _TrackedTensor(tuple(reversed(self.shape)), self.dtype, list(self.sources), "transpose")
+    @property
+    def size(self):
+        r = 1
+        for d in self.shape:
+            r *= d
+        return r
+
+
+def _discover_sanitize_plan(sanitize_fn, lazy_index):
+    """Run sanitize on _TrackedTensors to discover the key mapping and
+    transforms without materializing any real data.
+
+    Returns a dict: output_key -> {sources, transform, shape, axis}
+    or None if discovery fails.
+    """
+    import mlx.core as mx
+
+    # Build tracked dict mirroring the lazy index
+    tracked = {}
+    for k in lazy_index._index:
+        meta = lazy_index._index[k]
+        shape, dtype = meta[4], meta[5]
+        tracked[k] = _TrackedTensor(shape, dtype, sources=[k])
+
+    # Monkey-patch mx ops to work on tracked tensors
+    _orig = {
+        "stack": mx.stack,
+        "concatenate": mx.concatenate,
+        "split": mx.split,
+        "eval": mx.eval,
+        "clear_cache": mx.clear_cache,
+        "synchronize": mx.synchronize,
+        "moveaxis": mx.moveaxis,
+        "transpose": mx.transpose,
+    }
+
+    def _fake_stack(tensors, axis=0):
+        if tensors and isinstance(tensors[0], _TrackedTensor):
+            n = len(tensors)
+            base = list(tensors[0].shape)
+            new_shape = base[:axis] + [n] + base[axis:]
+            all_src = []
+            for t in tensors:
+                all_src.extend(t.sources)
+            return _TrackedTensor(new_shape, tensors[0].dtype, all_src, "stack", axis=axis)
+        return _orig["stack"](tensors, axis=axis)
+
+    def _fake_concatenate(tensors, axis=0):
+        if tensors and isinstance(tensors[0], _TrackedTensor):
+            all_src = []
+            for t in tensors:
+                all_src.extend(t.sources)
+            base = list(tensors[0].shape)
+            base[axis] = sum(t.shape[axis] for t in tensors)
+            return _TrackedTensor(base, tensors[0].dtype, all_src, "concatenate", axis=axis)
+        return _orig["concatenate"](tensors, axis=axis)
+
+    def _fake_split(tensor, indices_or_sections, axis=0):
+        if isinstance(tensor, _TrackedTensor):
+            if isinstance(indices_or_sections, int):
+                n = indices_or_sections
+                sz = tensor.shape[axis] // n
+                parts = []
+                for i in range(n):
+                    sh = list(tensor.shape)
+                    sh[axis] = sz
+                    parts.append(_TrackedTensor(sh, tensor.dtype, list(tensor.sources), f"split_{i}_{n}", axis=axis))
+                return parts
+            # list of indices
+            parts = []
+            prev = 0
+            idxs = list(indices_or_sections) + [tensor.shape[axis]]
+            for i, idx in enumerate(idxs):
+                sh = list(tensor.shape)
+                sh[axis] = idx - prev
+                parts.append(_TrackedTensor(sh, tensor.dtype, list(tensor.sources), f"split_{i}", axis=axis))
+                prev = idx
+            return parts
+        return _orig["split"](tensor, indices_or_sections, axis=axis)
+
+    def _fake_moveaxis(tensor, src_ax, dst_ax):
+        if isinstance(tensor, _TrackedTensor):
+            dims = list(range(tensor.ndim))
+            dims.insert(dst_ax, dims.pop(src_ax))
+            new_shape = tuple(tensor.shape[d] for d in dims)
+            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources), "moveaxis")
+        return _orig["moveaxis"](tensor, src_ax, dst_ax)
+
+    def _fake_transpose(tensor, axes=None):
+        if isinstance(tensor, _TrackedTensor):
+            if axes is None:
+                axes = list(reversed(range(tensor.ndim)))
+            new_shape = tuple(tensor.shape[a] for a in axes)
+            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources), "transpose")
+        return _orig["transpose"](tensor, axes=axes)
+
+    def _noop(*a, **kw): pass
+
+    mx.stack = _fake_stack
+    mx.concatenate = _fake_concatenate
+    mx.split = _fake_split
+    mx.eval = _noop
+    mx.clear_cache = _noop
+    mx.synchronize = _noop
+    mx.moveaxis = _fake_moveaxis
+    mx.transpose = _fake_transpose
+
+    try:
+        result = sanitize_fn(tracked)
+    finally:
+        for name, fn in _orig.items():
+            setattr(mx, name, fn)
+
+    # Extract plan
+    plan = {}
+    for k, v in result.items():
+        if isinstance(v, _TrackedTensor):
+            plan[k] = {
+                "sources": v.sources,
+                "transform": v.transform,
+                "shape": v.shape,
+                "axis": v.axis,
+            }
+        else:
+            # sanitize returned a real value (rare — e.g. a scalar override)
+            plan[k] = {
+                "sources": [],
+                "transform": "literal",
+                "shape": getattr(v, "shape", ()),
+                "axis": None,
+                "value": v,
+            }
+
+    return plan
+
+
+class _DiscoveredPlan:
+    """Dict-like wrapper that materializes tensors one at a time using
+    a plan discovered by _discover_sanitize_plan. Supports chunked
+    stacking for huge MoE expert tensors."""
+
+    _STACK_CHUNK = 16  # experts per chunk during materialization
+
+    def __init__(self, plan, lazy_index):
+        self._plan = plan       # output_key -> {sources, transform, ...}
+        self._lazy = lazy_index
+        self._cache = {}        # output_key -> mx.array (for multi-consumer sources)
+
+    def keys(self):
+        return self._plan.keys()
+
+    def __len__(self):
+        return len(self._plan)
+
+    def __contains__(self, k):
+        return k in self._plan
+
+    def __iter__(self):
+        return iter(self._plan)
+
+    def items(self):
+        # Yield (key, shape_proxy) for the quantize loop shape inspection
+        class _SP:
+            __slots__ = ("shape", "ndim")
+            def __init__(self, sh):
+                self.shape = tuple(sh)
+                self.ndim = len(self.shape)
+        return ((k, _SP(info["shape"])) for k, info in self._plan.items())
+
+    def nbytes(self):
+        return self._lazy.nbytes()
+
+    def _materialize_source(self, src_key):
+        """Load a single source tensor from the lazy index."""
+        meta = self._lazy._index.get(src_key)
+        if meta is None:
+            raise KeyError(f"source tensor {src_key!r} not in lazy index")
+        sf_path, data_offset, start, end, shape, dtype = meta
+        # Scalars (0-dim tensors) need special handling
+        if len(shape) == 0:
+            import numpy as _np
+            with open(sf_path, "rb") as f:
+                f.seek(data_offset + start)
+                raw = f.read(end - start)
+            lt_tmp = _LazyTensor(sf_path, data_offset, start, end, (1,), dtype)
+            np_view = _np.frombuffer(raw, dtype=lt_tmp._np_view_dtype())
+            arr = mx.array(np_view).view(lt_tmp._mlx_dtype()).reshape(())
+            mx.eval(arr)
+            return arr
+        lt = _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
+        arr = lt[:]
+        mx.eval(arr)
+        return arr
+
+    def pop(self, key, *default):
+        if key not in self._plan:
+            if default:
+                return default[0]
+            raise KeyError(key)
+
+        info = self._plan.pop(key)
+        transform = info["transform"]
+        sources = info["sources"]
+
+        if transform == "literal":
+            return info["value"]
+
+        if transform == "passthrough" and len(sources) == 1:
+            arr = self._materialize_source(sources[0])
+            return arr
+
+        if transform == "stack":
+            # Chunked stacking to bound peak memory
+            axis = info.get("axis", 0)
+            chunk = self._STACK_CHUNK
+            partials = []
+            for base in range(0, len(sources), chunk):
+                piece = []
+                for src in sources[base:base + chunk]:
+                    piece.append(self._materialize_source(src))
+                stk = mx.stack(piece, axis=axis)
+                mx.eval(stk)
+                del piece
+                mx.clear_cache()
+                partials.append(stk)
+            if len(partials) == 1:
+                return partials[0]
+            result = mx.concatenate(partials, axis=axis)
+            mx.eval(result)
+            del partials
+            mx.clear_cache()
+            return result
+
+        if transform == "concatenate":
+            axis = info.get("axis", 0)
+            parts = [self._materialize_source(src) for src in sources]
+            result = mx.concatenate(parts, axis=axis)
+            mx.eval(result)
+            del parts
+            mx.clear_cache()
+            return result
+
+        if transform == "add":
+            arr = self._materialize_source(sources[0])
+            return arr + 1.0
+
+        if transform == "transpose":
+            arr = self._materialize_source(sources[0])
+            return mx.transpose(arr)
+
+        if transform == "moveaxis":
+            arr = self._materialize_source(sources[0])
+            return mx.moveaxis(arr, 2, 1)  # common conv1d pattern
+
+        if "split_" in transform:
+            # split_N_M means take part N of M
+            parts = transform.split("_")
+            arr = self._materialize_source(sources[0])
+            axis = info.get("axis", 0)
+            if len(parts) == 3:  # split_idx_total
+                idx, total = int(parts[1]), int(parts[2])
+                chunks = mx.split(arr, total, axis=axis)
+                result = chunks[idx]
+                mx.eval(result)
+                del arr, chunks
+                mx.clear_cache()
+                return result
+            # split_idx (index-based split) — less common
+            return arr
+
+        # Fallback: just load first source
+        if sources:
+            return self._materialize_source(sources[0])
+        raise ValueError(f"cannot materialize {key!r}: transform={transform}, no sources")
+
+
+
 def validate_quantizable(config: dict) -> bool:
     """Check if a model config indicates it can be quantized.
 
@@ -1094,7 +1405,12 @@ class _LazyTensorIndex:
     def __contains__(self, k):
         if k in self._index: return True
         return hasattr(self, "_overrides") and k in self._overrides
-    def __iter__(self):       return iter(self._index)
+    def __iter__(self):
+        yield from self._index
+        if hasattr(self, "_overrides"):
+            for k in self._overrides:
+                if k not in self._index:
+                    yield k
     def nbytes(self):         return sum(e - s for _,_,s,e,_,_ in self._index.values())
 
     def __getitem__(self, key):
@@ -1111,6 +1427,9 @@ class _LazyTensorIndex:
         for k in list(self._index.keys()):
             yield k, self[k]
             mx.clear_cache()
+        if hasattr(self, "_overrides"):
+            for k, v in self._overrides.items():
+                yield k, v
 
     def get(self, key, default=None):
         if key in self._index:
@@ -1145,7 +1464,10 @@ class _LazyTensorIndex:
             if default: return default[0]
             raise KeyError(key)
         sf_path, data_offset, start, end, shape, dtype = self._index.pop(key)
-        return _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
+        lt = _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
+        arr = lt[:]
+        mx.eval(arr)
+        return arr
 
 
 class _LazyTensor:
@@ -1215,6 +1537,11 @@ class _LazyTensor:
         return result
 
     def __getitem__(self, idx):
+        if len(self.shape) == 0:
+            raise IndexError(
+                "0-dim _LazyTensor cannot be indexed; caller should use "
+                "_materialize_source scalar path"
+            )
         if isinstance(idx, tuple):
             return self._load_rows(0, self.shape[0])[idx]
         if isinstance(idx, slice):
@@ -1499,23 +1826,26 @@ def quantize_oq_streaming(
 
     cb("loading", 12.0)
 
-    architectures = config.get("architectures", [])
-    is_vlm = any("ForConditionalGeneration" in a for a in architectures)
-    if is_vlm:
+    sanitize_fn = _build_model_sanitizer(config)
+    if sanitize_fn is not None:
+        # Try discovery-based streaming sanitize first (works for any model,
+        # bounds peak memory by materializing one tensor at a time)
         try:
-            all_weights = _StreamingPlan(all_weights, config)
-            logger.info(f"oQ{oq_level:g}: streaming sanitize plan built, {len(all_weights)} output tensors")
+            plan = _discover_sanitize_plan(sanitize_fn, all_weights)
+            all_weights = _DiscoveredPlan(plan, all_weights)
+            logger.info(
+                f"oQ{oq_level:g}: discovered streaming sanitize plan, "
+                f"{len(all_weights)} output tensors"
+            )
         except Exception as e:
-            import traceback; traceback.print_exc()
-            logger.warning(f"Streaming sanitize plan failed ({e}), using original names")
-    else:
-        sanitize_fn = _build_model_sanitizer(config)
-        if sanitize_fn is not None:
+            logger.warning(
+                f"Streaming discovery failed ({e}), falling back to eager sanitize"
+            )
             try:
                 all_weights = sanitize_fn(all_weights)
-                logger.info(f"oQ{oq_level:g}: sanitize applied, {len(all_weights)} tensors")
-            except Exception as e:
-                logger.warning(f"Sanitize failed ({e}), using original names")
+                logger.info(f"oQ{oq_level:g}: eager sanitize applied, {len(all_weights)} tensors")
+            except Exception as e2:
+                logger.warning(f"Sanitize failed ({e2}), using original names")
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
 
