@@ -4,6 +4,9 @@ module.exports = {
     "./templates/**/*.html",
     "./static/js/**/*.js",
   ],
+  safelist: [
+    "sm:grid-cols-2",  // dynamic :class in _modal_model_settings.html
+  ],
   theme: {
     extend: {
       fontFamily: {
