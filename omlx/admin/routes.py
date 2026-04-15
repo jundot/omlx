@@ -197,7 +197,9 @@ class GlobalSettingsRequest(BaseModel):
     integrations_opencode_model: Optional[str] = None
     integrations_openclaw_model: Optional[str] = None
     integrations_pi_model: Optional[str] = None
-    integrations_openclaw_tools_profile: Optional[Literal["minimal", "coding", "messaging", "full"]] = None
+    integrations_openclaw_tools_profile: Optional[
+        Literal["minimal", "coding", "messaging", "full"]
+    ] = None
 
     # UI settings
     ui_language: Optional[str] = None
@@ -268,17 +270,19 @@ class HFValidateTokenRequest(BaseModel):
 
 def _format_cache_size(size_bytes: int) -> str:
     """Format cache size in bytes to human-readable string (e.g., '100GB')."""
-    gb = size_bytes / (1024 ** 3)
+    gb = size_bytes / (1024**3)
     if gb >= 1:
         return f"{gb:.0f}GB"
-    mb = size_bytes / (1024 ** 2)
+    mb = size_bytes / (1024**2)
     return f"{mb:.0f}MB"
 
 
 def _apply_log_level_runtime(level: str) -> None:
     """Apply log level change at runtime to all oMLX loggers and handlers."""
     level_name = level.upper()
-    log_level = 5 if level_name == "TRACE" else getattr(logging, level_name, logging.INFO)
+    log_level = (
+        5 if level_name == "TRACE" else getattr(logging, level_name, logging.INFO)
+    )
 
     # Update root logger level and all its handlers
     root_logger = logging.getLogger()
@@ -506,6 +510,7 @@ async def _apply_max_process_memory_runtime(
             max_bytes = int(get_system_memory() * percent / 100)
         except ValueError:
             from ..config import parse_size
+
             max_bytes = parse_size(max_process_memory)
 
     if _server_state.process_memory_enforcer is not None:
@@ -514,8 +519,7 @@ async def _apply_max_process_memory_runtime(
         # Trigger immediate check
         await _server_state.process_memory_enforcer._check_and_enforce()
         return True, (
-            f"Process memory limit updated to "
-            f"{max_bytes / 1024**3:.1f}GB"
+            f"Process memory limit updated to " f"{max_bytes / 1024**3:.1f}GB"
         )
     else:
         # Create and start new enforcer
@@ -531,8 +535,7 @@ async def _apply_max_process_memory_runtime(
         _server_state.engine_pool._process_memory_enforcer = enforcer
         enforcer.start()
         return True, (
-            f"Process memory enforcement enabled at "
-            f"{max_bytes / 1024**3:.1f}GB"
+            f"Process memory enforcement enabled at " f"{max_bytes / 1024**3:.1f}GB"
         )
 
 
@@ -569,7 +572,9 @@ async def _apply_cache_settings_runtime(
         if ssd_cache_dir is not None:
             pool._scheduler_config.paged_ssd_cache_dir = ssd_cache_dir
         elif global_settings.cache.ssd_cache_dir:
-            pool._scheduler_config.paged_ssd_cache_dir = global_settings.cache.ssd_cache_dir
+            pool._scheduler_config.paged_ssd_cache_dir = (
+                global_settings.cache.ssd_cache_dir
+            )
         else:
             # Use default cache dir
             pool._scheduler_config.paged_ssd_cache_dir = str(
@@ -580,14 +585,20 @@ async def _apply_cache_settings_runtime(
             # Handle "auto" value
             if ssd_cache_max_size.lower() == "auto":
                 pool._scheduler_config.paged_ssd_cache_max_size = (
-                    global_settings.cache.get_ssd_cache_max_size_bytes(global_settings.base_path)
+                    global_settings.cache.get_ssd_cache_max_size_bytes(
+                        global_settings.base_path
+                    )
                 )
             else:
-                pool._scheduler_config.paged_ssd_cache_max_size = parse_size(ssd_cache_max_size)
+                pool._scheduler_config.paged_ssd_cache_max_size = parse_size(
+                    ssd_cache_max_size
+                )
         elif global_settings.cache.ssd_cache_max_size:
             # Use settings value (handles "auto")
             pool._scheduler_config.paged_ssd_cache_max_size = (
-                global_settings.cache.get_ssd_cache_max_size_bytes(global_settings.base_path)
+                global_settings.cache.get_ssd_cache_max_size_bytes(
+                    global_settings.base_path
+                )
             )
         elif global_settings.cache.ssd_cache_max_size:
             pool._scheduler_config.paged_ssd_cache_max_size = parse_size(
@@ -601,6 +612,7 @@ async def _apply_cache_settings_runtime(
         pool._scheduler_config.hot_cache_max_size = hot_bytes
         if hot_bytes != old_hot:
             from ..utils.formatting import format_bytes
+
             old_str = "Off" if old_hot == 0 else format_bytes(old_hot)
             new_str = "Off" if hot_bytes == 0 else format_bytes(hot_bytes)
             logger.info(f"Hot cache max size changed: {old_str} -> {new_str}")
@@ -690,6 +702,7 @@ def _static_version(path: str) -> str:
 templates.env.globals["static"] = _static_version
 
 from omlx._version import __version__ as _omlx_version
+
 templates.env.globals["version"] = _omlx_version
 
 # i18n defaults (English) — overridden once set_admin_getters is called
@@ -933,10 +946,7 @@ async def login_page(request: Request):
     global_settings = _get_global_settings()
 
     # Skip login page when skip_api_key_verification is enabled
-    if (
-        global_settings is not None
-        and global_settings.auth.skip_api_key_verification
-    ):
+    if global_settings is not None and global_settings.auth.skip_api_key_verification:
         return RedirectResponse(url="/admin/dashboard", status_code=302)
 
     api_key_configured = bool(global_settings and global_settings.auth.api_key)
@@ -975,9 +985,7 @@ async def chat_page(request: Request, is_admin: bool = Depends(require_admin)):
     """
     global_settings = _get_global_settings()
     api_key = global_settings.auth.api_key if global_settings else ""
-    return templates.TemplateResponse(
-        request, "chat.html", {"api_key": api_key or ""}
-    )
+    return templates.TemplateResponse(request, "chat.html", {"api_key": api_key or ""})
 
 
 @router.get("/static/{path:path}")
@@ -1104,9 +1112,7 @@ async def setup_api_key(request: SetupApiKeyRequest, response: Response):
     try:
         global_settings.save()
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to save settings: {e}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
 
     logger.info("API key configured via initial setup")
 
@@ -1216,9 +1222,7 @@ async def create_sub_key(
 
     for sk in global_settings.auth.sub_keys:
         if sk.key and secrets.compare_digest(request.key, sk.key):
-            raise HTTPException(
-                status_code=400, detail="This key already exists"
-            )
+            raise HTTPException(status_code=400, detail="This key already exists")
 
     entry = SubKeyEntry(
         key=request.key,
@@ -1232,9 +1236,7 @@ async def create_sub_key(
     except Exception as e:
         # Rollback
         global_settings.auth.sub_keys.pop()
-        raise HTTPException(
-            status_code=500, detail=f"Failed to save settings: {e}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
 
     logger.info(f"Sub key created: {request.name or '(unnamed)'}")
     return {"success": True, "sub_key": entry.to_dict()}
@@ -1345,9 +1347,13 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "loaded": model_info.get("loaded", False),
             "is_loading": model_info.get("is_loading", False),
             "estimated_size": model_info.get("estimated_size", 0),
-            "estimated_size_formatted": format_size(model_info.get("estimated_size", 0)),
+            "estimated_size_formatted": format_size(
+                model_info.get("estimated_size", 0)
+            ),
             "pinned": model_info.get("pinned", False),
-            "is_default": server_state.default_model == model_id if server_state else False,
+            "is_default": (
+                server_state.default_model == model_id if server_state else False
+            ),
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),
@@ -1434,9 +1440,15 @@ async def load_model(
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is not None:
-        return {"status": "ok", "model_id": model_id, "message": f"Already loaded: {model_id}"}
+        return {
+            "status": "ok",
+            "model_id": model_id,
+            "message": f"Already loaded: {model_id}",
+        }
     if entry.is_loading:
-        raise HTTPException(status_code=409, detail=f"Model is already loading: {model_id}")
+        raise HTTPException(
+            status_code=409, detail=f"Model is already loading: {model_id}"
+        )
 
     try:
         await engine_pool.get_engine(model_id)
@@ -1492,6 +1504,7 @@ async def update_model_settings(
 
     # Get current settings
     from ..model_settings import ModelSettings
+
     current_settings = settings_manager.get_settings(model_id)
 
     # Apply updates — use model_fields_set to distinguish "sent as null"
@@ -1518,7 +1531,15 @@ async def update_model_settings(
                     )
         current_settings.model_alias = alias_value
     if "model_type_override" in sent:
-        valid_types = {"llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"}
+        valid_types = {
+            "llm",
+            "vlm",
+            "embedding",
+            "reranker",
+            "audio_stt",
+            "audio_tts",
+            "audio_sts",
+        }
         # Treat empty string as None (auto-detect)
         override_value = request.model_type_override or None
         if override_value is not None and override_value not in valid_types:
@@ -1570,15 +1591,21 @@ async def update_model_settings(
     if "max_tool_result_tokens" in sent:
         # 0 means disable (reset to None)
         current_settings.max_tool_result_tokens = (
-            request.max_tool_result_tokens if request.max_tool_result_tokens and request.max_tool_result_tokens > 0 else None
+            request.max_tool_result_tokens
+            if request.max_tool_result_tokens and request.max_tool_result_tokens > 0
+            else None
         )
     if "enable_thinking" in sent:
         current_settings.enable_thinking = request.enable_thinking
     if "thinking_budget_enabled" in sent:
-        current_settings.thinking_budget_enabled = request.thinking_budget_enabled or False
+        current_settings.thinking_budget_enabled = (
+            request.thinking_budget_enabled or False
+        )
     if "thinking_budget_tokens" in sent:
         current_settings.thinking_budget_tokens = (
-            request.thinking_budget_tokens if request.thinking_budget_tokens and request.thinking_budget_tokens > 0 else None
+            request.thinking_budget_tokens
+            if request.thinking_budget_tokens and request.thinking_budget_tokens > 0
+            else None
         )
     if "chat_template_kwargs" in sent:
         current_settings.chat_template_kwargs = request.chat_template_kwargs
@@ -1599,12 +1626,18 @@ async def update_model_settings(
     if "turboquant_kv_bits" in sent:
         current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
     if "turboquant_skip_last" in sent:
-        current_settings.turboquant_skip_last = request.turboquant_skip_last if request.turboquant_skip_last is not None else True
+        current_settings.turboquant_skip_last = (
+            request.turboquant_skip_last
+            if request.turboquant_skip_last is not None
+            else True
+        )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
     if "specprefill_draft_model" in sent:
-        current_settings.specprefill_draft_model = request.specprefill_draft_model or None
+        current_settings.specprefill_draft_model = (
+            request.specprefill_draft_model or None
+        )
     if "specprefill_keep_pct" in sent:
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
@@ -1615,7 +1648,9 @@ async def update_model_settings(
     if "dflash_draft_model" in sent:
         current_settings.dflash_draft_model = request.dflash_draft_model or None
     if "dflash_draft_quant_bits" in sent:
-        current_settings.dflash_draft_quant_bits = request.dflash_draft_quant_bits or None
+        current_settings.dflash_draft_quant_bits = (
+            request.dflash_draft_quant_bits or None
+        )
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -1633,15 +1668,12 @@ async def update_model_settings(
     settings_manager.set_settings(model_id, current_settings)
 
     # Warn if engine type or index_cache_freq changed while model is loaded
-    requires_reload = (
-        entry.engine is not None
-        and (
-            ("model_type_override" in sent and entry.engine_type != prev_engine_type)
-            or "index_cache_freq" in sent
-            or "dflash_enabled" in sent
-            or "dflash_draft_model" in sent
-            or "turboquant_skip_last" in sent
-        )
+    requires_reload = entry.engine is not None and (
+        ("model_type_override" in sent and entry.engine_type != prev_engine_type)
+        or "index_cache_freq" in sent
+        or "dflash_enabled" in sent
+        or "dflash_draft_model" in sent
+        or "turboquant_skip_last" in sent
     )
     if requires_reload:
         logger.info(
@@ -1702,7 +1734,9 @@ async def get_generation_config(
             # Temperature: if do_sample is false, effective temperature is 0
             do_sample = gen_config.get("do_sample", True)
             if "temperature" in gen_config:
-                result["temperature"] = 0.0 if not do_sample else gen_config["temperature"]
+                result["temperature"] = (
+                    0.0 if not do_sample else gen_config["temperature"]
+                )
 
             if "top_p" in gen_config:
                 result["top_p"] = gen_config["top_p"]
@@ -1714,7 +1748,9 @@ async def get_generation_config(
                 result["repetition_penalty"] = gen_config["repetition_penalty"]
 
         except (json_module.JSONDecodeError, OSError) as e:
-            logger.warning(f"Failed to parse generation_config.json for {model_id}: {e}")
+            logger.warning(
+                f"Failed to parse generation_config.json for {model_id}: {e}"
+            )
 
     # Read config.json for max_position_embeddings → max_context_window
     config_path = model_path / "config.json"
@@ -1833,9 +1869,12 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "model": {
             "model_dirs": [
-                str(d) for d in global_settings.model.get_model_dirs(global_settings.base_path)
+                str(d)
+                for d in global_settings.model.get_model_dirs(global_settings.base_path)
             ],
-            "model_dir": str(global_settings.model.get_model_dir(global_settings.base_path)),
+            "model_dir": str(
+                global_settings.model.get_model_dir(global_settings.base_path)
+            ),
             "max_model_memory": global_settings.model.max_model_memory,
             "model_fallback": global_settings.model.model_fallback,
         },
@@ -1851,7 +1890,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "ssd_cache_dir": cache_dir,
             # Resolve "auto" to actual value (10% of SSD capacity)
             "ssd_cache_max_size": _format_cache_size(
-                global_settings.cache.get_ssd_cache_max_size_bytes(global_settings.base_path)
+                global_settings.cache.get_ssd_cache_max_size_bytes(
+                    global_settings.base_path
+                )
             ),
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
@@ -2004,8 +2045,7 @@ async def update_global_settings(
                 logger.info(msg)
             else:
                 raise HTTPException(
-                    status_code=400,
-                    detail=f"Failed to change model directories: {msg}"
+                    status_code=400, detail=f"Failed to change model directories: {msg}"
                 )
 
     if request.max_model_memory is not None and request.max_model_memory != "":
@@ -2102,7 +2142,9 @@ async def update_global_settings(
 
     # Apply MCP settings (restart required)
     if request.mcp_config is not None:
-        global_settings.mcp.config_path = request.mcp_config if request.mcp_config else None
+        global_settings.mcp.config_path = (
+            request.mcp_config if request.mcp_config else None
+        )
 
     # Apply HuggingFace settings (Live - immediately applied via env var)
     if request.hf_endpoint is not None:
@@ -2113,8 +2155,7 @@ async def update_global_settings(
             del os.environ["HF_ENDPOINT"]
         runtime_applied.append("hf_endpoint")
         logger.info(
-            f"HuggingFace endpoint updated to: "
-            f"{request.hf_endpoint or '(default)'}"
+            f"HuggingFace endpoint updated to: " f"{request.hf_endpoint or '(default)'}"
         )
 
     # Apply ModelScope settings (Live - immediately applied via env var)
@@ -2126,8 +2167,7 @@ async def update_global_settings(
             del os.environ["MODELSCOPE_DOMAIN"]
         runtime_applied.append("ms_endpoint")
         logger.info(
-            f"ModelScope endpoint updated to: "
-            f"{request.ms_endpoint or '(default)'}"
+            f"ModelScope endpoint updated to: " f"{request.ms_endpoint or '(default)'}"
         )
 
     # Apply network settings (Live - immediately applied via env vars)
@@ -2205,7 +2245,9 @@ async def update_global_settings(
     # Apply sampling settings (Live - immediately applied)
     sampling_changed = False
     if request.sampling_max_context_window is not None:
-        global_settings.sampling.max_context_window = request.sampling_max_context_window
+        global_settings.sampling.max_context_window = (
+            request.sampling_max_context_window
+        )
         sampling_changed = True
     if request.sampling_max_tokens is not None:
         global_settings.sampling.max_tokens = request.sampling_max_tokens
@@ -2220,7 +2262,9 @@ async def update_global_settings(
         global_settings.sampling.top_k = request.sampling_top_k
         sampling_changed = True
     if request.sampling_repetition_penalty is not None:
-        global_settings.sampling.repetition_penalty = request.sampling_repetition_penalty
+        global_settings.sampling.repetition_penalty = (
+            request.sampling_repetition_penalty
+        )
         sampling_changed = True
 
     if sampling_changed:
@@ -2332,7 +2376,9 @@ async def update_global_settings(
         logger.info("API key updated via admin settings")
 
     if request.skip_api_key_verification is not None:
-        global_settings.auth.skip_api_key_verification = request.skip_api_key_verification
+        global_settings.auth.skip_api_key_verification = (
+            request.skip_api_key_verification
+        )
         runtime_applied.append("skip_api_key_verification")
 
     # Validate settings
@@ -2589,9 +2635,7 @@ def _load_fallback_commits(packages: dict[str, str]) -> dict:
     return {}
 
 
-def _parse_commits_from_pyproject(
-    pyproject_path, packages: dict[str, str]
-) -> dict:
+def _parse_commits_from_pyproject(pyproject_path, packages: dict[str, str]) -> dict:
     """Extract commit SHAs from git+https:// URLs in pyproject.toml."""
     import re
     from pathlib import Path
@@ -2694,7 +2738,9 @@ def _build_runtime_cache_observability(
             ssd_stats = {}
 
         ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
-        scheduler_model_name = getattr(getattr(scheduler, "config", None), "model_name", "")
+        scheduler_model_name = getattr(
+            getattr(scheduler, "config", None), "model_name", ""
+        )
         if ssd_manager is not None and hasattr(ssd_manager, "get_stats_for_model"):
             try:
                 scoped_ssd_stats = ssd_manager.get_stats_for_model(
@@ -2893,23 +2939,24 @@ def _build_active_models_data() -> dict:
 
         # Generating = active requests that finished prefill
         generating = [
-            {"request_id": rid}
-            for rid in sorted(active_request_ids - prefilling_ids)
+            {"request_id": rid} for rid in sorted(active_request_ids - prefilling_ids)
         ]
 
-        models.append({
-            "id": model_id,
-            "estimated_size": model_info.get("estimated_size", 0),
-            "estimated_size_formatted": format_size(
-                model_info.get("estimated_size", 0)
-            ),
-            "pinned": model_info.get("pinned", False),
-            "is_loading": model_info.get("is_loading", False),
-            "active_requests": active_requests,
-            "waiting_requests": waiting_requests,
-            "prefilling": prefilling,
-            "generating": generating,
-        })
+        models.append(
+            {
+                "id": model_id,
+                "estimated_size": model_info.get("estimated_size", 0),
+                "estimated_size_formatted": format_size(
+                    model_info.get("estimated_size", 0)
+                ),
+                "pinned": model_info.get("pinned", False),
+                "is_loading": model_info.get("is_loading", False),
+                "active_requests": active_requests,
+                "waiting_requests": waiting_requests,
+                "prefilling": prefilling,
+                "generating": generating,
+            }
+        )
 
         total_active += active_requests
         total_waiting += waiting_requests
@@ -2967,9 +3014,7 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
             core = (
                 getattr(async_core, "engine", None) if async_core is not None else None
             )
-            scheduler = (
-                getattr(core, "scheduler", None) if core is not None else None
-            )
+            scheduler = getattr(core, "scheduler", None) if core is not None else None
 
             if scheduler is not None:
                 ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
@@ -3080,6 +3125,7 @@ async def probe_cache(
             messages = engine._preprocess_messages(messages)
         try:
             from ..api.tool_calling import convert_tools_for_template  # type: ignore
+
             template_tools = (
                 convert_tools_for_template(request.tools) if request.tools else None
             )
@@ -3204,9 +3250,7 @@ async def start_hf_download(
         raise HTTPException(status_code=503, detail="Downloader not initialized")
 
     try:
-        task = await _hf_downloader.start_download(
-            request.repo_id, request.hf_token
-        )
+        task = await _hf_downloader.start_download(request.repo_id, request.hf_token)
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -3232,9 +3276,7 @@ async def cancel_hf_download(
 
     success = await _hf_downloader.cancel_download(task_id)
     if not success:
-        raise HTTPException(
-            status_code=404, detail="Task not found or not cancellable"
-        )
+        raise HTTPException(status_code=404, detail="Task not found or not cancellable")
     return {"success": True}
 
 
@@ -3266,9 +3308,7 @@ async def remove_hf_task(
 
     success = _hf_downloader.remove_task(task_id)
     if not success:
-        raise HTTPException(
-            status_code=404, detail="Task not found or still active"
-        )
+        raise HTTPException(status_code=404, detail="Task not found or still active")
     return {"success": True}
 
 
@@ -3377,9 +3417,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
         if model_name in seen_names:
             return
         seen_names.add(model_name)
-        total_size = sum(
-            f.stat().st_size for f in model_path.rglob("*") if f.is_file()
-        )
+        total_size = sum(f.stat().st_size for f in model_path.rglob("*") if f.is_file())
         models.append(
             {
                 "name": model_name,
@@ -3514,9 +3552,7 @@ async def delete_hf_model(
             pinned_models = settings_manager.get_pinned_model_ids()
 
         engine_pool._entries.pop(model_name, None)
-        engine_pool.discover_models(
-            [str(d) for d in model_dirs], pinned_models
-        )
+        engine_pool.discover_models([str(d) for d in model_dirs], pinned_models)
         if settings_manager:
             engine_pool.apply_settings_overrides(settings_manager)
         logger.info("Model pool refreshed after deletion")
@@ -3542,12 +3578,12 @@ async def start_ms_download(
 ):
     """Start downloading a model from ModelScope."""
     if _ms_downloader is None:
-        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+        raise HTTPException(
+            status_code=503, detail="ModelScope downloader not initialized"
+        )
 
     try:
-        task = await _ms_downloader.start_download(
-            request.model_id, request.ms_token
-        )
+        task = await _ms_downloader.start_download(request.model_id, request.ms_token)
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -3559,7 +3595,9 @@ async def start_ms_download(
 async def list_ms_tasks(is_admin: bool = Depends(require_admin)):
     """List all ModelScope download tasks."""
     if _ms_downloader is None:
-        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+        raise HTTPException(
+            status_code=503, detail="ModelScope downloader not initialized"
+        )
 
     return {"tasks": _ms_downloader.get_tasks()}
 
@@ -3571,13 +3609,13 @@ async def cancel_ms_download(
 ):
     """Cancel an active ModelScope download."""
     if _ms_downloader is None:
-        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+        raise HTTPException(
+            status_code=503, detail="ModelScope downloader not initialized"
+        )
 
     success = await _ms_downloader.cancel_download(task_id)
     if not success:
-        raise HTTPException(
-            status_code=404, detail="Task not found or not cancellable"
-        )
+        raise HTTPException(status_code=404, detail="Task not found or not cancellable")
     return {"success": True}
 
 
@@ -3589,7 +3627,9 @@ async def retry_ms_download(
 ):
     """Retry a failed or cancelled ModelScope download."""
     if _ms_downloader is None:
-        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+        raise HTTPException(
+            status_code=503, detail="ModelScope downloader not initialized"
+        )
 
     try:
         task = await _ms_downloader.retry_download(task_id, request.ms_token)
@@ -3605,13 +3645,13 @@ async def remove_ms_task(
 ):
     """Remove a completed, failed, or cancelled ModelScope task."""
     if _ms_downloader is None:
-        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+        raise HTTPException(
+            status_code=503, detail="ModelScope downloader not initialized"
+        )
 
     success = _ms_downloader.remove_task(task_id)
     if not success:
-        raise HTTPException(
-            status_code=404, detail="Task not found or still active"
-        )
+        raise HTTPException(status_code=404, detail="Task not found or still active")
     return {"success": True}
 
 
@@ -3622,7 +3662,9 @@ async def get_ms_recommended_models(
 ):
     """Get recommended models from ModelScope filtered by system memory."""
     if _ms_downloader is None:
-        raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
+        raise HTTPException(
+            status_code=503, detail="ModelScope downloader not initialized"
+        )
 
     memory_info = get_system_memory_info()
     max_memory = memory_info["total_bytes"] or 16 * 1024**3
@@ -4099,8 +4141,7 @@ async def check_update(
 
             latest_ver = Version(latest)
             update_available = (
-                latest_ver > Version(_omlx_version)
-                and not latest_ver.is_prerelease
+                latest_ver > Version(_omlx_version) and not latest_ver.is_prerelease
             )
         except Exception:
             update_available = False
@@ -4131,9 +4172,7 @@ async def check_update(
 async def list_oq_models(is_admin: bool = Depends(require_admin)):
     """List non-quantized models available for oQ quantization."""
     if _oq_manager is None:
-        raise HTTPException(
-            status_code=503, detail="oQ quantizer not initialized"
-        )
+        raise HTTPException(status_code=503, detail="oQ quantizer not initialized")
     source_models, all_models = await _oq_manager.list_quantizable_models()
     return {"models": source_models, "all_models": all_models}
 
@@ -4148,9 +4187,7 @@ async def estimate_oq(
     from ..oq import estimate_bpw_and_size
 
     try:
-        result = await asyncio.to_thread(
-            estimate_bpw_and_size, model_path, oq_level
-        )
+        result = await asyncio.to_thread(estimate_bpw_and_size, model_path, oq_level)
         return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -4163,9 +4200,7 @@ async def start_oq_quantization(
 ):
     """Start an oQ quantization task."""
     if _oq_manager is None:
-        raise HTTPException(
-            status_code=503, detail="oQ quantizer not initialized"
-        )
+        raise HTTPException(status_code=503, detail="oQ quantizer not initialized")
     if request.oq_level not in (2, 3, 3.5, 4, 5, 6, 8):
         raise HTTPException(
             status_code=400,
@@ -4188,43 +4223,29 @@ async def start_oq_quantization(
 async def list_oq_tasks(is_admin: bool = Depends(require_admin)):
     """List all quantization tasks."""
     if _oq_manager is None:
-        raise HTTPException(
-            status_code=503, detail="oQ quantizer not initialized"
-        )
+        raise HTTPException(status_code=503, detail="oQ quantizer not initialized")
     return {"tasks": _oq_manager.get_tasks()}
 
 
 @router.post("/api/oq/cancel/{task_id}")
-async def cancel_oq_task(
-    task_id: str, is_admin: bool = Depends(require_admin)
-):
+async def cancel_oq_task(task_id: str, is_admin: bool = Depends(require_admin)):
     """Cancel an active quantization task."""
     if _oq_manager is None:
-        raise HTTPException(
-            status_code=503, detail="oQ quantizer not initialized"
-        )
+        raise HTTPException(status_code=503, detail="oQ quantizer not initialized")
     success = await _oq_manager.cancel_quantization(task_id)
     if not success:
-        raise HTTPException(
-            status_code=404, detail="Task not found or not cancellable"
-        )
+        raise HTTPException(status_code=404, detail="Task not found or not cancellable")
     return {"success": True}
 
 
 @router.delete("/api/oq/task/{task_id}")
-async def remove_oq_task(
-    task_id: str, is_admin: bool = Depends(require_admin)
-):
+async def remove_oq_task(task_id: str, is_admin: bool = Depends(require_admin)):
     """Remove a completed/failed/cancelled task."""
     if _oq_manager is None:
-        raise HTTPException(
-            status_code=503, detail="oQ quantizer not initialized"
-        )
+        raise HTTPException(status_code=503, detail="oQ quantizer not initialized")
     success = _oq_manager.remove_task(task_id)
     if not success:
-        raise HTTPException(
-            status_code=404, detail="Task not found or still active"
-        )
+        raise HTTPException(status_code=404, detail="Task not found or still active")
     return {"success": True}
 
 
@@ -4240,9 +4261,7 @@ async def validate_upload_token(
 ):
     """Validate a HuggingFace token and return user info."""
     if _hf_uploader is None:
-        raise HTTPException(
-            status_code=503, detail="HF Uploader not initialized"
-        )
+        raise HTTPException(status_code=503, detail="HF Uploader not initialized")
     try:
         result = await _hf_uploader.validate_token(request.hf_token)
         return result
@@ -4254,9 +4273,7 @@ async def validate_upload_token(
 async def list_upload_oq_models(is_admin: bool = Depends(require_admin)):
     """List local oQ models available for upload."""
     if _hf_uploader is None:
-        raise HTTPException(
-            status_code=503, detail="HF Uploader not initialized"
-        )
+        raise HTTPException(status_code=503, detail="HF Uploader not initialized")
     oq_models = await _hf_uploader.list_oq_models()
     all_models = await _hf_uploader.list_all_models()
     return {"oq_models": oq_models, "all_models": all_models}
@@ -4269,9 +4286,7 @@ async def start_upload(
 ):
     """Start an upload task to HuggingFace Hub."""
     if _hf_uploader is None:
-        raise HTTPException(
-            status_code=503, detail="HF Uploader not initialized"
-        )
+        raise HTTPException(status_code=503, detail="HF Uploader not initialized")
     try:
         task = await _hf_uploader.start_upload(
             model_path=request.model_path,
@@ -4291,41 +4306,27 @@ async def start_upload(
 async def list_upload_tasks(is_admin: bool = Depends(require_admin)):
     """List all upload tasks."""
     if _hf_uploader is None:
-        raise HTTPException(
-            status_code=503, detail="HF Uploader not initialized"
-        )
+        raise HTTPException(status_code=503, detail="HF Uploader not initialized")
     return {"tasks": _hf_uploader.get_tasks()}
 
 
 @router.post("/api/upload/cancel/{task_id}")
-async def cancel_upload_task(
-    task_id: str, is_admin: bool = Depends(require_admin)
-):
+async def cancel_upload_task(task_id: str, is_admin: bool = Depends(require_admin)):
     """Cancel an active or pending upload task."""
     if _hf_uploader is None:
-        raise HTTPException(
-            status_code=503, detail="HF Uploader not initialized"
-        )
+        raise HTTPException(status_code=503, detail="HF Uploader not initialized")
     success = await _hf_uploader.cancel_upload(task_id)
     if not success:
-        raise HTTPException(
-            status_code=404, detail="Task not found or not cancellable"
-        )
+        raise HTTPException(status_code=404, detail="Task not found or not cancellable")
     return {"success": True}
 
 
 @router.delete("/api/upload/task/{task_id}")
-async def remove_upload_task(
-    task_id: str, is_admin: bool = Depends(require_admin)
-):
+async def remove_upload_task(task_id: str, is_admin: bool = Depends(require_admin)):
     """Remove a completed/failed/cancelled upload task."""
     if _hf_uploader is None:
-        raise HTTPException(
-            status_code=503, detail="HF Uploader not initialized"
-        )
+        raise HTTPException(status_code=503, detail="HF Uploader not initialized")
     success = _hf_uploader.remove_task(task_id)
     if not success:
-        raise HTTPException(
-            status_code=404, detail="Task not found or still active"
-        )
+        raise HTTPException(status_code=404, detail="Task not found or still active")
     return {"success": True}
