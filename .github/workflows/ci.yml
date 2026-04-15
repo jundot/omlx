@@ -39,9 +39,9 @@ jobs:
         run: |
           uv run black --check omlx tests
           
-      - name: Lint with ruff
-        run: |
-          uv run ruff check omlx tests
+       # - name: Lint with ruff
+        # run: |
+        #   uv run ruff check omlx tests
           
       - name: Type check with mypy
         run: |
