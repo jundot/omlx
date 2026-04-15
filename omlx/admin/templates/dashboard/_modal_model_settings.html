@@ -40,7 +40,7 @@
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-5">{{ t('modal.model_settings.basic_label') }}</h3>
                         <div class="space-y-5">
                             <!-- Row 1: Model Alias / Model Type / Reasoning Parser -->
-                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                            <div class="grid grid-cols-1 gap-4" :class="reasoningParsers.length > 0 ? 'sm:grid-cols-3' : 'sm:grid-cols-2'">
                                 <div>
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.model_alias') }}</label>
                                     <input type="text" x-model="modelSettings.model_alias"
@@ -61,7 +61,7 @@
                                         <option value="audio_sts">Audio STS</option>
                                     </select>
                                 </div>
-                                <div>
+                                <div x-show="reasoningParsers.length > 0">
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Reasoning Parser</label>
                                     <select x-model="modelSettings.reasoning_parser"
                                             class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
