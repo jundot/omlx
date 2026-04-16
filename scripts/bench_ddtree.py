@@ -26,12 +26,18 @@ CODE_PROMPTS = [
     "Write a Python function `mergesort` that sorts a list of integers in-place. Include a brief test harness.",
     "Implement a minimal HTTP GET in Go using net/http. Show the full file including imports and error handling.",
     "Write a Rust function that computes the fibonacci numbers up to N using iteration, with a doctest.",
+    "Write a TypeScript class `LRUCache<K, V>` with get/set that evicts the least recently used entry. No external deps.",
+    "Implement binary search in C. Provide the full file including a small main() that tests it on a sorted array.",
+    "Write a Python decorator `@retry(times=3, delay=0.1)` that retries a function on exception. Include type hints and a short example.",
 ]
 
 PROSE_PROMPTS = [
     "Write a short paragraph describing a foggy morning at a coastal lighthouse. No dialogue.",
     "Explain to a beginner, in two short paragraphs, how a CPU pipeline stall happens.",
     "Compose a three-sentence summary of the plot of Moby Dick.",
+    "Describe, in one paragraph, the taste and texture of a perfectly ripe peach on a summer afternoon.",
+    "Write a short motivational message (2-3 sentences) for someone who just failed an important exam.",
+    "Explain in plain language, in two paragraphs, why the sky appears blue during the day and red at sunset.",
 ]
 
 
