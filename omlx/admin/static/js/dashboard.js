@@ -276,6 +276,7 @@
             // oQ Advanced Settings
             oqAdvancedOpen: false,
             oqTextOnly: false,
+            oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
 
             // oQ Uploader state
@@ -2799,6 +2800,7 @@
                             group_size: 64,
                             sensitivity_model_path: this.oqSensitivityModelPath,
                             text_only: this.oqTextOnly,
+                            dtype: this.oqDtype,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));

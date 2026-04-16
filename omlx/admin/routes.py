@@ -236,6 +236,7 @@ class OQStartRequest(BaseModel):
     group_size: int = 64
     sensitivity_model_path: str = ""
     text_only: bool = False
+    dtype: str = "bfloat16"
 
 
 class HFUploadRequest(BaseModel):
@@ -4130,6 +4131,11 @@ async def start_oq_quantization(
             status_code=400,
             detail="Invalid oQ level. Must be 2, 3, 4, 5, 6, or 8",
         )
+    if request.dtype not in ("bfloat16", "float16"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid dtype. Must be 'bfloat16' or 'float16'",
+        )
     try:
         task = await _oq_manager.start_quantization(
             model_path=request.model_path,
@@ -4137,6 +4143,7 @@ async def start_oq_quantization(
             group_size=request.group_size,
             sensitivity_model_path=request.sensitivity_model_path,
             text_only=request.text_only,
+            dtype=request.dtype,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

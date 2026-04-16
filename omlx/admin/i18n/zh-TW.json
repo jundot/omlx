@@ -196,6 +196,8 @@
   "models.oq.cancel_tooltip": "取消量化",
   "models.oq.remove_tooltip": "從列表中移除",
   "models.oq.advanced_settings": "進階設定",
+  "models.oq.dtype_label": "Non-quant weight dtype",
+  "models.oq.dtype_help": "float16 gives ~20% faster prefill on M1/M2 Apple Silicon (native fp16). bfloat16 is safer on M3/M4 and for numerical stability. Output name appends '-fp16' when float16 is selected.",
   "models.uploader.section_label": "Hub Upload",
   "models.uploader.heading": "Upload oQ Models",
   "models.uploader.description": "Upload your locally quantized oQ models to HuggingFace Hub.",

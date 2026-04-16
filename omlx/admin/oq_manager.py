@@ -73,6 +73,7 @@ class QuantTask:
     group_size: int = 64
     sensitivity_model_path: str = ""
     text_only: bool = False
+    dtype: str = "bfloat16"
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -92,6 +93,7 @@ class QuantTask:
             "completed_at": self.completed_at,
             "source_size": self.source_size,
             "output_size": self.output_size,
+            "dtype": self.dtype,
         }
 
 
@@ -219,12 +221,15 @@ class OQManager:
         group_size: int = 64,
         sensitivity_model_path: str = "",
         text_only: bool = False,
+        dtype: str = "bfloat16",
     ) -> QuantTask:
         """Start a quantization job.
 
         Args:
             model_path: Path to source model directory.
             oq_level: oQ level (2, 3, 4, 6, or 8).
+            dtype: Target fp dtype for non-quantized weights and quant
+                scales/biases. "bfloat16" (default) or "float16".
 
         Returns:
             The created QuantTask.
@@ -232,11 +237,15 @@ class OQManager:
         Raises:
             ValueError: On invalid inputs or output conflict.
         """
-        from ..oq import OQ_LEVELS, resolve_output_name
+        from ..oq import OQ_DTYPES, OQ_LEVELS, resolve_output_name
 
         if oq_level not in OQ_LEVELS:
             raise ValueError(
                 f"Invalid oQ level {oq_level}. Must be one of {sorted(OQ_LEVELS)}"
+            )
+        if dtype not in OQ_DTYPES:
+            raise ValueError(
+                f"Invalid dtype {dtype!r}. Must be one of {OQ_DTYPES}"
             )
 
         source = Path(model_path)
@@ -244,7 +253,7 @@ class OQManager:
             raise ValueError(f"Model not found: {model_path}")
 
         model_name = source.name
-        output_name = resolve_output_name(model_name, oq_level)
+        output_name = resolve_output_name(model_name, oq_level, dtype)
         output_path = self._output_dir / output_name
 
         if output_path.exists():
@@ -253,16 +262,17 @@ class OQManager:
                 "Delete it first via the Manager tab."
             )
 
-        # Check for duplicate active tasks
+        # Check for duplicate active tasks (same level + dtype combo)
         for task in self._tasks.values():
             if (
                 task.model_path == model_path
                 and task.oq_level == oq_level
+                and task.dtype == dtype
                 and task.status in _ACTIVE_STATUSES
             ):
                 raise ValueError(
                     f"Quantization for '{model_name}' at oQ{oq_level:g} "
-                    "is already in progress"
+                    f"({dtype}) is already in progress"
                 )
 
         source_size = sum(
@@ -283,6 +293,7 @@ class OQManager:
             group_size=group_size,
             sensitivity_model_path=sensitivity_model_path,
             text_only=text_only,
+            dtype=dtype,
         )
         self._tasks[task_id] = task
 
@@ -438,6 +449,7 @@ class OQManager:
                     None,  # target_bpw
                     None,  # hard_cap_bpw
                     task.sensitivity_model_path,
+                    task.dtype,
                 )
 
                 if task_id in self._cancelled:

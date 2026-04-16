@@ -368,6 +368,27 @@ class TestResolveOutputName:
             result = resolve_output_name("Model-7B", level)
             assert result == f"Model-7B-oQ{level}"
 
+    def test_bfloat16_default_no_suffix(self):
+        assert resolve_output_name("Llama-3-8B", 4, "bfloat16") == "Llama-3-8B-oQ4"
+
+    def test_float16_appends_fp16_suffix(self):
+        assert resolve_output_name("Llama-3-8B", 4, "float16") == "Llama-3-8B-oQ4-fp16"
+
+    def test_float16_strips_existing_dtype_suffix(self):
+        assert (
+            resolve_output_name("Model-oQ6-fp16", 4, "float16")
+            == "Model-oQ4-fp16"
+        )
+
+    def test_bfloat16_strips_chained_suffixes(self):
+        assert resolve_output_name("Model-oQ6-fp16", 4, "bfloat16") == "Model-oQ4"
+
+    def test_strips_bf16_suffix(self):
+        assert resolve_output_name("Model-bf16", 4, "bfloat16") == "Model-oQ4"
+
+    def test_float16_with_bitwidth_suffix(self):
+        assert resolve_output_name("Model-8bit", 3, "float16") == "Model-oQ3-fp16"
+
 
 # =============================================================================
 # Test validate_quantizable

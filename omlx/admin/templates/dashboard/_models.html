@@ -1124,6 +1124,25 @@
                                         <p x-show="oqTextOnly && oqSelectedModelIsVLM()" x-cloak class="text-xs text-amber-600 leading-relaxed">
                                             Excludes vision encoder weights. Output is a text-only model (~2-3% smaller).
                                         </p>
+                                        <!-- Non-quant weight dtype -->
+                                        <div class="flex items-center justify-between gap-4">
+                                            <div class="flex-1 min-w-0">
+                                                <span class="text-sm text-neutral-600">{{ t('models.oq.dtype_label') }}</span>
+                                                <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.dtype_help') }}</p>
+                                            </div>
+                                            <div class="flex gap-1.5 shrink-0">
+                                                <button type="button" @click="oqDtype='bfloat16'"
+                                                        :class="oqDtype==='bfloat16' ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
+                                                        class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors">
+                                                    bfloat16
+                                                </button>
+                                                <button type="button" @click="oqDtype='float16'"
+                                                        :class="oqDtype==='float16' ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
+                                                        class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors">
+                                                    float16
+                                                </button>
+                                            </div>
+                                        </div>
                                     </div>
                                 </div>
                                 <!-- Error -->
