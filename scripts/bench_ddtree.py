@@ -21,8 +21,6 @@ import statistics
 import time
 from typing import Any
 
-import mlx.core as mx
-
 
 CODE_PROMPTS = [
     "Write a Python function `mergesort` that sorts a list of integers in-place. Include a brief test harness.",
@@ -55,20 +53,24 @@ def _run_ar(
     max_new: int,
     stop_ids: list[int],
 ) -> dict:
-    from dflash_mlx.generate import decode_token
+    """Autoregressive baseline via mlx_lm.stream_generate."""
+    from mlx_lm import stream_generate
+    from mlx_lm.sample_utils import make_sampler
 
-    start = time.perf_counter()
+    sampler = make_sampler(temp=0.0)
     tokens: list[int] = []
-    past = None
-    cur = mx.array(prompt_tokens)[None, :]
-    for _ in range(max_new):
-        logits, past = decode_token(target_model, cur, past)
-        tok = int(mx.argmax(logits[:, -1, :], axis=-1).item())
-        tokens.append(tok)
-        if tok in stop_ids:
+    start = time.perf_counter()
+    for resp in stream_generate(
+        target_model,
+        tokenizer,
+        prompt=prompt_tokens,
+        max_tokens=max_new,
+        sampler=sampler,
+    ):
+        tid = int(getattr(resp, "token", 0))
+        if tid in stop_ids:
             break
-        cur = mx.array([[tok]])
-    mx.eval(cur)
+        tokens.append(tid)
     elapsed = time.perf_counter() - start
     return {
         "tokens": tokens,
@@ -154,7 +156,8 @@ def main() -> int:
 
     print(f"Loading {args.model} ...")
     target_model, tokenizer, draft_model, draft_ref = load_runtime_components(
-        model_ref=args.model, draft_ref=args.draft,
+        model_ref=args.model,
+        draft_ref=args.draft,  # None => registry lookup in dflash-mlx
     )
     stop_ids = get_stop_token_ids(tokenizer)
     print(f"Loaded target={args.model} draft={draft_ref}\n")
