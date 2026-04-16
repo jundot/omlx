@@ -140,6 +140,9 @@ class OMLXAppDelegate(NSObject):
         self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
             NSVariableStatusItemLength
         )
+        # Stable identity for ControlCenter so it persists visibility prefs
+        # across app relaunches and distinguishes from previously blocked items.
+        self.status_item.setAutosaveName_("com.omlx.app-statusItem")
         self._update_menubar_icon()
 
         # Build menu
@@ -160,6 +163,9 @@ class OMLXAppDelegate(NSObject):
         # We start as Regular (in main()) so macOS grants full GUI access,
         # then switch here — required on macOS Tahoe where Accessory apps
         # launched via LaunchServices remain "NotVisible" otherwise.
+        # IMPORTANT: Info.plist must NOT contain LSUIElement=true. Combining
+        # LSUIElement with this runtime policy switch causes ControlCenter
+        # to block the NSStatusItem on Sonoma+. See issue #725.
         NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
         NSApp.activateIgnoringOtherApps_(True)
 
@@ -189,6 +195,31 @@ class OMLXAppDelegate(NSObject):
                 self._handle_port_conflict(result)
             else:
                 self._update_status_display()
+
+        # Delayed check: warn user if ControlCenter blocked the status item.
+        # 1s delay gives ControlCenter time to settle its visibility decision.
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0, self, "checkStatusItemVisibility:", None, False
+        )
+
+    def checkStatusItemVisibility_(self, timer):
+        """One-shot check for ControlCenter blocking the menubar icon."""
+        if self.status_item and not self.status_item.isVisible():
+            logger.warning(
+                "NSStatusItem is not visible — likely blocked by ControlCenter"
+            )
+            from AppKit import NSAlert
+
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Menubar Icon Hidden")
+            alert.setInformativeText_(
+                "macOS is hiding the oMLX menubar icon.\n\n"
+                "To fix this, go to System Settings > Control Center, "
+                "find oMLX under the menu bar items section, "
+                "and set it to \"Show in Menu Bar\"."
+            )
+            alert.addButtonWithTitle_("OK")
+            alert.runModal()
 
     # --- Icon management ---
 

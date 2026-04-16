@@ -976,6 +976,10 @@ def create_app_bundle():
     cli_launcher.chmod(0o755)
 
     # Create Info.plist
+    # NOTE: do NOT add LSUIElement here. Dock icon visibility is controlled
+    # at runtime via setActivationPolicy_ in app.py. Combining LSUIElement
+    # with runtime policy switching causes ControlCenter to block the
+    # NSStatusItem (menubar icon) on macOS Sonoma+. See issue #725.
     print("  Creating Info.plist...")
     info_plist = {
         "CFBundleName": APP_NAME,
@@ -988,7 +992,6 @@ def create_app_bundle():
         "CFBundleSignature": "????",
         "CFBundleIconFile": "AppIcon",
         "LSMinimumSystemVersion": "15.0",
-        "LSUIElement": True,
         "NSHighResolutionCapable": True,
         "LSArchitecturePriority": ["arm64"],
         "NSHumanReadableCopyright": f"Copyright 2024 oMLX contributors. Version {VERSION}",
