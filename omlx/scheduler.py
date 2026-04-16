@@ -3155,6 +3155,12 @@ class Scheduler:
                 del self.uid_to_request_id[temp_uid]
                 del self.request_id_to_uid[request.request_id]
 
+                # Prefill complete: remove from progress tracker so dashboard
+                # shows "generating" instead of "PP" during decode.
+                from .prefill_progress import get_prefill_tracker
+
+                get_prefill_tracker().remove(request.request_id)
+
                 cache_to_use = prefilled_cache
                 tokens_to_process = last_token
 
