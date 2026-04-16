@@ -1165,17 +1165,21 @@ class _DiscoveredPlan:
             mx.clear_cache()
             return result
 
+        # NOTE: discovery records transform TYPE but not parameters.
+        # These hardcoded values cover all current mlx-lm/mlx-vlm sanitize
+        # patterns. If a future model uses different parameters, discovery
+        # will fail and the eager sanitize fallback handles it safely.
         if transform == "add":
             arr = self._materialize_source(sources[0])
-            return arr + 1.0
+            return arr + 1.0  # norm weight += 1.0 pattern
 
         if transform == "transpose":
             arr = self._materialize_source(sources[0])
-            return mx.transpose(arr)
+            return mx.transpose(arr)  # full axis reverse
 
         if transform == "moveaxis":
             arr = self._materialize_source(sources[0])
-            return mx.moveaxis(arr, 2, 1)  # common conv1d pattern
+            return mx.moveaxis(arr, 2, 1)  # conv1d weight permute
 
         if "split_" in transform:
             # split_N_M means take part N of M
@@ -1803,177 +1807,6 @@ def _quantize_chunked(w, group_size, bits, mode):
             biases = biases.reshape(*orig[:-1], -1)
     return qw, scales, biases
 # --- end chunked-quantize helpers ---
-
-class _StreamingPlan:
-    """Streaming sanitizer for VLM models. Builds a transformation plan from
-    a _LazyTensorIndex without materializing tensors. Materializes one entry
-    at a time via pop().
-
-    Each plan entry is (output_key, source_key, transform).
-    transform is one of:
-      "passthrough" -- just rename
-      "split_gate"  -- split fused gate_up_proj on axis -2, take first half
-      "split_up"    -- split fused gate_up_proj on axis -2, take second half
-      "norm_add1"   -- add 1.0 to a 1D norm weight
-      "conv1d_perm" -- moveaxis(2, 1) when last dim != 1
-    Multiple transforms can stack via list.
-    """
-
-    NORM_SUFFIXES = (
-        ".input_layernorm.weight",
-        ".post_attention_layernorm.weight",
-        "model.norm.weight",
-        ".q_norm.weight",
-        ".k_norm.weight",
-    )
-
-    def __init__(self, lazy_index, config):
-        self._lazy = lazy_index
-        self._config = config
-        self._plan = {}     # output_key -> (source_key, [transforms])
-        self._shapes = {}   # output_key -> output_shape (post-transform)
-        self._build()
-
-    def _rename_key(self, key):
-        if "model" in key:
-            if "model.language_model" in key:
-                return key.replace("model.language_model", "language_model.model")
-            if "model.visual" in key:
-                return key.replace("model.visual", "vision_tower")
-        if "lm_head" in key and not key.startswith("language_model."):
-            return key.replace("lm_head", "language_model.lm_head")
-        return key
-
-    def _transforms_for(self, src_key, src_shape):
-        ts = []
-        if "conv1d.weight" in src_key and src_shape[-1] != 1:
-            ts.append("conv1d_perm")
-        if src_key.endswith("visual.patch_embed.proj.weight") and len(src_shape) == 5:
-            ts.append("patch_embed_perm")
-        # norm_add1 only for 1D weights matching norm suffixes
-        renamed = self._rename_key(src_key)
-        if any(renamed.endswith(s) for s in self.NORM_SUFFIXES) and len(src_shape) == 1:
-            ts.append("norm_add1")
-        return ts
-
-    def _output_shape(self, src_shape, transforms, gate_split=False):
-        sh = list(src_shape)
-        if gate_split:
-            sh[-2] = sh[-2] // 2
-        for t in transforms:
-            if t == "conv1d_perm":
-                sh[1], sh[2] = sh[2], sh[1]
-            elif t == "patch_embed_perm":
-                sh = [sh[0], sh[2], sh[3], sh[4], sh[1]]
-        return tuple(sh)
-
-    def _build(self):
-        text_cfg = self._config.get("text_config", {})
-        n_layers = text_cfg.get("num_hidden_layers", 0)
-        tie_emb = text_cfg.get("tie_word_embeddings", False)
-
-        src_keys = list(self._lazy._index.keys())
-        consumed = set()
-
-        # Per-layer expert split rules
-        for l in range(n_layers):
-            prefix = f"model.language_model.layers.{l}.mlp"
-            fused = f"{prefix}.experts.gate_up_proj"
-            down = f"{prefix}.experts.down_proj"
-
-            new_prefix = f"language_model.model.layers.{l}.mlp"
-            if fused in src_keys:
-                src_meta = self._lazy._index[fused]
-                src_shape = src_meta[4]
-                gate_key = f"{new_prefix}.switch_mlp.gate_proj.weight"
-                up_key = f"{new_prefix}.switch_mlp.up_proj.weight"
-                self._plan[gate_key] = (fused, ["split_gate"])
-                self._plan[up_key] = (fused, ["split_up"])
-                self._shapes[gate_key] = self._output_shape(src_shape, [], gate_split=True)
-                self._shapes[up_key] = self._output_shape(src_shape, [], gate_split=True)
-                consumed.add(fused)
-            if down in src_keys:
-                new_key = f"{new_prefix}.switch_mlp.down_proj.weight"
-                self._plan[new_key] = (down, ["passthrough"])
-                self._shapes[new_key] = self._lazy._index[down][4]
-                consumed.add(down)
-
-        # Everything else: rename + per-tensor transforms; drop mtp.*
-        for k in src_keys:
-            if k in consumed:
-                continue
-            if "mtp." in k:
-                continue
-            if tie_emb and k == "lm_head.weight":
-                continue
-            new_key = self._rename_key(k)
-            src_shape = self._lazy._index[k][4]
-            ts = self._transforms_for(k, src_shape) or ["passthrough"]
-            self._plan[new_key] = (k, ts)
-            self._shapes[new_key] = self._output_shape(src_shape, ts)
-
-    # dict-ish surface for quantize loop -------------------------------------
-    def keys(self):
-        return self._plan.keys()
-
-    def __len__(self):
-        return len(self._plan)
-
-    def __contains__(self, k):
-        return k in self._plan
-
-    def __iter__(self):
-        return iter(self._plan)
-
-    def items(self):
-        class _SP:
-            __slots__ = ("shape", "ndim")
-            def __init__(self, sh):
-                self.shape = sh
-                self.ndim = len(sh)
-        return ((k, _SP(self._shapes[k])) for k in self._plan)
-
-    def nbytes(self):
-        return self._lazy.nbytes()
-
-    def pop(self, key, *default):
-        if key not in self._plan:
-            if default:
-                return default[0]
-            raise KeyError(key)
-        src_key, transforms = self._plan.pop(key)
-        # Materialize source via the lazy index (chunked internally)
-        meta = self._lazy._index.get(src_key)
-        if meta is None:
-            raise KeyError(f"source tensor {src_key} for {key} not in lazy index")
-        sf_path, data_offset, start, end, shape, dtype = meta
-        lt = _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
-        arr = lt[:]
-        # Apply transforms in order
-        for t in transforms:
-            if t == "passthrough":
-                pass
-            elif t == "split_gate":
-                arr = mx.split(arr, 2, axis=-2)[0]
-                mx.eval(arr)
-            elif t == "split_up":
-                arr = mx.split(arr, 2, axis=-2)[1]
-                mx.eval(arr)
-            elif t == "conv1d_perm":
-                arr = mx.moveaxis(arr, 2, 1)
-                mx.eval(arr)
-            elif t == "norm_add1":
-                arr = arr + 1.0
-                mx.eval(arr)
-            elif t == "patch_embed_perm":
-                arr = mx.transpose(arr, (0, 2, 3, 4, 1))
-                mx.eval(arr)
-        # Don't try to free source from lazy index here -- gate_split needs it twice.
-        # The source stays in _lazy._index; that's just the file pointer, not data.
-        mx.clear_cache()
-        return arr
-
-
 
 
 def quantize_oq_streaming(

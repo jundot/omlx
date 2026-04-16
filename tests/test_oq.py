@@ -17,14 +17,18 @@ from omlx.oq import (
     OQ_LEVELS,
     _LEVEL_BITS,
     _OQ_BPW_TARGETS,
+    _TrackedTensor,
     _bpw_targets_for_level,
     _build_quant_plan,
+    _discover_sanitize_plan,
     _extract_layer_index,
     _format_size,
     _forward_layer,
     _get_predicate_bits,
     _is_moe_router,
+    _LazyTensorIndex,
     _normalize_quant_path,
+    _quantize_chunked,
     _should_quantize_tensor,
     estimate_memory,
     make_predicate,
@@ -781,6 +785,261 @@ class TestForwardLayer:
             return (x * 3, {"cache": True})
         result = _forward_layer(block_only_one_arg, tensor, None, None)
         assert isinstance(result, mx.array)
+
+
+# =============================================================================
+# Test _LazyTensorIndex
+# =============================================================================
+
+
+def _write_safetensors(path, tensors):
+    """Write a minimal safetensors file from {name: np.ndarray} dict."""
+    import json
+    import struct
+
+    header = {}
+    data_parts = []
+    offset = 0
+    dtype_map = {np.float16: "F16", np.float32: "F32", np.dtype("<f2"): "F16"}
+    for name, arr in tensors.items():
+        raw = arr.tobytes()
+        sf_dtype = dtype_map.get(arr.dtype, "F16")
+        header[name] = {
+            "dtype": sf_dtype,
+            "shape": list(arr.shape),
+            "data_offsets": [offset, offset + len(raw)],
+        }
+        data_parts.append(raw)
+        offset += len(raw)
+    hdr_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(hdr_bytes)))
+        f.write(hdr_bytes)
+        for part in data_parts:
+            f.write(part)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestLazyTensorIndex:
+    @pytest.fixture
+    def sf_file(self, tmp_path):
+        path = tmp_path / "weights.safetensors"
+        tensors = {
+            "layer.0.weight": np.random.randn(4, 8).astype(np.float16),
+            "layer.1.weight": np.random.randn(2, 8).astype(np.float16),
+            "embed.weight": np.random.randn(16, 8).astype(np.float16),
+        }
+        _write_safetensors(str(path), tensors)
+        return str(path), tensors
+
+    def test_keys_and_len(self, sf_file):
+        path, tensors = sf_file
+        idx = _LazyTensorIndex([path])
+        assert set(idx.keys()) == set(tensors.keys())
+        assert len(idx) == len(tensors)
+
+    def test_contains(self, sf_file):
+        path, _ = sf_file
+        idx = _LazyTensorIndex([path])
+        assert "layer.0.weight" in idx
+        assert "nonexistent" not in idx
+
+    def test_getitem_roundtrip(self, sf_file):
+        path, tensors = sf_file
+        idx = _LazyTensorIndex([path])
+        for name, expected in tensors.items():
+            result = idx[name]
+            assert isinstance(result, mx.array)
+            np.testing.assert_allclose(
+                np.array(result.astype(mx.float32)), expected.astype(np.float32),
+                atol=1e-3,
+            )
+
+    def test_pop_returns_mx_array(self, sf_file):
+        path, tensors = sf_file
+        idx = _LazyTensorIndex([path])
+        result = idx.pop("layer.0.weight")
+        assert isinstance(result, mx.array)
+        assert "layer.0.weight" not in idx
+
+    def test_pop_missing_raises(self, sf_file):
+        path, _ = sf_file
+        idx = _LazyTensorIndex([path])
+        with pytest.raises(KeyError):
+            idx.pop("nonexistent")
+
+    def test_pop_missing_default(self, sf_file):
+        path, _ = sf_file
+        idx = _LazyTensorIndex([path])
+        assert idx.pop("nonexistent", None) is None
+
+    def test_setitem_override(self, sf_file):
+        path, _ = sf_file
+        idx = _LazyTensorIndex([path])
+        override = mx.ones((3, 3))
+        idx["custom_key"] = override
+        assert "custom_key" in idx
+        assert "custom_key" in list(idx.keys())
+
+    def test_iter_includes_overrides(self, sf_file):
+        path, tensors = sf_file
+        idx = _LazyTensorIndex([path])
+        idx["override_key"] = mx.zeros((2,))
+        all_keys = list(idx)
+        assert "override_key" in all_keys
+        for k in tensors:
+            assert k in all_keys
+
+    def test_delitem(self, sf_file):
+        path, _ = sf_file
+        idx = _LazyTensorIndex([path])
+        del idx["layer.0.weight"]
+        assert "layer.0.weight" not in idx
+
+
+# =============================================================================
+# Test _quantize_chunked
+# =============================================================================
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestQuantizeChunked:
+    def test_matches_mx_quantize(self):
+        w = mx.random.normal((32, 64))
+        mx.eval(w)
+        qw_ref, scales_ref, *rest_ref = mx.quantize(w, group_size=64, bits=4)
+        biases_ref = rest_ref[0] if rest_ref else None
+
+        qw, scales, biases = _quantize_chunked(w, group_size=64, bits=4, mode="affine")
+
+        np.testing.assert_array_equal(np.array(qw), np.array(qw_ref))
+        np.testing.assert_array_equal(np.array(scales), np.array(scales_ref))
+        if biases is not None and biases_ref is not None:
+            np.testing.assert_array_equal(np.array(biases), np.array(biases_ref))
+
+    def test_output_shapes(self):
+        w = mx.random.normal((16, 128))
+        mx.eval(w)
+        qw, scales, biases = _quantize_chunked(w, group_size=64, bits=4, mode="affine")
+        assert qw.shape[0] == 16
+        assert scales.shape[0] == 16
+
+
+# =============================================================================
+# Test _TrackedTensor
+# =============================================================================
+
+
+class TestTrackedTensor:
+    def test_shape_preserved(self):
+        t = _TrackedTensor((4, 8), "F16", sources=["a"])
+        assert t.shape == (4, 8)
+        assert t.ndim == 2
+
+    def test_reshape(self):
+        t = _TrackedTensor((4, 8), "F16", sources=["a"])
+        r = t.reshape(2, 16)
+        assert r.shape == (2, 16)
+        assert r.transform == "reshape"
+
+    def test_reshape_infer_dim(self):
+        t = _TrackedTensor((4, 8), "F16", sources=["a"])
+        r = t.reshape(-1, 4)
+        assert r.shape == (8, 4)
+
+    def test_getitem_int(self):
+        t = _TrackedTensor((4, 8), "F16", sources=["a"])
+        r = t[0]
+        assert r.shape == (8,)
+
+    def test_getitem_slice(self):
+        t = _TrackedTensor((4, 8), "F16", sources=["a"])
+        r = t[1:3]
+        assert r.transform == "slice"
+
+    def test_getitem_none_broadcast(self):
+        t = _TrackedTensor((4, 8), "F16", sources=["a"])
+        r = t[:, None, :]
+        assert r.shape == (4, 1, 8)
+
+    def test_astype(self):
+        t = _TrackedTensor((4, 8), "F16", sources=["a"])
+        r = t.astype("BF16")
+        assert r.dtype == "BF16"
+        assert r.shape == (4, 8)
+
+    def test_arithmetic_preserves_sources(self):
+        t = _TrackedTensor((4, 8), "F16", sources=["a"])
+        r = t + 1.0
+        assert r.sources == ["a"]
+        assert r.transform == "add"
+
+    def test_transpose_property(self):
+        t = _TrackedTensor((4, 8), "F16", sources=["a"])
+        r = t.T
+        assert r.shape == (8, 4)
+
+    def test_size_property(self):
+        t = _TrackedTensor((4, 8), "F16", sources=["a"])
+        assert t.size == 32
+
+
+# =============================================================================
+# Test _discover_sanitize_plan
+# =============================================================================
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestDiscoverSanitizePlan:
+    @pytest.fixture
+    def sf_file(self, tmp_path):
+        path = tmp_path / "weights.safetensors"
+        tensors = {
+            "model.layers.0.self_attn.q_proj.weight": np.random.randn(8, 8).astype(np.float16),
+            "model.layers.0.self_attn.k_proj.weight": np.random.randn(4, 8).astype(np.float16),
+            "model.layers.0.mlp.gate_proj.weight": np.random.randn(16, 8).astype(np.float16),
+            "model.embed_tokens.weight": np.random.randn(32, 8).astype(np.float16),
+        }
+        _write_safetensors(str(path), tensors)
+        return str(path), tensors
+
+    def test_passthrough_sanitize(self, sf_file):
+        path, tensors = sf_file
+        idx = _LazyTensorIndex([path])
+
+        def identity_sanitize(weights):
+            return weights
+
+        plan = _discover_sanitize_plan(identity_sanitize, idx)
+        assert plan is not None
+        assert set(plan.keys()) == set(tensors.keys())
+        for k, info in plan.items():
+            assert info["transform"] == "passthrough"
+            assert info["sources"] == [k]
+
+    def test_rename_sanitize(self, sf_file):
+        path, tensors = sf_file
+        idx = _LazyTensorIndex([path])
+
+        def rename_sanitize(weights):
+            return {k.replace("model.", "renamed."): v for k, v in weights.items()}
+
+        plan = _discover_sanitize_plan(rename_sanitize, idx)
+        assert plan is not None
+        for k in plan:
+            assert k.startswith("renamed.")
+
+    def test_drop_key_sanitize(self, sf_file):
+        path, tensors = sf_file
+        idx = _LazyTensorIndex([path])
+
+        def drop_sanitize(weights):
+            return {k: v for k, v in weights.items() if "embed" not in k}
+
+        plan = _discover_sanitize_plan(drop_sanitize, idx)
+        assert plan is not None
+        assert "model.embed_tokens.weight" not in plan
+        assert len(plan) == len(tensors) - 1
 
 
 # =============================================================================
