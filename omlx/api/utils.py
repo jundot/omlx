@@ -313,6 +313,19 @@ def extract_text_content(
         role = msg.role
         content = msg.content
 
+        # Reconstruct <think> blocks from reasoning_content for historical
+        # assistant messages.  External clients (e.g. Pi) receive thinking in
+        # the reasoning_content field but only send content back on subsequent
+        # turns.  When the client echoes reasoning_content alongside content we
+        # merge them so that preserve_thinking=True in the chat template has
+        # actual thinking to preserve.
+        reasoning = getattr(msg, "reasoning_content", None)
+        if role == "assistant" and reasoning:
+            text = content if isinstance(content, str) else ""
+            if isinstance(content, list):
+                text = _extract_text_from_content_list(content)
+            content = f"<think>\n{reasoning}\n</think>\n\n{text}"
+
         # Normalize "developer" role to "system" (OpenAI API compatibility)
         if role == "developer":
             role = "system"
@@ -472,6 +485,14 @@ def extract_multimodal_content(
     for msg in messages:
         role = msg.role
         content = msg.content
+
+        # Reconstruct <think> blocks from reasoning_content (see extract_text_content)
+        reasoning = getattr(msg, "reasoning_content", None)
+        if role == "assistant" and reasoning:
+            text = content if isinstance(content, str) else ""
+            if isinstance(content, list):
+                text = _extract_text_from_content_list(content)
+            content = f"<think>\n{reasoning}\n</think>\n\n{text}"
 
         if role == "developer":
             role = "system"
