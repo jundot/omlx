@@ -122,6 +122,10 @@ class ModelSettingsRequest(BaseModel):
     dflash_enabled: Optional[bool] = None
     dflash_draft_model: Optional[str] = None
     dflash_draft_quant_bits: Optional[int] = None
+    # DDTree (tree-based speculative decoding on top of DFlash drafter)
+    ddtree_enabled: Optional[bool] = None
+    ddtree_budget: Optional[int] = None
+    ddtree_exact_commit: Optional[bool] = None
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
@@ -1375,6 +1379,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "index_cache_freq": settings.index_cache_freq,
                 "turboquant_kv_enabled": settings.turboquant_kv_enabled,
                 "turboquant_kv_bits": settings.turboquant_kv_bits,
+                "turboquant_skip_last": settings.turboquant_skip_last,
                 "specprefill_enabled": settings.specprefill_enabled,
                 "specprefill_draft_model": settings.specprefill_draft_model,
                 "specprefill_keep_pct": settings.specprefill_keep_pct,
@@ -1382,6 +1387,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_enabled": settings.dflash_enabled,
                 "dflash_draft_model": settings.dflash_draft_model,
                 "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
+                "ddtree_enabled": settings.ddtree_enabled,
+                "ddtree_budget": settings.ddtree_budget,
+                "ddtree_exact_commit": settings.ddtree_exact_commit,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
@@ -1608,6 +1616,25 @@ async def update_model_settings(
         current_settings.dflash_draft_model = request.dflash_draft_model or None
     if "dflash_draft_quant_bits" in sent:
         current_settings.dflash_draft_quant_bits = request.dflash_draft_quant_bits or None
+    # DDTree settings (enforce dependency on DFlash: ddtree requires dflash)
+    if "ddtree_enabled" in sent:
+        requested = bool(request.ddtree_enabled)
+        if requested and not current_settings.dflash_enabled:
+            raise HTTPException(
+                status_code=400,
+                detail="ddtree_enabled requires dflash_enabled=true",
+            )
+        current_settings.ddtree_enabled = requested
+    if "ddtree_budget" in sent and request.ddtree_budget is not None:
+        budget = int(request.ddtree_budget)
+        if budget < 1 or budget > 32:
+            raise HTTPException(
+                status_code=400,
+                detail="ddtree_budget must be in [1, 32]",
+            )
+        current_settings.ddtree_budget = budget
+    if "ddtree_exact_commit" in sent:
+        current_settings.ddtree_exact_commit = bool(request.ddtree_exact_commit)
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -1632,6 +1659,7 @@ async def update_model_settings(
             or "index_cache_freq" in sent
             or "dflash_enabled" in sent
             or "dflash_draft_model" in sent
+            or "ddtree_enabled" in sent
         )
     )
     if requires_reload:
