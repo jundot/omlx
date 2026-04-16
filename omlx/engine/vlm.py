@@ -605,17 +605,27 @@ class VLMBatchedEngine(BaseEngine):
             ):
                 formatted_messages.append(msg)
             else:
-                formatted_messages.append(
-                    get_message_json(
-                        model_type,
-                        content,
-                        role,
-                        skip_image_token=role != "user" or msg_num_images == 0,
-                        skip_audio_token=True,
-                        num_images=msg_num_images,
-                        num_audios=0,
-                    )
+                formatted = get_message_json(
+                    model_type,
+                    content,
+                    role,
+                    skip_image_token=role != "user" or msg_num_images == 0,
+                    skip_audio_token=True,
+                    num_images=msg_num_images,
+                    num_audios=0,
                 )
+                # Collapse text-only list content to plain string so that
+                # simplified chat templates (without render_content macro)
+                # can handle it.  Image/audio/video parts stay as list.
+                fc = formatted.get("content")
+                if isinstance(fc, list) and all(
+                    isinstance(p, dict) and p.get("type") == "text"
+                    for p in fc
+                ):
+                    formatted["content"] = "\n".join(
+                        p.get("text", "") for p in fc
+                    )
+                formatted_messages.append(formatted)
 
         return formatted_messages, image_message_ranges
 

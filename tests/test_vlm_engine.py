@@ -722,6 +722,56 @@ class TestFormatMessagesForVLMTemplate:
         assert self._count_image_placeholders(formatted) == 1
         assert image_ranges == [(0, 1)]
 
+    def test_text_only_messages_have_string_content(self):
+        """Text-only messages should have string content, not list.
+
+        Regression test for #796: get_message_json() wraps text in list
+        format which breaks simplified chat templates.
+        """
+        engine = _make_loaded_engine(model_type="qwen3_5_moe")
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+            {"role": "user", "content": "How are you?"},
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=0
+        )
+
+        assert image_ranges == []
+        for msg in formatted:
+            assert isinstance(msg["content"], str), (
+                f"Expected string content for {msg['role']} message, "
+                f"got {type(msg['content'])}: {msg['content']}"
+            )
+
+    def test_image_messages_retain_list_content(self):
+        """Image-bearing messages should keep list content with image tokens."""
+        engine = _make_loaded_engine(model_type="qwen3_5_moe")
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                ],
+            },
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
+
+        assert image_ranges == [(1, 1)]
+        # System message should be string (text-only)
+        assert isinstance(formatted[0]["content"], str)
+        # User message with image should be list
+        assert isinstance(formatted[1]["content"], list)
+        assert self._count_image_placeholders([formatted[1]]) == 1
+
 
 # ---------------------------------------------------------------------------
 # TestCountChatTokens
