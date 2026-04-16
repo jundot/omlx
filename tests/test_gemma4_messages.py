@@ -31,18 +31,18 @@ class TestExtractGemma4Messages:
         assert result[1] == {"role": "assistant", "content": "Hi"}
 
     def test_tool_result_folded_onto_model_turn(self):
-        """Single tool result becomes a model turn with tool_responses."""
+        """Single tool result is attached to the same assistant message as tool_calls."""
         messages = [
             Message(role="user", content="What's the weather?"),
             _assistant_with_calls(_tool_call_dict("c1", "get_weather")),
             _tool_result("c1", "sunny"),
         ]
         result = extract_gemma4_messages(messages)
-        # user + assistant(tool_calls) + assistant(tool_responses)
-        assert len(result) == 3
-        tr_msg = result[2]
+        # user + assistant(tool_calls + tool_responses)
+        assert len(result) == 2
+        tr_msg = result[1]
         assert tr_msg["role"] == "assistant"
-        assert tr_msg["content"] == ""
+        assert "tool_calls" in tr_msg
         assert tr_msg["tool_responses"] == [
             {"name": "get_weather", "response": "sunny"}
         ]
@@ -57,12 +57,13 @@ class TestExtractGemma4Messages:
             _tool_result("c1", "results"),
         ]
         result = extract_gemma4_messages(messages)
-        tr_msg = result[-1]
+        # tool_responses attached to the same assistant message
+        tr_msg = result[0]
         names = {tr["name"] for tr in tr_msg["tool_responses"]}
         assert names == {"calculate", "search"}
 
     def test_multiple_tool_results_batched(self):
-        """Multiple consecutive tool results land in a single tool_responses turn."""
+        """Multiple consecutive tool results land on the same assistant message."""
         messages = [
             _assistant_with_calls(
                 _tool_call_dict("c1", "fn_a"),
@@ -72,7 +73,9 @@ class TestExtractGemma4Messages:
             _tool_result("c2", "result_b"),
         ]
         result = extract_gemma4_messages(messages)
-        tr_msg = result[-1]
+        # tool_responses on the same message as tool_calls
+        tr_msg = result[0]
+        assert "tool_calls" in tr_msg
         assert len(tr_msg["tool_responses"]) == 2
         assert tr_msg["tool_responses"][0] == {"name": "fn_a", "response": "result_a"}
         assert tr_msg["tool_responses"][1] == {"name": "fn_b", "response": "result_b"}
@@ -84,7 +87,7 @@ class TestExtractGemma4Messages:
             _tool_result("c1", '{"value": 42}'),
         ]
         result = extract_gemma4_messages(messages)
-        response = result[-1]["tool_responses"][0]["response"]
+        response = result[0]["tool_responses"][0]["response"]
         assert response == {"value": 42}
 
     def test_non_json_response_stays_string(self):
@@ -93,7 +96,7 @@ class TestExtractGemma4Messages:
             _tool_result("c1", "plain text result"),
         ]
         result = extract_gemma4_messages(messages)
-        assert result[-1]["tool_responses"][0]["response"] == "plain text result"
+        assert result[0]["tool_responses"][0]["response"] == "plain text result"
 
     def test_orphaned_tool_result_fallback_to_tool_call_id_as_name(self):
         """Tool result with no preceding assistant turn uses tool_call_id as name."""
@@ -123,8 +126,8 @@ class TestExtractGemma4Messages:
         result = extract_gemma4_messages(messages)
         assert result[0] == {"role": "user", "content": "Look it up"}
         assert "tool_calls" in result[1]
-        assert result[2]["tool_responses"][0]["name"] == "search"
-        assert result[3] == {"role": "assistant", "content": "Here is what I found."}
+        assert result[1]["tool_responses"][0]["name"] == "search"
+        assert result[2] == {"role": "assistant", "content": "Here is what I found."}
 
     def test_system_message_preserved(self):
         messages = [

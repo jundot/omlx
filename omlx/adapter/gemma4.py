@@ -205,14 +205,15 @@ def extract_gemma4_messages(
                 i += 1
 
             if tool_responses:
-                processed.append(
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_responses": tool_responses,
-                        _PRESERVE_BOUNDARY_KEY: True,
-                    }
-                )
+                # Attach tool_responses to the SAME assistant message that
+                # has tool_calls.  The Gemma 4 chat template checks for
+                # tool_responses on the current message (lines 261-267)
+                # BEFORE falling back to a forward-scan for role='tool'
+                # messages (lines 268-302).  Putting them on a separate
+                # assistant message causes both paths to miss, producing a
+                # corrupt bare <|tool_response> tag and making the model
+                # loop on the same tool call.
+                out_msg["tool_responses"] = tool_responses
             continue
 
         # All other roles (user, system)
