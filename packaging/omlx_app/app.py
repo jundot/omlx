@@ -8,6 +8,7 @@ import logging
 import platform
 import time
 import webbrowser
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Optional
 
@@ -24,12 +25,21 @@ from AppKit import (
     NSAttributedString,
     NSBundle,
     NSColor,
+    NSFont,
+    NSFontAttributeName,
     NSForegroundColorAttributeName,
     NSImage,
     NSMenu,
     NSMenuItem,
+    NSMutableParagraphStyle,
+    NSParagraphStyleAttributeName,
+    NSRightTabStopType,
     NSStatusBar,
+    NSTextField,
+    NSTextTab,
+    NSTextAlignmentCenter,
     NSVariableStatusItemLength,
+    NSView,
 )
 from Foundation import NSData, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
 
@@ -537,6 +547,140 @@ class OMLXAppDelegate(NSObject):
             logger.debug(f"Failed to load SF Symbol {sf_symbol}: {e}")
         return None
 
+    def _menu_font(self) -> Optional[NSFont]:
+        """Return the default menu font for measurement and rendering."""
+        try:
+            return NSFont.menuFontOfSize_(0.0)
+        except Exception:
+            return None
+
+    def _measure_menu_text_width(self, text: str, font: Optional[NSFont]) -> float:
+        """Measure menu text width in points, with a safe fallback."""
+        try:
+            attrs = {}
+            if font is not None:
+                attrs[NSFontAttributeName] = font
+            attributed = NSAttributedString.alloc().initWithString_attributes_(
+                text, attrs
+            )
+            return float(attributed.size().width)
+        except Exception:
+            return float(max(1, len(text)) * 7)
+
+    def _compute_stats_tab_stop(self, entries: list[tuple[str, str]]) -> float:
+        """Compute right-tab position for aligned stats rows."""
+        if not entries:
+            return 240.0
+
+        font = self._menu_font()
+        max_label_width = max(
+            self._measure_menu_text_width(label, font) for label, _ in entries
+        )
+        max_value_width = max(
+            self._measure_menu_text_width(value, font) for _, value in entries
+        )
+
+        gap = 16.0
+        return max(200.0, max_label_width + gap + max_value_width)
+
+    def _format_compact_count(self, value) -> tuple[str, str]:
+        """Format large counts with compact units and return raw full value."""
+        if value is None or isinstance(value, bool):
+            return "--", "--"
+
+        try:
+            if isinstance(value, int):
+                n = Decimal(value)
+            else:
+                s = str(value).strip().replace(",", "")
+                if not s:
+                    return "--", "--"
+                n = Decimal(s)
+        except (InvalidOperation, ValueError, TypeError):
+            return "--", "--"
+
+        is_integer = n == n.to_integral_value()
+        raw_value = f"{int(n):,}" if is_integer else f"{n:,.2f}"
+
+        abs_n = abs(n)
+        units: list[tuple[str, Decimal]] = [
+            ("E", Decimal("1000000000000000000")),  # 10^18
+            ("P", Decimal("1000000000000000")),  # 10^15
+            ("T", Decimal("1000000000000")),  # 10^12
+            ("B", Decimal("1000000000")),  # 10^9
+            ("M", Decimal("1000000")),  # 10^6
+            ("K", Decimal("1000")),  # 10^3
+        ]
+        for suffix, factor in units:
+            if abs_n >= factor:
+                compact = (n / factor).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                return f"{compact}{suffix}", raw_value
+
+        if is_integer:
+            return str(int(n)), raw_value
+        return str(n.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)), raw_value
+
+    def _make_aligned_stats_item(
+        self, label: str, value: str, tab_stop: float, tooltip: Optional[str] = None
+    ) -> NSMenuItem:
+        """Create one stats row with left-aligned label and right-aligned value."""
+        plain_text = f"{label}: {value}"
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            plain_text, "noOp:", ""
+        )
+        item.setTarget_(self)
+        if tooltip and tooltip != "--":
+            try:
+                item.setToolTip_(tooltip)
+            except Exception:
+                pass
+
+        try:
+            paragraph = NSMutableParagraphStyle.alloc().init()
+            tab = NSTextTab.alloc().initWithType_location_(
+                NSRightTabStopType, tab_stop
+            )
+            paragraph.setTabStops_([tab])
+
+            attrs = {NSParagraphStyleAttributeName: paragraph}
+            font = self._menu_font()
+            if font is not None:
+                attrs[NSFontAttributeName] = font
+
+            attributed = NSAttributedString.alloc().initWithString_attributes_(
+                f"{label}\t{value}", attrs
+            )
+            item.setAttributedTitle_(attributed)
+        except Exception as e:
+            logger.debug(f"Failed to align stats row '{plain_text}': {e}")
+
+        return item
+
+    def _make_centered_stats_header(self, title: str, row_width: float) -> NSMenuItem:
+        """Create a centered, disabled header item for stats sections."""
+        text = f"── {title} ──"
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(text, None, "")
+        item.setEnabled_(False)
+        header_width = max(220.0, float(row_width))
+
+        view = NSView.alloc().initWithFrame_(((0.0, 0.0), (header_width, 20.0)))
+        label = NSTextField.alloc().initWithFrame_(((0.0, 1.0), (header_width, 18.0)))
+        label.setStringValue_(text)
+        label.setEditable_(False)
+        label.setBordered_(False)
+        label.setDrawsBackground_(False)
+        label.setSelectable_(False)
+        label.setAlignment_(NSTextAlignmentCenter)
+        label.setTextColor_(NSColor.secondaryLabelColor())
+        font = self._menu_font()
+        if font is not None:
+            label.setFont_(font)
+        view.addSubview_(label)
+        item.setView_(view)
+        return item
+
     def _get_status_display(self):
         """Return (text, color) for the current server status header."""
         status = self.server_manager.status
@@ -667,51 +811,76 @@ class OMLXAppDelegate(NSObject):
 
         if is_running and self._cached_stats:
             s = self._cached_stats
+            a = self._cached_alltime_stats or {}
 
-            # Session stats
-            session_header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "── Session ──", None, ""
+            session_total_display, session_total_raw = self._format_compact_count(
+                s.get("total_prompt_tokens", 0)
             )
-            session_header.setEnabled_(False)
-            stats_submenu.addItem_(session_header)
+            session_cached_display, session_cached_raw = self._format_compact_count(
+                s.get("total_cached_tokens", 0)
+            )
+            alltime_total_display, alltime_total_raw = self._format_compact_count(
+                a.get("total_prompt_tokens", 0)
+            )
+            alltime_cached_display, alltime_cached_raw = self._format_compact_count(
+                a.get("total_cached_tokens", 0)
+            )
+            alltime_requests_display, alltime_requests_raw = self._format_compact_count(
+                a.get("total_requests", 0)
+            )
 
             session_entries = [
-                ("Total Tokens Processed", f"{s.get('total_prompt_tokens', 0):,}"),
-                ("Cached Tokens", f"{s.get('total_cached_tokens', 0):,}"),
-                ("Cache Efficiency", f"{s.get('cache_efficiency', 0):.1f}%"),
-                ("Avg PP Speed", f"{s.get('avg_prefill_tps', 0):.1f} tok/s"),
-                ("Avg TG Speed", f"{s.get('avg_generation_tps', 0):.1f} tok/s"),
+                (
+                    "Total Tokens Processed",
+                    session_total_display,
+                    session_total_raw,
+                ),
+                ("Cached Tokens", session_cached_display, session_cached_raw),
+                ("Cache Efficiency", f"{s.get('cache_efficiency', 0):.1f}%", None),
+                ("Avg PP Speed", f"{s.get('avg_prefill_tps', 0):.1f} tok/s", None),
+                ("Avg TG Speed", f"{s.get('avg_generation_tps', 0):.1f} tok/s", None),
             ]
-            for label, value in session_entries:
-                text = f"{label}: {value}"
-                mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                    text, "noOp:", ""
+            alltime_entries = [
+                (
+                    "Total Tokens Processed",
+                    alltime_total_display,
+                    alltime_total_raw,
+                ),
+                ("Cached Tokens", alltime_cached_display, alltime_cached_raw),
+                ("Cache Efficiency", f"{a.get('cache_efficiency', 0):.1f}%", None),
+                ("Total Requests", alltime_requests_display, alltime_requests_raw),
+            ]
+
+            # One shared tab stop keeps the right value edge aligned across both sections.
+            shared_tab_stop = self._compute_stats_tab_stop(
+                [(label, value) for label, value, _ in (session_entries + alltime_entries)]
+            )
+            header_row_width = shared_tab_stop + 28.0
+
+            # Session stats
+            session_header = self._make_centered_stats_header(
+                "Session", header_row_width
+            )
+            stats_submenu.addItem_(session_header)
+            for label, value, tooltip in session_entries:
+                stats_submenu.addItem_(
+                    self._make_aligned_stats_item(
+                        label, value, shared_tab_stop, tooltip=tooltip
+                    )
                 )
-                mi.setTarget_(self)
-                stats_submenu.addItem_(mi)
 
             # All-time stats
             stats_submenu.addItem_(NSMenuItem.separatorItem())
-            alltime_header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "── All-Time ──", None, ""
+            alltime_header = self._make_centered_stats_header(
+                "All-Time", header_row_width
             )
-            alltime_header.setEnabled_(False)
             stats_submenu.addItem_(alltime_header)
-
-            a = self._cached_alltime_stats or {}
-            alltime_entries = [
-                ("Total Tokens Processed", f"{a.get('total_prompt_tokens', 0):,}"),
-                ("Cached Tokens", f"{a.get('total_cached_tokens', 0):,}"),
-                ("Cache Efficiency", f"{a.get('cache_efficiency', 0):.1f}%"),
-                ("Total Requests", f"{a.get('total_requests', 0):,}"),
-            ]
-            for label, value in alltime_entries:
-                text = f"{label}: {value}"
-                mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                    text, "noOp:", ""
+            for label, value, tooltip in alltime_entries:
+                stats_submenu.addItem_(
+                    self._make_aligned_stats_item(
+                        label, value, shared_tab_stop, tooltip=tooltip
+                    )
                 )
-                mi.setTarget_(self)
-                stats_submenu.addItem_(mi)
         else:
             off_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 "Server is off" if not is_running else "Loading stats...",
