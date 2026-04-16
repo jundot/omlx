@@ -114,6 +114,7 @@ EMBEDDING_ARCHITECTURES = {
 SUPPORTED_RERANKER_ARCHITECTURES = {
     "ModernBertForSequenceClassification",  # via mlx-embeddings
     "XLMRobertaForSequenceClassification",  # omlx native implementation
+    "JinaForRanking",  # Jina v3 listwise reranker
 }
 
 # CausalLM-based reranker architectures.
@@ -121,7 +122,6 @@ SUPPORTED_RERANKER_ARCHITECTURES = {
 # Detected by architecture + heuristic (model name or tokenizer hints).
 CAUSAL_LM_RERANKER_ARCHITECTURES = {
     "Qwen3ForCausalLM",
-    "JinaForRanking",  # Jina v3 reranker: uses <|score_token|> logits
 }
 
 # CausalLM-based embedding architectures.

@@ -89,8 +89,9 @@ class MLXRerankerModel:
         self._is_jina_reranker = False
         self._token_true_id: int | None = None
         self._token_false_id: int | None = None
-        self._score_token_id: int | None = None
-        self._rerank_token_id: int | None = None
+        self._doc_embed_token_id: int | None = None
+        self._query_embed_token_id: int | None = None
+        self._jina_projector = None
         self._prefix_tokens: list[int] | None = None
         self._suffix_tokens: list[int] | None = None
         self._is_compiled = False
@@ -158,7 +159,9 @@ class MLXRerankerModel:
         from mlx_lm import load as mlx_lm_load
 
         model_path = str(self.model_name)
-        model, tokenizer_wrapper = mlx_lm_load(model_path)
+        loaded = mlx_lm_load(model_path)
+        model = loaded[0]
+        tokenizer_wrapper = loaded[1]
 
         # mlx-lm returns a TokenizerWrapper; unwrap to get the underlying
         # transformers tokenizer which supports __call__ for batch encoding.
@@ -211,24 +214,43 @@ class MLXRerankerModel:
         """
         Load a Jina v3 reranker model using mlx-lm.
 
-        Jina v3 reranker uses <|score_token|> logits for scoring instead of
-        yes/no logit pairs. The model is based on Qwen3 architecture.
+        Jina v3 reranker uses special-token hidden states + projector + cosine
+        similarity for listwise scoring.
         """
         from mlx_lm import load as mlx_lm_load
 
         model_path = str(self.model_name)
-        model, tokenizer_wrapper = mlx_lm_load(model_path)
+        loaded = mlx_lm_load(model_path)
+        model = loaded[0]
+        tokenizer_wrapper = loaded[1]
 
         # mlx-lm returns a TokenizerWrapper; unwrap to get the underlying
         # transformers tokenizer which supports __call__ for batch encoding.
         tokenizer = getattr(tokenizer_wrapper, "_tokenizer", tokenizer_wrapper)
 
-        # Resolve <|score_token|> and <|rerank_token|> IDs
-        score_token_id = None
-        rerank_token_id = None
-        
-        # Try multiple ways to get token IDs
-        # 1. Check added_tokens_decoder (keys are int IDs, values can be str or Token objects)
+        doc_embed_token_id = self._resolve_token_id(tokenizer, "<|embed_token|>")
+        query_embed_token_id = self._resolve_token_id(tokenizer, "<|rerank_token|>")
+
+        if doc_embed_token_id is None or query_embed_token_id is None:
+            raise ValueError(
+                "Could not resolve required Jina special tokens "
+                "('<|embed_token|>', '<|rerank_token|>'). "
+                "This model may not be a compatible Jina v3 reranker."
+            )
+
+        self._doc_embed_token_id = doc_embed_token_id
+        self._query_embed_token_id = query_embed_token_id
+        self._jina_projector = self._load_jina_projector(self.model_name)
+
+        logger.info(
+            f"Jina reranker tokens: embed_token={doc_embed_token_id}, "
+            f"rerank_token={query_embed_token_id}"
+        )
+
+        return model, tokenizer
+
+    def _resolve_token_id(self, tokenizer: Any, token_text: str) -> int | None:
+        """Resolve token IDs across tokenizer implementations."""
         added_tokens = getattr(tokenizer, "added_tokens_decoder", {}) or {}
         for tid, tinfo in added_tokens.items():
             content = ""
@@ -238,49 +260,219 @@ class MLXRerankerModel:
                 content = tinfo.content
             elif isinstance(tinfo, dict):
                 content = tinfo.get("content", "")
-            
-            if content == "<|score_token|>":
-                score_token_id = int(tid)
-            elif content == "<|rerank_token|>":
-                rerank_token_id = int(tid)
-        
-        # 2. Fallback to convert_tokens_to_ids
-        if score_token_id is None:
+
+            if content == token_text:
+                return int(tid)
+
+        convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
+        if callable(convert_tokens_to_ids):
             try:
-                score_token_id = tokenizer.convert_tokens_to_ids("<|score_token|>")
+                token_id = convert_tokens_to_ids(token_text)
             except Exception:
-                pass
-        
-        if rerank_token_id is None:
+                token_id = None
+
+            if isinstance(token_id, int) and token_id >= 0:
+                unk_token_id = getattr(tokenizer, "unk_token_id", None)
+                if unk_token_id is None or token_id != unk_token_id:
+                    return token_id
+
+        get_added_vocab = getattr(tokenizer, "get_added_vocab", None)
+        if callable(get_added_vocab):
             try:
-                rerank_token_id = tokenizer.convert_tokens_to_ids("<|rerank_token|>")
+                added_vocab = get_added_vocab() or {}
             except Exception:
-                pass
-        
-        # 3. Fallback to get_added_vocab
-        if score_token_id is None:
-            added_vocab = getattr(tokenizer, "get_added_vocab", lambda: {})()
-            score_token_id = added_vocab.get("<|score_token|>")
-        
-        if rerank_token_id is None:
-            added_vocab = getattr(tokenizer, "get_added_vocab", lambda: {})()
-            rerank_token_id = added_vocab.get("<|rerank_token|>")
-        
-        if score_token_id is None:
-            raise ValueError(
-                "Could not find '<|score_token|>' in tokenizer added_tokens_decoder. "
-                "This model may not be a compatible Jina v3 reranker."
+                added_vocab = {}
+
+            token_id = added_vocab.get(token_text)
+            if isinstance(token_id, int):
+                return token_id
+
+        get_vocab = getattr(tokenizer, "get_vocab", None)
+        if callable(get_vocab):
+            try:
+                vocab = get_vocab() or {}
+            except Exception:
+                vocab = {}
+
+            token_id = vocab.get(token_text)
+            if isinstance(token_id, int):
+                return token_id
+
+        encode = getattr(tokenizer, "encode", None)
+        if callable(encode):
+            try:
+                encoded = encode(token_text, add_special_tokens=False)
+            except TypeError:
+                encoded = encode(token_text)
+            except Exception:
+                encoded = None
+
+            if hasattr(encoded, "ids"):
+                encoded = encoded.ids
+
+            if (
+                isinstance(encoded, list)
+                and len(encoded) == 1
+                and isinstance(encoded[0], int)
+            ):
+                return encoded[0]
+
+        return None
+
+    def _load_jina_projector(self, model_dir: str | Path):
+        """Load Jina projector weights and return a projection callable."""
+        model_path = Path(model_dir)
+        projector_path = model_path / "projector.safetensors"
+        if not projector_path.exists():
+            raise FileNotFoundError(
+                f"Missing Jina projector file: {projector_path}. "
+                "Expected projector.safetensors for JinaForRanking models."
             )
 
-        self._score_token_id = score_token_id
-        self._rerank_token_id = rerank_token_id
+        from safetensors import safe_open
 
-        logger.info(
-            f"Jina reranker tokens: score_token={score_token_id}, "
-            f"rerank_token={rerank_token_id}"
+        weights = {}
+        with safe_open(projector_path, framework="mlx") as f:
+            for key in f.keys():
+                weights[key] = f.get_tensor(key)
+
+        required_keys = ("linear1.weight", "linear2.weight")
+        missing_keys = [key for key in required_keys if key not in weights]
+        if missing_keys:
+            raise ValueError(
+                f"Jina projector is malformed: missing keys {missing_keys} in "
+                f"{projector_path}. "
+                f"Available keys: {sorted(weights.keys())}"
+            )
+
+        linear1_weight = weights["linear1.weight"]
+        linear2_weight = weights["linear2.weight"]
+
+        if len(linear1_weight.shape) != 2 or len(linear2_weight.shape) != 2:
+            raise ValueError(
+                "Jina projector weights must be 2D matrices: "
+                f"linear1.weight={linear1_weight.shape}, "
+                f"linear2.weight={linear2_weight.shape}."
+            )
+
+        if linear1_weight.shape != (512, 1024) or linear2_weight.shape != (512, 512):
+            raise ValueError(
+                "Unexpected Jina projector shapes. Expected "
+                "linear1.weight=(512, 1024) and linear2.weight=(512, 512), "
+                f"got linear1.weight={linear1_weight.shape}, "
+                f"linear2.weight={linear2_weight.shape}."
+            )
+
+        def _project(x):
+            if x.shape[-1] != linear1_weight.shape[1]:
+                raise ValueError(
+                    "Jina projector input dim mismatch for linear1: "
+                    f"input={x.shape[-1]}, expected={linear1_weight.shape[1]}."
+                )
+            hidden = x @ mx.transpose(linear1_weight)
+            hidden = mx.maximum(hidden, 0)
+            return hidden @ mx.transpose(linear2_weight)
+
+        return _project
+
+    def _sanitize_jina_text(self, text: str) -> str:
+        """Strip conflicting special tokens from user-provided text."""
+        sanitized = str(text)
+        sanitized = sanitized.replace("<|embed_token|>", " ")
+        sanitized = sanitized.replace("<|rerank_token|>", " ")
+        sanitized = sanitized.replace("<|score_token|>", " ")
+        sanitized = sanitized.replace("<|im_start|>", " ")
+        sanitized = sanitized.replace("<|im_end|>", " ")
+        return sanitized.strip()
+
+    def _format_jina_prompt(
+        self,
+        query: str,
+        documents: list[str],
+        instruction: str | None = None,
+    ) -> str:
+        """Format a listwise Jina reranking prompt."""
+        sanitized_query = self._sanitize_jina_text(query)
+        sanitized_docs = [self._sanitize_jina_text(doc) for doc in documents]
+        sanitized_instruction = (
+            self._sanitize_jina_text(instruction) if instruction is not None else None
         )
 
-        return model, tokenizer
+        user_content = (
+            f"I will provide you with {len(sanitized_docs)} passages, each indicated "
+            f"by a numerical identifier. Rank the passages based on their relevance "
+            f"to query: {sanitized_query}\n"
+        )
+        if sanitized_instruction:
+            user_content += f"<instruct>\n{sanitized_instruction}\n</instruct>\n"
+
+        doc_prompts = [
+            f'<passage id="{idx}">\n{doc}<|embed_token|>\n</passage>'
+            for idx, doc in enumerate(sanitized_docs)
+        ]
+        user_content += "\n".join(doc_prompts) + "\n"
+        user_content += f"<query>\n{sanitized_query}<|rerank_token|>\n</query>"
+
+        system_prompt = (
+            "You are a search relevance expert who can determine a ranking of the "
+            "passages based on how relevant they are to the query. If the query is "
+            "a question, how relevant a passage is depends on how well it answers "
+            "the question. If not, try to analyze the intent of the query and "
+            "assess how well each passage satisfies the intent. If an instruction "
+            "is provided, you should follow the instruction when determining the "
+            "ranking."
+        )
+
+        return (
+            "<|im_start|>system\n"
+            f"{system_prompt}"
+            "<|im_end|>\n"
+            "<|im_start|>user\n"
+            f"{user_content}"
+            "<|im_end|>\n"
+            "<|im_start|>assistant\n"
+            "<think>\n\n</think>\n\n"
+        )
+
+    def _get_jina_hidden_states(self, input_ids):
+        """Extract final hidden states from the Jina mlx-lm backbone."""
+
+        backbone = getattr(self.model, "model", None)
+        if backbone is None or not callable(backbone):
+            model_type = type(self.model).__name__ if self.model is not None else "None"
+            raise ValueError(
+                "Could not find Jina model backbone (model.model). "
+                f"The mlx-lm model wrapper may have changed: {model_type}."
+            )
+
+        hidden_states = backbone(input_ids)
+
+        if not hasattr(hidden_states, "shape"):
+            raise ValueError("Jina backbone did not return hidden states as a tensor.")
+
+        if len(hidden_states.shape) == 2:
+            return mx.expand_dims(hidden_states, axis=0)
+
+        if len(hidden_states.shape) != 3:
+            raise ValueError(
+                "Jina hidden states must be rank 2 or 3. "
+                f"Got shape: {hidden_states.shape}"
+            )
+
+        return hidden_states
+
+    def _cosine_similarity(self, query_vec, doc_vecs, eps: float = 1e-8):
+        """Compute cosine similarity between one query vector and many docs."""
+        if len(query_vec.shape) == 2:
+            query_vec = query_vec[0]
+        if len(doc_vecs.shape) == 1:
+            doc_vecs = mx.expand_dims(doc_vecs, axis=0)
+
+        query_norm = mx.linalg.norm(query_vec)
+        doc_norms = mx.linalg.norm(doc_vecs, axis=-1)
+        denom = mx.maximum(doc_norms * query_norm, eps)
+        numer = mx.sum(doc_vecs * query_vec, axis=-1)
+        return numer / denom
 
     def load(self) -> None:
         """Load the model and processor/tokenizer."""
@@ -295,10 +487,10 @@ class MLXRerankerModel:
 
         try:
             if arch == "JinaForRanking":
-                # Jina v3 reranker: uses <|score_token|> logits instead of yes/no
+                # Jina v3 reranker: listwise hidden-state scoring + projector
                 self.model, self.processor = self._load_jina_reranker()
                 self._is_jina_reranker = True
-                self._num_labels = 1  # score token
+                self._num_labels = 1
             elif arch in CAUSAL_LM_RERANKER_ARCHITECTURES:
                 # CausalLM-based reranker (e.g., Qwen3-Reranker)
                 self.model, self.processor = self._load_causal_lm()
@@ -311,6 +503,7 @@ class MLXRerankerModel:
             else:
                 # Use mlx-embeddings for other architectures (ModernBert, etc.)
                 from mlx_embeddings import load
+
                 self.model, self.processor = load(self.model_name)
 
                 # Get num_labels from model config
@@ -362,7 +555,10 @@ class MLXRerankerModel:
             return False
 
         base_model = self.model
+        if not callable(base_model):
+            return False
         try:
+
             def _compiled_seq_logits(inputs):
                 outputs = base_model(**inputs)
                 if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
@@ -468,6 +664,12 @@ class MLXRerankerModel:
         tokenizer = self.processor
         prefix_tokens = self._prefix_tokens
         suffix_tokens = self._suffix_tokens
+        if not callable(tokenizer):
+            raise ValueError("CausalLM reranker tokenizer is not initialized.")
+        if prefix_tokens is None or suffix_tokens is None:
+            raise ValueError("CausalLM reranker prompt tokens are not initialized.")
+        if not callable(self.model):
+            raise ValueError("CausalLM reranker model is not initialized.")
 
         # Compute max tokens available for the instruction content
         max_content_tokens = max_length - len(prefix_tokens) - len(suffix_tokens)
@@ -535,65 +737,161 @@ class MLXRerankerModel:
         max_length: int = 8192,
     ) -> RerankOutput:
         """
-        Rerank using Jina v3 reranker with <|score_token|> logits.
+        Rerank using Jina v3 listwise embedding-based scoring.
 
-        Each document is formatted with <|rerank_token|> instruction and the query,
-        then scored by extracting logits at the <|score_token|> position.
+        Builds multi-document prompts, extracts hidden states at special token
+        positions, applies the projector, and computes query-document cosine
+        similarities. Uses deterministic greedy chunking under max_length.
         """
-        import mlx.core as mx
-
         tokenizer = self.processor
-        score_token_id = self._score_token_id
-        rerank_token_id = self._rerank_token_id
+        doc_embed_token_id = self._doc_embed_token_id
+        query_embed_token_id = self._query_embed_token_id
+        projector = self._jina_projector
+        if tokenizer is None:
+            raise ValueError("Jina reranker tokenizer is not initialized.")
 
-        # Format instruction
-        rerank_instruct = "Given a query, retrieve relevant documents that answer the query."
-        if rerank_token_id is not None:
-            instruct_tokens = tokenizer.encode(
-                f"<|rerank_token|>{rerank_instruct}", add_special_tokens=False
+        encode = getattr(tokenizer, "encode", None)
+        if not callable(encode):
+            raise ValueError("Jina reranker tokenizer does not provide encode().")
+
+        if (
+            doc_embed_token_id is None
+            or query_embed_token_id is None
+            or projector is None
+        ):
+            raise ValueError(
+                "Jina reranker is not fully initialized. "
+                "Missing special-token IDs or projector."
             )
-        else:
-            instruct_tokens = tokenizer.encode(rerank_instruct, add_special_tokens=False)
 
-        query_tokens = tokenizer.encode(query, add_special_tokens=False)
-        bos_token_id = getattr(tokenizer, "bos_token_id", None)
-        eos_id = getattr(tokenizer, "eos_token_id", None)
+        def _to_token_ids(text: str) -> list[int]:
+            encoded = encode(text, add_special_tokens=False)
+            if hasattr(encoded, "ids"):
+                return list(encoded.ids)
+            return list(encoded)
 
-        # Compute max content tokens per document
-        # reserved = instruct + query + (BOS if present) + (EOS if present)
-        reserved = len(instruct_tokens) + len(query_tokens)
-        if bos_token_id is not None:
-            reserved += 1
-        if eos_id is not None:
-            reserved += 1
-        max_doc_tokens = max_length - reserved
+        decode = getattr(tokenizer, "decode", None)
 
-        scores = []
+        def _truncate_doc_to_fit(
+            query_text: str, doc_text: str
+        ) -> Tuple[str, list[int]]:
+            doc_token_ids = _to_token_ids(doc_text)
+            if not doc_token_ids:
+                prompt = self._format_jina_prompt(query_text, [""])
+                prompt_ids = _to_token_ids(prompt)[:max_length]
+                return "", prompt_ids
+
+            best_doc = ""
+            best_ids: list[int] = []
+            lo = 0
+            hi = len(doc_token_ids)
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if callable(decode):
+                    candidate_doc = decode(
+                        doc_token_ids[:mid], skip_special_tokens=False
+                    )
+                else:
+                    candidate_doc = doc_text[:mid]
+
+                prompt = self._format_jina_prompt(query_text, [candidate_doc])
+                prompt_ids = _to_token_ids(prompt)
+                if len(prompt_ids) <= max_length:
+                    best_doc = candidate_doc
+                    best_ids = prompt_ids
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+
+            if not best_ids:
+                raise ValueError(
+                    "Could not fit even a minimally truncated document into max_length. "
+                    f"max_length={max_length}"
+                )
+
+            return best_doc, best_ids
+
+        sanitized_query = self._sanitize_jina_text(query)
+        sanitized_docs = [self._sanitize_jina_text(doc) for doc in documents]
+
+        scores = [0.0] * len(documents)
         total_tokens = 0
-        for doc in documents:
-            doc_tokens = tokenizer.encode(doc, add_special_tokens=False)[:max_doc_tokens]
+        start = 0
+        while start < len(sanitized_docs):
+            chunk_doc_indices: list[int] = []
+            chunk_docs: list[str] = []
+            chunk_input_ids: list[int] | None = None
+            cursor = start
 
-            # Build input: [BOS] + instruct + [Query] + query + [Document] + doc + [EOS]
-            input_ids = []
-            if bos_token_id is not None:
-                input_ids.append(bos_token_id)
-            input_ids.extend(instruct_tokens)
-            input_ids.extend(query_tokens)
-            input_ids.extend(doc_tokens)
-            # Add eos if available
-            if eos_id is not None:
-                input_ids.append(eos_id)
+            while cursor < len(sanitized_docs):
+                candidate_docs = chunk_docs + [sanitized_docs[cursor]]
+                candidate_prompt = self._format_jina_prompt(
+                    sanitized_query, candidate_docs
+                )
+                candidate_ids = _to_token_ids(candidate_prompt)
 
-            input_ids = input_ids[:max_length]
-            input_array = mx.array([input_ids])
+                if len(candidate_ids) <= max_length:
+                    chunk_docs = candidate_docs
+                    chunk_doc_indices.append(cursor)
+                    chunk_input_ids = candidate_ids
+                    cursor += 1
+                    continue
 
-            logits = self.model(input_array)
-            # Get logits at the last position
-            last_logits = logits[0, -1, :]
-            # Extract score token logits (scalar)
-            score_logit = last_logits[score_token_id].item()
-            scores.append(score_logit)
-            total_tokens += len(input_ids)
+                if chunk_docs:
+                    break
+
+                truncated_doc, truncated_ids = _truncate_doc_to_fit(
+                    sanitized_query,
+                    sanitized_docs[cursor],
+                )
+                chunk_docs = [truncated_doc]
+                chunk_doc_indices = [cursor]
+                chunk_input_ids = truncated_ids
+                cursor += 1
+                break
+
+            if chunk_input_ids is None or not chunk_doc_indices:
+                raise ValueError("Failed to create a valid Jina reranker chunk.")
+
+            input_array = mx.array([chunk_input_ids])
+            hidden_states = self._get_jina_hidden_states(input_array)
+
+            query_positions = [
+                pos
+                for pos, token_id in enumerate(chunk_input_ids)
+                if token_id == query_embed_token_id
+            ]
+            if not query_positions:
+                raise ValueError(
+                    "Jina prompt does not contain '<|rerank_token|>' in tokenized input."
+                )
+
+            doc_positions = [
+                pos
+                for pos, token_id in enumerate(chunk_input_ids)
+                if token_id == doc_embed_token_id
+            ]
+            if len(doc_positions) < len(chunk_docs):
+                raise ValueError(
+                    "Jina prompt/doc mismatch: detected fewer '<|embed_token|>' "
+                    "positions than documents in chunk."
+                )
+
+            selected_doc_positions = doc_positions[: len(chunk_docs)]
+            query_hidden = hidden_states[0, query_positions[0], :]
+            doc_hidden = hidden_states[0, selected_doc_positions, :]
+
+            query_vec = projector(query_hidden)
+            doc_vecs = projector(doc_hidden)
+            similarities = self._cosine_similarity(query_vec, doc_vecs)
+            mx.eval(similarities)
+
+            chunk_scores = similarities.tolist()
+            for original_idx, score in zip(chunk_doc_indices, chunk_scores):
+                scores[original_idx] = float(score)
+
+            total_tokens += len(chunk_input_ids)
+            start = cursor
 
         # Sort by score descending
         indexed_scores = list(enumerate(scores))
@@ -621,6 +919,8 @@ class MLXRerankerModel:
         processor_class = type(processor).__name__
         if processor_class == "TokenizerWrapper" and hasattr(processor, "_tokenizer"):
             processor = processor._tokenizer
+        if not callable(processor):
+            raise ValueError("SequenceClassification processor is not initialized.")
 
         # Tokenize query-document pairs
         # SequenceClassification models expect pairs as (query, document)
@@ -658,6 +958,8 @@ class MLXRerankerModel:
                 self._compiled_seq_logits = None
 
         if logits is None:
+            if not callable(self.model):
+                raise ValueError("SequenceClassification model is not initialized.")
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -672,7 +974,6 @@ class MLXRerankerModel:
                     "Model output does not contain pooler_output. "
                     "Ensure the model is a SequenceClassification model."
                 )
-
 
         # Ensure computation is done
         mx.eval(logits)

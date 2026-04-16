@@ -86,6 +86,17 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "reranker"
 
+    def test_detect_jina_reranker_without_name_heuristic(self, tmp_path):
+        """JinaForRanking should detect as reranker without requiring 'rerank' in directory name."""
+        model_dir = tmp_path / "jina-v3-mlx"
+        model_dir.mkdir()
+        config = {
+            "model_type": "qwen3",
+            "architectures": ["JinaForRanking"],
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(model_dir) == "reranker"
+
     def test_detect_causal_lm_reranker(self, tmp_path):
         """Test detection of CausalLM-based reranker (e.g., Qwen3-Reranker)."""
         reranker_dir = tmp_path / "Qwen3-Reranker-0.6B-mxfp8"
