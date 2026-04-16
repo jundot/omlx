@@ -704,29 +704,207 @@ class _TrackedTensor:
         self.transform = transform
         self.axis = axis
 
-    # Support `weight + 1.0` patterns (norm adjustments)
+    def _clone(self, shape=None, dtype=None, transform=None):
+        return _TrackedTensor(
+            shape if shape is not None else self.shape,
+            dtype if dtype is not None else self.dtype,
+            list(self.sources),
+            transform if transform is not None else self.transform,
+        )
+
+    # Arithmetic — recipe is "fp8_dequant" for the whole sanitize block if weight came from FP8
     def __add__(self, other):
-        return _TrackedTensor(self.shape, self.dtype, list(self.sources), "add")
+        return self._clone(transform="add")
     def __radd__(self, other):
         return self.__add__(other)
     def __sub__(self, other):
-        return _TrackedTensor(self.shape, self.dtype, list(self.sources), "sub")
+        return self._clone(transform="sub")
+    def __mul__(self, other):
+        return self._clone(transform="mul")
+    def __rmul__(self, other):
+        return self.__mul__(other)
+    def __truediv__(self, other):
+        return self._clone(transform="div")
 
-    # Support indexing like tensor[..., :half] for split patterns
+    # Indexing: handle slice + None (broadcast) + tuple variants
     def __getitem__(self, idx):
-        # Rough shape tracking for common slice patterns
-        return _TrackedTensor(self.shape, self.dtype, list(self.sources), "slice")
+        new_shape = list(self.shape)
+        # Handle None-broadcasting like scale[:, None, :, None]
+        if isinstance(idx, tuple):
+            result_shape = []
+            axis = 0
+            for part in idx:
+                if part is None:
+                    result_shape.append(1)
+                elif isinstance(part, slice):
+                    if axis < len(new_shape):
+                        result_shape.append(new_shape[axis])
+                        axis += 1
+                    else:
+                        result_shape.append(1)
+                else:
+                    # int index → dimension removed
+                    if axis < len(new_shape):
+                        axis += 1
+            while axis < len(new_shape):
+                result_shape.append(new_shape[axis])
+                axis += 1
+            return _TrackedTensor(result_shape, self.dtype, list(self.sources), "slice")
+        if isinstance(idx, slice):
+            return self._clone(transform="slice")
+        # int or other
+        if new_shape:
+            return _TrackedTensor(new_shape[1:], self.dtype, list(self.sources), "slice")
+        return self._clone(transform="slice")
 
-    # Support .T, .reshape, transpose, moveaxis etc
+    def reshape(self, *new_shape):
+        if len(new_shape) == 1 and isinstance(new_shape[0], (tuple, list)):
+            new_shape = tuple(new_shape[0])
+        # Resolve any -1 using total element count
+        total = 1
+        for d in self.shape:
+            total *= d
+        resolved = []
+        unknown_idx = -1
+        known_prod = 1
+        for i, d in enumerate(new_shape):
+            if d == -1:
+                unknown_idx = i
+                resolved.append(-1)
+            else:
+                resolved.append(d)
+                known_prod *= d
+        if unknown_idx >= 0 and known_prod > 0:
+            resolved[unknown_idx] = total // known_prod
+        return _TrackedTensor(tuple(resolved), self.dtype, list(self.sources), "reshape")
+
+    def astype(self, dtype):
+        return _TrackedTensor(self.shape, dtype, list(self.sources), "astype")
+
     @property
     def T(self):
         return _TrackedTensor(tuple(reversed(self.shape)), self.dtype, list(self.sources), "transpose")
+
     @property
     def size(self):
         r = 1
         for d in self.shape:
             r *= d
         return r
+
+
+
+def _streaming_fp8_dequant(lazy_index, scratch_dir=None, shard_bytes=4_000_000_000):
+    """Streaming FP8 dequant with disk spill. For each (weight, weight_scale_inv)
+    pair, materialize both, run block-scaled dequant to bf16, append to a
+    scratch safetensors shard, and re-point the lazy index at it. Peak RAM
+    bounded to one weight + scale + current shard buffer."""
+    import tempfile, struct, json as _json
+    import numpy as _np
+    from pathlib import Path as _Path
+
+    scale_suffix = "_scale_inv"
+    scale_keys = [k for k in lazy_index._index if k.endswith(scale_suffix)]
+    if not scale_keys:
+        return 0
+
+    if scratch_dir is None:
+        scratch_dir = tempfile.mkdtemp(prefix="oq_fp8_dequant_")
+    scratch_dir = _Path(scratch_dir)
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"FP8 dequant scratch dir: {scratch_dir}")
+
+    shard_idx = 0
+    shard_path = None
+    shard_fh = None
+    shard_header = {}
+    shard_data_bytes = 0
+
+    def _flush_shard():
+        nonlocal shard_fh
+        if shard_fh is None:
+            return
+        shard_fh.close()
+        tmp_path = shard_path.with_suffix(".tmp")
+        hdr_bytes = _json.dumps(shard_header, separators=(",", ":")).encode("utf-8")
+        hlen = len(hdr_bytes)
+        with open(shard_path, "rb") as src, open(tmp_path, "wb") as dst:
+            dst.write(struct.pack("<Q", hlen))
+            dst.write(hdr_bytes)
+            dst.write(src.read())
+        tmp_path.replace(shard_path)
+        data_offset = 8 + hlen
+        for k, meta in shard_header.items():
+            start, end = meta["data_offsets"]
+            lazy_index._index[k] = (
+                str(shard_path), data_offset, start, end,
+                tuple(meta["shape"]), meta["dtype"],
+            )
+
+    def _open_new_shard():
+        nonlocal shard_idx, shard_path, shard_fh, shard_header, shard_data_bytes
+        shard_idx += 1
+        shard_path = scratch_dir / f"dequant-{shard_idx:04d}.safetensors"
+        shard_fh = open(shard_path, "wb")
+        shard_header = {}
+        shard_data_bytes = 0
+
+    _open_new_shard()
+    count = 0
+
+    for sk in scale_keys:
+        wk = sk.replace(scale_suffix, "")
+        if wk not in lazy_index._index:
+            continue
+        w_meta = lazy_index._index[wk]
+        s_meta = lazy_index._index[sk]
+        w_lt = _LazyTensor(w_meta[0], w_meta[1], w_meta[2], w_meta[3], w_meta[4], w_meta[5])
+        s_lt = _LazyTensor(s_meta[0], s_meta[1], s_meta[2], s_meta[3], s_meta[4], s_meta[5])
+        weight_u8 = w_lt[:]
+        scale_inv = s_lt[:]
+        mx.eval(weight_u8, scale_inv)
+
+        weight = mx.from_fp8(weight_u8, dtype=mx.bfloat16)
+        bs = 128
+        m, n = weight.shape
+        pad_bottom = (-m) % bs
+        pad_side = (-n) % bs
+        weight = mx.pad(weight, ((0, pad_bottom), (0, pad_side)))
+        weight = weight.reshape(
+            ((m + pad_bottom) // bs, bs, (n + pad_side) // bs, bs)
+        )
+        weight = (weight * scale_inv[:, None, :, None]).reshape(
+            m + pad_bottom, n + pad_side
+        )
+        weight = weight[:m, :n].astype(mx.bfloat16)
+        mx.eval(weight)
+
+        raw = bytes(_np.asarray(weight.view(mx.uint16)))
+        tensor_bytes = len(raw)
+        if shard_data_bytes > 0 and shard_data_bytes + tensor_bytes > shard_bytes:
+            _flush_shard()
+            _open_new_shard()
+
+        start = shard_data_bytes
+        end = start + tensor_bytes
+        shard_fh.write(raw)
+        shard_data_bytes = end
+        shard_header[wk] = {
+            "dtype": "BF16",
+            "shape": list(weight.shape),
+            "data_offsets": [start, end],
+        }
+        lazy_index._index.pop(wk, None)
+        lazy_index._index.pop(sk, None)
+        del weight_u8, scale_inv, weight, raw
+        mx.clear_cache()
+        count += 1
+        if count % 50 == 0:
+            logger.info(f"FP8 dequant: {count} tensors processed")
+
+    _flush_shard()
+    logger.info(f"FP8 dequant complete: {count} tensors spilled to {scratch_dir}")
+    return count
 
 
 def _discover_sanitize_plan(sanitize_fn, lazy_index):
@@ -755,6 +933,8 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "synchronize": mx.synchronize,
         "moveaxis": mx.moveaxis,
         "transpose": mx.transpose,
+        "from_fp8": getattr(mx, "from_fp8", None),
+        "pad": getattr(mx, "pad", None),
     }
 
     def _fake_stack(tensors, axis=0):
@@ -827,6 +1007,28 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
     mx.synchronize = _noop
     mx.moveaxis = _fake_moveaxis
     mx.transpose = _fake_transpose
+
+    def _fake_from_fp8(x, dtype=None, **kw):
+        if isinstance(x, _TrackedTensor):
+            return _TrackedTensor(x.shape, dtype or x.dtype, list(x.sources), "from_fp8")
+        return _orig["from_fp8"](x, dtype=dtype, **kw) if _orig["from_fp8"] else x
+
+    def _fake_pad(x, pad_width, **kw):
+        if isinstance(x, _TrackedTensor):
+            new_shape = []
+            for i, d in enumerate(x.shape):
+                if i < len(pad_width):
+                    lo, hi = pad_width[i] if isinstance(pad_width[i], (tuple, list)) else (pad_width[i], pad_width[i])
+                    new_shape.append(d + lo + hi)
+                else:
+                    new_shape.append(d)
+            return _TrackedTensor(new_shape, x.dtype, list(x.sources), "pad")
+        return _orig["pad"](x, pad_width, **kw) if _orig["pad"] else x
+
+    if _orig["from_fp8"] is not None:
+        mx.from_fp8 = _fake_from_fp8
+    if _orig["pad"] is not None:
+        mx.pad = _fake_pad
 
     try:
         result = sanitize_fn(tracked)
@@ -1378,7 +1580,8 @@ _LOAD_CHUNK_BYTES     = max(1 << 20, _METAL_MAX_BUFFER // 2)
 
 class _LazyTensorIndex:
     _DTYPE_BYTES = {"BF16":2,"F16":2,"F32":4,"F64":8,"I8":1,"U8":1,
-                    "I16":2,"U16":2,"I32":4,"U32":4,"I64":8,"U64":8,"BOOL":1}
+                    "I16":2,"U16":2,"I32":4,"U32":4,"I64":8,"U64":8,"BOOL":1,
+                    "F8_E4M3":1,"F8_E5M2":1}
 
     def __init__(self, weight_files):
         self._index = {}
@@ -1496,9 +1699,14 @@ class _LazyTensor:
         return self._end - self._start
 
     def _mlx_dtype(self):
+        # FP8 variants are loaded as uint8; sanitize calls mx.from_fp8 to convert
+        if self._dtype in ("F8_E4M3", "F8_E5M2"):
+            return mx.uint8
         return {"BF16":mx.bfloat16,"F16":mx.float16,"F32":mx.float32}.get(self._dtype, mx.bfloat16)
 
     def _np_view_dtype(self):
+        if self._dtype in ("F8_E4M3", "F8_E5M2"):
+            return _np.uint8
         if self._bpe == 2: return _np.uint16
         return _np.dtype({"F32":"<f4","F64":"<f8","I32":"<i4","I64":"<i8"}.get(self._dtype, "<u2"))
 
@@ -1830,22 +2038,45 @@ def quantize_oq_streaming(
     if sanitize_fn is not None:
         # Try discovery-based streaming sanitize first (works for any model,
         # bounds peak memory by materializing one tensor at a time)
-        try:
-            plan = _discover_sanitize_plan(sanitize_fn, all_weights)
-            all_weights = _DiscoveredPlan(plan, all_weights)
+        # Check if source contains FP8 weights — discovery can't capture the
+        # multi-op dequant chain (from_fp8 + pad + reshape + mul + slice + astype)
+        # as a single replayable transform. Fall back to eager sanitize for those.
+        has_fp8 = False
+        if hasattr(all_weights, "_index"):
+            for _k, _meta in all_weights._index.items():
+                if _meta[5] in ("F8_E4M3", "F8_E5M2"):
+                    has_fp8 = True
+                    break
+        if has_fp8:
             logger.info(
-                f"oQ{oq_level:g}: discovered streaming sanitize plan, "
-                f"{len(all_weights)} output tensors"
-            )
-        except Exception as e:
-            logger.warning(
-                f"Streaming discovery failed ({e}), falling back to eager sanitize"
+                f"oQ{oq_level:g}: FP8 source detected, streaming dequant to scratch shards"
             )
             try:
+                n_deq = _streaming_fp8_dequant(all_weights)
+                logger.info(f"oQ{oq_level:g}: FP8 dequant complete ({n_deq} tensors)")
                 all_weights = sanitize_fn(all_weights)
-                logger.info(f"oQ{oq_level:g}: eager sanitize applied, {len(all_weights)} tensors")
-            except Exception as e2:
-                logger.warning(f"Sanitize failed ({e2}), using original names")
+                logger.info(f"oQ{oq_level:g}: sanitize applied, {len(all_weights)} tensors")
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                logger.warning(f"FP8 sanitize failed ({e}), aborting")
+                raise
+        else:
+            try:
+                plan = _discover_sanitize_plan(sanitize_fn, all_weights)
+                all_weights = _DiscoveredPlan(plan, all_weights)
+                logger.info(
+                    f"oQ{oq_level:g}: discovered streaming sanitize plan, "
+                    f"{len(all_weights)} output tensors"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Streaming discovery failed ({e}), falling back to eager sanitize"
+                )
+                try:
+                    all_weights = sanitize_fn(all_weights)
+                    logger.info(f"oQ{oq_level:g}: eager sanitize applied, {len(all_weights)} tensors")
+                except Exception as e2:
+                    logger.warning(f"Sanitize failed ({e2}), using original names")
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
 
