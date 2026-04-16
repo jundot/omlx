@@ -70,6 +70,42 @@ class DFlashEngine(BaseEngine):
         except ValueError:
             self._max_dflash_ctx = DEFAULT_MAX_DFLASH_CTX
 
+        # DDTree (tree-based speculative decoding on top of DFlash drafter).
+        # Reads optional per-model settings; resolves ImportError lazily.
+        self._ddtree_enabled = bool(
+            getattr(model_settings, "ddtree_enabled", False)
+        ) if model_settings is not None else False
+        self._ddtree_budget = int(
+            getattr(model_settings, "ddtree_budget", 4) or 4
+        ) if model_settings is not None else 4
+        self._ddtree_exact_commit = bool(
+            getattr(model_settings, "ddtree_exact_commit", False)
+        ) if model_settings is not None else False
+        self._ddtree_import_ok: bool | None = None  # resolved on first use
+
+    def _ddtree_available(self) -> bool:
+        """Check ddtree_mlx importability; cache result, warn once on failure."""
+        if self._ddtree_import_ok is not None:
+            return self._ddtree_import_ok
+        try:
+            import ddtree_mlx.runtime  # noqa: F401
+            self._ddtree_import_ok = True
+        except ImportError as e:
+            logger.warning(
+                f"DDTree enabled but ddtree-mlx is not installed "
+                f"({e}); falling back to DFlash."
+            )
+            self._ddtree_import_ok = False
+        return self._ddtree_import_ok
+
+    def _use_ddtree(self) -> bool:
+        """True iff DDTree is enabled, import succeeded, and no fallback in effect."""
+        return (
+            self._ddtree_enabled
+            and not self._in_fallback_mode
+            and self._ddtree_available()
+        )
+
     @property
     def model_name(self) -> str:
         return self._model_name
@@ -118,11 +154,16 @@ class DFlashEngine(BaseEngine):
 
         self._loaded = True
         self._in_fallback_mode = False
+        ddtree_state = (
+            "on" if self._ddtree_enabled and self._ddtree_available() else "off"
+        )
         logger.info(
             f"DFlashEngine loaded: target={self._model_name}, "
             f"draft={self._draft_model_path}, "
             f"max_ctx={self._max_dflash_ctx}, "
-            f"fallback={self._fallback_engine_type}"
+            f"fallback={self._fallback_engine_type}, "
+            f"ddtree={ddtree_state} "
+            f"(budget={self._ddtree_budget}, exact_commit={self._ddtree_exact_commit})"
         )
 
     async def _evict_dflash_and_start_fallback(self) -> None:
@@ -254,9 +295,8 @@ class DFlashEngine(BaseEngine):
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
     ) -> None:
-        """Run dflash generation with streaming on MLX executor thread."""
+        """Run dflash/ddtree generation with streaming on MLX executor thread."""
         from dflash_mlx.generate import get_stop_token_ids
-        from dflash_mlx.runtime import stream_dflash_generate
 
         try:
             stop_ids = get_stop_token_ids(self._executor_tokenizer)
@@ -268,6 +308,61 @@ class DFlashEngine(BaseEngine):
                 detokenizer = NaiveStreamingDetokenizer(self._executor_tokenizer)
             except ImportError:
                 pass
+
+            if self._use_ddtree():
+                from ddtree_mlx.runtime import generate_ddtree_once
+
+                if self._ddtree_exact_commit:
+                    os.environ["DDTREE_EXACT_COMMIT"] = "1"
+
+                summary = generate_ddtree_once(
+                    target_model=self._target_model,
+                    draft_model=self._draft_model,
+                    tokenizer=self._executor_tokenizer,
+                    prompt_tokens=prompt_tokens,
+                    max_new_tokens=max_tokens,
+                    tree_budget=self._ddtree_budget,
+                    stop_token_ids=stop_ids,
+                )
+                gen_tokens_list = summary.get("generated_token_ids", [])
+
+                # DDTree produces the full result in one call; emit per-token
+                # events for OpenAI-streaming compatibility.
+                for token_id in gen_tokens_list:
+                    if token_id in stop_ids:
+                        continue
+                    if detokenizer is not None:
+                        detokenizer.add_token(token_id)
+                        text = detokenizer.last_segment
+                    else:
+                        text = self._executor_tokenizer.decode([token_id])
+                    asyncio.run_coroutine_threadsafe(
+                        queue.put((text, [token_id], False, None)), loop
+                    )
+
+                gen_count = int(summary.get("generation_tokens", len(gen_tokens_list)))
+                tps = float(summary.get("tokens_per_second", 0.0))
+                accept = float(summary.get("avg_acceptance", 0.0))
+                fast = float(summary.get("fast_path_ratio", 0.0))
+                logger.info(
+                    f"DDTree generation complete: {gen_count} tokens, "
+                    f"{tps:.1f} tok/s, avg_acceptance={accept:.2f}, "
+                    f"fast_path_ratio={fast:.0%}"
+                )
+                metrics = {
+                    "prompt_tokens": len(prompt_tokens),
+                    "completion_tokens": gen_count,
+                    "avg_acceptance": accept,
+                    "fast_path_ratio": fast,
+                    "tokens_per_second": tps,
+                    "engine": "ddtree",
+                }
+                asyncio.run_coroutine_threadsafe(
+                    queue.put(("", [], True, metrics)), loop
+                )
+                return
+
+            from dflash_mlx.runtime import stream_dflash_generate
 
             for event in stream_dflash_generate(
                 target_model=self._target_model,
@@ -372,10 +467,48 @@ class DFlashEngine(BaseEngine):
 
         from ..engine_core import get_mlx_executor
         from dflash_mlx.generate import get_stop_token_ids
-        from dflash_mlx.runtime import generate_dflash_once
 
         loop = asyncio.get_running_loop()
         stop_ids = get_stop_token_ids(self._tokenizer_obj)
+
+        if self._use_ddtree():
+            from ddtree_mlx.runtime import generate_ddtree_once
+
+            # DDTREE_EXACT_COMMIT is read inside ddtree-mlx on each call.
+            if self._ddtree_exact_commit:
+                os.environ["DDTREE_EXACT_COMMIT"] = "1"
+            budget = self._ddtree_budget
+
+            def _run():
+                return generate_ddtree_once(
+                    target_model=self._target_model,
+                    draft_model=self._draft_model,
+                    tokenizer=self._executor_tokenizer,
+                    prompt_tokens=prompt_tokens,
+                    max_new_tokens=max_tokens,
+                    tree_budget=budget,
+                    stop_token_ids=stop_ids,
+                )
+
+            summary = await loop.run_in_executor(get_mlx_executor(), _run)
+            generated = summary.get("generated_token_ids", [])
+            text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
+            text = clean_special_tokens(text)
+            logger.info(
+                f"DDTree generation: {len(generated)} tokens, "
+                f"{summary.get('tokens_per_second', 0):.1f} tok/s, "
+                f"avg_acceptance={summary.get('avg_acceptance', 0):.2f}, "
+                f"fast_path_ratio={summary.get('fast_path_ratio', 0):.0%}"
+            )
+            return GenerationOutput(
+                text=text,
+                tokens=generated,
+                prompt_tokens=len(prompt_tokens),
+                completion_tokens=int(summary.get("generation_tokens", len(generated))),
+                finish_reason="stop",
+            )
+
+        from dflash_mlx.runtime import generate_dflash_once
 
         def _run():
             return generate_dflash_once(
@@ -565,6 +698,10 @@ class DFlashEngine(BaseEngine):
             "fallback_engine_type": self._fallback_engine_type,
             "in_fallback_mode": self._in_fallback_mode,
             "loaded": self._loaded,
+            "ddtree_enabled": self._ddtree_enabled,
+            "ddtree_budget": self._ddtree_budget,
+            "ddtree_exact_commit": self._ddtree_exact_commit,
+            "ddtree_active": self._use_ddtree(),
         }
 
     def get_cache_stats(self) -> dict[str, Any] | None:
