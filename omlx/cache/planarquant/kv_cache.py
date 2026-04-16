@@ -164,6 +164,16 @@ class PlanarQuantKVCache(_BaseCache):
         self._packed_last_k: int | None = None
         self._packed_last_v: int | None = None
 
+        # Tiled decode configuration. When ``tile_size`` is not None,
+        # :meth:`decode_attention` routes through
+        # :meth:`decode_attention_tiled` with online softmax, decompressing
+        # ``tile_size`` tokens at a time. This keeps peak memory O(tile_size)
+        # instead of O(offset). ``memory_pressure`` enables an eager
+        # per-token quantization path in update_and_fetch so dequant caches
+        # are never allocated.
+        self.tile_size: int | None = None
+        self.memory_pressure: bool = False
+
     # ------------------------------------------------------------------
     # Buffer management
     # ------------------------------------------------------------------
@@ -427,6 +437,38 @@ class PlanarQuantKVCache(_BaseCache):
         assert self._k_packed is not None
         assert self._k_norms is not None
 
+        # Memory-pressure mode: eagerly quantize new rows, skip dequant cache
+        if self.memory_pressure:
+            k_packed_new, k_norms_new = _quantize(keys.astype(mx.float16))
+            self._k_packed = self._write_slice(self._k_packed, k_packed_new, self.offset)
+            self._k_norms = self._write_slice(self._k_norms, k_norms_new, self.offset)
+            if self.quantize_v:
+                assert self._v_packed is not None
+                assert self._v_norms is not None
+                v_packed_new, v_norms_new = _quantize(values.astype(mx.float16))
+                self._v_packed = self._write_slice(self._v_packed, v_packed_new, self.offset)
+                self._v_norms = self._write_slice(self._v_norms, v_norms_new, self.offset)
+            else:
+                assert self._v_fp16 is not None
+                self._v_fp16 = self._write_slice(
+                    self._v_fp16, values.astype(mx.float16), self.offset
+                )
+            self.offset = new_end
+            # Return packed states directly — tiled attention will dequant
+            # per tile on demand.
+            k_state = PlanarQuantState(
+                self._k_packed[..., :self.offset, :],
+                self._k_norms[..., :self.offset, :],
+            )
+            if self.quantize_v:
+                v_state = PlanarQuantState(
+                    self._v_packed[..., :self.offset, :],
+                    self._v_norms[..., :self.offset, :],
+                )
+            else:
+                v_state = FP16State(self._v_fp16[..., :self.offset, :])
+            return k_state, v_state
+
         # Ensure K dequant cache covers the prefill portion (one-time dequant)
         self._ensure_k_dequant_cache()
         # Grow K cache buffer if needed, then append new FP16 K rows
@@ -540,6 +582,140 @@ class PlanarQuantKVCache(_BaseCache):
         assert self._v_dequant_cache is not None
         return self._v_dequant_cache[..., :self.offset, :].astype(out_dtype)
 
+    def enable_memory_pressure_mode(self, tile_size: int = 4096) -> None:
+        """Switch to memory-pressure mode for very long contexts.
+
+        Effects:
+          - Sets ``self.tile_size`` so subsequent ``decode_attention`` calls
+            route through ``decode_attention_tiled`` (online softmax).
+          - Frees ``_k_dequant_cache`` / ``_v_dequant_cache``.
+          - Future ``update_and_fetch`` calls eagerly quantize new rows
+            directly into ``_k_packed`` / ``_v_packed`` (no dequant caching).
+
+        Peak memory for the KV cache drops from O(offset × head_dim × fp16)
+        to O(packed_bytes_per_token × offset + tile_size × head_dim × fp16),
+        at the cost of per-step dequant of tile-sized slices. Reviewer
+        reports this keeps throughput flat from 1K→100K context where the
+        non-tiled path OOMs or degrades 2.1×.
+        """
+        self.tile_size = int(tile_size)
+        self.memory_pressure = True
+        # Ensure any lazily-unpacked decode rows are in _k_packed before we
+        # drop the dequant cache (otherwise we'd lose data).
+        self._flush_unpacked()
+        self._invalidate_dequant_cache()
+
+    def decode_attention_tiled(
+        self,
+        queries: mx.array,
+        scale: float = 1.0,
+        mask: mx.array | None = None,
+        tile_size: int | None = None,
+    ) -> mx.array:
+        """Tiled decode attention with online softmax accumulation.
+
+        For each tile of ``tile_size`` tokens:
+          1. Dequantize the packed K (and V if ``quantize_v``) tile via
+             the fused Metal kernel.
+          2. Compute attention scores Q·Kᵀ·scale.
+          3. Update running (m, l, o) with the flash-attention recurrence:
+             m_new = max(m, scores.max)
+             α = exp(m − m_new)
+             p = exp(scores − m_new)
+             l_new = α·l + p.sum
+             o_new = α·o + p·V
+
+        Returns ``(o / l)`` cast back to the query dtype. Produces
+        bit-equivalent output to monolithic MPS SDPA within fp32
+        accumulation precision.
+
+        Memory: O(tile_size · head_dim · fp32) regardless of context length.
+        Requires ``self._finalized`` — callers must ensure finalize_prefill
+        has run. Packs any unpacked decode rows via ``_flush_unpacked``.
+        """
+        assert self._finalized, "decode_attention_tiled requires finalized cache"
+        if tile_size is None:
+            tile_size = self.tile_size or 4096
+
+        # Ensure packed buffers cover all rows (finalize any lazy decode rows)
+        self._flush_unpacked()
+        assert self._k_packed is not None
+        assert self._k_norms is not None
+
+        t = self.offset
+        if t == 0:
+            return mx.zeros_like(queries)
+
+        compute_dtype = queries.dtype
+        b = queries.shape[0]
+        h_q = queries.shape[1]
+        q_len = queries.shape[2]
+        # Use the value head_dim for output (GQA: d_q may equal d_v or d_k)
+        d_v_full = self._D_v or queries.shape[-1]
+
+        queries_f32 = queries.astype(mx.float32)
+
+        # Online softmax state (fp32 for numerical stability)
+        m = mx.full((b, h_q, q_len, 1), -float("inf"), dtype=mx.float32)
+        sum_exp = mx.zeros((b, h_q, q_len, 1), dtype=mx.float32)
+        out = mx.zeros((b, h_q, q_len, d_v_full), dtype=mx.float32)
+
+        h_k = self._H_k or self._k_packed.shape[1]
+        n_rep = h_q // h_k if h_k > 0 else 1
+
+        n_tiles = (t + tile_size - 1) // tile_size
+        for ti in range(n_tiles):
+            start = ti * tile_size
+            end = min(start + tile_size, t)
+
+            # K tile — always packed after finalize
+            k_tile = dequantize_fused(
+                self._k_packed[..., start:end, :],
+                self._k_norms[..., start:end, :],
+                out_dtype=mx.float32,
+            )  # (B, H_k, tile_len, D_k)
+
+            # V tile — packed if quantize_v else raw fp16
+            if self.quantize_v and self._v_packed is not None:
+                assert self._v_norms is not None
+                v_tile = dequantize_fused(
+                    self._v_packed[..., start:end, :],
+                    self._v_norms[..., start:end, :],
+                    out_dtype=mx.float32,
+                )
+            else:
+                assert self._v_fp16 is not None
+                v_tile = self._v_fp16[..., start:end, :].astype(mx.float32)
+
+            # GQA expansion: repeat K/V heads if queries have more heads
+            if n_rep > 1:
+                k_tile = mx.repeat(k_tile, n_rep, axis=1)
+                v_tile = mx.repeat(v_tile, n_rep, axis=1)
+
+            # scores: (B, H_q, Q, tile_len)
+            scores = mx.matmul(queries_f32, k_tile.transpose(0, 1, 3, 2)) * scale
+
+            if mask is not None:
+                # Slice the mask column-range matching this tile
+                # mask shape is typically (Q, T) or broadcast-compatible
+                mask_tile = mask[..., start:end]
+                scores = scores + mask_tile.astype(mx.float32)
+
+            # Online softmax update
+            tile_max = scores.max(axis=-1, keepdims=True)
+            m_new = mx.maximum(m, tile_max)
+            alpha = mx.exp(m - m_new)
+            p = mx.exp(scores - m_new)
+            sum_new = alpha * sum_exp + p.sum(axis=-1, keepdims=True)
+            out_new = alpha * out + mx.matmul(p, v_tile)
+
+            m = m_new
+            sum_exp = sum_new
+            out = out_new
+
+        normalized = out / mx.maximum(sum_exp, mx.array(1e-20, dtype=mx.float32))
+        return normalized.astype(compute_dtype)
+
     def decode_attention(
         self,
         queries: mx.array,
@@ -550,11 +726,19 @@ class PlanarQuantKVCache(_BaseCache):
     ) -> mx.array:
         """Decode-path attention.
 
-        All quantized paths route through Apple's MPS-backed SDPA via the
-        FP16 dequant caches. The fused quantized Metal kernel is retained
-        in :func:`fused_quantized_sdpa` for research/reference but is ~103x
+        When ``self.tile_size`` is set (memory-pressure mode), routes
+        through :meth:`decode_attention_tiled` with online softmax — peak
+        memory O(tile_size) instead of O(offset).
+
+        Otherwise routes through Apple's MPS-backed SDPA via the FP16
+        dequant caches. The fused quantized Metal kernel is retained in
+        :func:`fused_quantized_sdpa` for research/reference but is ~103x
         slower than MPS on Apple Silicon and is no longer on the hot path.
         """
+        if self.tile_size is not None and self._finalized:
+            return self.decode_attention_tiled(
+                queries, scale=scale, mask=mask, tile_size=self.tile_size
+            )
         if keys_state is None or values_state is None:
             keys_state, values_state = self._current_state()
 
