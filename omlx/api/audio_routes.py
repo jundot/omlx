@@ -223,6 +223,22 @@ async def create_speech(request: AudioSpeechRequest):
             detail=f"Model '{resolved_model}' is not a text-to-speech model",
         )
 
+    # Validate response_format early so the user gets a clear error
+    # before we spend time synthesizing audio.
+    from omlx.engine.audio_utils import (
+        SUPPORTED_RESPONSE_FORMATS,
+        convert_wav_to_response_format,
+    )
+    fmt = (request.response_format or "wav").lower()
+    if fmt not in SUPPORTED_RESPONSE_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported response_format '{fmt}'. "
+                f"Supported values: {sorted(SUPPORTED_RESPONSE_FORMATS)}"
+            ),
+        )
+
     ref_audio_path = None
     try:
         # Write decoded audio to temp file if voice clone requested
@@ -256,7 +272,12 @@ async def create_speech(request: AudioSpeechRequest):
             except OSError:
                 pass
 
-    return Response(content=wav_bytes, media_type="audio/wav")
+    try:
+        audio_content, media_type = convert_wav_to_response_format(wav_bytes, fmt)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return Response(content=audio_content, media_type=media_type)
 
 
 @router.post("/v1/audio/process")
