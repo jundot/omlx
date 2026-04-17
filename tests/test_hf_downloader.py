@@ -1358,6 +1358,151 @@ class TestSearchModels:
 
         assert len(result["models"]) == 5
 
+    @pytest.mark.asyncio
+    async def test_search_largest_sort(self):
+        """Test largest sorting works correctly."""
+        small = _make_mock_model("org/small", disk_size_bytes=2_000_000_000, downloads=100)
+        large = _make_mock_model("org/large", disk_size_bytes=20_000_000_000, downloads=100)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [small, large]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="model", sort="largest"
+            )
+
+        # Large should come first
+        assert result["models"][0]["repo_id"] == "org/large"
+        assert result["models"][1]["repo_id"] == "org/small"
+
+    @pytest.mark.asyncio
+    async def test_search_smallest_sort(self):
+        """Test smallest sorting works correctly."""
+        small = _make_mock_model("org/small", disk_size_bytes=2_000_000_000, downloads=100)
+        large = _make_mock_model("org/large", disk_size_bytes=20_000_000_000, downloads=100)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [small, large]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="model", sort="smallest"
+            )
+
+        # Small should come first
+        assert result["models"][0]["repo_id"] == "org/small"
+        assert result["models"][1]["repo_id"] == "org/large"
+
+    @pytest.mark.asyncio
+    async def test_search_sort_by_size(self):
+        """Test sort_by_size parameter works correctly."""
+        small = _make_mock_model("org/small", disk_size_bytes=2_000_000_000, downloads=100)
+        large = _make_mock_model("org/large", disk_size_bytes=20_000_000_000, downloads=100)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [small, large]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="model",
+                sort="downloads",  # base sort
+                sort_by_size=True,
+                sort_ascending=True,  # smallest first
+            )
+
+        # Small should come first when ascending
+        assert result["models"][0]["repo_id"] == "org/small"
+
+    @pytest.mark.asyncio
+    async def test_search_filter_by_quant(self):
+        """Test filtering by quantization type."""
+        model_4bit = _make_mock_model("org/model-4bit", disk_size_bytes=2_000_000_000, downloads=100)
+        model_4bit.safetensors = {"parameters": {"Q4_K": 1_000_000_000}, "total": 1_000_000_000}
+        model_8bit = _make_mock_model("org/model-8bit", disk_size_bytes=4_000_000_000, downloads=100)
+        model_8bit.safetensors = {"parameters": {"Q8": 2_000_000_000}, "total": 2_000_000_000}
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model_4bit, model_8bit]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="model",
+                quant="4bit",
+            )
+
+        # Only 4bit model should be included
+        assert len(result["models"]) == 1
+        assert result["models"][0]["repo_id"] == "org/model-4bit"
+
+    @pytest.mark.asyncio
+    async def test_search_filter_by_min_max_params(self):
+        """Test filtering by parameter count range."""
+        small = _make_mock_model("org/small", disk_size_bytes=4_000_000_000, downloads=100)
+        medium = _make_mock_model("org/medium", disk_size_bytes=14_000_000_000, downloads=100)
+        large = _make_mock_model("org/large", disk_size_bytes=28_000_000_000, downloads=100)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [small, medium, large]
+            mock_api_cls.return_value = mock_api
+
+            # Filter: 3B-8B params (BF16: 4GB=2B, 14GB=7B, 28GB=14B)
+            result = await HFDownloader.search_models(
+                query="model",
+                min_params=3_000_000_000,
+                max_params=8_000_000_000,
+            )
+
+        # Only medium model should be included
+        assert len(result["models"]) == 1
+        assert result["models"][0]["repo_id"] == "org/medium"
+
+    @pytest.mark.asyncio
+    async def test_search_filter_by_min_max_size(self):
+        """Test filtering by model size range."""
+        small = _make_mock_model("org/small", disk_size_bytes=2_000_000_000, downloads=100)
+        medium = _make_mock_model("org/medium", disk_size_bytes=8_000_000_000, downloads=100)
+        large = _make_mock_model("org/large", disk_size_bytes=20_000_000_000, downloads=100)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [small, medium, large]
+            mock_api_cls.return_value = mock_api
+
+            # Filter: 5GB-15GB
+            result = await HFDownloader.search_models(
+                query="model",
+                min_size=5_000_000_000,
+                max_size=15_000_000_000,
+            )
+
+        # Only medium model should be included
+        assert len(result["models"]) == 1
+        assert result["models"][0]["repo_id"] == "org/medium"
+
+    @pytest.mark.asyncio
+    async def test_search_includes_quantization_field(self):
+        """Verify search results include quantization field."""
+        model = _make_mock_model(
+            "org/model-4bit", disk_size_bytes=2_000_000_000, downloads=100
+        )
+        model.safetensors = {"parameters": {"Q4_K": 1_000_000_000}, "total": 1_000_000_000}
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(query="model")
+
+        assert "quantization" in result["models"][0]
+        assert result["models"][0]["quantization"] in ("int4", "q4_k")
+
 
 # =============================================================================
 # Get Model Info Tests
@@ -1540,6 +1685,59 @@ class TestCalcSafetensorsDiskSize:
 
         assert _calc_safetensors_disk_size({"parameters": {}}) == 0
         assert _calc_safetensors_disk_size({}) == 0
+
+
+class TestDetectQuantization:
+    """Test _detect_quantization helper."""
+
+    def test_detects_bf16(self):
+        from omlx.admin.hf_downloader import _detect_quantization
+
+        st = {"parameters": {"BF16": 1_000_000}, "total": 1_000_000}
+        assert _detect_quantization(st, "org/model") == "bf16"
+
+    def test_detects_fp16(self):
+        from omlx.admin.hf_downloader import _detect_quantization
+
+        st = {"parameters": {"F16": 1_000_000}, "total": 1_000_000}
+        assert _detect_quantization(st, "org/model") == "fp16"
+
+    def test_detects_fp32(self):
+        from omlx.admin.hf_downloader import _detect_quantization
+
+        st = {"parameters": {"F32": 1_000_000}, "total": 1_000_000}
+        assert _detect_quantization(st, "org/model") == "fp32"
+
+    def test_detects_q4_k(self):
+        from omlx.admin.hf_downloader import _detect_quantization
+
+        st = {"parameters": {"Q4_K": 1_000_000}, "total": 1_000_000}
+        assert _detect_quantization(st, "org/model") == "int4"
+
+    def test_detects_q8(self):
+        from omlx.admin.hf_downloader import _detect_quantization
+
+        st = {"parameters": {"Q8": 1_000_000}, "total": 1_000_000}
+        assert _detect_quantization(st, "org/model") == "int8"
+
+    def test_detects_from_model_name_4bit(self):
+        from omlx.admin.hf_downloader import _detect_quantization
+
+        # No safetensors, infer from name
+        result = _detect_quantization(None, "mlx-community/Llama-3-8B-4bit-MLX")
+        assert result == "int4"
+
+    def test_detects_from_model_name_8bit(self):
+        from omlx.admin.hf_downloader import _detect_quantization
+
+        result = _detect_quantization(None, "mlx-community/Llama-3-8B-8bit")
+        assert result == "int8"
+
+    def test_returns_none_when_no_info(self):
+        from omlx.admin.hf_downloader import _detect_quantization
+
+        result = _detect_quantization(None, "mlx-community/Llama-3-8B-Instruct")
+        assert result is None
 
 
 # =============================================================================
