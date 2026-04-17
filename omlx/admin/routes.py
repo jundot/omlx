@@ -3421,13 +3421,23 @@ async def delete_hf_model(
         raise HTTPException(status_code=404, detail="Model not found")
 
     # Validate path traversal against parent model directory
+    # Symlinks require separate validation: the symlink itself must reside
+    # inside model_dir, but its target may point anywhere.  We only ever
+    # unlink the symlink (never follow it), so validating the parent is safe.
     try:
-        if not model_path.resolve().is_relative_to(parent_model_dir.resolve()):
-            raise HTTPException(status_code=400, detail="Invalid model name")
+        if model_path.is_symlink():
+            # Ensure the symlink lives inside the model directory.
+            # We resolve the *parent* (which cannot be a symlink we created)
+            # and verify the symlink name is legitimate.
+            if not model_path.parent.resolve().is_relative_to(parent_model_dir.resolve()):
+                raise HTTPException(status_code=400, detail="Invalid model name")
+        else:
+            if not model_path.resolve().is_relative_to(parent_model_dir.resolve()):
+                raise HTTPException(status_code=400, detail="Invalid model name")
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid model name")
 
-    if not model_path.is_dir():
+    if not model_path.is_dir() and not model_path.is_symlink():
         raise HTTPException(status_code=400, detail="Not a model directory")
 
     # Unload model if loaded
@@ -3457,11 +3467,15 @@ async def delete_hf_model(
         raise exc_info[1].with_traceback(exc_info[2])
 
     try:
-        if sys.version_info >= (3, 12):
+        if model_path.is_symlink():
+            model_path.unlink()
+            logger.info(f"Deleted model symlink: {model_path}")
+        elif sys.version_info >= (3, 12):
             shutil.rmtree(model_path, onexc=_handle_onexc)
+            logger.info(f"Deleted model directory: {model_path}")
         else:
             shutil.rmtree(model_path, onerror=_handle_onerror)
-        logger.info(f"Deleted model directory: {model_path}")
+            logger.info(f"Deleted model directory: {model_path}")
     except Exception as e:
         logger.error(f"Failed to delete model directory {model_path}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete model: {e}")
