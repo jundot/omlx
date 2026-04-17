@@ -798,6 +798,14 @@ def sparse_prefill(
 
     M = tokens.shape[0]
 
+    # Strip any stale _OffsetAdjustedRoPE / _PositionMappedRoPE wrappers from
+    # a previous sparse_prefill that was interrupted (e.g. by cache corruption
+    # and rescheduled re-prefill).  Without this, the constructor of
+    # _PositionMappedRoPE would try to read `.dims` off an _OffsetAdjustedRoPE
+    # object, which doesn't have that attribute, causing:
+    #   AttributeError: '_OffsetAdjustedRoPE' object has no attribute 'dims'
+    cleanup_rope(model)
+
     # Ensure tail tokens for RotatingKVCache (sliding window) layers
     max_rotating_size = 0
     for c in cache:
