@@ -62,6 +62,22 @@
                            placeholder="https://huggingface.co"
                            @keydown.enter="saveHfMirrorEndpoint()"
                            class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                    <div class="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm font-medium text-neutral-700 mb-1.5">{{ t('models.downloader.max_simultaneous_downloads') }}</label>
+                            <p class="text-xs text-neutral-400 mb-3">{{ t('models.downloader.max_simultaneous_downloads_hint') }}</p>
+                            <input type="number" x-model.number="hfMirrorMaxSimultaneousDownloads"
+                                   min="1" step="1"
+                                   class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-neutral-700 mb-1.5">{{ t('models.downloader.max_workers') }}</label>
+                            <p class="text-xs text-neutral-400 mb-3">{{ t('models.downloader.max_workers_hint') }}</p>
+                            <input type="number" x-model.number="hfMirrorMaxWorkers"
+                                   min="1" step="1"
+                                   class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                        </div>
+                    </div>
                 </div>
                 <div class="flex items-center justify-end gap-3 px-6 py-4 border-t border-neutral-100 bg-neutral-50">
                     <button @click="showHfMirrorModal = false"

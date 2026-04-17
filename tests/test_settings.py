@@ -14,6 +14,7 @@ from omlx.settings import (
     AuthSettings,
     CacheSettings,
     ClaudeCodeSettings,
+    DownloadSettings,
     GlobalSettings,
     HuggingFaceSettings,
     LoggingSettings,
@@ -394,6 +395,7 @@ class TestAuthSettings:
     def test_to_dict_with_sub_keys(self):
         """Test conversion to dictionary with sub keys."""
         from omlx.settings import SubKeyEntry
+
         settings = AuthSettings(
             api_key="my-key",
             sub_keys=[SubKeyEntry(key="sk1", name="Test", created_at="2024-01-01")],
@@ -551,6 +553,38 @@ class TestNetworkSettings:
         assert settings.ca_bundle == "/tmp/ca.pem"
 
 
+class TestDownloadSettings:
+    """Tests for DownloadSettings dataclass."""
+
+    def test_defaults(self):
+        """Test default values."""
+        settings = DownloadSettings()
+        assert settings.max_simultaneous_downloads == 2
+        assert settings.max_workers == 8
+
+    def test_to_dict(self):
+        """Test conversion to dictionary."""
+        settings = DownloadSettings(max_simultaneous_downloads=4, max_workers=16)
+        assert settings.to_dict() == {
+            "max_simultaneous_downloads": 4,
+            "max_workers": 16,
+        }
+
+    def test_from_dict(self):
+        """Test creation from dictionary."""
+        settings = DownloadSettings.from_dict(
+            {"max_simultaneous_downloads": 3, "max_workers": 12}
+        )
+        assert settings.max_simultaneous_downloads == 3
+        assert settings.max_workers == 12
+
+    def test_from_dict_defaults(self):
+        """Test creation from empty dictionary uses defaults."""
+        settings = DownloadSettings.from_dict({})
+        assert settings.max_simultaneous_downloads == 2
+        assert settings.max_workers == 8
+
+
 class TestLoggingSettings:
     """Tests for LoggingSettings dataclass."""
 
@@ -667,9 +701,7 @@ class TestMemorySettings:
 
     def test_to_dict_guard_disabled(self):
         """Test serialization with prefill guard disabled."""
-        settings = MemorySettings(
-            max_process_memory="75%", prefill_memory_guard=False
-        )
+        settings = MemorySettings(max_process_memory="75%", prefill_memory_guard=False)
         d = settings.to_dict()
         assert d["prefill_memory_guard"] is False
 
@@ -702,6 +734,8 @@ class TestGlobalSettings:
             assert settings.server.port == 8000
             assert settings.model.max_model_memory == "auto"
             assert settings.scheduler.max_concurrent_requests == 8
+            assert settings.download.max_simultaneous_downloads == 2
+            assert settings.download.max_workers == 8
             assert settings.cache.enabled is True
             assert settings.auth.api_key is None
             assert settings.mcp.config_path is None
@@ -717,6 +751,10 @@ class TestGlobalSettings:
                         "version": "1.0",
                         "server": {"port": 9000},
                         "auth": {"api_key": "test-key"},
+                        "download": {
+                            "max_simultaneous_downloads": 3,
+                            "max_workers": 12,
+                        },
                     }
                 )
             )
@@ -724,6 +762,8 @@ class TestGlobalSettings:
             settings = GlobalSettings.load(base_path=tmpdir)
             assert settings.server.port == 9000
             assert settings.auth.api_key == "test-key"
+            assert settings.download.max_simultaneous_downloads == 3
+            assert settings.download.max_workers == 12
 
     def test_load_from_file_all_sections(self):
         """Test loading all settings sections from file."""
@@ -733,7 +773,11 @@ class TestGlobalSettings:
                 json.dumps(
                     {
                         "version": "1.0",
-                        "server": {"host": "0.0.0.0", "port": 9000, "log_level": "debug"},
+                        "server": {
+                            "host": "0.0.0.0",
+                            "port": 9000,
+                            "log_level": "debug",
+                        },
                         "model": {"model_dir": "/models", "max_model_memory": "64GB"},
                         "scheduler": {
                             "max_concurrent_requests": 128,
@@ -745,6 +789,10 @@ class TestGlobalSettings:
                         },
                         "auth": {"api_key": "secret"},
                         "mcp": {"config_path": "/mcp.json"},
+                        "download": {
+                            "max_simultaneous_downloads": 4,
+                            "max_workers": 10,
+                        },
                     }
                 )
             )
@@ -761,6 +809,8 @@ class TestGlobalSettings:
             assert settings.cache.ssd_cache_dir == "/cache"
             assert settings.auth.api_key == "secret"
             assert settings.mcp.config_path == "/mcp.json"
+            assert settings.download.max_simultaneous_downloads == 4
+            assert settings.download.max_workers == 10
 
     def test_load_nonexistent_file_uses_defaults(self):
         """Test loading with no settings file uses defaults."""
@@ -785,6 +835,8 @@ class TestGlobalSettings:
             settings = GlobalSettings(base_path=Path(tmpdir))
             settings.server.port = 9001
             settings.auth.api_key = "saved-key"
+            settings.download.max_simultaneous_downloads = 5
+            settings.download.max_workers = 14
             settings.save()
 
             # Verify file was created
@@ -796,6 +848,8 @@ class TestGlobalSettings:
             assert data["version"] == "1.0"
             assert data["server"]["port"] == 9001
             assert data["auth"]["api_key"] == "saved-key"
+            assert data["download"]["max_simultaneous_downloads"] == 5
+            assert data["download"]["max_workers"] == 14
 
     def test_save_and_load_cors_origins(self):
         """Test saving and loading cors_origins through settings file."""
@@ -977,6 +1031,15 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert any("initial_cache_blocks" in e.lower() for e in errors)
 
+    def test_validate_invalid_download_settings(self):
+        """Test validation catches invalid downloader settings."""
+        settings = GlobalSettings()
+        settings.download.max_simultaneous_downloads = 0
+        settings.download.max_workers = -1
+        errors = settings.validate()
+        assert any("max_simultaneous_downloads" in e for e in errors)
+        assert any("max_workers" in e for e in errors)
+
     def test_validate_multiple_errors(self):
         """Test validation returns multiple errors."""
         settings = GlobalSettings()
@@ -1093,16 +1156,12 @@ class TestGlobalSettings:
         """Test various values for OMLX_CACHE_ENABLED."""
         with tempfile.TemporaryDirectory() as tmpdir:
             for value in ["true", "1", "yes"]:
-                with patch.dict(
-                    os.environ, {"OMLX_CACHE_ENABLED": value}, clear=False
-                ):
+                with patch.dict(os.environ, {"OMLX_CACHE_ENABLED": value}, clear=False):
                     settings = GlobalSettings.load(base_path=tmpdir)
                     assert settings.cache.enabled is True
 
             for value in ["false", "0", "no"]:
-                with patch.dict(
-                    os.environ, {"OMLX_CACHE_ENABLED": value}, clear=False
-                ):
+                with patch.dict(os.environ, {"OMLX_CACHE_ENABLED": value}, clear=False):
                     settings = GlobalSettings.load(base_path=tmpdir)
                     assert settings.cache.enabled is False
 
@@ -1152,6 +1211,21 @@ class TestGlobalSettings:
                 assert settings.network.no_proxy == "localhost,127.0.0.1"
                 assert settings.network.ca_bundle == "/tmp/corp-ca.pem"
 
+    def test_env_override_download_settings(self):
+        """Test environment variable overrides for downloader settings."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {
+                    "OMLX_DOWNLOAD_MAX_SIMULTANEOUS": "3",
+                    "OMLX_DOWNLOAD_MAX_WORKERS": "12",
+                },
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.download.max_simultaneous_downloads == 3
+                assert settings.download.max_workers == 12
+
     def test_env_override_invalid_port_logs_warning(self):
         """Test invalid OMLX_PORT logs warning and keeps default."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1159,6 +1233,21 @@ class TestGlobalSettings:
                 settings = GlobalSettings.load(base_path=tmpdir)
                 # Should keep default due to parse error
                 assert settings.server.port == 8000
+
+    def test_env_override_invalid_download_values_log_warning(self):
+        """Test invalid downloader env vars keep defaults."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {
+                    "OMLX_DOWNLOAD_MAX_SIMULTANEOUS": "many",
+                    "OMLX_DOWNLOAD_MAX_WORKERS": "lots",
+                },
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.download.max_simultaneous_downloads == 2
+                assert settings.download.max_workers == 8
 
     def test_env_override_after_file(self):
         """Test env vars override file settings."""
@@ -1183,6 +1272,8 @@ class TestGlobalSettings:
                 log_level="warning",
                 model_dir="/cli/models",
                 max_model_memory="32GB",
+                download_max_simultaneous=4,
+                download_max_workers=16,
                 api_key="cli-key",
             )
             settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
@@ -1191,6 +1282,8 @@ class TestGlobalSettings:
             assert settings.server.log_level == "warning"
             assert settings.model.model_dir == "/cli/models"
             assert settings.model.max_model_memory == "32GB"
+            assert settings.download.max_simultaneous_downloads == 4
+            assert settings.download.max_workers == 16
             assert settings.auth.api_key == "cli-key"
 
     def test_cli_override_partial(self):
@@ -1221,6 +1314,17 @@ class TestGlobalSettings:
             assert settings.cache.enabled is False
             assert settings.cache.ssd_cache_dir == "/cli/cache"
             assert settings.cache.ssd_cache_max_size == "500GB"
+
+    def test_cli_override_download_settings(self):
+        """Test CLI override for downloader settings."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = Namespace(
+                download_max_simultaneous=6,
+                download_max_workers=24,
+            )
+            settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
+            assert settings.download.max_simultaneous_downloads == 6
+            assert settings.download.max_workers == 24
 
     def test_cli_override_initial_cache_blocks(self):
         """Test CLI override for initial_cache_blocks."""
@@ -1301,11 +1405,13 @@ class TestGlobalSettings:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = GlobalSettings(base_path=Path(tmpdir))
             settings.server.port = 9000
+            settings.download.max_workers = 12
             result = settings.to_dict()
 
             assert result["version"] == "1.0"
             assert result["base_path"] == tmpdir
             assert result["server"]["port"] == 9000
+            assert result["download"]["max_workers"] == 12
             assert "model" in result
             assert "scheduler" in result
             assert "cache" in result
@@ -1382,7 +1488,10 @@ class TestInitSettings:
 
     def test_multiple_init_overwrites(self):
         """Test calling init_settings multiple times overwrites."""
-        with tempfile.TemporaryDirectory() as tmpdir1, tempfile.TemporaryDirectory() as tmpdir2:
+        with (
+            tempfile.TemporaryDirectory() as tmpdir1,
+            tempfile.TemporaryDirectory() as tmpdir2,
+        ):
             settings1 = init_settings(base_path=tmpdir1)
             settings2 = init_settings(base_path=tmpdir2)
 
@@ -1566,7 +1675,11 @@ class TestSamplingSettings:
 
     def test_from_dict(self):
         """Test creation from dictionary."""
-        data = {"max_context_window": 8192, "max_tokens": 1024, "repetition_penalty": 1.2}
+        data = {
+            "max_context_window": 8192,
+            "max_tokens": 1024,
+            "repetition_penalty": 1.2,
+        }
         settings = SamplingSettings.from_dict(data)
         assert settings.max_context_window == 8192
         assert settings.max_tokens == 1024
@@ -1767,6 +1880,7 @@ class TestClaudeCodeRouteIntegration:
         the field in model_fields_set so the POST handler can clear it.
         """
         from omlx.admin.routes import GlobalSettingsRequest
+
         r = GlobalSettingsRequest.model_validate({"claude_code_opus_model": None})
         assert "claude_code_opus_model" in r.model_fields_set
         assert r.claude_code_opus_model is None
@@ -1777,6 +1891,7 @@ class TestClaudeCodeRouteIntegration:
         in model_fields_set — POST handler must not apply it (leave server value alone).
         """
         from omlx.admin.routes import GlobalSettingsRequest
+
         r = GlobalSettingsRequest()
         assert "claude_code_opus_model" not in r.model_fields_set
 
@@ -1786,7 +1901,10 @@ class TestClaudeCodeRouteIntegration:
         in model_fields_set and carry the value.
         """
         from omlx.admin.routes import GlobalSettingsRequest
-        r = GlobalSettingsRequest(claude_code_opus_model="mlx-community/Qwen3-30B-A3B-4bit")
+
+        r = GlobalSettingsRequest(
+            claude_code_opus_model="mlx-community/Qwen3-30B-A3B-4bit"
+        )
         assert "claude_code_opus_model" in r.model_fields_set
         assert r.claude_code_opus_model == "mlx-community/Qwen3-30B-A3B-4bit"
 

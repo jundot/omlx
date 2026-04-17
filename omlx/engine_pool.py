@@ -21,17 +21,14 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
+    from .engine import BaseEngine, BatchedEngine
+    from .engine.embedding import EmbeddingEngine
+    from .engine.reranker import RerankerEngine
+    from .engine.stt import STTEngine
+    from .engine.sts import STSEngine
+    from .engine.tts import TTSEngine
+    from .engine.vlm import VLMBatchedEngine
     from .model_settings import ModelSettingsManager
-
-import mlx.core as mx
-
-from .engine import BaseEngine, BatchedEngine
-from .engine.embedding import EmbeddingEngine
-from .engine.reranker import RerankerEngine
-from .engine.stt import STTEngine
-from .engine.sts import STSEngine
-from .engine.tts import TTSEngine
-from .engine.vlm import VLMBatchedEngine
 from .exceptions import (
     EnginePoolError,
     InsufficientMemoryError,
@@ -40,10 +37,15 @@ from .exceptions import (
     ModelTooLargeError,
 )
 from .model_discovery import DiscoveredModel, discover_models, format_size
-from .engine_core import get_mlx_executor
-from .scheduler import SchedulerConfig
+from .scheduler_config import SchedulerConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _mx():
+    import mlx.core as mx
+
+    return mx
 
 
 @dataclass
@@ -52,12 +54,35 @@ class EngineEntry:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
+    model_type: Literal[
+        "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"
+    ]  # Model type
+    engine_type: Literal[
+        "batched",
+        "simple",
+        "embedding",
+        "reranker",
+        "vlm",
+        "audio_stt",
+        "audio_tts",
+        "audio_sts",
+    ]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
-    config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
-    thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
-    engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
+    config_model_type: str = (
+        ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
+    )
+    thinking_default: bool | None = (
+        None  # True if model thinks by default, False if not, None if unknown
+    )
+    engine: (
+        BaseEngine
+        | EmbeddingEngine
+        | RerankerEngine
+        | STTEngine
+        | STSEngine
+        | TTSEngine
+        | None
+    ) = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
     is_pinned: bool = False  # Never evict if True
@@ -180,10 +205,13 @@ class EnginePool:
             if model_id not in found_models:
                 logger.warning(f"Pinned model not found: {model_id}")
 
-        mem_display = "disabled" if self._max_model_memory is None else format_size(self._max_model_memory)
+        mem_display = (
+            "disabled"
+            if self._max_model_memory is None
+            else format_size(self._max_model_memory)
+        )
         logger.info(
-            f"Discovered {len(self._entries)} models, "
-            f"max memory: {mem_display}"
+            f"Discovered {len(self._entries)} models, " f"max memory: {mem_display}"
         )
 
     _MODEL_TYPE_TO_ENGINE: dict[str, str] = {
@@ -291,8 +319,17 @@ class EnginePool:
         return model_id_or_alias
 
     async def get_engine(
-        self, model_id: str, force_lm: bool = False,
-    ) -> BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine:
+        self,
+        model_id: str,
+        force_lm: bool = False,
+    ) -> (
+        BaseEngine
+        | EmbeddingEngine
+        | RerankerEngine
+        | STTEngine
+        | STSEngine
+        | TTSEngine
+    ):
         """
         Get or load engine for the specified model.
 
@@ -325,7 +362,7 @@ class EnginePool:
             # Already loaded - just update access time
             if entry.engine is not None:
                 # If force_lm requested but current engine is VLM, unload and reload
-                if force_lm and isinstance(entry.engine, VLMBatchedEngine):
+                if force_lm and type(entry.engine).__name__ == "VLMBatchedEngine":
                     logger.info(
                         f"Unloading VLM engine for {model_id} "
                         f"(force_lm=True, reloading as LM)"
@@ -361,7 +398,10 @@ class EnginePool:
                 except InsufficientMemoryError:
                     # Can't fit with headroom even after evicting everything possible.
                     # Fall back to weights-only if that fits.
-                    if self._current_model_memory + entry.estimated_size <= self._max_model_memory:
+                    if (
+                        self._current_model_memory + entry.estimated_size
+                        <= self._max_model_memory
+                    ):
                         logger.info(
                             f"Loading {model_id} without KV headroom "
                             f"(need {format_size(required_with_headroom)}, "
@@ -376,6 +416,7 @@ class EnginePool:
             if self._process_memory_enforcer is not None:
                 enforcer = self._process_memory_enforcer
                 if enforcer.max_bytes > 0:
+                    mx = _mx()
                     while True:
                         current_active = mx.get_active_memory()
                         projected = current_active + entry.estimated_size
@@ -453,9 +494,7 @@ class EnginePool:
                 continue
             try:
                 if e.engine.has_active_requests():
-                    logger.debug(
-                        f"Skipping victim '{mid}': has active requests"
-                    )
+                    logger.debug(f"Skipping victim '{mid}': has active requests")
                     continue
             except AttributeError:
                 pass
@@ -481,6 +520,9 @@ class EnginePool:
             return
 
         logger.info(f"Unloading model: {model_id} (immediate abort)")
+        mx = _mx()
+        from .engine_core import get_mlx_executor
+
         pre_unload_active = mx.get_active_memory()
 
         try:
@@ -590,6 +632,17 @@ class EnginePool:
         entry.abort_loading = False
         try:
             effective_type = entry.engine_type
+            from .engine import BatchedEngine
+            from .engine.embedding import EmbeddingEngine
+            from .engine.reranker import RerankerEngine
+            from .engine.stt import STTEngine
+            from .engine.sts import STSEngine
+            from .engine.tts import TTSEngine
+            from .engine.vlm import VLMBatchedEngine
+            from .engine_core import get_mlx_executor
+
+            mx = _mx()
+
             if force_lm and effective_type == "vlm":
                 effective_type = "batched"
                 logger.info(f"Loading model as LM (force_lm=True): {model_id}")
@@ -610,15 +663,20 @@ class EnginePool:
                 if dflash_enabled and dflash_draft:
                     try:
                         from .engine.dflash import DFlashEngine
+
                         engine = DFlashEngine(
                             model_name=entry.model_path,
                             draft_model_path=dflash_draft,
-                            draft_quant_bits=getattr(model_settings, "dflash_draft_quant_bits", None),
+                            draft_quant_bits=getattr(
+                                model_settings, "dflash_draft_quant_bits", None
+                            ),
                             model_settings=model_settings,
                             fallback_engine_type=effective_type,
                             scheduler_config=self._scheduler_config,
                         )
-                        logger.info(f"DFlash enabled for {model_id}, draft={dflash_draft}")
+                        logger.info(
+                            f"DFlash enabled for {model_id}, draft={dflash_draft}"
+                        )
                     except ImportError:
                         logger.warning(
                             f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
@@ -658,7 +716,9 @@ class EnginePool:
                         model_settings=model_settings,
                     )
 
-            _is_dflash_engine = engine is not None and type(engine).__name__ == "DFlashEngine"
+            _is_dflash_engine = (
+                engine is not None and type(engine).__name__ == "DFlashEngine"
+            )
 
             try:
                 await engine.start()
@@ -756,23 +816,18 @@ class EnginePool:
                     entry.model_type = "llm"
                     entry.engine_type = "batched"
                     logger.info(
-                        f"Successfully loaded {model_id} as LLM "
-                        f"(fallback from VLM)"
+                        f"Successfully loaded {model_id} as LLM " f"(fallback from VLM)"
                     )
                 else:
                     raise
 
             # Check if memory enforcer requested abort during loading
             if entry.abort_loading:
-                logger.warning(
-                    f"Model load aborted by memory enforcer: {model_id}"
-                )
+                logger.warning(f"Model load aborted by memory enforcer: {model_id}")
                 try:
                     await engine.stop()
                 except Exception as e:
-                    logger.warning(
-                        f"Error stopping aborted engine for {model_id}: {e}"
-                    )
+                    logger.warning(f"Error stopping aborted engine for {model_id}: {e}")
                 gc.collect()
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
@@ -780,8 +835,7 @@ class EnginePool:
                     lambda: (mx.synchronize(), mx.clear_cache()),
                 )
                 raise ModelLoadingError(
-                    f"Model {model_id} load aborted: "
-                    f"process memory limit exceeded"
+                    f"Model {model_id} load aborted: " f"process memory limit exceeded"
                 )
 
             entry.engine = engine
@@ -854,7 +908,9 @@ class EnginePool:
             "max_model_memory": self._max_model_memory,
             "current_model_memory": self._current_model_memory,
             "model_count": len(self._entries),
-            "loaded_count": sum(1 for e in self._entries.values() if e.engine is not None),
+            "loaded_count": sum(
+                1 for e in self._entries.values() if e.engine is not None
+            ),
             "models": [
                 {
                     "id": mid,

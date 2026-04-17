@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 from .config import parse_size
 
 if TYPE_CHECKING:
-    from .scheduler import SchedulerConfig
+    from .scheduler_config import SchedulerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -304,7 +304,9 @@ class MemorySettings:
     """Process-level memory enforcement settings."""
 
     max_process_memory: str = "auto"  # "auto" (RAM - 8GB), "disabled", or "XX%"
-    prefill_memory_guard: bool = True  # Memory guard: prefill estimation + generation scheduling defer
+    prefill_memory_guard: bool = (
+        True  # Memory guard: prefill estimation + generation scheduling defer
+    )
 
     def get_max_process_memory_bytes(self) -> int | None:
         """
@@ -332,9 +334,7 @@ class MemorySettings:
             # Try parsing as absolute size (e.g., "32GB")
             return parse_size(self.max_process_memory)
         if not 10 <= percent <= 99:
-            raise ValueError(
-                f"max_process_memory must be 10-99%, got {percent}%"
-            )
+            raise ValueError(f"max_process_memory must be 10-99%, got {percent}%")
         return int(get_system_memory() * percent / 100)
 
     def to_dict(self) -> dict[str, Any]:
@@ -404,9 +404,7 @@ class AuthSettings:
             api_key=data.get("api_key"),
             secret_key=data.get("secret_key"),
             skip_api_key_verification=data.get("skip_api_key_verification", False),
-            sub_keys=[
-                SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])
-            ],
+            sub_keys=[SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])],
         )
 
 
@@ -484,6 +482,26 @@ class NetworkSettings:
             https_proxy=data.get("https_proxy", ""),
             no_proxy=data.get("no_proxy", ""),
             ca_bundle=data.get("ca_bundle", ""),
+        )
+
+
+@dataclass
+class DownloadSettings:
+    """Downloader configuration settings."""
+
+    max_simultaneous_downloads: int = 2
+    max_workers: int = 8
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DownloadSettings":
+        """Create from dictionary."""
+        return cls(
+            max_simultaneous_downloads=data.get("max_simultaneous_downloads", 2),
+            max_workers=data.get("max_workers", 8),
         )
 
 
@@ -667,6 +685,7 @@ class GlobalSettings:
     huggingface: HuggingFaceSettings = field(default_factory=HuggingFaceSettings)
     modelscope: ModelScopeSettings = field(default_factory=ModelScopeSettings)
     network: NetworkSettings = field(default_factory=NetworkSettings)
+    download: DownloadSettings = field(default_factory=DownloadSettings)
     sampling: SamplingSettings = field(default_factory=SamplingSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
@@ -753,6 +772,8 @@ class GlobalSettings:
                 self.modelscope = ModelScopeSettings.from_dict(data["modelscope"])
             if "network" in data:
                 self.network = NetworkSettings.from_dict(data["network"])
+            if "download" in data:
+                self.download = DownloadSettings.from_dict(data["download"])
             if "sampling" in data:
                 self.sampling = SamplingSettings.from_dict(data["sampling"])
             if "logging" in data:
@@ -760,9 +781,7 @@ class GlobalSettings:
             if "claude_code" in data:
                 self.claude_code = ClaudeCodeSettings.from_dict(data["claude_code"])
             if "integrations" in data:
-                self.integrations = IntegrationSettings.from_dict(
-                    data["integrations"]
-                )
+                self.integrations = IntegrationSettings.from_dict(data["integrations"])
             if "ui" in data:
                 self.ui = UISettings.from_dict(data["ui"])
 
@@ -849,6 +868,25 @@ class GlobalSettings:
         if ca_bundle := os.getenv("OMLX_CA_BUNDLE"):
             self.network.ca_bundle = ca_bundle
 
+        # Download settings
+        if download_max_simultaneous := os.getenv("OMLX_DOWNLOAD_MAX_SIMULTANEOUS"):
+            try:
+                self.download.max_simultaneous_downloads = int(
+                    download_max_simultaneous
+                )
+            except ValueError:
+                logger.warning(
+                    "Invalid OMLX_DOWNLOAD_MAX_SIMULTANEOUS value: "
+                    f"{download_max_simultaneous}"
+                )
+        if download_max_workers := os.getenv("OMLX_DOWNLOAD_MAX_WORKERS"):
+            try:
+                self.download.max_workers = int(download_max_workers)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_DOWNLOAD_MAX_WORKERS value: {download_max_workers}"
+                )
+
         # Logging settings
         if log_dir := os.getenv("OMLX_LOG_DIR"):
             self.logging.log_dir = log_dir
@@ -882,10 +920,7 @@ class GlobalSettings:
             self.model.max_model_memory = args.max_model_memory
 
         # Memory enforcement settings
-        if (
-            hasattr(args, "max_process_memory")
-            and args.max_process_memory is not None
-        ):
+        if hasattr(args, "max_process_memory") and args.max_process_memory is not None:
             self.memory.max_process_memory = args.max_process_memory
 
         # Scheduler settings
@@ -934,6 +969,18 @@ class GlobalSettings:
         if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
             self.network.ca_bundle = args.ca_bundle
 
+        # Download settings
+        if (
+            hasattr(args, "download_max_simultaneous")
+            and args.download_max_simultaneous is not None
+        ):
+            self.download.max_simultaneous_downloads = args.download_max_simultaneous
+        if (
+            hasattr(args, "download_max_workers")
+            and args.download_max_workers is not None
+        ):
+            self.download.max_workers = args.download_max_workers
+
     def save(self) -> None:
         """Save current settings to the settings file."""
         self.ensure_directories()
@@ -951,6 +998,7 @@ class GlobalSettings:
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),
             "network": self.network.to_dict(),
+            "download": self.download.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
@@ -1014,9 +1062,7 @@ class GlobalSettings:
 
         # Server validation
         if not 1 <= self.server.port <= 65535:
-            errors.append(
-                f"Invalid port: {self.server.port} (must be 1-65535)"
-            )
+            errors.append(f"Invalid port: {self.server.port} (must be 1-65535)")
 
         valid_log_levels = {"trace", "debug", "info", "warning", "error", "critical"}
         if self.server.log_level.lower() not in valid_log_levels:
@@ -1041,9 +1087,7 @@ class GlobalSettings:
             try:
                 percent = int(percent_str)
                 if not 10 <= percent <= 99:
-                    errors.append(
-                        f"max_process_memory must be 10-99%, got {percent}%"
-                    )
+                    errors.append(f"max_process_memory must be 10-99%, got {percent}%")
             except ValueError:
                 # Could be absolute size, try parsing
                 try:
@@ -1073,6 +1117,17 @@ class GlobalSettings:
             errors.append(
                 f"Invalid initial_cache_blocks: "
                 f"{self.cache.initial_cache_blocks} (must be > 0)"
+            )
+
+        # Download validation
+        if self.download.max_simultaneous_downloads <= 0:
+            errors.append(
+                "Invalid max_simultaneous_downloads: "
+                f"{self.download.max_simultaneous_downloads} (must be > 0)"
+            )
+        if self.download.max_workers <= 0:
+            errors.append(
+                f"Invalid max_workers: {self.download.max_workers} (must be > 0)"
             )
 
         # Sampling validation
@@ -1150,7 +1205,7 @@ class GlobalSettings:
         Returns:
             SchedulerConfig instance with values from settings.
         """
-        from .scheduler import SchedulerConfig
+        from .scheduler_config import SchedulerConfig
 
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
@@ -1173,6 +1228,7 @@ class GlobalSettings:
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),
             "network": self.network.to_dict(),
+            "download": self.download.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
@@ -1197,9 +1253,7 @@ def get_settings() -> GlobalSettings:
     """
     global _global_settings
     if _global_settings is None:
-        raise RuntimeError(
-            "Settings not initialized. Call init_settings() first."
-        )
+        raise RuntimeError("Settings not initialized. Call init_settings() first.")
     return _global_settings
 
 

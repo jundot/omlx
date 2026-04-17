@@ -113,3 +113,9 @@ omlx/admin/tailwindcss-*
 
 # Git worktrees
 .worktrees/
+
+# UV package manager lock file
+uv.lock
+
+# Claude IDE settings
+.claude/
