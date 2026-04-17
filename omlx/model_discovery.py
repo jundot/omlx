@@ -381,6 +381,10 @@ def detect_model_type(model_path: Path) -> ModelType:
     except (json.JSONDecodeError, IOError):
         return "llm"
 
+    # JANG models always route to batched engine — jang_tools handles loading
+    if (model_path / "jang_config.json").exists():
+        return "llm"
+
     # Check architectures field for reranker first (more specific)
     architectures = config.get("architectures", [])
     for arch in architectures:
