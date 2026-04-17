@@ -992,9 +992,17 @@ def create_app_bundle():
         "CFBundleSignature": "????",
         "CFBundleIconFile": "AppIcon",
         "LSMinimumSystemVersion": "15.0",
+        # Xcode sets this automatically; our manual bundle was missing it.
+        # Aligns the launch metadata with native AppKit templates so tools
+        # that key off NSPrincipalClass (Accessibility enumerators among
+        # them) recognize the process as a standard NSApplication host.
+        "NSPrincipalClass": "NSApplication",
         "NSHighResolutionCapable": True,
         "LSArchitecturePriority": ["arm64"],
-        "NSHumanReadableCopyright": f"Copyright 2024 oMLX contributors. Version {VERSION}",
+        "NSHumanReadableCopyright": (
+            f"Copyright © {datetime.now().year} oMLX contributors.\n"
+            "Licensed under the Apache License 2.0."
+        ),
     }
 
     with open(contents_dir / "Info.plist", "wb") as f:
