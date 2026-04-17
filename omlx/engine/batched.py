@@ -204,6 +204,23 @@ class BatchedEngine(BaseEngine):
         from ..engine_core import get_mlx_executor
 
         def _load_model_sync():
+            from pathlib import Path
+
+            jang_cfg = Path(self._model_name) / "jang_config.json"
+            if jang_cfg.exists():
+                try:
+                    from jang_tools.loader import load_jang_model
+                except ImportError:
+                    raise ImportError(
+                        "JANG model detected but jang-tools not installed. "
+                        "Install with: pip install jang-tools[mlx]"
+                    )
+                import logging
+                logging.getLogger("omlx.engine.batched").info(
+                    f"Loading JANG model: {self._model_name}"
+                )
+                return load_jang_model(str(self._model_name))
+
             return load(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
