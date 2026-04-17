@@ -59,6 +59,19 @@ VLM_MODEL_TYPES = {
     "youtu_vl",
 }
 
+# Model types that have both VLM and text-only variants.
+# These require a VLM architecture to be listed in the architectures field
+# to be detected as VLM — vision_config alone is not sufficient, since
+# text-only quantized variants of these families sometimes retain vision_config
+# as a configuration artefact without carrying actual vision encoder weights.
+# Example: Qwen3.6-35B-A3B-mlx-mxfp8 (text-only MoE) may keep vision_config
+# from the base model's config.json, causing spurious VLM detection that breaks
+# tool calling (VLMBatchedEngine vs BatchedEngine have different tool-call paths).
+AMBIGUOUS_VLM_MODEL_TYPES = {
+    "qwen3_5_moe",
+    "qwen3_vl_moe",
+}
+
 # Known VLM architectures
 VLM_ARCHITECTURES = {
     "LlavaForConditionalGeneration",
@@ -477,7 +490,22 @@ def detect_model_type(model_path: Path) -> ModelType:
     # Text-only quants won't have vision_config in their config.json.
     if normalized_type in VLM_MODEL_TYPES:
         if "vision_config" in config:
-            return "vlm"
+            # For ambiguous model types (families with both VLM and text-only
+            # variants), vision_config alone is not reliable — text-only quants
+            # sometimes retain it as a config artefact without carrying actual
+            # vision encoder weights.  Require a VLM architecture to confirm.
+            if normalized_type in AMBIGUOUS_VLM_MODEL_TYPES:
+                has_vlm_arch = any(a in VLM_ARCHITECTURES for a in architectures)
+                if not has_vlm_arch:
+                    logger.info(
+                        f"Model type '{model_type}' has vision_config but no VLM "
+                        "architecture — treating as LLM (text-only quant with "
+                        "residual vision_config)"
+                    )
+                else:
+                    return "vlm"
+            else:
+                return "vlm"
         logger.info(
             f"Model type '{model_type}' is in VLM_MODEL_TYPES but no vision_config found — "
             "treating as LLM (text-only quant)"
@@ -485,7 +513,8 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     # Check for VLM: presence of vision_config (fallback heuristic)
     # Catch-all for VLMs that aren't yet listed in VLM_MODEL_TYPES.
-    if "vision_config" in config:
+    # For ambiguous model types, skip this fallback (already handled above).
+    if "vision_config" in config and normalized_type not in AMBIGUOUS_VLM_MODEL_TYPES:
         return "vlm"
 
     # Check for audio models — architectures take priority over model_type.
