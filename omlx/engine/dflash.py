@@ -22,6 +22,8 @@ from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from .base import BaseEngine, GenerationOutput
 
+_IMAGE_CONTENT_TYPES = {"image", "image_url", "input_image"}
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_DFLASH_CTX = 4096
@@ -245,6 +247,18 @@ class DFlashEngine(BaseEngine):
 
     def _should_fallback(self, prompt_tokens: list[int]) -> bool:
         return len(prompt_tokens) >= self._max_dflash_ctx
+
+    @staticmethod
+    def _messages_have_images(messages: list[dict]) -> bool:
+        """Return True if any message contains an image content part."""
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in _IMAGE_CONTENT_TYPES:
+                    return True
+        return False
 
     def _run_generate_streaming(
         self,
@@ -508,6 +522,22 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # Image requests require VLM processing — route to fallback engine.
+        if self._messages_have_images(messages):
+            if not self._in_fallback_mode:
+                logger.info(
+                    "DFlash image fallback: request contains images, "
+                    "evicting dflash models and switching to %s engine",
+                    self._fallback_engine_type,
+                )
+                await self._evict_dflash_and_start_fallback()
+            return await self._fallback_engine.chat(
+                messages=messages, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty, tools=tools, **kwargs,
+            )
+
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         prompt = self._apply_chat_template(
@@ -536,6 +566,24 @@ class DFlashEngine(BaseEngine):
     ) -> AsyncIterator[GenerationOutput]:
         if not self._loaded:
             await self.start()
+
+        # Image requests require VLM processing — route to fallback engine.
+        if self._messages_have_images(messages):
+            if not self._in_fallback_mode:
+                logger.info(
+                    "DFlash image fallback: request contains images, "
+                    "evicting dflash models and switching to %s engine",
+                    self._fallback_engine_type,
+                )
+                await self._evict_dflash_and_start_fallback()
+            async for output in self._fallback_engine.stream_chat(
+                messages=messages, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty, tools=tools, **kwargs,
+            ):
+                yield output
+            return
 
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
