@@ -206,20 +206,36 @@ class BatchedEngine(BaseEngine):
         def _load_model_sync():
             from pathlib import Path
 
-            jang_cfg = Path(self._model_name) / "jang_config.json"
-            if jang_cfg.exists():
+            jang_cfg_path = Path(self._model_name) / "jang_config.json"
+            if jang_cfg_path.exists():
                 try:
-                    from jang_tools.loader import load_jang_model
+                    from jang_tools.loader import (
+                        _load_jang_v2,
+                        _is_v2_model,
+                    )
+                    import json
                 except ImportError:
                     raise ImportError(
                         "JANG model detected but jang-tools not installed. "
-                        "Install with: pip install jang-tools[mlx]"
+                        "Install with: pip install 'jang[mlx]'"
                     )
                 import logging
-                logging.getLogger("omlx.engine.batched").info(
-                    f"Loading JANG model: {self._model_name}"
-                )
-                return load_jang_model(str(self._model_name))
+                logger = logging.getLogger("omlx.engine.batched")
+                logger.info(f"Loading JANG model (text): {self._model_name}")
+
+                path = Path(self._model_name)
+                with open(jang_cfg_path) as f:
+                    jang_cfg = json.load(f)
+
+                # Batched engine is text-only — always use the text loader,
+                # bypassing jang_tools VLM detection which requires torchvision
+                # and routes through mlx_vlm (incompatible with batched cache).
+                if _is_v2_model(path):
+                    return _load_jang_v2(path, jang_cfg)
+                else:
+                    from jang_tools.loader import _load_jang_v1
+                    config_path = path / "config.json"
+                    return _load_jang_v1(path, jang_cfg, config_path)
 
             return load(
                 self._model_name,
