@@ -394,6 +394,99 @@ def launch_command(args):
     )
 
 
+def diagnose_menubar() -> int:
+    """Diagnose why the oMLX menubar icon might be missing.
+
+    Reports macOS version, app install path, running menubar process, and the
+    most recent visibility warning from the log. Prints manual recovery steps
+    since Tahoe's ControlCenter doesn't expose a public API to re-enable a
+    hidden status item.
+    """
+    import platform
+    import subprocess
+    from pathlib import Path
+
+    print("oMLX menubar diagnostics")
+    print("=" * 40)
+
+    mac_ver = platform.mac_ver()[0] or "unknown"
+    print(f"macOS:          {mac_ver}")
+    print(f"Bundle ID:      com.omlx.app")
+
+    app_path = Path("/Applications/oMLX.app")
+    print(f"App installed:  {'yes' if app_path.exists() else 'NO (install DMG first)'}")
+
+    try:
+        res = subprocess.run(
+            ["pgrep", "-af", "omlx_app"],
+            capture_output=True, text=True, timeout=5,
+        )
+        running = bool(res.stdout.strip())
+        print(f"Menubar app:    {'running' if running else 'NOT running'}")
+        if running:
+            first_line = res.stdout.strip().splitlines()[0]
+            pid = first_line.split()[0] if first_line else "?"
+            print(f"PID:            {pid}")
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        print(f"Menubar app:    check failed ({e})")
+
+    log_dir = Path.home() / "Library" / "Application Support" / "oMLX" / "logs"
+    # menubar.log captures the visibility probe (frame + isVisible);
+    # server.log may carry fallback warnings for older builds.
+    log_candidates = [log_dir / "menubar.log", log_dir / "server.log"]
+    print(f"Log dir:        {log_dir}")
+
+    hits: list[tuple[str, str]] = []
+    for path in log_candidates:
+        if not path.exists():
+            continue
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 131072))
+                tail = f.read().decode("utf-8", errors="replace")
+        except OSError as e:
+            print(f"Could not read {path.name}: {e}")
+            continue
+        for ln in tail.splitlines():
+            if (
+                "menubar visibility probe" in ln
+                or "NSStatusItem" in ln
+                or "ControlCenter" in ln
+                or "Menu Bar" in ln
+            ):
+                hits.append((path.name, ln))
+
+    if hits:
+        print("\nRecent visibility log entries (last 10):")
+        for src, ln in hits[-10:]:
+            print(f"  [{src}] {ln}")
+    else:
+        print("\nNo visibility log entries found (app may not have probed yet).")
+
+    print()
+    print("If the icon is missing on macOS Tahoe (26.x):")
+    print("  1. Open System Settings > Menu Bar")
+    print("     open 'x-apple.systempreferences:com.apple.ControlCenter-Settings.extension?MenuBar'")
+    print("  2. Find 'oMLX' and set it to 'Show in Menu Bar'")
+    print("  3. If oMLX isn't in the list, quit the menubar app and relaunch oMLX.app")
+    print()
+    print("Note: Apple's sandbox policy prevents third-party apps from")
+    print("programmatically re-enabling their own menubar visibility on Tahoe.")
+    return 0
+
+
+def diagnose_command(args) -> int:
+    """Dispatch 'omlx diagnose <target>' to the appropriate subcommand."""
+    target = getattr(args, "target", None)
+    if target == "menubar":
+        return diagnose_menubar()
+    print(f"Unknown diagnose target: {target}")
+    print("Available: menubar")
+    return 1
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="omlx: Production-ready LLM server for Apple Silicon",
@@ -609,12 +702,27 @@ Example directory structure:
         help="OpenClaw tools profile (default: coding)",
     )
 
+    # Diagnose command
+    diagnose_parser = subparsers.add_parser(
+        "diagnose",
+        help="Diagnose installation or runtime issues",
+        description="Run diagnostic checks and print recovery steps.",
+    )
+    diagnose_parser.add_argument(
+        "target",
+        type=str,
+        choices=["menubar"],
+        help="What to diagnose. 'menubar' checks Tahoe ControlCenter visibility.",
+    )
+
     args = parser.parse_args()
 
     if args.command == "serve":
         serve_command(args)
     elif args.command == "launch":
         launch_command(args)
+    elif args.command == "diagnose":
+        sys.exit(diagnose_command(args))
     else:
         parser.print_help()
         sys.exit(1)

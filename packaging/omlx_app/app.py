@@ -17,6 +17,9 @@ import requests
 
 from omlx._version import __version__
 from AppKit import (
+    NSAlert,
+    NSAlertFirstButtonReturn,
+    NSAlertSecondButtonReturn,
     NSApp,
     NSAppearanceNameDarkAqua,
     NSApplication,
@@ -25,10 +28,12 @@ from AppKit import (
     NSAttributedString,
     NSBundle,
     NSColor,
+    NSFloatingWindowLevel,
     NSFont,
     NSFontAttributeName,
     NSForegroundColorAttributeName,
     NSImage,
+    NSLinkAttributeName,
     NSMenu,
     NSMenuItem,
     NSMutableParagraphStyle,
@@ -40,8 +45,17 @@ from AppKit import (
     NSTextAlignmentCenter,
     NSVariableStatusItemLength,
     NSView,
+    NSWorkspace,
 )
-from Foundation import NSData, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
+from Foundation import (
+    NSData,
+    NSMutableAttributedString,
+    NSObject,
+    NSRunLoop,
+    NSRunLoopCommonModes,
+    NSTimer,
+    NSURL,
+)
 
 from .config import ServerConfig
 from .server_manager import PortConflict, ServerManager, ServerStatus
@@ -101,6 +115,10 @@ class OMLXAppDelegate(NSObject):
         self._updater = None  # AppUpdater instance during download
         self._update_progress_text = ""  # Current download progress text
         self._menu_is_open = False  # True while the status-bar menu is visible
+        # Menubar visibility tracking — Tahoe ControlCenter can hide the item
+        # silently, and isVisible() returns True even when hidden (see issue #725)
+        self._visibility_check_timer = None
+        self._warned_hidden = False
         # Weak references to dynamic menu items for in-place updates
         self._status_header_item = None
         self._stop_item = None
@@ -131,8 +149,6 @@ class OMLXAppDelegate(NSObject):
 
     def _show_fatal_error_and_quit(self, message: str):
         """Show a fatal error dialog and terminate the application."""
-        from AppKit import NSAlert
-
         alert = NSAlert.alloc().init()
         alert.setMessageText_("oMLX Failed to Launch")
         alert.setInformativeText_(message)
@@ -207,29 +223,169 @@ class OMLXAppDelegate(NSObject):
                 self._update_status_display()
 
         # Delayed check: warn user if ControlCenter blocked the status item.
-        # 1s delay gives ControlCenter time to settle its visibility decision.
-        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            1.0, self, "checkStatusItemVisibility:", None, False
+        # 3s delay gives ControlCenter time to settle its visibility decision.
+        # Retain the timer reference to prevent early dealloc under PyObjC.
+        self._visibility_check_timer = (
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                3.0, self, "checkStatusItemVisibility:", None, False
+            )
         )
 
-    def checkStatusItemVisibility_(self, timer):
-        """One-shot check for ControlCenter blocking the menubar icon."""
-        if self.status_item and not self.status_item.isVisible():
-            logger.warning(
-                "NSStatusItem is not visible — likely blocked by ControlCenter"
-            )
-            from AppKit import NSAlert
+    def _is_status_item_hidden(self) -> bool:
+        """Detect whether the menubar icon is actually rendered.
 
-            alert = NSAlert.alloc().init()
-            alert.setMessageText_("Menubar Icon Hidden")
-            alert.setInformativeText_(
-                "macOS is hiding the oMLX menubar icon.\n\n"
-                "To fix this, go to System Settings > Control Center, "
-                "find oMLX under the menu bar items section, "
-                "and set it to \"Show in Menu Bar\"."
+        There's no single reliable signal on macOS Tahoe, so probe several:
+
+        - NSStatusItem.isVisible(): app-side setVisible: flag only. Stays True
+          when ControlCenter/Menu Bar settings hide the item, so it alone
+          can't catch Tahoe's toggle-off.
+        - button.window().isVisible: NSWindow's own "hooked to the screen"
+          flag. On a hidden status item this tends to flip False even when
+          the app hasn't touched anything.
+        - button.window().occlusionState: finer-grained visibility bitmask.
+          The NSWindowOcclusionStateVisible bit (1<<1) is what we look for.
+        - frame: mostly diagnostic. The size/position is typically preserved
+          even when hidden (autosaveName persists Preferred Position), so
+          it's weak for detection but useful in logs.
+
+        Treat the item as hidden if ANY of the strong signals say hidden.
+        Always log the raw probe so `omlx diagnose menubar` can surface it.
+        """
+        NS_WINDOW_OCCLUSION_STATE_VISIBLE = 1 << 1  # NSWindowOcclusionStateVisible
+
+        button = self.status_item.button() if self.status_item else None
+        window = button.window() if button else None
+        frame = window.frame() if window else None
+        api_visible = bool(self.status_item and self.status_item.isVisible())
+        window_visible = bool(window and window.isVisible())
+        occlusion = int(window.occlusionState()) if window else 0
+        occlusion_visible = bool(occlusion & NS_WINDOW_OCCLUSION_STATE_VISIBLE)
+
+        frame_str = (
+            f"({frame.origin.x:.1f},{frame.origin.y:.1f},"
+            f"{frame.size.width:.1f}x{frame.size.height:.1f})"
+            if frame
+            else None
+        )
+        logger.info(
+            "menubar visibility probe: isVisible=%s window.isVisible=%s "
+            "occlusion=0x%x(visible=%s) button=%s window=%s frame=%s",
+            api_visible,
+            window_visible,
+            occlusion,
+            occlusion_visible,
+            bool(button),
+            bool(window),
+            frame_str,
+        )
+
+        if not button or not window:
+            return True
+        if not api_visible:
+            return True
+        # If the NSWindow is not visible or not marked occlusion-visible, the
+        # icon isn't reaching the menubar even if frame numbers look normal.
+        if not window_visible:
+            return True
+        if not occlusion_visible:
+            return True
+        return False
+
+    def checkStatusItemVisibility_(self, timer):
+        """One-shot post-launch check for menubar icon visibility."""
+        if self._is_status_item_hidden():
+            logger.warning(
+                "NSStatusItem appears hidden after launch — likely blocked by "
+                "ControlCenter or disabled in System Settings > Menu Bar."
             )
-            alert.addButtonWithTitle_("OK")
-            alert.runModal()
+            self._show_menubar_hidden_alert()
+
+    def _show_menubar_hidden_alert(self):
+        """Inform the user about the hidden menubar icon and offer recovery.
+
+        Tahoe (26.x) adds a dedicated Menu Bar settings pane with per-app
+        toggles, so the alert deep-links there. Earlier versions of macOS
+        have no System Settings UI for third-party status items — the only
+        recovery is restarting oMLX (or checking Bartender/Ice style tools
+        if the user has them) — so on Sequoia and older we drop the
+        Settings button entirely to avoid pointing users at a dead end.
+        """
+        if self._warned_hidden:
+            return
+        self._warned_hidden = True
+
+        try:
+            mac_major = int(platform.mac_ver()[0].split(".")[0])
+        except (ValueError, IndexError):
+            mac_major = 0
+        is_tahoe_or_newer = mac_major >= 26
+
+        # Accessory apps don't steal focus, so the alert would otherwise land
+        # behind every other window. Activate first and raise the alert window
+        # to floating level so it surfaces above the browser/editor the user
+        # is likely looking at.
+        NSApp.activateIgnoringOtherApps_(True)
+
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("oMLX Menubar Icon Hidden")
+
+        settings_label = "Open Menu Bar Settings"
+        settings_url = (
+            "x-apple.systempreferences:com.apple.ControlCenter-Settings."
+            "extension?MenuBar"
+        )
+
+        if is_tahoe_or_newer:
+            alert.setInformativeText_(
+                "The oMLX menubar icon isn't showing up.\n\n"
+                "macOS may be hiding it, or oMLX has been toggled off in "
+                "System Settings > Menu Bar.\n\n"
+                f"Click \"{settings_label}\" to check, or \"View Log\" to "
+                "see what the app detected."
+            )
+            alert.addButtonWithTitle_(settings_label)  # 1000
+            alert.addButtonWithTitle_("View Log")      # 1001
+            alert.addButtonWithTitle_("Dismiss")       # 1002
+        else:
+            alert.setInformativeText_(
+                "The oMLX menubar icon isn't showing up.\n\n"
+                "macOS before Tahoe doesn't offer a System Settings toggle "
+                "for third-party menubar apps. Try quitting and relaunching "
+                "oMLX, and check menubar manager tools like Bartender or "
+                "Ice if you use them.\n\n"
+                "Click \"View Log\" to see what the app detected."
+            )
+            alert.addButtonWithTitle_("View Log")      # 1000
+            alert.addButtonWithTitle_("Dismiss")       # 1001
+
+        alert_window = alert.window()
+        if alert_window is not None:
+            alert_window.setLevel_(NSFloatingWindowLevel)
+
+        response = alert.runModal()
+        log_path = (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "oMLX"
+            / "logs"
+            / "menubar.log"
+        )
+
+        if is_tahoe_or_newer:
+            if response == NSAlertFirstButtonReturn:
+                NSWorkspace.sharedWorkspace().openURL_(
+                    NSURL.URLWithString_(settings_url)
+                )
+            elif response == NSAlertSecondButtonReturn:
+                NSWorkspace.sharedWorkspace().openURL_(
+                    NSURL.fileURLWithPath_(str(log_path))
+                )
+        else:
+            if response == NSAlertFirstButtonReturn:
+                NSWorkspace.sharedWorkspace().openURL_(
+                    NSURL.fileURLWithPath_(str(log_path))
+                )
 
     # --- Icon management ---
 
@@ -1142,6 +1298,15 @@ class OMLXAppDelegate(NSObject):
         # Always refresh icon in case theme changed
         self._update_menubar_icon()
 
+        # Catch runtime changes: user toggles oMLX off in System Settings
+        # after the 3s one-shot has already fired. Warn once per session.
+        if not self._warned_hidden and self._is_status_item_hidden():
+            logger.warning(
+                "NSStatusItem turned hidden at runtime — user likely toggled "
+                "oMLX off in System Settings > Menu Bar."
+            )
+            self._show_menubar_hidden_alert()
+
     # --- Menu actions ---
 
     def _handle_port_conflict(self, conflict: PortConflict) -> None:
@@ -1293,35 +1458,58 @@ class OMLXAppDelegate(NSObject):
 
     @objc.IBAction
     def showAbout_(self, sender):
-        """Show About dialog."""
-        import webbrowser
+        """Show the standard macOS About panel with a clickable GitHub link.
 
-        from AppKit import NSAlert, NSAlertFirstButtonReturn
-
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_("About oMLX")
-
+        Using orderFrontStandardAboutPanelWithOptions_ gives the centered
+        Aqua layout that matches every other Mac app and sidesteps NSAlert's
+        left-aligned icon-plus-text rendering. The GitHub URL is embedded as
+        a real NSLinkAttributeName in the Credits NSAttributedString, so
+        AppKit renders it as a clickable hyperlink.
+        """
         try:
             from omlx._build_info import build_number
         except ImportError:
             build_number = None
 
-        version_text = f"Version: {__version__}"
-        if build_number:
-            version_text += f"\nBuild: {build_number}"
-
-        alert.setInformativeText_(
-            "LLM inference,\n"
-            "optimized for your Mac\n\n"
+        github_url = "https://github.com/jundot/omlx"
+        credits_text = (
+            "LLM inference, optimized for your Mac\n\n"
             "Built with MLX, mlx-lm, and mlx-vlm\n"
             "Special Thanks to 1212.H.\n\n"
-            f"{version_text}"
+            f"{github_url}"
         )
-        alert.addButtonWithTitle_("OK")
-        alert.addButtonWithTitle_("GitHub")
+        credits = NSMutableAttributedString.alloc().initWithString_(credits_text)
 
-        if alert.runModal() != NSAlertFirstButtonReturn:
-            webbrowser.open("https://github.com/jundot")
+        # Center the whole credits block to match the panel's header alignment.
+        paragraph = NSMutableParagraphStyle.alloc().init()
+        paragraph.setAlignment_(NSTextAlignmentCenter)
+        credits.addAttribute_value_range_(
+            NSParagraphStyleAttributeName,
+            paragraph,
+            (0, credits.length()),
+        )
+
+        # Embed the URL as a link attribute so clicking opens the browser.
+        loc = credits_text.find(github_url)
+        if loc >= 0:
+            credits.addAttribute_value_range_(
+                NSLinkAttributeName,
+                NSURL.URLWithString_(github_url),
+                (loc, len(github_url)),
+            )
+
+        options = {
+            "ApplicationName": "oMLX",
+            "ApplicationVersion": __version__,
+            "Credits": credits,
+        }
+        if build_number:
+            options["Version"] = str(build_number)
+
+        NSApp.activateIgnoringOtherApps_(True)
+        NSApplication.sharedApplication().orderFrontStandardAboutPanelWithOptions_(
+            options
+        )
 
     @objc.IBAction
     def quitApp_(self, sender):
