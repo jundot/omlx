@@ -67,8 +67,9 @@ VLM_MODEL_TYPES = {
 # from the base model's config.json, causing spurious VLM detection that breaks
 # tool calling (VLMBatchedEngine vs BatchedEngine have different tool-call paths).
 AMBIGUOUS_VLM_MODEL_TYPES = {
+    # qwen3_5_moe is a text-only MoE family; text-only quants sometimes retain
+    # vision_config from the base model's config.json as an artefact.
     "qwen3_5_moe",
-    "qwen3_vl_moe",
 }
 
 # Known VLM architectures
