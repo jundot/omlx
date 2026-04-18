@@ -65,12 +65,45 @@ class _AttentionCapture:
 
 
 def _qwen35_extract_queries(attn, x, cache=None):
-    """Qwen3.5: gate split + q_norm + RoPE."""
+    """Qwen3.5 / Qwen3-Next: gate split + q_norm + RoPE.
+
+    Applies to models whose ``q_proj`` concatenates (queries, gate) and
+    outputs ``2 * n_heads * head_dim``. Dispatcher ``_detect_query_extractor``
+    picks this when q_proj output dim == 2 * n_heads * q_norm_dim.
+    """
     B, L, D = x.shape
+    n_heads = getattr(
+        attn,
+        "num_attention_heads",
+        getattr(attn, "n_heads", getattr(attn, "num_heads", None)),
+    )
     q_out = attn.q_proj(x)
     queries, _gate = mx.split(
-        q_out.reshape(B, L, attn.num_attention_heads, -1), 2, axis=-1
+        q_out.reshape(B, L, n_heads, -1), 2, axis=-1
     )
+    queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
+    if cache is not None:
+        queries = attn.rope(queries, offset=cache.offset)
+    else:
+        queries = attn.rope(queries)
+    return queries
+
+
+def _qwen36_extract_queries(attn, x, cache=None):
+    """Qwen3.6 MoE (mlx-lm ``qwen3_moe.Attention``): no gate, q_norm per head.
+
+    Differs from ``_qwen35_extract_queries`` in that ``q_proj`` outputs
+    ``n_heads * head_dim`` (no gate channel). Used when the dispatcher
+    detects q_proj output dim == n_heads * q_norm_dim.
+    """
+    B, L, D = x.shape
+    n_heads = getattr(
+        attn,
+        "num_attention_heads",
+        getattr(attn, "n_heads", getattr(attn, "num_heads", None)),
+    )
+    q_out = attn.q_proj(x)
+    queries = q_out.reshape(B, L, n_heads, -1)
     queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
     if cache is not None:
         queries = attn.rope(queries, offset=cache.offset)
@@ -159,8 +192,29 @@ def _build_layer_to_cache_map(model) -> Dict[int, int]:
 
 
 def _detect_query_extractor(attn_obj) -> Callable:
-    """Auto-detect the appropriate query extractor for the model architecture."""
+    """Auto-detect the appropriate query extractor for the model architecture.
+
+    For Qwen-family models that expose ``q_norm``, disambiguate between:
+      - Qwen3.5 / Qwen3-Next: q_proj outputs 2 * n_heads * head_dim (gate split)
+      - Qwen3.6 MoE:           q_proj outputs n_heads * head_dim (no gate)
+    by comparing q_proj.weight.shape[0] against n_heads * q_norm.weight.shape[0].
+    """
     if hasattr(attn_obj, "q_norm"):
+        try:
+            n_heads = getattr(
+                attn_obj,
+                "num_attention_heads",
+                getattr(attn_obj, "n_heads", getattr(attn_obj, "num_heads", None)),
+            )
+            q_proj_out = attn_obj.q_proj.weight.shape[0]
+            q_norm_dim = attn_obj.q_norm.weight.shape[0]
+            if n_heads and q_proj_out == n_heads * q_norm_dim:
+                return _qwen36_extract_queries
+            if n_heads and q_proj_out == 2 * n_heads * q_norm_dim:
+                return _qwen35_extract_queries
+        except (AttributeError, IndexError):
+            pass
+        # Fallback: original behavior (Qwen3.5 with gate split)
         return _qwen35_extract_queries
     elif not hasattr(attn_obj, "rope"):
         return _nemotron_h_extract_queries
