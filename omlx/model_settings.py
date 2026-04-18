@@ -90,6 +90,7 @@ class ModelSettings:
     # Metadata
     display_name: Optional[str] = None
     description: Optional[str] = None
+    active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

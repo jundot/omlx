@@ -1058,7 +1058,7 @@
                     this.profileError = String(e);
                 }
             },
-            applyProfileToForm(profile) {
+            async applyProfileToForm(profile) {
                 // Merge all profile fields into the form (no server call — user clicks Save to persist).
                 const s = profile.settings || {};
                 const ms = this.modelSettings;
@@ -1093,14 +1093,29 @@
                 }
                 this.activeProfileName = profile.name;
                 this.profilesDrift = false;
+                // Persist active_profile_name to backend
+                try {
+                    const r = await fetch(
+                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(profile.name)}/apply`,
+                        { method: 'POST' }
+                    );
+                    if (r.ok) {
+                        // Update the models list so the profile badge reflects the change
+                        const updated = r.json().settings;
+                        const m = this.models.find(m => m.id === this.selectedModel.id);
+                        if (m) m.settings = { ...m.settings, active_profile_name: profile.name };
+                    }
+                } catch (e) {
+                    console.error('Failed to apply profile:', e);
+                }
             },
             async applyTemplateToForm(template) {
                 // Check if a profile with this template's name already exists
                 const existingProfile = this.profiles.find(p => p.name === template.name);
-                
+
                 if (existingProfile) {
                     // Profile exists, just apply it (preserve user customizations)
-                    this.applyProfileToForm(existingProfile);
+                    await this.applyProfileToForm(existingProfile);
                 } else {
                     // Create a new profile from the template
                     const body = {
@@ -1123,7 +1138,7 @@
                             // Find the newly created profile in the refreshed list
                             const newProfile = this.profiles.find(p => p.name === template.name);
                             if (newProfile) {
-                                this.applyProfileToForm(newProfile);
+                                await this.applyProfileToForm(newProfile);
                             }
                         }
                     } catch (e) {
