@@ -57,6 +57,8 @@ dependencies = [
     # Server
     "fastapi>=0.108.0",
     "uvicorn>=0.23.0",
+    # Multipart form handling — required for file upload endpoints (UploadFile)
+    "python-multipart>=0.0.5",
     # JSON Schema validation for structured output
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
@@ -73,6 +75,10 @@ grammar = [
     # Grammar-constrained decoding for structured output (requires torch ~2GB)
     "xgrammar>=0.1.32",
 ]
+pdf = [
+    # PDF text extraction for chat file attachment (BSD-3-Clause)
+    "pypdf>=4.0.0",
+]
 mcp = [
     "mcp>=1.0.0",
 ]
@@ -85,7 +91,6 @@ audio = [
     # stt extra: tiktoken, mistral-common[audio]
     # sts extra: tts deps + stt deps + webrtcvad
     "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
-    "python-multipart>=0.0.5",
 ]
 dev = [
     "pytest>=7.0.0",

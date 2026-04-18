@@ -79,6 +79,7 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e .          # Core only
 pip install -e ".[mcp]"   # With MCP (Model Context Protocol) support
+pip install -e ".[pdf]"   # With PDF file attachment support in chat UI
 ```
 
 Requires macOS 15.0+ (Sequoia), Python 3.10+, and Apple Silicon (M1/M2/M3/M4).
@@ -178,6 +179,8 @@ Configure sampling parameters, chat template kwargs, TTL, model alias, model typ
 ### Built-in Chat
 
 Chat directly with any loaded model from the admin panel. Supports conversation history, model switching, dark mode, reasoning model output, and image upload for VLM/OCR models.
+
+**File attachment** — attach PDF, Markdown, JSON, or plain text files to any message. File content is extracted and injected as document context for the model. The chat UI shows the token count and checks against the loaded model's context window before send, with safe / danger / exceeded states. PDF support requires `pip install 'omlx[pdf]'` (pypdf, BSD-3-Clause).
 
 <p align="center">
   <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="oMLX Chat" width="720">
