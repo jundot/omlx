@@ -490,6 +490,20 @@ def detect_model_type(model_path: Path) -> ModelType:
     if normalized_type.startswith("lfm") and normalized_type not in EMBEDDING_MODEL_TYPES:
         return "audio_sts"
 
+    # Directory-name fallback for audio models whose config.json omits model_type.
+    # Some model families (e.g. NeMo-format parakeet) do not include a top-level
+    # model_type field, so the checks above find nothing.  As a last resort, match
+    # the first hyphen-separated segment of the model directory name against the
+    # same mlx-audio model-type sets used above.
+    dir_stem = model_path.name.lower().split("-")[0]
+    if dir_stem and dir_stem not in _LLM_TYPE_COLLISIONS:
+        if dir_stem in AUDIO_TTS_MODEL_TYPES:
+            return "audio_tts"
+        if dir_stem in AUDIO_STT_MODEL_TYPES:
+            return "audio_stt"
+        if dir_stem in AUDIO_STS_MODEL_TYPES:
+            return "audio_sts"
+
     return "llm"
 
 
