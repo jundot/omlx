@@ -29,6 +29,12 @@ from .openai_models import FunctionCall, ResponseFormat, ToolCall, ToolDefinitio
 
 logger = logging.getLogger(__name__)
 
+# Pre-compiled patterns for the naked <function=...> fallback (see parse_tool_calls).
+# Hoisted to module scope to avoid re-compilation on every request.
+_NAKED_FUNCTION_RE = re.compile(r"<function=([^\s>]+)>(.*?)</function>", re.DOTALL)
+_NAKED_PARAMETER_RE = re.compile(r"<parameter=([^\s>]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+_STRAY_TOOL_CALL_RE = re.compile(r"</?tool_call>")
+
 
 def _serialize_tool_call_arguments(arguments: Any) -> str:
     """Serialize parser output to a JSON-object arguments string.
@@ -535,6 +541,39 @@ def parse_tool_calls(
     # Fallback: parse XML <tool_call> tags (GLM, Qwen, generic formats)
     if "<tool_call>" in cleaned_text:
         return _parse_xml_tool_calls(cleaned_text)
+
+    # Fallback: naked <function=name>...</function> emitted by Qwen3-Coder
+    # when the model skips the outer <tool_call> wrapper it was trained on.
+    # Upstream parser (mlx_lm.tool_parsers.qwen3_coder) requires the wrapper;
+    # this branch recovers the structured call when the wrapper is absent.
+    if "<function=" in cleaned_text and "</function>" in cleaned_text:
+        naked_tool_calls: List[ToolCall] = []
+        for match in _NAKED_FUNCTION_RE.finditer(cleaned_text):
+            func_name = match.group(1)
+            body = match.group(2)
+            arguments: Dict[str, Any] = {}
+            for pm in _NAKED_PARAMETER_RE.finditer(body):
+                key = pm.group(1)
+                val = pm.group(2).strip()
+                try:
+                    arguments[key] = json.loads(val)
+                except (json.JSONDecodeError, ValueError):
+                    arguments[key] = val
+            naked_tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=func_name,
+                        arguments=json.dumps(arguments, ensure_ascii=False),
+                    ),
+                )
+            )
+        if naked_tool_calls:
+            cleaned = _NAKED_FUNCTION_RE.sub("", cleaned_text)
+            # Strip any stray wrapper fragments the model emitted without pairs
+            cleaned = _STRAY_TOOL_CALL_RE.sub("", cleaned).strip()
+            return cleaned, naked_tool_calls
 
     # Fallback: namespaced tool_call tags (e.g. <minimax:tool_call>)
     ns_match = re.search(r"<([A-Za-z_][\w.-]*):tool_call>", cleaned_text)
