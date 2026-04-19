@@ -1944,6 +1944,9 @@ async def create_chat_completion(
         # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
         if ms.enable_thinking is not None:
             merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
+        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
+        if ms.preserve_thinking is not None:
+            merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
     # Per-request kwargs override model settings (except forced keys)
     if request.chat_template_kwargs:
         for k, v in request.chat_template_kwargs.items():
@@ -2054,6 +2057,13 @@ async def create_chat_completion(
     # kwarg is True.
     if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
         merged_ct_kwargs["enable_thinking"] = True
+
+    # Auto-set preserve_thinking when thinking is active.  Qwen 3.6+
+    # templates strip <think> blocks from historical turns by default,
+    # which breaks KV prefix cache reuse.  Always preserve unless the
+    # user explicitly opted out.
+    if merged_ct_kwargs.get("enable_thinking") is not False and "preserve_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["preserve_thinking"] = True
 
     # Add compiled grammar for logit-level structured output.
     # When a reasoning_parser is configured, the structural tag includes
@@ -3182,6 +3192,9 @@ async def create_anthropic_message(
         # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
         if ms.enable_thinking is not None:
             merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
+        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
+        if ms.preserve_thinking is not None:
+            merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
     # Per-request kwargs override model settings (except forced keys)
     if request.chat_template_kwargs:
         for k, v in request.chat_template_kwargs.items():
@@ -3250,6 +3263,10 @@ async def create_anthropic_message(
     # the Anthropic thinking.type field above or model settings).
     if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
         merged_ct_kwargs["enable_thinking"] = True
+
+    # Auto-set preserve_thinking when thinking is active (Qwen 3.6+).
+    if merged_ct_kwargs.get("enable_thinking") is not False and "preserve_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["preserve_thinking"] = True
 
     # Merge MCP tools with user-provided Anthropic tools
     user_internal = convert_anthropic_tools_to_internal(request.tools)
@@ -3564,6 +3581,9 @@ async def create_response(
         # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
         if ms.enable_thinking is not None:
             merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
+        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
+        if ms.preserve_thinking is not None:
+            merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
 
     # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
     # are NOT called here because convert_responses_input_to_messages() already
@@ -3666,6 +3686,10 @@ async def create_response(
     # Auto-set enable_thinking when thinking budget is active.
     if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
         merged_ct_kwargs["enable_thinking"] = True
+
+    # Auto-set preserve_thinking when thinking is active (Qwen 3.6+).
+    if merged_ct_kwargs.get("enable_thinking") is not False and "preserve_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["preserve_thinking"] = True
 
     # Add compiled grammar for logit-level structured output.
     if compiled_grammar is not None:
