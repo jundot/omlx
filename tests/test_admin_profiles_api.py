@@ -181,6 +181,12 @@ def test_all_model_settings_fields_classified():
         f"UNIVERSAL_PROFILE_FIELDS, MODEL_SPECIFIC_PROFILE_FIELDS, or "
         f"EXCLUDED_FROM_PROFILES. If unsure, add to EXCLUDED_FROM_PROFILES."
     )
+    stale = classified - all_fields
+    assert not stale, (
+        f"Stale entries {stale} reference removed ModelSettings fields. "
+        f"Remove them from UNIVERSAL_PROFILE_FIELDS, "
+        f"MODEL_SPECIFIC_PROFILE_FIELDS, and/or EXCLUDED_FROM_PROFILES."
+    )
 
 
 class TestTemplateRoutes:
