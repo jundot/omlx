@@ -271,10 +271,18 @@ class TestLaunchCommandFunction:
             tools_profile="coding",
         )
 
-        with patch("requests.get", side_effect=[health_response, status_response]):
-            with patch("omlx.integrations.get_integration", return_value=integration):
-                with patch("omlx.settings.GlobalSettings.load", return_value=settings):
-                    launch_command(args)
+        session = MagicMock()
+        session.get.return_value = health_response
+
+        with patch("requests.Session", return_value=session) as session_ctor:
+            with patch("requests.get", return_value=status_response):
+                with patch("omlx.integrations.get_integration", return_value=integration):
+                    with patch("omlx.settings.GlobalSettings.load", return_value=settings):
+                        launch_command(args)
+
+        session_ctor.assert_called_once()
+        assert session.trust_env is False
+        session.get.assert_called_once_with("http://127.0.0.1:8000/health", timeout=3)
 
         integration.launch.assert_called_once_with(
             port=8000,
