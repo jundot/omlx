@@ -943,71 +943,21 @@
                                         </div>
                                     </div>
 
-                                    <!-- Sampling Settings Row (if any settings configured) - hidden for embedding/reranker models -->
-                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens)"
+                                    <!-- Profile chip -->
+                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && model.settings && (model.settings.active_profile_name || model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser)"
                                          class="px-6 pb-4 -mt-2">
                                         <div class="ml-11 flex flex-wrap gap-2">
-                                            <template x-if="model.settings?.max_context_window">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-700 border border-amber-200">
-                                                    ctx_window: <span class="ml-1" x-text="model.settings.max_context_window"></span>
+                                            <template x-if="model.settings?.active_profile_name">
+                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
+                                                    <i data-lucide="settings" class="w-3 h-3"></i>
+                                                    <span x-text="model.settings.active_profile_name"></span>
                                                 </span>
                                             </template>
-                                            <template x-if="model.settings?.max_tokens">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-blue-50 text-blue-700 border border-blue-200">
-                                                    max_tokens: <span class="ml-1" x-text="model.settings.max_tokens"></span>
+                                            <template x-if="!model.settings?.active_profile_name">
+                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-neutral-100 text-neutral-600 border border-neutral-200">
+                                                    <i data-lucide="settings" class="w-3 h-3"></i>
+                                                    <span>{{ t('modal.model_settings.profiles.custom_label') }}</span>
                                                 </span>
-                                            </template>
-                                            <template x-if="model.settings?.temperature !== null && model.settings?.temperature !== undefined">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-orange-50 text-orange-700 border border-orange-200">
-                                                    temp: <span class="ml-1" x-text="model.settings.temperature"></span>
-                                                </span>
-                                            </template>
-                                            <template x-if="model.settings?.top_p !== null && model.settings?.top_p !== undefined">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-green-50 text-green-700 border border-green-200">
-                                                    top_p: <span class="ml-1" x-text="model.settings.top_p"></span>
-                                                </span>
-                                            </template>
-                                            <template x-if="model.settings?.top_k !== null && model.settings?.top_k !== undefined">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-purple-50 text-purple-700 border border-purple-200">
-                                                    top_k: <span class="ml-1" x-text="model.settings.top_k"></span>
-                                                </span>
-                                            </template>
-                                            <template x-if="model.settings?.min_p !== null && model.settings?.min_p !== undefined">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
-                                                    min_p: <span class="ml-1" x-text="model.settings.min_p"></span>
-                                                </span>
-                                            </template>
-                                            <template x-if="model.settings?.repetition_penalty !== null && model.settings?.repetition_penalty !== undefined">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-pink-50 text-pink-700 border border-pink-200">
-                                                    rep_penalty: <span class="ml-1" x-text="model.settings.repetition_penalty"></span>
-                                                </span>
-                                            </template>
-                                            <template x-if="model.settings?.presence_penalty !== null && model.settings?.presence_penalty !== undefined">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-rose-50 text-rose-700 border border-rose-200">
-                                                    presence_penalty: <span class="ml-1" x-text="model.settings.presence_penalty"></span>
-                                                </span>
-                                            </template>
-                                            <template x-if="model.settings?.max_tool_result_tokens">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-teal-50 text-teal-700 border border-teal-200">
-                                                    tool_result_tokens: <span class="ml-1" x-text="model.settings.max_tool_result_tokens"></span>
-                                                </span>
-                                            </template>
-                                            <template x-if="model.settings?.reasoning_parser">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-violet-50 text-violet-700 border border-violet-200">
-                                                    reasoning_parser: <span class="ml-1" x-text="model.settings.reasoning_parser"></span>
-                                                </span>
-                                            </template>
-                                            <template x-if="model.settings?.force_sampling">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200">
-                                                    force_sampling
-                                                </span>
-                                            </template>
-                                            <template x-if="model.settings?.chat_template_kwargs">
-                                                <template x-for="[k, v] in Object.entries(model.settings.chat_template_kwargs)" :key="k">
-                                                    <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
-                                                        <span x-text="k"></span>: <span class="ml-1" x-text="v"></span>
-                                                    </span>
-                                                </template>
                                             </template>
                                         </div>
                                     </div>
