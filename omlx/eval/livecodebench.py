@@ -255,6 +255,7 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
                         time_seconds=gen_elapsed / len(batch),
                         question_text=prompt_text,
                         raw_response=response_text,
+                        category=self.get_category(item),
                     )
                 )
 

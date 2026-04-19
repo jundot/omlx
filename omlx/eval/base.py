@@ -27,6 +27,7 @@ class QuestionResult:
     time_seconds: float
     question_text: str = ""
     raw_response: str = ""
+    category: Optional[str] = None
 
 
 @dataclass
@@ -307,6 +308,7 @@ class BaseBenchmark(ABC):
                         time_seconds=batch_elapsed / len(batch),
                         question_text=prompt_text,
                         raw_response=response_text,
+                        category=cat,
                     )
                 )
 

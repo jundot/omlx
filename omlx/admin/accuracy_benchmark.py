@@ -33,9 +33,10 @@ _current_model: Optional[str] = None
 _engine_pool_ref: Any = None
 
 VALID_BENCHMARKS = [
-    "mmlu", "kmmlu", "cmmlu", "jmmlu",
+    "mmlu", "mmlu_pro", "kmmlu", "cmmlu", "jmmlu",
     "hellaswag", "truthfulqa", "arc_challenge", "winogrande",
-    "gsm8k", "humaneval", "mbpp", "livecodebench",
+    "gsm8k", "mathqa", "humaneval", "mbpp", "livecodebench",
+    "bbq", "safetybench",
 ]
 
 
@@ -440,6 +441,7 @@ async def run_accuracy_benchmark(
                         "predicted": qr.predicted,
                         "question": qr.question_text,
                         "raw_response": qr.raw_response,
+                        "category": qr.category,
                         "time_s": round(qr.time_seconds, 3),
                     }
                     for qr in result.question_results

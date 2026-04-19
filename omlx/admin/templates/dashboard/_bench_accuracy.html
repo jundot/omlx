@@ -70,46 +70,59 @@
                             <!-- Benchmark Selection — Card Grid -->
                             <div>
                                 <label class="block text-sm font-medium text-neutral-700 mb-3">{{ t('acc_bench.config.benchmarks') }}</label>
-                                <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-                                    <template x-for="b in accBenchmarkList" :key="b.key">
-                                        <div @click="accBenchmarks[b.key] = !accBenchmarks[b.key]"
-                                             class="relative rounded-xl border-2 p-4 cursor-pointer transition-all select-none"
-                                             :class="accBenchmarks[b.key]
-                                                 ? 'border-neutral-900 bg-neutral-900 text-white shadow-md'
-                                                 : 'border-neutral-200 bg-white text-neutral-500 hover:border-neutral-300 hover:shadow-sm'">
-                                            <!-- Check icon -->
-                                            <div class="absolute top-2 right-2">
-                                                <svg x-show="accBenchmarks[b.key]" class="w-4 h-4 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                                <div class="space-y-5">
+                                    <template x-for="group in accBenchmarkGroups" :key="group.name">
+                                        <div>
+                                            <!-- Group header -->
+                                            <div class="flex items-center gap-2 mb-2">
+                                                <span class="text-[11px] font-bold uppercase tracking-wider text-neutral-500" x-text="group.name"></span>
+                                                <span class="text-[11px] text-neutral-400" x-text="'(' + group.benchmarks.length + ')'"></span>
+                                                <div class="flex-1 border-t border-neutral-200"></div>
                                             </div>
-                                            <!-- Benchmark name -->
-                                            <div class="text-lg font-bold mb-1" x-text="b.label"></div>
-                                            <!-- Description -->
-                                            <div class="text-[10px] mb-3 opacity-70" x-text="b.desc"></div>
-                                            <!-- Sample size selector -->
-                                            <select x-model.number="accSampleSizes[b.key]"
-                                                    x-init="$nextTick(() => $el.value = accSampleSizes[b.key])"
-                                                    @click.stop
-                                                    :disabled="!accBenchmarks[b.key]"
-                                                    class="w-full px-2 py-1 text-xs rounded-lg border transition-all tabular-nums"
-                                                    :class="accBenchmarks[b.key]
-                                                        ? 'bg-white/20 border-white/30 text-white disabled:opacity-40 [&>option]:text-neutral-900'
-                                                        : 'bg-neutral-50 border-neutral-200 text-neutral-600 disabled:opacity-40'">
-                                                <template x-for="s in b.sizes" :key="s">
-                                                    <option :value="s" x-text="s"></option>
+                                            <!-- Benchmarks grid -->
+                                            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+                                                <template x-for="b in group.benchmarks" :key="b.key">
+                                                    <div @click="accBenchmarks[b.key] = !accBenchmarks[b.key]"
+                                                         class="relative rounded-xl border-2 p-4 cursor-pointer transition-all select-none"
+                                                         :class="accBenchmarks[b.key]
+                                                             ? 'border-neutral-900 bg-neutral-900 text-white shadow-md'
+                                                             : 'border-neutral-200 bg-white text-neutral-500 hover:border-neutral-300 hover:shadow-sm'">
+                                                        <!-- Check icon -->
+                                                        <div class="absolute top-2 right-2">
+                                                            <svg x-show="accBenchmarks[b.key]" class="w-4 h-4 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                                                        </div>
+                                                        <!-- Benchmark name -->
+                                                        <div class="text-lg font-bold mb-1" x-text="b.label"></div>
+                                                        <!-- Description -->
+                                                        <div class="text-[10px] mb-3 opacity-70" x-text="b.desc"></div>
+                                                        <!-- Sample size selector -->
+                                                        <select x-model.number="accSampleSizes[b.key]"
+                                                                x-init="$nextTick(() => $el.value = accSampleSizes[b.key])"
+                                                                @click.stop
+                                                                :disabled="!accBenchmarks[b.key]"
+                                                                class="w-full px-2 py-1 text-xs rounded-lg border transition-all tabular-nums"
+                                                                :class="accBenchmarks[b.key]
+                                                                    ? 'bg-white/20 border-white/30 text-white disabled:opacity-40 [&>option]:text-neutral-900'
+                                                                    : 'bg-neutral-50 border-neutral-200 text-neutral-600 disabled:opacity-40'">
+                                                            <template x-for="s in b.sizes" :key="s">
+                                                                <option :value="s" x-text="s"></option>
+                                                            </template>
+                                                            <option value="0" x-text="'Full (' + b.fullSize.toLocaleString() + ')'"></option>
+                                                        </select>
+                                                        <!-- Code exec warning badge -->
+                                                        <template x-if="b.key === 'livecodebench' || b.key === 'humaneval' || b.key === 'mbpp'">
+                                                            <div class="mt-2">
+                                                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium rounded"
+                                                                      :class="accBenchmarks[b.key] ? 'bg-amber-400/20 text-amber-200' : 'bg-amber-50 text-amber-500'"
+                                                                      title="{{ t('acc_bench.config.livecodebench_warning') }}">
+                                                                    <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                                                                    {{ t('acc_bench.config.code_exec') }}
+                                                                </span>
+                                                            </div>
+                                                        </template>
+                                                    </div>
                                                 </template>
-                                                <option value="0" x-text="'Full (' + b.fullSize.toLocaleString() + ')'"></option>
-                                            </select>
-                                            <!-- Code exec warning badge -->
-                                            <template x-if="b.key === 'livecodebench' || b.key === 'humaneval' || b.key === 'mbpp'">
-                                                <div class="mt-2">
-                                                    <span class="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium rounded"
-                                                          :class="accBenchmarks[b.key] ? 'bg-amber-400/20 text-amber-200' : 'bg-amber-50 text-amber-500'"
-                                                          title="{{ t('acc_bench.config.livecodebench_warning') }}">
-                                                        <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-                                                        {{ t('acc_bench.config.code_exec') }}
-                                                    </span>
-                                                </div>
-                                            </template>
+                                            </div>
                                         </div>
                                     </template>
                                 </div>

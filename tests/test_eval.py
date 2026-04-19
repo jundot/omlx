@@ -367,3 +367,40 @@ class TestSampling:
         # big should get ~20, small should get ~2
         assert big_count > small_count
         assert small_count >= 1
+
+
+# --- Benchmark Registry Smoke Tests ---
+
+
+class TestBenchmarkRegistry:
+    """Cover every registered benchmark with cheap checks.
+
+    Regression guard against silent bugs like registration drift or
+    load_dataset() crashes on the sampling path.
+    """
+
+    def test_parity(self):
+        """BENCHMARKS dict and VALID_BENCHMARKS list must be in sync."""
+        from omlx.admin.accuracy_benchmark import VALID_BENCHMARKS
+        from omlx.eval import BENCHMARKS
+        assert set(BENCHMARKS.keys()) == set(VALID_BENCHMARKS)
+
+    def test_instantiate_all(self):
+        """Every registered class instantiates without error."""
+        from omlx.eval import BENCHMARKS
+        for cls in BENCHMARKS.values():
+            cls()
+
+
+def _registered_benchmark_names():
+    from omlx.eval import BENCHMARKS
+    return sorted(BENCHMARKS.keys())
+
+
+@pytest.mark.parametrize("name", _registered_benchmark_names())
+async def test_load_sample_per_benchmark(name):
+    """Each registered benchmark loads a 10-row sample without crashing."""
+    from omlx.eval import BENCHMARKS
+    items = await BENCHMARKS[name]().load_dataset(sample_size=10)
+    assert items, f"{name} returned empty list"
+    assert len(items) <= 10, f"{name} returned {len(items)} items"
