@@ -40,6 +40,7 @@ from omlx.api.anthropic_models import (
     AnthropicTool,
     ContentBlockDocument,
     ContentBlockText,
+    ContentBlockThinking,
     ContentBlockToolResult,
     ContentBlockToolUse,
     MessagesRequest,
@@ -419,6 +420,70 @@ class TestExtractTextContent:
         assert len(result) == 2
         assert result[0]["role"] == "system"
         assert result[0]["content"] == "You are a coding assistant."
+
+
+class TestExtractTextContentReasoningReconstruction:
+    """Tests that extract_text_content reassembles <think> from reasoning_content.
+
+    External clients (e.g. Pi) receive reasoning in the OpenAI reasoning_content
+    field but echo it back alongside normal content on subsequent turns.  For
+    models whose chat template exposes preserve_thinking=True (Qwen 3.6+), we
+    must inject <think>…</think> back into the assistant message so the
+    template has something to preserve — otherwise thinking is silently dropped
+    from conversation history.
+    """
+
+    def test_reasoning_and_content_merged_on_assistant(self):
+        """reasoning_content + content string should produce a <think>…</think> prefix."""
+        messages = [
+            Message(role="assistant", reasoning_content="R", content="A"),
+        ]
+        result = extract_text_content(messages)
+        assert len(result) == 1
+        assert result[0]["role"] == "assistant"
+        assert result[0]["content"] == "<think>\nR\n</think>\n\nA"
+
+    def test_reasoning_with_none_content(self):
+        """reasoning_content with content=None should still emit the <think> block."""
+        messages = [
+            Message(role="assistant", reasoning_content="R", content=None),
+        ]
+        result = extract_text_content(messages)
+        # Non-empty content after reconstruction keeps the message alive.
+        assert len(result) == 1
+        assert result[0]["content"] == "<think>\nR\n</think>\n\n"
+
+    def test_reasoning_with_content_list(self):
+        """reasoning_content + list content should extract text parts and prefix <think>."""
+        messages = [
+            Message(
+                role="assistant",
+                reasoning_content="R",
+                content=[{"type": "text", "text": "A"}],
+            ),
+        ]
+        result = extract_text_content(messages)
+        assert len(result) == 1
+        assert result[0]["content"] == "<think>\nR\n</think>\n\nA"
+
+    def test_reasoning_on_non_assistant_passthrough(self):
+        """reasoning_content on a user message must NOT trigger reconstruction."""
+        messages = [
+            Message(role="user", reasoning_content="R", content="A"),
+        ]
+        result = extract_text_content(messages)
+        assert len(result) == 1
+        # User content left untouched — no <think> wrapper.
+        assert result[0]["content"] == "A"
+
+    def test_no_reasoning_content_passthrough(self):
+        """Without reasoning_content the assistant message should pass through unchanged."""
+        messages = [
+            Message(role="assistant", content="A"),
+        ]
+        result = extract_text_content(messages)
+        assert len(result) == 1
+        assert result[0]["content"] == "A"
 
 
 class TestConvertAnthropicToInternal:
@@ -825,6 +890,118 @@ class TestConvertAnthropicToInternal:
         content = result[0]["content"]
         assert "manual.pdf" in content
         assert "oMLX does not provide PDF parsing" in content
+
+    def test_thinking_block_reconstructed_as_think_tag(self):
+        """Single Anthropic thinking block should be reassembled into a <think> wrapper."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking",
+                            thinking="step by step",
+                            signature="",
+                        ),
+                        ContentBlockText(text="Answer"),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert "<think>\nstep by step\n</think>" in content
+        assert "Answer" in content
+        # <think> must come before the answer text
+        assert content.index("<think>") < content.index("Answer")
+
+    def test_multiple_thinking_blocks_preserve_source_order(self):
+        """Multiple thinking blocks must appear in Anthropic source order (regression guard).
+
+        Earlier drafts inserted at position 0, which reversed the order of
+        consecutive thinking blocks.  Appending preserves natural ordering.
+        """
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking",
+                            thinking="FIRST",
+                            signature="",
+                        ),
+                        ContentBlockThinking(
+                            type="thinking",
+                            thinking="SECOND",
+                            signature="",
+                        ),
+                        ContentBlockText(text="Answer"),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        content = result[0]["content"]
+        assert content.index("FIRST") < content.index("SECOND")
+        assert content.index("SECOND") < content.index("Answer")
+
+    def test_thinking_block_native_tool_calling_assistant(self):
+        """Native-tool-calling assistant path must also reconstruct thinking blocks.
+
+        Most Qwen 3.6+ models hit this branch (has_tool_calling=True).  Before
+        the fix, the branch silently dropped thinking content, so
+        preserve_thinking=True in the chat template had nothing to preserve.
+        """
+
+        class NativeToolTokenizer:
+            has_tool_calling = True
+
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking",
+                            thinking="deliberating",
+                            signature="",
+                        ),
+                        ContentBlockText(text="Let me check."),
+                        ContentBlockToolUse(
+                            id="toolu_1",
+                            name="get_weather",
+                            input={"location": "Tokyo"},
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(
+            request,
+            tokenizer=NativeToolTokenizer(),
+        )
+
+        assert len(result) == 1
+        assert result[0]["role"] == "assistant"
+        # tool_calls still structured for native rendering
+        assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        # <think> wrapper present in the text content
+        content = result[0]["content"]
+        assert "<think>\ndeliberating\n</think>" in content
+        assert "Let me check." in content
 
     def test_document_block_mixed_with_text(self):
         """Test document block alongside text blocks."""

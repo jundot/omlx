@@ -192,6 +192,14 @@ def convert_anthropic_to_internal(
                                     "arguments": tool_input,
                                 },
                             })
+                        elif block_type == "thinking":
+                            # Reconstruct <think> block so preserve_thinking can keep it.
+                            # Append in source order; Anthropic places thinking before
+                            # text/tool_use blocks, so natural ordering already puts
+                            # <think> first in the reassembled message.
+                            thinking_text = block_dict.get("thinking", "")
+                            if thinking_text:
+                                text_parts.append(f"<think>\n{thinking_text}\n</think>")
                         elif block_type == "document":
                             text_parts.append(_decode_document_block(block_dict))
                     msg_dict = _build_message_from_parts(role, text_parts, image_parts) or {
@@ -238,7 +246,13 @@ def convert_anthropic_to_internal(
                                     block_dict.get("content", ""), image_parts
                                 )
                         elif block_type == "thinking":
-                            continue
+                            # Reconstruct <think> block so preserve_thinking can keep it.
+                            # Append in source order — Anthropic emits thinking blocks
+                            # before the text blocks they precede, so appending keeps
+                            # the natural ordering intact across multiple blocks.
+                            thinking_text = block_dict.get("thinking", "")
+                            if thinking_text:
+                                text_parts.append(f"<think>\n{thinking_text}\n</think>")
                         elif block_type == "document":
                             text_parts.append(_decode_document_block(block_dict))
                     msg_dict = _build_message_from_parts(role, text_parts, image_parts)
@@ -292,8 +306,13 @@ def convert_anthropic_to_internal(
                         )
 
                 elif block_type == "thinking":
-                    # Thinking blocks are ignored (reasoning content is not passed to model)
-                    continue
+                    # Reconstruct <think> block so preserve_thinking can keep it.
+                    # Append in source order — Anthropic emits thinking blocks
+                    # before the text blocks they precede, so appending keeps
+                    # the natural ordering intact across multiple blocks.
+                    thinking_text = block_dict.get("thinking", "")
+                    if thinking_text:
+                        text_parts.append(f"<think>\n{thinking_text}\n</think>")
 
                 elif block_type == "document":
                     text_parts.append(_decode_document_block(block_dict))

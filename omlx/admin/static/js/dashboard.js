@@ -108,6 +108,23 @@
             loadingGenDefaults: false,
             reasoningParsers: [],
 
+            // Profile / template state
+            profiles: [],                // per-model profiles for selectedModel
+            templates: [],               // global templates
+            profileFields: { universal: [], model_specific: [] },  // loaded from /api/profile-fields
+            activeProfileName: null,     // currently-active profile for the form
+            profilesDrift: false,        // true if form values differ from active profile
+            _applySeq: 0,               // monotonic counter for apply race guard
+            profileError: '',
+            showNewProfileForm: false,
+            newProfile: { name: '', display_name: '', description: '', also_as_template: false },
+            showNewTemplateForm: false,
+            newTemplate: { name: '', display_name: '', description: '' },
+            editingProfile: null,        // profile name being edited inline
+            editingTemplate: null,       // template name being edited inline
+            profileDeleteConfirm: null,
+            templateDeleteConfirm: null,
+
             // Status tab state
             stats: {
                 total_prompt_tokens: 0,
@@ -329,21 +346,50 @@
 
             // Accuracy benchmark state
             accModelId: '',
-            accBenchmarks: { mmlu: true, kmmlu: false, cmmlu: false, jmmlu: false, hellaswag: false, truthfulqa: true, arc_challenge: false, winogrande: false, gsm8k: false, humaneval: true, mbpp: false, livecodebench: false },
-            accSampleSizes: { mmlu: 1000, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, humaneval: 0, mbpp: 200, livecodebench: 100 },
-            accBenchmarkList: [
-                { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects', fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                { key: 'kmmlu', label: 'KMMLU', desc: '한국어 지식 · 45 과목', fullSize: 35030, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                { key: 'cmmlu', label: 'CMMLU', desc: '中文知识 · 67 科目', fullSize: 11582, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                { key: 'jmmlu', label: 'JMMLU', desc: '日本語知識 · 112 科目', fullSize: 7536, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning', fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness', fullSize: 817, sizes: [30, 50, 100, 200, 300] },
-                { key: 'arc_challenge', label: 'ARC-C', desc: 'Science reasoning', fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
-                { key: 'winogrande', label: 'Winogrande', desc: 'Coreference resolution', fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
-                { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning', fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
-                { key: 'humaneval', label: 'HumanEval', desc: 'Function completion', fullSize: 164, sizes: [30, 50, 100] },
-                { key: 'mbpp', label: 'MBPP', desc: 'Python problems', fullSize: 500, sizes: [30, 50, 100, 200, 300] },
-                { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
+            accBenchmarks: { mmlu: true, mmlu_pro: false, kmmlu: false, cmmlu: false, jmmlu: false, hellaswag: false, truthfulqa: true, arc_challenge: false, winogrande: false, gsm8k: false, mathqa: false, humaneval: true, mbpp: false, livecodebench: false, bbq: false, safetybench: false },
+            accSampleSizes: { mmlu: 1000, mmlu_pro: 300, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, mathqa: 300, humaneval: 0, mbpp: 200, livecodebench: 100, bbq: 300, safetybench: 300 },
+            accBenchmarkGroups: [
+                {
+                    name: 'Knowledge',
+                    benchmarks: [
+                        { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects', fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'mmlu_pro', label: 'MMLU-Pro', desc: 'Hard knowledge · 14 subjects (10-way)', fullSize: 12032, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'kmmlu', label: 'KMMLU', desc: '한국어 지식 · 45 과목', fullSize: 35030, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'cmmlu', label: 'CMMLU', desc: '中文知识 · 67 科目', fullSize: 11582, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'jmmlu', label: 'JMMLU', desc: '日本語知識 · 112 科目', fullSize: 7536, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                    ],
+                },
+                {
+                    name: 'Commonsense & Reasoning',
+                    benchmarks: [
+                        { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning', fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'arc_challenge', label: 'ARC-C', desc: 'Science reasoning', fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'winogrande', label: 'Winogrande', desc: 'Coreference resolution', fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness', fullSize: 817, sizes: [30, 50, 100, 200, 300] },
+                    ],
+                },
+                {
+                    name: 'Math',
+                    benchmarks: [
+                        { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning', fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'mathqa', label: 'MathQA', desc: 'Quantitative reasoning · 5-way', fullSize: 2985, sizes: [30, 50, 100, 200, 300, 500, 1000] },
+                    ],
+                },
+                {
+                    name: 'Coding',
+                    benchmarks: [
+                        { key: 'humaneval', label: 'HumanEval', desc: 'Function completion', fullSize: 164, sizes: [30, 50, 100] },
+                        { key: 'mbpp', label: 'MBPP', desc: 'Python problems', fullSize: 500, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
+                    ],
+                },
+                {
+                    name: 'Safety & Alignment',
+                    benchmarks: [
+                        { key: 'bbq', label: 'BBQ', desc: 'Social bias · 11 categories', fullSize: 10864, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'safetybench', label: 'SafetyBench', desc: 'Safety · 7 categories', fullSize: 11435, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                    ],
+                },
             ],
             accBatchSize: 1,
             accEnableThinking: false,
@@ -367,6 +413,7 @@
                     this.loadGlobalSettings(),
                     this.loadModels(),
                     this.loadServerInfo(),
+                    this.loadProfileFields(),
                     this.checkForUpdate()
                 ]);
 
@@ -897,7 +944,372 @@
                 }
             },
 
+            // ===== Profiles / Templates =====
+            formValuesForProfile() {
+                const ms = this.modelSettings;
+                const out = {};
+
+                for (const k of this.profileFields.universal.concat(this.profileFields.model_specific)) {
+                    if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
+                    if (k === 'thinking_budget_enabled') {
+                        if (ms.enableThinkingBudget) out.thinking_budget_tokens = ms.thinking_budget_tokens ?? null;
+                        continue;
+                    }
+                    if (k === 'index_cache_freq') {
+                        if (ms.enableIndexCache) out.index_cache_freq = ms.index_cache_freq || 4;
+                        continue;
+                    }
+                    if (k === 'max_tool_result_tokens') {
+                        if (ms.enableToolResultLimit) out.max_tool_result_tokens = ms.max_tool_result_tokens || null;
+                        continue;
+                    }
+                    // Standard field: apply nullish coalescing; coerce string numerics
+                    let v = ms[k] ?? null;
+                    if (typeof v === 'string' && v !== '' && !isNaN(Number(v))) v = Number(v);
+                    out[k] = v;
+                }
+
+                // Build chat_template_kwargs and forced_ct_kwargs from ctKwargEntries
+                const ctk = {};
+                const forced = [];
+                for (const e of (ms.ctKwargEntries || [])) {
+                    if (e.type === 'enable_thinking') {
+                        ctk.enable_thinking = e.value === 'true';
+                        if (e.force) forced.push('enable_thinking');
+                    } else if (e.type === 'reasoning_effort') {
+                        ctk.reasoning_effort = e.value;
+                        if (e.force) forced.push('reasoning_effort');
+                    } else if (e.type === 'custom' && e.key && e.key.trim()) {
+                        let v = e.value;
+                        if (v === 'true') v = true;
+                        else if (v === 'false') v = false;
+                        else if (!isNaN(Number(v)) && String(v).trim() !== '') v = Number(v);
+                        ctk[e.key.trim()] = v;
+                        if (e.force) forced.push(e.key.trim());
+                    }
+                }
+                if (Object.keys(ctk).length > 0) out.chat_template_kwargs = ctk;
+                if (forced.length > 0) out.forced_ct_kwargs = forced;
+
+                return out;
+            },
+            formValuesForTemplate() {
+                const full = this.formValuesForProfile();
+                const out = {};
+                for (const k of this.profileFields.universal) {
+                    if (k in full) out[k] = full[k];
+                }
+                return out;
+            },
+            computeDrift() {
+                if (!this.activeProfileName) { this.profilesDrift = false; return; }
+                const active = this.profiles.find(p => p.name === this.activeProfileName);
+                if (!active) { this.profilesDrift = false; return; }
+                const form = this.formValuesForProfile();
+                for (const [k, v] of Object.entries(active.settings || {})) {
+                    if (JSON.stringify(form[k]) !== JSON.stringify(v)) {
+                        this.profilesDrift = true;
+                        return;
+                    }
+                }
+                this.profilesDrift = false;
+            },
+            async loadProfilesForModel(modelId) {
+                this.profiles = [];
+                try {
+                    const r = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/profiles`);
+                    if (r.ok) {
+                        const data = await r.json();
+                        this.profiles = data.profiles || [];
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Failed to load profiles:', e);
+                }
+            },
+            async loadTemplates() {
+                try {
+                    const r = await fetch('/admin/api/profile-templates');
+                    if (r.ok) {
+                        const data = await r.json();
+                        this.templates = data.templates || [];
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Failed to load templates:', e);
+                }
+            },
+            async loadProfileFields() {
+                try {
+                    const r = await fetch('/admin/api/profile-fields');
+                    if (r.ok) {
+                        const data = await r.json();
+                        this.profileFields = {
+                            universal: data.universal || [],
+                            model_specific: data.model_specific || [],
+                        };
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Failed to load profile field definitions:', e);
+                }
+            },
+
+            async createProfile() {
+                if (!this.selectedModel) return;
+                this.profileError = '';
+                const body = {
+                    name: this.newProfile.name.trim(),
+                    display_name: this.newProfile.display_name.trim() || this.newProfile.name.trim(),
+                    description: this.newProfile.description.trim() || null,
+                    settings: this.formValuesForProfile(),
+                    also_save_as_template: !!this.newProfile.also_as_template,
+                };
+                try {
+                    const r = await fetch(
+                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles`,
+                        { method: 'POST', headers: {'Content-Type': 'application/json'},
+                          body: JSON.stringify(body) }
+                    );
+                    if (r.ok) {
+                        await this.loadProfilesForModel(this.selectedModel.id);
+                        if (body.also_save_as_template) await this.loadTemplates();
+                        this.showNewProfileForm = false;
+                        this.newProfile = { name: '', display_name: '', description: '', also_as_template: false };
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await r.json().catch(() => ({}));
+                        this.profileError = data.detail || 'Failed to save profile';
+                    }
+                } catch (e) {
+                    this.profileError = String(e);
+                }
+            },
+            async applyProfileToForm(profile) {
+                // Merge all profile fields into the form (no server call — user clicks Save to persist).
+                const s = profile.settings || {};
+                const ms = this.modelSettings;
+                for (const k of this.profileFields.universal.concat(this.profileFields.model_specific)) {
+                    if (!(k in s)) continue;
+                    if (k === 'thinking_budget_enabled') {
+                        ms.enableThinkingBudget = !!s[k];
+                    } else if (k === 'index_cache_freq') {
+                        ms.enableIndexCache = !!s[k];
+                        ms.index_cache_freq = s[k] || null;
+                    } else if (k === 'max_tool_result_tokens') {
+                        ms.enableToolResultLimit = !!s[k];
+                        ms.max_tool_result_tokens = s[k] || null;
+                    } else if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') {
+                        // Rebuild ctKwargEntries
+                        const ctk = s.chat_template_kwargs || {};
+                        const forced = new Set(s.forced_ct_kwargs || []);
+                        const entries = [];
+                        for (const [key, value] of Object.entries(ctk)) {
+                            if (key === 'enable_thinking') {
+                                entries.push({type:'enable_thinking', value:String(value), force:forced.has('enable_thinking')});
+                            } else if (key === 'reasoning_effort') {
+                                entries.push({type:'reasoning_effort', value:String(value), force:forced.has('reasoning_effort')});
+                            } else {
+                                entries.push({type:'custom', key, value:String(value), force:forced.has(key)});
+                            }
+                        }
+                        ms.ctKwargEntries = entries;
+                    } else {
+                        ms[k] = s[k];
+                    }
+                }
+                // Persist active_profile_name to backend before updating UI state
+                const seq = ++this._applySeq;
+                try {
+                    const r = await fetch(
+                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(profile.name)}/apply`,
+                        { method: 'POST' }
+                    );
+                    if (seq !== this._applySeq) return;  // superseded by a newer click
+                    if (r.ok) {
+                        this.activeProfileName = profile.name;
+                        this.profilesDrift = false;
+                        // Update the models list so the profile badge reflects the change
+                        const m = this.models.find(m => m.id === this.selectedModel.id);
+                        if (m) m.settings = { ...m.settings, active_profile_name: profile.name };
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Failed to apply profile:', e);
+                }
+            },
+            async applyTemplateToForm(template) {
+                // Check if a profile with this template's name already exists
+                const existingProfile = this.profiles.find(p => p.name === template.name);
+
+                if (existingProfile) {
+                    // Profile exists, just apply it (preserve user customizations)
+                    await this.applyProfileToForm(existingProfile);
+                } else {
+                    // Create a new profile from the template
+                    const body = {
+                        name: template.name,
+                        display_name: template.display_name,
+                        description: template.description || null,
+                        settings: template.settings,
+                        source_template: template.name,
+                    };
+                    
+                    try {
+                        const r = await fetch(
+                            `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles`,
+                            { method: 'POST', headers: {'Content-Type': 'application/json'},
+                              body: JSON.stringify(body) }
+                        );
+                        if (r.ok) {
+                            // Reload profiles first to include the new one
+                            await this.loadProfilesForModel(this.selectedModel.id);
+                            // Find the newly created profile in the refreshed list
+                            const newProfile = this.profiles.find(p => p.name === template.name);
+                            if (newProfile) {
+                                await this.applyProfileToForm(newProfile);
+                            }
+                        }
+                    } catch (e) {
+                        console.error('Failed to create profile from template:', e);
+                    }
+                }
+            },
+            async deleteProfile(name) {
+                if (!this.selectedModel) return;
+                try {
+                    const r = await fetch(
+                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(name)}`,
+                        { method: 'DELETE' }
+                    );
+                    if (r.ok) {
+                        if (this.activeProfileName === name) this.activeProfileName = null;
+                        await this.loadProfilesForModel(this.selectedModel.id);
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Delete profile failed:', e);
+                } finally {
+                    this.profileDeleteConfirm = null;
+                }
+            },
+            async updateProfile(name, patch) {
+                // patch: { new_name?, display_name?, description?, settings?, also_save_as_template? }
+                if (!this.selectedModel) return;
+                this.profileError = '';
+                try {
+                    const r = await fetch(
+                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(name)}`,
+                        { method: 'PUT', headers: {'Content-Type':'application/json'},
+                          body: JSON.stringify(patch) }
+                    );
+                    if (r.ok) {
+                        const data = await r.json();
+                        if (this.activeProfileName === name && patch.new_name) {
+                            this.activeProfileName = patch.new_name;
+                        }
+                        await this.loadProfilesForModel(this.selectedModel.id);
+                        if (patch.also_save_as_template) await this.loadTemplates();
+                        this.editingProfile = null;
+                        return data.profile;
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await r.json().catch(() => ({}));
+                        this.profileError = data.detail || 'Failed to update profile';
+                    }
+                } catch (e) {
+                    this.profileError = String(e);
+                }
+            },
+            async createTemplate() {
+                this.profileError = '';
+                const body = {
+                    name: this.newTemplate.name.trim(),
+                    display_name: this.newTemplate.display_name.trim() || this.newTemplate.name.trim(),
+                    description: this.newTemplate.description.trim() || null,
+                    // Only universal fields — server will filter again defensively.
+                    settings: this.formValuesForTemplate(),
+                };
+                try {
+                    const r = await fetch('/admin/api/profile-templates', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify(body),
+                    });
+                    if (r.ok) {
+                        await this.loadTemplates();
+                        this.showNewTemplateForm = false;
+                        this.newTemplate = { name: '', display_name: '', description: '' };
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await r.json().catch(() => ({}));
+                        this.profileError = data.detail || 'Failed to save template';
+                    }
+                } catch (e) {
+                    this.profileError = String(e);
+                }
+            },
+            async updateTemplate(name, patch) {
+                this.profileError = '';
+                try {
+                    const r = await fetch(
+                        `/admin/api/profile-templates/${encodeURIComponent(name)}`,
+                        { method: 'PUT', headers: {'Content-Type':'application/json'},
+                          body: JSON.stringify(patch) }
+                    );
+                    if (r.ok) {
+                        await this.loadTemplates();
+                        this.editingTemplate = null;
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await r.json().catch(() => ({}));
+                        this.profileError = data.detail || 'Failed to update template';
+                    }
+                } catch (e) {
+                    this.profileError = String(e);
+                }
+            },
+            async deleteTemplate(name) {
+                try {
+                    const r = await fetch(
+                        `/admin/api/profile-templates/${encodeURIComponent(name)}`,
+                        { method: 'DELETE' }
+                    );
+                    if (r.ok) {
+                        await this.loadTemplates();
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Delete template failed:', e);
+                } finally {
+                    this.templateDeleteConfirm = null;
+                }
+            },
+
             async openModelSettings(model) {
+                this.profileError = '';
+                this.showNewProfileForm = false;
+                this.showNewTemplateForm = false;
+                this.editingProfile = null;
+                this.editingTemplate = null;
+                this.profileDeleteConfirm = null;
+                this.templateDeleteConfirm = null;
+                this.activeProfileName = (model.settings && model.settings.active_profile_name) || null;
+                await Promise.all([
+                    this.loadProfilesForModel(model.id),
+                    this.loadTemplates(),
+                ]);
+                this.computeDrift();
                 if (this.reasoningParsers.length === 0) {
                     try {
                         const resp = await fetch('/admin/api/grammar/parsers');
@@ -1038,19 +1450,9 @@
                     });
 
                     if (response.ok) {
-                        // Update local model data from server response
+                        // Refresh the model list to update badges
+                        await this.loadModels();
                         const data = await response.json();
-                        const model = this.models.find(m => m.id === this.selectedModel.id);
-                        if (model) {
-                            model.settings = data.settings || {};
-                            // Update effective model_type/engine_type from server
-                            if (data.model_type) {
-                                model.model_type = data.model_type;
-                            }
-                            if (data.engine_type) {
-                                model.engine_type = data.engine_type;
-                            }
-                        }
                         this.showModelSettingsModal = false;
                         if (data.requires_reload) {
                             alert(window.t('js.info.model_type_reload_required'));
@@ -1082,6 +1484,29 @@
                         this.modelSettings.top_p = data.top_p ?? null;
                         this.modelSettings.top_k = data.top_k ?? null;
                         this.modelSettings.repetition_penalty = data.repetition_penalty ?? null;
+                        this.modelSettings.max_tokens = null;
+                        this.modelSettings.min_p = null;
+                        this.modelSettings.presence_penalty = null;
+                        this.modelSettings.force_sampling = false;
+                        this.modelSettings.reasoning_parser = null;
+                        this.modelSettings.ttl_seconds = null;
+                        this.modelSettings.enableIndexCache = false;
+                        this.modelSettings.index_cache_freq = 0;
+                        this.modelSettings.enable_thinking = false;
+                        this.modelSettings.enableThinkingBudget = false;
+                        this.modelSettings.thinking_budget_tokens = 0;
+                        this.modelSettings.enableToolResultLimit = false;
+                        this.modelSettings.max_tool_result_tokens = 0;
+                        this.modelSettings.ctKwargEntries = [];
+                        this.modelSettings.turboquant_kv_enabled = false;
+                        this.modelSettings.turboquant_kv_bits = 4;
+                        this.modelSettings.specprefill_enabled = false;
+                        this.modelSettings.specprefill_draft_model = null;
+                        this.modelSettings.specprefill_keep_pct = 0.2;
+                        this.modelSettings.specprefill_threshold = null;
+                        this.modelSettings.dflash_enabled = false;
+                        this.modelSettings.dflash_draft_model = null;
+                        this.modelSettings.dflash_draft_quant_bits = null;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
                     } else if (response.status === 401) {
@@ -1096,6 +1521,8 @@
                 } finally {
                     this.loadingGenDefaults = false;
                 }
+                this.activeProfileName = null;
+                this.profilesDrift = false;
             },
 
             // Status tab functions
@@ -1940,7 +2367,9 @@
 
                 // Full sizes lookup
                 const fullSizes = {};
-                for (const bl of this.accBenchmarkList) fullSizes[bl.key] = bl.fullSize;
+                for (const grp of this.accBenchmarkGroups) {
+                    for (const bl of grp.benchmarks) fullSizes[bl.key] = bl.fullSize;
+                }
 
                 // Determine column widths
                 const modelWidth = Math.max(12, ...models.map(m => m.length + 2));
@@ -2036,9 +2465,9 @@
                     mime = 'application/json';
                 } else if (format === 'csv') {
                     const esc = s => '"' + (s || '').replace(/"/g, '""') + '"';
-                    const lines = ['id,correct,expected,predicted,question,raw_response,time_s'];
+                    const lines = ['id,category,correct,expected,predicted,question,raw_response,time_s'];
                     for (const q of qr) {
-                        lines.push([q.id, q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                        lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
                     }
                     content = lines.join('\n');
                     mime = 'text/csv';
@@ -2052,6 +2481,7 @@
                     ];
                     for (const q of qr) {
                         lines.push(`--- Q${q.id} [${q.correct ? 'CORRECT' : 'WRONG'}] ---`);
+                        if (q.category) lines.push(`Category: ${q.category}`);
                         lines.push(`Question: ${q.question || ''}`);
                         lines.push(`Expected: ${q.expected}`);
                         lines.push(`Predicted: ${q.predicted}`);

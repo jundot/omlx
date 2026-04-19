@@ -25,7 +25,7 @@ from typing import Any, Dict, Optional, List, Literal
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .auth import (
     REMEMBER_ME_MAX_AGE,
@@ -125,6 +125,42 @@ class ModelSettingsRequest(BaseModel):
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
+
+
+class CreateProfileRequest(BaseModel):
+    """Request body for creating a per-model profile."""
+    name: str
+    display_name: str
+    description: Optional[str] = None
+    settings: Dict[str, Any] = Field(default_factory=dict)
+    also_save_as_template: bool = False
+    source_template: Optional[str] = None
+
+
+class UpdateProfileRequest(BaseModel):
+    """Request body for updating/renaming a per-model profile."""
+    new_name: Optional[str] = None
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    settings: Optional[Dict[str, Any]] = None
+    source_template: Optional[str] = None
+    also_save_as_template: bool = False
+
+
+class CreateTemplateRequest(BaseModel):
+    """Request body for creating a global template."""
+    name: str
+    display_name: str
+    description: Optional[str] = None
+    settings: Dict[str, Any] = Field(default_factory=dict)
+
+
+class UpdateTemplateRequest(BaseModel):
+    """Request body for updating/renaming a global template."""
+    new_name: Optional[str] = None
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    settings: Optional[Dict[str, Any]] = None
 
 
 class GlobalSettingsRequest(BaseModel):
@@ -1348,6 +1384,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),
             "thinking_default": model_info.get("thinking_default"),
+            "preserve_thinking_default": model_info.get("preserve_thinking_default"),
             "last_access": model_info.get("last_access"),
         }
 
@@ -1387,6 +1424,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
                 "description": settings.description,
+                "active_profile_name": settings.active_profile_name,
             }
 
         models.append(model_data)
@@ -1622,6 +1660,22 @@ async def update_model_settings(
         if request.is_default and server_state:
             server_state.default_model = model_id
 
+    # If an active profile was set, clear it when the user's save diverges
+    # from the profile's stored values.
+    if current_settings.active_profile_name:
+        profile = settings_manager.get_profile(
+            model_id, current_settings.active_profile_name
+        )
+        if profile is None:
+            current_settings.active_profile_name = None
+        else:
+            profile_settings = profile.get("settings", {}) or {}
+            candidate = current_settings.to_dict()
+            for key, expected in profile_settings.items():
+                if candidate.get(key) != expected:
+                    current_settings.active_profile_name = None
+                    break
+
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
 
@@ -1649,6 +1703,221 @@ async def update_model_settings(
         "engine_type": entry.engine_type,
         "requires_reload": requires_reload,
     }
+
+
+# =============================================================================
+# Profile & Template endpoints
+# =============================================================================
+
+
+def _require_settings_manager():
+    mgr = _get_settings_manager()
+    if mgr is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    return mgr
+
+
+def _require_model(model_id: str):
+    pool = _get_engine_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    entry = pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    return entry
+
+
+@router.get("/api/models/{model_id}/profiles")
+async def list_model_profiles(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    return {"profiles": mgr.list_profiles(model_id)}
+
+
+@router.post("/api/models/{model_id}/profiles")
+async def create_model_profile(
+    model_id: str,
+    request: CreateProfileRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    from ..model_profiles import InvalidProfileNameError, filter_universal_fields
+
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    try:
+        profile = mgr.save_profile(
+            model_id=model_id,
+            name=request.name,
+            display_name=request.display_name,
+            description=request.description,
+            settings=request.settings or {},
+            source_template=request.source_template,
+        )
+    except InvalidProfileNameError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    if request.also_save_as_template:
+        try:
+            mgr.upsert_template(
+                name=request.name,
+                display_name=request.display_name,
+                description=request.description,
+                settings=filter_universal_fields(request.settings or {}),
+            )
+        except InvalidProfileNameError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    return {"profile": profile}
+
+
+@router.put("/api/models/{model_id}/profiles/{name}")
+async def update_model_profile(
+    model_id: str,
+    name: str,
+    request: UpdateProfileRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    from ..model_profiles import InvalidProfileNameError, filter_universal_fields
+
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    try:
+        updated = mgr.update_profile(
+            model_id=model_id,
+            name=name,
+            new_name=request.new_name,
+            display_name=request.display_name,
+            description=request.description,
+            settings=request.settings,
+            source_template=request.source_template,
+        )
+    except InvalidProfileNameError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+
+    if request.also_save_as_template and request.settings is not None:
+        try:
+            mgr.upsert_template(
+                name=updated["name"],
+                display_name=updated["display_name"],
+                description=updated.get("description"),
+                settings=filter_universal_fields(request.settings),
+            )
+        except InvalidProfileNameError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    return {"profile": updated}
+
+
+@router.delete("/api/models/{model_id}/profiles/{name}")
+async def delete_model_profile(
+    model_id: str,
+    name: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    if not mgr.delete_profile(model_id, name):
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    return {"deleted": True, "name": name}
+
+
+@router.post("/api/models/{model_id}/profiles/{name}/apply")
+async def apply_model_profile(
+    model_id: str,
+    name: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    applied = mgr.apply_profile(model_id, name)
+    if applied is None:
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    return {"model_id": model_id, "settings": applied.to_dict()}
+
+
+@router.get("/api/profile-fields")
+async def get_profile_fields(is_admin: bool = Depends(require_admin)):
+    from ..model_profiles import (
+        UNIVERSAL_PROFILE_FIELDS,
+        MODEL_SPECIFIC_PROFILE_FIELDS,
+    )
+
+    return {
+        "universal": list(UNIVERSAL_PROFILE_FIELDS),
+        "model_specific": list(MODEL_SPECIFIC_PROFILE_FIELDS),
+    }
+
+
+@router.get("/api/profile-templates")
+async def list_templates(is_admin: bool = Depends(require_admin)):
+    mgr = _require_settings_manager()
+    return {"templates": mgr.list_templates()}
+
+
+@router.post("/api/profile-templates")
+async def create_template(
+    request: CreateTemplateRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    from ..model_profiles import InvalidProfileNameError
+
+    mgr = _require_settings_manager()
+    try:
+        tmpl = mgr.save_template(
+            name=request.name,
+            display_name=request.display_name,
+            description=request.description,
+            settings=request.settings or {},
+        )
+    except InvalidProfileNameError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"template": tmpl}
+
+
+@router.put("/api/profile-templates/{name}")
+async def update_template(
+    name: str,
+    request: UpdateTemplateRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    from ..model_profiles import InvalidProfileNameError
+
+    mgr = _require_settings_manager()
+    try:
+        updated = mgr.update_template(
+            name=name,
+            new_name=request.new_name,
+            display_name=request.display_name,
+            description=request.description,
+            settings=request.settings,
+        )
+    except InvalidProfileNameError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Template not found: {name}")
+    return {"template": updated}
+
+
+@router.delete("/api/profile-templates/{name}")
+async def delete_template(
+    name: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    if not mgr.delete_template(name):
+        raise HTTPException(status_code=404, detail=f"Template not found: {name}")
+    return {"deleted": True, "name": name}
 
 
 @router.get("/api/models/{model_id}/generation_config")
