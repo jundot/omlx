@@ -36,7 +36,7 @@ VALID_BENCHMARKS = [
     "mmlu", "mmlu_pro", "kmmlu", "cmmlu", "jmmlu",
     "hellaswag", "truthfulqa", "arc_challenge", "winogrande",
     "gsm8k", "mathqa", "humaneval", "mbpp", "livecodebench",
-    "bbq", "ethics", "safetybench",
+    "bbq", "safetybench",
 ]
 
 

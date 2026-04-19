@@ -2,15 +2,14 @@
 """Accuracy evaluation benchmarks for LLMs.
 
 Provides benchmarks across knowledge, commonsense reasoning, math,
-coding, safety, bias, and ethics categories with deterministic
-sampling for fair model comparison.
+coding, safety, and bias categories with deterministic sampling
+for fair model comparison.
 """
 
 from .arc import ARCChallengeBenchmark
 from .base import BaseBenchmark, BenchmarkResult, QuestionResult
 from .bbq import BBQBenchmark
 from .cmmlu import CMMLUBenchmark
-from .ethics import EthicsBenchmark
 from .gsm8k import GSM8KBenchmark
 from .hellaswag import HellaSwagBenchmark
 from .humaneval import HumanEvalBenchmark
@@ -41,7 +40,6 @@ BENCHMARKS: dict[str, type[BaseBenchmark]] = {
     "mbpp": MBPPBenchmark,
     "livecodebench": LiveCodeBenchBenchmark,
     "bbq": BBQBenchmark,
-    "ethics": EthicsBenchmark,
     "safetybench": SafetyBenchBenchmark,
 }
 
@@ -62,6 +60,5 @@ __all__ = [
     "MBPPBenchmark",
     "LiveCodeBenchBenchmark",
     "BBQBenchmark",
-    "EthicsBenchmark",
     "SafetyBenchBenchmark",
 ]
