@@ -446,17 +446,11 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     # model_index.json is a diffusers-format signature file.
     # Check _class_name to confirm it's an image pipeline (not e.g. depth estimation).
-    index_path = model_path / "model_index.json"
-    if index_path.exists():
-        try:
-            with open(index_path) as f:
-                index = json.load(f)
-            class_name = index.get("_class_name", "").lower()
-            # Known image pipeline class names from mflux and diffusers
-            if any(kw in class_name for kw in ("pipeline", "flux", "zimage", "z_image", "fibo", "seedvr")):
-                return "image_t2i"
-        except (json.JSONDecodeError, IOError):
-            pass
+    class_name = _get_diffusers_class_name(model_path)
+    if class_name:
+        # Known image pipeline class names from mflux and diffusers
+        if any(kw in class_name for kw in ("pipeline", "flux", "zimage", "z_image", "fibo", "seedvr")):
+            return "image_t2i"
 
     # Directory name heuristic for image models without config.json
     name_lower = model_path.name.lower()
@@ -736,6 +730,26 @@ def _is_diffusers_image_dir(path: Path) -> bool:
     return has_transformer and (has_vae or has_text_encoder)
 
 
+def _get_diffusers_class_name(model_path: Path) -> str | None:
+    """Extract the _class_name from model_index.json if present.
+
+    Args:
+        model_path: Path to model directory
+
+    Returns:
+        The _class_name value converted to lowercase, or None if not found
+    """
+    index_path = model_path / "model_index.json"
+    if not index_path.exists():
+        return None
+    try:
+        with open(index_path) as f:
+            index = json.load(f)
+        return index.get("_class_name", "").lower()
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
 def _is_model_dir(path: Path) -> bool:
     """Check if a directory contains a valid model.
 
@@ -750,16 +764,9 @@ def _is_model_dir(path: Path) -> bool:
     if (path / "config.json").exists() or _is_diffusers_image_dir(path):
         return True
     # model_index.json with a pipeline class indicates a diffusers model
-    index_path = path / "model_index.json"
-    if index_path.exists():
-        try:
-            with open(index_path) as f:
-                index = json.load(f)
-            class_name = index.get("_class_name", "").lower()
-            if "pipeline" in class_name:
-                return True
-        except (json.JSONDecodeError, IOError):
-            pass
+    class_name = _get_diffusers_class_name(path)
+    if class_name and "pipeline" in class_name:
+        return True
     return False
 
 

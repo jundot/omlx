@@ -129,16 +129,32 @@ class ImageEngine(BaseNonStreamingEngine):
     - Qwen Image
     """
 
-    # Model name to mflux class path mapping
-    MODEL_MAP = {
+    # Unified model alias mapping.
+    #
+    # This mapping provides aliases for common model names and config types.
+    # It supports both user-friendly names (e.g., "z-image-turbo", "flux.1-schnell")
+    # and config.json model_type values (e.g., "flux", "z_image").
+    #
+    # The actual model discovery is dynamic - new mflux models are automatically
+    # detected via config_model_type from the model's config.json.
+    #
+    # To add a new alias:
+    # Add an entry here: "alias-name": ("module.path", "ClassName")
+    #
+    # To support a new mflux model family without aliasing:
+    # Just use the HuggingFace repo name directly - it will be auto-detected.
+    MODEL_ALIAS_MAP = {
         # Z-Image (fastest)
         "z-image-turbo": ("mflux.models.z_image", "ZImageTurbo"),
         "zimage-turbo": ("mflux.models.z_image", "ZImageTurbo"),
         "z_image_turbo": ("mflux.models.z_image", "ZImageTurbo"),
         "z-image": ("mflux.models.z_image", "ZImage"),
-        "zimage": ("mflux.models.z_image", "ZImage"),
-        "z_image": ("mflux.models.z_image", "ZImage"),
+        "zimage": ("mflux.models.z_image", "ZImageTurbo"),
+        "z_image": ("mflux.models.z_image", "ZImageTurbo"),
         # FLUX.1 - uses Flux1 class from txt2img module
+        "flux": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
+        "flux1": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
+        "flux_1": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
         "flux.1-schnell": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
         "flux1-schnell": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
         "flux_schnell": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
@@ -147,13 +163,14 @@ class ImageEngine(BaseNonStreamingEngine):
         "flux_dev": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
         "flux.1": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
         # FLUX.2
-        "flux.2": ("mflux.models.flux2", "Flux2Klein"),
         "flux2": ("mflux.models.flux2", "Flux2Klein"),
+        "flux_2": ("mflux.models.flux2", "Flux2Klein"),
+        "flux.2": ("mflux.models.flux2", "Flux2Klein"),
         # FIBO
         "fibo": ("mflux.models.fibo", "FIBO"),
         # SeedVR2
-        "seedvr2": ("mflux.models.seedvr2", "SeedVR2"),
         "seedvr": ("mflux.models.seedvr2", "SeedVR2"),
+        "seedvr2": ("mflux.models.seedvr2", "SeedVR2"),
         # Qwen Image
         "qwen-image": ("mflux.models.qwen", "QwenImage"),
         "qwen_image": ("mflux.models.qwen", "QwenImage"),
@@ -191,47 +208,32 @@ class ImageEngine(BaseNonStreamingEngine):
         # Normalize model_type from config.json
         type_normalized = config_model_type.lower().replace("-", "_").replace(".", "_")
 
-        # Map config_model_type to mflux class
-        CONFIG_TYPE_MAP = {
-            "flux": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
-            "flux1": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
-            "flux_1": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
-            "flux2": ("mflux.models.flux2", "Flux2Klein"),
-            "flux_2": ("mflux.models.flux2", "Flux2Klein"),
-            "z_image": ("mflux.models.z_image", "ZImageTurbo"),
-            "zimage": ("mflux.models.z_image", "ZImageTurbo"),
-            "fibo": ("mflux.models.fibo", "FIBO"),
-            "seedvr": ("mflux.models.seedvr2", "SeedVR2"),
-            "seedvr2": ("mflux.models.seedvr2", "SeedVR2"),
-            "qwen_image": ("mflux.models.qwen", "QwenImage"),
-        }
-
-        # Use config_model_type if available
-        if type_normalized in CONFIG_TYPE_MAP:
-            return CONFIG_TYPE_MAP[type_normalized]
+        # Try config_model_type first
+        if type_normalized in self.MODEL_ALIAS_MAP:
+            return self.MODEL_ALIAS_MAP[type_normalized]
 
         # Normalize model name for lookup
         name_lower = model_name.lower().replace("_", "-").replace(".", "-")
 
-        # Direct mapping
-        if name_lower in self.MODEL_MAP:
-            return self.MODEL_MAP[name_lower]
+        # Direct name mapping
+        if name_lower in self.MODEL_ALIAS_MAP:
+            return self.MODEL_ALIAS_MAP[name_lower]
 
         # Fuzzy matching on model name
         if "turbo" in name_lower or "schnell" in name_lower:
-            return self.MODEL_MAP["z-image-turbo"]
+            return self.MODEL_ALIAS_MAP["z-image-turbo"]
         if "flux" in name_lower and "2" in name_lower:
-            return self.MODEL_MAP["flux2"]
+            return self.MODEL_ALIAS_MAP["flux2"]
         if "flux" in name_lower:
-            return self.MODEL_MAP["flux.1-schnell"]
+            return self.MODEL_ALIAS_MAP["flux"]
         if "qwen" in name_lower:
-            return self.MODEL_MAP["qwen-image"]
+            return self.MODEL_ALIAS_MAP["qwen-image"]
         if "fibo" in name_lower:
-            return self.MODEL_MAP["fibo"]
+            return self.MODEL_ALIAS_MAP["fibo"]
         if "seed" in name_lower:
-            return self.MODEL_MAP["seedvr2"]
+            return self.MODEL_ALIAS_MAP["seedvr2"]
         if "z" in name_lower and "image" in name_lower:
-            return self.MODEL_MAP["z-image-turbo"]
+            return self.MODEL_ALIAS_MAP["z-image-turbo"]
 
         # Default
         logger.warning(f"Unknown model '{model_name}' (type='{config_model_type}'), defaulting to ZImageTurbo")
@@ -263,8 +265,19 @@ class ImageEngine(BaseNonStreamingEngine):
             import os
             from pathlib import Path
 
-            module = importlib.import_module(self._model_module)
-            model_class = getattr(module, self._model_class_name)
+            try:
+                module = importlib.import_module(self._model_module)
+                model_class = getattr(module, self._model_class_name)
+            except (ImportError, ModuleNotFoundError) as e:
+                raise RuntimeError(
+                    f"Failed to import mflux module '{self._model_module}'. "
+                    f"Please ensure mflux is installed and supports this model. Error: {e}"
+                ) from e
+            except AttributeError as e:
+                raise RuntimeError(
+                    f"Model class '{self._model_class_name}' not found in module '{self._model_module}'. "
+                    f"This may indicate a version mismatch or unsupported model. Error: {e}"
+                ) from e
 
             # Build constructor kwargs
             init_kwargs = {}
