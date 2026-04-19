@@ -387,9 +387,7 @@ def extract_text_content(
                                 "id": tc.get("id", ""),
                                 "function": {
                                     "name": func.get("name", ""),
-                                    "arguments": _try_parse_json(
-                                        func.get("arguments", "{}")
-                                    ),
+                                    "arguments": func.get("arguments", "{}"),
                                 },
                             }
                         )
@@ -408,7 +406,7 @@ def extract_text_content(
                                         if hasattr(tc, "function")
                                         else ""
                                     ),
-                                    "arguments": _try_parse_json(args_str),
+                                    "arguments": args_str,
                                 },
                             }
                         )
@@ -547,9 +545,7 @@ def extract_multimodal_content(
                                 "id": tc.get("id", ""),
                                 "function": {
                                     "name": func.get("name", ""),
-                                    "arguments": _try_parse_json(
-                                        func.get("arguments", "{}")
-                                    ),
+                                    "arguments": func.get("arguments", "{}"),
                                 },
                             }
                         )
@@ -568,7 +564,7 @@ def extract_multimodal_content(
                                         if hasattr(tc, "function")
                                         else ""
                                     ),
-                                    "arguments": _try_parse_json(args_str),
+                                    "arguments": args_str,
                                 },
                             }
                         )
