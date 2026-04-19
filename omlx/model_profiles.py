@@ -14,8 +14,7 @@ allowed keys.
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
-
+from typing import Any
 
 # Universal fields — eligible for global templates AND per-model profiles.
 UNIVERSAL_PROFILE_FIELDS = (
@@ -65,13 +64,13 @@ EXCLUDED_FROM_PROFILES = frozenset({
 })
 
 
-def filter_universal_fields(data: Dict[str, Any]) -> Dict[str, Any]:
+def filter_universal_fields(data: dict[str, Any]) -> dict[str, Any]:
     """Return a new dict containing only UNIVERSAL_PROFILE_FIELDS keys."""
     allowed = set(UNIVERSAL_PROFILE_FIELDS)
     return {k: v for k, v in data.items() if k in allowed}
 
 
-def filter_profile_fields(data: Dict[str, Any]) -> Dict[str, Any]:
+def filter_profile_fields(data: dict[str, Any]) -> dict[str, Any]:
     """Return a new dict containing UNIVERSAL + MODEL_SPECIFIC keys."""
     allowed = set(UNIVERSAL_PROFILE_FIELDS) | set(MODEL_SPECIFIC_PROFILE_FIELDS)
     return {k: v for k, v in data.items() if k in allowed}
@@ -85,9 +84,9 @@ class ModelProfile:
     display_name: str
     created_at: datetime
     updated_at: datetime
-    settings: Dict[str, Any] = field(default_factory=dict)
-    description: Optional[str] = None
-    source_template: Optional[str] = None
+    settings: dict[str, Any] = field(default_factory=dict)
+    description: str | None = None
+    source_template: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -121,8 +120,8 @@ class GlobalTemplate:
     display_name: str
     created_at: datetime
     updated_at: datetime
-    settings: Dict[str, Any] = field(default_factory=dict)
-    description: Optional[str] = None
+    settings: dict[str, Any] = field(default_factory=dict)
+    description: str | None = None
 
     def to_dict(self) -> dict:
         return {

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for admin profile/template API routes."""
 
+
 import pytest
-from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -150,15 +150,28 @@ class TestProfileRoutes:
         assert "temperature" in data["universal"]
         assert "turboquant_kv_enabled" in data["model_specific"]
 
+    def test_also_save_as_template(self, client):
+        c, mgr = client
+        r = c.post("/admin/api/models/model-a/profiles", json={
+            "name": "coding", "display_name": "Coding",
+            "settings": {"temperature": 0.0, "turboquant_kv_enabled": True},
+            "also_save_as_template": True,
+        })
+        assert r.status_code == 200
+        tmpl = mgr.get_template("coding")
+        assert tmpl is not None
+        assert tmpl["settings"] == {"temperature": 0.0}
+
 
 def test_all_model_settings_fields_classified():
     from dataclasses import fields
-    from omlx.model_settings import ModelSettings
+
     from omlx.model_profiles import (
-        UNIVERSAL_PROFILE_FIELDS,
-        MODEL_SPECIFIC_PROFILE_FIELDS,
         EXCLUDED_FROM_PROFILES,
+        MODEL_SPECIFIC_PROFILE_FIELDS,
+        UNIVERSAL_PROFILE_FIELDS,
     )
+    from omlx.model_settings import ModelSettings
 
     classified = set(UNIVERSAL_PROFILE_FIELDS) | set(MODEL_SPECIFIC_PROFILE_FIELDS) | EXCLUDED_FROM_PROFILES
     all_fields = {f.name for f in fields(ModelSettings)}
@@ -168,20 +181,6 @@ def test_all_model_settings_fields_classified():
         f"UNIVERSAL_PROFILE_FIELDS, MODEL_SPECIFIC_PROFILE_FIELDS, or "
         f"EXCLUDED_FROM_PROFILES. If unsure, add to EXCLUDED_FROM_PROFILES."
     )
-
-
-def test_also_save_as_template(client):
-    c, mgr = client
-    r = c.post("/admin/api/models/model-a/profiles", json={
-        "name": "coding", "display_name": "Coding",
-        "settings": {"temperature": 0.0, "turboquant_kv_enabled": True},
-        "also_save_as_template": True,
-    })
-    assert r.status_code == 200
-    tmpl = mgr.get_template("coding")
-    assert tmpl is not None
-    # Template carries only universal fields
-    assert tmpl["settings"] == {"temperature": 0.0}
 
 
 class TestTemplateRoutes:
@@ -227,9 +226,6 @@ class TestTemplateRoutes:
 def test_request_models_import():
     from omlx.admin.routes import (
         CreateProfileRequest,
-        UpdateProfileRequest,
-        CreateTemplateRequest,
-        UpdateTemplateRequest,
     )
     # Minimal round-trip
     req = CreateProfileRequest(

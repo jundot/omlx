@@ -5,6 +5,7 @@ per-model configuration settings, including sampling parameters, pinned/default
 flags, and metadata.
 """
 
+import copy
 import json
 import logging
 import threading
@@ -351,15 +352,17 @@ class ModelSettingsManager:
             self._profiles = {}
 
     def _save_profiles(self) -> None:
-        """Must be called while holding the lock."""
+        """Write profiles to disk atomically (temp file + rename)."""
         data = {"version": PROFILES_VERSION, "profiles": self._profiles}
+        temp_file = self.profiles_file.with_suffix(".tmp")
         try:
-            temp_file = self.profiles_file.with_suffix(".tmp")
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False, default=str)
             temp_file.replace(self.profiles_file)
         except Exception as e:
             logger.error(f"Failed to save profiles file: {e}")
+            if temp_file.exists():
+                temp_file.unlink(missing_ok=True)
             raise
 
     def list_profiles(self, model_id: str) -> list[dict]:
@@ -419,6 +422,7 @@ class ModelSettingsManager:
                 return None
             profile = dict(per_model[name])
             target_name = name
+            rename_mode = False
             if new_name is not None and new_name != name:
                 validate_profile_name(new_name)
                 if new_name in per_model:
@@ -427,6 +431,7 @@ class ModelSettingsManager:
                     )
                 target_name = new_name
                 profile["name"] = new_name
+                rename_mode = True
             if display_name is not None:
                 profile["display_name"] = display_name
             if description is not None:
@@ -437,15 +442,30 @@ class ModelSettingsManager:
                 profile["source_template"] = source_template or None
             profile["updated_at"] = utcnow().isoformat()
 
+            # Snapshot for rollback on write failure
+            profiles_snapshot = copy.deepcopy(self._profiles)
+            settings_snapshot = copy.deepcopy(self._settings)
+
             # Also update ModelSettings.active_profile_name if renamed and it was active
-            if target_name != name:
+            old_active = None
+            if rename_mode:
+                old_active = self._settings.get(model_id)
+                if old_active is not None and old_active.active_profile_name == name:
+                    old_active.active_profile_name = target_name
                 del per_model[name]
-                current = self._settings.get(model_id)
-                if current is not None and current.active_profile_name == name:
-                    current.active_profile_name = target_name
-                    self._save()
+
             per_model[target_name] = profile
-            self._save_profiles()
+
+            # Write profiles first; if this throws, rollback everything
+            try:
+                self._save_profiles()
+                if rename_mode and old_active is not None:
+                    self._save()
+            except Exception:
+                self._profiles = profiles_snapshot
+                self._settings = settings_snapshot
+                raise
+
             return dict(profile)
 
     def delete_profile(self, model_id: str, name: str) -> bool:
@@ -453,15 +473,26 @@ class ModelSettingsManager:
             per_model = self._profiles.get(model_id, {})
             if name not in per_model:
                 return False
+
+            profiles_snapshot = copy.deepcopy(self._profiles)
+            settings_snapshot = copy.deepcopy(self._settings)
+
             del per_model[name]
             if not per_model and model_id in self._profiles:
                 del self._profiles[model_id]
             # Clear active_profile_name if it referenced this profile
-            current = self._settings.get(model_id)
-            if current is not None and current.active_profile_name == name:
-                current.active_profile_name = None
-                self._save()
-            self._save_profiles()
+            old_active = self._settings.get(model_id)
+            if old_active is not None and old_active.active_profile_name == name:
+                old_active.active_profile_name = None
+
+            try:
+                self._save_profiles()
+                if old_active is not None and old_active.active_profile_name is None:
+                    self._save()
+            except Exception:
+                self._profiles = profiles_snapshot
+                self._settings = settings_snapshot
+                raise
             return True
 
     def apply_profile(self, model_id: str, name: str) -> Optional[ModelSettings]:
@@ -472,6 +503,8 @@ class ModelSettingsManager:
                 return None
             profile_settings = per_model[name].get("settings", {}) or {}
 
+            settings_snapshot = copy.deepcopy(self._settings)
+
             current = self._settings.get(model_id)
             if current is None:
                 current = ModelSettings()
@@ -481,7 +514,11 @@ class ModelSettingsManager:
             merged["active_profile_name"] = name
             new_settings = ModelSettings.from_dict(merged)
             self._settings[model_id] = new_settings
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                self._settings = settings_snapshot
+                raise
             return ModelSettings.from_dict(new_settings.to_dict())
 
     # ==================== Templates ====================

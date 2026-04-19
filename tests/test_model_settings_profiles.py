@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for profile/template CRUD on ModelSettingsManager."""
 
-import json
-import tempfile
-from pathlib import Path
 
 import pytest
 
-from omlx.model_settings import ModelSettings, ModelSettingsManager
 from omlx.model_profiles import InvalidProfileNameError
+from omlx.model_settings import ModelSettings, ModelSettingsManager
 
 
 @pytest.fixture

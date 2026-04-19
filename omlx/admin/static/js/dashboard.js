@@ -114,6 +114,7 @@
             profileFields: { universal: [], model_specific: [] },  // loaded from /api/profile-fields
             activeProfileName: null,     // currently-active profile for the form
             profilesDrift: false,        // true if form values differ from active profile
+            _applySeq: 0,               // monotonic counter for apply race guard
             profileError: '',
             showNewProfileForm: false,
             newProfile: { name: '', display_name: '', description: '', also_as_template: false },
@@ -917,7 +918,29 @@
             // ===== Profiles / Templates =====
             formValuesForProfile() {
                 const ms = this.modelSettings;
-                // Reconstruct chat_template_kwargs from ctKwargEntries
+                const out = {};
+
+                for (const k of this.profileFields.universal.concat(this.profileFields.model_specific)) {
+                    if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
+                    if (k === 'thinking_budget_enabled') {
+                        if (ms.enableThinkingBudget) out.thinking_budget_tokens = ms.thinking_budget_tokens ?? null;
+                        continue;
+                    }
+                    if (k === 'index_cache_freq') {
+                        if (ms.enableIndexCache) out.index_cache_freq = ms.index_cache_freq || 4;
+                        continue;
+                    }
+                    if (k === 'max_tool_result_tokens') {
+                        if (ms.enableToolResultLimit) out.max_tool_result_tokens = ms.max_tool_result_tokens || null;
+                        continue;
+                    }
+                    // Standard field: apply nullish coalescing; coerce string numerics
+                    let v = ms[k] ?? null;
+                    if (typeof v === 'string' && v !== '' && !isNaN(Number(v))) v = Number(v);
+                    out[k] = v;
+                }
+
+                // Build chat_template_kwargs and forced_ct_kwargs from ctKwargEntries
                 const ctk = {};
                 const forced = [];
                 for (const e of (ms.ctKwargEntries || [])) {
@@ -936,36 +959,10 @@
                         if (e.force) forced.push(e.key.trim());
                     }
                 }
-                return {
-                    max_context_window: ms.max_context_window || null,
-                    max_tokens: ms.max_tokens || null,
-                    temperature: Number.isFinite(ms.temperature) ? ms.temperature : null,
-                    top_p: Number.isFinite(ms.top_p) ? ms.top_p : null,
-                    top_k: Number.isFinite(ms.top_k) ? ms.top_k : null,
-                    min_p: Number.isFinite(ms.min_p) ? ms.min_p : null,
-                    repetition_penalty: Number.isFinite(ms.repetition_penalty) ? ms.repetition_penalty : null,
-                    presence_penalty: Number.isFinite(ms.presence_penalty) ? ms.presence_penalty : null,
-                    force_sampling: !!ms.force_sampling,
-                    enable_thinking: ms.enable_thinking,
-                    thinking_budget_enabled: !!ms.enableThinkingBudget,
-                    thinking_budget_tokens: ms.enableThinkingBudget ? (ms.thinking_budget_tokens || null) : null,
-                    reasoning_parser: ms.reasoning_parser || null,
-                    max_tool_result_tokens: ms.enableToolResultLimit ? (ms.max_tool_result_tokens || null) : null,
-                    chat_template_kwargs: Object.keys(ctk).length > 0 ? ctk : null,
-                    forced_ct_kwargs: forced.length > 0 ? forced : null,
-                    ttl_seconds: ms.ttl_seconds || null,
-                    turboquant_kv_enabled: !!ms.turboquant_kv_enabled,
-                    turboquant_kv_bits: ms.turboquant_kv_enabled ? (parseFloat(ms.turboquant_kv_bits) || 4) : null,
-                    specprefill_enabled: !!ms.specprefill_enabled,
-                    specprefill_draft_model: ms.specprefill_draft_model || null,
-                    specprefill_keep_pct: ms.specprefill_enabled ? (parseFloat(ms.specprefill_keep_pct) || 0.2) : null,
-                    specprefill_threshold: ms.specprefill_enabled ? (ms.specprefill_threshold || null) : null,
-                    dflash_enabled: !!ms.dflash_enabled,
-                    dflash_draft_model: ms.dflash_draft_model || null,
-                    dflash_draft_quant_bits: ms.dflash_enabled && ms.dflash_draft_quant_bits
-                        ? parseInt(ms.dflash_draft_quant_bits) : null,
-                    index_cache_freq: ms.enableIndexCache ? (ms.index_cache_freq || 4) : null,
-                };
+                if (Object.keys(ctk).length > 0) out.chat_template_kwargs = ctk;
+                if (forced.length > 0) out.forced_ct_kwargs = forced;
+
+                return out;
             },
             formValuesForTemplate() {
                 const full = this.formValuesForProfile();
@@ -1097,11 +1094,13 @@
                     }
                 }
                 // Persist active_profile_name to backend before updating UI state
+                const seq = ++this._applySeq;
                 try {
                     const r = await fetch(
                         `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(profile.name)}/apply`,
                         { method: 'POST' }
                     );
+                    if (seq !== this._applySeq) return;  // superseded by a newer click
                     if (r.ok) {
                         this.activeProfileName = profile.name;
                         this.profilesDrift = false;
