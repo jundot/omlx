@@ -193,8 +193,9 @@ def _drop_void_assistant_messages(messages: list[dict]) -> list[dict]:
     carry no information and can appear when a client echoes back a response
     that had only tool calls which were not preserved in its history.
 
-    Messages with ``tool_responses`` (Gemma 4 format) are never dropped even
-    when content is empty — they carry tool result data.
+    Messages with ``tool_responses`` (Gemma 4 format) or ``reasoning_content``
+    (Qwen 3.6+ native reasoning field) are never dropped even when content is
+    empty — they carry their own payload the template renders.
     """
     return [
         msg
@@ -204,6 +205,7 @@ def _drop_void_assistant_messages(messages: list[dict]) -> list[dict]:
             and not msg.get("content")
             and not msg.get("tool_calls")
             and not msg.get("tool_responses")
+            and not msg.get("reasoning_content")
         )
     ]
 
@@ -285,10 +287,42 @@ def _merge_consecutive_roles(messages: list[dict]) -> list[dict]:
     return merged
 
 
+def _apply_reasoning_reconstruction(
+    role: str,
+    content: Any,
+    reasoning: str | None,
+    native: bool,
+) -> tuple[Any, str | None]:
+    """Reconstruct reasoning on a historical assistant message.
+
+    External clients echo reasoning back via the OpenAI ``reasoning_content``
+    field (or Anthropic ``thinking`` blocks).  Chat templates fall into two
+    camps:
+
+    * ``native=True`` — template understands ``message.reasoning_content``
+      as a top-level field (Qwen 3.6+).  Content stays clean and reasoning
+      travels separately.
+    * ``native=False`` — template only parses ``<think>...</think>`` embedded
+      in content.  Reasoning is inlined into content as a fallback.
+
+    Returns ``(new_content, reasoning_out)`` where ``reasoning_out`` is the
+    string to attach as a ``reasoning_content`` field, or ``None`` to skip.
+    """
+    if role != "assistant" or not reasoning:
+        return content, None
+    text = content if isinstance(content, str) else ""
+    if isinstance(content, list):
+        text = _extract_text_from_content_list(content)
+    if native:
+        return text, reasoning
+    return f"<think>\n{reasoning}\n</think>\n\n{text}", None
+
+
 def extract_text_content(
     messages: List[Message],
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
+    native_reasoning_content: bool = False,
 ) -> List[dict]:
     """
     Extract text content from OpenAI-format messages.
@@ -303,6 +337,9 @@ def extract_text_content(
         messages: List of Message objects
         max_tool_result_tokens: Maximum token count for tool results.
         tokenizer: Tokenizer instance for token counting and truncation.
+        native_reasoning_content: If True, pass ``reasoning_content`` through
+            as a message-level field (Qwen 3.6+ templates).  If False, inline
+            ``<think>...</think>`` into content as a fallback.
 
     Returns:
         List of {"role": str, "content": str}
@@ -313,18 +350,13 @@ def extract_text_content(
         role = msg.role
         content = msg.content
 
-        # Reconstruct <think> blocks from reasoning_content for historical
-        # assistant messages.  External clients (e.g. Pi) receive thinking in
-        # the reasoning_content field but only send content back on subsequent
-        # turns.  When the client echoes reasoning_content alongside content we
-        # merge them so that preserve_thinking=True in the chat template has
-        # actual thinking to preserve.
+        # Reconstruct reasoning for historical assistant messages.  Native
+        # mode passes reasoning as a separate field; fallback inlines it as
+        # <think>...</think> in content.
         reasoning = getattr(msg, "reasoning_content", None)
-        if role == "assistant" and reasoning:
-            text = content if isinstance(content, str) else ""
-            if isinstance(content, list):
-                text = _extract_text_from_content_list(content)
-            content = f"<think>\n{reasoning}\n</think>\n\n{text}"
+        content, reasoning_out = _apply_reasoning_reconstruction(
+            role, content, reasoning, native_reasoning_content
+        )
 
         # Normalize "developer" role to "system" (OpenAI API compatibility)
         if role == "developer":
@@ -370,6 +402,8 @@ def extract_text_content(
             if isinstance(content, list):
                 content = _extract_text_from_content_list(content)
             msg_dict = {"role": role, "content": content if content else ""}
+            if reasoning_out is not None:
+                msg_dict["reasoning_content"] = reasoning_out
             if getattr(msg, "name", None):
                 msg_dict["name"] = msg.name
 
@@ -437,6 +471,8 @@ def extract_text_content(
             _extra["name"] = msg.name
         if getattr(msg, "partial", False):
             _extra["partial"] = True
+        if reasoning_out is not None:
+            _extra["reasoning_content"] = reasoning_out
 
         # Handle None content
         if content is None:
@@ -465,6 +501,7 @@ def extract_multimodal_content(
     messages: List[Message],
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
+    native_reasoning_content: bool = False,
 ) -> List[dict]:
     """
     Extract content from messages, preserving image_url parts for VLM.
@@ -476,6 +513,8 @@ def extract_multimodal_content(
         messages: List of Message objects
         max_tool_result_tokens: Maximum token count for tool results.
         tokenizer: Tokenizer instance for token counting and truncation.
+        native_reasoning_content: If True, pass ``reasoning_content`` through
+            as a message-level field.  See ``extract_text_content``.
 
     Returns:
         List of message dicts. Messages with images have content as list.
@@ -486,13 +525,11 @@ def extract_multimodal_content(
         role = msg.role
         content = msg.content
 
-        # Reconstruct <think> blocks from reasoning_content (see extract_text_content)
+        # Reconstruct reasoning (see extract_text_content).
         reasoning = getattr(msg, "reasoning_content", None)
-        if role == "assistant" and reasoning:
-            text = content if isinstance(content, str) else ""
-            if isinstance(content, list):
-                text = _extract_text_from_content_list(content)
-            content = f"<think>\n{reasoning}\n</think>\n\n{text}"
+        content, reasoning_out = _apply_reasoning_reconstruction(
+            role, content, reasoning, native_reasoning_content
+        )
 
         if role == "developer":
             role = "system"
@@ -534,6 +571,8 @@ def extract_multimodal_content(
             if isinstance(content, list):
                 content = _extract_text_from_content_list(content)
             msg_dict = {"role": role, "content": content if content else ""}
+            if reasoning_out is not None:
+                msg_dict["reasoning_content"] = reasoning_out
             if getattr(msg, "name", None):
                 msg_dict["name"] = msg.name
 
@@ -596,6 +635,8 @@ def extract_multimodal_content(
             _extra["name"] = msg.name
         if getattr(msg, "partial", False):
             _extra["partial"] = True
+        if reasoning_out is not None:
+            _extra["reasoning_content"] = reasoning_out
 
         if content is None:
             processed_messages.append({"role": role, "content": "", **_extra})

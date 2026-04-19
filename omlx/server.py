@@ -1953,7 +1953,12 @@ async def create_chat_completion(
             if k not in forced_keys:
                 merged_ct_kwargs[k] = v
 
-    # Extract messages - different engines need different content handling
+    # Extract messages - different engines need different content handling.
+    # Templates that expose message.reasoning_content natively (Qwen 3.6+)
+    # get reasoning as a separate field; others fall back to <think> inlined
+    # in content.
+    _entry = get_engine_pool().get_entry(resolved_model)
+    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     is_vlm = isinstance(engine, VLMBatchedEngine)
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
@@ -1961,11 +1966,17 @@ async def create_chat_completion(
     elif is_vlm:
         # VLM: preserve image_url content parts for vision processing
         messages = extract_multimodal_content(
-            request.messages, max_tool_result_tokens, engine.tokenizer
+            request.messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            native_reasoning_content=native_reasoning,
         )
     else:
         messages = extract_text_content(
-            request.messages, max_tool_result_tokens, engine.tokenizer
+            request.messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            native_reasoning_content=native_reasoning,
         )
 
     # Compile grammar for structured output (logit-level enforcement).
@@ -3223,6 +3234,8 @@ async def create_anthropic_message(
     # Convert Anthropic format to internal format
     # Harmony models need special handling to preserve tool format
     is_vlm = isinstance(engine, VLMBatchedEngine)
+    _entry = get_engine_pool().get_entry(resolved_model)
+    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     if engine.model_type == "gpt_oss":
         messages = convert_anthropic_to_internal_harmony(
             request, max_tool_result_tokens, engine.tokenizer
@@ -3231,6 +3244,7 @@ async def create_anthropic_message(
         messages = convert_anthropic_to_internal(
             request, max_tool_result_tokens, engine.tokenizer,
             preserve_images=is_vlm,
+            native_reasoning_content=native_reasoning,
         )
 
     # Apply model-specific message extraction (e.g. Gemma 4 converts
