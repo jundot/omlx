@@ -140,18 +140,48 @@ class TestProfileRoutes:
         r = c.post("/admin/api/models/model-a/profiles/nope/apply")
         assert r.status_code == 404
 
-    def test_also_save_as_template(self, client):
-        c, mgr = client
-        r = c.post("/admin/api/models/model-a/profiles", json={
-            "name": "coding", "display_name": "Coding",
-            "settings": {"temperature": 0.0, "turboquant_kv_enabled": True},
-            "also_save_as_template": True,
-        })
+    def test_get_profile_fields(self, client):
+        c, _ = client
+        r = c.get("/admin/api/profile-fields")
         assert r.status_code == 200
-        tmpl = mgr.get_template("coding")
-        assert tmpl is not None
-        # Template carries only universal fields
-        assert tmpl["settings"] == {"temperature": 0.0}
+        data = r.json()
+        assert "universal" in data
+        assert "model_specific" in data
+        assert "temperature" in data["universal"]
+        assert "turboquant_kv_enabled" in data["model_specific"]
+
+
+def test_all_model_settings_fields_classified():
+    from dataclasses import fields
+    from omlx.model_settings import ModelSettings
+    from omlx.model_profiles import (
+        UNIVERSAL_PROFILE_FIELDS,
+        MODEL_SPECIFIC_PROFILE_FIELDS,
+        EXCLUDED_FROM_PROFILES,
+    )
+
+    classified = set(UNIVERSAL_PROFILE_FIELDS) | set(MODEL_SPECIFIC_PROFILE_FIELDS) | EXCLUDED_FROM_PROFILES
+    all_fields = {f.name for f in fields(ModelSettings)}
+    missing = all_fields - classified
+    assert not missing, (
+        f"New ModelSettings field(s) {missing} must be classified in "
+        f"UNIVERSAL_PROFILE_FIELDS, MODEL_SPECIFIC_PROFILE_FIELDS, or "
+        f"EXCLUDED_FROM_PROFILES. If unsure, add to EXCLUDED_FROM_PROFILES."
+    )
+
+
+def test_also_save_as_template(client):
+    c, mgr = client
+    r = c.post("/admin/api/models/model-a/profiles", json={
+        "name": "coding", "display_name": "Coding",
+        "settings": {"temperature": 0.0, "turboquant_kv_enabled": True},
+        "also_save_as_template": True,
+    })
+    assert r.status_code == 200
+    tmpl = mgr.get_template("coding")
+    assert tmpl is not None
+    # Template carries only universal fields
+    assert tmpl["settings"] == {"temperature": 0.0}
 
 
 class TestTemplateRoutes:

@@ -37,12 +37,36 @@ class ModelSettings:
         temperature: Sampling temperature (None = use global default).
         top_p: Nucleus sampling probability (None = use global default).
         top_k: Top-k sampling parameter (None = use global default).
+        min_p: Minimum probability threshold (None = use global default).
         repetition_penalty: Repetition penalty (None = use default 1.0, i.e. disabled).
+        presence_penalty: Presence penalty (None = use global default).
         force_sampling: Force sampling even with temperature=0.
+        max_tool_result_tokens: Maximum tokens in tool result (None = use global default).
+        chat_template_kwargs: Extra chat template keyword arguments.
+        forced_ct_kwargs: Keys in chat_template_kwargs that cannot be overridden.
+        ttl_seconds: Auto-unload after idle seconds (None = no TTL).
+        model_type_override: "llm", "vlm", "embedding", "reranker", or None (auto-detect).
+        model_alias: API-visible alternative to the directory name.
+        index_cache_freq: IndexCache: every Nth layer keeps indexer (DSA models only).
+        enable_thinking: Explicit toggle for thinking/reasoning mode (None = auto).
+        thinking_budget_enabled: Whether a thinking token budget is active.
+        thinking_budget_tokens: Max tokens for thinking/reasoning.
+        reasoning_parser: xgrammar builtin name: "qwen", "harmony", "llama", etc.
+        turboquant_kv_enabled: Enable TurboQuant KV cache compression.
+        turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
+        turboquant_skip_last: Skip last KVCache layer to prevent corruption.
+        specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
+        specprefill_draft_model: Path to draft model for SpecPrefill.
+        specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
+        specprefill_threshold: Min tokens to trigger SpecPrefill.
+        dflash_enabled: Enable DFlash speculative decoding.
+        dflash_draft_model: Path/repo for DFlash draft checkpoint.
+        dflash_draft_quant_bits: Draft model quantization bits.
         is_pinned: Keep model loaded in memory.
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.
         description: Optional description of the model.
+        active_profile_name: Name of the currently-applied profile (None = no profile).
     """
 
     # Sampling parameters (None means use global default)

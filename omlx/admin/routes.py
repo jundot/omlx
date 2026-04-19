@@ -25,7 +25,7 @@ from typing import Any, Dict, Optional, List, Literal
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .auth import (
     REMEMBER_ME_MAX_AGE,
@@ -132,7 +132,7 @@ class CreateProfileRequest(BaseModel):
     name: str
     display_name: str
     description: Optional[str] = None
-    settings: Dict[str, Any] = {}
+    settings: Dict[str, Any] = Field(default_factory=dict)
     also_save_as_template: bool = False
     source_template: Optional[str] = None
 
@@ -152,7 +152,7 @@ class CreateTemplateRequest(BaseModel):
     name: str
     display_name: str
     description: Optional[str] = None
-    settings: Dict[str, Any] = {}
+    settings: Dict[str, Any] = Field(default_factory=dict)
 
 
 class UpdateTemplateRequest(BaseModel):
@@ -1839,6 +1839,19 @@ async def apply_model_profile(
     if applied is None:
         raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
     return {"model_id": model_id, "settings": applied.to_dict()}
+
+
+@router.get("/api/profile-fields")
+async def get_profile_fields(is_admin: bool = Depends(require_admin)):
+    from ..model_profiles import (
+        UNIVERSAL_PROFILE_FIELDS,
+        MODEL_SPECIFIC_PROFILE_FIELDS,
+    )
+
+    return {
+        "universal": list(UNIVERSAL_PROFILE_FIELDS),
+        "model_specific": list(MODEL_SPECIFIC_PROFILE_FIELDS),
+    }
 
 
 @router.get("/api/profile-templates")

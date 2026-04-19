@@ -111,6 +111,7 @@
             // Profile / template state
             profiles: [],                // per-model profiles for selectedModel
             templates: [],               // global templates
+            profileFields: { universal: [], model_specific: [] },  // loaded from /api/profile-fields
             activeProfileName: null,     // currently-active profile for the form
             profilesDrift: false,        // true if form values differ from active profile
             profileError: '',
@@ -382,6 +383,7 @@
                     this.loadGlobalSettings(),
                     this.loadModels(),
                     this.loadServerInfo(),
+                    this.loadProfileFields(),
                     this.checkForUpdate()
                 ]);
 
@@ -913,19 +915,6 @@
             },
 
             // ===== Profiles / Templates =====
-            UNIVERSAL_PROFILE_FIELDS: [
-                'max_context_window','max_tokens','temperature','top_p','top_k','min_p',
-                'repetition_penalty','presence_penalty','force_sampling',
-                'enable_thinking','thinking_budget_enabled','thinking_budget_tokens',
-                'reasoning_parser','max_tool_result_tokens','chat_template_kwargs',
-                'forced_ct_kwargs','ttl_seconds',
-            ],
-            MODEL_SPECIFIC_PROFILE_FIELDS: [
-                'turboquant_kv_enabled','turboquant_kv_bits','turboquant_skip_last',
-                'dflash_enabled','dflash_draft_model','dflash_draft_quant_bits',
-                'specprefill_enabled','specprefill_draft_model',
-                'specprefill_keep_pct','specprefill_threshold','index_cache_freq',
-            ],
             formValuesForProfile() {
                 const ms = this.modelSettings;
                 // Reconstruct chat_template_kwargs from ctKwargEntries
@@ -981,7 +970,7 @@
             formValuesForTemplate() {
                 const full = this.formValuesForProfile();
                 const out = {};
-                for (const k of this.UNIVERSAL_PROFILE_FIELDS) {
+                for (const k of this.profileFields.universal) {
                     if (k in full) out[k] = full[k];
                 }
                 return out;
@@ -1026,6 +1015,22 @@
                     console.error('Failed to load templates:', e);
                 }
             },
+            async loadProfileFields() {
+                try {
+                    const r = await fetch('/admin/api/profile-fields');
+                    if (r.ok) {
+                        const data = await r.json();
+                        this.profileFields = {
+                            universal: data.universal || [],
+                            model_specific: data.model_specific || [],
+                        };
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Failed to load profile field definitions:', e);
+                }
+            },
 
             async createProfile() {
                 if (!this.selectedModel) return;
@@ -1062,7 +1067,7 @@
                 // Merge all profile fields into the form (no server call — user clicks Save to persist).
                 const s = profile.settings || {};
                 const ms = this.modelSettings;
-                for (const k of this.UNIVERSAL_PROFILE_FIELDS.concat(this.MODEL_SPECIFIC_PROFILE_FIELDS)) {
+                for (const k of this.profileFields.universal.concat(this.profileFields.model_specific)) {
                     if (!(k in s)) continue;
                     if (k === 'thinking_budget_enabled') {
                         ms.enableThinkingBudget = !!s[k];
@@ -1091,19 +1096,20 @@
                         ms[k] = s[k];
                     }
                 }
-                this.activeProfileName = profile.name;
-                this.profilesDrift = false;
-                // Persist active_profile_name to backend
+                // Persist active_profile_name to backend before updating UI state
                 try {
                     const r = await fetch(
                         `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(profile.name)}/apply`,
                         { method: 'POST' }
                     );
                     if (r.ok) {
+                        this.activeProfileName = profile.name;
+                        this.profilesDrift = false;
                         // Update the models list so the profile badge reflects the change
-                        const updated = r.json().settings;
                         const m = this.models.find(m => m.id === this.selectedModel.id);
                         if (m) m.settings = { ...m.settings, active_profile_name: profile.name };
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
                     }
                 } catch (e) {
                     console.error('Failed to apply profile:', e);
