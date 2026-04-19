@@ -249,27 +249,66 @@ AUDIO_STS_ARCHITECTURES = {
 # Image model detection — diffusion models for image generation (mflux)
 # ---------------------------------------------------------------------------
 
-IMAGE_MODEL_TYPES = {
-    "flux",
-    "flux1",
-    "flux_1",
-    "flux2",
-    "flux_2",
-    "z_image",
-    "zimage",
-    "fibo",
-    "seedvr",
-    "seedvr2",
-    "qwen_image",
-}
 
-IMAGE_ARCHITECTURES = {
-    "FluxPipeline",
-    "FluxTransformer2DModel",
-    "ZImagePipeline",
-    "FIBOPipeline",
-    "SeedVR2Pipeline",
-}
+def _build_image_detection_sets():
+    """Build image model-type sets from mflux at import time.
+
+    Returns (image_model_types, image_architectures) where image_model_types
+    is a set of model_type strings and image_architectures is a set of
+    architecture strings that should trigger image detection.
+
+    Dynamically reads mflux/models/ directory names so oMLX automatically
+    recognises new image model families when mflux is updated.
+    Falls back to static sets when mflux is not installed.
+    """
+    # Static architectures (stable identifiers)
+    architectures = {
+        "FluxPipeline",
+        "FluxTransformer2DModel",
+        "ZImagePipeline",
+        "FIBOPipeline",
+        "SeedVR2Pipeline",
+    }
+
+    try:
+        from pathlib import Path as _P
+
+        import mflux as _mf
+
+        _base = _P(_mf.__file__).parent / "models"
+
+        if _base.is_dir():
+            # Collect directory names from mflux/models/ (e.g. flux, flux2, z_image)
+            dir_names = {
+                p.name.lower().replace("-", "_")
+                for p in _base.iterdir()
+                if p.is_dir() and not p.name.startswith("_")
+            }
+            # Add common variants (with/without underscores/dots/numbers)
+            expanded = set(dir_names)
+            for name in dir_names:
+                expanded.add(name.replace("_", ""))
+                expanded.add(name.replace("_", "-"))
+                expanded.add(name.replace("_", "."))
+            logger.debug(
+                "Image detection sets loaded from mflux: %d model types",
+                len(expanded),
+            )
+            return expanded, architectures
+    except Exception:
+        logger.debug("mflux not available — using static image detection sets")
+
+    # Static fallback
+    return {
+        "flux", "flux1", "flux_1", "flux2", "flux_2",
+        "z_image", "zimage",
+        "fibo",
+        "seedvr", "seedvr2",
+        "qwen_image",
+    }, architectures
+
+
+IMAGE_MODEL_TYPES, IMAGE_ARCHITECTURES = _build_image_detection_sets()
 
 
 @dataclass
@@ -405,6 +444,20 @@ def detect_model_type(model_path: Path) -> ModelType:
     if _is_diffusers_image_dir(model_path):
         return "image_t2i"
 
+    # model_index.json is a diffusers-format signature file.
+    # Check _class_name to confirm it's an image pipeline (not e.g. depth estimation).
+    index_path = model_path / "model_index.json"
+    if index_path.exists():
+        try:
+            with open(index_path) as f:
+                index = json.load(f)
+            class_name = index.get("_class_name", "").lower()
+            # Known image pipeline class names from mflux and diffusers
+            if any(kw in class_name for kw in ("pipeline", "flux", "zimage", "z_image", "fibo", "seedvr")):
+                return "image_t2i"
+        except (json.JSONDecodeError, IOError):
+            pass
+
     # Directory name heuristic for image models without config.json
     name_lower = model_path.name.lower()
     if any(hint in name_lower for hint in ["flux", "z-image", "zimage", "fibo", "seedvr"]):
@@ -534,8 +587,18 @@ def detect_model_type(model_path: Path) -> ModelType:
         if arch in IMAGE_ARCHITECTURES:
             return "image_t2i"
 
+    # mflux-format config.json uses singular "architecture" field (string)
+    # instead of "architectures" (list)
+    arch_str = config.get("architecture", "")
+    if arch_str and arch_str in IMAGE_ARCHITECTURES:
+        return "image_t2i"
+
     # model_type check for image models
     if normalized_type in IMAGE_MODEL_TYPES or model_type in IMAGE_MODEL_TYPES:
+        return "image_t2i"
+
+    # Prefix matching for mflux variants (e.g., "flux2-klein-4b" → "flux2")
+    if any(normalized_type.startswith(t) for t in ("flux2_", "flux_", "z_image_", "zimage_")):
         return "image_t2i"
 
     # Heuristic: model directory name suggests image generation
@@ -631,6 +694,10 @@ def estimate_model_size(model_path: Path) -> int:
             total_size += f.stat().st_size
 
     if total_size == 0:
+        logger.warning(
+            f"No model weights found in {model_path} — "
+            "model may be incompletely downloaded"
+        )
         raise ValueError(f"No model weights found in {model_path}")
 
     # Add overhead for runtime buffers (~5%)
@@ -675,11 +742,25 @@ def _is_model_dir(path: Path) -> bool:
     Supports:
     - Standard models: has config.json
     - Diffusers-style image models: transformer/ + vae/ or text_encoder/
+    - Diffusers models (incomplete download): has model_index.json with pipeline class
     - Not a LoRA adapter: no adapter_config.json
     """
-    return (
-        (path / "config.json").exists() or _is_diffusers_image_dir(path)
-    ) and not _is_adapter_dir(path)
+    if _is_adapter_dir(path):
+        return False
+    if (path / "config.json").exists() or _is_diffusers_image_dir(path):
+        return True
+    # model_index.json with a pipeline class indicates a diffusers model
+    index_path = path / "model_index.json"
+    if index_path.exists():
+        try:
+            with open(index_path) as f:
+                index = json.load(f)
+            class_name = index.get("_class_name", "").lower()
+            if "pipeline" in class_name:
+                return True
+        except (json.JSONDecodeError, IOError):
+            pass
+    return False
 
 
 def _resolve_hf_cache_entry(path: Path) -> tuple[Path, str] | None:

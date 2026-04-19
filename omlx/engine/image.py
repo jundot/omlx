@@ -147,8 +147,8 @@ class ImageEngine(BaseNonStreamingEngine):
         "flux_dev": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
         "flux.1": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
         # FLUX.2
-        "flux.2": ("mflux.models.flux2", "Flux2"),
-        "flux2": ("mflux.models.flux2", "Flux2"),
+        "flux.2": ("mflux.models.flux2", "Flux2Klein"),
+        "flux2": ("mflux.models.flux2", "Flux2Klein"),
         # FIBO
         "fibo": ("mflux.models.fibo", "FIBO"),
         # SeedVR2
@@ -196,8 +196,8 @@ class ImageEngine(BaseNonStreamingEngine):
             "flux": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
             "flux1": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
             "flux_1": ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
-            "flux2": ("mflux.models.flux2", "Flux2"),
-            "flux_2": ("mflux.models.flux2", "Flux2"),
+            "flux2": ("mflux.models.flux2", "Flux2Klein"),
+            "flux_2": ("mflux.models.flux2", "Flux2Klein"),
             "z_image": ("mflux.models.z_image", "ZImageTurbo"),
             "zimage": ("mflux.models.z_image", "ZImageTurbo"),
             "fibo": ("mflux.models.fibo", "FIBO"),
