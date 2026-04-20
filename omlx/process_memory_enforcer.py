@@ -21,6 +21,7 @@ import mlx.core as mx
 
 if TYPE_CHECKING:
     from .engine_pool import EnginePool
+    from .global_settings import GlobalSettings
     from .model_settings import ModelSettingsManager
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ class ProcessMemoryEnforcer:
         poll_interval: float = 1.0,
         settings_manager: ModelSettingsManager | None = None,
         prefill_memory_guard: bool = True,
+        global_settings: GlobalSettings | None = None,
     ):
         """
         Initialize the process memory enforcer.
@@ -57,12 +59,14 @@ class ProcessMemoryEnforcer:
             settings_manager: Optional settings manager for TTL checks.
             prefill_memory_guard: Whether to enable pre-flight memory
                 estimation to reject requests that would exceed limits.
+            global_settings: Optional global settings for idle timeout.
         """
         self._engine_pool = engine_pool
         self._max_bytes = max_bytes
         self._poll_interval = poll_interval
         self._settings_manager = settings_manager
         self._prefill_memory_guard = prefill_memory_guard
+        self._global_settings = global_settings
         self._task: asyncio.Task | None = None
         self._running = False
 
@@ -187,7 +191,13 @@ class ProcessMemoryEnforcer:
         """Check and unload models that exceeded their TTL."""
         if self._settings_manager is None:
             return
-        await self._engine_pool.check_ttl_expirations(self._settings_manager)
+        await self._engine_pool.check_ttl_expirations(
+            self._settings_manager,
+            global_idle_timeout_seconds=(
+                self._global_settings.idle_timeout.idle_timeout_seconds
+                if self._global_settings else None
+            ),
+        )
 
     async def _check_and_enforce(self) -> None:
         """Check current memory and enforce limit if exceeded.
