@@ -309,6 +309,7 @@
   "settings.resource.restart_badge": "Restart needed",
   "settings.cache.section_label": "Cache",
   "settings.cache.enabled": "Cache Enabled",
+  "settings.cache.hot_cache_only": "Hot Cache Only",
   "settings.cache.ssd_directory": "SSD Cache Directory",
   "settings.generation.section_label": "Generation Defaults",
   "settings.generation.max_context_window": "Max Context Window",

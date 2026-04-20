@@ -328,6 +328,7 @@ class TestCacheSettings:
         result = settings.to_dict()
         assert result == {
             "enabled": False,
+            "hot_cache_only": False,
             "ssd_cache_dir": "/cache",
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",

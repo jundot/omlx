@@ -239,6 +239,7 @@ class CacheSettings:
     """Cache configuration settings."""
 
     enabled: bool = True
+    hot_cache_only: bool = False
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
@@ -281,6 +282,7 @@ class CacheSettings:
         """Convert to dictionary."""
         return {
             "enabled": self.enabled,
+            "hot_cache_only": self.hot_cache_only,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
@@ -292,6 +294,7 @@ class CacheSettings:
         """Create from dictionary."""
         return cls(
             enabled=data.get("enabled", True),
+            hot_cache_only=data.get("hot_cache_only", False),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=data.get("hot_cache_max_size", "0"),
@@ -815,6 +818,8 @@ class GlobalSettings:
             self.cache.ssd_cache_dir = ssd_cache_dir
         if ssd_cache_max := os.getenv("OMLX_SSD_CACHE_MAX_SIZE"):
             self.cache.ssd_cache_max_size = ssd_cache_max
+        if hot_cache_only := os.getenv("OMLX_HOT_CACHE_ONLY"):
+            self.cache.hot_cache_only = hot_cache_only.lower() in ("true", "1", "yes")
         if initial_blocks := os.getenv("OMLX_INITIAL_CACHE_BLOCKS"):
             try:
                 self.cache.initial_cache_blocks = int(initial_blocks)
@@ -1152,10 +1157,19 @@ class GlobalSettings:
         """
         from .scheduler import SchedulerConfig
 
+        # Always resolve ssd_dir so the scheduler can initialize PagedSSDCacheManager.
+        # When hot_cache_only=True, PagedSSDCacheManager skips directory init and
+        # the writer thread internally — the dir is not used for disk I/O.
+        ssd_dir = self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
+
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
             initial_cache_blocks=self.cache.initial_cache_blocks,
+            paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
+            hot_cache_only=self.cache.hot_cache_only,
+            paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(self.base_path),
+            hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
         )
 
     def to_dict(self) -> dict[str, Any]:
