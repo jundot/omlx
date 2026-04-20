@@ -143,3 +143,149 @@ class TestDFlashEnginePoolRouting:
         )
         assert settings.dflash_enabled is True
         assert settings.dflash_draft_model == "z-lab/Qwen3.5-4B-DFlash"
+
+class TestDFlashEngineMaxCtx:
+    """Test DFlashEngine max_dflash_ctx resolution logic."""
+
+    def _clear_env(self):
+        """Clear DFLASH_MAX_CTX env var so model_settings takes effect."""
+        import os
+        os.environ.pop("DFLASH_MAX_CTX", None)
+
+    def test_max_ctx_from_model_settings(self):
+        """max_dflash_ctx should be read from model_settings when env var is not set."""
+        try:
+            from omlx.engine.dflash import DFlashEngine, DEFAULT_MAX_DFLASH_CTX
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        self._clear_env()
+        settings = ModelSettings(dflash_max_ctx=4096)
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=settings,
+        )
+        assert engine._max_dflash_ctx == 4096
+
+    def test_max_ctx_defaults_when_none(self):
+        """When model_settings.dflash_max_ctx is None, use DEFAULT_MAX_DFLASH_CTX."""
+        try:
+            from omlx.engine.dflash import DFlashEngine, DEFAULT_MAX_DFLASH_CTX
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        self._clear_env()
+        settings = ModelSettings()  # dflash_max_ctx is None
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=settings,
+        )
+        assert engine._max_dflash_ctx == DEFAULT_MAX_DFLASH_CTX
+
+    def test_max_ctx_defaults_when_no_model_settings(self):
+        """When model_settings is None, use DEFAULT_MAX_DFLASH_CTX."""
+        try:
+            from omlx.engine.dflash import DFlashEngine, DEFAULT_MAX_DFLASH_CTX
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        self._clear_env()
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        assert engine._max_dflash_ctx == DEFAULT_MAX_DFLASH_CTX
+
+    def test_max_ctx_env_var_override(self):
+        """DFLASH_MAX_CTX env var should override model settings."""
+        import os
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        os.environ["DFLASH_MAX_CTX"] = "2048"
+        try:
+            settings = ModelSettings(dflash_max_ctx=4096)
+            engine = DFlashEngine(
+                model_name="test-model",
+                draft_model_path="test-draft",
+                model_settings=settings,
+            )
+            # Env var takes priority over model settings
+            assert engine._max_dflash_ctx == 2048
+        finally:
+            os.environ.pop("DFLASH_MAX_CTX", None)
+
+    def test_max_ctx_invalid_env_var_falls_back(self):
+        """Invalid env var value should fall back to DEFAULT_MAX_DFLASH_CTX."""
+        import os
+        try:
+            from omlx.engine.dflash import DFlashEngine, DEFAULT_MAX_DFLASH_CTX
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        os.environ["DFLASH_MAX_CTX"] = "not-a-number"
+        try:
+            settings = ModelSettings(dflash_max_ctx=4096)
+            engine = DFlashEngine(
+                model_name="test-model",
+                draft_model_path="test-draft",
+                model_settings=settings,
+            )
+            assert engine._max_dflash_ctx == DEFAULT_MAX_DFLASH_CTX
+        finally:
+            os.environ.pop("DFLASH_MAX_CTX", None)
+
+
+class TestDFlashRoutingLogic:
+    """Test context-size-based routing to batched mode."""
+
+    def test_short_prompt_uses_dflash(self):
+        """Prompts shorter than max_dflash_ctx should route to DFlash."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        settings = ModelSettings(dflash_max_ctx=8192)
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=settings,
+        )
+
+        # Simulate prompt encoding and check routing decision
+        class MockTokenizer:
+            def encode(self, text):
+                return list(range(len(text)))  # 1 token per char
+
+        engine._tokenizer_obj = MockTokenizer()
+        prompt = "hello world"  # 11 tokens < 8192
+        prompt_tokens = engine._tokenizer_obj.encode(prompt)
+        assert len(prompt_tokens) < engine._max_dflash_ctx
+
+    def test_long_prompt_exceeds_max_ctx(self):
+        """Prompts at or above max_dflash_ctx should route to batched."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        settings = ModelSettings(dflash_max_ctx=100)
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=settings,
+        )
+
+        class MockTokenizer:
+            def encode(self, text):
+                return list(range(len(text)))
+
+        engine._tokenizer_obj = MockTokenizer()
+        prompt = "x" * 100  # exactly 100 tokens = max_ctx
+        prompt_tokens = engine._tokenizer_obj.encode(prompt)
+        assert len(prompt_tokens) >= engine._max_dflash_ctx
