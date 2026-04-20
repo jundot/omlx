@@ -64,7 +64,6 @@ class DFlashEngine(BaseEngine):
         self._active_request = False
         self._model_type_str = None
         self._fallback_engine: BaseEngine | None = None
-        self._in_fallback_mode = False
 
         raw = os.environ.get("DFLASH_MAX_CTX", str(DEFAULT_MAX_DFLASH_CTX)).strip()
         try:
@@ -119,7 +118,6 @@ class DFlashEngine(BaseEngine):
             self._model_type_str = config.model_type
 
         self._loaded = True
-        self._in_fallback_mode = False
         logger.info(
             f"DFlashEngine loaded: target={self._model_name}, "
             f"draft={self._draft_model_path}, "
@@ -127,45 +125,11 @@ class DFlashEngine(BaseEngine):
             f"fallback={self._fallback_engine_type}"
         )
 
-    async def _evict_dflash_and_start_fallback(self) -> None:
-        """Evict dflash models from memory, verify release, then start fallback engine."""
-        from ..engine_core import get_mlx_executor
+    async def _init_fallback_engine(self) -> None:
+        """Create and start fallback engine sharing target model (no eviction)."""
+        shared_model = self._target_model
+        shared_tokenizer = self._tokenizer_obj
 
-        loop = asyncio.get_running_loop()
-        pre_active = mx.get_active_memory()
-
-        # Release dflash model references
-        self._target_model = None
-        self._draft_model = None
-        self._executor_tokenizer = None
-
-        # Force memory reclaim with settle barrier
-        gc.collect()
-        await loop.run_in_executor(
-            get_mlx_executor(),
-            lambda: (mx.synchronize(), mx.clear_cache()),
-        )
-
-        # Poll for actual memory release (same pattern as engine_pool._unload_engine)
-        for settle_round in range(10):
-            active_now = mx.get_active_memory()
-            freed = pre_active - active_now
-            if freed > 0:
-                logger.info(
-                    f"DFlash models evicted: freed={freed / 1024**3:.2f}GB "
-                    f"(round {settle_round + 1})"
-                )
-                break
-            await asyncio.sleep(0.5)
-            gc.collect()
-            await loop.run_in_executor(
-                get_mlx_executor(),
-                lambda: (mx.synchronize(), mx.clear_cache()),
-            )
-        else:
-            logger.warning("DFlash model eviction: memory settle timed out")
-
-        # Start fallback engine with shared target model
         if self._fallback_engine_type == "vlm":
             from .vlm import VLMBatchedEngine
             self._fallback_engine = VLMBatchedEngine(
@@ -185,7 +149,6 @@ class DFlashEngine(BaseEngine):
                 tokenizer=shared_tokenizer,
             )
         await self._fallback_engine.start()
-        self._in_fallback_mode = True
         logger.info(
             f"DFlash fallback engine started: {self._fallback_engine_type}"
         )
@@ -198,8 +161,6 @@ class DFlashEngine(BaseEngine):
         self._draft_model = None
         self._tokenizer_obj = None
         self._executor_tokenizer = None
-        self._in_fallback_mode = False
-        self._loaded = False
         logger.info("DFlashEngine stopped")
 
     def _apply_chat_template(
@@ -355,22 +316,12 @@ class DFlashEngine(BaseEngine):
         use_batched = len(prompt_tokens) >= self._max_dflash_ctx
 
         if use_batched:
-            if not self._in_fallback_mode:
+            if self._fallback_engine is None:
                 logger.info(
                     f"Switching to batched mode: prompt={len(prompt_tokens)} tokens "
                     f"(exceeds max_dflash_ctx={self._max_dflash_ctx})"
                 )
-                await self._evict_dflash_and_start_fallback()
-            return await self._fallback_engine.generate(
-                prompt=prompt, max_tokens=max_tokens, temperature=temperature,
-                top_p=top_p, top_k=top_k, min_p=min_p,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty, stop=stop, **kwargs,
-            )
-
-        # Already in fallback mode but short context came in.
-        # Stay in fallback mode (reloading dflash models is expensive).
-        if self._in_fallback_mode:
+                await self._init_fallback_engine()
             return await self._fallback_engine.generate(
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, min_p=min_p,
@@ -433,23 +384,12 @@ class DFlashEngine(BaseEngine):
         use_batched = len(prompt_tokens) >= self._max_dflash_ctx
 
         if use_batched:
-            if not self._in_fallback_mode:
+            if self._fallback_engine is None:
                 logger.info(
                     f"Switching to batched mode: prompt={len(prompt_tokens)} tokens "
                     f"(exceeds max_dflash_ctx={self._max_dflash_ctx})"
                 )
-                await self._evict_dflash_and_start_fallback()
-            async for output in self._fallback_engine.stream_generate(
-                prompt=prompt, max_tokens=max_tokens, temperature=temperature,
-                top_p=top_p, top_k=top_k, min_p=min_p,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty, stop=stop, **kwargs,
-            ):
-                yield output
-            return
-
-        # Already in fallback mode — stay there
-        if self._in_fallback_mode:
+                await self._init_fallback_engine()
             async for output in self._fallback_engine.stream_generate(
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, min_p=min_p,
@@ -573,7 +513,6 @@ class DFlashEngine(BaseEngine):
             "draft_model": self._draft_model_path,
             "max_dflash_ctx": self._max_dflash_ctx,
             "fallback_engine_type": self._fallback_engine_type,
-            "in_fallback_mode": self._in_fallback_mode,
             "loaded": self._loaded,
         }
 
