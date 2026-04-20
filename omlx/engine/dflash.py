@@ -29,13 +29,15 @@ DEFAULT_MAX_DFLASH_CTX = 4096
 
 class DFlashEngine(BaseEngine):
     """
-    DFlash speculative decoding engine with automatic fallback.
+    DFlash speculative decoding engine with per-request mode switching.
 
     For prompts within max_dflash_ctx tokens, uses block diffusion speculative
-    decoding for 3-4x faster generation. For longer prompts, evicts dflash
-    models from memory and delegates to a fallback engine (BatchedEngine or
-    VLMBatchedEngine) that provides paged cache, SSD cache, and continuous
-    batching.
+    decoding for 3-4x faster generation. For longer prompts, delegates to a fallback
+    engine (BatchedEngine or VLMBatchedEngine) that provides paged cache, SSD cache,
+    and continuous batching.
+
+    The target model is loaded once and shared across both dflash and batched modes,
+    avoiding model reload overhead when switching between them.
     """
 
     def __init__(
@@ -345,12 +347,14 @@ class DFlashEngine(BaseEngine):
 
         prompt_tokens = self._tokenizer_obj.encode(prompt)
 
-        # Fallback: evict dflash models, start LLM/VLM engine
-        if self._should_fallback(prompt_tokens):
+        # Determine if we should use batched mode
+        use_batched = len(prompt_tokens) >= self._max_dflash_ctx
+
+        if use_batched:
             if not self._in_fallback_mode:
                 logger.info(
-                    f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
-                    f"evicting dflash models and switching to {self._fallback_engine_type} engine"
+                    f"Switching to batched mode: prompt={len(prompt_tokens)} tokens "
+                    f"(exceeds max_dflash_ctx={self._max_dflash_ctx})"
                 )
                 await self._evict_dflash_and_start_fallback()
             return await self._fallback_engine.generate(
@@ -421,12 +425,14 @@ class DFlashEngine(BaseEngine):
 
         prompt_tokens = self._tokenizer_obj.encode(prompt)
 
-        # Fallback: evict dflash models, start LLM/VLM engine
-        if self._should_fallback(prompt_tokens):
+        # Determine if we should use batched mode
+        use_batched = len(prompt_tokens) >= self._max_dflash_ctx
+
+        if use_batched:
             if not self._in_fallback_mode:
                 logger.info(
-                    f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
-                    f"evicting dflash models and switching to {self._fallback_engine_type} engine"
+                    f"Switching to batched mode: prompt={len(prompt_tokens)} tokens "
+                    f"(exceeds max_dflash_ctx={self._max_dflash_ctx})"
                 )
                 await self._evict_dflash_and_start_fallback()
             async for output in self._fallback_engine.stream_generate(
