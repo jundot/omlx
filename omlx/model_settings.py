@@ -108,6 +108,7 @@ class ModelSettings:
     dflash_enabled: bool = False
     dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
     dflash_draft_quant_bits: Optional[int] = None  # Draft model quantization (None=bf16, 4)
+    dflash_max_ctx: Optional[int] = None  # Max prompt tokens for DFlash (None=use default)
 
     # Model management flags
     is_pinned: bool = False
