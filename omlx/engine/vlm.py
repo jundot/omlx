@@ -175,7 +175,22 @@ class VLMBatchedEngine(BaseEngine):
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
         model_settings: Any | None = None,
+        model: Any | None = None,
+        tokenizer: Any | None = None,
     ):
+        """
+        Initialize the VLM batched engine.
+
+        Args:
+            model_name: Model identifier for loading (ignored if model is provided)
+            trust_remote_code: Allow remote code execution during loading
+            scheduler_config: Scheduler configuration
+            stream_interval: Tokens to batch before streaming
+            enable_thinking: Enable thinking mode for reasoning models
+            model_settings: Per-model settings for post-load transforms
+            model: Optional already-loaded VLM model (shared from DFlashEngine)
+            tokenizer: Optional already-loaded tokenizer (shared from DFlashEngine)
+        """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
@@ -183,8 +198,9 @@ class VLMBatchedEngine(BaseEngine):
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
 
-        self._vlm_model = None
-        self._processor = None
+        # Model/tokenizer may be shared from DFlashEngine (no reload)
+        self._vlm_model = model
+        self._processor = tokenizer
         self._tokenizer = None
         self._adapter = None
         self._engine = None
@@ -286,30 +302,36 @@ class VLMBatchedEngine(BaseEngine):
         return ids
 
     async def start(self) -> None:
-        """Load VLM model and processor via mlx-vlm, create engine with VLMModelAdapter."""
+        """Load VLM model and processor via mlx-vlm, create engine with VLMModelAdapter.
+
+        If model/tokenizer already provided (shared from DFlashEngine), skip loading
+        and use the shared references directly.
+        """
         if self._loaded:
             return
-
-        from mlx_vlm.utils import load as vlm_load
 
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
 
         # Load VLM model on the global MLX executor to avoid blocking the event loop
         # while ensuring no concurrent Metal operations. See issue #85.
-        from ..engine_core import get_mlx_executor
+        if self._vlm_model is None:
+            from mlx_vlm.utils import load as vlm_load
 
-        def _load_vlm_sync():
-            # Patch transformers bug: video_processor_class_from_name crashes
-            # when torchvision is not available (extractors is None, `in` fails).
-            # oMLX does not support video input, so we skip video processing.
-            _patch_video_processor_bug()
-            return vlm_load(self._model_name)
+            # Load VLM model from scratch (not shared)
+            from ..engine_core import get_mlx_executor
 
-        loop = asyncio.get_running_loop()
-        self._vlm_model, self._processor = await loop.run_in_executor(
-            get_mlx_executor(), _load_vlm_sync
-        )
+            def _load_vlm_sync():
+                # Patch transformers bug: video_processor_class_from_name crashes
+                # when torchvision is not available (extractors is None, `in` fails).
+                # oMLX does not support video input, so we skip video processing.
+                _patch_video_processor_bug()
+                return vlm_load(self._model_name)
+
+            loop = asyncio.get_running_loop()
+            self._vlm_model, self._processor = await loop.run_in_executor(
+                get_mlx_executor(), _load_vlm_sync
+            )
 
         # Initialize vision feature cache
         vision_ssd_dir = None

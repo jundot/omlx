@@ -45,6 +45,8 @@ class BatchedEngine(BaseEngine):
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
         model_settings: Any | None = None,
+        model: Any | None = None,
+        tokenizer: Any | None = None,
     ):
         """
         Initialize the batched engine.
@@ -56,6 +58,8 @@ class BatchedEngine(BaseEngine):
             stream_interval: Tokens to batch before streaming (1=every token)
             enable_thinking: Enable thinking mode for reasoning models (passed to chat_template_kwargs)
             model_settings: Optional per-model settings for post-load transforms
+            model: Optional already-loaded MLX model (shared from another engine)
+            tokenizer: Optional already-loaded tokenizer (shared from another engine)
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -64,8 +68,8 @@ class BatchedEngine(BaseEngine):
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
 
-        self._model = None
-        self._tokenizer = None
+        self._model = model
+        self._tokenizer = tokenizer
         self._engine = None
         self._loaded = False
         self._grammar_compiler = None
@@ -193,33 +197,35 @@ class BatchedEngine(BaseEngine):
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
 
-        # Build tokenizer config with model-specific fixes
-        tokenizer_config = get_tokenizer_config(
-            self._model_name,
-            trust_remote_code=self._trust_remote_code,
-        )
-
-        # Load model on the global MLX executor to avoid blocking the event loop
-        # while ensuring no concurrent Metal operations. See issue #85.
-        from ..engine_core import get_mlx_executor
-
-        def _load_model_sync():
-            return load(
+        # If model/tokenizer already provided (shared from another engine), skip loading
+        if self._model is None:
+            # Build tokenizer config with model-specific fixes
+            tokenizer_config = get_tokenizer_config(
                 self._model_name,
-                tokenizer_config=tokenizer_config,
+                trust_remote_code=self._trust_remote_code,
             )
 
-        loop = asyncio.get_running_loop()
-        self._model, self._tokenizer = await loop.run_in_executor(
-            get_mlx_executor(), _load_model_sync
-        )
+            # Load model on the global MLX executor to avoid blocking the event loop
+            # while ensuring no concurrent Metal operations. See issue #85.
+            from ..engine_core import get_mlx_executor
 
-        # Apply post-load transforms (e.g., IndexCache for DSA models)
-        from ..utils.model_loading import apply_post_load_transforms
+            def _load_model_sync():
+                return load(
+                    self._model_name,
+                    tokenizer_config=tokenizer_config,
+                )
 
-        self._model = apply_post_load_transforms(
-            self._model, self._model_settings
-        )
+            loop = asyncio.get_running_loop()
+            self._model, self._tokenizer = await loop.run_in_executor(
+                get_mlx_executor(), _load_model_sync
+            )
+        else:
+            # Model already loaded — apply post-load transforms if needed
+            from ..utils.model_loading import apply_post_load_transforms
+
+            self._model = apply_post_load_transforms(
+                self._model, self._model_settings
+            )
 
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
         if self._model_settings is not None:

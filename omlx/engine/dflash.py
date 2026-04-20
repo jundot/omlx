@@ -165,13 +165,15 @@ class DFlashEngine(BaseEngine):
         else:
             logger.warning("DFlash model eviction: memory settle timed out")
 
-        # Start fallback engine
+        # Start fallback engine with shared target model
         if self._fallback_engine_type == "vlm":
             from .vlm import VLMBatchedEngine
             self._fallback_engine = VLMBatchedEngine(
                 model_name=self._model_name,
                 scheduler_config=self._scheduler_config,
                 model_settings=self._model_settings,
+                model=shared_model,
+                tokenizer=shared_tokenizer,
             )
         else:
             from .batched import BatchedEngine
@@ -179,6 +181,8 @@ class DFlashEngine(BaseEngine):
                 model_name=self._model_name,
                 scheduler_config=self._scheduler_config,
                 model_settings=self._model_settings,
+                model=shared_model,
+                tokenizer=shared_tokenizer,
             )
         await self._fallback_engine.start()
         self._in_fallback_mode = True
