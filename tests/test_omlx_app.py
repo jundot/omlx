@@ -22,7 +22,15 @@ import pytest
 
 # Import the modules under test
 sys.path.insert(0, str(Path(__file__).parent.parent / "packaging"))
-from omlx_app.config import ServerConfig, get_app_support_dir, get_config_path, get_log_path
+from omlx_app.config import (
+    ServerConfig,
+    get_app_support_dir,
+    get_config_path,
+    get_log_path,
+    resolve_local_server_base_url,
+    resolve_local_server_health_url,
+    tcp_probe_connection_targets,
+)
 from omlx_app.server_manager import PortConflict, ServerManager, ServerStatus
 
 
@@ -234,6 +242,29 @@ class TestServerConfig:
         result = config.load_server_settings()
         assert result["model_dir"] == "/server/models"
         assert result["port"] == 9000
+        assert result.get("host") is None
+
+    def test_load_server_settings_includes_host(self, tmp_path: Path):
+        """Test server host is loaded from settings.json."""
+        config = ServerConfig(base_path=str(tmp_path))
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps({
+            "server": {"port": 8000, "host": "100.64.0.2"},
+        }))
+
+        result = config.load_server_settings()
+        assert result["host"] == "100.64.0.2"
+
+    def test_get_server_bind_host(self, tmp_path: Path):
+        """Test bind host reader."""
+        config = ServerConfig(base_path=str(tmp_path))
+        assert config.get_server_bind_host() == ""
+
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps({
+            "server": {"host": "100.64.0.2", "port": 8000},
+        }))
+        assert config.get_server_bind_host() == "100.64.0.2"
 
     def test_load_server_settings_missing_file(self, tmp_path: Path):
         """Test load_server_settings returns empty dict when no file."""
@@ -326,6 +357,38 @@ class TestServerConfig:
         assert result is False
 
 
+class TestResolveLocalServerUrls:
+    """Tests for bind-host-aware local URL resolution."""
+
+    def test_unspecified_uses_loopback(self):
+        assert resolve_local_server_base_url("", 8000) == "http://127.0.0.1:8000"
+        assert resolve_local_server_base_url(None, 8000) == "http://127.0.0.1:8000"
+        assert resolve_local_server_base_url("0.0.0.0", 8000) == "http://127.0.0.1:8000"
+        assert resolve_local_server_base_url("::", 8000) == "http://127.0.0.1:8000"
+
+    def test_localhost_aliases(self):
+        assert resolve_local_server_base_url("127.0.0.1", 9000) == "http://127.0.0.1:9000"
+        assert resolve_local_server_base_url("localhost", 9000) == "http://127.0.0.1:9000"
+
+    def test_custom_ipv4(self):
+        assert resolve_local_server_base_url("100.64.0.5", 8765) == "http://100.64.0.5:8765"
+
+    def test_ipv6_brackets_in_url(self):
+        assert resolve_local_server_base_url(
+            "2001:db8::1", 8080
+        ) == "http://[2001:db8::1]:8080"
+
+    def test_health_url(self):
+        assert resolve_local_server_health_url(
+            "100.64.0.5", 8765
+        ) == "http://100.64.0.5:8765/health"
+
+    def test_tcp_probe_targets(self):
+        assert tcp_probe_connection_targets("", 8000) == [("127.0.0.1", 8000)]
+        assert tcp_probe_connection_targets("0.0.0.0", 8000) == [("127.0.0.1", 8000)]
+        assert tcp_probe_connection_targets("100.64.0.5", 8000) == [("100.64.0.5", 8000)]
+
+
 class TestServerStatus:
     """Tests for ServerStatus enum."""
 
@@ -416,10 +479,27 @@ class TestServerManager:
         url = manager._get_health_url()
         assert url == "http://127.0.0.1:8765/health"
 
+    def test_get_health_url_custom_bind(self, manager: ServerManager):
+        """Health URL follows server.host when not loopback / all-interfaces."""
+        base = Path(manager.config.base_path)
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "settings.json").write_text(
+            json.dumps({"server": {"host": "100.64.0.5", "port": 8765}})
+        )
+        assert manager._get_health_url() == "http://100.64.0.5:8765/health"
+
     def test_get_api_url(self, manager: ServerManager):
         """Test API URL generation."""
         url = manager.get_api_url()
         assert url == "http://127.0.0.1:8765"
+
+    def test_get_api_url_custom_bind(self, manager: ServerManager):
+        base = Path(manager.config.base_path)
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "settings.json").write_text(
+            json.dumps({"server": {"host": "100.64.0.5"}})
+        )
+        assert manager.get_api_url() == "http://100.64.0.5:8765"
 
     def test_update_config(self, manager: ServerManager):
         """Test config update."""

@@ -62,7 +62,7 @@ from Foundation import (
     NSURL,
 )
 
-from .config import ServerConfig
+from .config import ServerConfig, resolve_local_server_base_url
 from .server_manager import PortConflict, ServerManager, ServerStatus
 
 logger = logging.getLogger(__name__)
@@ -1702,7 +1702,9 @@ class OMLXAppDelegate(NSObject):
         """
         try:
             api_key = self.config.get_server_api_key()
-            base_url = f"http://127.0.0.1:{self.config.port}"
+            base_url = resolve_local_server_base_url(
+                self.config.get_server_bind_host(), self.config.port
+            )
 
             if not api_key:
                 self._cached_stats = None
@@ -1899,7 +1901,9 @@ class OMLXAppDelegate(NSObject):
         if self.server_manager.status != ServerStatus.RUNNING:
             return
 
-        base_url = f"http://127.0.0.1:{self.config.port}"
+        base_url = resolve_local_server_base_url(
+            self.config.get_server_bind_host(), self.config.port
+        )
         api_key = self.config.get_server_api_key()
 
         if api_key:
