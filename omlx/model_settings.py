@@ -63,6 +63,7 @@ class ModelSettings:
         dflash_enabled: Enable DFlash speculative decoding.
         dflash_draft_model: Path/repo for DFlash draft checkpoint.
         dflash_draft_quant_bits: Draft model quantization bits.
+        dflash_max_ctx: Max context for DFlash.
         is_pinned: Keep model loaded in memory.
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.

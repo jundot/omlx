@@ -1532,6 +1532,7 @@
                     dflash_enabled: settings.dflash_enabled || false,
                     dflash_draft_model: settings.dflash_draft_model || '',
                     dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
+                    dflash_max_ctx: settings.dflash_max_ctx ? String(settings.dflash_max_ctx) : '',
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
@@ -1612,6 +1613,9 @@
                                 dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
                                     ? parseInt(this.modelSettings.dflash_draft_quant_bits)
                                     : null,
+                                dflash_max_ctx: this.modelSettings.dflash_enabled && this.modelSettings.dflash_max_ctx
+                                    ? parseInt(this.modelSettings.dflash_max_ctx)
+                                    : null,
                             };
                         })()),
                     });
@@ -1674,6 +1678,7 @@
                         this.modelSettings.dflash_enabled = false;
                         this.modelSettings.dflash_draft_model = null;
                         this.modelSettings.dflash_draft_quant_bits = null;
+                        this.modelSettings.dflash_max_ctx = null;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
                     } else if (response.status === 401) {

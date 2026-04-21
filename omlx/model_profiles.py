@@ -44,6 +44,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "dflash_enabled",
     "dflash_draft_model",
     "dflash_draft_quant_bits",
+    "dflash_max_ctx",
     "specprefill_enabled",
     "specprefill_draft_model",
     "specprefill_keep_pct",

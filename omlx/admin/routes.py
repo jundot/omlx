@@ -126,6 +126,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_enabled: Optional[bool] = None
     dflash_draft_model: Optional[str] = None
     dflash_draft_quant_bits: Optional[int] = None
+    dflash_max_ctx: Optional[int] = None
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
@@ -1428,6 +1429,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_enabled": settings.dflash_enabled,
                 "dflash_draft_model": settings.dflash_draft_model,
                 "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
+                "dflash_max_ctx": settings.dflash_max_ctx,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
@@ -1655,6 +1657,8 @@ async def update_model_settings(
         current_settings.dflash_draft_model = request.dflash_draft_model or None
     if "dflash_draft_quant_bits" in sent:
         current_settings.dflash_draft_quant_bits = request.dflash_draft_quant_bits or None
+    if "dflash_max_ctx" in sent:
+        current_settings.dflash_max_ctx = request.dflash_max_ctx or None
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
