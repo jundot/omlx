@@ -772,6 +772,105 @@ class TestFormatMessagesForVLMTemplate:
         assert isinstance(formatted[1]["content"], list)
         assert self._count_image_placeholders([formatted[1]]) == 1
 
+    def test_reasoning_content_preserved_verbatim(self):
+        """Assistant messages with reasoning_content must skip get_message_json.
+
+        Qwen 3.6+ VLM models read reasoning_content as a top-level field in
+        the chat template. get_message_json() only forwards (content, role)
+        and drops every other key, so preserve-verbatim is required or the
+        native reasoning path is broken end-to-end.
+        """
+        engine = _make_loaded_engine(model_type="qwen3_5_moe")
+        messages = [
+            {"role": "user", "content": "Q"},
+            {
+                "role": "assistant",
+                "content": "A",
+                "reasoning_content": "R",
+            },
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=0
+        )
+
+        assert image_ranges == []
+        assert formatted[1]["role"] == "assistant"
+        assert formatted[1]["content"] == "A"
+        assert formatted[1]["reasoning_content"] == "R"
+
+    def test_reasoning_content_coexists_with_tool_calls(self):
+        """OR-connected whitelist must still preserve when both fields present."""
+        engine = _make_loaded_engine(model_type="qwen3_5_moe")
+        messages = [
+            {
+                "role": "assistant",
+                "content": "calling",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "function": {"name": "fn", "arguments": "{}"},
+                    }
+                ],
+                "reasoning_content": "R",
+            },
+        ]
+
+        formatted, _ = engine._format_messages_for_vlm_template(
+            messages, num_images=0
+        )
+
+        assert formatted[0]["reasoning_content"] == "R"
+        assert formatted[0]["tool_calls"][0]["function"]["name"] == "fn"
+
+    def test_no_reasoning_content_uses_get_message_json(self):
+        """Assistant msgs without reasoning_content keep the default path.
+
+        Regression guard: the whitelist must not accidentally steal plain
+        assistant messages from get_message_json, which handles image-token
+        placement and string/list content normalization.
+        """
+        engine = _make_loaded_engine(model_type="qwen3_5_moe")
+        messages = [
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "A"},
+        ]
+
+        formatted, _ = engine._format_messages_for_vlm_template(
+            messages, num_images=0
+        )
+
+        # Default path flattens text-only list content to string (see #796),
+        # so if we accidentally preserve verbatim the content may stay as-is
+        # instead of being normalized. Checking the type confirms the
+        # correct branch ran.
+        assert isinstance(formatted[1]["content"], str)
+        assert "reasoning_content" not in formatted[1]
+
+    def test_user_reasoning_content_is_ignored(self):
+        """reasoning_content on user messages is not preserved verbatim.
+
+        The Qwen template only reads reasoning_content on assistant turns,
+        and user messages may carry image tokens that require placeholder
+        injection. So user messages always go through get_message_json,
+        dropping any stray reasoning_content field (matches template
+        semantics).
+        """
+        engine = _make_loaded_engine(model_type="qwen3_5_moe")
+        messages = [
+            {
+                "role": "user",
+                "content": "Q",
+                "reasoning_content": "R",
+            },
+        ]
+
+        formatted, _ = engine._format_messages_for_vlm_template(
+            messages, num_images=0
+        )
+
+        assert "reasoning_content" not in formatted[0]
+
 
 # ---------------------------------------------------------------------------
 # TestCountChatTokens

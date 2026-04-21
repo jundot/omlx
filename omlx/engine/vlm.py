@@ -595,13 +595,19 @@ class VLMBatchedEngine(BaseEngine):
             if msg_num_images > 0:
                 image_message_ranges.append((idx, msg_num_images))
 
-            # Preserve tool-related messages verbatim so the chat
-            # template receives tool_calls, tool_call_id, and
-            # tool_responses fields.  get_message_json() strips these,
-            # which makes tool results invisible to the model.
+            # Preserve tool-related messages and reasoning_content verbatim
+            # so the chat template receives tool_calls, tool_call_id,
+            # tool_responses, and reasoning_content fields. get_message_json()
+            # only handles (content, role) and strips every other top-level
+            # key, which would make tool results and Qwen 3.6+ reasoning
+            # blocks invisible to the model.
             if role == "tool" or (
                 role == "assistant"
-                and (msg.get("tool_calls") or msg.get("tool_responses"))
+                and (
+                    msg.get("tool_calls")
+                    or msg.get("tool_responses")
+                    or msg.get("reasoning_content")
+                )
             ):
                 formatted_messages.append(msg)
             else:
