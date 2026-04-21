@@ -402,20 +402,24 @@ def parse_tool_calls(
             for match in matches:
                 try:
                     parsed = tool_parser(match.strip(), tools)
-                    name = parsed.get("name", "")
-                    arguments = parsed.get("arguments", {})
-                    tool_calls.append(
-                        ToolCall(
-                            id=f"call_{uuid.uuid4().hex[:8]}",
-                            type="function",
-                            function=FunctionCall(
-                                name=name,
-                                arguments=json.dumps(arguments, ensure_ascii=False)
-                                if isinstance(arguments, dict)
-                                else str(arguments),
-                            ),
+                    # MiniMax M2 parser returns a list when a single
+                    # <minimax:tool_call> block contains multiple <invoke>s.
+                    items = parsed if isinstance(parsed, list) else [parsed]
+                    for p in items:
+                        name = p.get("name", "")
+                        arguments = p.get("arguments", {})
+                        tool_calls.append(
+                            ToolCall(
+                                id=f"call_{uuid.uuid4().hex[:8]}",
+                                type="function",
+                                function=FunctionCall(
+                                    name=name,
+                                    arguments=json.dumps(arguments, ensure_ascii=False)
+                                    if isinstance(arguments, dict)
+                                    else str(arguments),
+                                ),
+                            )
                         )
-                    )
                 except (ValueError, json.JSONDecodeError, AttributeError, KeyError):
                     # Gemma 4 only: try robust fallback that handles bare
                     # string values and colons in function names.

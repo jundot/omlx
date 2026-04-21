@@ -393,7 +393,7 @@
                                                    class="rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
                                             <span class="text-xs text-neutral-500">{{ t('settings.resource.auto') }}</span>
                                         </label>
-                                        <input type="range" min="0" max="100" step="5"
+                                        <input type="range" min="0" max="100" step="1"
                                                x-model.number="memoryPercent"
                                                :disabled="modelMemoryAuto"
                                                @input="updateMemoryFromSlider()"
@@ -461,7 +461,7 @@
                                         </p>
                                     </div>
                                     <div class="flex flex-wrap items-center gap-2 sm:gap-3">
-                                        <input type="range" min="0" max="100" step="5"
+                                        <input type="range" min="0" max="100" step="1"
                                                x-model.number="cachePercent"
                                                @input="updateCacheFromSlider()"
                                                class="w-32 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer

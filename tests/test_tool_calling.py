@@ -1675,3 +1675,86 @@ class TestRestoreGemma4ParamNames:
         model_args = {k: "test" for k in enriched_props}
         restored = restore_gemma4_param_names(model_args)
         assert set(restored.keys()) == {"description", "prompt"}
+
+
+class TestParseToolCallsNativeParserListReturn:
+    """MiniMax M2 parser returns a list when a single <minimax:tool_call>
+    block contains multiple <invoke>s. parse_tool_calls() must flatten that
+    into one ToolCall per invoke, not drop the whole block.
+    """
+
+    def test_single_block_multiple_invokes(self):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<minimax:tool_call>"
+        tok.tool_call_end = "</minimax:tool_call>"
+        tok.tool_parser = lambda text, tools: [
+            {"name": "list_files", "arguments": {"path": "."}},
+            {"name": "read_file", "arguments": {"path": "README.md"}},
+        ]
+
+        text = (
+            "<minimax:tool_call>"
+            "<invoke name=\"list_files\"><parameter name=\"path\">.</parameter></invoke>"
+            "<invoke name=\"read_file\"><parameter name=\"path\">README.md</parameter></invoke>"
+            "</minimax:tool_call>"
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 2
+        assert tool_calls[0].function.name == "list_files"
+        assert tool_calls[1].function.name == "read_file"
+        assert json.loads(tool_calls[1].function.arguments) == {"path": "README.md"}
+
+    def test_single_block_single_invoke_returns_dict(self):
+        """Regression guard: single-invoke case still returns a dict."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<minimax:tool_call>"
+        tok.tool_call_end = "</minimax:tool_call>"
+        tok.tool_parser = lambda text, tools: {
+            "name": "list_files",
+            "arguments": {"path": "."},
+        }
+
+        text = (
+            "<minimax:tool_call>"
+            "<invoke name=\"list_files\"><parameter name=\"path\">.</parameter></invoke>"
+            "</minimax:tool_call>"
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "list_files"
+
+    def test_multiple_blocks_each_with_multiple_invokes(self):
+        """Two blocks, each returning a list — total 4 tool calls."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<minimax:tool_call>"
+        tok.tool_call_end = "</minimax:tool_call>"
+
+        def parser(text, tools):
+            if "first" in text:
+                return [
+                    {"name": "first_a", "arguments": {}},
+                    {"name": "first_b", "arguments": {}},
+                ]
+            return [
+                {"name": "second_a", "arguments": {}},
+                {"name": "second_b", "arguments": {}},
+            ]
+
+        tok.tool_parser = parser
+        text = (
+            "<minimax:tool_call>first</minimax:tool_call>"
+            "<minimax:tool_call>second</minimax:tool_call>"
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert [tc.function.name for tc in tool_calls] == [
+            "first_a",
+            "first_b",
+            "second_a",
+            "second_b",
+        ]
