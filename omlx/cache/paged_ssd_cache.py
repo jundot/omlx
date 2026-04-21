@@ -742,8 +742,15 @@ class PagedSSDCacheManager(CacheManager):
             self._hot_cache_total_bytes += entry_size
 
         # Flush evicted entries to SSD outside the hot cache lock
-        for evicted_hash, evicted in evicted_entries:
-            self._enqueue_ssd_write(evicted_hash, evicted)
+        # Skip SSD write when hot_cache_only=True (evicted entries are discarded)
+        if not self._hot_cache_only:
+            for evicted_hash, evicted in evicted_entries:
+                self._enqueue_ssd_write(evicted_hash, evicted)
+        elif evicted_entries:
+            logger.debug(
+                f"Discarding {len(evicted_entries)} evicted blocks "
+                f"(hot_cache_only=True)"
+            )
 
     def _enqueue_ssd_write(self, block_hash: bytes, entry: dict) -> bool:
         """Enqueue a hot cache entry for SSD background write.
