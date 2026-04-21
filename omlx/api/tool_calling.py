@@ -420,9 +420,17 @@ def parse_tool_calls(
                                 ),
                             )
                         )
-                except (ValueError, json.JSONDecodeError, AttributeError, KeyError):
+                except (
+                    ValueError,
+                    json.JSONDecodeError,
+                    AttributeError,
+                    KeyError,
+                    SyntaxError,
+                    TypeError,
+                ) as primary_err:
                     # Gemma 4 only: try robust fallback that handles bare
                     # string values and colons in function names.
+                    gemma4_handled = False
                     if tool_call_start == "<|tool_call>":
                         try:
                             parsed = _parse_gemma4_tool_call_fallback(
@@ -448,12 +456,42 @@ def parse_tool_calls(
                                         ),
                                     )
                                 )
+                            gemma4_handled = True
                         except (
                             ValueError,
                             json.JSONDecodeError,
                             KeyError,
+                            SyntaxError,
+                            TypeError,
                         ):
                             pass
+
+                    if gemma4_handled:
+                        continue
+
+                    # Per-match XML fallback: regex-only, no ast.literal_eval,
+                    # recovers Qwen/GLM/Hermes-JSON formats. Prevents silent
+                    # drop when the native parser raises (e.g. ast.literal_eval
+                    # SyntaxError on non-Python-literal parameter values).
+                    fb_wrapped = f"<tool_call>{match}</tool_call>"
+                    _, fb_calls = _parse_xml_tool_calls(fb_wrapped)
+                    if fb_calls:
+                        tool_calls.extend(fb_calls)
+                        logger.warning(
+                            "Native tool parser failed (%s: %s), "
+                            "recovered via XML fallback. Match: %r",
+                            type(primary_err).__name__,
+                            primary_err,
+                            match[:200],
+                        )
+                    else:
+                        logger.warning(
+                            "Native tool parser failed (%s: %s) and XML "
+                            "fallback could not recover. Dropping match: %r",
+                            type(primary_err).__name__,
+                            primary_err,
+                            match[:200],
+                        )
                     continue
 
             if tool_calls:

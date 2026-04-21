@@ -1085,6 +1085,123 @@ class TestParseToolCallsEmptyEndMarker:
         assert tool_calls is None or len(tool_calls) == 0
 
 
+class TestParseToolCallsSyntaxError:
+    """Regression tests for issue #882.
+
+    mlx-lm's qwen3_coder parser calls ast.literal_eval on parameter
+    values, which raises SyntaxError on non-Python-literal strings
+    (e.g. "python3 test.py" for an array-typed parameter). The
+    exception used to escape parse_tool_calls and turned into a
+    server_error SSE chunk, silently dropping the tool call.
+    """
+
+    def _qwen_tok(self, failing_parser):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = failing_parser
+        return tok
+
+    def test_syntax_error_does_not_escape(self):
+        """SyntaxError from native parser must not crash parse_tool_calls."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = self._qwen_tok(failing_parser)
+        text = (
+            "pre\n<tool_call>\n<function=shell>\n"
+            "<parameter=command>python3 test.py</parameter>\n"
+            "</function>\n</tool_call>\npost"
+        )
+        # Must not raise.
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        # XML fallback should have recovered the call.
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "shell"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"command": "python3 test.py"}
+
+    def test_qwen_xml_fallback_recovers_call(self):
+        """Qwen-style XML body recovers via _parse_xml_tool_calls on native failure."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = self._qwen_tok(failing_parser)
+        text = (
+            "<tool_call>\n<function=read>\n"
+            "<parameter=path>/etc/hosts</parameter>\n"
+            "<parameter=lines>10</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        _, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "read"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["path"] == "/etc/hosts"
+        assert args["lines"] == 10  # json.loads converts numeric string
+
+    def test_unparseable_body_logs_and_drops(self, caplog):
+        """Fully unparseable body drops gracefully and logs a warning."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = self._qwen_tok(failing_parser)
+        text = "<tool_call>not a function at all, just text</tool_call>"
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert tool_calls is None or len(tool_calls) == 0
+        # Warning emitted so failures are visible rather than silent.
+        assert any(
+            "Native tool parser failed" in r.message
+            and "SyntaxError" in r.message
+            for r in caplog.records
+        )
+
+    def test_type_error_also_caught(self):
+        """TypeError from native parser also must not escape."""
+
+        def failing_parser(text, tools):
+            raise TypeError("unexpected type during parse")
+
+        tok = self._qwen_tok(failing_parser)
+        text = (
+            "<tool_call>\n<function=patch>\n"
+            "<parameter=path>src/a.py</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        # Must not raise.
+        _, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "patch"
+
+    def test_gemma4_path_syntax_error_does_not_escape(self):
+        """Gemma 4 fallback branch also must not propagate SyntaxError."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<|tool_call>"
+        tok.tool_call_end = "<tool_call|>"
+        tok.tool_parser = failing_parser
+
+        text = "<|tool_call>garbage body<tool_call|>"
+        # Must not raise. Gemma 4 fallback will also fail on this body,
+        # but the outer code must still complete gracefully.
+        _, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is None or len(tool_calls) == 0
+
+
 class TestParseBracketToolCalls:
     """Tests for bracket-style tool call parsing (issue #159)."""
 
