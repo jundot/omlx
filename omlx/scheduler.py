@@ -1201,10 +1201,14 @@ class Scheduler:
             # Setting _rope_deltas=None makes the language model use
             # _position_ids (set by get_input_embeddings) instead.
             # Saved and restored after prefill for decode rope_deltas capture.
+            # Only applies to mRoPE VLMs (Qwen2-VL, Qwen2.5-VL, GLM-4V, etc.);
+            # non-mRoPE VLMs like Gemma 4 have no _rope_deltas attribute.
             _saved_rope_deltas = None
-            if start_offset > 0 and hasattr(self.model, "_language_model"):
-                _saved_rope_deltas = self.model._language_model._rope_deltas
-                self.model._language_model._rope_deltas = None
+            if start_offset > 0:
+                lm = getattr(self.model, "_language_model", None)
+                if lm is not None and hasattr(lm, "_rope_deltas"):
+                    _saved_rope_deltas = lm._rope_deltas
+                    lm._rope_deltas = None
 
         # Prefill tokens[0:N-1] (leave last token for insert())
         prefill_tokens = tokens[:-1]
