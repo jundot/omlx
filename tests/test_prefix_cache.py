@@ -683,9 +683,9 @@ class TestArraysCacheLastBlockOnly:
         assert result is not None
         assert len(result) == 1
         keys, values = result[0]
-        # Should be placeholder
-        assert keys.shape == (1,)
-        assert values.shape == (1,)
+        # Should be full state (always stored to enable walk-back)
+        assert keys.shape == (1, 3, 64)
+        assert values.shape == (1, 32, 128, 128)
 
     def test_extract_block_hybrid_model_arrays_cache_and_kvcache(
         self, prefix_cache, mx
@@ -723,8 +723,8 @@ class TestArraysCacheLastBlockOnly:
         assert len(result) == 2
         # KVCache layer should be sliced normally
         assert result[0][0].shape[2] == 4  # seq_len slice
-        # ArraysCache layer should be placeholder
-        assert result[1][0].shape == (1,)
+        # ArraysCache layer should be full state (always stored to enable walk-back)
+        assert result[1][0].shape == (1, 3, 64)
 
         # Last block
         result = prefix_cache._extract_block_tensor_slice(
