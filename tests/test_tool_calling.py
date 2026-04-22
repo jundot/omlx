@@ -15,6 +15,7 @@ from omlx.api.tool_calling import (
     ToolCallStreamFilter,
     _gemma4_args_to_json_robust,
     _parse_gemma4_tool_call_fallback,
+    _serialize_tool_call_arguments,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
@@ -1875,3 +1876,38 @@ class TestParseToolCallsNativeParserListReturn:
             "second_a",
             "second_b",
         ]
+
+
+class TestSerializeToolCallArguments:
+    """Tests for `_serialize_tool_call_arguments`.
+
+    Guards the server-side exit: whatever the parser returns must leave
+    omlx as a valid JSON-object string so a subsequent turn's chat template
+    (which iterates `arguments.items()`) never crashes on the echo.
+    """
+
+    def test_dict_roundtrip(self):
+        result = _serialize_tool_call_arguments({"location": "Tokyo", "unit": "c"})
+        assert json.loads(result) == {"location": "Tokyo", "unit": "c"}
+
+    def test_empty_dict(self):
+        assert _serialize_tool_call_arguments({}) == "{}"
+
+    def test_non_ascii_preserved(self):
+        """ensure_ascii=False is applied so CJK/emoji stay readable."""
+        result = _serialize_tool_call_arguments({"city": "서울"})
+        assert "서울" in result
+
+    def test_non_dict_bare_string_coerced_to_empty(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments("Tokyo")
+        assert result == "{}"
+        assert any("non-dict" in r.message for r in caplog.records)
+
+    def test_non_dict_list_coerced_to_empty(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments([1, 2])
+        assert result == "{}"
+
+    def test_non_dict_none_coerced_to_empty(self):
+        assert _serialize_tool_call_arguments(None) == "{}"

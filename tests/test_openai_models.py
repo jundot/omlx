@@ -177,6 +177,131 @@ class TestFunctionCallAndToolCall:
         assert tc.type == "function"
 
 
+class TestFunctionCallArgumentsValidation:
+    """Tests for FunctionCall.arguments JSON-object validator.
+
+    Native tool-calling chat templates iterate `arguments.items()`, which
+    requires the echoed value to parse back into a dict. Malformed inputs
+    must be rejected at the request boundary with a 422-friendly ValueError.
+    """
+
+    def test_accepts_empty_string_as_empty_object(self):
+        """Some clients send ``""`` — normalize to ``"{}"`` instead of rejecting."""
+        fc = FunctionCall(name="f", arguments="")
+        assert fc.arguments == "{}"
+
+    def test_accepts_whitespace_only_string(self):
+        """Whitespace-only input normalizes to ``"{}"`` too."""
+        fc = FunctionCall(name="f", arguments="   ")
+        assert fc.arguments == "{}"
+
+    def test_accepts_dict_and_serializes(self):
+        """Some clients wrongly send a dict; coerce to JSON string instead of 422."""
+        fc = FunctionCall(name="f", arguments={"a": 1, "b": "x"})
+        assert json.loads(fc.arguments) == {"a": 1, "b": "x"}
+
+    def test_rejects_invalid_json(self):
+        """Truncated or otherwise malformed JSON must raise."""
+        with pytest.raises(ValidationError) as exc:
+            FunctionCall(name="f", arguments='{"a": "b')
+        msg = str(exc.value)
+        assert "valid JSON" in msg
+
+    def test_rejects_python_repr_with_single_quotes(self):
+        """``{'a': 1}`` is not valid JSON and must be rejected."""
+        with pytest.raises(ValidationError):
+            FunctionCall(name="f", arguments="{'a': 1}")
+
+    def test_rejects_bare_string(self):
+        """``"Tokyo"`` parses as a JSON string, not an object — reject."""
+        with pytest.raises(ValidationError) as exc:
+            FunctionCall(name="f", arguments='"Tokyo"')
+        assert "JSON object" in str(exc.value)
+
+    def test_rejects_json_array(self):
+        """Arrays are valid JSON but not objects; reject."""
+        with pytest.raises(ValidationError) as exc:
+            FunctionCall(name="f", arguments="[1, 2, 3]")
+        assert "JSON object" in str(exc.value)
+
+    def test_rejects_plain_text(self):
+        """Plain text that isn't JSON at all — reject."""
+        with pytest.raises(ValidationError):
+            FunctionCall(name="f", arguments="Tokyo")
+
+    def test_rejects_numeric_type(self):
+        """Non-string, non-dict types are rejected."""
+        with pytest.raises(ValidationError):
+            FunctionCall(name="f", arguments=123)
+
+
+class TestMessageToolCallsArgumentsValidation:
+    """Tests that Message.tool_calls validates nested arguments.
+
+    Since tool_calls is typed as List[dict], Pydantic does not transitively
+    run FunctionCall's own validator on the nested entries. A Message-level
+    validator rejects malformed echoes so downstream template rendering is
+    safe.
+    """
+
+    def test_valid_tool_calls_accepted(self):
+        msg = Message(
+            role="assistant",
+            content=None,
+            tool_calls=[
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": '{"a": 1}'},
+                }
+            ],
+        )
+        assert msg.tool_calls[0]["function"]["arguments"] == '{"a": 1}'
+
+    def test_empty_arguments_normalized(self):
+        msg = Message(
+            role="assistant",
+            tool_calls=[{"function": {"name": "f", "arguments": ""}}],
+        )
+        assert msg.tool_calls[0]["function"]["arguments"] == "{}"
+
+    def test_dict_arguments_coerced(self):
+        msg = Message(
+            role="assistant",
+            tool_calls=[{"function": {"name": "f", "arguments": {"a": 1}}}],
+        )
+        assert json.loads(msg.tool_calls[0]["function"]["arguments"]) == {"a": 1}
+
+    def test_malformed_json_rejected(self):
+        with pytest.raises(ValidationError):
+            Message(
+                role="assistant",
+                tool_calls=[{"function": {"name": "f", "arguments": '{"a":'}}],
+            )
+
+    def test_python_repr_rejected(self):
+        with pytest.raises(ValidationError):
+            Message(
+                role="assistant",
+                tool_calls=[{"function": {"name": "f", "arguments": "{'a': 1}"}}],
+            )
+
+    def test_plain_text_rejected(self):
+        with pytest.raises(ValidationError):
+            Message(
+                role="assistant",
+                tool_calls=[{"function": {"name": "f", "arguments": "Tokyo"}}],
+            )
+
+    def test_missing_arguments_key_allowed(self):
+        """Some payloads omit arguments entirely — don't invent a failure."""
+        msg = Message(
+            role="assistant",
+            tool_calls=[{"function": {"name": "f"}}],
+        )
+        assert msg.tool_calls[0]["function"] == {"name": "f"}
+
+
 class TestToolDefinition:
     """Tests for ToolDefinition model."""
 

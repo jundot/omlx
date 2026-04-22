@@ -30,6 +30,26 @@ from .openai_models import FunctionCall, ResponseFormat, ToolCall, ToolDefinitio
 logger = logging.getLogger(__name__)
 
 
+def _serialize_tool_call_arguments(arguments: Any) -> str:
+    """Serialize parser output to a JSON-object arguments string.
+
+    Chat templates for models with native tool calling (Qwen 3.5/3.6 XML,
+    GLM, MiniMax) iterate `arguments.items()` when the call is echoed back
+    in history. Anything other than a dict must be coerced to "{}" here so
+    we never hand the client a non-JSON value that the next turn's template
+    would crash on.
+    """
+    if isinstance(arguments, dict):
+        return json.dumps(arguments, ensure_ascii=False)
+    logger.warning(
+        "Tool parser returned non-dict arguments (type=%s, repr=%.200r); "
+        "coercing to empty object to keep downstream template safe.",
+        type(arguments).__name__,
+        arguments,
+    )
+    return "{}"
+
+
 @dataclass(frozen=True)
 class ToolCallExtraction:
     """Parsed tool-call result plus sanitized reasoning text."""
@@ -69,9 +89,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                     type="function",
                     function=FunctionCall(
                         name=name,
-                        arguments=json.dumps(arguments, ensure_ascii=False)
-                        if isinstance(arguments, dict)
-                        else str(arguments),
+                        arguments=_serialize_tool_call_arguments(arguments),
                     ),
                 )
             )
@@ -414,9 +432,7 @@ def parse_tool_calls(
                                 type="function",
                                 function=FunctionCall(
                                     name=name,
-                                    arguments=json.dumps(arguments, ensure_ascii=False)
-                                    if isinstance(arguments, dict)
-                                    else str(arguments),
+                                    arguments=_serialize_tool_call_arguments(arguments),
                                 ),
                             )
                         )
@@ -448,11 +464,9 @@ def parse_tool_calls(
                                         type="function",
                                         function=FunctionCall(
                                             name=name,
-                                            arguments=json.dumps(
-                                                arguments, ensure_ascii=False
-                                            )
-                                            if isinstance(arguments, dict)
-                                            else str(arguments),
+                                            arguments=_serialize_tool_call_arguments(
+                                                arguments
+                                            ),
                                         ),
                                     )
                                 )
