@@ -2143,7 +2143,7 @@ class PagedSSDCacheManager(CacheManager):
                     if blk_meta is None or not _matches(blk_meta.model_name):
                         continue
                     hot_entries.append(entry)
-                    hot_size += self._hot_cache_entry_size(entry["tensors_raw"])
+                    hot_size += self._hot_cache_entry_size(entry)
 
             return PagedSSDCacheStats(
                 hits=self._stats["hits"],
