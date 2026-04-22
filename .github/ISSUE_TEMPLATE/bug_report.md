@@ -24,9 +24,7 @@ A clear and concise description of what you expected to happen.
 If applicable, add screenshots to help explain your problem.
 
 **Desktop (please complete the following information):**
- - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
- - Version [e.g. 22]
+ - macOS Version: [e.g. 26.4.1]
  - oMLX Version [e.g. 0.3.7]
 
 **Additional context**
