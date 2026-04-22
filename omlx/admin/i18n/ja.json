@@ -318,6 +318,8 @@
   "settings.resource.restart_badge": "再起動が必要",
   "settings.cache.section_label": "キャッシュ",
   "settings.cache.enabled": "キャッシュ有効",
+  "settings.cache.hot_cache_only": "Hot Cache のみ",
+  "settings.cache.hot_cache_only_hint": "KV キャッシュを RAM のみに保持します。SSD 書き込みなし、再起動でクリアされます。",
   "settings.cache.ssd_directory": "SSDキャッシュディレクトリ",
   "settings.generation.section_label": "生成デフォルト",
   "settings.generation.max_context_window": "最大コンテキストウィンドウ",

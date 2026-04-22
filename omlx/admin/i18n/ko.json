@@ -318,6 +318,8 @@
   "settings.resource.restart_badge": "재시작 필요",
   "settings.cache.section_label": "캐시",
   "settings.cache.enabled": "캐시 활성화",
+  "settings.cache.hot_cache_only": "Hot Cache만 사용",
+  "settings.cache.hot_cache_only_hint": "KV 캐시를 RAM에만 유지합니다. SSD 쓰기 없음, 재시작 시 초기화됩니다.",
   "settings.cache.ssd_directory": "SSD 캐시 디렉토리",
   "settings.generation.section_label": "생성 기본값",
   "settings.generation.max_context_window": "최대 컨텍스트 윈도우",

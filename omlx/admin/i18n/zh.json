@@ -318,6 +318,8 @@
   "settings.resource.restart_badge": "需要重启",
   "settings.cache.section_label": "缓存",
   "settings.cache.enabled": "启用缓存",
+  "settings.cache.hot_cache_only": "仅 Hot Cache",
+  "settings.cache.hot_cache_only_hint": "仅在 RAM 中保留 KV 缓存。不写入 SSD，重启后清除。",
   "settings.cache.ssd_directory": "SSD 缓存目录",
   "settings.generation.section_label": "生成默认值",
   "settings.generation.max_context_window": "最大上下文窗口",
