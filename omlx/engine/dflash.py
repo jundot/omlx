@@ -145,7 +145,7 @@ class DFlashEngine(BaseEngine):
         self._model_type_str = None
         self._fallback_engine: BaseEngine | None = None
         if self._model_settings is not None and self._model_settings.dflash_max_ctx is not None:
-            self._max_dflash_ctx = self._model_settings.dflash_max_ctx
+            self._max_dflash_ctx = max(1024, self._model_settings.dflash_max_ctx)
         else:
             self._max_dflash_ctx = DEFAULT_MAX_DFLASH_CTX
 

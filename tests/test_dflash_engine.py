@@ -231,12 +231,14 @@ class TestDFlashRoutingLogic:
             draft_model_path="test-draft",
             model_settings=settings,
         )
+        # Clamped to 1024 minimum, so effective value is 1024
+        assert engine._max_dflash_ctx == 1024
 
         class MockTokenizer:
             def encode(self, text):
                 return list(range(len(text)))
 
         engine._tokenizer_obj = MockTokenizer()
-        prompt = "x" * 100  # exactly 100 tokens = max_ctx
+        prompt = "x" * 1024  # exactly 1024 tokens = effective max_ctx
         prompt_tokens = engine._tokenizer_obj.encode(prompt)
         assert len(prompt_tokens) >= engine._max_dflash_ctx
