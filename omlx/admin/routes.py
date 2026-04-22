@@ -9,6 +9,7 @@ This module provides HTTP routes for the admin panel including:
 """
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -22,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -1010,6 +1011,285 @@ async def chat_page(request: Request, is_admin: bool = Depends(require_admin)):
     return templates.TemplateResponse(
         request, "chat.html", {"api_key": api_key or ""}
     )
+
+
+# =============================================================================
+# Chat File Attachment Route
+# =============================================================================
+
+# Maximum extracted character count accepted per attachment.
+# This is a conservative proxy for token budget — actual token cost depends
+# on the loaded model's tokeniser. ~50k chars ≈ 12–16k tokens at typical
+# ratios; well within the context window of all supported models.
+_ATTACH_MAX_CHARS: int = 50_000
+
+# Maximum raw file size accepted before any parsing.
+# Prevents large uploads from being read entirely into memory.
+_ATTACH_MAX_BYTES: int = 20 * 1_048_576  # 20 MB
+
+# File types accepted for attachment. PDF requires the optional [pdf] extra.
+_ATTACH_ACCEPTED: frozenset[str] = frozenset({".md", ".txt", ".json", ".pdf"})
+
+
+@router.post("/api/chat/attach")
+async def chat_attach(
+    file: UploadFile = File(...),
+    is_admin: bool = Depends(require_admin),
+):
+    """Extract text content from an attached file for use in chat context.
+
+    Accepts PDF (text-layer only), Markdown, plain text, and JSON.
+    Returns extracted text and a token count for context-window planning.
+    The file is not stored — content is returned to the client for injection
+    into the next outgoing message.
+
+    PDF support requires the optional dependency::
+
+        pip install 'omlx[pdf]'
+
+    Without it, PDF uploads return HTTP 501 with install instructions.
+
+    Args:
+        file: The uploaded file (multipart/form-data).
+
+    Returns:
+        JSON with keys:
+            filename (str): Original filename.
+            content (str): Extracted plain text.
+            char_count (int): Length of extracted text in characters.
+            token_count (int): Token estimate — exact if a model is loaded,
+                approximate (chars // 3) otherwise.
+            token_count_exact (bool): True when count comes from the loaded
+                model's tokeniser; False when it is an approximation.
+
+    Raises:
+        HTTP 400: File is empty or extracted content exceeds the character limit.
+        HTTP 415: File type not in the accepted set.
+        HTTP 422: File is malformed (bad UTF-8, invalid JSON, corrupt PDF,
+                  password-protected PDF, or scanned-image PDF with no text).
+        HTTP 501: PDF requested but pypdf is not installed.
+    """
+    suffix = Path(file.filename or "").suffix.lower()
+
+    if suffix not in _ATTACH_ACCEPTED:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"Unsupported file type '{suffix}'. "
+                f"Accepted: {', '.join(sorted(_ATTACH_ACCEPTED))}"
+            ),
+        )
+
+    content = await file.read()
+
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    # Byte-level size guard — before any parsing or decoding.
+    # Prevents a large upload from being read entirely into memory before
+    # extraction logic runs.
+    if len(content) > _ATTACH_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File is {len(content) / 1_048_576:.1f} MB, which exceeds the "
+                f"{_ATTACH_MAX_BYTES // 1_048_576} MB upload limit."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Markdown / plain text
+    # ------------------------------------------------------------------
+    if suffix in (".md", ".txt"):
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(
+                status_code=422,
+                detail="File is not valid UTF-8 text.",
+            )
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="File is empty.")
+
+    # ------------------------------------------------------------------
+    # JSON
+    # ------------------------------------------------------------------
+    elif suffix == ".json":
+        try:
+            raw = content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(
+                status_code=422,
+                detail="JSON file is not valid UTF-8.",
+            )
+        # Size check on raw string before deserialising and re-serialising,
+        # to avoid building large objects that are then discarded.
+        if len(raw) > _ATTACH_MAX_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"JSON file is {len(raw):,} characters, which exceeds the "
+                    f"{_ATTACH_MAX_CHARS:,} character limit. "
+                    "Attach a shorter excerpt."
+                ),
+            )
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Invalid JSON at line {exc.lineno}, "
+                    f"col {exc.colno}: {exc.msg}"
+                ),
+            )
+        if parsed is None or parsed == {} or parsed == []:
+            raise HTTPException(
+                status_code=422,
+                detail="JSON file is empty or null.",
+            )
+        # Re-serialise with indent for readability. Check size again —
+        # indent=2 can expand compact JSON beyond the limit.
+        text = json.dumps(parsed, indent=2)
+        if len(text) > _ATTACH_MAX_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"JSON content is {len(text):,} characters after formatting, "
+                    f"which exceeds the {_ATTACH_MAX_CHARS:,} character limit. "
+                    "Attach a shorter excerpt."
+                ),
+            )
+
+    # ------------------------------------------------------------------
+    # PDF
+    # ------------------------------------------------------------------
+    elif suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "PDF support requires pypdf. "
+                    "Install it with: pip install 'omlx[pdf]'"
+                ),
+            )
+
+        try:
+            reader: "PdfReader" = await asyncio.to_thread(
+                PdfReader, io.BytesIO(content)
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Could not open PDF: {exc}",
+            )
+
+        if reader.is_encrypted:
+            try:
+                decrypted = await asyncio.to_thread(reader.decrypt, "")
+            except Exception:
+                decrypted = 0  # treat exceptions as failed decrypt
+            if not decrypted:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "PDF is password-protected and cannot be read. "
+                        "Remove the password and re-attach."
+                    ),
+                )
+
+        def _extract_pdf_text(rdr: "PdfReader") -> str:
+            """Extract text page-by-page with an early-exit size guard.
+
+            Runs inside asyncio.to_thread — must not await.
+            Raises HTTPException on size exceeded so the caller surfaces
+            it directly; the exception propagates through to_thread normally.
+            """
+            pages: list[str] = []
+            total = 0
+            for page in rdr.pages:
+                page_text = page.extract_text() or ""
+                total += len(page_text)
+                if total > _ATTACH_MAX_CHARS:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"PDF content exceeds the {_ATTACH_MAX_CHARS:,} "
+                            "character limit after extraction. "
+                            "Attach a shorter section of the document."
+                        ),
+                    )
+                pages.append(page_text)
+            return "\n\n".join(pages)
+
+        text = await asyncio.to_thread(_extract_pdf_text, reader)
+
+        if not text.strip():
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "No text could be extracted from this PDF. "
+                    "It may be a scanned image. "
+                    "Use an OCR model (DeepSeek-OCR, DOTS-OCR, or GLM-OCR) instead."
+                ),
+            )
+
+    # ------------------------------------------------------------------
+    # Final size guard (catches .md / .txt; JSON caught above on raw)
+    # ------------------------------------------------------------------
+    if len(text) > _ATTACH_MAX_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"File content is {len(text):,} characters, which exceeds the "
+                f"{_ATTACH_MAX_CHARS:,} character limit. "
+                "Attach a shorter excerpt."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Token count
+    # Use the first loaded model's tokeniser for an exact count.
+    # Fall back to a conservative character approximation when no model
+    # is loaded or the tokeniser is unavailable.
+    # ------------------------------------------------------------------
+    token_count: int
+    token_count_exact: bool = False
+
+    try:
+        engine_pool = _get_engine_pool()
+        if engine_pool is not None:
+            loaded_ids = engine_pool.get_loaded_model_ids()
+            if loaded_ids:
+                entry = engine_pool.get_entry(loaded_ids[0])
+                if entry is not None and entry.engine is not None:
+                    # Try both attribute names — standard engines use _tokenizer,
+                    # DFlash engine uses _tokenizer_obj.
+                    tokenizer = (
+                        getattr(entry.engine, "_tokenizer", None)
+                        or getattr(entry.engine, "_tokenizer_obj", None)
+                    )
+                    if tokenizer is not None and hasattr(tokenizer, "encode"):
+                        token_count = len(
+                            await asyncio.to_thread(tokenizer.encode, text)
+                        )
+                        token_count_exact = True
+    except Exception:
+        pass  # fall through to approximation
+
+    if not token_count_exact:
+        # ~3 chars/token is conservative for mixed prose + structured content.
+        token_count = max(1, len(text) // 3)
+
+    return {
+        "filename": file.filename,
+        "content": text,
+        "char_count": len(text),
+        "token_count": token_count,
+        "token_count_exact": token_count_exact,
+    }
 
 
 @router.get("/static/{path:path}")

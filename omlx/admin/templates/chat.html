@@ -734,6 +734,13 @@
                            x-ref="imageInput" @change="handleImageSelect($event)"
                            class="hidden">
 
+                    <!-- Hidden file input for document attachment -->
+                    <input type="file" id="fileAttachInput"
+                           accept=".pdf,.md,.json,.txt"
+                           x-ref="fileAttachInput"
+                           @change="handleFileAttach($event)"
+                           class="hidden">
+
                     <!-- Image preview area (multi-image) -->
                     <div x-show="uploadImages.length > 0" class="flex flex-wrap gap-2 px-2 pt-2" x-cloak>
                         <template x-for="(img, idx) in uploadImages" :key="img.id">
@@ -748,6 +755,43 @@
                         </template>
                     </div>
 
+                    <!-- Attached file badge -->
+                    <div x-show="attachedFile" class="flex items-center gap-2 px-3 pt-2 text-sm" x-cloak>
+                        <i data-lucide="file-text" class="w-4 h-4 text-fg-tertiary shrink-0"></i>
+                        <span x-text="attachedFile?.filename" class="truncate text-fg-secondary"></span>
+                        <span x-text="`${attachedFile?.token_count_exact ? '' : '~'}${(attachedFile?.token_count || 0).toLocaleString()} tokens`"
+                              class="text-fg-tertiary shrink-0 text-xs"></span>
+                        <button @click="removeAttachedFile()"
+                                class="ml-auto text-fg-tertiary hover:text-fg shrink-0"
+                                :title="window.t('chat.remove_file')">
+                            <i data-lucide="x" class="w-3.5 h-3.5"></i>
+                        </button>
+                    </div>
+
+                    <!-- File attach warning (danger / unknown context states) -->
+                    <div x-show="attachFileWarning" class="px-2 pt-1" x-cloak>
+                        <div class="flex items-start gap-2 text-sm rounded-lg px-3 py-2 bg-surface-alt border border-line">
+                            <i data-lucide="triangle-alert" class="w-4 h-4 text-amber-500 shrink-0 mt-0.5"></i>
+                            <span x-text="attachFileWarning" class="text-fg-secondary flex-1"></span>
+                            <button @click="attachFileWarning = null"
+                                    class="text-fg-tertiary hover:text-fg shrink-0">
+                                <i data-lucide="x" class="w-3.5 h-3.5"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- File attach error (hard failure / exceeded) -->
+                    <div x-show="attachFileError" class="px-2 pt-1" x-cloak>
+                        <div class="flex items-start gap-2 text-sm rounded-lg px-3 py-2 bg-surface-alt border border-line">
+                            <i data-lucide="circle-x" class="w-4 h-4 text-danger shrink-0 mt-0.5"></i>
+                            <span x-text="attachFileError" class="text-fg-secondary flex-1"></span>
+                            <button @click="attachFileError = null"
+                                    class="text-fg-tertiary hover:text-fg shrink-0">
+                                <i data-lucide="x" class="w-3.5 h-3.5"></i>
+                            </button>
+                        </div>
+                    </div>
+
                     <div class="flex items-end">
                         <!-- Image upload button (only for VLM models) -->
                         <button x-show="hasVisionSupport()"
@@ -756,6 +800,14 @@
                                 class="p-3 shrink-0 transition-colors text-fg-tertiary hover:text-fg-secondary disabled:opacity-50 disabled:cursor-not-allowed"
                                 :title="window.t('chat.upload_image')">
                             <i data-lucide="image" class="w-5 h-5"></i>
+                        </button>
+
+                        <!-- File attach button (all LLM/VLM models) -->
+                        <button @click="$refs.fileAttachInput.click()"
+                                :disabled="!apiKeySet || !currentModel || isStreaming || !!attachedFile"
+                                class="p-3 shrink-0 transition-colors text-fg-tertiary hover:text-fg-secondary disabled:opacity-50 disabled:cursor-not-allowed"
+                                :title="window.t('chat.attach_file')">
+                            <i data-lucide="paperclip" class="w-5 h-5"></i>
                         </button>
 
                         <textarea
@@ -772,7 +824,7 @@
                         <div class="relative flex-shrink-0">
                             <button
                                 @click="sendMessage()"
-                                :disabled="(!inputMessage.trim() && uploadImages.length === 0) || !apiKeySet || !currentModel || isStreaming"
+                                :disabled="(!inputMessage.trim() && uploadImages.length === 0 && !attachedFile) || !apiKeySet || !currentModel || isStreaming"
                                 class="w-10 h-10 m-1 bg-accent hover:bg-accent-hover disabled:bg-surface-muted rounded-full transition-colors flex items-center justify-center"
                             >
                                 <i data-lucide="arrow-up" class="w-4 h-4 text-accent-fg"></i>
@@ -925,6 +977,24 @@
             uploadImages: [],            // Array of { id, base64 } for pending images (max 10)
             isDragOver: false,           // drag-and-drop state
 
+            // File Attachment State
+            attachedFile: null,          // { filename, content, char_count, token_count, token_count_exact }
+            attachFileError: null,       // string | null — hard error (shown, blocks send on exceeded)
+            attachFileWarning: null,     // string | null — soft warning (danger / unknown context state)
+            conversationTokens: 0,       // updated from lastUsage.prompt_tokens after each response
+
+            // Context window per model — populated by fetchModelTypes()
+            modelContextMap: {},         // { modelId: max_context_window | null }
+
+            // File attach constants
+            ATTACH_MAX_CHARS: 50000,
+            ATTACH_MAX_BYTES: 10 * 1024 * 1024,
+            ATTACH_ACCEPTED: ['.pdf', '.md', '.json', '.txt'],
+            ATTACH_CHARS_PER_TOKEN: 3.5,   // approximation fallback
+            ATTACH_RESPONSE_RESERVE: 2048, // tokens reserved for model response
+            ATTACH_SYSTEM_OVERHEAD: 256,   // estimated tokens for system prompt
+            ATTACH_DANGER_THRESHOLD: 0.70, // warn above this fraction of available window
+
             // Image Modal State
             imageModal: {
                 show: false,
@@ -990,13 +1060,44 @@
                     });
                     if (!resp.ok) return;
                     const data = await resp.json();
-                    const map = {};
+                    const typeMap = {};
+                    const contextMap = {};
                     for (const m of (data.models || [])) {
-                        map[m.id] = m.model_type || 'llm';
+                        typeMap[m.id] = m.model_type || 'llm';
+                        // max_context_window appears at top level when read from
+                        // config.json, or inside settings when explicitly configured.
+                        contextMap[m.id] = (
+                            m.max_context_window
+                            ?? m.settings?.max_context_window
+                            ?? null
+                        );
                     }
-                    this.modelTypeMap = map;
+                    this.modelTypeMap = typeMap;
+                    this.modelContextMap = contextMap;
+
+                    // For any model where context window is still null,
+                    // fall back to generation_config which reads config.json directly.
+                    // This covers freshly loaded models with no saved settings.
+                    const missing = Object.entries(contextMap)
+                        .filter(([, v]) => v === null)
+                        .map(([id]) => id);
+                    for (const modelId of missing) {
+                        try {
+                            const gcResp = await fetch(
+                                `/admin/api/models/${encodeURIComponent(modelId)}/generation_config`,
+                                { headers: { 'Authorization': `Bearer ${this.getApiKey()}` },
+                                  credentials: 'same-origin' }
+                            );
+                            if (gcResp.ok) {
+                                const gc = await gcResp.json();
+                                if (gc.max_context_window) {
+                                    this.modelContextMap[modelId] = gc.max_context_window;
+                                }
+                            }
+                        } catch (_) { /* non-fatal — unknown state is safe fallback */ }
+                    }
                 } catch (e) {
-                    // Model status endpoint unavailable
+                    // Model status endpoint unavailable — both maps remain empty
                 }
             },
 
@@ -1135,6 +1236,165 @@
 
             removeImage(index) {
                 this.uploadImages.splice(index, 1);
+            },
+
+            // ===== File Attachment =====
+
+            checkContextViability(tokenCount) {
+                const contextWindow = this.modelContextMap[this.currentModel] ?? null;
+                if (!contextWindow) return { state: 'unknown', tokenCount };
+
+                const reserved = this.ATTACH_RESPONSE_RESERVE + this.ATTACH_SYSTEM_OVERHEAD;
+                const available = contextWindow - this.conversationTokens - reserved;
+                const fraction = available > 0 ? tokenCount / available : Infinity;
+                const deficit = Math.max(0, tokenCount - available);
+                const requiredWindow = this.conversationTokens + tokenCount + reserved;
+
+                let state;
+                if (fraction <= this.ATTACH_DANGER_THRESHOLD)  state = 'safe';
+                else if (fraction <= 1.0)                       state = 'danger';
+                else                                            state = 'exceeded';
+
+                return { state, tokenCount, available, fraction, deficit,
+                         requiredWindow, contextWindow };
+            },
+
+            renderContextFeedback(viability, exact) {
+                const prefix = exact ? '' : '~';
+                const fmt = n => n.toLocaleString();
+                const pct = Math.round((viability.fraction ?? 0) * 100);
+
+                this.attachFileWarning = null;
+
+                if (viability.state === 'safe') {
+                    // Badge text is set by the caller — no additional message needed
+
+                } else if (viability.state === 'danger') {
+                    const remaining = viability.available - viability.tokenCount;
+                    this.attachFileWarning = window.t('chat.warn.file_context_danger')
+                        .replace('{pct}', pct)
+                        .replace('{tokens}', `${prefix}${fmt(viability.tokenCount)}`)
+                        .replace('{available}', fmt(viability.available))
+                        .replace('{remaining}', fmt(remaining));
+
+                } else if (viability.state === 'exceeded') {
+                    this.attachedFile = null;
+                    this.attachFileError = window.t('chat.error.file_context_exceeded')
+                        .replace('{tokens}', `${prefix}${fmt(viability.tokenCount)}`)
+                        .replace('{deficit}', fmt(viability.deficit))
+                        .replace('{available}', fmt(viability.available))
+                        .replace('{required}', fmt(viability.requiredWindow));
+
+                } else if (viability.state === 'unknown') {
+                    this.attachFileWarning = window.t('chat.warn.file_context_unknown');
+                }
+            },
+
+            async handleFileAttach(event) {
+                const file = event.target.files[0];
+                if (!file) return;
+                event.target.value = '';   // reset — same pattern as image upload
+
+                // Clear prior state
+                this.attachedFile = null;
+                this.attachFileError = null;
+                this.attachFileWarning = null;
+
+                // 1. Extension check
+                const ext = '.' + file.name.split('.').pop().toLowerCase();
+                if (!this.ATTACH_ACCEPTED.includes(ext)) {
+                    this.attachFileError = window.t('chat.error.invalid_file_type')
+                        .replace('{ext}', ext)
+                        .replace('{accepted}', this.ATTACH_ACCEPTED.join(', '));
+                    return;
+                }
+
+                // 2. Raw size check
+                if (file.size > this.ATTACH_MAX_BYTES) {
+                    this.attachFileError = window.t('chat.error.file_too_large')
+                        .replace('{mb}', (file.size / 1024 / 1024).toFixed(1));
+                    return;
+                }
+
+                // 3. Client-side content validation for JSON and text
+                //    PDF validation is deferred to the server (requires pypdf).
+                if (ext === '.json') {
+                    try {
+                        const raw = await file.text();
+                        if (raw.length > this.ATTACH_MAX_CHARS) {
+                            this.attachFileError = window.t('chat.error.file_too_large')
+                                .replace('{mb}', (file.size / 1024 / 1024).toFixed(1));
+                            return;
+                        }
+                        const parsed = JSON.parse(raw);
+                        if (!parsed || (typeof parsed === 'object'
+                                && !Array.isArray(parsed)
+                                && Object.keys(parsed).length === 0)) {
+                            this.attachFileError = window.t('chat.error.json_invalid')
+                                .replace('{reason}', 'file is empty or null');
+                            return;
+                        }
+                    } catch (e) {
+                        this.attachFileError = window.t('chat.error.json_invalid')
+                            .replace('{reason}', e.message);
+                        return;
+                    }
+                }
+
+                if (ext === '.md' || ext === '.txt') {
+                    try {
+                        const text = await file.text();
+                        if (!text.trim()) {
+                            this.attachFileError = window.t('chat.error.file_empty');
+                            return;
+                        }
+                        if (text.length > this.ATTACH_MAX_CHARS) {
+                            this.attachFileError = window.t('chat.error.file_too_large')
+                                .replace('{mb}', (file.size / 1024 / 1024).toFixed(1));
+                            return;
+                        }
+                    } catch (e) {
+                        this.attachFileError = window.t('chat.error.file_load_failed');
+                        return;
+                    }
+                }
+
+                // 4. Upload to server for authoritative extraction and token count
+                let data;
+                try {
+                    const form = new FormData();
+                    form.append('file', file);
+                    const resp = await fetch('/admin/api/chat/attach', {
+                        method: 'POST',
+                        body: form,
+                        credentials: 'same-origin',
+                    });
+                    if (!resp.ok) {
+                        let reason = window.t('chat.error.file_load_failed');
+                        try {
+                            const err = await resp.json();
+                            reason = err.detail || reason;
+                        } catch (_) {}
+                        this.attachFileError = reason;
+                        return;
+                    }
+                    data = await resp.json();
+                } catch (e) {
+                    this.attachFileError = window.t('chat.error.file_load_failed');
+                    return;
+                }
+
+                // 5. Context viability check
+                this.attachedFile = data;
+                const viability = this.checkContextViability(data.token_count);
+                this.renderContextFeedback(viability, data.token_count_exact);
+                // renderContextFeedback nulls attachedFile on exceeded state
+            },
+
+            removeAttachedFile() {
+                this.attachedFile = null;
+                this.attachFileError = null;
+                this.attachFileWarning = null;
             },
 
             handlePaste(event) {
@@ -1295,6 +1555,11 @@
 
             selectModel(modelId) {
                 this.currentModel = modelId;
+                // Token count is model-specific — reset on switch
+                this.conversationTokens = 0;
+                this.attachedFile = null;
+                this.attachFileError = null;
+                this.attachFileWarning = null;
             },
 
             loadChatHistory() {
@@ -1316,6 +1581,10 @@
                 this.currentChatId = 'chat_' + Date.now();
                 this.messages = [];
                 this.uploadImages = [];
+                this.attachedFile = null;
+                this.attachFileError = null;
+                this.attachFileWarning = null;
+                this.conversationTokens = 0;
                 this.systemPrompt = localStorage.getItem('omlx_chat_system_prompt') || '';
                 this.isMobile = window.innerWidth < 768;
                 this.sidebarOpen = window.innerWidth >= 768;
@@ -1331,6 +1600,10 @@
                     if (chat.model) {
                         this.currentModel = chat.model;
                     }
+                    this.attachedFile = null;
+                    this.attachFileError = null;
+                    this.attachFileWarning = null;
+                    this.conversationTokens = 0;
                     this.scheduleEnhanceMessages();
                 }
                 this.isMobile = window.innerWidth < 768;
@@ -1382,16 +1655,51 @@
             async sendMessage() {
                 const userText = this.inputMessage.trim();
                 const images = [...this.uploadImages];
+                const fileAttach = this.attachedFile;  // capture before clearing
 
-                if (!userText && images.length === 0) return;
+                if (!userText && images.length === 0 && !fileAttach) return;
                 if (!this.currentModel || this.isStreaming) return;
+
+                // Re-check context viability at send time — conversation may
+                // have grown since the file was attached.
+                if (fileAttach) {
+                    const viability = this.checkContextViability(fileAttach.token_count);
+                    if (viability.state === 'exceeded') {
+                        // Block send and surface the error
+                        this.renderContextFeedback(viability, fileAttach.token_count_exact);
+                        return;
+                    }
+                    if (viability.state === 'danger') {
+                        // Re-render warning in case it was dismissed, but allow send
+                        this.renderContextFeedback(viability, fileAttach.token_count_exact);
+                    }
+                }
 
                 // Clear input state
                 this.inputMessage = '';
                 this.uploadImages = [];
+                this.attachedFile = null;
+                this.attachFileError = null;
+                this.attachFileWarning = null;
 
                 if (!this.currentChatId) {
                     this.currentChatId = 'chat_' + Date.now();
+                }
+
+                // Build final user text — prepend file content if attached
+                let textWithAttach = userText;
+                if (fileAttach) {
+                    const safeName = fileAttach.filename
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;')
+                        .replace(/"/g, '&quot;');
+                    textWithAttach = (
+                        `<attached file="${safeName}">\n` +
+                        `${fileAttach.content}\n` +
+                        `</attached>\n\n` +
+                        userText
+                    );
                 }
 
                 // Build message content (OpenAI content array for images, string for text-only)
@@ -1401,11 +1709,11 @@
                     for (const img of images) {
                         content.push({ type: 'image_url', image_url: { url: img.base64 } });
                     }
-                    if (userText) {
-                        content.push({ type: 'text', text: userText });
+                    if (textWithAttach) {
+                        content.push({ type: 'text', text: textWithAttach });
                     }
                 } else {
-                    content = userText;
+                    content = textWithAttach || userText;
                 }
 
                 this.messages.push({ role: 'user', content });
@@ -1604,6 +1912,8 @@
                         if (gtps != null) parts.push(`gen ${Math.round(gtps)} tok/s`);
                         if (ttft != null) parts.push(`ttft ${ttft}s`);
                         if (parts.length) this.setEngineStatus({ text: parts.join(' · ') });
+                        // Track consumed tokens for context window viability checks
+                        if (pt != null) this.conversationTokens = pt;
                     }
 
                     const toolCalls = Object.values(toolCallsMap);
