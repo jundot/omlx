@@ -551,6 +551,81 @@ class TestHotCacheStatsAccuracy:
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestHotCacheOnlyMode:
+    """Contrast behavior when hot_cache_only=True vs False."""
+
+    def test_eviction_discard_vs_write(self, tmp_path):
+        """hot_cache_only=True should discard evicted blocks, False should write to SSD."""
+        block_hash = b"evict_contrast_hash"
+        cache_data = [(mx.zeros((1, 4, 16, 16)), mx.zeros((1, 4, 16, 16)))]
+
+        # Case 1: hot_cache_only = True (Discard)
+        mgr_true = PagedSSDCacheManager(
+            cache_dir=tmp_path / "evict_true",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=100,  # Force immediate eviction
+            hot_cache_only=True,
+        )
+        mgr_true.save_block(block_hash, cache_data, 16, layer_cache_types=["KVCache"])
+        # Save another block to trigger eviction of first
+        mgr_true.save_block(
+            b"evict_trigger", cache_data, 16, layer_cache_types=["KVCache"]
+        )
+
+        # No SSD files should exist
+        ssd_files = list((tmp_path / "evict_true").rglob("*.safetensors"))
+        assert len(ssd_files) == 0
+        mgr_true.close()
+
+        # Case 2: hot_cache_only = False (Write to SSD)
+        mgr_false = PagedSSDCacheManager(
+            cache_dir=tmp_path / "evict_false",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=100,  # Force immediate eviction
+            hot_cache_only=False,
+        )
+        mgr_false.save_block(block_hash, cache_data, 16, layer_cache_types=["KVCache"])
+        # Save another block to trigger eviction
+        mgr_false.save_block(
+            b"evict_trigger", cache_data, 16, layer_cache_types=["KVCache"]
+        )
+
+        # Wait for background writer
+        import time
+
+        time.sleep(0.5)
+        ssd_files = list((tmp_path / "evict_false").rglob("*.safetensors"))
+        assert len(ssd_files) >= 1
+        mgr_false.close()
+
+    def test_entry_size_calculation(self):
+        """Verify size calculation for both array and tensor_raw formats."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=Path("/tmp/size_test"), max_size_bytes=1024**3
+        )
+
+        # 1. Array format
+        arrays = {"k": mx.zeros((1, 8, 16, 16)), "v": mx.zeros((1, 8, 16, 16))}
+        entry_arrays = {"arrays": arrays}
+        # 1*8*16*16 * 4 bytes * 2 tensors = 16384 bytes
+        expected_size = 1 * 8 * 16 * 16 * 4 * 2
+        assert mgr._hot_cache_entry_size(entry_arrays) == expected_size
+
+        # 2. Tensors_raw format
+        raw_data = bytes(1024)
+        tensors_raw = {
+            "k": (raw_data, "F32", [1, 8, 16, 16]),
+            "v": (raw_data, "F32", [1, 8, 16, 16]),
+        }
+        entry_raw = {"tensors_raw": tensors_raw}
+        # 1024 * 2 = 2048 bytes
+        assert mgr._hot_cache_entry_size(entry_raw) == 2048
+
+        # 3. Empty/Unknown
+        assert mgr._hot_cache_entry_size({}) == 0
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestHotCacheWriteBack:
     """Test write-back behavior: no SSD writes until eviction or shutdown."""
 
