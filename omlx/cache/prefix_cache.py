@@ -1846,19 +1846,18 @@ class BlockAwarePrefixCache(CacheManager):
                         if isinstance(ms, (list, tuple)) and len(ms) >= 3:
                             tq_bits = float(ms[1])
                             tq_seed = int(ms[2])
-                        # Dequantize back to fp16 KVCache for merge compatibility.
+                        # Keep TurboQuantKVCache in quantized form to avoid memory doubling.
                         # TQ will be re-applied at decode start (lazy quantization).
+                        # This avoids the dequantize() step which creates FP16 copy.
                         tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
                         tq.keys = cat_ks
                         tq.values = cat_vs
                         tq.offset = _state_length(cat_ks)
                         _rebuild_codecs(tq, cat_ks, cat_vs)
-                        keys, values = tq.dequantize()
-                        cache = KVCache()
-                        cache.keys = keys
-                        cache.values = values
-                        cache.offset = keys.shape[2]
-                        reconstructed_caches.append(cache)
+
+                        # Use TurboQuantKVCache directly without dequantizing
+                        # This keeps memory at quantized level (vs 16-bit)
+                        reconstructed_caches.append(tq)
                     except Exception as e:
                         logger.error(
                             f"TQ layer {layer_idx}: reconstruction failed: {e}"
