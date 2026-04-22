@@ -2,10 +2,13 @@
 """
 DFlash engine for block diffusion speculative decoding.
 
-This engine wraps dflash-mlx to provide 3-4x faster decoding on Apple Silicon.
-For short/medium contexts it uses speculative decoding; for long contexts
-(>DFLASH_MAX_CTX) it evicts dflash models and switches to omlx's BatchedEngine
-or VLMBatchedEngine which have paged cache, SSD cache, and continuous batching.
+For prompts within max_dflash_ctx tokens, uses block diffusion speculative
+decoding for 3-4x faster generation. For longer prompts, delegates to a fallback
+engine (BatchedEngine or VLMBatchedEngine) that provides paged cache, SSD cache,
+and continuous batching.
+
+The target model is loaded once and shared across both dflash and batched modes,
+avoiding model reload overhead when switching between them.
 """
 
 import asyncio
