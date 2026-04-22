@@ -1030,15 +1030,32 @@
                 }
                 this.profilesDrift = false;
             },
-            settingsSummary(settings) {
-                if (!settings) return '';
-                const parts = [];
-                if (settings.temperature != null) parts.push('t' + settings.temperature);
-                if (settings.top_p != null) parts.push('p' + settings.top_p);
-                if (settings.top_k != null) parts.push('k' + settings.top_k);
-                if (settings.min_p != null) parts.push('m' + settings.min_p);
-                if (settings.repetition_penalty != null) parts.push('r' + settings.repetition_penalty);
-                return parts.join(' ');
+            matchedPreset(settings) {
+                // Return the preset whose universal-field settings match the current model
+                // settings exactly, otherwise null. Used by the models list to show "which
+                // preset was applied" as a pill without any server-side tracking.
+                if (!settings || !this.presets || this.presets.length === 0) return null;
+                const universal = this.profileFields.universal || [];
+                if (universal.length === 0) return null;
+                const canonical = v => {
+                    if (v === undefined || v === null || v === false) return null;
+                    if (typeof v === 'object') {
+                        return JSON.stringify(v, Object.keys(v).sort());
+                    }
+                    return v;
+                };
+                for (const p of this.presets) {
+                    const ps = p.settings || {};
+                    let ok = true;
+                    for (const k of universal) {
+                        if (canonical(ps[k]) !== canonical(settings[k])) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok) return p;
+                }
+                return null;
             },
             async loadProfilesForModel(modelId) {
                 this.profiles = [];
