@@ -126,6 +126,10 @@
         padding: 8px 16px;
         font-size: 14px;
         color: var(--text-primary);
+        max-width: 100%;
+        min-width: 0;
+        overflow-wrap: anywhere;
+        word-break: break-word;
     }
     .user-message-bubble p {
         color: var(--text-primary) !important;
@@ -133,6 +137,26 @@
     }
     .user-message-bubble * {
         color: var(--text-primary);
+    }
+    .user-message-bubble pre {
+        max-width: 100%;
+        overflow-x: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+        background-color: var(--code-bg);
+        border-radius: 0.5em;
+        padding: 0.75em 1em;
+        margin: 0.5em 0 0;
+    }
+    .user-message-bubble code {
+        background-color: var(--code-bg);
+        border-radius: 0.25em;
+        padding: 0.125em 0.25em;
+        font-size: 0.875em;
+    }
+    .user-message-bubble pre code {
+        background: transparent;
+        padding: 0;
     }
 
     /* Loading dots */
@@ -759,6 +783,7 @@
                         </button>
 
                         <textarea
+                            x-ref="messageInput"
                             x-model="inputMessage"
                             @keydown.enter="if (!isMobile && !$event.shiftKey && !$event.isComposing && $event.keyCode !== 229) { $event.preventDefault(); sendMessage(); }"
                             @input="autoResize($event.target)"
@@ -1389,6 +1414,11 @@
                 // Clear input state
                 this.inputMessage = '';
                 this.uploadImages = [];
+                this.$nextTick(() => {
+                    if (this.$refs.messageInput) {
+                        this.resetTextareaHeight(this.$refs.messageInput);
+                    }
+                });
 
                 if (!this.currentChatId) {
                     this.currentChatId = 'chat_' + Date.now();
@@ -2364,6 +2394,11 @@
             autoResize(el) {
                 el.style.height = 'auto';
                 el.style.height = Math.min(el.scrollHeight, 128) + 'px';
+            },
+
+            resetTextareaHeight(el) {
+                if (!el) return;
+                el.style.height = 'auto';
             },
 
             setTheme(theme) {
