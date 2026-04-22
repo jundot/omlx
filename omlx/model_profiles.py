@@ -34,7 +34,6 @@ UNIVERSAL_PROFILE_FIELDS = (
     "max_tool_result_tokens",
     "chat_template_kwargs",
     "forced_ct_kwargs",
-    "ttl_seconds",
 )
 
 # Model-specific fields — eligible for per-model profiles only (never templates).
@@ -61,6 +60,7 @@ EXCLUDED_FROM_PROFILES = frozenset({
     "model_alias",
     "model_type_override",
     "active_profile_name",
+    "ttl_seconds",
 })
 
 

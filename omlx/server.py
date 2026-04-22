@@ -339,6 +339,7 @@ async def lifespan(app: FastAPI):
                 max_bytes=max_bytes,
                 settings_manager=_server_state.settings_manager,
                 prefill_memory_guard=_server_state.global_settings.memory.prefill_memory_guard,
+                global_settings=_server_state.global_settings,
             )
             _server_state.process_memory_enforcer = enforcer
             _server_state.engine_pool._process_memory_enforcer = enforcer
@@ -353,7 +354,9 @@ async def lifespan(app: FastAPI):
                 try:
                     if _server_state.settings_manager is not None:
                         await _server_state.engine_pool.check_ttl_expirations(
-                            _server_state.settings_manager
+                            _server_state.settings_manager,
+                            global_idle_timeout_seconds=_server_state.global_settings.idle_timeout.idle_timeout_seconds
+                            if _server_state.global_settings else None,
                         )
                 except asyncio.CancelledError:
                     break

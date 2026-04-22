@@ -37,6 +37,7 @@ from .auth import (
     verify_api_key,
 )
 from ..settings import SubKeyEntry
+from ..model_profiles import EXCLUDED_FROM_PROFILES
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,7 @@ class ModelSettingsRequest(BaseModel):
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
+    active_profile_name: Optional[str] = None
 
 
 class CreateProfileRequest(BaseModel):
@@ -236,6 +238,9 @@ class GlobalSettingsRequest(BaseModel):
 
     # UI settings
     ui_language: Optional[str] = None
+
+    # Idle timeout settings
+    idle_timeout_seconds: Optional[int] = None
 
     # Auth settings
     api_key: Optional[str] = None
@@ -1663,9 +1668,14 @@ async def update_model_settings(
         # Update server_state.default_model if setting as default
         if request.is_default and server_state:
             server_state.default_model = model_id
+    if "active_profile_name" in sent:
+        current_settings.active_profile_name = request.active_profile_name or None
 
     # If an active profile was set, clear it when the user's save diverges
-    # from the profile's stored values.
+    # from the profile's stored values.  Only compare fields present in
+    # both the profile and the current settings — new fields in the model
+    # settings that the profile doesn't have are silently merged in, and
+    # removed fields (no longer in the profile) are skipped.
     if current_settings.active_profile_name:
         profile = settings_manager.get_profile(
             model_id, current_settings.active_profile_name
@@ -1675,10 +1685,34 @@ async def update_model_settings(
         else:
             profile_settings = profile.get("settings", {}) or {}
             candidate = current_settings.to_dict()
+            diverged = False
             for key, expected in profile_settings.items():
-                if candidate.get(key) != expected:
-                    current_settings.active_profile_name = None
+                # Profile None means "unconstrained" — candidate.to_dict()
+                # drops None, so treat profile None as no constraint to
+                # keep the comparison symmetric.
+                if expected is None:
+                    continue
+                if key not in candidate:
+                    diverged = True
                     break
+                if candidate[key] != expected:
+                    diverged = True
+                    break
+            if diverged:
+                current_settings.active_profile_name = None
+            else:
+                new_fields = {
+                    k: v for k, v in candidate.items()
+                    if k not in profile_settings and k not in EXCLUDED_FROM_PROFILES
+                }
+                if new_fields:
+                    profile_settings.update(new_fields)
+                    profile["settings"] = profile_settings
+                    settings_manager.update_profile(
+                        model_id,
+                        current_settings.active_profile_name,
+                        settings=profile_settings,
+                    )
 
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
@@ -2208,6 +2242,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "ui": {
             "language": global_settings.ui.language,
         },
+        "idle_timeout": {
+            "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
+        },
     }
 
 
@@ -2585,6 +2622,18 @@ async def update_global_settings(
         runtime_applied.append("ui_language")
         _refresh_i18n_globals()
         logger.info(f"UI language changed to: {request.ui_language}")
+
+    # Apply idle timeout settings (Live)
+    # Use model_fields_set to distinguish "explicitly sent as null" (disable)
+    # from "not sent" (don't touch).
+    if "idle_timeout_seconds" in request.model_fields_set:
+        global_settings.idle_timeout.idle_timeout_seconds = request.idle_timeout_seconds
+        runtime_applied.append("idle_timeout_seconds")
+        logger.info(
+            f"Idle timeout set to: {request.idle_timeout_seconds}s"
+            if request.idle_timeout_seconds
+            else "Idle timeout disabled"
+        )
 
     # Apply auth settings (API key change)
     if request.api_key is not None:

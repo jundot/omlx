@@ -348,6 +348,12 @@ class ModelSettingsManager:
                     f"Profiles file version {version} differs from current {PROFILES_VERSION}"
                 )
             self._profiles = data.get("profiles", {}) or {}
+            # Migration: strip ttl_seconds from existing profile settings
+            for model_id, profiles in self._profiles.items():
+                for name, profile in profiles.items():
+                    settings = profile.get("settings")
+                    if settings and "ttl_seconds" in settings:
+                        del settings["ttl_seconds"]
         except Exception as e:
             logger.error(f"Failed to load profiles file: {e}")
             self._profiles = {}
@@ -537,6 +543,11 @@ class ModelSettingsManager:
                     f"Templates file version {version} differs from current {TEMPLATES_VERSION}"
                 )
             self._templates = data.get("templates", {}) or {}
+            # Migration: strip ttl_seconds from existing template settings
+            for name, template in self._templates.items():
+                settings = template.get("settings")
+                if settings and "ttl_seconds" in settings:
+                    del settings["ttl_seconds"]
         except Exception as e:
             logger.error(f"Failed to load templates file: {e}")
             self._templates = {}

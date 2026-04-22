@@ -357,6 +357,24 @@ class MemorySettings:
 
 
 @dataclass
+class ModelIdleTimeoutSettings:
+    """Idle timeout settings for automatic model unloading."""
+
+    idle_timeout_seconds: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {"idle_timeout_seconds": self.idle_timeout_seconds}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ModelIdleTimeoutSettings":
+        """Create from dictionary."""
+        return cls(
+            idle_timeout_seconds=data.get("idle_timeout_seconds"),
+        )
+
+
+@dataclass
 class SubKeyEntry:
     """A sub API key entry for API-only authentication."""
 
@@ -675,6 +693,7 @@ class GlobalSettings:
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
+    idle_timeout: ModelIdleTimeoutSettings = field(default_factory=ModelIdleTimeoutSettings)
 
     @classmethod
     def load(
@@ -768,6 +787,8 @@ class GlobalSettings:
                 )
             if "ui" in data:
                 self.ui = UISettings.from_dict(data["ui"])
+            if "idle_timeout" in data:
+                self.idle_timeout = ModelIdleTimeoutSettings.from_dict(data["idle_timeout"])
 
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse settings file {path}: {e}")
@@ -961,6 +982,7 @@ class GlobalSettings:
             "claude_code": self.claude_code.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
+            "idle_timeout": self.idle_timeout.to_dict(),
         }
 
         try:
@@ -1192,6 +1214,7 @@ class GlobalSettings:
             "claude_code": self.claude_code.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
+            "idle_timeout": self.idle_timeout.to_dict(),
         }
 
 
