@@ -524,6 +524,20 @@
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div class="flex items-center gap-2">
+                                        <label class="text-sm text-neutral-700">{{ t('settings.cache.hot_cache_only') }}</label>
+                                        <span class="px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+                                            {{ t('settings.global.restart_badge') }}
+                                        </span>
+                                    </div>
+                                    <button type="button" @click="globalSettings.cache.hot_cache_only = !globalSettings.cache.hot_cache_only"
+                                            :class="globalSettings.cache.hot_cache_only ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.cache.hot_cache_only ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.cache.ssd_directory') }}</label>
                                     </div>
                                     <input type="text" x-model="globalSettings.cache.ssd_cache_dir"

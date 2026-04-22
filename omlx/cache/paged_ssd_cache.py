@@ -533,9 +533,10 @@ class PagedSSDCacheManager(CacheManager):
 
     def __init__(
         self,
-        cache_dir: Path,
+        cache_dir: Optional[Path],
         max_size_bytes: int,
         hot_cache_max_bytes: int = 0,
+        hot_cache_only: bool = False,
     ):
         """
         Initialize the SSD cache manager.
@@ -545,10 +546,14 @@ class PagedSSDCacheManager(CacheManager):
             max_size_bytes: Maximum total size of SSD cache.
             hot_cache_max_bytes: Maximum in-memory hot cache size in bytes.
                 0 means disabled (default).
+            hot_cache_only: When True, skip directory init and writer thread.
+                All data is stored exclusively in the hot cache (RAM only).
+                No SSD I/O is performed.
         """
-        self._cache_dir = Path(cache_dir)
+        self._cache_dir = cache_dir
         self._max_size = max_size_bytes
         self._index = PagedSSDCacheIndex(max_size_bytes)
+        self._hot_cache_only = hot_cache_only
         self._lock = threading.RLock()
 
         # Disk usage cache for dynamic effective max size (30s TTL)
@@ -577,8 +582,10 @@ class PagedSSDCacheManager(CacheManager):
         self._hot_cache_lock = threading.Lock()
 
         # Initialize directory structure and scan existing files
-        self._init_directories()
-        self._scan_existing_files()
+        # Skip in hot_cache_only mode: no SSD I/O, so no directories needed.
+        if self._cache_dir and not self._hot_cache_only:
+            self._init_directories()
+            self._scan_existing_files()
 
         # --- Background writer for non-blocking saves ---
         self._write_queue: queue.Queue = queue.Queue(maxsize=_MAX_PENDING_WRITES)
@@ -586,25 +593,30 @@ class PagedSSDCacheManager(CacheManager):
         self._pending_write_hashes: set = set()
         self._pending_write_hashes_lock = threading.Lock()
         self._writer_shutdown = threading.Event()
-        self._writer_thread = threading.Thread(
-            target=self._writer_loop,
-            name="ssd-cache-writer",
-            daemon=True,
-        )
-        self._writer_thread.start()
+        # Writer thread is only needed when writing to SSD.
+        self._writer_thread = None
+        if not self._hot_cache_only:
+            self._writer_thread = threading.Thread(
+                target=self._writer_loop,
+                name="ssd-cache-writer",
+                daemon=True,
+            )
+            self._writer_thread.start()
 
         hot_info = ""
         if self._hot_cache_enabled:
             hot_info = f", hot_cache={format_bytes(hot_cache_max_bytes)}"
         # Log initialization with disk space info
-        try:
-            du = shutil.disk_usage(self._cache_dir)
-            disk_info = (
-                f", disk_free={format_bytes(du.free)}, "
-                f"cache_used={format_bytes(self._index.total_size)}"
-            )
-        except OSError:
-            disk_info = ""
+        disk_info = ""
+        if self._cache_dir:
+            try:
+                du = shutil.disk_usage(self._cache_dir)
+                disk_info = (
+                    f", disk_free={format_bytes(du.free)}, "
+                    f"cache_used={format_bytes(self._index.total_size)}"
+                )
+            except OSError:
+                pass
         logger.info(
             f"PagedSSDCacheManager initialized: dir={self._cache_dir}, "
             f"max_size={format_bytes(max_size_bytes)}{hot_info}, "
@@ -614,24 +626,31 @@ class PagedSSDCacheManager(CacheManager):
     # --- Hot cache helpers ---
 
     @staticmethod
-    def _hot_cache_entry_size(tensors_raw: Dict[str, tuple]) -> int:
-        """Calculate memory footprint of a hot cache entry (sum of raw bytes)."""
-        return sum(len(raw) for raw, _, _ in tensors_raw.values())
+    def _hot_cache_entry_size(entry: Dict) -> int:
+        """Calculate memory footprint of a hot cache entry.
+
+        Entries from save_block() use 'tensors_raw' (raw bytes).
+        Entries from _promote_to_hot_cache() may use 'arrays' (mx.array objects
+        loaded from SSD, not from active inference — safe to retain).
+        """
+        if 'arrays' in entry:
+            return sum(arr.nbytes for arr in entry['arrays'].values())
+        if 'tensors_raw' in entry:
+            return sum(len(raw) for raw, _, _ in entry['tensors_raw'].values())
+        return 0
 
     def _hot_cache_put(self, block_hash: bytes, entry: Dict) -> None:
         """Add entry to hot cache, evicting LRU entries if capacity exceeded.
 
         Evicted entries are flushed to SSD via the background writer thread.
         """
-        entry_size = self._hot_cache_entry_size(entry['tensors_raw'])
+        entry_size = self._hot_cache_entry_size(entry)
         evicted_entries: list = []
         with self._hot_cache_lock:
             # Remove old entry if updating
             if block_hash in self._hot_cache:
                 old = self._hot_cache.pop(block_hash)
-                self._hot_cache_total_bytes -= self._hot_cache_entry_size(
-                    old['tensors_raw']
-                )
+                self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
 
             # Evict LRU entries until we have room
             while (
@@ -639,9 +658,7 @@ class PagedSSDCacheManager(CacheManager):
                 and self._hot_cache
             ):
                 evicted_hash, evicted = self._hot_cache.popitem(last=False)
-                self._hot_cache_total_bytes -= self._hot_cache_entry_size(
-                    evicted['tensors_raw']
-                )
+                self._hot_cache_total_bytes -= self._hot_cache_entry_size(evicted)
                 self._stats["hot_cache_evictions"] += 1
                 evicted_entries.append((evicted_hash, evicted))
 
@@ -658,11 +675,16 @@ class PagedSSDCacheManager(CacheManager):
         Used when evicting from hot cache or flushing on shutdown.
         Adds block to SSD index before enqueueing write.
         """
+        if self._hot_cache_only:
+            return False
+
         blk_meta = entry.get('block_metadata')
         if blk_meta is None:
             return False
         file_path = blk_meta.file_path
-        tensors_raw = entry['tensors_raw']
+        tensors_raw = entry.get('tensors_raw', {})
+        if not tensors_raw:
+            return False
         metadata = entry['file_metadata']
 
         # Add to SSD index now that block is being written to SSD
@@ -1105,8 +1127,13 @@ class PagedSSDCacheManager(CacheManager):
             )
 
             # Store in hot cache (or temporary buffer) for immediate read-back.
-            # Uses raw bytes (not mx tensors) so mx.arrays can be GC'd,
-            # releasing Metal resources sooner.
+            # Uses raw bytes (not mx.array objects) so Metal GPU memory can be
+            # released as soon as the inference thread is done with the arrays.
+            # NOTE: _promote_to_hot_cache() stores mx.array objects directly
+            # because those are freshly loaded from SSD (not active inference),
+            # so they don't tie up Metal allocations from the inference pipeline.
+            # Storing live inference arrays here would accumulate GPU memory
+            # under a large hot cache and cause kernel panics (IOGPUMemory underflow).
             cache_entry = {
                 'tensors_raw': tensors_raw,
                 'file_metadata': metadata,
@@ -1122,6 +1149,10 @@ class PagedSSDCacheManager(CacheManager):
                 self._hot_cache_put(block_hash, cache_entry)
                 self._stats["saves"] += 1
                 return True
+
+            if self._hot_cache_only:
+                # Hot cache disabled but hot_cache_only set: block is not retained.
+                return False
 
             # SSD path: add to index for SSD file tracking
             self._index.add(block_metadata)
@@ -1322,7 +1353,10 @@ class PagedSSDCacheManager(CacheManager):
         # Check hot cache first (in-memory, no I/O)
         entry = self._hot_cache_get(block_hash)
         if entry is not None:
-            arrays = self._arrays_from_tensors_raw(entry['tensors_raw'])
+            # Entries from _promote_to_hot_cache() store mx.array objects directly
+            # (safe — they come from SSD loads, not active inference).
+            # Entries from save_block() use tensors_raw (raw bytes).
+            arrays = entry.get('arrays') or self._arrays_from_tensors_raw(entry['tensors_raw'])
             cache_data = self._reconstruct_cache_data(
                 arrays, entry['file_metadata'],
                 entry['num_layers'], entry['layer_cache_types'],
@@ -1430,7 +1464,7 @@ class PagedSSDCacheManager(CacheManager):
         entry = self._hot_cache_get(block_hash)
         if entry is not None:
             blk_meta = entry['block_metadata']
-            arrays = self._arrays_from_tensors_raw(entry['tensors_raw'])
+            arrays = entry.get('arrays') or self._arrays_from_tensors_raw(entry['tensors_raw'])
             cache_data = self._reconstruct_cache_data(
                 arrays, entry['file_metadata'],
                 entry['num_layers'], entry['layer_cache_types'],
@@ -1605,6 +1639,9 @@ class PagedSSDCacheManager(CacheManager):
 
         Uses a 30-second TTL cache for shutil.disk_usage() results.
         """
+        if self._cache_dir is None:
+            return self._max_size
+
         now = time.monotonic()
         if (
             self._disk_usage_cache is None
@@ -1814,7 +1851,7 @@ class PagedSSDCacheManager(CacheManager):
                 hot_size = self._hot_cache_total_bytes
             effective_max = self._get_effective_max_size()
             return {
-                "cache_dir": str(self._cache_dir),
+                "cache_dir": str(self._cache_dir) if self._cache_dir else "None",
                 "max_size": effective_max,
                 "max_size_formatted": format_bytes(effective_max),
                 "configured_max_size": self._max_size,
@@ -1857,21 +1894,22 @@ class PagedSSDCacheManager(CacheManager):
                 )
 
         # Signal writer thread to stop (after processing remaining queue)
-        self._writer_shutdown.set()
+        if self._writer_thread:
+            self._writer_shutdown.set()
 
-        # Send sentinel to unblock the writer if it's waiting on the queue
-        try:
-            self._write_queue.put_nowait(None)
-        except queue.Full:
-            pass  # Writer will check shutdown flag on next iteration
+            # Send sentinel to unblock the writer if it's waiting on the queue
+            try:
+                self._write_queue.put_nowait(None)
+            except queue.Full:
+                pass  # Writer will check shutdown flag on next iteration
 
-        # Wait for writer to finish — longer timeout to allow flush
-        timeout = 120 if self._hot_cache_enabled else 60
-        self._writer_thread.join(timeout=timeout)
-        if self._writer_thread.is_alive():
-            logger.warning(
-                f"SSD cache writer thread did not stop within {timeout}s"
-            )
+            # Wait for writer to finish — longer timeout to allow flush
+            timeout = 120 if self._hot_cache_enabled else 60
+            self._writer_thread.join(timeout=timeout)
+            if self._writer_thread.is_alive():
+                logger.warning(
+                    f"SSD cache writer thread did not stop within {timeout}s"
+                )
 
         # Clear hot cache
         with self._hot_cache_lock:

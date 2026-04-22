@@ -192,6 +192,7 @@ class GlobalSettingsRequest(BaseModel):
     cache_enabled: Optional[bool] = None
     ssd_cache_dir: Optional[str] = None
     ssd_cache_max_size: Optional[str] = None
+    hot_cache_only: Optional[bool] = None
     hot_cache_max_size: Optional[str] = None  # "0" = disabled, "8GB", etc.
     initial_cache_blocks: Optional[int] = None  # Starting blocks (requires restart)
 
@@ -2149,6 +2150,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "ssd_cache_max_size": _format_cache_size(
                 global_settings.cache.get_ssd_cache_max_size_bytes(global_settings.base_path)
             ),
+            "hot_cache_only": global_settings.cache.hot_cache_only,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
         },
@@ -2370,6 +2372,8 @@ async def update_global_settings(
     if request.ssd_cache_max_size is not None:
         global_settings.cache.ssd_cache_max_size = request.ssd_cache_max_size
         cache_changed = True
+    if request.hot_cache_only is not None:
+        global_settings.cache.hot_cache_only = request.hot_cache_only
     if request.hot_cache_max_size is not None:
         global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
         cache_changed = True
