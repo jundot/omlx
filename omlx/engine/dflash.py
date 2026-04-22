@@ -13,6 +13,7 @@ import copy
 import gc
 import logging
 import os
+import threading
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -21,11 +22,66 @@ import mlx.core as mx
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from .base import BaseEngine, GenerationOutput
+from dflash_mlx.runtime import _ExactSmallProjPad, _target_text_model
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_DFLASH_CTX = 4096
 
+# Lock for toggling dflash hooks on the shared model. Prevents concurrent
+# flag changes when requests arrive simultaneously from different threads
+# (e.g., async request handler + MLX executor thread).
+_dflash_toggle_lock = threading.Lock()
+
+def _get_text_model(model: Any) -> Any:
+    """Get the inner text model from a wrapped target model."""
+    return _target_text_model(model)
+
+def _enable_dflash_hooks(model: Any) -> None:
+    """Re-enable dflash-mlx hooks on all layers of the model.
+
+    Sets _dflash_split_sdpa_enabled = True on self_attn layers so that the
+    split_call wrapper runs its custom attention path instead of falling
+    through to original_call. Also re-wraps _ExactSmallProjPad on linear_attn
+    layers if they were unwrapped by a previous fallback request.
+
+    Call this before any DFlash speculative decoding request.
+    """
+    text_model = _get_text_model(model)
+    for layer in text_model.layers:
+        if hasattr(layer, "self_attn"):
+            layer.self_attn._dflash_split_sdpa_enabled = True
+        if hasattr(layer, "linear_attn"):
+            linear = layer.linear_attn
+            for attr_name in ("in_proj_b", "in_proj_a"):
+                proj = getattr(linear, attr_name, None)
+                if proj is not None and type(proj).__name__ != "_ExactSmallProjPad":
+                    # Was unwrapped by _disable_dflash_hooks — re-wrap it
+                    setattr(linear, attr_name, _ExactSmallProjPad(proj))
+
+    text_model._dflash_speculative_hooks_installed = True
+
+def _disable_dflash_hooks(model: Any) -> None:
+    """Disable dflash-mlx hooks on all layers of the model.
+
+    Sets _dflash_split_sdpa_enabled = False on self_attn layers so that the
+    split_call wrapper falls through to original_call. Also unwraps
+    _ExactSmallProjPad on linear_attn layers.
+
+    Call this before passing the model to BatchedEngine for the fallback path.
+    """
+    text_model = _get_text_model(model)
+    for layer in text_model.layers:
+        if hasattr(layer, "self_attn"):
+            layer.self_attn._dflash_split_sdpa_enabled = False
+        if hasattr(layer, "linear_attn"):
+            linear = layer.linear_attn
+            for attr_name in ("in_proj_b", "in_proj_a"):
+                proj = getattr(linear, attr_name, None)
+                if proj is not None and type(proj).__name__ == "_ExactSmallProjPad":
+                    setattr(linear, attr_name, proj.linear)
+
+    text_model._dflash_speculative_hooks_installed = False
 
 class DFlashEngine(BaseEngine):
     """
@@ -130,8 +186,17 @@ class DFlashEngine(BaseEngine):
         )
 
     async def _init_fallback_engine(self) -> None:
-        """Create and start fallback engine sharing target model (no eviction)."""
+        """Create and start fallback engine sharing target model (no eviction).
+
+        Before passing the model to BatchedEngine, disable dflash-mlx hooks
+        that wrap self_attn/linear_attn.__call__ at the class level. These hooks
+        add Python overhead and run a less-optimized attention path even during
+        prefill, which can cause a ~25% throughput regression on the fallback path.
+        """
         shared_model = self._target_model
+        with _dflash_toggle_lock:
+            _disable_dflash_hooks(shared_model)
+
         shared_tokenizer = self._tokenizer_obj
 
         if self._fallback_engine_type == "vlm":
@@ -330,6 +395,11 @@ class DFlashEngine(BaseEngine):
                 presence_penalty=presence_penalty, stop=stop, **kwargs,
             )
 
+        # Re-enable dflash hooks before speculative decoding path.
+        # After a long-context fallback request, hooks may have been disabled.
+        with _dflash_toggle_lock:
+            _enable_dflash_hooks(self._target_model)
+
         from ..engine_core import get_mlx_executor
         from dflash_mlx.generate import get_stop_token_ids
         from dflash_mlx.runtime import generate_dflash_once
@@ -399,6 +469,10 @@ class DFlashEngine(BaseEngine):
             ):
                 yield output
             return
+
+        # Re-enable dflash hooks before speculative decoding path.
+        with _dflash_toggle_lock:
+            _enable_dflash_hooks(self._target_model)
 
         prompt_len = len(prompt_tokens)
         loop = asyncio.get_running_loop()
