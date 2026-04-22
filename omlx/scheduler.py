@@ -1449,7 +1449,8 @@ class Scheduler:
         # Boundary snapshot setup
         block_size = self.config.paged_cache_block_size
         boundary_enabled = (
-            block_size > 0
+            not self.config.hot_cache_only
+            and block_size > 0
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
