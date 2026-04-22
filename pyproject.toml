@@ -29,8 +29,8 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.31.1",
-    # mlx-lm from commit (a401730) - MiniMax M2 parallel tool fix + BatchKVCache extend fix
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@a40173094136fbcbfb41966889a22530c83bd86e",
+    # mlx-lm from commit (a401730) - Thread local generation stream
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@v0.31.3",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
@@ -132,7 +132,7 @@ include = ["omlx*"]
 # mlx-lm is pinned to a git commit; override transitive pins
 # (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
 override-dependencies = [
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@a40173094136fbcbfb41966889a22530c83bd86e",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@v0.31.3",
 ]
 
 [tool.black]

@@ -15,8 +15,8 @@ runtime = "cpython-3.11"
 requirements = [
     # Core MLX
     "mlx==0.31.1",
-    # mlx-lm from commit (a401730) - aligned with pyproject.toml
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@a40173094136fbcbfb41966889a22530c83bd86e",
+    # mlx-lm from tag (v0.31.3) - aligned with pyproject.toml
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@v0.31.3",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa) - aligned with pyproject.toml
