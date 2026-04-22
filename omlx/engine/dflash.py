@@ -214,9 +214,6 @@ class DFlashEngine(BaseEngine):
         )
         return len(self._tokenizer_obj.encode(prompt))
 
-    def _should_fallback(self, prompt_tokens: list[int]) -> bool:
-        return len(prompt_tokens) >= self._max_dflash_ctx
-
     def _run_generate_streaming(
         self,
         prompt_tokens: list[int],
@@ -521,6 +518,6 @@ class DFlashEngine(BaseEngine):
         }
 
     def get_cache_stats(self) -> dict[str, Any] | None:
-        if self._fallback_engine is not None:
-            return self._fallback_engine.get_cache_stats()
+        # The DFlashEngine doesn't use paged KV cache / SSD tiering, so this is a stub.
+        # The "fallback" BatchedEngine reports it's own cache stats separately.
         return None
