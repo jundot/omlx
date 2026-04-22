@@ -336,7 +336,24 @@ class BatchedEngine(BaseEngine):
                 return self._tokenizer.apply_chat_template(messages, **template_kwargs)
             except Exception as e:
                 # Template rendering failed (e.g. Jinja2 TemplateError from
-                # unsupported roles, invalid message format, etc.)
+                # unsupported roles, invalid message format, OR missing chat_template)
+                err_msg = str(e)
+                if "chat_template" in err_msg.lower():
+                    # Chat template is not set in tokenizer (e.g., some Gemma 4 models)
+                    # Fall back to simple concatenation format
+                    logger.warning(f"Chat template not set, using simple format: {e}")
+                    parts = []
+                    for m in messages:
+                        role = m.get('role', 'user')
+                        content = m.get('content', '')
+                        if isinstance(content, list):
+                            # Handle content arrays (e.g., with images)
+                            text_parts = [c.get('text', '') if isinstance(c, dict) else str(c)
+                                        for c in content if isinstance(c, dict) and c.get('type') == 'text']
+                            content = ''.join(text_parts)
+                        parts.append(f"{role}: {content}")
+                    return '\n'.join(parts) + '\nassistant:'
+                # Other template errors
                 logger.error(f"Chat template rendering failed: {e}")
                 raise
         else:

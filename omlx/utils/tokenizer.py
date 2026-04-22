@@ -141,6 +141,31 @@ def is_qwen3_model(model_name: str) -> bool:
     return "qwen3" in model_lower or "Qwen3" in model_name
 
 
+def is_mistral_model(model_name: str) -> bool:
+    """
+    Check if the model is a Mistral model that needs fix_mistral_regex.
+
+    Mistral-Small and some other Mistral models have a known tokenizer
+    regex issue that requires the fix_mistral_regex=True flag.
+
+    Also includes Qwen3.5-Claude models which use Mistral-based tokenizers.
+
+    Args:
+        model_name: The model name or path.
+
+    Returns:
+        True if the model needs the mistral regex fix.
+    """
+    model_lower = model_name.lower()
+    # Check for Mistral-Small variants and other affected Mistral models
+    # Also includes Qwen3.5-Claude models which use Mistral tokenizers
+    return (
+        "mistral-small" in model_lower or
+        "mistral" in model_lower or
+        "qwen3.5" in model_lower and "claude" in model_lower
+    )
+
+
 def get_tokenizer_config(
     model_name: str,
     trust_remote_code: bool = False,
@@ -164,6 +189,25 @@ def get_tokenizer_config(
     if is_qwen3_model(model_name):
         config["eos_token"] = "<|im_end|>"
         logger.debug("Qwen3 detected: setting eos_token to <|im_end|>")
+
+    # Gemma 4 models: Set extra_special_tokens to empty dict to avoid AttributeError
+    # Gemma 4 configs have extra_special_tokens as a list, but transformers expects a dict.
+    # Setting it to an empty dict overrides the config value and prevents:
+    # "AttributeError: 'list' object has no attribute 'keys'"
+    if is_gemma4_model(model_name):
+        config["extra_special_tokens"] = {}
+        # Override tokenizer_class to GemmaTokenizer (Gemma 2/3 tokenizer) for compatibility
+        # with transformers <5.4.0. Gemma 4 support was added in transformers 5.5.0+.
+        # GemmaTokenizer is backward compatible and works with Gemma 4 models.
+        config["tokenizer_class"] = "GemmaTokenizer"
+        logger.debug("Gemma 4 detected: overriding extra_special_tokens to empty dict, tokenizer_class to GemmaTokenizer")
+
+    # Fix for Qwen3.5/3.6-A3B models with broken tokenizer_class
+    # These MLX-quantized models have "tokenizer_class": "TokenizersBackend" which
+    # doesn't exist in transformers. We need to override it to "Qwen2Tokenizer".
+    if ("Qwen3.5" in model_name or "Qwen3.6" in model_name) and "A3B" in model_name:
+        config["tokenizer_class"] = "Qwen2Tokenizer"
+        logger.debug(f"{model_name}: overriding tokenizer_class to Qwen2Tokenizer")
 
     return config
 

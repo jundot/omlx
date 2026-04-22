@@ -15,7 +15,7 @@ runtime = "cpython-3.11"
 requirements = [
     # Core MLX
     "mlx==0.31.1",
-    # mlx-lm from commit (a401730) - aligned with pyproject.toml
+    # mlx-lm from commit (a401730) - MiniMax M2 parallel tool fix + BatchKVCache extend fix
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@a40173094136fbcbfb41966889a22530c83bd86e",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
@@ -48,32 +48,15 @@ requirements = [
     "mcp>=1.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (3472132) - aligned with pyproject.toml
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@3472132fe6ee7beeae2c2fc35923eaed2e734b3d",
-    # dflash-mlx v0.1.3 (814c4a1) — block diffusion speculative decoding + temperature sampling
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@814c4a1",
+    # mlx-vlm from commit (7f7a04c) - aligned with pyproject.toml
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@7f7a04ce20337996da335ab17cdfee0ba51d6610",
     "Pillow>=9.0.0",
+    # Grammar-constrained decoding for structured output
+    "xgrammar>=0.1.32",
     # ModelScope SDK for downloading models from ModelScope Hub
     "modelscope>=1.10.0",
     # python-multipart needed by audio routes (File/Form uploads)
     "python-multipart>=0.0.5",
-    # mlx-audio runtime deps (mlx-audio itself installed --no-deps in build.py)
-    "scipy>=1.11.0",
-    "librosa>=0.10.0",
-    "miniaudio>=1.59",
-    "numba>=0.59.0",
-    "pyloudnorm>=0.1.0",
-    "sounddevice>=0.4.6",
-    # mlx-audio [tts] extra deps
-    "misaki>=0.9.4",
-    "num2words>=0.5.14",
-    "spacy>=3.8.4",
-    "phonemizer-fork>=3.3.2",
-    "espeakng-loader>=0.2.4",
-    # mlx-audio [stt] extra deps
-    "mistral-common[audio]>=0.4.2",
-    # mlx-audio [sts] extra deps
-    "webrtcvad>=2.0.10",
     # NOTE: mlx-audio is built from git and installed with --no-deps in build.py
     # because mlx-audio pins mlx-lm==0.31.1 which conflicts with our git-pinned mlx-lm
 ]

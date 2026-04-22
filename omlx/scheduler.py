@@ -115,7 +115,11 @@ class _PrefillAbortedError(Exception):
 # (constrain NEXT token) but can't know which token was just sampled.
 # After _original_step returns, self._next_tokens holds the freshly sampled
 # tokens.  We eval them synchronously and accept in grammar processors.
+#
+# TEMPORARILY DISABLED: GenerationBatch not available in mlx-lm 0.31.2
+# TODO: Re-enable when mlx-lm adds GenerationBatch back or alternative is found
 # ---------------------------------------------------------------------------
+# NOTE: Re-enabled in mlx-lm commit dcbf6e3 - GenerationBatch is now available
 _original_generation_batch_step = GenerationBatch._step
 
 def _patched_generation_batch_step(self):
@@ -318,6 +322,7 @@ class SchedulerConfig:
     paged_ssd_cache_dir: Optional[str] = None  # Path for paged SSD cache storage (None = disabled)
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
+    clear_ssd_cache_on_unload: bool = False  # Clear SSD cache when model is unloaded (useful for benchmarking)
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")

@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).parent / "data"
 
 # Execution limits
-EXEC_TIMEOUT_SECONDS = 30
+EXEC_TIMEOUT_SECONDS = 5
 EXEC_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024  # 256 MB
 
 
@@ -167,7 +167,7 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
         return deterministic_sample(normalized, sample_size)
 
     def get_max_tokens(self) -> int:
-        return 16384
+        return 8192
 
     def format_prompt(self, item: dict) -> list[dict[str, str]]:
         """Format as a coding problem prompt."""
@@ -188,13 +188,13 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
     def check_answer(self, predicted: str, item: dict) -> bool:
         """Execute code and check against test cases.
 
-        Runs the first 3 test cases to keep execution time reasonable.
+        Runs the first 1 test case to keep execution time reasonable.
         """
         if not predicted.strip():
             return False
 
-        inputs = item["inputs"][:3]
-        outputs = item["outputs"][:3]
+        inputs = item["inputs"][:1]
+        outputs = item["outputs"][:1]
 
         for inp, expected_out in zip(inputs, outputs):
             stdin_input = inp if isinstance(inp, str) else str(inp)

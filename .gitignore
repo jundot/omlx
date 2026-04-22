@@ -113,3 +113,23 @@ omlx/admin/tailwindcss-*
 
 # Git worktrees
 .worktrees/
+
+# User local configurations and tools
+MEMORY/
+benchmark_qwen35.py
+config/
+docs/CLAUDE_CODE_*.md
+docs/NETWORK_DEPLOYMENT.md
+scripts/check_omlx_model.sh
+scripts/client.py
+scripts/quick_test.sh
+scripts/start_server.sh
+scripts/test_connection.sh
+
+# Graphify output directory
+graphify-out/
+
+# User-specific configuration files
+.graphify_python
+GITHUB_ISSUE_TEMPLATE.md
+hfd.sh

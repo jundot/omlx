@@ -1350,3 +1350,128 @@ class TestMemorySettleBarrier:
 
         assert pool._entries["model-a"].engine is None
         assert pool._current_model_memory == 0
+
+
+class TestClearSSDCacheOnUnload:
+    """Tests for clear_ssd_cache_on_unload functionality."""
+
+    @pytest.mark.asyncio
+    async def test_clear_ssd_cache_enabled(self, small_mock_model_dir):
+        """Test that SSD cache is cleared when clear_ssd_cache_on_unload is enabled."""
+        from omlx.scheduler import SchedulerConfig
+
+        # Create pool with clear_ssd_cache_on_unload enabled
+        scheduler_config = SchedulerConfig(clear_ssd_cache_on_unload=True)
+        pool = EnginePool(
+            max_model_memory=10 * 1024**3,
+            scheduler_config=scheduler_config,
+        )
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Create mock engine with nested structure
+        mock_engine = MagicMock()
+        mock_engine.stop = AsyncMock()
+
+        # Create mock SSD cache manager
+        mock_ssd_manager = MagicMock()
+        mock_ssd_manager.clear = MagicMock(return_value=5)  # 5 files deleted
+
+        # Create mock scheduler with SSD manager
+        mock_scheduler = MagicMock()
+        mock_scheduler.paged_ssd_cache_manager = mock_ssd_manager
+
+        # Create mock engine core with scheduler
+        mock_core = MagicMock()
+        mock_core.scheduler = mock_scheduler
+
+        # Create mock async engine core with engine
+        mock_async_core = MagicMock()
+        mock_async_core.engine = mock_core
+
+        # Attach to engine
+        mock_engine._engine = mock_async_core
+
+        # Load mock engine
+        entry = pool.get_entry("model-a")
+        entry.engine = mock_engine
+
+        # Unload the engine
+        await pool._unload_engine("model-a")
+
+        # Verify SSD cache was cleared
+        mock_ssd_manager.clear.assert_called_once()
+        assert mock_ssd_manager.clear.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_clear_ssd_cache_disabled(self, small_mock_model_dir):
+        """Test that SSD cache is NOT cleared when clear_ssd_cache_on_unload is disabled."""
+        from omlx.scheduler import SchedulerConfig
+
+        # Create pool with clear_ssd_cache_on_unload disabled (default)
+        scheduler_config = SchedulerConfig(clear_ssd_cache_on_unload=False)
+        pool = EnginePool(
+            max_model_memory=10 * 1024**3,
+            scheduler_config=scheduler_config,
+        )
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Create mock engine with nested structure
+        mock_engine = MagicMock()
+        mock_engine.stop = AsyncMock()
+
+        # Create mock SSD cache manager
+        mock_ssd_manager = MagicMock()
+        mock_ssd_manager.clear = MagicMock(return_value=5)
+
+        # Create mock scheduler with SSD manager
+        mock_scheduler = MagicMock()
+        mock_scheduler.paged_ssd_cache_manager = mock_ssd_manager
+
+        # Create mock engine core with scheduler
+        mock_core = MagicMock()
+        mock_core.scheduler = mock_scheduler
+
+        # Create mock async engine core with engine
+        mock_async_core = MagicMock()
+        mock_async_core.engine = mock_core
+
+        # Attach to engine
+        mock_engine._engine = mock_async_core
+
+        # Load mock engine
+        entry = pool.get_entry("model-a")
+        entry.engine = mock_engine
+
+        # Unload the engine
+        await pool._unload_engine("model-a")
+
+        # Verify SSD cache was NOT cleared
+        mock_ssd_manager.clear.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_clear_ssd_cache_handles_missing_attributes(self, small_mock_model_dir):
+        """Test that missing attributes in engine hierarchy are handled gracefully."""
+        from omlx.scheduler import SchedulerConfig
+
+        # Create pool with clear_ssd_cache_on_unload enabled
+        scheduler_config = SchedulerConfig(clear_ssd_cache_on_unload=True)
+        pool = EnginePool(
+            max_model_memory=10 * 1024**3,
+            scheduler_config=scheduler_config,
+        )
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Create mock engine WITHOUT _engine attribute
+        mock_engine = MagicMock()
+        mock_engine.stop = AsyncMock()
+        del mock_engine._engine  # Remove the attribute
+
+        # Load mock engine
+        entry = pool.get_entry("model-a")
+        entry.engine = mock_engine
+
+        # Unload should not raise an exception
+        await pool._unload_engine("model-a")
+
+        # Verify engine was still stopped
+        mock_engine.stop.assert_called_once()

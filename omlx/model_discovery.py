@@ -439,12 +439,17 @@ def detect_model_type(model_path: Path) -> ModelType:
     # For model families known to have text-only variants, require vision_config.
     for arch in architectures:
         if arch in VLM_ARCHITECTURES:
-            if normalized_type in VLM_MODEL_TYPES and "vision_config" not in config:
-                logger.info(
-                    f"Architecture '{arch}' is a VLM architecture but no vision_config "
-                    "found — treating as LLM (text-only quant)"
-                )
-                break
+            # Special handling for Gemma 4: check if it's a quantized text-only version
+            # Quantized versions often keep vision_config in config.json but lack vision weights
+            if normalized_type in VLM_MODEL_TYPES:
+                model_dir_lower = str(model_path).lower()
+                is_quantized = any(q in model_dir_lower for q in ["4bit", "8bit", "quant", "gguf"])
+                if is_quantized or "vision_config" not in config:
+                    logger.info(
+                        f"Architecture '{arch}' is a VLM architecture but this appears to be "
+                        f"a text-only quant (no vision weights) — treating as LLM"
+                    )
+                    break
             return "vlm"
 
     # Check for VLM: model_type field (only if vision capabilities are present)

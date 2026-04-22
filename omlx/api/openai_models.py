@@ -301,6 +301,8 @@ class ModelInfo(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=get_unix_timestamp)
     owned_by: str = "omlx"
+    # Optional capabilities for Claude Code compatibility
+    capabilities: Optional[Dict[str, Any]] = None
 
 
 class ModelsResponse(BaseModel):

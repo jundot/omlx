@@ -143,6 +143,17 @@ class TestGetTokenizerConfig:
         assert config["trust_remote_code"] is True
         assert config["eos_token"] == "<|im_end|>"
 
+    def test_gemma4_model_config(self):
+        """Test Gemma 4 model gets extra_special_tokens fix."""
+        config = get_tokenizer_config("google/gemma-4b")
+        assert "extra_special_tokens" in config
+        assert config["extra_special_tokens"] == {}
+
+    def test_non_gemma4_model_no_extra_special_tokens(self):
+        """Test non-Gemma 4 models don't get extra_special_tokens override."""
+        config = get_tokenizer_config("llama-3.1-8b")
+        assert "extra_special_tokens" not in config
+
 
 class TestApplyQwen3Fix:
     """Test cases for apply_qwen3_fix function."""

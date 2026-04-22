@@ -485,6 +485,28 @@ class EnginePool:
         logger.info(f"Unloading model: {model_id} (immediate abort)")
         pre_unload_active = mx.get_active_memory()
 
+        # Clear SSD cache if configured (before stopping engine)
+        # This prevents cache from interfering with subsequent model loads
+        if self._scheduler_config.clear_ssd_cache_on_unload:
+            try:
+                # Access SSD cache manager through engine's scheduler
+                async_core = getattr(entry.engine, "_engine", None)
+                if async_core is not None:
+                    core = getattr(async_core, "engine", None)
+                    if core is not None:
+                        scheduler = getattr(core, "scheduler", None)
+                        if scheduler is not None:
+                            ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+                            if ssd_manager is not None:
+                                deleted = ssd_manager.clear()
+                                logger.info(
+                                    f"Cleared SSD cache for {model_id}: {deleted} files"
+                                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to clear SSD cache for {model_id}: {e}"
+                )
+
         try:
             await entry.engine.stop()
         except Exception as e:

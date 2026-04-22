@@ -711,7 +711,9 @@ async def get_engine_for_model(model: str | None = None) -> BaseEngine:
     Raises:
         HTTPException: If model not found or memory error
     """
-    return await get_engine(model, EngineType.LLM)
+    # Resolve model alias before getting engine
+    resolved_model = resolve_model_id(model) or model
+    return await get_engine(resolved_model, EngineType.LLM)
 
 
 async def get_embedding_engine(model: str) -> EmbeddingEngine:
@@ -924,6 +926,22 @@ def resolve_model_id(model_id: str | None) -> str | None:
     """
     if model_id is None:
         return None
+
+    # Claude Code compatibility: map Claude model names to the actual model
+    claude_aliases = {
+        "claude-3-opus": "Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit",
+        "claude-3-sonnet": "Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit",
+        "claude-3-haiku": "Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit",
+        "claude-opus-4": "Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit",
+        "claude-sonnet-4": "Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit",
+        "claude-haiku-4": "Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit",
+    }
+
+    if model_id in claude_aliases:
+        resolved = claude_aliases[model_id]
+        logger.debug(f"Resolved model alias '{model_id}' to '{resolved}'")
+        return resolved
+
     pool = _server_state.engine_pool
     if pool is None:
         return model_id
@@ -1522,17 +1540,36 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
     if _server_state.engine_pool is not None:
         status = _server_state.engine_pool.get_status()
         settings_manager = _server_state.settings_manager
+
+        # Add all available models
         for m in status["models"]:
             model_id = m["id"]
+            model_type = m.get("model_type", "llm")
+
+            # Get display name (alias if set)
             display_id = model_id
             if settings_manager:
                 ms = settings_manager.get_settings(model_id)
                 if ms.model_alias:
                     display_id = ms.model_alias
+
+            # Get max tokens for capabilities
+            max_tok = get_max_context_window(model_id)
+
+            # Determine capabilities based on model type
+            is_vlm = model_type == "vlm"
+
             models.append(
                 ModelInfo(
                     id=display_id,
                     owned_by="omlx",
+                    capabilities={
+                        "type": "text" if not is_vlm else "vision",
+                        "streaming": True,
+                        "vision": is_vlm,
+                        "function_calling": True,
+                        "max_tokens": max_tok,
+                    },
                 )
             )
 

@@ -1295,6 +1295,10 @@
 
             selectModel(modelId) {
                 this.currentModel = modelId;
+                // Clear images if switching to a non-VLM model
+                if (!this.hasVisionSupport()) {
+                    this.uploadImages = [];
+                }
             },
 
             loadChatHistory() {

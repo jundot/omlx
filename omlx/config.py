@@ -106,6 +106,7 @@ class PagedSSDCacheConfig:
     cache_dir: Optional[Path] = None
     max_size: str = "100GB"
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
+    clear_on_unload: bool = False  # Clear SSD cache when model is unloaded
 
     @property
     def max_size_bytes(self) -> int:
@@ -182,6 +183,9 @@ class OMLXConfig:
             config.paged_ssd_cache.max_size = os.getenv(
                 "OMLX_PAGED_SSD_CACHE_MAX_SIZE", config.paged_ssd_cache.max_size
             )
+            config.paged_ssd_cache.clear_on_unload = os.getenv(
+                "OMLX_PAGED_SSD_CACHE_CLEAR_ON_UNLOAD", "false"
+            ).lower() == "true"
 
         # MCP settings
         mcp_config = os.getenv("OMLX_MCP_CONFIG")
@@ -240,6 +244,8 @@ class OMLXConfig:
             config.paged_ssd_cache.cache_dir = Path(args.paged_ssd_cache_dir)
         if hasattr(args, "paged_ssd_cache_max_size") and args.paged_ssd_cache_max_size:
             config.paged_ssd_cache.max_size = args.paged_ssd_cache_max_size
+        if hasattr(args, "paged_ssd_cache_clear_on_unload"):
+            config.paged_ssd_cache.clear_on_unload = args.paged_ssd_cache_clear_on_unload
 
         if hasattr(args, "mcp_config") and args.mcp_config:
             config.mcp.enabled = True

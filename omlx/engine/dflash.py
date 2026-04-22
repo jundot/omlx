@@ -227,6 +227,25 @@ class DFlashEngine(BaseEngine):
                 return self._tokenizer_obj.apply_chat_template(
                     messages, **template_kwargs
                 )
+            except Exception as e:
+                # Chat template is not set or rendering failed
+                err_msg = str(e)
+                if "chat_template" in err_msg.lower():
+                    # Fall back to simple concatenation format
+                    logger.warning(f"Chat template not set, using simple format: {e}")
+                    parts = []
+                    for m in messages:
+                        role = m.get('role', 'user')
+                        content = m.get('content', '')
+                        if isinstance(content, list):
+                            # Handle content arrays
+                            text_parts = [c.get('text', '') if isinstance(c, dict) else str(c)
+                                        for c in content if isinstance(c, dict) and c.get('type') == 'text']
+                            content = ''.join(text_parts)
+                        parts.append(f"{role}: {content}")
+                    return '\n'.join(parts) + '\nassistant:'
+                # Other errors - re-raise
+                raise
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"

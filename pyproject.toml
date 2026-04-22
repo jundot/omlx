@@ -30,11 +30,13 @@ classifiers = [
 dependencies = [
     "mlx>=0.31.1",
     # mlx-lm from commit (a401730) - MiniMax M2 parallel tool fix + BatchKVCache extend fix
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@a40173094136fbcbfb41966889a22530c83bd86e",
+    # Using local path for development (from /Users/berton/Github/mlx-lm)
+    "mlx-lm @ file:///Users/berton/Github/mlx-lm",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
-    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
+    # Using local path for development (from /Users/berton/Github/mlx-embeddings)
+    "mlx-embeddings @ file:///Users/berton/Github/mlx-embeddings",
     # transformers version aligned with mlx-lm requirement
     # 5.4.0 broke VLM: Qwen2VLImageProcessor now hard-requires torch (#431)
     "transformers>=5.0.0,<5.4.0",
@@ -62,10 +64,12 @@ dependencies = [
     # Harmony format parser for gpt-oss models
     "openai-harmony",
     # mlx-vlm from commit (3472132) - TQ race fix, Gemma 4 offset/projection/audio fixes
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@3472132fe6ee7beeae2c2fc35923eaed2e734b3d",
+    # Using local path for development (from /Users/berton/Github/mlx-vlm)
+    "mlx-vlm @ file:///Users/berton/Github/mlx-vlm",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.3 (814c4a1) — block diffusion speculative decoding + temperature sampling
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@814c4a1",
+    # Using local path for development (from /Users/berton/Github/dflash-mlx)
+    "dflash-mlx @ file:///Users/berton/Github/dflash-mlx",
 ]
 
 [project.optional-dependencies]

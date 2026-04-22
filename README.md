@@ -200,6 +200,24 @@ Set up OpenClaw, OpenCode, Codex, and Pi directly from the admin dashboard with 
   <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
 </p>
 
+### Ollama Integration
+
+oMLX includes scripts for integrating with local Ollama instances, enabling you to use Ollama models across your local network:
+
+- **Server Setup**: Configure Ollama for LAN access with `scripts/ollama_network_setup.sh`
+- **Client Tools**: Shell scripts and Python clients for easy model access
+- **Claude Code Integration**: Use Ollama models from Claude Code CLI on any network machine
+
+```bash
+# Quick server configuration
+./scripts/ollama_network_setup.sh
+
+# Client usage
+OLLAMA_HOST=http://192.168.2.19:11434 ./scripts/ollama_chat.sh "Your question"
+```
+
+See [Ollama Network Setup Guide](docs/OLLAMA_NETWORK_SETUP.md) for complete documentation.
+
 ### Performance Benchmark
 
 One-click benchmarking from the admin panel. Measures prefill (PP) and text generation (TG) tokens per second, with partial prefix cache hit testing for realistic performance numbers.
