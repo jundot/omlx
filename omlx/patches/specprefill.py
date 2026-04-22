@@ -108,6 +108,23 @@ def _qwen35_extract_queries(attn, x, cache=None, **kwargs):
     return queries
 
 
+def _qwen36_extract_queries(attn, x, cache=None, **kwargs):
+    """Qwen3.6 MoE / non-gated q_norm models: q_proj + q_norm + RoPE."""
+    B, L, _ = x.shape
+    n_heads = getattr(
+        attn,
+        "num_attention_heads",
+        getattr(attn, "n_heads", getattr(attn, "num_heads", None)),
+    )
+    queries = attn.q_proj(x).reshape(B, L, n_heads, -1)
+    queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
+    if cache is not None:
+        queries = attn.rope(queries, offset=cache.offset)
+    else:
+        queries = attn.rope(queries)
+    return queries
+
+
 def _llama_extract_queries(attn, x, cache=None, **kwargs):
     """Standard transformer: q_proj + reshape + RoPE."""
     B, L, D = x.shape
@@ -240,6 +257,35 @@ def _uses_gated_q_proj(attn_obj) -> bool:
     return q_out == 2 * n_heads * head_dim
 
 
+def _uses_non_gated_q_norm(attn_obj) -> bool:
+    """Detect Qwen3.6-style attention: per-head RMSNorm on q, no gate split.
+
+    Matches when q_norm has weight shape (head_dim,) and q_proj outputs
+    n_heads * head_dim. Filters out olmo-style flat q_norm and cohere-style
+    LayerNorm2D, whose q_norm.weight.shape[0] does not equal head_dim.
+    """
+    q_norm = getattr(attn_obj, "q_norm", None)
+    if q_norm is None:
+        return False
+    q_norm_weight = getattr(q_norm, "weight", None)
+    if q_norm_weight is None:
+        return False
+    shape = getattr(q_norm_weight, "shape", None)
+    if not shape:
+        return False
+    q_norm_dim = shape[0]
+
+    n_heads = getattr(
+        attn_obj,
+        "num_attention_heads",
+        getattr(attn_obj, "n_heads", getattr(attn_obj, "num_heads", None)),
+    )
+    q_out = _linear_output_dims(getattr(attn_obj, "q_proj", None))
+    if not n_heads or q_out is None:
+        return False
+    return q_out == n_heads * q_norm_dim
+
+
 def _is_gemma4_attention(attn_obj) -> bool:
     """Detect Gemma 4 attention by its shared-KV / offset call contract."""
     if not hasattr(attn_obj, "q_norm") or not hasattr(attn_obj, "rope"):
@@ -262,6 +308,8 @@ def _detect_query_extractor(attn_obj) -> Callable:
         return _gemma4_extract_queries
     elif not hasattr(attn_obj, "rope"):
         return _nemotron_h_extract_queries
+    elif _uses_non_gated_q_norm(attn_obj):
+        return _qwen36_extract_queries
     else:
         return _llama_extract_queries
 

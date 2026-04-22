@@ -236,6 +236,42 @@ class TestModelTopologyHelpers:
         )
         assert _detect_query_extractor(attn) is _llama_extract_queries
 
+    def test_detect_query_extractor_qwen36_moe(self):
+        """Qwen3.6 MoE: non-gated q_proj + per-head q_norm routes to qwen36."""
+        from types import SimpleNamespace
+
+        from omlx.patches.specprefill import (
+            _detect_query_extractor,
+            _qwen36_extract_queries,
+        )
+
+        attn = SimpleNamespace(
+            q_norm=SimpleNamespace(weight=mx.zeros((16,))),  # RMSNorm(head_dim=16)
+            n_heads=8,
+            q_proj=SimpleNamespace(weight=mx.zeros((128, 64))),  # 8 * 16 = 128
+            rope=object(),
+        )
+        assert _detect_query_extractor(attn) is _qwen36_extract_queries
+
+    def test_detect_query_extractor_flat_q_norm_stays_llama(self):
+        """Olmo-style: q_norm on flat n_heads*head_dim must not match qwen36."""
+        from types import SimpleNamespace
+
+        from omlx.patches.specprefill import (
+            _detect_query_extractor,
+            _llama_extract_queries,
+        )
+
+        attn = SimpleNamespace(
+            q_norm=SimpleNamespace(weight=mx.zeros((128,))),  # flat n_heads*head_dim
+            n_heads=8,
+            head_dim=16,
+            q_proj=SimpleNamespace(weight=mx.zeros((128, 64))),
+            rope=object(),
+        )
+        # q_norm_dim=128, n_heads*q_norm_dim=1024 != q_out=128 → no qwen36 match
+        assert _detect_query_extractor(attn) is _llama_extract_queries
+
     def test_attention_capture_forwards_extra_kwargs(self):
         from unittest.mock import MagicMock
 
@@ -311,6 +347,37 @@ class TestModelTopologyHelpers:
         assert call_log[1] == ("rope", (1, 4, 3, head_dim), 11)
         # and q_norm's scaling survived into the output
         assert mx.allclose(out, mx.ones_like(out) * 2.0).item()
+
+    def test_qwen36_extract_queries_applies_q_norm(self):
+        """Qwen3.6: q_norm runs on per-head queries before RoPE, no gate split."""
+        from omlx.patches.specprefill import _qwen36_extract_queries
+
+        call_log = []
+
+        class FakeAttn:
+            n_heads = 4
+
+            def q_proj(self, x):
+                return x
+
+            def q_norm(self, q):
+                call_log.append(("q_norm", q.shape))
+                return q * 3.0
+
+            def rope(self, q, offset=0):
+                call_log.append(("rope", q.shape, offset))
+                return q
+
+        head_dim = 8
+        x = mx.ones((1, 3, 4 * head_dim))
+        cache = type("C", (), {"offset": 5})()
+        out = _qwen36_extract_queries(FakeAttn(), x, cache=cache)
+
+        # q_norm gets (B, L, n_heads, head_dim) — reshape before norm, no split
+        assert call_log[0] == ("q_norm", (1, 3, 4, head_dim))
+        # rope gets (B, n_heads, L, head_dim) with cache.offset
+        assert call_log[1] == ("rope", (1, 4, 3, head_dim), 5)
+        assert mx.allclose(out, mx.ones_like(out) * 3.0).item()
 
     def test_llama_extract_queries_without_q_norm(self):
         """Plain Llama/Mistral: no q_norm attr, fall through unchanged."""
