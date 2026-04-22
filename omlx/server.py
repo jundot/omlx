@@ -1730,10 +1730,13 @@ async def create_rerank(
 
     engine = await get_reranker_engine(request.model)
 
-    # Normalize documents to list of strings
-    documents = normalize_documents(request.documents)
+    # Preserve original structure for the engine (multimodal rerankers need
+    # dicts with 'image'), but keep a normalized text view for logging and
+    # emptiness checks.
+    documents_raw = request.documents
+    documents_text = normalize_documents(documents_raw)
 
-    if not documents:
+    if not documents_text:
         raise HTTPException(status_code=400, detail="Documents cannot be empty")
 
     if not request.query:
@@ -1744,23 +1747,30 @@ async def create_rerank(
 
     output = await engine.rerank(
         query=request.query,
-        documents=documents,
+        documents=documents_raw,
         top_n=request.top_n,
     )
 
     elapsed = time.perf_counter() - start_time
     logger.info(
-        f"Rerank: {len(documents)} docs, "
+        f"Rerank: {len(documents_raw)} docs, "
         f"{output.total_tokens} tokens in {elapsed:.3f}s"
     )
 
-    # Format response - results sorted by score (descending)
+    # Format response - results sorted by score (descending). Strings wrap
+    # into {"text": "..."}; dict inputs pass through as-is so multimodal
+    # callers get their original 'image' back.
     results = []
     for idx in output.indices:
+        if request.return_documents:
+            orig = documents_raw[idx]
+            display_doc = orig if isinstance(orig, dict) else {"text": orig}
+        else:
+            display_doc = None
         result = RerankResult(
             index=idx,
             relevance_score=output.scores[idx],
-            document={"text": documents[idx]} if request.return_documents else None,
+            document=display_doc,
         )
         results.append(result)
 

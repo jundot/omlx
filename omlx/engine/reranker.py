@@ -91,8 +91,8 @@ class RerankerEngine(BaseNonStreamingEngine):
 
     async def rerank(
         self,
-        query: str,
-        documents: list[str],
+        query: "str | dict",
+        documents: "list[str] | list[dict]",
         top_n: int | None = None,
         max_length: int | None = None,
     ) -> RerankOutput:
@@ -100,8 +100,10 @@ class RerankerEngine(BaseNonStreamingEngine):
         Rerank documents by relevance to the query.
 
         Args:
-            query: The search query
-            documents: List of documents to rerank
+            query: The search query. String for text-only rerankers, or dict
+                with 'text' and/or 'image' for multimodal rerankers.
+            documents: List of documents. Strings or dicts with 'text' and/or
+                'image' keys.
             top_n: Number of top results to return (None = all)
             max_length: Maximum token length for each query-document pair.
                 If None, uses model-appropriate default (512 for encoder,

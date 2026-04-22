@@ -21,14 +21,19 @@ class RerankRequest(BaseModel):
     model: str
     """ID of the model to use."""
 
-    query: str
-    """The search query to compare documents against."""
+    query: str | dict[str, str]
+    """
+    The search query to compare documents against. String for text-only
+    rerankers. Dict with 'text' and/or 'image' (URL, base64 data URI, or
+    local path) for multimodal rerankers like Qwen3-VL-Reranker.
+    """
 
     documents: list[str] | list[dict[str, str]]
     """
     Documents to rerank. Can be:
     - List of strings
-    - List of dicts with 'text' field
+    - List of dicts with 'text' field (and optional 'image' for multimodal
+      rerankers). Image values accept URL, base64 data URI, or local path.
     """
 
     top_n: int | None = None
@@ -58,8 +63,9 @@ class RerankResult(BaseModel):
 
     document: dict[str, str] | None = None
     """
-    The document text (if return_documents=True).
-    Format: {"text": "..."}
+    The document (if return_documents=True). For text-only rerankers or
+    string inputs, format is {"text": "..."}. For multimodal inputs, the
+    original dict (including 'image') is returned as-is.
     """
 
 
