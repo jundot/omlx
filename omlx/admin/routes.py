@@ -3036,6 +3036,13 @@ def _build_runtime_cache_observability(
         if not isinstance(block_size, int) or block_size <= 0:
             block_size = int(prefix_stats.get("block_size", 0) or 0)
 
+        max_blocks = int(prefix_stats.get("max_blocks", 0) or 0)
+        allocated_blocks = int(prefix_stats.get("allocated_blocks", 0) or 0)
+        free_blocks = int(prefix_stats.get("free_blocks", 0) or 0)
+        shared_blocks = int(prefix_stats.get("shared_blocks", 0) or 0)
+        total_tokens_cached = int(prefix_stats.get("total_tokens_cached", 0) or 0)
+        utilization = float(prefix_stats.get("utilization", 0.0) or 0.0)
+        cache_hit_rate = float(prefix_stats.get("cache_hit_rate", 0.0) or 0.0)
         partial_block_skips = int(prefix_stats.get("partial_block_skips", 0) or 0)
         partial_tokens_skipped = int(prefix_stats.get("partial_tokens_skipped", 0) or 0)
         last_partial_tokens_skipped = int(
@@ -3060,6 +3067,13 @@ def _build_runtime_cache_observability(
                 f"<{block_size}" if has_sub_block_cache else str(indexed_blocks_value)
             ),
             "has_sub_block_cache": has_sub_block_cache,
+            "max_blocks": max_blocks,
+            "allocated_blocks": allocated_blocks,
+            "free_blocks": free_blocks,
+            "shared_blocks": shared_blocks,
+            "total_tokens_cached": total_tokens_cached,
+            "utilization": utilization,
+            "cache_hit_rate": cache_hit_rate,
             "partial_block_skips": partial_block_skips,
             "partial_tokens_skipped": partial_tokens_skipped,
             "last_partial_tokens_skipped": last_partial_tokens_skipped,
