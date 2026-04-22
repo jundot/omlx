@@ -219,8 +219,7 @@ class BatchedEngine(BaseEngine):
             self._model, self._tokenizer = await loop.run_in_executor(
                 get_mlx_executor(), _load_model_sync
             )
-        else:
-            # Model already loaded — apply post-load transforms if needed
+
             from ..utils.model_loading import apply_post_load_transforms
 
             self._model = apply_post_load_transforms(

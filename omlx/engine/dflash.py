@@ -115,6 +115,12 @@ class DFlashEngine(BaseEngine):
         result = await loop.run_in_executor(get_mlx_executor(), _load_models)
         self._target_model, self._tokenizer_obj, target_meta, self._draft_model = result
 
+        from ..utils.model_loading import apply_post_load_transforms
+
+        self._target_model = apply_post_load_transforms(
+            self._target_model, self._model_settings
+        )
+
         # Deep-copy tokenizer for executor-thread usage (dflash generation).
         # The original self._tokenizer_obj stays for event-loop operations
         # (encode, apply_chat_template, count_chat_tokens).
