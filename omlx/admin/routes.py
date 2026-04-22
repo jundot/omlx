@@ -3064,10 +3064,12 @@ async def get_server_stats(
         model: Filter by model ID. Empty string returns global aggregate.
         scope: "session" for current session, "alltime" for persisted totals.
     """
+    from ..server import resolve_model_id
     from ..server_metrics import get_server_metrics
 
     metrics = get_server_metrics()
-    snapshot = metrics.get_snapshot(model_id=model, scope=scope)
+    resolved_model = resolve_model_id(model) or model if model else ""
+    snapshot = metrics.get_snapshot(model_id=resolved_model, scope=scope)
 
     global_settings = _get_global_settings()
     host = global_settings.server.host if global_settings else "127.0.0.1"

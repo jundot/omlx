@@ -1872,7 +1872,7 @@ async def create_completion(
             completion_tokens=total_completion_tokens,
             cached_tokens=total_cached_tokens,
             generation_duration=elapsed,
-            model_id=request.model,
+            model_id=resolve_model_id(request.model) or request.model,
         )
 
         return CompletionResponse(
@@ -2150,7 +2150,7 @@ async def create_chat_completion(
             completion_tokens=output.completion_tokens,
             cached_tokens=output.cached_tokens,
             generation_duration=elapsed,
-            model_id=request.model,
+            model_id=resolved_model,
         )
 
         # Separate thinking from content
@@ -2533,7 +2533,7 @@ async def stream_completion(
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
             generation_duration=gen_duration,
-            model_id=request.model,
+            model_id=resolve_model_id(request.model) or request.model,
         )
 
         # Emit usage chunk if requested
@@ -2841,7 +2841,7 @@ async def stream_chat_completion(
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
             generation_duration=gen_duration,
-            model_id=request.model,
+            model_id=resolved_model or request.model,
         )
 
         # Emit usage chunk if requested
@@ -3156,7 +3156,7 @@ async def stream_anthropic_messages(
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
             generation_duration=end_time - (first_token_time or start_time),
-            model_id=request.model,
+            model_id=resolved_model or request.model,
         )
 
     # 7. Send message_stop
@@ -3383,7 +3383,7 @@ async def create_anthropic_message(
             completion_tokens=output.completion_tokens,
             cached_tokens=output.cached_tokens,
             generation_duration=elapsed,
-            model_id=request.model,
+            model_id=resolved_model,
         )
 
         # Separate thinking from content
@@ -3789,7 +3789,7 @@ async def create_response(
             completion_tokens=output.completion_tokens,
             cached_tokens=output.cached_tokens,
             generation_duration=elapsed,
-            model_id=request.model,
+            model_id=resolved_model,
         )
 
         # Process output text
@@ -4234,7 +4234,7 @@ async def stream_responses_api(
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
             generation_duration=gen_duration,
-            model_id=request.model,
+            model_id=resolved_model or request.model,
         )
         usage_data = {
             "input_tokens": last_output.prompt_tokens,
