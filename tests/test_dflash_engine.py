@@ -147,27 +147,6 @@ class TestDFlashEnginePoolRouting:
 class TestDFlashEngineMaxCtx:
     """Test DFlashEngine max_dflash_ctx resolution logic."""
 
-    def _clear_env(self):
-        """Clear DFLASH_MAX_CTX env var so model_settings takes effect."""
-        import os
-        os.environ.pop("DFLASH_MAX_CTX", None)
-
-    def test_max_ctx_from_model_settings(self):
-        """max_dflash_ctx should be read from model_settings when env var is not set."""
-        try:
-            from omlx.engine.dflash import DFlashEngine, DEFAULT_MAX_DFLASH_CTX
-        except ImportError:
-            pytest.skip("dflash-mlx not installed")
-
-        self._clear_env()
-        settings = ModelSettings(dflash_max_ctx=4096)
-        engine = DFlashEngine(
-            model_name="test-model",
-            draft_model_path="test-draft",
-            model_settings=settings,
-        )
-        assert engine._max_dflash_ctx == 4096
-
     def test_max_ctx_defaults_when_none(self):
         """When model_settings.dflash_max_ctx is None, use DEFAULT_MAX_DFLASH_CTX."""
         try:
@@ -175,7 +154,6 @@ class TestDFlashEngineMaxCtx:
         except ImportError:
             pytest.skip("dflash-mlx not installed")
 
-        self._clear_env()
         settings = ModelSettings()  # dflash_max_ctx is None
         engine = DFlashEngine(
             model_name="test-model",
@@ -191,53 +169,26 @@ class TestDFlashEngineMaxCtx:
         except ImportError:
             pytest.skip("dflash-mlx not installed")
 
-        self._clear_env()
         engine = DFlashEngine(
             model_name="test-model",
             draft_model_path="test-draft",
         )
         assert engine._max_dflash_ctx == DEFAULT_MAX_DFLASH_CTX
 
-    def test_max_ctx_env_var_override(self):
-        """DFLASH_MAX_CTX env var should override model settings."""
-        import os
-        try:
-            from omlx.engine.dflash import DFlashEngine
-        except ImportError:
-            pytest.skip("dflash-mlx not installed")
-
-        os.environ["DFLASH_MAX_CTX"] = "2048"
-        try:
-            settings = ModelSettings(dflash_max_ctx=4096)
-            engine = DFlashEngine(
-                model_name="test-model",
-                draft_model_path="test-draft",
-                model_settings=settings,
-            )
-            # Env var takes priority over model settings
-            assert engine._max_dflash_ctx == 2048
-        finally:
-            os.environ.pop("DFLASH_MAX_CTX", None)
-
-    def test_max_ctx_invalid_env_var_falls_back(self):
-        """Invalid env var value should fall back to DEFAULT_MAX_DFLASH_CTX."""
-        import os
+    def test_max_ctx_from_model_settings(self):
+        """max_dflash_ctx should be read from model_settings when set."""
         try:
             from omlx.engine.dflash import DFlashEngine, DEFAULT_MAX_DFLASH_CTX
         except ImportError:
             pytest.skip("dflash-mlx not installed")
 
-        os.environ["DFLASH_MAX_CTX"] = "not-a-number"
-        try:
-            settings = ModelSettings(dflash_max_ctx=4096)
-            engine = DFlashEngine(
-                model_name="test-model",
-                draft_model_path="test-draft",
-                model_settings=settings,
-            )
-            assert engine._max_dflash_ctx == DEFAULT_MAX_DFLASH_CTX
-        finally:
-            os.environ.pop("DFLASH_MAX_CTX", None)
+        settings = ModelSettings(dflash_max_ctx=8192)
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=settings,
+        )
+        assert engine._max_dflash_ctx == 8192
 
 
 class TestDFlashRoutingLogic:
