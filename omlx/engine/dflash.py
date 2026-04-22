@@ -28,10 +28,15 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_DFLASH_CTX = 4096
 
-# Lock for toggling dflash hooks on the shared model. Prevents concurrent
-# flag changes when requests arrive simultaneously from different threads
-# (e.g., async request handler + MLX executor thread).
+# Lock for toggling dflash hooks on the shared model.
 _dflash_toggle_lock = threading.Lock()
+
+# Reference count of active DFlash requests. Used to prevent disabling hooks
+# while a DFlash generation is in-flight on the shared model.
+_dflash_active_count = 0
+_dflash_active_lock = threading.Lock()
+_dflash_active_cond = threading.Condition(_dflash_active_lock)
+
 
 def _get_text_model(model: Any) -> Any:
     """Get the inner text model from a wrapped target model."""
@@ -82,6 +87,25 @@ def _disable_dflash_hooks(model: Any) -> None:
                     setattr(linear, attr_name, proj.linear)
 
     text_model._dflash_speculative_hooks_installed = False
+
+def _enter_dflash_request() -> None:
+    """
+    Acquire a DFlash request slot. Blocks until no in-flight DFlash requests.
+    Ensures there are not DFlash and non-DFlash requests being served at the same time.
+    """
+    global _dflash_active_count
+    with _dflash_active_cond:
+        while _dflash_active_count > 0:
+            logger.debug("DFlash: waiting for in-flight requests to complete...")
+            _dflash_active_cond.wait(timeout=30)
+        _dflash_active_count += 1
+
+def _exit_dflash_request() -> None:
+    """Release a DFlash request slot and wake any waiting fallback engine."""
+    global _dflash_active_count
+    with _dflash_active_cond:
+        _dflash_active_count -= 1
+        _dflash_active_cond.notify_all()
 
 class DFlashEngine(BaseEngine):
     """
@@ -192,8 +216,16 @@ class DFlashEngine(BaseEngine):
         that wrap self_attn/linear_attn.__call__ at the class level. These hooks
         add Python overhead and run a less-optimized attention path even during
         prefill, which can cause a ~25% throughput regression on the fallback path.
+
+        Waits for any in-flight DFlash requests to complete before disabling hooks,
+        ensuring no concurrent DFlash + batched execution on the shared model.
         """
         shared_model = self._target_model
+
+        # Wait for all in-flight DFlash requests to finish before disabling hooks.
+        _enter_dflash_request()  # ensures count is 0 when we proceed
+        _exit_dflash_request()   # release our dummy slot
+
         with _dflash_toggle_lock:
             _disable_dflash_hooks(shared_model)
 
@@ -397,41 +429,45 @@ class DFlashEngine(BaseEngine):
 
         # Re-enable dflash hooks before speculative decoding path.
         # After a long-context fallback request, hooks may have been disabled.
-        with _dflash_toggle_lock:
-            _enable_dflash_hooks(self._target_model)
+        _enter_dflash_request()
+        try:
+            with _dflash_toggle_lock:
+                _enable_dflash_hooks(self._target_model)
 
-        from ..engine_core import get_mlx_executor
-        from dflash_mlx.generate import get_stop_token_ids
-        from dflash_mlx.runtime import generate_dflash_once
+            from ..engine_core import get_mlx_executor
+            from dflash_mlx.generate import get_stop_token_ids
+            from dflash_mlx.runtime import generate_dflash_once
 
-        loop = asyncio.get_running_loop()
-        stop_ids = get_stop_token_ids(self._tokenizer_obj)
+            loop = asyncio.get_running_loop()
+            stop_ids = get_stop_token_ids(self._tokenizer_obj)
 
-        def _run():
-            return generate_dflash_once(
-                target_model=self._target_model,
-                tokenizer=self._executor_tokenizer,
-                draft_model=self._draft_model,
-                prompt="",
-                max_new_tokens=max_tokens,
-                stop_token_ids=stop_ids,
-                prompt_tokens_override=prompt_tokens,
-                temperature=temperature,
+            def _run():
+                return generate_dflash_once(
+                    target_model=self._target_model,
+                    tokenizer=self._executor_tokenizer,
+                    draft_model=self._draft_model,
+                    prompt="",
+                    max_new_tokens=max_tokens,
+                    stop_token_ids=stop_ids,
+                    prompt_tokens_override=prompt_tokens,
+                    temperature=temperature,
+                )
+
+            summary = await loop.run_in_executor(get_mlx_executor(), _run)
+
+            generated = summary.get("generated_token_ids", [])
+            text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
+            text = clean_special_tokens(text)
+
+            return GenerationOutput(
+                text=text,
+                tokens=generated,
+                prompt_tokens=summary.get("prompt_token_count", len(prompt_tokens)),
+                completion_tokens=summary.get("generation_tokens", len(generated)),
+                finish_reason="stop",
             )
-
-        summary = await loop.run_in_executor(get_mlx_executor(), _run)
-
-        generated = summary.get("generated_token_ids", [])
-        text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
-        text = clean_special_tokens(text)
-
-        return GenerationOutput(
-            text=text,
-            tokens=generated,
-            prompt_tokens=summary.get("prompt_token_count", len(prompt_tokens)),
-            completion_tokens=summary.get("generation_tokens", len(generated)),
-            finish_reason="stop",
-        )
+        finally:
+            _exit_dflash_request()
 
     async def stream_generate(
         self,
@@ -471,51 +507,55 @@ class DFlashEngine(BaseEngine):
             return
 
         # Re-enable dflash hooks before speculative decoding path.
-        with _dflash_toggle_lock:
-            _enable_dflash_hooks(self._target_model)
+        _enter_dflash_request()
+        try:
+            with _dflash_toggle_lock:
+                _enable_dflash_hooks(self._target_model)
 
-        prompt_len = len(prompt_tokens)
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue = asyncio.Queue()
+            prompt_len = len(prompt_tokens)
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue = asyncio.Queue()
 
-        from ..engine_core import get_mlx_executor
-        loop.run_in_executor(
-            get_mlx_executor(),
-            self._run_generate_streaming,
-            prompt_tokens,
-            max_tokens,
-            temperature,
-            queue,
-            loop,
-        )
-
-        total_text = ""
-        total_completion = 0
-
-        while True:
-            new_text, new_tokens, finished, metrics = await queue.get()
-
-            total_text += new_text
-            total_completion += len(new_tokens)
-
-            finish_reason = None
-            if finished:
-                finish_reason = "stop"
-                if metrics and metrics.get("error"):
-                    finish_reason = "error"
-
-            yield GenerationOutput(
-                text=total_text,
-                new_text=new_text,
-                tokens=new_tokens,
-                prompt_tokens=prompt_len,
-                completion_tokens=total_completion,
-                finished=finished,
-                finish_reason=finish_reason,
+            from ..engine_core import get_mlx_executor
+            loop.run_in_executor(
+                get_mlx_executor(),
+                self._run_generate_streaming,
+                prompt_tokens,
+                max_tokens,
+                temperature,
+                queue,
+                loop,
             )
 
-            if finished:
-                break
+            total_text = ""
+            total_completion = 0
+
+            while True:
+                new_text, new_tokens, finished, metrics = await queue.get()
+
+                total_text += new_text
+                total_completion += len(new_tokens)
+
+                finish_reason = None
+                if finished:
+                    finish_reason = "stop"
+                    if metrics and metrics.get("error"):
+                        finish_reason = "error"
+
+                yield GenerationOutput(
+                    text=total_text,
+                    new_text=new_text,
+                    tokens=new_tokens,
+                    prompt_tokens=prompt_len,
+                    completion_tokens=total_completion,
+                    finished=finished,
+                    finish_reason=finish_reason,
+                )
+
+                if finished:
+                    break
+        finally:
+            _exit_dflash_request()
 
     async def chat(
         self,
