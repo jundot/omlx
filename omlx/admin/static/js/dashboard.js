@@ -1718,6 +1718,15 @@
                 return this.formatDisplayHost(host);
             },
 
+            get ttlPlaceholder() {
+                if (this.selectedModel?.pinned) return window.t('modal.model_settings.ttl_pinned');
+                const globalTtl = this.globalSettings.idle_timeout?.idle_timeout_seconds;
+                if (globalTtl) {
+                    return window.t('modal.model_settings.ttl_global_fallback').replace('{seconds}', globalTtl);
+                }
+                return window.t('modal.model_settings.ttl_no_ttl');
+            },
+
             async loadServerInfo() {
                 try {
                     const response = await fetch('/admin/api/server-info');

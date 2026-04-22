@@ -890,3 +890,22 @@ class TestGlobalSettingsValidation:
             integrations_openclaw_tools_profile="coding"
         )
         assert req.integrations_openclaw_tools_profile == "coding"
+
+    def test_idle_timeout_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(idle_timeout_seconds=-1)
+
+    def test_idle_timeout_rejects_below_minimum(self):
+        # Minimum is 60s — anything smaller is not a meaningful idle window.
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(idle_timeout_seconds=30)
+
+    def test_idle_timeout_accepts_null_explicitly(self):
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=None)
+        assert req.idle_timeout_seconds is None
+        # model_fields_set should include it when explicitly passed.
+        assert "idle_timeout_seconds" in req.model_fields_set
+
+    def test_idle_timeout_accepts_valid_value(self):
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=1800)
+        assert req.idle_timeout_seconds == 1800

@@ -21,8 +21,8 @@ import mlx.core as mx
 
 if TYPE_CHECKING:
     from .engine_pool import EnginePool
-    from .global_settings import GlobalSettings
     from .model_settings import ModelSettingsManager
+    from .settings import GlobalSettings
 
 logger = logging.getLogger(__name__)
 

@@ -129,7 +129,6 @@ class ModelSettingsRequest(BaseModel):
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
-    active_profile_name: Optional[str] = None
 
 
 class CreateProfileRequest(BaseModel):
@@ -239,8 +238,8 @@ class GlobalSettingsRequest(BaseModel):
     # UI settings
     ui_language: Optional[str] = None
 
-    # Idle timeout settings
-    idle_timeout_seconds: Optional[int] = None
+    # Idle timeout settings. null disables the global fallback.
+    idle_timeout_seconds: Optional[int] = Field(default=None, ge=60)
 
     # Auth settings
     api_key: Optional[str] = None
@@ -1668,8 +1667,6 @@ async def update_model_settings(
         # Update server_state.default_model if setting as default
         if request.is_default and server_state:
             server_state.default_model = model_id
-    if "active_profile_name" in sent:
-        current_settings.active_profile_name = request.active_profile_name or None
 
     # If an active profile was set, clear it when the user's save diverges
     # from the profile's stored values.  Only compare fields present in
@@ -2629,11 +2626,10 @@ async def update_global_settings(
     if "idle_timeout_seconds" in request.model_fields_set:
         global_settings.idle_timeout.idle_timeout_seconds = request.idle_timeout_seconds
         runtime_applied.append("idle_timeout_seconds")
-        logger.info(
-            f"Idle timeout set to: {request.idle_timeout_seconds}s"
-            if request.idle_timeout_seconds
-            else "Idle timeout disabled"
-        )
+        if request.idle_timeout_seconds:
+            logger.info(f"Idle timeout set to: {request.idle_timeout_seconds}s")
+        else:
+            logger.info("Idle timeout disabled")
 
     # Apply auth settings (API key change)
     if request.api_key is not None:

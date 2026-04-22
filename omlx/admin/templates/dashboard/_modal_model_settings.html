@@ -353,7 +353,7 @@
                                 <div>
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.ttl_seconds') }}</label>
                                     <input type="number" x-model.number="modelSettings.ttl_seconds"
-                                           :placeholder="selectedModel?.pinned ? window.t('modal.model_settings.ttl_pinned') : (globalSettings.idle_timeout?.idle_timeout_seconds ? window.t('modal.model_settings.ttl_global_fallback').replace('{seconds}', globalSettings.idle_timeout.idle_timeout_seconds) : window.t('modal.model_settings.ttl_no_ttl'))"
+                                           :placeholder="ttlPlaceholder"
                                            :disabled="selectedModel?.pinned"
                                            min="0" step="60"
                                            :class="selectedModel?.pinned ? 'bg-neutral-100 text-neutral-400 cursor-not-allowed' : ''"
