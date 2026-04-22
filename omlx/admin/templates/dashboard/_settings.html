@@ -979,7 +979,7 @@
                                     </div>
 
                                     <!-- Profile / preset / per-field chips -->
-                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && model.settings && (model.settings.active_profile_name || model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs)"
+                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && model.settings && (model.settings.active_profile_name || model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true)"
                                          class="px-6 pb-4 -mt-2">
                                         <div class="ml-11 flex flex-wrap gap-2">
                                             <!-- 1. Profile pill (emerald) if active_profile_name -->
@@ -1045,6 +1045,11 @@
                                             <template x-if="model.settings?.reasoning_parser">
                                                 <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-violet-50 text-violet-700 border border-violet-200">
                                                     reasoning_parser: <span class="ml-1" x-text="model.settings.reasoning_parser"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.enable_thinking === true">
+                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-sky-50 text-sky-700 border border-sky-200">
+                                                    thinking
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.force_sampling">
