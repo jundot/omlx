@@ -48,9 +48,16 @@ def _sync_and_clear_cache():
     'completeMemory() prepare count underflow' kernel panic on M4 hardware
     (and SIGSEGV/SIGABRT on M3).
 
-    See: https://github.com/jundot/omlx/issues/300
+    See: https://github.com/jundot/omlx/issues/300, #888
     """
-    mx.synchronize(generation_stream)
+    # Generation_stream may not have in-flight work on the current thread
+    # (e.g. external prefill submits to the default stream). On some MLX
+    # builds mx.synchronize raises "There is no Stream(gpu, 0) in current
+    # thread" in that case; swallow it since there is nothing to drain.
+    try:
+        mx.synchronize(generation_stream)
+    except RuntimeError:
+        pass
     mx.synchronize()  # default stream
     mx.clear_cache()
 
