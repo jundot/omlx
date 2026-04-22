@@ -957,6 +957,9 @@
                                                 <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-neutral-100 text-neutral-600 border border-neutral-200">
                                                     <i data-lucide="settings" class="w-3 h-3"></i>
                                                     <span>{{ t('modal.model_settings.profiles.custom_label') }}</span>
+                                                    <span x-show="settingsSummary(model.settings)"
+                                                          x-text="settingsSummary(model.settings)"
+                                                          class="ml-1 font-mono text-[10px] text-neutral-500"></span>
                                                 </span>
                                             </template>
                                         </div>

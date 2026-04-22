@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Literal
 
+import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -38,6 +39,8 @@ from .auth import (
 from ..settings import SubKeyEntry
 
 logger = logging.getLogger(__name__)
+
+PRESET_REMOTE_URL = "https://omlx.ai/assets/omlx_preset.json"
 
 
 # =============================================================================
@@ -1918,6 +1921,38 @@ async def delete_template(
     if not mgr.delete_template(name):
         raise HTTPException(status_code=404, detail=f"Template not found: {name}")
     return {"deleted": True, "name": name}
+
+
+# =============================================================================
+# Preset refresh (proxy to omlx.ai to avoid CORS)
+# =============================================================================
+
+
+@router.post("/api/presets/refresh")
+async def refresh_presets(is_admin: bool = Depends(require_admin)):
+    """Fetch the latest preset bundle from omlx.ai and return it.
+
+    The client uses this instead of fetching omlx.ai directly so we do not
+    depend on CORS headers on the remote host. Any failure is surfaced as 502
+    so the client can silently fall back to the bundled presets.
+    """
+    try:
+        resp = await asyncio.to_thread(
+            requests.get,
+            PRESET_REMOTE_URL,
+            timeout=10,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Fetch failed: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Remote returned {resp.status_code}",
+        )
+    try:
+        return resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Invalid JSON: {e}")
 
 
 @router.get("/api/models/{model_id}/generation_config")
@@ -4308,8 +4343,6 @@ async def check_update(
     }
 
     try:
-        import requests
-
         resp = await asyncio.to_thread(
             requests.get,
             "https://api.github.com/repos/jundot/omlx/releases/latest",

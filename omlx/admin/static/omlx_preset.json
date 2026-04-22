@@ -1,0 +1,119 @@
+{
+  "version": 1,
+  "presets": [
+    {
+      "name": "qwen3-r-general",
+      "display_name": "qwen3.5/6(r, general)",
+      "description": "qwen3.5/6 thinking mode, general tasks",
+      "settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repetition_penalty": 1.0,
+        "enable_thinking": true
+      }
+    },
+    {
+      "name": "qwen3-r-code",
+      "display_name": "qwen3.5/6(r, code)",
+      "description": "qwen3.5/6 thinking mode, precise coding (e.g. WebDev)",
+      "settings": {
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "enable_thinking": true
+      }
+    },
+    {
+      "name": "qwen3-nr-general",
+      "display_name": "qwen3.5/6(n/r, general)",
+      "description": "qwen3.5/6 non-thinking (instruct) mode, general tasks",
+      "settings": {
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repetition_penalty": 1.0,
+        "enable_thinking": false
+      }
+    },
+    {
+      "name": "qwen3-nr-reasoning",
+      "display_name": "qwen3.5/6(n/r, reasoning)",
+      "description": "qwen3.5/6 non-thinking (instruct) mode, reasoning tasks",
+      "settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repetition_penalty": 1.0,
+        "enable_thinking": false
+      }
+    },
+    {
+      "name": "gemma4",
+      "display_name": "gemma4",
+      "description": "gemma 4 (Google recommended)",
+      "settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 64
+      }
+    },
+    {
+      "name": "minimax-m27",
+      "display_name": "minimax-m2.7",
+      "description": "minimax m2.7 (reasoning)",
+      "settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 40
+      }
+    },
+    {
+      "name": "gpt-oss-120b",
+      "display_name": "gpt-oss-120b",
+      "description": "gpt-oss-120b (OpenAI, disables top_k)",
+      "settings": {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": null,
+        "reasoning_parser": "harmony"
+      }
+    },
+    {
+      "name": "glm-5",
+      "display_name": "glm-5/5.1",
+      "description": "glm-5 / glm-5.1 (Zhipu default)",
+      "settings": {
+        "temperature": 1.0,
+        "top_p": 0.95
+      }
+    },
+    {
+      "name": "llama4",
+      "display_name": "llama4",
+      "description": "llama 4 Maverick/Scout",
+      "settings": {
+        "temperature": 0.6,
+        "top_p": 0.9
+      }
+    },
+    {
+      "name": "mistral-small-4",
+      "display_name": "mistral-small-4",
+      "description": "mistral small 4 (reasoning_effort=high)",
+      "settings": {
+        "temperature": 0.7,
+        "chat_template_kwargs": {"reasoning_effort": "high"}
+      }
+    }
+  ]
+}

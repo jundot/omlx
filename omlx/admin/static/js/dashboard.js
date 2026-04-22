@@ -108,10 +108,13 @@
             loadingGenDefaults: false,
             reasoningParsers: [],
 
-            // Profile / template state
+            // Profile / template / preset state
             profiles: [],                // per-model profiles for selectedModel
             templates: [],               // global templates
+            presets: [],                 // curated presets (bundled + remote refresh)
             profileFields: { universal: [], model_specific: [] },  // loaded from /api/profile-fields
+            profileScope: 'model',       // 'preset' | 'global' | 'model'
+            refreshingPresets: false,
             activeProfileName: null,     // currently-active profile for the form
             profilesDrift: false,        // true if form values differ from active profile
             _applySeq: 0,               // monotonic counter for apply race guard
@@ -414,6 +417,7 @@
                     this.loadModels(),
                     this.loadServerInfo(),
                     this.loadProfileFields(),
+                    this.loadPresets(),
                     this.checkForUpdate()
                 ]);
 
@@ -1014,6 +1018,16 @@
                 }
                 this.profilesDrift = false;
             },
+            settingsSummary(settings) {
+                if (!settings) return '';
+                const parts = [];
+                if (settings.temperature != null) parts.push('t' + settings.temperature);
+                if (settings.top_p != null) parts.push('p' + settings.top_p);
+                if (settings.top_k != null) parts.push('k' + settings.top_k);
+                if (settings.min_p != null) parts.push('m' + settings.min_p);
+                if (settings.repetition_penalty != null) parts.push('r' + settings.repetition_penalty);
+                return parts.join(' ');
+            },
             async loadProfilesForModel(modelId) {
                 this.profiles = [];
                 try {
@@ -1058,15 +1072,143 @@
                 }
             },
 
+            async loadPresets() {
+                // Use localStorage cache if present, otherwise fall back to the bundled file.
+                const cached = localStorage.getItem('omlx_preset_cache');
+                if (cached) {
+                    try {
+                        const parsed = JSON.parse(cached);
+                        this.presets = parsed.presets || [];
+                        return;
+                    } catch (e) { /* corrupted, fall through */ }
+                }
+                try {
+                    const r = await fetch('/admin/static/omlx_preset.json');
+                    if (r.ok) {
+                        const data = await r.json();
+                        this.presets = data.presets || [];
+                    }
+                } catch (e) {
+                    console.error('Failed to load bundled presets:', e);
+                }
+            },
+
+            async refreshPresets() {
+                if (this.refreshingPresets) return;
+                this.refreshingPresets = true;
+                try {
+                    const r = await fetch('/admin/api/presets/refresh', { method: 'POST' });
+                    if (r.ok) {
+                        const data = await r.json();
+                        this.presets = data.presets || [];
+                        localStorage.setItem('omlx_preset_cache', JSON.stringify(data));
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Preset refresh failed:', e);
+                } finally {
+                    this.refreshingPresets = false;
+                }
+            },
+
+            // Floating tooltip shared by preset/profile pills (position:fixed escapes
+            // the scroll container's overflow clipping, unlike absolute+group-hover).
+            tip: { visible: false, text: '', x: 0, y: 0 },
+
+            showTip(el, text) {
+                if (!text) return;
+                const rect = el.getBoundingClientRect();
+                this.tip = {
+                    visible: true,
+                    text: text,
+                    x: rect.left + rect.width / 2,
+                    y: rect.bottom + 6,
+                };
+            },
+            hideTip() {
+                this.tip.visible = false;
+            },
+
+            _resetPresetApplicableFields() {
+                // Reset all fields a preset can touch so switching presets does not leave
+                // stale values. Intentionally does NOT touch model_alias / model_type_override
+                // / is_pinned / is_default / turboquant_* / dflash_* / specprefill_* / index_cache_*.
+                const ms = this.modelSettings;
+                ms.temperature = null;
+                ms.top_p = null;
+                ms.top_k = null;
+                ms.min_p = null;
+                ms.repetition_penalty = null;
+                ms.presence_penalty = null;
+                ms.force_sampling = false;
+                ms.max_context_window = null;
+                ms.max_tokens = null;
+                ms.reasoning_parser = null;
+                ms.ttl_seconds = null;
+                ms.enable_thinking = null;
+                ms.enableThinkingBudget = false;
+                ms.thinking_budget_tokens = null;
+                ms.enableToolResultLimit = false;
+                ms.max_tool_result_tokens = null;
+                ms.ctKwargEntries = [];
+            },
+
+            applyPresetToForm(preset) {
+                // Reset first so previous preset's fields (e.g. presence_penalty) do not stick.
+                this._resetPresetApplicableFields();
+                const s = preset.settings || {};
+                const ms = this.modelSettings;
+                for (const k of Object.keys(s)) {
+                    if (k === 'thinking_budget_enabled') {
+                        ms.enableThinkingBudget = !!s[k];
+                    } else if (k === 'max_tool_result_tokens') {
+                        ms.enableToolResultLimit = s[k] != null;
+                        ms.max_tool_result_tokens = s[k] ?? null;
+                    } else if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') {
+                        const ctk = s.chat_template_kwargs || {};
+                        const forced = new Set(s.forced_ct_kwargs || []);
+                        const entries = [];
+                        for (const [key, value] of Object.entries(ctk)) {
+                            if (key === 'enable_thinking') {
+                                entries.push({type:'enable_thinking', value:String(value), force:forced.has('enable_thinking')});
+                            } else if (key === 'reasoning_effort') {
+                                entries.push({type:'reasoning_effort', value:String(value), force:forced.has('reasoning_effort')});
+                            } else {
+                                entries.push({type:'custom', key, value:String(value), force:forced.has(key)});
+                            }
+                        }
+                        ms.ctKwargEntries = entries;
+                    } else {
+                        ms[k] = s[k];
+                    }
+                }
+                this.activeProfileName = null;
+                this.profilesDrift = false;
+            },
+
+            setScope(scope) {
+                this.profileScope = scope;
+                try { localStorage.setItem('omlx_profile_scope', scope); } catch (e) {}
+            },
+
             async createProfile() {
                 if (!this.selectedModel) return;
                 this.profileError = '';
+                const displayName = this.newProfile.display_name.trim();
+                if (!displayName) {
+                    this.profileError = 'Name required';
+                    return;
+                }
+                // Auto-generate short unique slug (matches backend ^[a-z0-9][a-z0-9_-]{0,31}$)
+                const autoId = 'p-' + Date.now().toString(36) + '-' +
+                               Math.random().toString(36).slice(2, 6);
                 const body = {
-                    name: this.newProfile.name.trim(),
-                    display_name: this.newProfile.display_name.trim() || this.newProfile.name.trim(),
+                    name: autoId,
+                    display_name: displayName,
                     description: this.newProfile.description.trim() || null,
                     settings: this.formValuesForProfile(),
-                    also_save_as_template: !!this.newProfile.also_as_template,
+                    also_save_as_template: false,
                 };
                 try {
                     const r = await fetch(
@@ -1230,9 +1372,16 @@
             },
             async createTemplate() {
                 this.profileError = '';
+                const displayName = this.newTemplate.display_name.trim();
+                if (!displayName) {
+                    this.profileError = 'Name required';
+                    return;
+                }
+                const autoId = 't-' + Date.now().toString(36) + '-' +
+                               Math.random().toString(36).slice(2, 6);
                 const body = {
-                    name: this.newTemplate.name.trim(),
-                    display_name: this.newTemplate.display_name.trim() || this.newTemplate.name.trim(),
+                    name: autoId,
+                    display_name: displayName,
                     description: this.newTemplate.description.trim() || null,
                     // Only universal fields — server will filter again defensively.
                     settings: this.formValuesForTemplate(),
@@ -1305,6 +1454,12 @@
                 this.profileDeleteConfirm = null;
                 this.templateDeleteConfirm = null;
                 this.activeProfileName = (model.settings && model.settings.active_profile_name) || null;
+                try {
+                    const saved = localStorage.getItem('omlx_profile_scope');
+                    if (saved === 'preset' || saved === 'global' || saved === 'model') {
+                        this.profileScope = saved;
+                    }
+                } catch (e) {}
                 await Promise.all([
                     this.loadProfilesForModel(model.id),
                     this.loadTemplates(),

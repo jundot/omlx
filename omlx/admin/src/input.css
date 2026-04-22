@@ -1,3 +1,20 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Always-visible thin scrollbar for pill rows (macOS hides scrollbars by default,
+   which hides the overflow cue). Applied via .pills-scrollbar utility class. */
+.pills-scrollbar::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+.pills-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+}
+.pills-scrollbar::-webkit-scrollbar-thumb {
+    background: rgba(0, 0, 0, 0.18);
+    border-radius: 3px;
+}
+.pills-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 0, 0, 0.32);
+}
