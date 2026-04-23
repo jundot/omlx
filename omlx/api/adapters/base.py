@@ -77,6 +77,7 @@ class InternalResponse:
     # Token counts
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cached_tokens: int = 0
 
     # Tool calls (parsed)
     tool_calls: Optional[List[Dict[str, Any]]] = None
@@ -100,6 +101,7 @@ class StreamChunk:
     # Token counts (usually only on last chunk)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cached_tokens: int = 0
 
 
 class BaseAdapter(ABC):

@@ -135,7 +135,7 @@ class OpenAIAdapter(BaseAdapter):
                 completion_tokens=response.completion_tokens,
                 total_tokens=response.prompt_tokens + response.completion_tokens,
                 prompt_tokens_details=PromptTokensDetails(
-                    cached_tokens=getattr(response, "cached_tokens", 0),
+                    cached_tokens=response.cached_tokens,
                 ),
             ),
         )
@@ -185,7 +185,7 @@ class OpenAIAdapter(BaseAdapter):
                 completion_tokens=chunk.completion_tokens,
                 total_tokens=chunk.prompt_tokens + chunk.completion_tokens,
                 prompt_tokens_details=PromptTokensDetails(
-                    cached_tokens=getattr(chunk, "cached_tokens", 0),
+                    cached_tokens=chunk.cached_tokens,
                 ),
             )
 
