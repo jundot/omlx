@@ -125,6 +125,35 @@ class TestUniversalQuantPredicate:
     def test_time_decay_not_quantized(self, dense_config, module):
         assert universal_quant_predicate("model.layers.0.time_decay", module, dense_config) is False
 
+    # Qwen3_5 hybrid (GatedDeltaNet) — issue #913 regression guards.
+    # Real weight names use capital `A_log`, so the skip check must be case-insensitive.
+
+    def test_qwen35_A_log_not_quantized(self, dense_config, module):
+        path = "model.language_model.layers.0.linear_attn.A_log"
+        assert universal_quant_predicate(path, module, dense_config) is False
+
+    def test_qwen35_dt_bias_not_quantized(self, dense_config, module):
+        path = "model.language_model.layers.0.linear_attn.dt_bias"
+        assert universal_quant_predicate(path, module, dense_config) is False
+
+    def test_qwen35_linear_attn_conv1d_8bit(self, dense_config, module):
+        path = "model.language_model.layers.0.linear_attn.conv1d.weight"
+        result = universal_quant_predicate(path, module, dense_config)
+        assert isinstance(result, dict)
+        assert result["bits"] == 8
+
+    def test_qwen35_linear_attn_out_proj_5bit(self, dense_config, module):
+        path = "model.language_model.layers.0.linear_attn.out_proj.weight"
+        result = universal_quant_predicate(path, module, dense_config)
+        assert isinstance(result, dict)
+        assert result["bits"] == 5
+
+    def test_qwen35_linear_attn_in_proj_qkv_quantized(self, dense_config, module):
+        # Regression guard: existing behavior should still return a quant dict/True, not skip.
+        path = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+        result = universal_quant_predicate(path, module, dense_config)
+        assert result is not False
+
     # Stage 1: High-precision protection
 
     def test_ssm_output_8bit(self, dense_config, module):

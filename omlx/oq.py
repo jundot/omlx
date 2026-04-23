@@ -91,6 +91,7 @@ def universal_quant_predicate(
         dict with {"bits": N, "group_size": M} for per-layer override.
     """
     path = _normalize_quant_path(path)
+    path_l = path.lower()
 
     non_quantizable = config.get("_oq_non_quantizable", set())
     if path in non_quantizable:
@@ -137,13 +138,24 @@ def universal_quant_predicate(
         return False
 
     if any(
-        p in path
+        p in path_l
         for p in ("ssm_alpha", "ssm_beta", "a_log", "time_decay", "time_faaaa")
     ):
         return False
 
     if path.endswith(".D"):
         return False
+
+    # Gated DeltaNet / Mamba-like SSM sensitive params (Qwen3_5 hybrid arch).
+    # dt_bias drives the discretization step, keep fp16/fp32 like A_log.
+    # conv1d is a small depth-wise causal conv, very sensitive to low bits.
+    # linear_attn.out_proj mirrors self_attn.o_proj sensitivity.
+    if path_l.endswith("dt_bias"):
+        return False
+    if "conv1d" in path_l and "linear_attn" in path_l:
+        return bits(8)
+    if "linear_attn.out_proj" in path_l:
+        return bits(5)
 
     boost_map = config.get("_oq_boost_map") or {}
     if path in boost_map:
