@@ -1186,7 +1186,7 @@ class Scheduler:
         # derived from block_table.num_tokens and therefore trustworthy.
         if boundary_enabled and hasattr(request, "cached_tokens") and request.cached_tokens > 0:
             if base_size != request.cached_tokens:
-                logger.warning(
+                logger.debug(
                     "Cache base_size mismatch: computed %d, expected %d "
                     "(cached_tokens). Using cached_tokens for boundary "
                     "alignment.",
