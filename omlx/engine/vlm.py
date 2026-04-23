@@ -1372,7 +1372,7 @@ class VLMBatchedEngine(BaseEngine):
                     non_system_prompt = self._tokenizer.apply_chat_template(
                         non_system, tokenize=False, add_generation_prompt=True,
                     )
-                    full_tokens = len(self._tokenizer.encode(prompt))
+                    full_tokens = len(prompt)
                     non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
                     system_end = full_tokens - non_system_tokens
                     if system_end > 0:
