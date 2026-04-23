@@ -259,14 +259,16 @@ def serve_command(args):
     )
 
     # Start server
-    print(f"Starting server at http://{settings.server.host}:{settings.server.port}")
+    hosts = [h.strip() for h in settings.server.host.split(",") if h.strip()]
+    for h in hosts:
+        print(f"Starting server at http://{h}:{settings.server.port}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
     uvicorn_level = "debug" if settings.server.log_level == "trace" else settings.server.log_level
     # Only show access logs at trace level
     show_access_log = settings.server.log_level == "trace"
     uvicorn.run(
         app,
-        host=settings.server.host,
+        host=hosts if len(hosts) > 1 else hosts[0],
         port=settings.server.port,
         log_level=uvicorn_level,
         access_log=show_access_log,
