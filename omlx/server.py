@@ -97,6 +97,7 @@ from .api.openai_models import (
     CompletionResponse,
     ModelInfo,
     ModelsResponse,
+    PromptTokensDetails,
     Usage,
 )
 from .api.embedding_models import (
@@ -1885,6 +1886,9 @@ async def create_completion(
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
                 total_tokens=total_prompt_tokens + total_completion_tokens,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=total_cached_tokens,
+                ),
             ),
         ).model_dump_json()
 
@@ -2226,6 +2230,9 @@ async def create_chat_completion(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 total_tokens=output.prompt_tokens + output.completion_tokens,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=output.cached_tokens,
+                ),
             ),
         ).model_dump_json()
 
@@ -2554,7 +2561,9 @@ async def stream_completion(
                     prompt_tokens=pt,
                     completion_tokens=ct,
                     total_tokens=pt + ct,
-                    cached_tokens=last_output.cached_tokens or None,
+                    prompt_tokens_details=PromptTokensDetails(
+                        cached_tokens=last_output.cached_tokens,
+                    ),
                     model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
                     time_to_first_token=round(ttft, 2),
                     total_time=round(total_time, 2),
@@ -2860,7 +2869,9 @@ async def stream_chat_completion(
                     prompt_tokens=pt,
                     completion_tokens=ct,
                     total_tokens=pt + ct,
-                    cached_tokens=last_output.cached_tokens or None,
+                    prompt_tokens_details=PromptTokensDetails(
+                        cached_tokens=last_output.cached_tokens,
+                    ),
                     model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
                     time_to_first_token=round(ttft, 2),
                     total_time=round(total_time, 2),

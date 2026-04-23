@@ -281,6 +281,13 @@ class ChatCompletionChoice(BaseModel):
     finish_reason: Optional[str] = "stop"
 
 
+class PromptTokensDetails(BaseModel):
+    """Breakdown of prompt tokens used."""
+
+    cached_tokens: Optional[int] = None
+    audio_tokens: Optional[int] = None
+
+
 class Usage(BaseUsage):
     """Token usage statistics for OpenAI API.
 
@@ -288,7 +295,7 @@ class Usage(BaseUsage):
     When present, timing values are in seconds.
     """
 
-    cached_tokens: Optional[int] = None
+    prompt_tokens_details: Optional[PromptTokensDetails] = None
     # Timing metrics (oMLX extension, seconds)
     model_load_duration: Optional[float] = None
     time_to_first_token: Optional[float] = None
