@@ -309,6 +309,16 @@ class VLMBatchedEngine(BaseEngine):
                 )
         return self._grammar_compiler
 
+    @property
+    def prefix_cache_enabled(self) -> bool:
+        """True when the scheduler has a BlockAwarePrefixCache wired up."""
+        if self._engine is None:
+            return False
+        try:
+            return self._engine.engine.scheduler.block_aware_cache is not None
+        except AttributeError:
+            return False
+
     def _resolve_ocr_stop_token_ids(self) -> list[int]:
         """Convert OCR stop sequences to token IDs via the tokenizer.
 

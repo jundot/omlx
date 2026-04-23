@@ -3154,10 +3154,15 @@ async def stream_anthropic_messages(
     actual_output_tokens = scale_anthropic_tokens(
         last_output.completion_tokens if last_output else 0, request.model
     )
+    actual_cached_tokens = scale_anthropic_tokens(
+        last_output.cached_tokens if last_output else 0, request.model
+    )
     yield create_message_delta_event(
         stop_reason=stop_reason,
         output_tokens=actual_output_tokens,
         input_tokens=actual_input_tokens,
+        cached_tokens=actual_cached_tokens,
+        prefix_cache_enabled=engine.prefix_cache_enabled,
     )
 
     # Record metrics
@@ -3451,6 +3456,8 @@ async def create_anthropic_message(
             finish_reason=output.finish_reason,
             tool_calls=tool_calls,
             thinking=cleaned_thinking if cleaned_thinking else None,
+            cached_tokens=scale_anthropic_tokens(output.cached_tokens, request.model),
+            prefix_cache_enabled=engine.prefix_cache_enabled,
         )
 
         return response.model_dump_json()

@@ -163,6 +163,10 @@ class MockBaseEngine:
     def model_type(self) -> Optional[str]:
         return self._model_type
 
+    @property
+    def prefix_cache_enabled(self) -> bool:
+        return False
+
     async def start(self) -> None:
         pass
 

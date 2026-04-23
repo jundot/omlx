@@ -1363,6 +1363,38 @@ class TestConvertInternalToAnthropicResponse:
         # Should have at least one content block
         assert len(result.content) >= 1
 
+    def test_prefix_cache_disabled_legacy_shape(self):
+        """Caching off: usage keeps the legacy shape (input=prompt, cache=0)."""
+        result = convert_internal_to_anthropic_response(
+            text="hi",
+            model="claude-3",
+            prompt_tokens=100,
+            completion_tokens=5,
+            finish_reason="stop",
+            cached_tokens=40,
+            prefix_cache_enabled=False,
+        )
+
+        assert result.usage.input_tokens == 100
+        assert result.usage.cache_creation_input_tokens == 0
+        assert result.usage.cache_read_input_tokens == 0
+
+    def test_prefix_cache_enabled_splits_prompt(self):
+        """Caching on: prompt splits into input(0) + creation + read."""
+        result = convert_internal_to_anthropic_response(
+            text="hi",
+            model="claude-3",
+            prompt_tokens=100,
+            completion_tokens=5,
+            finish_reason="stop",
+            cached_tokens=20,
+            prefix_cache_enabled=True,
+        )
+
+        assert result.usage.input_tokens == 0
+        assert result.usage.cache_creation_input_tokens == 80
+        assert result.usage.cache_read_input_tokens == 20
+
 
 class TestMapFinishReasonToStopReason:
     """Tests for map_finish_reason_to_stop_reason function."""
@@ -1468,6 +1500,20 @@ class TestSSEEventFormatters:
         result = create_message_delta_event("end_turn", 10, input_tokens=100)
 
         assert '"input_tokens": 100' in result
+
+    def test_create_message_delta_event_prefix_cache_enabled(self):
+        """With caching active, usage splits into disjoint cache fields."""
+        result = create_message_delta_event(
+            "end_turn",
+            10,
+            input_tokens=100,
+            cached_tokens=30,
+            prefix_cache_enabled=True,
+        )
+
+        assert '"input_tokens": 0' in result
+        assert '"cache_creation_input_tokens": 70' in result
+        assert '"cache_read_input_tokens": 30' in result
 
     def test_create_message_stop_event(self):
         """Test creating message_stop event."""

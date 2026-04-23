@@ -723,9 +723,17 @@ def convert_internal_to_anthropic_response(
     finish_reason: str | None,
     tool_calls: list[ToolCall] | None = None,
     thinking: str | None = None,
+    cached_tokens: int = 0,
+    prefix_cache_enabled: bool = False,
 ) -> MessagesResponse:
     """
     Convert internal output to Anthropic MessagesResponse.
+
+    When ``prefix_cache_enabled`` is True the prompt count is split into
+    Anthropic's disjoint usage fields so that
+    input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+    equals prompt_tokens. Otherwise the response keeps the legacy shape
+    (input_tokens = prompt_tokens, cache fields = 0).
 
     Args:
         text: Generated text content
@@ -735,6 +743,8 @@ def convert_internal_to_anthropic_response(
         finish_reason: Internal finish reason ("stop", "length", "tool_calls")
         tool_calls: List of internal ToolCall objects
         thinking: Reasoning/thinking content from <think> blocks
+        cached_tokens: Prompt tokens served from the prefix cache
+        prefix_cache_enabled: Whether the engine runs automatic prefix caching
 
     Returns:
         Anthropic MessagesResponse
@@ -778,6 +788,17 @@ def convert_internal_to_anthropic_response(
     # Map finish reason to stop reason
     stop_reason = map_finish_reason_to_stop_reason(finish_reason, bool(tool_calls))
 
+    # When prefix caching is on, split prompt_tokens into the Anthropic
+    # disjoint triple (input + creation + read == prompt_tokens).
+    if prefix_cache_enabled:
+        cache_read = max(0, min(cached_tokens, prompt_tokens))
+        cache_creation = prompt_tokens - cache_read
+        input_display = 0
+    else:
+        cache_read = 0
+        cache_creation = 0
+        input_display = prompt_tokens
+
     return MessagesResponse(
         id=f"msg_{uuid.uuid4().hex[:24]}",
         type="message",
@@ -786,8 +807,10 @@ def convert_internal_to_anthropic_response(
         content=content,
         stop_reason=stop_reason,
         usage=AnthropicUsage(
-            input_tokens=prompt_tokens,
+            input_tokens=input_display,
             output_tokens=completion_tokens,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
         ),
     )
 
@@ -945,11 +968,25 @@ def create_message_delta_event(
     output_tokens: int,
     stop_sequence: str | None = None,
     input_tokens: int | None = None,
+    cached_tokens: int = 0,
+    prefix_cache_enabled: bool = False,
 ) -> str:
-    """Create message_delta SSE event."""
-    usage = {"output_tokens": output_tokens}
-    if input_tokens is not None:
+    """Create message_delta SSE event.
+
+    When ``prefix_cache_enabled`` is True and ``input_tokens`` is given, the
+    count is split into Anthropic's disjoint triple (input stays 0, creation
+    and read carry the remainder). Otherwise the legacy shape is preserved.
+    """
+    usage: dict[str, int] = {"output_tokens": output_tokens}
+
+    if prefix_cache_enabled and input_tokens is not None:
+        cache_read = max(0, min(cached_tokens, input_tokens))
+        usage["input_tokens"] = 0
+        usage["cache_creation_input_tokens"] = input_tokens - cache_read
+        usage["cache_read_input_tokens"] = cache_read
+    elif input_tokens is not None:
         usage["input_tokens"] = input_tokens
+
     return format_sse_event(
         "message_delta",
         {

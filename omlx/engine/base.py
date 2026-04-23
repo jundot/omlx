@@ -209,6 +209,14 @@ class BaseEngine(ABC):
         """
         return None
 
+    @property
+    def prefix_cache_enabled(self) -> bool:
+        """Whether automatic prefix caching is active on this engine.
+
+        Subclasses that wire up a BlockAwarePrefixCache should override this.
+        """
+        return False
+
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests.
 
