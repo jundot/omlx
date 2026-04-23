@@ -56,6 +56,7 @@ VLM_MODEL_TYPES = {
     "minicpmv",
     "phi4_siglip",
     "phi4mm",
+    "youtu_vl",
 }
 
 # Known VLM architectures

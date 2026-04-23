@@ -174,9 +174,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Monkey-patch PromptProcessingBatch.prompt to set mRoPE deltas before the
 # prompt processing loop.  Without this, batched VLM prompt processing
-# (e.g. the 1-token final prompt after external prefill) falls into the
-# _wrap_caches fallback which collapses per-request offsets to a scalar,
-# corrupting attention masks for concurrent VLM requests.
+# (e.g. the 1-token final prompt after external prefill) would use
+# per-request offsets without rope_deltas, corrupting attention masks
+# for concurrent VLM requests.
 # ---------------------------------------------------------------------------
 _original_ppb_prompt = PromptProcessingBatch.prompt
 

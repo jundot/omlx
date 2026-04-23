@@ -156,59 +156,17 @@ class TestVLMModelAdapter:
         vlm.language_model.__call__ = MagicMock(return_value=expected)
 
         result = adapter(input_ids, cache=cache)
-        # Cache is wrapped with _IntOffsetCacheProxy
         vlm.language_model.assert_called_once()
         call_args = vlm.language_model.call_args
         assert call_args[0][0] is input_ids
-        assert len(call_args[1]["cache"]) == 1
-
-    def test_forward_uses_decode_model_at_batch_1(self):
-        """Test that decode_model is used for batch=1 decode (no proxy overhead)."""
-        from omlx.models.vlm import VLMModelAdapter
-
-        vlm = self._make_mock_vlm_model()
-        decode_model = MagicMock()
-        decode_logits = MockMXArray(shape=(1, 10, 32000))
-        decode_model.return_value = decode_logits
-        adapter = VLMModelAdapter(vlm, decode_model=decode_model)
-
-        input_ids = MockMXArray(shape=(1, 10))
-        cache = [MagicMock()]
-
-        result = adapter(input_ids, cache=cache)
-
-        # decode_model should be called (fast path, no proxy wrapping)
-        decode_model.assert_called_once()
-        call_args = decode_model.call_args
-        assert call_args[0][0] is input_ids
-        # cache should be passed directly (no _IntOffsetCacheProxy wrapping)
         assert call_args[1]["cache"] is cache
-        # language_model should NOT be called
-        vlm.language_model.assert_not_called()
 
-    def test_forward_text_only_prefill_uses_decode_model(self):
-        """Text-only prefill (batch=1, long seq) routes through decode_model."""
+    def test_forward_text_only_uses_language_model_directly(self):
+        """Text-only decode passes cache directly to language_model."""
         from omlx.models.vlm import VLMModelAdapter
 
         vlm = self._make_mock_vlm_model()
-        decode_model = MagicMock()
-        decode_model.return_value = MockMXArray(shape=(1, 512, 32000))
-        adapter = VLMModelAdapter(vlm, decode_model=decode_model)
-
-        input_ids = MockMXArray(shape=(1, 512))
-        cache = [MagicMock()]
-
-        adapter(input_ids, cache=cache)
-
-        decode_model.assert_called_once()
-        vlm.language_model.assert_not_called()
-
-    def test_forward_without_decode_model_falls_back_to_language_model(self):
-        """Test that without decode_model, language_model is used with wrapped cache."""
-        from omlx.models.vlm import VLMModelAdapter
-
-        vlm = self._make_mock_vlm_model()
-        adapter = VLMModelAdapter(vlm)  # no decode_model
+        adapter = VLMModelAdapter(vlm)
 
         input_ids = MockMXArray(shape=(1, 10))
         cache = [MagicMock()]
@@ -216,12 +174,9 @@ class TestVLMModelAdapter:
 
         adapter(input_ids, cache=cache)
 
-        # language_model should be called (fallback path)
         vlm.language_model.assert_called_once()
-        # cache should be wrapped with _IntOffsetCacheProxy
         call_args = vlm.language_model.call_args
-        from omlx.models.vlm import _IntOffsetCacheProxy
-        assert isinstance(call_args[1]["cache"][0], _IntOffsetCacheProxy)
+        assert call_args[1]["cache"] is cache
 
     def test_forward_with_embeddings(self):
         """Test forward pass with pending embeddings injects inputs_embeds."""
@@ -383,49 +338,6 @@ class TestMRoPEDetection:
         assert VLMModelAdapter._detect_mrope(vlm) is False
 
 
-class TestCachedOffsetProxy:
-    """Tests for _CachedOffsetProxy."""
-
-    def test_returns_cached_int_offset(self):
-        """Proxy should return the pre-computed int offset."""
-        from omlx.models.vlm import _CachedOffsetProxy
-
-        inner = MagicMock()
-        inner.offset = 42  # raw cache offset (ignored by proxy)
-        proxy = _CachedOffsetProxy(inner, 100)
-
-        assert proxy.offset == 100
-
-    def test_delegates_other_attrs(self):
-        """Non-offset attributes should delegate to inner cache."""
-        from omlx.models.vlm import _CachedOffsetProxy
-
-        inner = MagicMock()
-        inner.keys = "test_keys"
-        proxy = _CachedOffsetProxy(inner, 50)
-
-        assert proxy.keys == "test_keys"
-
-    def test_update_and_fetch_delegates(self):
-        """update_and_fetch should be called on the inner cache."""
-        from omlx.models.vlm import _CachedOffsetProxy
-
-        inner = MagicMock()
-        inner.update_and_fetch.return_value = ("k", "v")
-        proxy = _CachedOffsetProxy(inner, 50)
-
-        result = proxy.update_and_fetch("new_k", "new_v")
-        inner.update_and_fetch.assert_called_once_with("new_k", "new_v")
-        assert result == ("k", "v")
-
-    def test_bool_is_true(self):
-        """Proxy should be truthy (used in 'if cache' checks)."""
-        from omlx.models.vlm import _CachedOffsetProxy
-
-        proxy = _CachedOffsetProxy(MagicMock(), 0)
-        assert bool(proxy) is True
-
-
 class TestPerRequestMRoPEDecode:
     """Tests for per-request mRoPE position_ids computation during decode."""
 
@@ -447,16 +359,14 @@ class TestPerRequestMRoPEDecode:
         return vlm
 
     def test_mrope_decode_uses_language_model_with_position_ids(self):
-        """mRoPE decode with batch_rope_deltas should use language_model, not decode_model."""
+        """mRoPE decode with batch_rope_deltas should use language_model with position_ids."""
         import mlx.core as mx
         from omlx.models.vlm import VLMModelAdapter
 
         vlm = self._make_mrope_vlm_model()
-        decode_model = MagicMock()
-        adapter = VLMModelAdapter(vlm, decode_model=decode_model)
+        adapter = VLMModelAdapter(vlm)
         assert adapter._uses_mrope is True
 
-        # Simulate batch of 2 requests with different rope_deltas
         adapter.set_batch_rope_deltas(mx.array([10.0, 0.0]))
 
         input_ids = mx.zeros((2, 1), dtype=mx.int32)
@@ -466,39 +376,25 @@ class TestPerRequestMRoPEDecode:
 
         adapter(input_ids, cache=cache)
 
-        # decode_model should NOT be called (mRoPE active)
-        decode_model.assert_not_called()
-        # language_model should be called with position_ids and original cache
         vlm.language_model.assert_called_once()
         call_kwargs = vlm.language_model.call_args[1]
         assert "position_ids" in call_kwargs
-        # Cache passed as-is (no proxy) for correct per-request attention mask
         assert call_kwargs["cache"][0] is cache_layer
 
     def test_mrope_always_uses_language_model(self):
-        """mRoPE model always uses vlm language_model (not decode_model).
-
-        The decode_model uses standard 1D RoPE which is incompatible with
-        mRoPE-encoded KV cache. Even without batch_rope_deltas, the vlm
-        language model handles position computation correctly via its
-        internal _rope_deltas state.
-        """
+        """mRoPE model always uses vlm language_model with position_ids."""
         import mlx.core as mx
         from omlx.models.vlm import VLMModelAdapter
 
         vlm = self._make_mrope_vlm_model()
-        decode_model = MagicMock()
-        adapter = VLMModelAdapter(vlm, decode_model=decode_model)
+        adapter = VLMModelAdapter(vlm)
 
-        # Simulate BatchKVCache: offset is mx.array
         cache_layer = MagicMock()
         cache_layer.offset = mx.array([50])
 
         input_ids = mx.zeros((1, 1), dtype=mx.int32)
         adapter(input_ids, cache=[cache_layer])
 
-        # mRoPE model: decode_model should NOT be used
-        decode_model.assert_not_called()
         vlm.language_model.assert_called_once()
 
     def test_position_ids_shape_and_values(self):
@@ -507,8 +403,7 @@ class TestPerRequestMRoPEDecode:
         from omlx.models.vlm import VLMModelAdapter
 
         vlm = self._make_mrope_vlm_model()
-        decode_model = MagicMock()
-        adapter = VLMModelAdapter(vlm, decode_model=decode_model)
+        adapter = VLMModelAdapter(vlm)
 
         # Request 0: VLM (offset=100, delta=-50) → position=50
         # Request 1: text-only (offset=80, delta=0) → position=80
@@ -592,47 +487,4 @@ class TestVLMModelAdapterModelProperty:
         assert adapter.layers is vlm.language_model.model.layers
 
 
-class TestIntOffsetCacheProxy:
-    """Tests for _IntOffsetCacheProxy offset conversion."""
-
-    def test_scalar_offset_passthrough(self):
-        """Scalar int offset is returned as-is."""
-        from omlx.models.vlm import _IntOffsetCacheProxy
-
-        cache = MagicMock(spec=[])
-        cache.offset = 42
-        proxy = _IntOffsetCacheProxy(cache)
-        assert proxy.offset == 42
-
-    def test_0d_mx_array_offset(self):
-        """0-d mx.array offset is converted to int."""
-        import mlx.core as mx
-        from omlx.models.vlm import _IntOffsetCacheProxy
-
-        cache = MagicMock(spec=[])
-        cache.offset = mx.array(7)
-        proxy = _IntOffsetCacheProxy(cache)
-        assert proxy.offset == 7
-
-    def test_single_element_batch_returns_int(self):
-        """Single-element batch offset is converted to int."""
-        import mlx.core as mx
-        from omlx.models.vlm import _IntOffsetCacheProxy
-
-        cache = MagicMock(spec=[])
-        cache.offset = mx.array([625])
-        proxy = _IntOffsetCacheProxy(cache)
-        assert proxy.offset == 625
-        assert isinstance(proxy.offset, int)
-
-    def test_multi_request_batch_returns_max(self):
-        """Multi-element batch returns max offset as int."""
-        import mlx.core as mx
-        from omlx.models.vlm import _IntOffsetCacheProxy
-
-        cache = MagicMock(spec=[])
-        cache.offset = mx.array([500, 625])
-        proxy = _IntOffsetCacheProxy(cache)
-        assert proxy.offset == 625
-        assert isinstance(proxy.offset, int)
 

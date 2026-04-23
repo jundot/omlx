@@ -95,18 +95,37 @@ _video_processor_patched = False
 
 
 def _patch_video_processor_bug():
-    """Remove video_processor from transformers' auto-processor mapping.
+    """Prevent video_processor from crashing processor loading.
 
-    oMLX does not support video input. Without torchvision, transformers'
-    AutoVideoProcessor crashes when loading VLM processors that have a
-    video_preprocessor_config.json. By removing ``video_processor`` from
-    the mapping, ``ProcessorMixin.get_attributes()`` no longer recognises
-    it as a sub-processor and ``_get_arguments_from_pretrained`` never
-    attempts to load it.
+    Two interrelated issues without torchvision:
+
+    1. Gemma4's video_preprocessor_config.json triggers AutoVideoProcessor
+       which requires torchvision. Removing ``video_processor`` from the
+       MODALITY mapping prevents transformers from attempting to load it.
+
+    2. When mlx-vlm's custom processor patch fails (e.g. due to a stale
+       mistral_common dependency), it falls back to HF's ProcessorMixin
+       which passes ``video_processor`` as a kwarg. HF's own
+       ProcessorMixin.__init__ rejects unexpected kwargs. We patch it to
+       silently drop ``video_processor``.
     """
     global _video_processor_patched
     if _video_processor_patched:
         return
+
+    try:
+        from mistral_common.protocol.instruct.request import ReasoningEffort  # noqa: F401
+    except ImportError:
+        try:
+            import mistral_common.protocol.instruct.request as _mcpir
+
+            class _ReasoningEffort:
+                pass
+
+            _mcpir.ReasoningEffort = _ReasoningEffort
+            logger.debug("Stubbed missing mistral_common.ReasoningEffort")
+        except (ImportError, AttributeError):
+            pass
 
     try:
         from transformers.processing_utils import MODALITY_TO_AUTOPROCESSOR_MAPPING
@@ -115,10 +134,41 @@ def _patch_video_processor_bug():
         if "video_processor" in mapping:
             del mapping["video_processor"]
             logger.debug("Removed video_processor from MODALITY_TO_AUTOPROCESSOR_MAPPING")
-
-        _video_processor_patched = True
     except (ImportError, AttributeError):
         pass
+
+    try:
+        from transformers.processing_utils import ProcessorMixin
+
+        _orig_pm_init = ProcessorMixin.__init__
+
+        def _pm_init_drop_video(self, *args, **kwargs):
+            kwargs.pop("video_processor", None)
+            return _orig_pm_init(self, *args, **kwargs)
+
+        ProcessorMixin.__init__ = _pm_init_drop_video
+    except (ImportError, AttributeError):
+        pass
+
+    _video_processor_patched = True
+
+
+def _fix_processor_none_pixels(processor):
+    """Set sensible defaults when preprocessor_config.json has null pixels.
+
+    Some Qwen3-VL model configs ship ``"max_pixels": null`` which overrides
+    the constructor default and causes ``int > NoneType`` comparison errors
+    in ``_smart_resize_image``.
+    """
+    ip = getattr(processor, "image_processor", None)
+    if ip is None:
+        return
+    if getattr(ip, "max_pixels", None) is None and hasattr(ip, "max_pixels"):
+        ip.max_pixels = 14 * 14 * 4 * 1280
+        logger.debug("Fixed image_processor.max_pixels: None → %d", ip.max_pixels)
+    if getattr(ip, "min_pixels", None) is None and hasattr(ip, "min_pixels"):
+        ip.min_pixels = 56 * 56
+        logger.debug("Fixed image_processor.min_pixels: None → %d", ip.min_pixels)
 
 
 # Models that only support a single image per request
@@ -300,9 +350,6 @@ class VLMBatchedEngine(BaseEngine):
         from ..engine_core import get_mlx_executor
 
         def _load_vlm_sync():
-            # Patch transformers bug: video_processor_class_from_name crashes
-            # when torchvision is not available (extractors is None, `in` fails).
-            # oMLX does not support video input, so we skip video processing.
             _patch_video_processor_bug()
             return vlm_load(self._model_name)
 
@@ -310,6 +357,8 @@ class VLMBatchedEngine(BaseEngine):
         self._vlm_model, self._processor = await loop.run_in_executor(
             get_mlx_executor(), _load_vlm_sync
         )
+
+        _fix_processor_none_pixels(self._processor)
 
         # Initialize vision feature cache
         vision_ssd_dir = None
@@ -337,47 +386,10 @@ class VLMBatchedEngine(BaseEngine):
         else:
             self._tokenizer = copy.deepcopy(self._processor)
 
-        # Build mlx-lm decode model for batched decode by sharing VLM weights.
-        # mlx-vlm language models may produce degenerated output in batched
-        # decode (e.g. gemma4 missing KV sharing between layers).
-        # The LM model is constructed without evaluating initial random weights
-        # (MLX lazy eval) then load_weights replaces them with VLM's arrays
-        # by reference — zero additional GPU memory.
-        self._lm_model = None
-        try:
-            from pathlib import Path as _Path
-
-            from mlx.utils import tree_flatten
-            from mlx_lm.utils import load_model
-
-            def _build_decode_model():
-                # Create LM model with lazy=True: reads disk headers for correct
-                # quantized structure but does NOT evaluate weights → 0 GPU memory.
-                lm_model, _ = load_model(
-                    _Path(self._model_name), lazy=True
-                )
-                # Replace lazy weights with VLM's evaluated arrays by reference.
-                # VLM params "model.*" map to LM "language_model.model.*".
-                vlm_params = dict(tree_flatten(
-                    self._vlm_model.language_model.parameters()
-                ))
-                lm_params = [
-                    ("language_model." + k, v) for k, v in vlm_params.items()
-                ]
-                lm_model.load_weights(lm_params, strict=False)
-                return lm_model
-
-            self._lm_model = await loop.run_in_executor(
-                get_mlx_executor(), _build_decode_model
-            )
-            logger.info("VLM decode model ready (weight sharing, zero-copy)")
-        except Exception as e:
-            logger.warning("mlx-lm decode model failed, using vlm fallback: %s", e)
-
-        # Create VLM model adapter wrapping language_model
-        self._adapter = VLMModelAdapter(
-            self._vlm_model, decode_model=self._lm_model
-        )
+        # Create VLM model adapter wrapping language_model.
+        # mlx-vlm models now handle per-sequence mx.array offsets natively
+        # and batched decode is fixed, so no separate mlx-lm decode model needed.
+        self._adapter = VLMModelAdapter(self._vlm_model)
 
         # Create scheduler config
         scheduler_config = (
@@ -950,7 +962,6 @@ class VLMBatchedEngine(BaseEngine):
                 logger.debug(
                     "Failed to compute segmented VLM cache boundaries, "
                     "falling back to whole-request keying",
-                    exc_info=True,
                 )
                 image_cache_key_start = 0
                 image_cache_key_ranges = []
