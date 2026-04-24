@@ -3205,12 +3205,24 @@ class Scheduler:
 
             # Insert into BatchGenerator with pre-filled cache + last token.
             # BatchGenerator only handles decode from here.
+            #
+            # IMPORTANT: ``logits_processors`` MUST be passed as a per-row
+            # list (possibly empty), never None.  mlx-lm's
+            # GenerationBatch._step does ``for p in self.logits_processors[e]``
+            # in any branch where ``any(self.logits_processors)`` is True
+            # (e.g., heterogeneous merge with another row that has a
+            # processor).  A None slot crashes that loop with
+            # ``TypeError: 'NoneType' object is not iterable``, which then
+            # bubbles into the engine retry loop and presents as a hang.
+            # See vllm-mlx-patched commit 8d4052b for the same root cause
+            # in a sibling project, and #934 for the user-visible symptom.
+            per_row_lps = list(logits_processors) if logits_processors else []
             uids = self.batch_generator.insert(
                 [tokens_to_process],
                 max_tokens=[request.sampling_params.max_tokens],
                 caches=[cache_to_use] if cache_to_use else None,
                 samplers=[sampler],
-                logits_processors=[logits_processors],
+                logits_processors=[per_row_lps],
                 state_machines=[sm],
             )
 

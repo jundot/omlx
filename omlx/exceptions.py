@@ -429,6 +429,14 @@ class MCPToolExecutionError(MCPError):
 # Patterns that indicate cache corruption (used by scheduler recovery logic)
 CACHE_CORRUPTION_PATTERNS = [
     "'NoneType' object is not subscriptable",
+    # Heterogeneous-batch crash: when one row has logits_processors=[proc]
+    # and another has None, mlx-lm's GenerationBatch._step does
+    # ``for p in self.logits_processors[e]`` over a None slot and raises
+    # this exact message.  Without matching it here, the error bubbles
+    # past recovery and into engine_loop's bare except, presenting as a
+    # request hang.  See vllm-mlx-patched commit 8d4052b for the same
+    # root cause in a sibling project.  Issue #934.
+    "'NoneType' object is not iterable",
     "BatchKVCache",
     "KVCache",
     "cache.keys",
