@@ -9,6 +9,7 @@ import pytest
 
 from omlx.integrations import get_integration, list_integrations
 from omlx.integrations.codex import CodexIntegration
+from omlx.integrations.crush import CrushIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
 from omlx.integrations.pi import PiIntegration
@@ -17,15 +18,16 @@ from omlx.integrations.pi import PiIntegration
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 4
+        assert len(integrations) == 5
         names = {i.name for i in integrations}
-        assert names == {"codex", "opencode", "openclaw", "pi"}
+        assert names == {"codex", "opencode", "openclaw", "pi", "crush"}
 
     def test_get_integration(self):
         assert get_integration("codex") is not None
         assert get_integration("opencode") is not None
         assert get_integration("openclaw") is not None
         assert get_integration("pi") is not None
+        assert get_integration("crush") is not None
         assert get_integration("nonexistent") is None
 
 
@@ -532,6 +534,151 @@ class TestPiIntegration:
         assert pi.display_name == "Pi"
 
 
+class TestCrushIntegration:
+    def test_get_command(self):
+        crush = CrushIntegration()
+        cmd = crush.get_command(port=8000, api_key="key", model="qwen3.5")
+        assert "omlx launch crush" in cmd
+        assert "--model qwen3.5" in cmd
+
+    def test_get_command_no_model(self):
+        crush = CrushIntegration()
+        cmd = crush.get_command(port=8000, api_key="", model="")
+        assert "select-a-model" in cmd
+
+    def test_configure_new_file(self, tmp_path):
+        crush = CrushIntegration()
+        config_path = tmp_path / "crush" / "crush.json"
+
+        with patch.object(CrushIntegration, "CONFIG_PATH", config_path):
+            crush.configure(port=8000, api_key="test-key", model="qwen3.5")
+
+        assert config_path.exists()
+        config = json.loads(config_path.read_text())
+        provider = config["providers"]["omlx"]
+        assert provider["base_url"] == "http://127.0.0.1:8000/v1"
+        assert provider["type"] == "openai-compat"
+        assert provider["name"] == "oMLX"
+        assert provider["api_key"] == "test-key"
+        assert provider["models"] == [{"id": "qwen3.5", "name": "qwen3.5"}]
+        assert config["models"]["large"] == {"provider": "omlx", "model": "qwen3.5"}
+        assert config["models"]["small"] == {"provider": "omlx", "model": "qwen3.5"}
+
+    def test_configure_default_api_key(self, tmp_path):
+        crush = CrushIntegration()
+        config_path = tmp_path / "crush" / "crush.json"
+
+        with patch.object(CrushIntegration, "CONFIG_PATH", config_path):
+            crush.configure(port=8000, api_key="", model="qwen3.5")
+
+        config = json.loads(config_path.read_text())
+        assert config["providers"]["omlx"]["api_key"] == "omlx"
+
+    def test_configure_custom_host(self, tmp_path):
+        crush = CrushIntegration()
+        config_path = tmp_path / "crush" / "crush.json"
+        with patch.object(CrushIntegration, "CONFIG_PATH", config_path):
+            crush.configure(port=9000, api_key="key", model="test", host="10.0.0.5")
+
+        config = json.loads(config_path.read_text())
+        assert config["providers"]["omlx"]["base_url"] == "http://10.0.0.5:9000/v1"
+
+    def test_configure_preserves_existing(self, tmp_path):
+        config_path = tmp_path / "crush.json"
+        existing = {
+            "$schema": "https://charm.land/crush.json",
+            "providers": {
+                "openai": {
+                    "name": "OpenAI",
+                    "type": "openai",
+                    "api_key": "sk-test",
+                }
+            },
+            "lsp": {"go": {"command": "gopls"}},
+        }
+        config_path.write_text(json.dumps(existing))
+
+        crush = CrushIntegration()
+        with patch.object(CrushIntegration, "CONFIG_PATH", config_path):
+            crush.configure(port=9000, api_key="", model="llama")
+
+        config = json.loads(config_path.read_text())
+        assert "openai" in config["providers"]
+        assert config["providers"]["openai"]["api_key"] == "sk-test"
+        assert "omlx" in config["providers"]
+        assert config["providers"]["omlx"]["base_url"] == "http://127.0.0.1:9000/v1"
+        assert config["lsp"] == {"go": {"command": "gopls"}}
+        assert config["$schema"] == "https://charm.land/crush.json"
+
+    def test_configure_creates_backup(self, tmp_path):
+        config_path = tmp_path / "crush.json"
+        config_path.write_text('{"existing": true}')
+
+        crush = CrushIntegration()
+        with patch.object(CrushIntegration, "CONFIG_PATH", config_path):
+            crush.configure(port=8000, api_key="", model="test")
+
+        backups = list(tmp_path.glob("crush.*.bak"))
+        assert len(backups) == 1
+        backup_content = json.loads(backups[0].read_text())
+        assert backup_content == {"existing": True}
+
+    def test_configure_handles_invalid_json(self, tmp_path):
+        config_path = tmp_path / "crush.json"
+        config_path.write_text("not valid json {{{")
+
+        crush = CrushIntegration()
+        with patch.object(CrushIntegration, "CONFIG_PATH", config_path):
+            crush.configure(port=8000, api_key="key", model="test")
+
+        config = json.loads(config_path.read_text())
+        assert "omlx" in config["providers"]
+
+    def test_configure_with_limits(self, tmp_path):
+        crush = CrushIntegration()
+        config_path = tmp_path / "crush" / "crush.json"
+
+        with patch.object(CrushIntegration, "CONFIG_PATH", config_path):
+            crush.configure(
+                port=8000, api_key="key", model="qwen3.5",
+                context_window=32768, max_tokens=8192,
+            )
+
+        config = json.loads(config_path.read_text())
+        model_entry = config["providers"]["omlx"]["models"][0]
+        assert model_entry["context_window"] == 32768
+        assert model_entry["default_max_tokens"] == 8192
+
+    def test_configure_without_limits(self, tmp_path):
+        crush = CrushIntegration()
+        config_path = tmp_path / "crush" / "crush.json"
+
+        with patch.object(CrushIntegration, "CONFIG_PATH", config_path):
+            crush.configure(port=8000, api_key="key", model="qwen3.5")
+
+        config = json.loads(config_path.read_text())
+        model_entry = config["providers"]["omlx"]["models"][0]
+        assert "context_window" not in model_entry
+        assert "default_max_tokens" not in model_entry
+
+    def test_configure_without_model(self, tmp_path):
+        crush = CrushIntegration()
+        config_path = tmp_path / "crush" / "crush.json"
+
+        with patch.object(CrushIntegration, "CONFIG_PATH", config_path):
+            crush.configure(port=8000, api_key="key", model="")
+
+        config = json.loads(config_path.read_text())
+        assert "models" not in config["providers"]["omlx"]
+        assert "models" not in config
+
+    def test_type(self):
+        crush = CrushIntegration()
+        assert crush.type == "config_file"
+        assert crush.display_name == "Crush"
+        assert crush.name == "crush"
+
+
 class TestIntegrationSettings:
     def test_settings_dataclass(self):
         from omlx.settings import IntegrationSettings
@@ -541,6 +688,7 @@ class TestIntegrationSettings:
         assert settings.opencode_model is None
         assert settings.openclaw_model is None
         assert settings.pi_model is None
+        assert settings.crush_model is None
         assert settings.openclaw_tools_profile == "coding"
 
     def test_to_dict(self):
@@ -551,21 +699,24 @@ class TestIntegrationSettings:
         assert d["codex_model"] == "qwen3.5"
         assert d["opencode_model"] is None
         assert d["pi_model"] is None
+        assert d["crush_model"] is None
         assert d["openclaw_tools_profile"] == "coding"
 
     def test_from_dict(self):
         from omlx.settings import IntegrationSettings
 
         settings = IntegrationSettings.from_dict(
-            {"codex_model": "llama", "opencode_model": "qwen"}
+            {"codex_model": "llama", "opencode_model": "qwen", "crush_model": "gemma"}
         )
         assert settings.codex_model == "llama"
         assert settings.opencode_model == "qwen"
         assert settings.openclaw_model is None
         assert settings.pi_model is None
+        assert settings.crush_model == "gemma"
 
     def test_from_dict_empty(self):
         from omlx.settings import IntegrationSettings
 
         settings = IntegrationSettings.from_dict({})
         assert settings.codex_model is None
+        assert settings.crush_model is None
