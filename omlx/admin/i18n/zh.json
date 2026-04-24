@@ -352,6 +352,7 @@
   "settings.language.zh-TW": "中文（繁體）",
   "settings.language.ko": "한국어",
   "settings.language.ja": "日本語",
+  "settings.language.ru": "Русский",
   "settings.save.button": "保存设置",
   "settings.save.saving": "保存中...",
   "settings.models.section_label": "模型设置",
