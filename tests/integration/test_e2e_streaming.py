@@ -174,6 +174,11 @@ class MockEnginePool:
     def get_status(self) -> Dict[str, Any]:
         return {"models": self._models}
 
+    def get_entry(self, model_id: str):
+        if model_id in self.get_model_ids():
+            return MagicMock(config_model_type="")
+        return None
+
     async def get_engine(self, model_id: str):
         return self._engine
 

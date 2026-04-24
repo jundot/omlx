@@ -263,16 +263,22 @@ class BoundarySnapshotSSDStore:
 
     def cleanup_all(self) -> None:
         """Delete all snapshot files (for reset/startup)."""
-        # Drain write queue so the writer thread doesn't process stale
-        # items after the directory is deleted.
+        # Drain queued writes, then wait for any item the writer already
+        # dequeued. Without the join, an in-flight write can recreate a
+        # request directory after the cleanup has removed it.
+        saw_sentinel = False
         while True:
             try:
                 item = self._write_queue.get_nowait()
+                self._write_queue.task_done()
                 if item is None:  # Sentinel — put it back for shutdown.
                     self._write_queue.put(item)
+                    saw_sentinel = True
                     break
             except queue.Empty:
                 break
+        if not saw_sentinel:
+            self._write_queue.join()
 
         with self._pending_lock:
             self._pending_writes.clear()
@@ -320,6 +326,7 @@ class BoundarySnapshotSSDStore:
                 continue
 
             if item is None:  # Sentinel
+                self._write_queue.task_done()
                 break
 
             pw_key, tensors_raw, metadata, file_path = item
@@ -335,6 +342,7 @@ class BoundarySnapshotSSDStore:
                 except Exception:
                     pass
                 self._dec_cancelled(pw_key[0])
+                self._write_queue.task_done()
                 continue
 
             temp_path = None
@@ -392,7 +400,7 @@ class BoundarySnapshotSSDStore:
                     # If file was written successfully, remove entirely.
                     if file_path.exists():
                         self._pending_writes.pop(pw_key, None)
-
+                self._write_queue.task_done()
 
     def _serialize_extracted(
         self,
