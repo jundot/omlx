@@ -1549,6 +1549,9 @@
                     dflash_enabled: settings.dflash_enabled || false,
                     dflash_draft_model: settings.dflash_draft_model || '',
                     dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
+                    ddtree_enabled: settings.ddtree_enabled || false,
+                    ddtree_budget: Number.isFinite(settings.ddtree_budget) ? settings.ddtree_budget : 4,
+                    ddtree_exact_commit: settings.ddtree_exact_commit || false,
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
@@ -1629,6 +1632,11 @@
                                 dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
                                     ? parseInt(this.modelSettings.dflash_draft_quant_bits)
                                     : null,
+                                ddtree_enabled: this.modelSettings.dflash_enabled && this.modelSettings.ddtree_enabled,
+                                ddtree_budget: this.modelSettings.ddtree_enabled
+                                    ? (parseInt(this.modelSettings.ddtree_budget) || 4)
+                                    : 4,
+                                ddtree_exact_commit: this.modelSettings.ddtree_enabled && this.modelSettings.ddtree_exact_commit,
                             };
                         })()),
                     });

@@ -695,6 +695,50 @@
                                         </div>
                                     </div>
                                 </div>
+
+                                <!-- DDTree (requires DFlash) -->
+                                <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                                     :class="!modelSettings.dflash_enabled ? 'opacity-60' : ''">
+                                    <div class="flex items-start justify-between gap-3">
+                                        <div class="min-w-0">
+                                            <span class="text-sm font-medium text-neutral-700">DDTree</span>
+                                            <p class="text-xs text-neutral-500 mt-0.5">Tree-based speculative decoding layered on top of DFlash. ~10-15% faster than DFlash on code/structured output. Requires DFlash to be enabled. (MLX impl by humanrouter: <a href="https://github.com/humanrouter/ddtree-mlx" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">GitHub</a>) (<a href="https://liranringel.github.io/ddtree/" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">Paper</a>)</p>
+                                        </div>
+                                        <button type="button"
+                                                @click="modelSettings.dflash_enabled && (modelSettings.ddtree_enabled = !modelSettings.ddtree_enabled)"
+                                                :disabled="!modelSettings.dflash_enabled"
+                                                :class="modelSettings.ddtree_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                                class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black disabled:cursor-not-allowed">
+                                            <span :class="modelSettings.ddtree_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
+                                    </div>
+                                    <div x-show="modelSettings.dflash_enabled && modelSettings.ddtree_enabled" x-transition class="space-y-3 pt-1">
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Tree Budget</label>
+                                            <div class="flex items-center gap-3">
+                                                <input type="range" min="1" max="16" step="1"
+                                                       x-model.number="modelSettings.ddtree_budget"
+                                                       class="flex-1"/>
+                                                <span class="text-sm font-mono w-10 text-right" x-text="modelSettings.ddtree_budget"></span>
+                                            </div>
+                                            <p class="text-xs text-neutral-400 mt-1">Tree node count excluding root (paper recommends 4 for hybrid models).</p>
+                                        </div>
+                                        <div class="flex items-start justify-between gap-3">
+                                            <div class="min-w-0">
+                                                <span class="text-sm font-medium text-neutral-700">Exact Commit</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">Re-forward accepted tokens sequentially on commit. Slower but strictly lossless. Usually unnecessary.</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="modelSettings.ddtree_exact_commit = !modelSettings.ddtree_exact_commit"
+                                                    :class="modelSettings.ddtree_exact_commit ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="modelSettings.ddtree_exact_commit ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
                         </div>
                     </div>
                 </div>

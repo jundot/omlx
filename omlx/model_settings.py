@@ -109,6 +109,12 @@ class ModelSettings:
     dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
     dflash_draft_quant_bits: Optional[int] = None  # Draft model quantization (None=bf16, 4)
 
+    # DDTree (tree-based speculative decoding — rides on top of DFlash drafter)
+    # Requires dflash_enabled=True; shares the same draft model.
+    ddtree_enabled: bool = False
+    ddtree_budget: int = 4  # Tree node budget excluding root (paper: 4 is optimal for hybrid)
+    ddtree_exact_commit: bool = False  # Strict lossless re-forward on commit (slow but safe)
+
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default
