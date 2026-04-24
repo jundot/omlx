@@ -9,6 +9,7 @@ using mock AsyncIterator without loading actual models.
 import json
 import pytest
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -176,7 +177,10 @@ class MockEnginePool:
 
     def get_entry(self, model_id: str):
         if model_id in self.get_model_ids():
-            return MagicMock(config_model_type="")
+            return SimpleNamespace(
+                config_model_type="",
+                preserve_thinking_default=None,
+            )
         return None
 
     async def get_engine(self, model_id: str):
