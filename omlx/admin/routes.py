@@ -24,7 +24,7 @@ from typing import Any, Dict, Optional, List, Literal
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
@@ -129,6 +129,7 @@ class ModelSettingsRequest(BaseModel):
     # DFlash speculative decoding
     dflash_enabled: Optional[bool] = None
     dflash_draft_model: Optional[str] = None
+    dflash_draft_quant_bits: Optional[int] = None
     dflash_block_tokens: Optional[int] = None
     dflash_quantize_kv_cache: Optional[bool] = None
     reasoning_parser: Optional[str] = None
@@ -1417,6 +1418,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "force_sampling": settings.force_sampling,
                 "max_tool_result_tokens": settings.max_tool_result_tokens,
                 "enable_thinking": settings.enable_thinking,
+                "preserve_thinking": settings.preserve_thinking,
                 "thinking_budget_enabled": settings.thinking_budget_enabled,
                 "thinking_budget_tokens": settings.thinking_budget_tokens,
                 "reasoning_parser": settings.reasoning_parser,
@@ -1436,6 +1438,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "specprefill_threshold": settings.specprefill_threshold,
                 "dflash_enabled": settings.dflash_enabled,
                 "dflash_draft_model": settings.dflash_draft_model,
+                "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
                 "dflash_block_tokens": settings.dflash_block_tokens,
                 "dflash_quantize_kv_cache": settings.dflash_quantize_kv_cache,
                 "is_pinned": settings.is_pinned,
@@ -1542,7 +1545,6 @@ async def update_model_settings(
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
     # Get current settings
-    from ..model_settings import ModelSettings
     current_settings = settings_manager.get_settings(model_id)
 
     # Apply updates — use model_fields_set to distinguish "sent as null"
@@ -1653,7 +1655,13 @@ async def update_model_settings(
     if "planarquant_kv_enabled" in sent:
         current_settings.planarquant_kv_enabled = request.planarquant_kv_enabled or False
     if "planarquant_kv_bits" in sent:
-        current_settings.planarquant_kv_bits = request.planarquant_kv_bits or 3
+        planarquant_bits = int(request.planarquant_kv_bits or 3)
+        if planarquant_bits != 3:
+            raise HTTPException(
+                status_code=400,
+                detail="PlanarQuant KV cache currently supports only 3-bit mode",
+            )
+        current_settings.planarquant_kv_bits = planarquant_bits
     if "planarquant_quantize_v" in sent:
         current_settings.planarquant_quantize_v = (
             True
@@ -1679,6 +1687,8 @@ async def update_model_settings(
         current_settings.dflash_enabled = request.dflash_enabled or False
     if "dflash_draft_model" in sent:
         current_settings.dflash_draft_model = request.dflash_draft_model or None
+    if "dflash_draft_quant_bits" in sent:
+        current_settings.dflash_draft_quant_bits = request.dflash_draft_quant_bits or None
     if "dflash_block_tokens" in sent:
         current_settings.dflash_block_tokens = request.dflash_block_tokens or 16
     if "dflash_quantize_kv_cache" in sent:
@@ -1748,8 +1758,16 @@ async def update_model_settings(
         and (
             ("model_type_override" in sent and entry.engine_type != prev_engine_type)
             or "index_cache_freq" in sent
+            or "turboquant_kv_enabled" in sent
+            or "turboquant_kv_bits" in sent
+            or "planarquant_kv_enabled" in sent
+            or "planarquant_kv_bits" in sent
+            or "planarquant_quantize_v" in sent
             or "dflash_enabled" in sent
             or "dflash_draft_model" in sent
+            or "dflash_draft_quant_bits" in sent
+            or "dflash_block_tokens" in sent
+            or "dflash_quantize_kv_cache" in sent
         )
     )
     if requires_reload:
@@ -3152,15 +3170,28 @@ async def get_server_stats(
         resolved_model = resolve_model_id(model) or model
         snapshot = metrics.get_snapshot(model_id=resolved_model, scope=scope)
     else:
-        snapshot = metrics.get_comprehensive_stats()
+        snapshot = metrics.get_snapshot(model_id="", scope=scope)
+        if scope == "session":
+            comprehensive = metrics.get_comprehensive_stats()
+            if isinstance(comprehensive, dict):
+                snapshot.update(
+                    {
+                        key: comprehensive[key]
+                        for key in (
+                            "request_counts",
+                            "latency_stats",
+                            "batching_speedup",
+                            "per_model_stats",
+                        )
+                        if key in comprehensive
+                    }
+                )
 
     global_settings = _get_global_settings()
     host = global_settings.server.host if global_settings else "127.0.0.1"
     port = global_settings.server.port if global_settings else 8000
     api_key = global_settings.auth.api_key if global_settings else ""
 
-    from ..model_discovery import format_size
-    from ..prefill_progress import get_prefill_tracker
     from ..utils.install import get_cli_prefix
 
     # Build active_models data for the dashboard card.

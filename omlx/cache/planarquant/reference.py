@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from .constants import PLANAR_D, PLANAR_QS_SIZE, PLANAR_SIGNS_SIZE, centroids_mx, cos_sin_mx, midpoints_mx
+from .constants import centroids_mx, cos_sin_mx, midpoints_mx
 
 
 def quantize_block(x: mx.array) -> tuple[mx.array, mx.array]:
@@ -32,12 +32,11 @@ def quantize_block(x: mx.array) -> tuple[mx.array, mx.array]:
         norms:  shape ``(..., 1)``, dtype ``float16``. Corrected per-block norm.
     """
     d = x.shape[-1]
-    if d % 2 != 0:
-        raise ValueError(f"Last dim {d} must be even for PlanarQuant")
+    if d % 8 != 0:
+        raise ValueError(f"Last dim {d} must be divisible by 8 for PlanarQuant3")
     n_pairs = d // 2
     qs_size = d // 4
     signs_size = d // 8
-    packed_last = qs_size + signs_size
 
     x32 = x.astype(mx.float32)
 
@@ -134,7 +133,6 @@ def _unpack_indices(packed: mx.array, d: int) -> mx.array:
         indices: shape ``(..., d)``, dtype int32, values in [0, 7]
     """
     qs_size = d // 4
-    signs_size = d // 8
 
     qs = packed[..., :qs_size]
     signs = packed[..., qs_size:]
@@ -170,8 +168,10 @@ def dequantize_block(packed: mx.array, norms: mx.array) -> mx.array:
     # Infer D from packed_last = D/4 + D/8 = 3D/8
     packed_last = packed.shape[-1]
     d = packed_last * 8 // 3
-    if d % 2 != 0:
-        raise ValueError(f"Inferred D={d} from packed_last={packed_last} is not even")
+    if d % 8 != 0:
+        raise ValueError(
+            f"Inferred D={d} from packed_last={packed_last} is not divisible by 8"
+        )
     n_pairs = d // 2
 
     indices = _unpack_indices(packed, d)  # (..., d) int32

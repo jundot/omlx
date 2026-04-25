@@ -416,8 +416,10 @@ def dequantize_fused(
     """
     packed_last = packed.shape[-1]
     d = packed_last * 8 // 3
-    if d % 2 != 0:
-        raise ValueError(f"Last dim {packed_last} doesn't correspond to even D")
+    if d % 8 != 0:
+        raise ValueError(
+            f"Last dim {packed_last} doesn't correspond to PlanarQuant3 D"
+        )
     n_pairs = d // 2
     qs_size = d // 4
 
@@ -571,8 +573,8 @@ def quantize_fused(
         norms:  shape ``(..., 1)``, dtype ``out_dtype``.
     """
     d = x.shape[-1]
-    if d % 2 != 0:
-        raise ValueError(f"Last dim {d} must be even for PlanarQuant")
+    if d % 8 != 0:
+        raise ValueError(f"Last dim {d} must be divisible by 8 for PlanarQuant3")
     n_pairs = d // 2
     qs_size = d // 4
     signs_size = d // 8

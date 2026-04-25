@@ -45,9 +45,9 @@ def test_quantize_returns_packed_layout():
     assert norms.dtype == mx.float16
 
 
-def test_odd_last_dim_raises():
-    x = mx.zeros((1, 1, 1, 127))
-    with pytest.raises(ValueError, match="even"):
+def test_last_dim_not_divisible_by_8_raises():
+    x = mx.zeros((1, 1, 1, 10))
+    with pytest.raises(ValueError, match="divisible by 8"):
         quantize_block(x)
 
 

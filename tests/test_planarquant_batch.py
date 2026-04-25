@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from omlx.cache.planarquant.constants import PLANAR_D
@@ -14,11 +15,10 @@ from omlx.cache.planarquant.kv_cache import (
     PlanarQuantState,
     _concat_packed_batch,
     _filter_packed_state,
-    _pad_packed_left,
     _packed_state_length,
+    _pad_packed_left,
     _slice_packed_range,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -172,6 +172,24 @@ class TestBatchUpdateAndFetch:
         assert int(cache.offset[0].item()) == 3
         assert int(cache.offset[1].item()) == 4
 
+    def test_left_padding_crossing_zero_preserves_valid_suffix_deferred(self):
+        cache = BatchPlanarQuantKVCache(left_padding=[1, 0])
+        x_np = np.zeros((2, 1, 3, PLANAR_D), dtype=np.float32)
+        x_np[0, 0, 0, :] = 99.0
+        x_np[0, 0, 1, :] = 1.0
+        x_np[0, 0, 2, :] = 2.0
+        x_np[1, 0, 0, :] = 3.0
+        x_np[1, 0, 1, :] = 4.0
+        x_np[1, 0, 2, :] = 5.0
+        x = mx.array(x_np)
+
+        cache.update_and_fetch(x, x)
+
+        assert float(cache._k_fp16[0, 0, 0, 0].item()) == pytest.approx(1.0)
+        assert float(cache._k_fp16[0, 0, 1, 0].item()) == pytest.approx(2.0)
+        assert float(cache._k_fp16[1, 0, 0, 0].item()) == pytest.approx(3.0)
+        assert float(cache._k_fp16[1, 0, 2, 0].item()) == pytest.approx(5.0)
+
 
 # ---------------------------------------------------------------------------
 # make_mask
@@ -249,7 +267,6 @@ class TestBatchFinalize:
         cache.finalize_prefill()
         # Simulate right padding from a subsequent prepare
         cache._right_padding = mx.array([2, 0])
-        k_before = mx.array(cache._k_packed)
         cache.finalize()
         # After: rolled, right_padding cleared
         assert cache._right_padding is None
@@ -275,8 +292,8 @@ class TestBatchFilter:
         x = mx.random.normal((3, 4, 3, PLANAR_D)) * 0.1
         cache.update_and_fetch(x, x)
         cache.finalize_prefill()
-        B_before = cache._k_packed.shape[0]
-        assert B_before == 3
+        b_before = cache._k_packed.shape[0]
+        assert b_before == 3
 
         cache.filter([0, 2])
         assert cache._k_packed.shape[0] == 2
@@ -370,7 +387,7 @@ class TestBatchMerge:
         """merge should finalize any deferred input caches."""
         c1 = _make_deferred_cache(T=4, H=4)
         assert not c1._finalized
-        batch = BatchPlanarQuantKVCache.merge([c1])
+        BatchPlanarQuantKVCache.merge([c1])
         assert c1._finalized  # Side effect: input is finalized
 
     def test_merge_preserves_quantize_v(self):
@@ -542,6 +559,40 @@ class TestBatchDecodeAttention:
         q = (mx.random.normal((2, 4, 1, PLANAR_D)) * 0.1).astype(mx.float16)
         out = batch.decode_attention(q, scale=1.0 / PLANAR_D**0.5)
         assert out.shape == (2, 4, 1, PLANAR_D)
+
+    def test_decode_attention_accepts_explicit_states_from_sdpa_patch(self):
+        c1 = _make_single_cache(T=4, H=4)
+        c2 = _make_single_cache(T=3, H=4)
+        batch = BatchPlanarQuantKVCache.merge([c1, c2])
+        keys_state, values_state = batch._current_state()
+
+        q = (mx.random.normal((2, 4, 1, PLANAR_D)) * 0.1).astype(mx.float16)
+        scale = 1.0 / PLANAR_D**0.5
+        out = batch.decode_attention(
+            q,
+            keys_state=keys_state,
+            values_state=values_state,
+            scale=scale,
+        )
+
+        keys, values = batch.dequantize(
+            keys_state=keys_state, values_state=values_state, out_dtype=mx.float16
+        )
+        ref = mx.fast.scaled_dot_product_attention(q, keys, values, scale=scale)
+        assert out.shape == (2, 4, 1, PLANAR_D)
+        assert float(mx.max(mx.abs(out - ref)).item()) < 1e-4
+
+    def test_state_serializes_batch_array_offset(self):
+        c1 = _make_single_cache(T=4, H=4)
+        c2 = _make_single_cache(T=3, H=4)
+        batch = BatchPlanarQuantKVCache.merge([c1, c2])
+
+        k_tensor, v_tensor = batch.state
+
+        assert k_tensor.shape[0] == 2
+        assert k_tensor.shape[2] == 4
+        assert v_tensor.shape[0] == 2
+        assert v_tensor.shape[2] == 4
 
 
 # ---------------------------------------------------------------------------

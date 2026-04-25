@@ -40,7 +40,6 @@ from ..utils.image import (
     compute_per_image_hashes,
     extract_images_from_messages,
 )
-from ..utils.tokenizer import get_tokenizer_config
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
@@ -424,7 +423,8 @@ class VLMBatchedEngine(BaseEngine):
 
         await self._engine.engine.start()
 
-        # TurboQuant / PlanarQuant KV cache (mutually exclusive)
+        # TurboQuant KV cache
+        pq_model_marked = False
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             pq_enabled = getattr(self._model_settings, "planarquant_kv_enabled", False)
@@ -443,17 +443,30 @@ class VLMBatchedEngine(BaseEngine):
                 )
                 logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
             if pq_enabled:
-                from ..patches.planarquant_cache import enable_planarquant_cache
+                from ..patches.planarquant_cache import (
+                    enable_planarquant_cache,
+                    mark_model_for_planarquant,
+                )
                 from ..patches.turboquant_attention import apply_turboquant_attention_patch
                 apply_turboquant_attention_patch()
                 pq_bits = int(getattr(self._model_settings, "planarquant_kv_bits", 3))
-                pq_quant_v = bool(getattr(self._model_settings, "planarquant_quantize_v", True))
+                pq_quant_v = bool(
+                    getattr(self._model_settings, "planarquant_quantize_v", True)
+                )
+                mark_model_for_planarquant(
+                    self._adapter, bits=pq_bits, quantize_v=pq_quant_v
+                )
+                pq_model_marked = True
                 enable_planarquant_cache(bits=pq_bits, quantize_v=pq_quant_v)
                 self._engine.engine.scheduler._planarquant_kv_bits = pq_bits
                 logger.info(
                     f"PlanarQuant3 KV cache enabled for VLM: {pq_bits}-bit, "
                     f"quantize_v={pq_quant_v}"
                 )
+        if not pq_model_marked:
+            from ..patches.planarquant_cache import mark_model_without_planarquant
+
+            mark_model_without_planarquant(self._adapter)
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:

@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for DFlash speculative decoding integration."""
 
-import json
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 

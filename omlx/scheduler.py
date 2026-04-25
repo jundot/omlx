@@ -14,7 +14,6 @@ The scheduler follows vLLM's design with:
 import copy
 import gc
 import logging
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -936,7 +935,7 @@ class Scheduler:
         NOTE: Detokenizers are NOT pooled - each request gets a fresh instance
         to prevent state contamination that causes text corruption.
         """
-        detok = self._request_detokenizers.pop(request_id, None)
+        self._request_detokenizers.pop(request_id, None)
         # Let GC collect - no pooling to prevent state contamination
 
     def _get_output_parser_session(
@@ -1189,7 +1188,6 @@ class Scheduler:
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
-        all_boundaries = boundary_enabled  # always stop at every boundary for hybrid models
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
         # Sanity check: base_size from cache offsets should match the number
         # of tokens actually cached. A mismatch indicates stale meta_state
@@ -4157,9 +4155,37 @@ class Scheduler:
         In paged SSD-only mode, memory pressure is not monitored since
         KV cache data is stored on paged SSD, not GPU memory.
         """
-        # In paged SSD-only mode, memory_monitor is not used
-        # All KV cache data is on paged SSD, so no GPU memory pressure from PagedCache
-        pass
+        if self.memory_monitor is None:
+            return
+        if not self.memory_monitor.is_under_pressure():
+            return
+        if self._planarquant_kv_bits is not None:
+            converted = self._enable_planarquant_memory_pressure_mode()
+            if converted:
+                logger.warning(
+                    "PlanarQuant memory pressure mode enabled on %d cache layers",
+                    converted,
+                )
+
+    def _enable_planarquant_memory_pressure_mode(self, tile_size: int = 4096) -> int:
+        converted = 0
+        seen: set[int] = set()
+        for request in self.running.values():
+            prompt_cache = getattr(request, "prompt_cache", None)
+            if not prompt_cache:
+                continue
+            for cache_obj in prompt_cache:
+                if id(cache_obj) in seen:
+                    continue
+                seen.add(id(cache_obj))
+                enable_mode = getattr(cache_obj, "enable_memory_pressure_mode", None)
+                if enable_mode is None:
+                    continue
+                if getattr(cache_obj, "memory_pressure", False):
+                    continue
+                enable_mode(tile_size=tile_size)
+                converted += 1
+        return converted
 
     def _evict_blocks_permanently(self, bytes_to_free: int) -> int:
         """

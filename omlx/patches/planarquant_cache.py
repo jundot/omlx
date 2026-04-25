@@ -27,6 +27,10 @@ _ACTIVE_BITS: float | None = None
 _QUANTIZE_V: bool = True
 _ORIGINAL_MAKE_PROMPT_CACHE = None
 _PATCHED = False
+_PATCH_ATTR = "_omlx_planarquant_patched"
+_ORIGINAL_ATTR = "_omlx_original_make_prompt_cache"
+_MODEL_CONFIG_ATTR = "_omlx_planarquant_cache_config"
+_MODEL_DISABLED_ATTR = "_omlx_planarquant_cache_disabled"
 
 
 def enable_planarquant_cache(bits: float = 3.0, quantize_v: bool = True) -> None:
@@ -51,14 +55,27 @@ def enable_planarquant_cache(bits: float = 3.0, quantize_v: bool = True) -> None
         logger.warning("mlx_lm.models.cache not importable — PlanarQuant hook skipped")
         return
 
-    _ORIGINAL_MAKE_PROMPT_CACHE = mlx_cache_mod.make_prompt_cache
+    current_make_prompt_cache = mlx_cache_mod.make_prompt_cache
+    _ORIGINAL_MAKE_PROMPT_CACHE = getattr(
+        current_make_prompt_cache, _ORIGINAL_ATTR, current_make_prompt_cache
+    )
 
     def patched_make_prompt_cache(model, max_kv_size: int | None = None):
         original = _ORIGINAL_MAKE_PROMPT_CACHE(model, max_kv_size=max_kv_size)
+        if getattr(model, _MODEL_DISABLED_ATTR, False):
+            return original
+        model_config = getattr(model, _MODEL_CONFIG_ATTR, None)
+        if model_config is not None:
+            model_bits, model_quantize_v = model_config
+            return _wrap_cache_list(
+                original, bits=float(model_bits), quantize_v=bool(model_quantize_v)
+            )
         if _ACTIVE_BITS is None:
             return original
         return _wrap_cache_list(original, bits=_ACTIVE_BITS, quantize_v=_QUANTIZE_V)
 
+    setattr(patched_make_prompt_cache, _PATCH_ATTR, True)
+    setattr(patched_make_prompt_cache, _ORIGINAL_ATTR, _ORIGINAL_MAKE_PROMPT_CACHE)
     mlx_cache_mod.make_prompt_cache = patched_make_prompt_cache
 
     # Also patch every module that already did `from mlx_lm.models.cache import make_prompt_cache`
@@ -69,10 +86,9 @@ def enable_planarquant_cache(bits: float = 3.0, quantize_v: bool = True) -> None
     for mod_name, mod in list(sys.modules.items()):
         if mod is None or mod_name.startswith("mlx_lm.models.cache"):
             continue
-        if hasattr(mod, "make_prompt_cache"):
-            existing = getattr(mod, "make_prompt_cache")
-            if existing is _ORIGINAL_MAKE_PROMPT_CACHE:
-                setattr(mod, "make_prompt_cache", patched_make_prompt_cache)
+        existing = vars(mod).get("make_prompt_cache")
+        if existing is _ORIGINAL_MAKE_PROMPT_CACHE:
+            setattr(mod, "make_prompt_cache", patched_make_prompt_cache)
 
     _PATCHED = True
     logger.info("PlanarQuant cache hook installed (%.1f-bit)", _ACTIVE_BITS)
@@ -82,21 +98,20 @@ def disable_planarquant_cache() -> None:
     """Disable the PlanarQuant cache hook globally."""
     global _ACTIVE_BITS, _PATCHED
     _ACTIVE_BITS = None
-    if not _PATCHED:
-        return
     try:
         from mlx_lm.models import cache as mlx_cache_mod
 
-        if _ORIGINAL_MAKE_PROMPT_CACHE is not None:
-            patched = mlx_cache_mod.make_prompt_cache
-            mlx_cache_mod.make_prompt_cache = _ORIGINAL_MAKE_PROMPT_CACHE
+        patched = mlx_cache_mod.make_prompt_cache
+        original = getattr(patched, _ORIGINAL_ATTR, _ORIGINAL_MAKE_PROMPT_CACHE)
+        if getattr(patched, _PATCH_ATTR, False) and original is not None:
+            mlx_cache_mod.make_prompt_cache = original
             import sys
 
             for mod_name, mod in list(sys.modules.items()):
                 if mod is None or mod_name.startswith("mlx_lm.models.cache"):
                     continue
-                if getattr(mod, "make_prompt_cache", None) is patched:
-                    mod.make_prompt_cache = _ORIGINAL_MAKE_PROMPT_CACHE
+                if vars(mod).get("make_prompt_cache") is patched:
+                    mod.make_prompt_cache = original
     except ImportError:
         pass
     _PATCHED = False
@@ -108,6 +123,22 @@ def is_planarquant_active() -> bool:
 
 def active_bits() -> float | None:
     return _ACTIVE_BITS
+
+
+def mark_model_for_planarquant(
+    model: Any, bits: float = 3.0, quantize_v: bool = True
+) -> Any:
+    setattr(model, _MODEL_CONFIG_ATTR, (float(bits), bool(quantize_v)))
+    if hasattr(model, _MODEL_DISABLED_ATTR):
+        delattr(model, _MODEL_DISABLED_ATTR)
+    return model
+
+
+def mark_model_without_planarquant(model: Any) -> Any:
+    if hasattr(model, _MODEL_CONFIG_ATTR):
+        delattr(model, _MODEL_CONFIG_ATTR)
+    setattr(model, _MODEL_DISABLED_ATTR, True)
+    return model
 
 
 def _wrap_cache_list(cache_list: list[Any], bits: float, quantize_v: bool = True) -> list[Any]:

@@ -13,7 +13,6 @@ Benchmarks:
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 
 import mlx.core as mx
@@ -237,7 +236,6 @@ def bench_evict_and_rebuild(model, tokenizer, args):
     from mlx_lm.models import cache as mlx_cache_mod
     from omlx.patches.planarquant_cache import enable_planarquant_cache, disable_planarquant_cache
     from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
-    from omlx.cache.planarquant.kv_cache import PlanarQuantKVCache, BatchPlanarQuantKVCache
 
     apply_turboquant_attention_patch()
     enable_planarquant_cache(args.pq_bits)
@@ -343,14 +341,6 @@ def main():
     print(f"\n{'Config':<12} {'Prompt':>7} {'Prefill':>10} {'Decode':>10} {'Step':>8} {'Cache':>8} {'Mem':>6} {'Speed':>7}")
     print(f"{'':12} {'toks':>7} {'tok/s':>10} {'tok/s':>10} {'ms':>8} {'MB':>8} {'ratio':>6} {'ratio':>7}")
     print("-" * 70)
-
-    for r in results:
-        label = r["label"]
-        prompt_t = r["prompt_tokens"]
-        prefill = r["prefill_tps"]
-        decode = r["decode_tps"]
-        step_ms = r["avg_step_ms"]
-        cache_mb = r["cache_mb"]
 
     # Pair up FP16 vs PQ at same prompt length
     for i in range(0, len(results), 2):
@@ -465,7 +455,6 @@ def main():
 
     if not args.skip_dflash and dflash_results:
         dflash_pq = [r for r in dflash_results if r["pq_on"] and r["dflash_on"]]
-        dflash_only = [r for r in dflash_results if not r["pq_on"] and r["dflash_on"]]
         baseline_r = dflash_results[0]
         if dflash_pq:
             total_speedup = dflash_pq[0]["decode_tps"] / baseline_r["decode_tps"]

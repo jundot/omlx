@@ -123,6 +123,8 @@ class PlanarQuantKVCache(_BaseCache):
         quantize_v: bool = True,
     ):
         self.bits = float(bits)
+        if self.bits != 3.0:
+            raise ValueError("PlanarQuantKVCache only supports 3-bit PlanarQuant3")
         self.quantize_v = quantize_v
         self.group_size = PLANAR_D  # block size matches upstream
         self.offset: int = 0
@@ -191,9 +193,9 @@ class PlanarQuantKVCache(_BaseCache):
     def _init_buffers(self, keys: mx.array, values: mx.array) -> None:
         B, H_k, _, D_k = keys.shape
         _, H_v, _, D_v = values.shape
-        if D_k % 2 != 0 or D_v % 2 != 0:
+        if D_k % 8 != 0 or D_v % 8 != 0:
             raise ValueError(
-                f"PlanarQuantKVCache requires even head_dim; "
+                f"PlanarQuantKVCache requires head_dim divisible by 8; "
                 f"got K head_dim={D_k}, V head_dim={D_v}"
             )
         cap = self.cache_step
@@ -244,6 +246,8 @@ class PlanarQuantKVCache(_BaseCache):
             arr = getattr(self, attr)
             if arr is not None:
                 setattr(self, attr, _pad(arr))
+        if self._v_fp16 is not None and self._v_fp16.shape[2] < new_cap:
+            self._v_fp16 = _pad(self._v_fp16)
         self._cap = new_cap
 
     @staticmethod
@@ -297,7 +301,10 @@ class PlanarQuantKVCache(_BaseCache):
             return
         B, H_k, _, D_k = self._k_dequant_cache.shape
         new_cache = mx.zeros((B, H_k, self._cap, D_k), dtype=mx.float16)
-        new_cache[..., :self.offset, :] = self._k_dequant_cache[..., :self.offset, :]
+        logical_len = self._logical_len()
+        new_cache[..., :logical_len, :] = self._k_dequant_cache[
+            ..., :logical_len, :
+        ]
         self._k_dequant_cache = new_cache
 
     def _grow_v_dequant_cache(self, new_end: int) -> None:
@@ -306,7 +313,10 @@ class PlanarQuantKVCache(_BaseCache):
             return
         B, H_v, _, D_v = self._v_dequant_cache.shape
         new_cache = mx.zeros((B, H_v, self._cap, D_v), dtype=mx.float16)
-        new_cache[..., :self.offset, :] = self._v_dequant_cache[..., :self.offset, :]
+        logical_len = self._logical_len()
+        new_cache[..., :logical_len, :] = self._v_dequant_cache[
+            ..., :logical_len, :
+        ]
         self._v_dequant_cache = new_cache
 
     def _flush_unpacked(self) -> None:
@@ -518,24 +528,25 @@ class PlanarQuantKVCache(_BaseCache):
     # ------------------------------------------------------------------
 
     def _current_state(self) -> tuple:
+        logical_len = self._logical_len()
         if not self._finalized:
             assert self._k_fp16 is not None
             assert self._v_fp16 is not None
             return (
-                FP16State(self._k_fp16[..., :self.offset, :]),
-                FP16State(self._v_fp16[..., :self.offset, :]),
+                FP16State(self._k_fp16[..., :logical_len, :]),
+                FP16State(self._v_fp16[..., :logical_len, :]),
             )
         k_state = PlanarQuantState(
-            self._k_packed[..., :self.offset, :],
-            self._k_norms[..., :self.offset, :],
+            self._k_packed[..., :logical_len, :],
+            self._k_norms[..., :logical_len, :],
         )
         if self.quantize_v:
             v_state = PlanarQuantState(
-                self._v_packed[..., :self.offset, :],
-                self._v_norms[..., :self.offset, :],
+                self._v_packed[..., :logical_len, :],
+                self._v_norms[..., :logical_len, :],
             )
         else:
-            v_state = FP16State(self._v_fp16[..., :self.offset, :])
+            v_state = FP16State(self._v_fp16[..., :logical_len, :])
         return k_state, v_state
 
     def dequantize(
@@ -816,40 +827,51 @@ class PlanarQuantKVCache(_BaseCache):
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
+    def _logical_len(self) -> int:
+        if isinstance(self.offset, mx.array):
+            return max(0, int(self.offset.max().item()))
+        return max(0, int(self.offset))
+
     @property
     def nbytes(self) -> int:
         total = 0
+        logical_len = self._logical_len()
         if self._k_fp16 is not None:
-            total += int(self._k_fp16[..., :self.offset, :].nbytes)
+            total += int(self._k_fp16[..., :logical_len, :].nbytes)
         if self._v_fp16 is not None:
-            total += int(self._v_fp16[..., :self.offset, :].nbytes)
+            total += int(self._v_fp16[..., :logical_len, :].nbytes)
         if self._k_packed is not None:
-            total += int(self._k_packed[..., :self.offset, :].nbytes)
-            total += int(self._k_norms[..., :self.offset, :].nbytes)
+            total += int(self._k_packed[..., :logical_len, :].nbytes)
+            total += int(self._k_norms[..., :logical_len, :].nbytes)
         if self._v_packed is not None:
-            total += int(self._v_packed[..., :self.offset, :].nbytes)
-            total += int(self._v_norms[..., :self.offset, :].nbytes)
+            total += int(self._v_packed[..., :logical_len, :].nbytes)
+            total += int(self._v_norms[..., :logical_len, :].nbytes)
+        if self._k_dequant_cache is not None:
+            total += int(self._k_dequant_cache[..., :self._k_dequant_offset, :].nbytes)
+        if self._v_dequant_cache is not None:
+            total += int(self._v_dequant_cache[..., :self._v_dequant_offset, :].nbytes)
         return total
 
     @property
     def state(self):
+        logical_len = self._logical_len()
         if self._k_fp16 is not None and not self._finalized:
-            return (self._k_fp16[..., :self.offset, :],
-                    self._v_fp16[..., :self.offset, :])
+            return (self._k_fp16[..., :logical_len, :],
+                    self._v_fp16[..., :logical_len, :])
         if self._k_packed is not None:
             # Pack any deferred decode rows before serializing
             self._flush_unpacked()
             k_state = PlanarQuantState(
-                self._k_packed[..., :self.offset, :],
-                self._k_norms[..., :self.offset, :],
+                self._k_packed[..., :logical_len, :],
+                self._k_norms[..., :logical_len, :],
             )
             if self.quantize_v and self._v_packed is not None:
                 v_state = PlanarQuantState(
-                    self._v_packed[..., :self.offset, :],
-                    self._v_norms[..., :self.offset, :],
+                    self._v_packed[..., :logical_len, :],
+                    self._v_norms[..., :logical_len, :],
                 )
             elif self._v_fp16 is not None:
-                v_state = FP16State(self._v_fp16[..., :self.offset, :])
+                v_state = FP16State(self._v_fp16[..., :logical_len, :])
             else:
                 v_state = None
             return _pack_state(k_state), _pack_state(v_state) if v_state else None
@@ -885,7 +907,7 @@ class PlanarQuantKVCache(_BaseCache):
         self._cap = T
         self._finalized = True
 
-        if v_tensor is not None:
+        if v_tensor is not None and self.quantize_v:
             v_idx, v_norm = _unpack_state(v_tensor, self._D_v, self._packed_last_v)
             self._H_v = v_idx.shape[1]
             self._D_v = v_idx.shape[-1] * 8 // 3
@@ -893,6 +915,14 @@ class PlanarQuantKVCache(_BaseCache):
             self._v_packed = v_idx
             self._v_norms = v_norm
             self.quantize_v = True
+        elif v_tensor is not None:
+            self._H_v = v_tensor.shape[1]
+            self._D_v = v_tensor.shape[-1]
+            self._packed_last_v = self._D_v // 4 + self._D_v // 8
+            self._v_fp16 = v_tensor.astype(mx.float16)
+            self._v_packed = None
+            self._v_norms = None
+            self.quantize_v = False
         else:
             self.quantize_v = False
 
@@ -1124,6 +1154,32 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
     def _packed_state_length(state: PlanarQuantState) -> int:
         return state.packed.shape[2]
 
+    @staticmethod
+    def _write_batch_rows(
+        buf: mx.array,
+        new: mx.array,
+        offsets: mx.array,
+    ) -> tuple[mx.array, int | None, int | None]:
+        """Write per-row chunks when offsets may start inside left padding."""
+        min_start: int | None = None
+        max_end: int | None = None
+        B = new.shape[0]
+        L = new.shape[2]
+        for b in range(B):
+            off = int(offsets[b].item())
+            src_start = max(0, -off)
+            if src_start >= L:
+                continue
+            dst_start = max(0, off)
+            n = L - src_start
+            dst_end = dst_start + n
+            buf[b, :, dst_start:dst_end, :] = new[
+                b : b + 1, :, src_start:, :
+            ].astype(buf.dtype)[0]
+            min_start = dst_start if min_start is None else min(min_start, dst_start)
+            max_end = dst_end if max_end is None else max(max_end, dst_end)
+        return buf, min_start, max_end
+
     # ------------------------------------------------------------------
     # update_and_fetch (batch override)
     # ------------------------------------------------------------------
@@ -1151,14 +1207,12 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
             assert self._k_fp16 is not None
             assert self._v_fp16 is not None
             if isinstance(self.offset, mx.array):
-                for b in range(B):
-                    off = int(self.offset[b].item())
-                    # Skip left-padded slots
-                    if off < 0:
-                        continue
-                    end = off + L
-                    self._k_fp16[b, :, off:end, :] = keys[b].astype(mx.float16)
-                    self._v_fp16[b, :, off:end, :] = values[b].astype(mx.float16)
+                self._k_fp16, _, _ = self._write_batch_rows(
+                    self._k_fp16, keys, self.offset
+                )
+                self._v_fp16, _, _ = self._write_batch_rows(
+                    self._v_fp16, values, self.offset
+                )
                 self.offset = self.offset + L
             else:
                 self._k_fp16 = self._write_slice(self._k_fp16, keys, self.offset)
@@ -1166,7 +1220,7 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
                 self.offset = self.offset + L
 
             # Return full buffer up to max valid position
-            max_valid = self._max_offset()
+            max_valid = max(0, self._max_offset())
             return (
                 FP16State(self._k_fp16[..., :max_valid, :]),
                 FP16State(self._v_fp16[..., :max_valid, :]),
@@ -1179,15 +1233,15 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
 
         assert self._k_dequant_cache is not None
         if isinstance(self.offset, mx.array):
-            for b in range(B):
-                off = int(self.offset[b].item())
-                if off < 0:
-                    continue
-                end = off + L
-                self._k_dequant_cache[b, :, off:end, :] = keys[b].astype(mx.float16)
-            if self._k_unpacked_start is None:
-                self._k_unpacked_start = int(self.offset.min().item())
-            self._k_unpacked_end = new_max
+            self._k_dequant_cache, k_start, k_end = self._write_batch_rows(
+                self._k_dequant_cache, keys, self.offset
+            )
+            if k_start is not None:
+                if self._k_unpacked_start is None:
+                    self._k_unpacked_start = k_start
+                else:
+                    self._k_unpacked_start = min(self._k_unpacked_start, k_start)
+                self._k_unpacked_end = max(self._k_unpacked_end or 0, k_end or k_start)
         else:
             k_fp16 = keys.astype(mx.float16)
             self._k_dequant_cache[..., self.offset:new_max, :] = k_fp16
@@ -1202,15 +1256,17 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
             self._grow_v_dequant_cache(new_max)
             assert self._v_dequant_cache is not None
             if isinstance(self.offset, mx.array):
-                for b in range(B):
-                    off = int(self.offset[b].item())
-                    if off < 0:
-                        continue
-                    end = off + L
-                    self._v_dequant_cache[b, :, off:end, :] = values[b].astype(mx.float16)
-                if self._v_unpacked_start is None:
-                    self._v_unpacked_start = int(self.offset.min().item())
-                self._v_unpacked_end = new_max
+                self._v_dequant_cache, v_start, v_end = self._write_batch_rows(
+                    self._v_dequant_cache, values, self.offset
+                )
+                if v_start is not None:
+                    if self._v_unpacked_start is None:
+                        self._v_unpacked_start = v_start
+                    else:
+                        self._v_unpacked_start = min(self._v_unpacked_start, v_start)
+                    self._v_unpacked_end = max(
+                        self._v_unpacked_end or 0, v_end or v_start
+                    )
             else:
                 v_fp16 = values.astype(mx.float16)
                 self._v_dequant_cache[..., self.offset:new_max, :] = v_fp16
@@ -1224,7 +1280,7 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
             else:
                 self.offset = new_max
 
-            max_valid = self._max_offset()
+            max_valid = max(0, self._max_offset())
             return (
                 FP16State(self._k_dequant_cache[..., :max_valid, :]),
                 FP16State(self._v_dequant_cache[..., :max_valid, :]),
@@ -1233,18 +1289,15 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
         # Asymmetric V
         assert self._v_fp16 is not None
         if isinstance(self.offset, mx.array):
-            for b in range(B):
-                off = int(self.offset[b].item())
-                if off < 0:
-                    continue
-                end = off + L
-                self._v_fp16[b, :, off:end, :] = values[b].astype(mx.float16)
+            self._v_fp16, _, _ = self._write_batch_rows(
+                self._v_fp16, values, self.offset
+            )
             self.offset = self.offset + L
         else:
             self._v_fp16 = self._write_slice(self._v_fp16, values, self.offset)
             self.offset = new_max
 
-        max_valid = self._max_offset()
+        max_valid = max(0, self._max_offset())
         return (
             FP16State(self._k_dequant_cache[..., :max_valid, :]),
             FP16State(self._v_fp16[..., :max_valid, :]),
@@ -1646,9 +1699,21 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
     def decode_attention(
         self,
         queries: mx.array,
+        keys_state=None,
+        values_state=None,
         scale: float = 1.0,
         mask: mx.array | None = None,
     ) -> mx.array:
+        if keys_state is not None or values_state is not None:
+            keys, values = self.dequantize(
+                keys_state=keys_state,
+                values_state=values_state,
+                out_dtype=queries.dtype,
+            )
+            return mx.fast.scaled_dot_product_attention(
+                queries, keys, values, scale=scale, mask=mask
+            )
+
         self._ensure_k_dequant_cache()
         keys = self._k_dequant_cache[..., :self._k_dequant_offset, :].astype(queries.dtype)
         if self.quantize_v:

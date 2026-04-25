@@ -232,6 +232,7 @@ class BatchedEngine(BaseEngine):
         )
 
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
+        pq_model_marked = False
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             pq_enabled = getattr(self._model_settings, "planarquant_kv_enabled", False)
@@ -246,16 +247,29 @@ class BatchedEngine(BaseEngine):
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
             if pq_enabled:
-                from ..patches.planarquant_cache import enable_planarquant_cache
+                from ..patches.planarquant_cache import (
+                    enable_planarquant_cache,
+                    mark_model_for_planarquant,
+                )
                 from ..patches.turboquant_attention import apply_turboquant_attention_patch
                 # The SDPA patch handles BOTH TQ and PQ dispatch
                 apply_turboquant_attention_patch()
                 pq_bits = int(getattr(self._model_settings, "planarquant_kv_bits", 3))
-                pq_quant_v = bool(getattr(self._model_settings, "planarquant_quantize_v", True))
+                pq_quant_v = bool(
+                    getattr(self._model_settings, "planarquant_quantize_v", True)
+                )
+                mark_model_for_planarquant(
+                    self._model, bits=pq_bits, quantize_v=pq_quant_v
+                )
+                pq_model_marked = True
                 enable_planarquant_cache(bits=pq_bits, quantize_v=pq_quant_v)
                 logger.info(
                     f"PlanarQuant3 KV cache enabled: {pq_bits}-bit, quantize_v={pq_quant_v}"
                 )
+        if not pq_model_marked:
+            from ..patches.planarquant_cache import mark_model_without_planarquant
+
+            mark_model_without_planarquant(self._model)
 
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()

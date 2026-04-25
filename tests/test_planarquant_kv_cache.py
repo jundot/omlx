@@ -27,12 +27,17 @@ def test_empty_cache_state():
     assert cache.nbytes == 0
 
 
-def test_head_dim_not_multiple_of_planar_d_raises():
+def test_head_dim_not_divisible_by_8_raises():
     cache = PlanarQuantKVCache()
-    k = mx.zeros((1, 1, 1, 127))
-    v = mx.zeros((1, 1, 1, 127))
-    with pytest.raises(ValueError, match="even"):
+    k = mx.zeros((1, 1, 1, 10))
+    v = mx.zeros((1, 1, 1, 10))
+    with pytest.raises(ValueError, match="divisible by 8"):
         cache.update_and_fetch(k, v)
+
+
+def test_non_three_bit_planarquant_rejected():
+    with pytest.raises(ValueError, match="3-bit"):
+        PlanarQuantKVCache(bits=4)
 
 
 def test_deferred_mode_returns_fp16_states(seeded_inputs):
@@ -142,6 +147,26 @@ def test_state_meta_state_roundtrip(seeded_inputs):
     assert float(mx.max(mx.abs(v1 - v2)).item()) < 1e-4
 
 
+def test_quantize_v_false_state_roundtrip_preserves_fp16_v(seeded_inputs):
+    cache = PlanarQuantKVCache(quantize_v=False)
+    cache.update_and_fetch(seeded_inputs, seeded_inputs)
+    cache.finalize_prefill()
+
+    meta = cache.meta_state
+    state = cache.state
+
+    cache2 = PlanarQuantKVCache()
+    cache2.meta_state = meta
+    cache2.state = state
+
+    assert cache2.quantize_v is False
+    assert cache2._v_packed is None
+    assert cache2._v_fp16 is not None
+    _, v1 = cache.dequantize()
+    _, v2 = cache2.dequantize()
+    assert float(mx.max(mx.abs(v1 - v2)).item()) < 1e-4
+
+
 def test_state_reset_via_none():
     cache = PlanarQuantKVCache()
     x = mx.random.normal((1, 1, 2, PLANAR_D))
@@ -196,6 +221,34 @@ def test_asymmetric_v_fp16(seeded_inputs):
     q = (mx.random.normal((1, 8, 1, PLANAR_D)) * 0.1).astype(mx.float16)
     out = cache.decode_attention(q, scale=1.0/PLANAR_D**0.5)
     assert out.shape == (1, 8, 1, PLANAR_D)
+
+
+def test_quantize_v_false_grows_v_buffer_after_finalize():
+    cache = PlanarQuantKVCache(quantize_v=False)
+    cache.cache_step = 2
+    x = mx.random.normal((1, 2, 2, PLANAR_D)) * 0.1
+    cache.update_and_fetch(x, x)
+    cache.finalize_prefill()
+
+    for _ in range(2):
+        t = mx.random.normal((1, 2, 1, PLANAR_D)) * 0.1
+        cache.update_and_fetch(t, t)
+
+    assert cache.offset == 4
+    assert cache._v_fp16 is not None
+    assert cache._v_fp16.shape[2] >= 4
+
+
+def test_nbytes_counts_runtime_dequant_caches(seeded_inputs):
+    cache = PlanarQuantKVCache()
+    cache.update_and_fetch(seeded_inputs, seeded_inputs)
+    cache.finalize_prefill()
+    packed_only = cache.nbytes
+
+    cache._ensure_k_dequant_cache()
+    cache._ensure_v_dequant_cache()
+
+    assert cache.nbytes > packed_only
 
 
 def test_memory_compression_ratio(seeded_inputs):

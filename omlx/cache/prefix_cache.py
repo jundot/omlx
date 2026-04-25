@@ -22,15 +22,13 @@ from .interface import CacheManager
 from .paged_ssd_cache import PagedSSDCacheManager
 from .paged_cache import (
     BlockTable,
-    CacheBlock,
     PagedCacheManager,
     compute_block_hash,
     resolve_block_extra_keys,
 )
-from .stats import BaseCacheStats, PrefixCacheStats
-from .type_handlers import CacheType, CacheTypeHandler
+from .stats import PrefixCacheStats
 from .type_registry import CacheTypeRegistry
-from .hybrid_cache import ModelCacheConfig, LayerCacheConfig
+from .hybrid_cache import ModelCacheConfig
 
 logger = logging.getLogger(__name__)
 
@@ -1440,13 +1438,6 @@ class BlockAwarePrefixCache(CacheManager):
                         f"block(s) with placeholder non-sliceable state, keeping "
                         f"{new_count} block(s) ({valid_token_count} tokens)"
                     )
-
-            # Build model cache config if we have type info
-            model_cache_config = None
-            if layer_cache_types and len(layer_cache_types) == num_layers:
-                model_cache_config = ModelCacheConfig.from_type_list(
-                    layer_cache_types, model_name=""
-                )
 
             # Reconstruct caches for each layer
             reconstructed_caches = []

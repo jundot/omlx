@@ -9,7 +9,7 @@ import copy
 import json
 import logging
 import threading
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -113,6 +113,7 @@ class ModelSettings:
     # DFlash speculative decoding (block-diffusion decode acceleration)
     dflash_enabled: bool = False
     dflash_draft_model: Optional[str] = None  # Override auto-resolved draft (None = auto from registry)
+    dflash_draft_quant_bits: Optional[int] = None  # Draft model quantization (None=bf16, 4)
     dflash_block_tokens: int = 16  # Tokens per speculative cycle (1-16)
     dflash_quantize_kv_cache: bool = False  # Quantized KV cache for target verify
 
@@ -126,6 +127,8 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
+        if int(self.planarquant_kv_bits) != 3:
+            raise ValueError("planarquant_kv_bits must be 3")
         if self.turboquant_kv_enabled and self.planarquant_kv_enabled:
             raise ValueError(
                 "turboquant_kv_enabled and planarquant_kv_enabled are "

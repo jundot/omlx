@@ -6,7 +6,7 @@ This module provides a registry for looking up cache type handlers
 by cache type enum or class name string.
 """
 
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict
 import logging
 
 from .type_handlers import (

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scale validation: PQ3 vs FP16 at increasing context + DFlash combined."""
 from __future__ import annotations
-import time, mlx.core as mx, sys
+import time, mlx.core as mx
 
 def main():
     model_id = "mlx-community/Qwen3.5-27B-4bit"
@@ -85,7 +85,6 @@ def main():
     print(f"{'':8} {'toks':>6} {'tok/s':>7} {'tok/s':>7} {'ms':>6} {'':>8} {'rat':>6} {'rat':>6} {'sim':>7}")
     print("-" * 70)
 
-    prev_fp16_logits = None
     for target in CONTEXTS:
         T, pf, f_tps, f_ms, f_mb, f_logits = _bench(False, target)
         T, pf, p_tps, p_ms, p_mb, p_logits = _bench(True, target)

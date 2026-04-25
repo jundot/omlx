@@ -876,6 +876,101 @@ class TestRuntimeCacheObservability:
         assert model_payload["last_partial_tokens_skipped"] == 577
 
 
+class TestPlanarQuantModelSettingsUpdate:
+    """Tests for PlanarQuant/TurboQuant settings update validation."""
+
+    @staticmethod
+    def _route_mocks(current_settings=None, loaded=True):
+        entry = SimpleNamespace(
+            engine=object() if loaded else None,
+            engine_type="batched",
+            model_type="llm",
+            is_pinned=False,
+        )
+        engine_pool = MagicMock()
+        engine_pool.get_entry.return_value = entry
+        engine_pool._entries = {"test-model": entry}
+
+        settings_manager = MagicMock()
+        settings_manager.get_settings.return_value = current_settings or ModelSettings()
+        settings_manager.get_all_settings.return_value = {"test-model": ModelSettings()}
+
+        server_state = SimpleNamespace(default_model=None)
+        return entry, engine_pool, settings_manager, server_state
+
+    def test_rejects_non_three_planarquant_bits(self):
+        from fastapi import HTTPException
+
+        _, engine_pool, settings_manager, server_state = self._route_mocks()
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool),
+            patch.object(
+                admin_routes, "_get_settings_manager", return_value=settings_manager
+            ),
+            patch.object(admin_routes, "_get_server_state", return_value=server_state),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            asyncio.run(
+                admin_routes.update_model_settings(
+                    "test-model",
+                    admin_routes.ModelSettingsRequest(planarquant_kv_bits=4),
+                    is_admin=True,
+                )
+            )
+
+        assert exc_info.value.status_code == 400
+        settings_manager.set_settings.assert_not_called()
+
+    def test_planarquant_changes_loaded_model_require_reload(self):
+        _, engine_pool, settings_manager, server_state = self._route_mocks()
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool),
+            patch.object(
+                admin_routes, "_get_settings_manager", return_value=settings_manager
+            ),
+            patch.object(admin_routes, "_get_server_state", return_value=server_state),
+        ):
+            result = asyncio.run(
+                admin_routes.update_model_settings(
+                    "test-model",
+                    admin_routes.ModelSettingsRequest(
+                        planarquant_kv_enabled=True,
+                        planarquant_quantize_v=False,
+                    ),
+                    is_admin=True,
+                )
+            )
+
+        assert result["requires_reload"] is True
+        saved = settings_manager.set_settings.call_args.args[1]
+        assert saved.planarquant_kv_enabled is True
+        assert saved.planarquant_quantize_v is False
+
+    def test_turboquant_changes_loaded_model_require_reload(self):
+        _, engine_pool, settings_manager, server_state = self._route_mocks()
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool),
+            patch.object(
+                admin_routes, "_get_settings_manager", return_value=settings_manager
+            ),
+            patch.object(admin_routes, "_get_server_state", return_value=server_state),
+        ):
+            result = asyncio.run(
+                admin_routes.update_model_settings(
+                    "test-model",
+                    admin_routes.ModelSettingsRequest(turboquant_kv_bits=3),
+                    is_admin=True,
+                )
+            )
+
+        assert result["requires_reload"] is True
+        saved = settings_manager.set_settings.call_args.args[1]
+        assert saved.turboquant_kv_bits == 3
+
+
 class TestGlobalSettingsValidation:
     """Tests for stricter GlobalSettingsRequest validation."""
 

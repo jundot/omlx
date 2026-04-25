@@ -11,6 +11,8 @@ from omlx.patches.planarquant_cache import (
     disable_planarquant_cache,
     enable_planarquant_cache,
     is_planarquant_active,
+    mark_model_for_planarquant,
+    mark_model_without_planarquant,
 )
 
 
@@ -75,6 +77,28 @@ def test_quantize_v_flag_propagated():
     assert all(not c.quantize_v for c in wrapped)
 
 
+def test_disabled_model_marker_prevents_global_hook_leakage():
+    enable_planarquant_cache(3.0)
+    model = mark_model_without_planarquant(_make_fake_model())
+
+    wrapped = mlx_cache.make_prompt_cache(model)
+
+    assert len(wrapped) == 4
+    assert not any(isinstance(c, PlanarQuantKVCache) for c in wrapped)
+
+
+def test_model_marker_overrides_global_quantize_v_default():
+    enable_planarquant_cache(3.0, quantize_v=True)
+    model = mark_model_for_planarquant(
+        _make_fake_model(), bits=3.0, quantize_v=False
+    )
+
+    wrapped = mlx_cache.make_prompt_cache(model)
+
+    assert all(isinstance(c, PlanarQuantKVCache) for c in wrapped)
+    assert all(not c.quantize_v for c in wrapped)
+
+
 def test_model_settings_round_trip():
     """ModelSettings round-trips PQ fields through to_dict / from_dict."""
     from omlx.model_settings import ModelSettings
@@ -103,3 +127,14 @@ def test_model_settings_defaults():
     assert s.planarquant_kv_enabled is False
     assert s.planarquant_kv_bits == 3
     assert s.planarquant_quantize_v is True
+
+
+def test_model_settings_rejects_non_three_planarquant_bits():
+    from omlx.model_settings import ModelSettings
+
+    try:
+        ModelSettings(planarquant_kv_bits=4)
+    except ValueError as exc:
+        assert "planarquant_kv_bits" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for unsupported PlanarQuant bits")

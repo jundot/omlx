@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 
 import mlx.core as mx
@@ -52,7 +51,6 @@ def bench_batch_ops(H: int = 16, D: int = 128, T: int = 256, B: int = 4,
     results["filter"] = (sum(times) / len(times)) * 1000
 
     # --- prepare ---
-    batch2 = BatchPlanarQuantKVCache(left_padding=[0] * B, bits=bits, quantize_v=quantize_v)
     times = []
     lp = list(range(B))
     for _ in range(n_iter):
@@ -64,10 +62,6 @@ def bench_batch_ops(H: int = 16, D: int = 128, T: int = 256, B: int = 4,
     results["prepare"] = (sum(times) / len(times)) * 1000
 
     # --- extend ---
-    c1 = _make_single(T)
-    c2 = _make_single(T)
-    b1 = BatchPlanarQuantKVCache.merge([c1])
-    b2 = BatchPlanarQuantKVCache.merge([c2])
     times = []
     for _ in range(n_iter):
         # Reset b1/b2 for each iteration
@@ -119,7 +113,7 @@ def bench_batch_ops(H: int = 16, D: int = 128, T: int = 256, B: int = 4,
         mx.eval(batch5r._k_dequant_cache)
         mx.synchronize()
         t0 = time.perf_counter()
-        freed = batch5r.evict_dequant_caches()
+        batch5r.evict_dequant_caches()
         times.append(time.perf_counter() - t0)
     results["evict_dequant"] = (sum(times) / len(times)) * 1000
 
@@ -184,7 +178,7 @@ def bench_batch_decode(model, tokenizer, prompt_lens: list[int], decode_steps: i
             try:
                 logits = model(batch_tokens, cache=cache)
                 mx.eval(logits)
-            except Exception as e:
+            except Exception:
                 # Some models don't support batched prefill directly
                 # Fall back to sequential prefill
                 for i in range(B):
@@ -336,7 +330,6 @@ def bench_single_decode(model, tokenizer, prompt: str, decode_steps: int = 64,
 
 def bench_memory_per_token(H: int = 16, D: int = 128, bits: float = 3.0):
     """Benchmark memory per token across storage modes."""
-    from omlx.cache.planarquant.kv_cache import PlanarQuantKVCache
 
     # FP16 K+V
     fp16_bytes = H * D * 2 * 2  # K+V, 2 bytes each
