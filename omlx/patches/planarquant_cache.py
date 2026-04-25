@@ -46,6 +46,13 @@ def enable_planarquant_cache(bits: float = 3.0, quantize_v: bool = True) -> None
     _ACTIVE_BITS = float(bits)
     _QUANTIZE_V = quantize_v
 
+    try:
+        from ..cache.planarquant.metal_kernels import warm_planarquant_kernels
+
+        warm_planarquant_kernels()
+    except Exception:
+        logger.debug("PlanarQuant kernel warmup unavailable", exc_info=True)
+
     if _PATCHED:
         return
 

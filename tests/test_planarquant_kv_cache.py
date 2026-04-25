@@ -84,6 +84,36 @@ def test_decode_after_finalize_returns_fp16_via_dequant_cache(seeded_inputs):
     assert cache._k_unpacked_end is None
 
 
+def test_dequantize_after_decode_uses_lazy_rows(seeded_inputs):
+    cache = PlanarQuantKVCache()
+    cache.update_and_fetch(seeded_inputs, seeded_inputs)
+    cache.finalize_prefill()
+
+    t = (mx.random.normal((1, 8, 1, PLANAR_D)) * 0.1).astype(mx.float16)
+    cache.update_and_fetch(t, t)
+
+    k, v = cache.dequantize()
+    assert k.shape[2] == 5
+    assert v.shape[2] == 5
+    assert float(mx.max(mx.abs(k[..., -1:, :] - t)).item()) == pytest.approx(0.0, abs=1e-5)
+    assert float(mx.max(mx.abs(v[..., -1:, :] - t)).item()) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_dequantize_after_decode_uses_lazy_rows_k_only(seeded_inputs):
+    cache = PlanarQuantKVCache(quantize_v=False)
+    cache.update_and_fetch(seeded_inputs, seeded_inputs)
+    cache.finalize_prefill()
+
+    t = (mx.random.normal((1, 8, 1, PLANAR_D)) * 0.1).astype(mx.float16)
+    cache.update_and_fetch(t, t)
+
+    k, v = cache.dequantize()
+    assert k.shape[2] == 5
+    assert v.shape[2] == 5
+    assert float(mx.max(mx.abs(k[..., -1:, :] - t)).item()) == pytest.approx(0.0, abs=1e-5)
+    assert float(mx.max(mx.abs(v[..., -1:, :] - t)).item()) == pytest.approx(0.0, abs=1e-5)
+
+
 def test_multi_step_growth(seeded_inputs):
     cache = PlanarQuantKVCache()
     cache.update_and_fetch(seeded_inputs, seeded_inputs)

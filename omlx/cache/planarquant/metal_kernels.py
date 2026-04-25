@@ -17,14 +17,19 @@ Kernels 2+3 form the fused SDPA decode path that never materializes K/V.
 
 from __future__ import annotations
 
+import logging
+
 import mlx.core as mx
 
 from .constants import centroids_mx, cos_sin_mx, midpoints_mx
+
+logger = logging.getLogger(__name__)
 
 _DEQUANT_KERNEL = None
 _QK_KERNEL = None
 _AV_KERNEL = None
 _QUANT_KERNEL = None
+_WARMED_DIMS: set[int] = set()
 
 # ---------------------------------------------------------------------------
 # 1. Fused dequant kernel (packed layout)
@@ -428,7 +433,8 @@ def dequantize_fused(
     for s in batch_shape:
         n *= int(s)
 
-    packed_flat = packed.astype(mx.uint8).reshape((n, packed_last))
+    packed_flat = packed if packed.dtype == mx.uint8 else packed.astype(mx.uint8)
+    packed_flat = packed_flat.reshape((n, packed_last))
     norms_flat = norms.astype(mx.float32).reshape((n, 1))
 
     cos_tab, sin_tab = cos_sin_mx(n_pairs)
@@ -612,6 +618,26 @@ def quantize_fused(
     packed = packed_out.reshape((*batch_shape, packed_last))
     norms = norms_out.reshape((*batch_shape, 1))
     return packed, norms
+
+
+def warm_planarquant_kernels(d: int = 128) -> bool:
+    """Compile PlanarQuant quantize/dequant kernels before first decode."""
+    if d in _WARMED_DIMS:
+        return True
+    try:
+        x = mx.zeros((1, 1, 1, d), dtype=mx.float16)
+        packed, norms = quantize_fused(x)
+        dequant = dequantize_fused(packed, norms, out_dtype=mx.float16)
+        mx.eval(packed, norms, dequant)
+        try:
+            mx.synchronize()
+        except Exception:
+            pass
+        _WARMED_DIMS.add(d)
+        return True
+    except Exception as exc:
+        logger.debug("PlanarQuant kernel warmup skipped: %s", exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
