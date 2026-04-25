@@ -232,13 +232,44 @@ class BatchedEngine(BaseEngine):
         )
 
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
+        pq_model_marked = False
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            pq_enabled = getattr(self._model_settings, "planarquant_kv_enabled", False)
+            if tq_enabled and pq_enabled:
+                raise ValueError(
+                    "turboquant_kv_enabled and planarquant_kv_enabled are "
+                    "mutually exclusive — both patch SDPA dispatch"
+                )
             if tq_enabled:
                 from ..patches.turboquant_attention import apply_turboquant_attention_patch
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
+            if pq_enabled:
+                from ..patches.planarquant_cache import (
+                    enable_planarquant_cache,
+                    mark_model_for_planarquant,
+                )
+                from ..patches.turboquant_attention import apply_turboquant_attention_patch
+                # The SDPA patch handles BOTH TQ and PQ dispatch
+                apply_turboquant_attention_patch()
+                pq_bits = int(getattr(self._model_settings, "planarquant_kv_bits", 3))
+                pq_quant_v = bool(
+                    getattr(self._model_settings, "planarquant_quantize_v", True)
+                )
+                mark_model_for_planarquant(
+                    self._model, bits=pq_bits, quantize_v=pq_quant_v
+                )
+                pq_model_marked = True
+                enable_planarquant_cache(bits=pq_bits, quantize_v=pq_quant_v)
+                logger.info(
+                    f"PlanarQuant3 KV cache enabled: {pq_bits}-bit, quantize_v={pq_quant_v}"
+                )
+        if not pq_model_marked:
+            from ..patches.planarquant_cache import mark_model_without_planarquant
+
+            mark_model_without_planarquant(self._model)
 
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()
@@ -268,6 +299,11 @@ class BatchedEngine(BaseEngine):
                     self._model_settings, "turboquant_skip_last", True
                 )
 
+            pq_enabled = getattr(self._model_settings, "planarquant_kv_enabled", False)
+            if pq_enabled:
+                pq_bits = int(getattr(self._model_settings, "planarquant_kv_bits", 3))
+                self._engine.engine.scheduler._planarquant_kv_bits = pq_bits
+
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
             specprefill_draft = getattr(self._model_settings, "specprefill_draft_model", None)
@@ -284,6 +320,48 @@ class BatchedEngine(BaseEngine):
                     logger.info(f"SpecPrefill: draft model loaded ({specprefill_draft})")
                 except Exception as e:
                     logger.error(f"SpecPrefill: draft model load failed: {e}")
+
+        # DFlash speculative decoding: load draft model and install hooks
+        if self._model_settings is not None:
+            dflash_enabled = getattr(self._model_settings, "dflash_enabled", False)
+            if dflash_enabled:
+                try:
+                    from ..patches.dflash import load_dflash_draft
+                    dflash_draft_ref = getattr(
+                        self._model_settings, "dflash_draft_model", None
+                    )
+                    dflash_block_tokens = int(
+                        getattr(self._model_settings, "dflash_block_tokens", 16)
+                    )
+                    dflash_quantize_kv = bool(
+                        getattr(self._model_settings, "dflash_quantize_kv_cache", False)
+                    )
+                    draft_model, resolved_ref = await loop.run_in_executor(
+                        get_mlx_executor(),
+                        lambda: load_dflash_draft(
+                            self._model_name,
+                            draft_ref_override=dflash_draft_ref,
+                        ),
+                    )
+                    if draft_model is not None:
+                        self._engine.engine.scheduler.set_dflash_draft_model(
+                            draft_model,
+                            draft_ref=resolved_ref,
+                            block_tokens=dflash_block_tokens,
+                            quantize_kv_cache=dflash_quantize_kv,
+                            target_model=self._model,
+                        )
+                        logger.info(
+                            f"DFlash: draft model loaded ({resolved_ref}), "
+                            f"block_tokens={dflash_block_tokens}"
+                        )
+                    else:
+                        logger.warning(
+                            f"DFlash: no draft model found for {self._model_name}, "
+                            f"falling back to AR decode"
+                        )
+                except Exception as e:
+                    logger.error(f"DFlash: draft model load failed: {e}")
 
         self._loaded = True
         logger.info(f"BatchedEngine loaded: {self._model_name}")

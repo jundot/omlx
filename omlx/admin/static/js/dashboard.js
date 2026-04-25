@@ -178,6 +178,7 @@
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
             showClearSsdCacheConfirm: false,
+            showLatencyDetails: false,
             _statsRefreshTimer: null,
 
             // Log viewer state
@@ -1542,13 +1543,17 @@
                     index_cache_freq: settings.index_cache_freq || null,
                     turboquant_kv_enabled: settings.turboquant_kv_enabled || false,
                     turboquant_kv_bits: settings.turboquant_kv_bits || 4,
+                    planarquant_kv_enabled: settings.planarquant_kv_enabled || false,
+                    planarquant_kv_bits: settings.planarquant_kv_bits || 3,
+                    planarquant_quantize_v: settings.planarquant_quantize_v !== false,
                     specprefill_enabled: settings.specprefill_enabled || false,
                     specprefill_draft_model: settings.specprefill_draft_model || '',
                     specprefill_keep_pct: settings.specprefill_keep_pct ? String(settings.specprefill_keep_pct) : '0.2',
                     specprefill_threshold: settings.specprefill_threshold || null,
                     dflash_enabled: settings.dflash_enabled || false,
                     dflash_draft_model: settings.dflash_draft_model || '',
-                    dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
+                    dflash_block_tokens: settings.dflash_block_tokens || 16,
+                    dflash_quantize_kv_cache: settings.dflash_quantize_kv_cache || false,
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
@@ -1616,6 +1621,11 @@
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
+                                planarquant_kv_enabled: this.modelSettings.planarquant_kv_enabled,
+                                planarquant_kv_bits: this.modelSettings.planarquant_kv_enabled
+                                    ? (parseInt(this.modelSettings.planarquant_kv_bits) || 3)
+                                    : 3,
+                                planarquant_quantize_v: this.modelSettings.planarquant_quantize_v !== false,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
                                 specprefill_keep_pct: this.modelSettings.specprefill_enabled
@@ -1626,8 +1636,11 @@
                                     : null,
                                 dflash_enabled: this.modelSettings.dflash_enabled,
                                 dflash_draft_model: this.modelSettings.dflash_draft_model || null,
-                                dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_bits)
+                                dflash_block_tokens: this.modelSettings.dflash_enabled
+                                    ? (this.modelSettings.dflash_block_tokens || 16)
+                                    : null,
+                                dflash_quantize_kv_cache: this.modelSettings.dflash_enabled
+                                    ? this.modelSettings.dflash_quantize_kv_cache
                                     : null,
                             };
                         })()),
@@ -2038,6 +2051,14 @@
                     console.error('Failed to copy:', err);
                 }
                 document.body.removeChild(textarea);
+            },
+
+            copyJsonStats() {
+                const statsToCopy = {
+                    ...this.stats,
+                    alltimeStats: this.alltimeStats,
+                };
+                this.copyToClipboard(JSON.stringify(statsToCopy, null, 2));
             },
 
             async logout() {

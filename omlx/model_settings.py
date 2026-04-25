@@ -9,7 +9,7 @@ import copy
 import json
 import logging
 import threading
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -98,16 +98,24 @@ class ModelSettings:
     turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
     turboquant_skip_last: bool = True  # Skip last KVCache layer (prevents corruption on sensitive models)
 
+    # PlanarQuant KV cache (2D Givens rotation + 3-bit Lloyd-Max, omlx-native)
+    # Mutually exclusive with TurboQuant — both patch SDPA dispatch.
+    planarquant_kv_enabled: bool = False
+    planarquant_kv_bits: int = 3  # only 3 supported in v1; reserved for planar4/iso3/iso4
+    planarquant_quantize_v: bool = True  # True = K+V quantized, False = K only
+
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
     specprefill_draft_model: Optional[str] = None  # Path to draft model (must share tokenizer)
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
 
-    # DFlash (block diffusion speculative decoding)
+    # DFlash speculative decoding (block-diffusion decode acceleration)
     dflash_enabled: bool = False
-    dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
+    dflash_draft_model: Optional[str] = None  # Override auto-resolved draft (None = auto from registry)
     dflash_draft_quant_bits: Optional[int] = None  # Draft model quantization (None=bf16, 4)
+    dflash_block_tokens: int = 16  # Tokens per speculative cycle (1-16)
+    dflash_quantize_kv_cache: bool = False  # Quantized KV cache for target verify
 
     # Model management flags
     is_pinned: bool = False
@@ -117,6 +125,25 @@ class ModelSettings:
     display_name: Optional[str] = None
     description: Optional[str] = None
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
+
+    def __post_init__(self) -> None:
+        if int(self.planarquant_kv_bits) != 3:
+            raise ValueError("planarquant_kv_bits must be 3")
+        if self.turboquant_kv_enabled and self.planarquant_kv_enabled:
+            raise ValueError(
+                "turboquant_kv_enabled and planarquant_kv_enabled are "
+                "mutually exclusive — both patch SDPA dispatch"
+            )
+        if self.dflash_enabled and self.turboquant_kv_enabled:
+            raise ValueError(
+                "dflash_enabled and turboquant_kv_enabled are "
+                "mutually exclusive — both patch SDPA dispatch"
+            )
+        if self.dflash_enabled and self.planarquant_kv_enabled:
+            raise ValueError(
+                "dflash_enabled and planarquant_kv_enabled are "
+                "mutually exclusive — both patch SDPA dispatch"
+            )
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

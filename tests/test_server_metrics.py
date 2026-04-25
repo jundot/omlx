@@ -3,7 +3,6 @@
 
 import json
 import threading
-from pathlib import Path
 
 import pytest
 
@@ -187,8 +186,21 @@ class TestServerMetrics:
             "total_prompt_tokens",
             "total_completion_tokens",
             "total_requests",
+            "total_tokens_in",
+            "total_tokens_out",
             "avg_prefill_tps",
+            "avg_prefill_duration",
             "avg_generation_tps",
+            "avg_generation_duration",
+            "tokens_per_second_total",
+            "generation_p50",
+            "generation_p95",
+            "prefill_p50",
+            "prefill_p95",
+            "requests_per_minute",
+            "ttft_p50",
+            "ttft_p95",
+            "ttft_p99",
             "uptime_seconds",
         }
         assert set(snapshot.keys()) == expected_fields

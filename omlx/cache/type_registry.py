@@ -6,7 +6,7 @@ This module provides a registry for looking up cache type handlers
 by cache type enum or class name string.
 """
 
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict
 import logging
 
 from .type_handlers import (
@@ -53,6 +53,10 @@ class CacheTypeRegistry:
         # checks the class name first and routes to TQ-specific handling)
         "TurboQuantKVCache": CacheType.KVCACHE,
         "BatchTurboQuantKVCache": CacheType.KVCACHE,
+        # PlanarQuant: same rationale as TurboQuant — treated as KVCache-shaped
+        # so supports_block_slicing = True; prefix_cache special-cases by name.
+        "PlanarQuantKVCache": CacheType.KVCACHE,
+        "BatchPlanarQuantKVCache": CacheType.KVCACHE,
     }
 
     # Default handler instance

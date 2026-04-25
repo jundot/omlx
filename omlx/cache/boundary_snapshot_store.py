@@ -20,11 +20,8 @@ import os
 import queue
 import shutil
 import threading
-import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
-import numpy as np
 
 from .paged_ssd_cache import (
     HAS_MLX,
@@ -263,16 +260,34 @@ class BoundarySnapshotSSDStore:
 
     def cleanup_all(self) -> None:
         """Delete all snapshot files (for reset/startup)."""
+        with self._pending_lock:
+            cancelled_requests = {key[0] for key in self._pending_writes}
+        for request_id in cancelled_requests:
+            self._cancelled_requests[request_id] = max(
+                self._cancelled_requests.get(request_id, 0),
+                1,
+            )
+
         # Drain write queue so the writer thread doesn't process stale
         # items after the directory is deleted.
         while True:
             try:
                 item = self._write_queue.get_nowait()
                 if item is None:  # Sentinel — put it back for shutdown.
+                    self._write_queue.task_done()
                     self._write_queue.put(item)
                     break
+                cancelled_requests.add(item[0][0])
+                self._write_queue.task_done()
             except queue.Empty:
                 break
+
+        for request_id in cancelled_requests:
+            self._cancelled_requests[request_id] = max(
+                self._cancelled_requests.get(request_id, 0),
+                1,
+            )
+        self._write_queue.join()
 
         with self._pending_lock:
             self._pending_writes.clear()
@@ -320,6 +335,7 @@ class BoundarySnapshotSSDStore:
                 continue
 
             if item is None:  # Sentinel
+                self._write_queue.task_done()
                 break
 
             pw_key, tensors_raw, metadata, file_path = item
@@ -392,6 +408,7 @@ class BoundarySnapshotSSDStore:
                     # If file was written successfully, remove entirely.
                     if file_path.exists():
                         self._pending_writes.pop(pw_key, None)
+                self._write_queue.task_done()
 
 
     def _serialize_extracted(

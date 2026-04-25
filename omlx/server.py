@@ -119,13 +119,9 @@ from .api.rerank_models import (
     RerankUsage,
 )
 from .api.responses_models import (
-    OutputContent,
     OutputItem,
     ResponseObject,
     ResponsesRequest,
-    ResponsesTool,
-    ResponseUsage,
-    TextConfig,
 )
 from .api.responses_utils import (
     ResponseStore,
@@ -148,13 +144,11 @@ from .api.tool_calling import (
     restore_gemma4_param_names,
     extract_tool_calls_with_thinking,
     parse_json_output,
-    parse_tool_calls,
-    parse_tool_calls_with_thinking_fallback,
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
-from .api.utils import clean_output_text, clean_special_tokens, extract_multimodal_content, extract_text_content
-from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
+from .api.utils import clean_special_tokens, extract_multimodal_content, extract_text_content
+from .engine import BaseEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
@@ -1801,6 +1795,11 @@ async def create_completion(
             status_code=503,
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
+
+    # Record request start for queue time metrics
+    from omlx.server_metrics import get_server_metrics
+    get_server_metrics().record_request_start(model_id=request.model)
+
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
@@ -1942,6 +1941,12 @@ async def create_chat_completion(
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
+
+    # Record request start for queue time metrics
+    # We don't have accurate queue time here, but we can track the request arrival
+    # The actual queue time would be between request arrival and start of processing
+    from omlx.server_metrics import get_server_metrics
+    get_server_metrics().record_request_start(model_id=request.model)
 
     # Resolve alias to real model ID for settings lookups
     resolved_model = resolve_model_id(request.model) or request.model
@@ -2131,6 +2136,10 @@ async def create_chat_completion(
         chat_kwargs["specprefill_threshold"] = request.specprefill_threshold
     elif _server_state.settings_manager and ms.specprefill_threshold is not None:
         chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
+
+    # DFlash: per-request override
+    if getattr(request, "dflash", None) is not None:
+        chat_kwargs["dflash"] = request.dflash
 
     if request.stream:
         return StreamingResponse(
@@ -3112,7 +3121,6 @@ async def stream_anthropic_messages(
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
         )
-        cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
 
     # Reverse Gemma 4 parameter renaming
@@ -3625,17 +3633,13 @@ async def create_response(
     openai_tools = convert_responses_tools(request.tools)
 
     # Get per-model settings
-    max_tool_result_tokens = None
     merged_ct_kwargs = {}
-    forced_keys: set[str] = set()
     reasoning_parser = None
     if _server_state.settings_manager:
         ms = _server_state.settings_manager.get_settings(resolved_model)
-        max_tool_result_tokens = ms.max_tool_result_tokens
         reasoning_parser = ms.reasoning_parser
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
-        forced_keys = set(ms.forced_ct_kwargs or [])
         # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
         if ms.enable_thinking is not None:
             merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
