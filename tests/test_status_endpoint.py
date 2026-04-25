@@ -156,3 +156,28 @@ class TestStatusEndpoint:
         data = resp.json()
         assert data["model_memory_max"] is None
         assert data["model_memory_max_formatted"] == "unlimited"
+
+    def test_claude_code_fields_default_when_no_settings(self, client):
+        """Issue #163: when global_settings is None, claude_code fields use safe defaults."""
+        self._state.global_settings = None
+        resp = client.get("/api/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["claude_code_context_scaling_enabled"] is False
+        assert data["claude_code_target_context_size"] == 200000
+
+    def test_claude_code_fields_reflect_settings(self, client):
+        """Issue #163: claude_code fields surface configured values for statusline polling."""
+        claude_code = MagicMock(spec=["context_scaling_enabled", "target_context_size"])
+        claude_code.context_scaling_enabled = True
+        claude_code.target_context_size = 131072
+        global_settings = MagicMock(spec=["claude_code"])
+        global_settings.claude_code = claude_code
+
+        self._state.global_settings = global_settings
+
+        resp = client.get("/api/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["claude_code_context_scaling_enabled"] is True
+        assert data["claude_code_target_context_size"] == 131072
