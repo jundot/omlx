@@ -133,6 +133,23 @@ def test_memory_pressure_mode_evicts_caches():
     assert cache.memory_pressure is True
 
 
+def test_memory_pressure_default_tile_autotunes_long_contexts():
+    cache = PlanarQuantKVCache(bits=3, quantize_v=True)
+    cache.enable_memory_pressure_mode()
+
+    assert cache.tile_size == 4096
+    assert cache._effective_tile_size(4096, 8192) == 4096
+    assert cache._effective_tile_size(4096, 16_384) == 16_384
+
+
+def test_memory_pressure_explicit_tile_can_disable_autotune():
+    cache = PlanarQuantKVCache(bits=3, quantize_v=True)
+    cache.enable_memory_pressure_mode(auto_tile_size=False)
+
+    assert cache._effective_tile_size(4096, 32_768) == 4096
+    assert cache._effective_tile_size(1024, 32_768) == 1024
+
+
 def test_memory_pressure_update_and_fetch_eager_packs():
     """Under memory_pressure, update_and_fetch writes to _k_packed directly
     and never allocates a dequant cache."""

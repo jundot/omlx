@@ -190,6 +190,23 @@ class TestBatchUpdateAndFetch:
         assert float(cache._k_fp16[1, 0, 0, 0].item()) == pytest.approx(3.0)
         assert float(cache._k_fp16[1, 0, 2, 0].item()) == pytest.approx(5.0)
 
+    def test_uniform_batch_write_fast_path_matches_row_loop(self):
+        buf_slow = mx.zeros((4, 2, 8, PLANAR_D), dtype=mx.float16)
+        buf_fast = mx.zeros((4, 2, 8, PLANAR_D), dtype=mx.float16)
+        x = mx.random.normal((4, 2, 2, PLANAR_D)).astype(mx.float16)
+        offsets = mx.array([3, 3, 3, 3])
+
+        slow, slow_start, slow_end = BatchPlanarQuantKVCache._write_batch_rows(
+            buf_slow, x, offsets, try_uniform=False
+        )
+        fast, fast_start, fast_end = BatchPlanarQuantKVCache._write_batch_rows(
+            buf_fast, x, offsets, try_uniform=True
+        )
+
+        assert slow_start == fast_start == 3
+        assert slow_end == fast_end == 5
+        assert mx.array_equal(slow, fast)
+
 
 # ---------------------------------------------------------------------------
 # make_mask
