@@ -1203,6 +1203,57 @@ class TestParseToolCallsSyntaxError:
         assert tool_calls is None or len(tool_calls) == 0
 
 
+class TestParseNakedQwenFunctionCalls:
+    """Regression coverage for Qwen-Coder omitting the outer <tool_call> tag."""
+
+    def _qwen_tok(self):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = None
+        return tok
+
+    def test_naked_function_call_is_recovered(self):
+        tok = self._qwen_tok()
+
+        text = (
+            "I'll inspect it.\n"
+            "<function=read_file>\n"
+            "<parameter=path>/tmp/example.py</parameter>\n"
+            "<parameter=limit>20</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert cleaned == "I'll inspect it."
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "read_file"
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "path": "/tmp/example.py",
+            "limit": 20,
+        }
+
+    def test_multiple_naked_function_calls_are_recovered(self):
+        tok = self._qwen_tok()
+
+        text = (
+            "<function=first><parameter=value>true</parameter></function>"
+            "<function=second><parameter=name>alpha</parameter></function>"
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert cleaned == ""
+        assert tool_calls is not None
+        assert [tc.function.name for tc in tool_calls] == ["first", "second"]
+        assert json.loads(tool_calls[0].function.arguments) == {"value": True}
+        assert json.loads(tool_calls[1].function.arguments) == {"name": "alpha"}
+
+
 class TestParseBracketToolCalls:
     """Tests for bracket-style tool call parsing (issue #159)."""
 
