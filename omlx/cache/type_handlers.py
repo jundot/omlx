@@ -12,6 +12,8 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 
+from ._rotating_subclass import PrefillReadyRotatingKVCache
+
 logger = logging.getLogger(__name__)
 
 # Try to import mlx for tensor operations
@@ -380,13 +382,20 @@ class RotatingKVCacheHandler(CacheTypeHandler):
         state: Dict[str, Any],
         meta_state: Optional[Tuple] = None,
     ) -> Any:
-        """Reconstruct RotatingKVCache from state."""
-        try:
-            from mlx_lm.models.cache import RotatingKVCache
-        except ImportError:
-            logger.error("mlx_lm not available for cache reconstruction")
-            return None
+        """Reconstruct RotatingKVCache from state.
 
+        mlx-lm v0.31.3 contract:
+          - ``keys.shape[2]`` is the actual buffer length (≤ ``max_size``).
+          - ``_idx == keys.shape[2]`` puts ``_temporal_order`` in case 1
+            (return as-is), so the buffer is read in temporal order
+            during merge.
+          - ``size()`` (clamped via PrefillReadyRotatingKVCache) reports
+            the real RHS slice length, never overshooting the buffer.
+
+        We never zero-pad the buffer to ``max_size``: doing so would
+        leak zero positions into attention during BatchRotatingKVCache
+        merge, causing softmax dilution (#934, #903).
+        """
         keys = state.get("keys")
         values = state.get("values")
 
@@ -395,25 +404,25 @@ class RotatingKVCacheHandler(CacheTypeHandler):
 
         # Parse meta_state: (keep, max_size, offset, _idx)
         if meta_state and len(meta_state) >= 4:
-            keep, max_size, offset, _idx = map(int, meta_state[:4])
+            keep, max_size, offset, _idx_unused = map(int, meta_state[:4])
         else:
-            # Use defaults from state or tensor shape
             keep = state.get("keep", 0)
             max_size = state.get("max_size", keys.shape[2])
             offset = state.get("offset", keys.shape[2])
-            _idx = state.get("_idx", 0)
 
-        # Backward-compatible canonicalization for oversized rotating snapshots.
-        # Older snapshots could persist prefill-internal states where seq_len >
-        # max_size (e.g., max_size + chunk_size - 1). Those states are not
-        # merge-safe when reintroduced as per-request prompt caches.
+        # Trim oversized prefill-internal snapshots back to max_size.
+        # Boundary snapshots can hold seq_len = max_size + chunk_size - 1
+        # (mid-prefill state) which is not merge-safe when reintroduced
+        # as a per-request prompt cache.
         if (
             hasattr(keys, "shape")
             and len(keys.shape) >= 3
             and max_size > 0
             and keys.shape[2] > max_size
+            and HAS_MLX
+            and mx is not None
         ):
-            if keep > 0 and keep < max_size and HAS_MLX and mx is not None:
+            if keep > 0 and keep < max_size:
                 tail_len = max_size - keep
                 keys = mx.concatenate(
                     [keys[..., :keep, :], keys[..., -tail_len:, :]],
@@ -427,52 +436,20 @@ class RotatingKVCacheHandler(CacheTypeHandler):
                 keys = keys[..., -max_size:, :]
                 values = values[..., -max_size:, :]
 
-            if HAS_MLX and mx is not None:
-                keys = mx.contiguous(keys)
-                values = mx.contiguous(values)
+            keys = mx.contiguous(keys)
+            values = mx.contiguous(values)
 
-            _idx = min(max_size, keys.shape[2])
+        # Force case 1 of _temporal_order by setting _idx = keys.shape[2].
+        # The buffer is already in temporal order (extract() guarantees this
+        # for SSD-restored caches; oversized trim above preserves it). Letting
+        # _idx fall into the rotated branch (case 2) would re-slice the
+        # buffer for no gain and obscure the merge contract.
+        seq_len = (
+            int(keys.shape[2]) if hasattr(keys, "shape") and len(keys.shape) >= 3 else 0
+        )
+        _idx = seq_len
 
-        # Handle undersized buffers from BatchRotatingKVCache.extract().
-        # extract() strips left_padding, producing keys.shape[2] < max_size
-        # while offset >= max_size. size() then reports max_size but
-        # _temporal_order returns fewer entries, breaking merge.
-        elif (
-            hasattr(keys, "shape")
-            and len(keys.shape) >= 3
-            and max_size > 0
-            and keys.shape[2] < max_size
-            and offset >= max_size
-            and HAS_MLX
-            and mx is not None
-        ):
-            # extract() reorders to temporal order before slicing, so
-            # real data is contiguous at the end. Pad zeros at front
-            # (left_padding position) to restore merge-safe buffer size.
-            actual_len = keys.shape[2]
-            pad_len = max_size - actual_len
-            pad_k = mx.zeros(
-                (*keys.shape[:2], pad_len, keys.shape[3]), dtype=keys.dtype
-            )
-            pad_v = mx.zeros(
-                (*values.shape[:2], pad_len, values.shape[3]), dtype=values.dtype
-            )
-            keys = mx.concatenate([pad_k, keys], axis=2)
-            values = mx.concatenate([pad_v, values], axis=2)
-            _idx = max_size
-            logger.debug(
-                "Padded undersized RotatingKVCache: %d -> %d (max_size=%d)",
-                actual_len,
-                max_size,
-                max_size,
-            )
-
-        if hasattr(keys, "shape") and len(keys.shape) >= 3:
-            seq_len = keys.shape[2]
-            _idx = min(max(0, int(_idx)), seq_len, max_size if max_size > 0 else seq_len)
-
-
-        cache = RotatingKVCache(max_size=max_size, keep=keep)
+        cache = PrefillReadyRotatingKVCache(max_size=max_size, keep=keep)
         cache.keys = keys
         cache.values = values
         cache.offset = offset

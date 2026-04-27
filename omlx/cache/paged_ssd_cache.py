@@ -71,6 +71,72 @@ def _compute_max_pending_writes() -> int:
 _MAX_PENDING_WRITES = _compute_max_pending_writes()
 
 
+# Cache format version. Bump when on-disk layout or RotatingKVCache meta_state
+# semantics change in a way that older blocks become unsafe to load.
+#
+# Version "2": added with the mlx-lm 0.31.3 contract fix (issues #934 / #903).
+# Version "1" / unset: pre-fix blocks. RotatingKVCache layers may have been
+#   zero-padded to max_size, which after the fix would leak zero positions
+#   into attention. Treat such blocks as a cache miss instead of migrating.
+_CACHE_FORMAT_VERSION = "2"
+
+
+# Layer cache type names whose meta_state should be clamped on save so the
+# rotating buffer's _idx never exceeds the actual buffer length. Restoring a
+# cache where _idx > keys.shape[2] makes BatchRotatingKVCache.merge() either
+# overshoot the RHS or (when omlx pads) leak zero positions into attention.
+_ROTATING_CACHE_TYPES = ("RotatingKVCache", "BatchRotatingKVCache")
+
+
+def _clamp_rotating_meta_states(
+    cache_data: List[Any],
+    layer_cache_types: Optional[List[str]],
+    layer_meta_states: Optional[List[Tuple]],
+) -> Optional[List[Tuple]]:
+    """Clamp ``_idx`` to ``keys.shape[2]`` for RotatingKVCache layers.
+
+    RotatingKVCache.meta_state is ``(keep, max_size, offset, _idx)``. When
+    we save a snapshot, ``_idx`` must reflect the actual buffer length so
+    the restored cache lands in case 1 of ``_temporal_order``. Older code
+    paths could leave ``_idx == max_size`` after zero-padding the buffer;
+    by clamping at write time we ensure newer blocks are always safe to
+    restore.
+    """
+    if not layer_meta_states or not layer_cache_types:
+        return layer_meta_states
+
+    clamped: List[Tuple] = []
+    for i, meta in enumerate(layer_meta_states):
+        if (
+            i < len(layer_cache_types)
+            and layer_cache_types[i] in _ROTATING_CACHE_TYPES
+            and meta
+            and len(meta) >= 4
+            and i < len(cache_data)
+        ):
+            layer_data = cache_data[i]
+            seq_len: Optional[int] = None
+            if (
+                isinstance(layer_data, tuple)
+                and len(layer_data) == 2
+                and not (isinstance(layer_data[0], str) and layer_data[0].startswith("__"))
+            ):
+                keys = layer_data[0]
+                if hasattr(keys, "shape") and len(keys.shape) >= 3:
+                    seq_len = int(keys.shape[2])
+            if seq_len is not None:
+                try:
+                    keep, max_size, offset, idx = meta[:4]
+                    idx_int = int(idx)
+                    if idx_int > seq_len:
+                        clamped.append((keep, max_size, offset, str(seq_len)))
+                        continue
+                except (TypeError, ValueError):
+                    pass
+        clamped.append(meta)
+    return clamped
+
+
 def _has_zero_dim(tensor: Any) -> bool:
     """Check if a tensor has any zero-dimension axis (unsupported by safetensors)."""
     return hasattr(tensor, "shape") and any(d == 0 for d in tensor.shape)
@@ -830,6 +896,21 @@ class PagedSSDCacheManager(CacheManager):
             if not block_hash_hex:
                 return None
 
+            # Reject pre-fix blocks. RotatingKVCache layers in those files
+            # may have been zero-padded to max_size, which the new merge
+            # contract would treat as real attention keys. See #934 / #903
+            # and the _CACHE_FORMAT_VERSION docstring for context.
+            cache_version = metadata.get("omlx_cache_format_version")
+            if cache_version != _CACHE_FORMAT_VERSION:
+                logger.debug(
+                    "Skipping cache block with unsupported format version "
+                    "%r (expected %r): %s",
+                    cache_version,
+                    _CACHE_FORMAT_VERSION,
+                    file_path,
+                )
+                return None
+
             file_stat = file_path.stat()
 
             # Parse cache type information if present
@@ -1075,6 +1156,7 @@ class PagedSSDCacheManager(CacheManager):
 
             # Prepare metadata
             metadata = {
+                "omlx_cache_format_version": _CACHE_FORMAT_VERSION,
                 "block_hash": block_hash.hex(),
                 "token_count": str(token_count),
                 "num_layers": str(len(cache_data)),
@@ -1086,8 +1168,11 @@ class PagedSSDCacheManager(CacheManager):
             if layer_cache_types:
                 metadata["layer_cache_types"] = json.dumps(layer_cache_types)
             if layer_meta_states:
+                clamped_meta_states = _clamp_rotating_meta_states(
+                    cache_data, layer_cache_types, layer_meta_states
+                )
                 metadata["layer_meta_states"] = json.dumps(
-                    [list(m) if m else [] for m in layer_meta_states]
+                    [list(m) if m else [] for m in clamped_meta_states]
                 )
 
             # Merge CacheList sub_count metadata
@@ -1393,6 +1478,15 @@ class PagedSSDCacheManager(CacheManager):
             # with the main inference thread.
             arrays, file_metadata = mx.load(str(file_path), return_metadata=True)
 
+            # Defensive: even if the index is stale (e.g. from a previous
+            # run that pre-dates the format version field), reject blocks
+            # without the expected version marker before they can poison
+            # the hot cache or downstream merge logic.
+            if file_metadata and file_metadata.get("omlx_cache_format_version") != _CACHE_FORMAT_VERSION:
+                self._index.remove(block_hash)
+                self._stats["misses"] += 1
+                return None
+
             # Get layer_cache_types for CacheList detection
             layer_cache_types = metadata.layer_cache_types
             if not layer_cache_types and file_metadata and "layer_cache_types" in file_metadata:
@@ -1508,6 +1602,12 @@ class PagedSSDCacheManager(CacheManager):
             # Load directly on the inference thread (Metal-safe).
             # See load_block() for rationale on removing the executor.
             arrays, file_metadata = mx.load(str(file_path), return_metadata=True)
+
+            # Defensive version check, mirrors load_block().
+            if file_metadata and file_metadata.get("omlx_cache_format_version") != _CACHE_FORMAT_VERSION:
+                self._index.remove(block_hash)
+                self._stats["misses"] += 1
+                return None, None
 
             # Parse layer_cache_types early for CacheList detection
             layer_cache_types = block_metadata.layer_cache_types

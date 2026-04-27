@@ -2079,13 +2079,13 @@ class Scheduler:
                 pass
 
         normalized_len = int(normalized_keys.shape[2]) if len(normalized_keys.shape) >= 3 else 0
-        effective_offset = max(0, offset)
-        if max_size > 0 and effective_offset >= max_size:
-            normalized_idx = min(normalized_len, max_size)
-        elif effective_offset > 0:
-            normalized_idx = min(normalized_len, effective_offset)
-        else:
-            normalized_idx = min(normalized_len, max(0, idx))
+        # Force case 1 of _temporal_order: _idx == keys.shape[2] means the
+        # buffer is already in temporal order (which is exactly what the
+        # oversized trim above produces — the contiguous tail of the most
+        # recent tokens). Anything else lets _temporal_order re-slice the
+        # buffer in the rotated branch (case 2), which is wasted work and
+        # obscures the merge contract. See cache.py:431-447 for the branches.
+        normalized_idx = normalized_len
 
         normalized_meta = (
             str(keep),

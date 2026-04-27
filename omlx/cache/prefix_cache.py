@@ -18,6 +18,7 @@ try:
 except ImportError:
     HAS_MLX = False
 
+from ._rotating_subclass import PrefillReadyRotatingKVCache
 from .interface import CacheManager
 from .paged_ssd_cache import PagedSSDCacheManager
 from .paged_cache import (
@@ -33,9 +34,6 @@ from .type_registry import CacheTypeRegistry
 from .hybrid_cache import ModelCacheConfig, LayerCacheConfig
 
 logger = logging.getLogger(__name__)
-
-
-_PrefillReadyRotatingKVCache = None  # Lazily initialized RotatingKVCache subclass
 
 
 @dataclass
@@ -1870,9 +1868,9 @@ class BlockAwarePrefixCache(CacheManager):
         3. The merge creates a zero-length buffer (not zero-filled) so that
            no phantom attention positions exist during window padding reprocessing
 
-        Uses _PrefillReadyRotatingKVCache which overrides size() to return 0
-        for zero-length keys, preventing BatchRotatingKVCache.merge() from
-        allocating a zero-filled buffer without left_padding masking.
+        Uses PrefillReadyRotatingKVCache (clamped size() by buffer length)
+        so BatchRotatingKVCache.merge() never reads beyond the actual buffer
+        and never sees zero-padded positions as valid attention keys.
 
         Args:
             meta_state: RotatingKVCache meta_state tuple (keep, max_size, offset, _idx).
@@ -1882,28 +1880,6 @@ class BlockAwarePrefixCache(CacheManager):
         Returns:
             RotatingKVCache with zero-length keys/values, or None on failure.
         """
-        global _PrefillReadyRotatingKVCache
-
-        try:
-            from mlx_lm.models.cache import RotatingKVCache
-        except ImportError:
-            logger.error("mlx_lm not available for empty RotatingKVCache creation")
-            return None
-
-        # Lazily create subclass that overrides size() for correct merge behavior.
-        # Standard RotatingKVCache.size() returns min(offset, max_size) which
-        # incorrectly reports data size > 0 for zero-length keys, causing
-        # BatchRotatingKVCache.merge() to create unmasked zero-filled buffers
-        # that dilute attention scores during prefill.
-        if _PrefillReadyRotatingKVCache is None:
-            class _Impl(RotatingKVCache):
-                """RotatingKVCache that reports actual buffer size for merge."""
-                def size(self):
-                    if self.keys is not None and self.keys.shape[2] == 0:
-                        return 0
-                    return super().size()
-            _PrefillReadyRotatingKVCache = _Impl
-
         if meta_state and len(meta_state) >= 2:
             keep = int(meta_state[0])
             max_size = int(meta_state[1])
@@ -1913,7 +1889,7 @@ class BlockAwarePrefixCache(CacheManager):
             )
             return None
 
-        cache = _PrefillReadyRotatingKVCache(max_size=max_size, keep=keep)
+        cache = PrefillReadyRotatingKVCache(max_size=max_size, keep=keep)
         cache.offset = kvcache_offset
 
         # Set zero-length keys/values so empty() returns False.
