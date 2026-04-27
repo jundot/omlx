@@ -36,6 +36,7 @@ from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..models.vlm import VLMModelAdapter
 from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
+from ..patches.qwen3_5_attention import apply_qwen3_5_attention_patch
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -409,6 +410,9 @@ class VLMBatchedEngine(BaseEngine):
         # Class-level monkey-patch — no-op when target classes are absent
         # or already fixed upstream.
         apply_gated_delta_advance_patch()
+        # Patch mlx-vlm Qwen3_5Attention to use plain RoPE on text-only
+        # inputs. Preserves mRoPE for genuine multimodal positions.
+        apply_qwen3_5_attention_patch()
 
         # Create scheduler config
         scheduler_config = (
