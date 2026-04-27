@@ -43,6 +43,13 @@ class CacheTypeRegistry:
     _class_name_map: Dict[str, CacheType] = {
         "KVCache": CacheType.KVCACHE,
         "RotatingKVCache": CacheType.ROTATING_KVCACHE,
+        # omlx subclass that overrides size() to clamp by actual buffer
+        # length (defined in omlx/cache/_rotating_subclass.py). Cache
+        # restore serializes type(cache).__name__, so the registry must
+        # recognize this name to route through RotatingKVCacheHandler;
+        # otherwise the default handler reconstructs vanilla
+        # RotatingKVCache and the size() override is lost.
+        "PrefillReadyRotatingKVCache": CacheType.ROTATING_KVCACHE,
         "BatchKVCache": CacheType.BATCH_KVCACHE,
         "BatchRotatingKVCache": CacheType.BATCH_ROTATING_KVCACHE,
         "ArraysCache": CacheType.ARRAYS_CACHE,
