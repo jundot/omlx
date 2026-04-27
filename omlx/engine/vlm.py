@@ -35,6 +35,7 @@ from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..models.vlm import VLMModelAdapter
+from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -400,6 +401,12 @@ class VLMBatchedEngine(BaseEngine):
         # mlx-vlm models now handle per-sequence mx.array offsets natively
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
         self._adapter = VLMModelAdapter(self._vlm_model)
+
+        # Patch mlx-vlm GatedDeltaNet to mirror mlx-lm fixes (cache.advance(S)
+        # + mx.contiguous on cache[0]) that mlx-vlm e41cd25 still lacks.
+        # Class-level monkey-patch — no-op when target classes are absent
+        # or already fixed upstream.
+        apply_gated_delta_advance_patch()
 
         # Create scheduler config
         scheduler_config = (
