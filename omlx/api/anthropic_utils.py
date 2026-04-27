@@ -751,12 +751,19 @@ def convert_internal_to_anthropic_response(
     """
     content: list[ContentBlockText | ContentBlockToolUse | ContentBlockThinking] = []
 
-    # Add thinking content block before text if present
+    # Add thinking content block before text if present.
+    # Anthropic's spec requires a non-empty cryptographic signature on
+    # thinking blocks; an empty string makes some SDK versions fall
+    # back to a text-block parser path and emit "Content block is not
+    # a text block". omlx cannot mint a real Anthropic signature, so
+    # we use a stable placeholder string. Clients that strictly verify
+    # the signature will still reject, but the common Claude Code SDK
+    # only checks that the field is present and non-empty.
     if thinking and thinking.strip():
         content.append(ContentBlockThinking(
             type="thinking",
             thinking=thinking,
-            signature="",
+            signature="omlx-reasoning",
         ))
 
     # Add text content block if present and not empty
@@ -902,7 +909,14 @@ def create_content_block_start_event(index: int, block_type: str, **kwargs) -> s
             "input": {},
         }
     elif block_type == "thinking":
-        content_block = {"type": "thinking", "thinking": ""}
+        # Anthropic spec requires a signature field on thinking blocks
+        # (see convert_internal_to_anthropic_response for the rationale
+        # behind the placeholder string).
+        content_block = {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "omlx-reasoning",
+        }
     else:
         content_block = {"type": block_type}
 
