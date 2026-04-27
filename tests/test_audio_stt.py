@@ -66,6 +66,7 @@ def _make_mock_pool(stt_engine=None, model_id: str = "whisper-tiny") -> MagicMoc
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
+    pool.resolve_model_id = MagicMock(side_effect=lambda m, _: m)
     return pool
 
 
@@ -265,6 +266,124 @@ class TestSTTEndpointErrors:
             data={"model": "whisper-tiny"},
         )
         assert response.status_code >= 500
+
+
+# ---------------------------------------------------------------------------
+# TestVideoContainerRemap
+# ---------------------------------------------------------------------------
+
+
+class TestVideoContainerRemap:
+    """Video container extensions are remapped to .m4a for ffmpeg routing."""
+
+    @pytest.mark.parametrize("filename,expected_suffix", [
+        ("video.mp4", ".m4a"),
+        ("video.mkv", ".m4a"),
+        ("video.mov", ".m4a"),
+        ("video.m4v", ".m4a"),
+        ("video.webm", ".m4a"),
+        ("video.avi", ".m4a"),
+        ("audio.wav", ".wav"),
+        ("audio.m4a", ".m4a"),
+        ("audio.mp3", ".mp3"),
+    ])
+    def test_video_container_suffix_remap(
+        self, server_audio_client, filename, expected_suffix, tmp_path,
+    ):
+        """Temp file suffix should be .m4a for video containers, unchanged otherwise."""
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        # Capture the path passed to engine.transcribe
+        called_paths = []
+        original_transcribe = engine.transcribe
+
+        async def capture_transcribe(path, **kwargs):
+            called_paths.append(path)
+            return await original_transcribe(path, **kwargs)
+
+        engine.transcribe = AsyncMock(side_effect=capture_transcribe)
+
+        client.post(
+            "/v1/audio/transcriptions",
+            files={"file": (filename, TINY_WAV, "application/octet-stream")},
+            data={"model": "whisper-tiny"},
+        )
+
+        assert len(called_paths) == 1
+        assert called_paths[0].endswith(expected_suffix)
+
+
+# ---------------------------------------------------------------------------
+# TestSTTModelAliasResolution
+# ---------------------------------------------------------------------------
+
+
+class TestSTTModelAliasResolution:
+    """Verify that STT endpoint resolves model aliases (#489)."""
+
+    def test_transcription_resolves_alias(self):
+        """POST /v1/audio/transcriptions with alias resolves to real model ID."""
+        from omlx.server import app
+
+        _ensure_audio_routes(app)
+
+        mock_pool = _make_mock_pool(model_id="Qwen3-ASR-1.7B-bf16")
+        mock_pool.resolve_model_id = MagicMock(
+            return_value="Qwen3-ASR-1.7B-bf16"
+        )
+
+        with patch("omlx.server._server_state") as mock_state:
+            mock_state.engine_pool = mock_pool
+            mock_state.global_settings = None
+            mock_state.process_memory_enforcer = None
+            mock_state.hf_downloader = None
+            mock_state.ms_downloader = None
+            mock_state.mcp_manager = None
+            mock_state.api_key = None
+            mock_state.settings_manager = MagicMock()
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/v1/audio/transcriptions",
+                    data={"model": "whisper"},
+                    files={"file": ("test.wav", TINY_WAV, "audio/wav")},
+                )
+                assert response.status_code == 200
+                mock_pool.get_engine.assert_awaited_once_with(
+                    "Qwen3-ASR-1.7B-bf16"
+                )
+
+    def test_transcription_direct_model_id(self):
+        """POST /v1/audio/transcriptions with direct model ID works without alias."""
+        from omlx.server import app
+
+        _ensure_audio_routes(app)
+
+        mock_pool = _make_mock_pool(model_id="Qwen3-ASR-1.7B-bf16")
+        # resolve_model_id returns the same ID when no alias matches
+        mock_pool.resolve_model_id = MagicMock(
+            return_value="Qwen3-ASR-1.7B-bf16"
+        )
+
+        with patch("omlx.server._server_state") as mock_state:
+            mock_state.engine_pool = mock_pool
+            mock_state.global_settings = None
+            mock_state.process_memory_enforcer = None
+            mock_state.hf_downloader = None
+            mock_state.ms_downloader = None
+            mock_state.mcp_manager = None
+            mock_state.api_key = None
+            mock_state.settings_manager = MagicMock()
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/v1/audio/transcriptions",
+                    data={"model": "Qwen3-ASR-1.7B-bf16"},
+                    files={"file": ("test.wav", TINY_WAV, "audio/wav")},
+                )
+                assert response.status_code == 200
+                mock_pool.get_engine.assert_awaited_once_with(
+                    "Qwen3-ASR-1.7B-bf16"
+                )
 
 
 # ---------------------------------------------------------------------------

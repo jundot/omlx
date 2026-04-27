@@ -18,7 +18,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Set, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, Union
 
 import mlx.core as mx
 
@@ -32,6 +32,35 @@ logger = logging.getLogger(__name__)
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
 
+def _init_mlx_thread() -> None:
+    """Replace generation_stream with a thread-local stream on the executor thread.
+
+    mlx-lm's module-level ``generation_stream`` is created at import time in
+    whichever thread imported it first (the main thread at server startup).
+    Arrays produced inside ``with mx.stream(generation_stream):`` blocks carry
+    that stream reference.  If the stream was created on the main thread,
+    subsequent ``.item()`` / ``mx.synchronize()`` calls from the executor
+    thread fail with "There is no Stream(gpu, 0) in current thread".
+
+    Fix: create a thread-local stream HERE and replace the module-level
+    ``generation_stream`` in mlx_lm.generate and omlx.scheduler.
+    """
+    import sys
+    import mlx.core as mx
+
+    stream = mx.new_thread_local_stream(mx.default_device())
+
+    gen_mod = sys.modules.get("mlx_lm.generate")
+    if gen_mod is not None:
+        gen_mod.generation_stream = stream
+
+    sched_mod = sys.modules.get("omlx.scheduler")
+    if sched_mod is not None:
+        sched_mod.generation_stream = stream
+
+    logger.info(f"MLX executor thread initialized: generation_stream = {stream}")
+
+
 def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     """Get or create the global MLX executor (lazy singleton).
 
@@ -43,7 +72,8 @@ def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     global _global_mlx_executor
     if _global_mlx_executor is None:
         _global_mlx_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mlx-global"
+            max_workers=1, thread_name_prefix="mlx-global",
+            initializer=_init_mlx_thread,
         )
     return _global_mlx_executor
 
@@ -253,6 +283,8 @@ class EngineCore:
         vlm_inputs_embeds: Optional[Any] = None,
         vlm_extra_kwargs: Optional[Dict[str, Any]] = None,
         vlm_image_hash: Optional[str] = None,
+        vlm_cache_key_start: int = 0,
+        vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = None,
         specprefill: Optional[bool] = None,
         specprefill_keep_pct: Optional[float] = None,
         specprefill_threshold: Optional[int] = None,
@@ -292,6 +324,8 @@ class EngineCore:
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
+            vlm_cache_key_start=vlm_cache_key_start,
+            vlm_cache_key_ranges=vlm_cache_key_ranges,
         )
 
         # SpecPrefill: resolve per-request settings.

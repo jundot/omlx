@@ -17,6 +17,7 @@ def _mock_global_settings(api_key=None):
     """Create a mock GlobalSettings with the given API key."""
     mock = MagicMock()
     mock.auth.api_key = api_key
+    mock.auth.skip_api_key_verification = False
     return mock
 
 
@@ -226,6 +227,73 @@ class TestChatPageApiKeyInjection:
                 assert context["api_key"] == ""
         finally:
             admin_routes._get_global_settings = original
+
+
+class TestSkipAdminAuth:
+    """Tests for skipping admin auth when skip_api_key_verification is enabled."""
+
+    def _mock_gs(self, skip=True, host="127.0.0.1"):
+        mock = MagicMock()
+        mock.auth.skip_api_key_verification = skip
+        mock.server.host = host
+        return mock
+
+    def test_require_admin_skipped_on_localhost(self):
+        """require_admin should pass when skip_api_key_verification=True."""
+        gs = self._mock_gs(skip=True, host="127.0.0.1")
+        original = admin_auth._get_global_settings
+        admin_auth._get_global_settings = lambda: gs
+        try:
+            mock_request = MagicMock()
+            mock_request.cookies.get.return_value = None  # No session cookie
+            result = asyncio.run(admin_auth.require_admin(mock_request))
+            assert result is True
+        finally:
+            admin_auth._get_global_settings = original
+
+    def test_require_admin_skipped_on_any_host(self):
+        """require_admin should skip auth when skip_api_key_verification=True regardless of host."""
+        gs = self._mock_gs(skip=True, host="0.0.0.0")
+        original = admin_auth._get_global_settings
+        admin_auth._get_global_settings = lambda: gs
+        try:
+            mock_request = MagicMock()
+            mock_request.cookies.get.return_value = None
+            result = asyncio.run(admin_auth.require_admin(mock_request))
+            assert result is True
+        finally:
+            admin_auth._get_global_settings = original
+
+    def test_require_admin_not_skipped_when_disabled(self):
+        """require_admin should still require auth when skip_api_key_verification=False."""
+        gs = self._mock_gs(skip=False, host="127.0.0.1")
+        original = admin_auth._get_global_settings
+        admin_auth._get_global_settings = lambda: gs
+        try:
+            mock_request = MagicMock()
+            mock_request.cookies.get.return_value = None
+            mock_request.headers.get.return_value = "application/json"
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(admin_auth.require_admin(mock_request))
+            assert exc_info.value.status_code == 401
+        finally:
+            admin_auth._get_global_settings = original
+
+    def test_login_page_redirects_when_skip_enabled(self):
+        """Login page should redirect to dashboard when skip is enabled on localhost."""
+        gs = MagicMock()
+        gs.auth.skip_api_key_verification = True
+        gs.auth.api_key = "test-key"
+        gs.server.host = "127.0.0.1"
+        original = _patch_getter(gs)
+        try:
+            mock_request = MagicMock()
+            with patch("omlx.admin.auth.verify_session", return_value=False):
+                result = asyncio.run(admin_routes.login_page(request=mock_request))
+                assert result.status_code == 302
+                assert result.headers["location"] == "/admin/dashboard"
+        finally:
+            _restore_getter(original)
 
 
 class TestInitAuth:

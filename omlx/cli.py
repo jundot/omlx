@@ -15,28 +15,41 @@ Usage:
 """
 
 import argparse
+import faulthandler
 import sys
 
 
 def _has_cli_overrides(args) -> bool:
-    """Check if CLI args contain non-default values that should be saved."""
-    # model_dir: default=None (don't save None)
+    """Check if CLI args contain non-default values that should be saved.
+
+    All argparse defaults are None, so `is not None` means the user
+    explicitly passed the flag on the command line.
+    """
     if hasattr(args, "model_dir") and args.model_dir is not None:
         return True
-    # port: default=8000
-    if hasattr(args, "port") and args.port != 8000:
+    if hasattr(args, "port") and args.port is not None:
         return True
-    # max_model_memory: default="auto"
-    if hasattr(args, "max_model_memory") and args.max_model_memory != "auto":
+    if hasattr(args, "max_model_memory") and args.max_model_memory is not None:
         return True
-    # max_process_memory: default=None (don't save None)
     if hasattr(args, "max_process_memory") and args.max_process_memory is not None:
         return True
-    # host: default="127.0.0.1"
-    if hasattr(args, "host") and args.host != "127.0.0.1":
+    if hasattr(args, "host") and args.host is not None:
         return True
-    # log_level: default="info"
-    if hasattr(args, "log_level") and args.log_level != "info":
+    if hasattr(args, "log_level") and args.log_level is not None:
+        return True
+    if hasattr(args, "mcp_config") and args.mcp_config is not None:
+        return True
+    if hasattr(args, "hf_endpoint") and args.hf_endpoint is not None:
+        return True
+    if hasattr(args, "ms_endpoint") and args.ms_endpoint is not None:
+        return True
+    if hasattr(args, "http_proxy") and args.http_proxy is not None:
+        return True
+    if hasattr(args, "https_proxy") and args.https_proxy is not None:
+        return True
+    if hasattr(args, "no_proxy") and args.no_proxy is not None:
+        return True
+    if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
         return True
     return False
 
@@ -105,6 +118,20 @@ def serve_command(args):
     if settings.modelscope.endpoint:
         os.environ["MODELSCOPE_DOMAIN"] = settings.modelscope.endpoint
 
+    # Apply proxy/TLS settings if configured
+    if settings.network.http_proxy:
+        os.environ["HTTP_PROXY"] = settings.network.http_proxy
+        os.environ["http_proxy"] = settings.network.http_proxy
+    if settings.network.https_proxy:
+        os.environ["HTTPS_PROXY"] = settings.network.https_proxy
+        os.environ["https_proxy"] = settings.network.https_proxy
+    if settings.network.no_proxy:
+        os.environ["NO_PROXY"] = settings.network.no_proxy
+        os.environ["no_proxy"] = settings.network.no_proxy
+    if settings.network.ca_bundle:
+        os.environ["REQUESTS_CA_BUNDLE"] = settings.network.ca_bundle
+        os.environ["SSL_CERT_FILE"] = settings.network.ca_bundle
+
     # Save CLI args to settings.json if non-default values provided
     if _has_cli_overrides(args):
         try:
@@ -122,6 +149,13 @@ def serve_command(args):
         retention_days=settings.logging.retention_days,
     )
     print(f"Log directory: {log_dir}")
+
+    # Enable native crash diagnostics (SIGABRT, SIGSEGV, SIGFPE, SIGBUS).
+    # On Metal/MLX crashes (#511, #520), this dumps all Python thread
+    # tracebacks to the server log before the process terminates.
+    crash_log_path = log_dir / "crash.log"
+    _crash_file = open(crash_log_path, "a")
+    faulthandler.enable(file=_crash_file, all_threads=True)
 
     # Validate settings
     errors = settings.validate()
@@ -332,6 +366,7 @@ def launch_command(args):
     # Fetch model limits from server
     context_window = None
     max_tokens = None
+    model_type = None
     try:
         resp = requests.get(f"{base_url}/v1/models/status", headers=headers, timeout=5)
         if resp.ok:
@@ -339,6 +374,7 @@ def launch_command(args):
                 if m["id"] == model:
                     context_window = m.get("max_context_window")
                     max_tokens = m.get("max_tokens")
+                    model_type = m.get("model_type")
                     break
     except Exception:
         pass
@@ -354,7 +390,101 @@ def launch_command(args):
         tools_profile=tools_profile,
         context_window=context_window,
         max_tokens=max_tokens,
+        model_type=model_type,
     )
+
+
+def diagnose_menubar() -> int:
+    """Diagnose why the oMLX menubar icon might be missing.
+
+    Reports macOS version, app install path, running menubar process, and the
+    most recent visibility warning from the log. Prints manual recovery steps
+    since Tahoe's ControlCenter doesn't expose a public API to re-enable a
+    hidden status item.
+    """
+    import platform
+    import subprocess
+    from pathlib import Path
+
+    print("oMLX menubar diagnostics")
+    print("=" * 40)
+
+    mac_ver = platform.mac_ver()[0] or "unknown"
+    print(f"macOS:          {mac_ver}")
+    print(f"Bundle ID:      com.omlx.app")
+
+    app_path = Path("/Applications/oMLX.app")
+    print(f"App installed:  {'yes' if app_path.exists() else 'NO (install DMG first)'}")
+
+    try:
+        res = subprocess.run(
+            ["pgrep", "-af", "omlx_app"],
+            capture_output=True, text=True, timeout=5,
+        )
+        running = bool(res.stdout.strip())
+        print(f"Menubar app:    {'running' if running else 'NOT running'}")
+        if running:
+            first_line = res.stdout.strip().splitlines()[0]
+            pid = first_line.split()[0] if first_line else "?"
+            print(f"PID:            {pid}")
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        print(f"Menubar app:    check failed ({e})")
+
+    log_dir = Path.home() / "Library" / "Application Support" / "oMLX" / "logs"
+    # menubar.log captures the visibility probe (frame + isVisible);
+    # server.log may carry fallback warnings for older builds.
+    log_candidates = [log_dir / "menubar.log", log_dir / "server.log"]
+    print(f"Log dir:        {log_dir}")
+
+    hits: list[tuple[str, str]] = []
+    for path in log_candidates:
+        if not path.exists():
+            continue
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 131072))
+                tail = f.read().decode("utf-8", errors="replace")
+        except OSError as e:
+            print(f"Could not read {path.name}: {e}")
+            continue
+        for ln in tail.splitlines():
+            if (
+                "menubar visibility probe" in ln
+                or "NSStatusItem" in ln
+                or "ControlCenter" in ln
+                or "Menu Bar" in ln
+            ):
+                hits.append((path.name, ln))
+
+    if hits:
+        print("\nRecent visibility log entries (last 10):")
+        for src, ln in hits[-10:]:
+            print(f"  [{src}] {ln}")
+    else:
+        print("\nNo visibility log entries found (app may not have probed yet).")
+
+    print()
+    print("If the icon is missing on macOS Tahoe (26.x):")
+    print("  1. Open System Settings > Menu Bar")
+    print("     open 'x-apple.systempreferences:com.apple.ControlCenter-Settings.extension?MenuBar'")
+    print("  2. Find 'oMLX' and set it to 'Show in Menu Bar'")
+    print("  3. If oMLX isn't in the list, quit the menubar app and relaunch oMLX.app")
+    print()
+    print("Note: Apple's sandbox policy prevents third-party apps from")
+    print("programmatically re-enabling their own menubar visibility on Tahoe.")
+    return 0
+
+
+def diagnose_command(args) -> int:
+    """Dispatch 'omlx diagnose <target>' to the appropriate subcommand."""
+    target = getattr(args, "target", None)
+    if target == "menubar":
+        return diagnose_menubar()
+    print(f"Unknown diagnose target: {target}")
+    print("Available: menubar")
+    return 1
 
 
 def main():
@@ -426,13 +556,10 @@ Example directory structure:
 
     # Scheduler options (for BatchedEngine)
     serve_parser.add_argument(
-        "--max-num-seqs", type=int, default=None, help="Max concurrent sequences (default: 256)"
-    )
-    serve_parser.add_argument(
-        "--completion-batch-size",
+        "--max-concurrent-requests",
         type=int,
         default=None,
-        help="Max sequences for mlx-lm BatchGenerator completion phase (token generation). (default: 32)",
+        help="Max requests processed simultaneously. Higher values increase throughput but use more memory. (default: 8)",
     )
 
     # paged SSD cache options
@@ -491,6 +618,32 @@ Example directory structure:
         help="Custom ModelScope Hub endpoint URL",
     )
 
+    # Network options
+    serve_parser.add_argument(
+        "--http-proxy",
+        type=str,
+        default=None,
+        help="HTTP proxy URL (e.g., http://proxy.company.com:8080)",
+    )
+    serve_parser.add_argument(
+        "--https-proxy",
+        type=str,
+        default=None,
+        help="HTTPS proxy URL (e.g., http://proxy.company.com:8080)",
+    )
+    serve_parser.add_argument(
+        "--no-proxy",
+        type=str,
+        default=None,
+        help="Comma-separated hosts/IPs to bypass proxy (e.g., localhost,127.0.0.1)",
+    )
+    serve_parser.add_argument(
+        "--ca-bundle",
+        type=str,
+        default=None,
+        help="Path to CA bundle PEM file for TLS interception environments",
+    )
+
     # Base path and auth
     serve_parser.add_argument(
         "--base-path",
@@ -509,13 +662,13 @@ Example directory structure:
     launch_parser = subparsers.add_parser(
         "launch",
         help="Launch an external tool with oMLX integration",
-        description="Configure and launch external coding tools (Codex, OpenCode, OpenClaw) "
+        description="Configure and launch external coding tools (Codex, OpenCode, OpenClaw, Pi) "
         "to use the running oMLX server.",
     )
     launch_parser.add_argument(
         "tool",
         type=str,
-        help="Tool to launch: codex, opencode, openclaw, or 'list' to show available",
+        help="Tool to launch: codex, opencode, openclaw, pi, or 'list' to show available",
     )
     launch_parser.add_argument(
         "--model",
@@ -549,12 +702,27 @@ Example directory structure:
         help="OpenClaw tools profile (default: coding)",
     )
 
+    # Diagnose command
+    diagnose_parser = subparsers.add_parser(
+        "diagnose",
+        help="Diagnose installation or runtime issues",
+        description="Run diagnostic checks and print recovery steps.",
+    )
+    diagnose_parser.add_argument(
+        "target",
+        type=str,
+        choices=["menubar"],
+        help="What to diagnose. 'menubar' checks Tahoe ControlCenter visibility.",
+    )
+
     args = parser.parse_args()
 
     if args.command == "serve":
         serve_command(args)
     elif args.command == "launch":
         launch_command(args)
+    elif args.command == "diagnose":
+        sys.exit(diagnose_command(args))
     else:
         parser.print_help()
         sys.exit(1)

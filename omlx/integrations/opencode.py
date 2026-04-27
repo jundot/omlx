@@ -31,6 +31,17 @@ class OpenCodeIntegration(Integration):
             f"launch opencode --model {model or 'select-a-model'}"
         )
 
+    @staticmethod
+    def _modalities_for_model(model_type: str | None) -> dict[str, list[str]]:
+        """Build OpenCode modality metadata for the selected oMLX model."""
+        input_modalities = ["text"]
+        if model_type == "vlm":
+            input_modalities.append("image")
+        return {
+            "input": input_modalities,
+            "output": ["text"],
+        }
+
     def configure(
         self,
         port: int,
@@ -39,6 +50,7 @@ class OpenCodeIntegration(Integration):
         host: str = "127.0.0.1",
         context_window: int | None = None,
         max_tokens: int | None = None,
+        model_type: str | None = None,
     ) -> None:
         def updater(config: dict) -> None:
             config.setdefault("provider", {})
@@ -52,7 +64,12 @@ class OpenCodeIntegration(Integration):
             if api_key:
                 provider_config["options"]["apiKey"] = api_key
             if model:
-                model_entry: dict = {"name": model}
+                model_entry: dict = {
+                    "name": model,
+                    "modalities": self._modalities_for_model(model_type),
+                }
+                if model_type == "vlm":
+                    model_entry["attachment"] = True
                 if context_window:
                     model_entry["limit"] = {
                         "context": context_window,
@@ -70,9 +87,11 @@ class OpenCodeIntegration(Integration):
     def launch(self, port: int, api_key: str, model: str, host: str = "127.0.0.1", **kwargs) -> None:
         context_window = kwargs.pop("context_window", None)
         max_tokens = kwargs.pop("max_tokens", None)
+        model_type = kwargs.pop("model_type", None)
         self.configure(
             port, api_key, model, host=host,
             context_window=context_window, max_tokens=max_tokens,
+            model_type=model_type,
         )
 
         env = os.environ.copy()

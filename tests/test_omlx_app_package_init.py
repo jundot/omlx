@@ -51,6 +51,10 @@ def test_omlx_app_app_module_does_not_import_omlx_runtime(monkeypatch):
 
     fake_appkit = types.ModuleType("AppKit")
     for name in [
+        "NSAlert",
+        "NSAlertFirstButtonReturn",
+        "NSAlertSecondButtonReturn",
+        "NSAlertThirdButtonReturn",
         "NSApp",
         "NSAppearanceNameDarkAqua",
         "NSApplication",
@@ -59,11 +63,23 @@ def test_omlx_app_app_module_does_not_import_omlx_runtime(monkeypatch):
         "NSAttributedString",
         "NSBundle",
         "NSColor",
+        "NSFloatingWindowLevel",
+        "NSFont",
+        "NSFontAttributeName",
         "NSForegroundColorAttributeName",
         "NSImage",
+        "NSLinkAttributeName",
         "NSMenu",
         "NSMenuItem",
+        "NSMutableParagraphStyle",
+        "NSParagraphStyleAttributeName",
+        "NSRightTabStopType",
         "NSStatusBar",
+        "NSTextField",
+        "NSTextTab",
+        "NSTextAlignmentCenter",
+        "NSView",
+        "NSWorkspace",
     ]:
         setattr(fake_appkit, name, type(name, (), {}))
     fake_appkit.NSVariableStatusItemLength = -1
@@ -71,9 +87,13 @@ def test_omlx_app_app_module_does_not_import_omlx_runtime(monkeypatch):
     fake_foundation = types.ModuleType("Foundation")
     fake_foundation.NSObject = type("NSObject", (), {})
     fake_foundation.NSData = type("NSData", (), {})
+    fake_foundation.NSMutableAttributedString = type(
+        "NSMutableAttributedString", (), {}
+    )
     fake_foundation.NSRunLoop = type("NSRunLoop", (), {})
     fake_foundation.NSDefaultRunLoopMode = "NSDefaultRunLoopMode"
     fake_foundation.NSTimer = type("NSTimer", (), {})
+    fake_foundation.NSURL = type("NSURL", (), {})
 
     fake_config = types.ModuleType("omlx_app.config")
     fake_config.ServerConfig = object()

@@ -1,16 +1,25 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.2.24.tar.gz"
-  sha256 "08ce4b8c910548f9627943740212f7655d52b10ea025e037f88d4100a53c89c9"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.3.7.tar.gz"
+  sha256 "464be2dd635e65bc929bd356ac3fde2da9e32618b905481e3eb99a8e2e1e9d10"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
+
+  option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
 
   depends_on "rust" => :build
   depends_on "python@3.11"
   depends_on :macos
   depends_on arch: :arm64
+
+  # mlx-audio pins mlx-lm==0.31.1 which conflicts with omlx's git-pinned
+  # mlx-lm. Fetch source separately so we can patch the pin before install.
+  resource "mlx-audio" do
+    url "https://github.com/Blaizzy/mlx-audio.git",
+      revision: "51753266e0a4f766fd5e6fbc46652224efc23981"
+  end
 
   service do
     run [opt_bin/"omlx", "serve"]
@@ -26,9 +35,24 @@ class Omlx < Formula
     system "python3.11", "-m", "venv", libexec
 
     # Build Rust-based packages from source with headerpad to prevent
-    # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths)
+    # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths).
+    # tokenizers is excluded: its wheel ships a stable-ABI .abi3.so that does
+    # not need Homebrew's dylib ID rewrite, and building from source fails on
+    # macOS 15+ due to PyO3 linker errors (missing Python symbols at link time).
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
-    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken,tokenizers", "#{buildpath}[audio]"
+
+    # Install omlx (with optional grammar extra for structured output)
+    install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
+    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken", install_spec
+
+    # Install mlx-audio with patched mlx-lm pin to avoid version conflict
+    resource("mlx-audio").stage do
+      inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
+      system libexec/"bin/pip", "install", ".[all]"
+    end
+
+    # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
+    system libexec/"bin/pip", "install", "python-multipart>=0.0.5"
 
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end

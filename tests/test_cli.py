@@ -158,8 +158,7 @@ class TestServeCommandOptions:
             text=True,
             timeout=10,
         )
-        assert "--max-num-seqs" in result.stdout
-        assert "--completion-batch-size" in result.stdout
+        assert "--max-concurrent-requests" in result.stdout
 
     def test_serve_has_cache_options(self):
         """Test that serve command has cache options."""
@@ -231,6 +230,63 @@ class TestLaunchCommandOptions:
         assert "--model" in result.stdout
 
 
+class TestLaunchCommandFunction:
+    """Tests for launch command runtime behavior."""
+
+    def test_launch_command_passes_model_type_to_integration(self):
+        """VLM model metadata should be forwarded to integrations."""
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "OpenCode"
+        integration.is_installed.return_value = True
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [
+                {
+                    "id": "qwen2.5-vl",
+                    "model_type": "vlm",
+                    "max_context_window": 32768,
+                    "max_tokens": 8192,
+                }
+            ]
+        }
+
+        settings = MagicMock()
+        settings.server.host = "127.0.0.1"
+        settings.server.port = 8000
+
+        args = argparse.Namespace(
+            tool="opencode",
+            host=None,
+            port=None,
+            api_key="test-key",
+            model="qwen2.5-vl",
+            tools_profile="coding",
+        )
+
+        with patch("requests.get", side_effect=[health_response, status_response]):
+            with patch("omlx.integrations.get_integration", return_value=integration):
+                with patch("omlx.settings.GlobalSettings.load", return_value=settings):
+                    launch_command(args)
+
+        integration.launch.assert_called_once_with(
+            port=8000,
+            api_key="test-key",
+            model="qwen2.5-vl",
+            host="127.0.0.1",
+            tools_profile="coding",
+            context_window=32768,
+            max_tokens=8192,
+            model_type="vlm",
+        )
+
+
 class TestServeCommandFunctions:
     """Tests for serve command function."""
 
@@ -252,6 +308,65 @@ class TestServeCommandFunctions:
         # Help text should mention ~/.omlx/models or similar
         assert ".omlx" in result.stdout or "model" in result.stdout.lower()
 
+
+
+class TestHasCliOverrides:
+    """Tests for _has_cli_overrides() — detects explicitly passed CLI args."""
+
+    @staticmethod
+    def _make_args(**kwargs):
+        """Namespace with all serve defaults (None), then apply overrides."""
+        defaults = {
+            "model_dir": None,
+            "port": None,
+            "max_model_memory": None,
+            "max_process_memory": None,
+            "host": None,
+            "log_level": None,
+        }
+        defaults.update(kwargs)
+        return argparse.Namespace(**defaults)
+
+    def test_no_overrides_returns_false(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args()) is False
+
+    def test_host_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(host="0.0.0.0")) is True
+        # Even the default value, when explicitly passed, counts as override
+        assert _has_cli_overrides(self._make_args(host="127.0.0.1")) is True
+
+    def test_port_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(port=9000)) is True
+        assert _has_cli_overrides(self._make_args(port=8000)) is True
+
+    def test_model_dir_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(model_dir="/tmp/models")) is True
+
+    def test_max_model_memory_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(max_model_memory="auto")) is True
+        assert _has_cli_overrides(self._make_args(max_model_memory="32GB")) is True
+
+    def test_max_process_memory_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(max_process_memory="64GB")) is True
+
+    def test_log_level_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(log_level="info")) is True
+        assert _has_cli_overrides(self._make_args(log_level="debug")) is True
+
+    def test_multiple_overrides(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(host="0.0.0.0", port=9000)) is True
+
+    def test_empty_namespace(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(argparse.Namespace()) is False
 
 
 class TestCLIDocstrings:

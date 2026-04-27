@@ -10,10 +10,13 @@
 <p align="center"><b>LLM inference, optimized for your Mac</b><br>Continuous batching and tiered KV caching, managed directly from your menu bar.</p>
 
 <p align="center">
+<a href="https://www.buymeacoffee.com/jundot"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
-  <a href="https://buymeacoffee.com/jundot"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=black" alt="Buy Me a Coffee"></a>
 </p>
 
 <p align="center">
@@ -51,7 +54,7 @@
 
 ### macOS App
 
-Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), drag to Applications, done. The app includes in-app auto-update, so future upgrades are just one click.
+Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), drag to Applications, done. The app includes in-app auto-update, so future upgrades are just one click. Note that the macOS app does not install the `omlx` CLI command. For terminal usage, install via Homebrew or from source.
 
 ### Homebrew
 
@@ -145,7 +148,7 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
 
 ### Continuous Batching
 
-Handles concurrent requests through mlx-lm's BatchGenerator. Prefill and completion batch sizes are configurable.
+Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requests is configurable via CLI or admin panel.
 
 ### Claude Code Optimization
 
@@ -191,7 +194,7 @@ Search and download MLX models from HuggingFace directly in the admin dashboard.
 
 ### Integrations
 
-Set up OpenClaw, OpenCode, and Codex directly from the admin dashboard with a single click. No manual config editing required.
+Set up OpenClaw, OpenCode, Codex, and Pi directly from the admin dashboard with a single click. No manual config editing required.
 
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
@@ -281,8 +284,8 @@ omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache
 # Set in-memory hot cache size
 omlx serve --model-dir ~/models --hot-cache-max-size 20%
 
-# Adjust batch sizes
-omlx serve --model-dir ~/models --prefill-batch-size 8 --completion-batch-size 32
+# Adjust max concurrent requests (default: 8)
+omlx serve --model-dir ~/models --max-concurrent-requests 16
 
 # With MCP tools
 omlx serve --model-dir ~/models --mcp-config mcp.json
@@ -311,7 +314,7 @@ FastAPI Server (OpenAI / Anthropic API)
     │
     ├── ProcessMemoryEnforcer (total memory limit, TTL checks)
     │
-    ├── Scheduler (FCFS, configurable batch sizes)
+    ├── Scheduler (FCFS, configurable concurrency)
     │   └── mlx-lm BatchGenerator
     │
     └── Cache Stack
@@ -371,4 +374,4 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX started from vllm-mlx v0.1.0 and evolved significantly with multi-model serving, tiered KV caching, VLM with full paged cache support, an admin panel, and a macOS menu bar app
 - [venvstacks](https://venvstacks.lmstudio.ai) - Portable Python environment layering for the macOS app bundle
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
-- [llm-compressor](https://github.com/vllm-project/llm-compressor) - Reference AWQ implementation for MoE models, used as design reference for oQ weight equalization
+- [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon

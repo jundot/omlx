@@ -46,6 +46,10 @@ def app_module():
 
     fake_appkit = types.ModuleType("AppKit")
     for name in [
+        "NSAlert",
+        "NSAlertFirstButtonReturn",
+        "NSAlertSecondButtonReturn",
+        "NSAlertThirdButtonReturn",
         "NSApp",
         "NSAppearanceNameDarkAqua",
         "NSApplication",
@@ -54,18 +58,30 @@ def app_module():
         "NSAttributedString",
         "NSBundle",
         "NSColor",
+        "NSFloatingWindowLevel",
+        "NSFont",
+        "NSFontAttributeName",
         "NSForegroundColorAttributeName",
         "NSImage",
+        "NSLinkAttributeName",
         "NSMenu",
         "NSMenuItem",
+        "NSMutableParagraphStyle",
+        "NSParagraphStyleAttributeName",
+        "NSRightTabStopType",
         "NSStatusBar",
+        "NSTextField",
+        "NSTextTab",
+        "NSTextAlignmentCenter",
+        "NSView",
+        "NSWorkspace",
     ]:
         setattr(fake_appkit, name, MagicMock())
     fake_appkit.NSVariableStatusItemLength = -1
 
     fake_foundation = types.ModuleType("Foundation")
     fake_foundation.NSObject = type("NSObject", (), {})
-    for name in ["NSData", "NSRunLoop", "NSTimer"]:
+    for name in ["NSData", "NSMutableAttributedString", "NSRunLoop", "NSTimer", "NSURL"]:
         setattr(fake_foundation, name, MagicMock())
     fake_foundation.NSDefaultRunLoopMode = "NSDefaultRunLoopMode"
 
@@ -202,6 +218,7 @@ class TestAsyncStatsRefreshContract:
             ),
             server_manager=server_manager,
             _load_menubar_icon=Mock(return_value=None),
+            _create_status_item=Mock(),
             _update_menubar_icon=Mock(),
             _build_menu=Mock(),
             _check_for_updates=Mock(),

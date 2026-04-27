@@ -1477,8 +1477,11 @@ class TestHFEndpointPassthrough:
             task = await downloader.start_download("owner/model")
             await asyncio.sleep(0.5)
 
-            mock_download.assert_called_once()
+            # Called twice: dry_run + actual download
+            assert mock_download.call_count == 2
+            # Last call is the actual download
             call_kwargs = mock_download.call_args[1]
+            assert "dry_run" not in call_kwargs
             assert call_kwargs["endpoint"] == "https://hf-mirror.com"
 
             await downloader.shutdown()
@@ -1502,8 +1505,9 @@ class TestHFEndpointPassthrough:
             task = await downloader.start_download("owner/model")
             await asyncio.sleep(0.5)
 
-            mock_download.assert_called_once()
+            assert mock_download.call_count == 2
             call_kwargs = mock_download.call_args[1]
+            assert "dry_run" not in call_kwargs
             assert call_kwargs["endpoint"] is None
 
             await downloader.shutdown()
@@ -1702,11 +1706,16 @@ class TestStallDetection:
 
         downloader = HFDownloader(model_dir=str(model_dir))
 
+        def _slow_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            time.sleep(30)
+
         with patch(
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(30),
+            side_effect=_slow_download,
         ):
             mock_api = MagicMock()
             mock_info = MagicMock()
@@ -1737,11 +1746,16 @@ class TestStallDetection:
 
         downloader = HFDownloader(model_dir=str(model_dir))
 
+        def _slow_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            time.sleep(10)
+
         with patch(
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(10),
+            side_effect=_slow_download,
         ):
             mock_api = MagicMock()
             mock_info = MagicMock()
@@ -1929,8 +1943,10 @@ class TestEtagTimeout:
             await downloader.start_download("owner/model")
             await asyncio.sleep(0.5)
 
-            mock_download.assert_called_once()
+            assert mock_download.call_count == 2
+            # Last call is the actual download
             call_kwargs = mock_download.call_args[1]
+            assert "dry_run" not in call_kwargs
             assert call_kwargs["etag_timeout"] == 30
 
             await downloader.shutdown()

@@ -13,7 +13,7 @@ import io
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +54,11 @@ def load_image(url_or_base64: str) -> Image.Image:
         # Try as local file path
         img = Image.open(url_or_base64)
 
+    # Apply EXIF orientation (phone photos etc.) before processing.
+    # Matches mlx-vlm's load_image which calls ImageOps.exif_transpose().
+    img = ImageOps.exif_transpose(img)
     # Ensure RGB format (RGBA/P/L etc. cause broadcast errors in vision processors)
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-    return img
+    return img.convert("RGB")
 
 
 def extract_images_from_messages(
@@ -169,3 +170,18 @@ def compute_image_hash(images: List[Image.Image]) -> Optional[str]:
         hasher.update(rgb_img.tobytes())
 
     return hasher.hexdigest()
+
+
+def compute_per_image_hashes(images: List[Image.Image]) -> List[str]:
+    """Compute individual SHA256 hashes for each image.
+
+    Returns a list of hex-encoded hash strings, one per image.
+    """
+    hashes = []
+    for img in images:
+        hasher = hashlib.sha256()
+        hasher.update(f"{img.size[0]}x{img.size[1]}".encode())
+        rgb_img = img.convert("RGB")
+        hasher.update(rgb_img.tobytes())
+        hashes.append(hasher.hexdigest())
+    return hashes

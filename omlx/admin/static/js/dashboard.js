@@ -13,7 +13,9 @@
     function dashboard() {
         return {
             // Theme
-            theme: localStorage.getItem('omlx-chat-theme') || 'light',
+            theme: localStorage.getItem('omlx-chat-theme') || 'auto',
+            activeTheme: 'light', // Will be updated by applyTheme
+            systemThemeListener: null,
 
             // Mobile menu
             mobileMenuOpen: false,
@@ -23,6 +25,7 @@
 
             activeTab: 'global',
             settingsDropdown: false,
+            themeDropdown: false,
 
             // Global settings
             globalSettings: {
@@ -30,15 +33,17 @@
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info' },
                 model: { model_dirs: [''], max_model_memory: '' },
                 memory: { max_process_memory: 'auto', prefill_memory_guard: true },
-                scheduler: { max_num_seqs: 8, completion_batch_size: 8 },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256 },
+                scheduler: { max_concurrent_requests: 8 },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
                 huggingface: { endpoint: '' },
+                network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
-                integrations: { codex_model: null, opencode_model: null, openclaw_model: null, openclaw_tools_profile: 'full' },
+                integrations: { codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
                 ui: { language: 'en' },
+                idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
 
@@ -57,6 +62,9 @@
             editingProcessMemory: false,
             editingModelMemory: false,
             editingHotCache: false,
+
+            // Idle timeout string value for select binding (null ↔ '')
+            idleTimeoutValue: '',
 
             // Models
             models: [],
@@ -99,9 +107,31 @@
                 enableToolResultLimit: false,
                 max_tool_result_tokens: null,
                 ctKwargEntries: [],
+                trust_remote_code: false,
             },
             savingModelSettings: false,
             loadingGenDefaults: false,
+            reasoningParsers: [],
+
+            // Profile / template / preset state
+            profiles: [],                // per-model profiles for selectedModel
+            templates: [],               // global templates
+            presets: [],                 // curated presets (bundled + remote refresh)
+            profileFields: { universal: [], model_specific: [] },  // loaded from /api/profile-fields
+            profileScope: 'model',       // 'preset' | 'global' | 'model'
+            refreshingPresets: false,
+            activeProfileName: null,     // currently-active profile for the form
+            profilesDrift: false,        // true if form values differ from active profile
+            _applySeq: 0,               // monotonic counter for apply race guard
+            profileError: '',
+            showNewProfileForm: false,
+            newProfile: { name: '', display_name: '', description: '', also_as_template: false },
+            showNewTemplateForm: false,
+            newTemplate: { name: '', display_name: '', description: '' },
+            editingProfile: null,        // profile name being edited inline
+            editingTemplate: null,       // template name being edited inline
+            profileDeleteConfirm: null,
+            templateDeleteConfirm: null,
 
             // Status tab state
             stats: {
@@ -140,6 +170,10 @@
                 avg_generation_tps: 0.0,
                 total_requests: 0,
             },
+            // Server connectivity info (from /admin/api/server-info)
+            serverAliases: [],
+            selectedAlias: '',
+
             statsScope: 'session',
             selectedStatsModel: '',
             showClearStatsConfirm: false,
@@ -266,14 +300,9 @@
             _oqRefreshTimer: null,
             // oQ Advanced Settings
             oqAdvancedOpen: false,
-            oqEnableClip: false,
             oqTextOnly: false,
-            oqClipSamples: 128,
-            oqClipSeqLen: 512,
-            oqCalibDataset: 'code_multilingual',
-            oqClipBatchSize: 1024,
+            oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
-            oqExpertBatchSize: 32,
 
             // oQ Uploader state
             uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
@@ -325,23 +354,53 @@
 
             // Accuracy benchmark state
             accModelId: '',
-            accBenchmarks: { mmlu: true, kmmlu: false, cmmlu: false, jmmlu: false, hellaswag: false, truthfulqa: true, arc_challenge: false, winogrande: false, gsm8k: false, humaneval: true, mbpp: false, livecodebench: false },
-            accSampleSizes: { mmlu: 1000, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, humaneval: 0, mbpp: 200, livecodebench: 100 },
-            accBenchmarkList: [
-                { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects', fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                { key: 'kmmlu', label: 'KMMLU', desc: '한국어 지식 · 45 과목', fullSize: 35030, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                { key: 'cmmlu', label: 'CMMLU', desc: '中文知识 · 67 科目', fullSize: 11582, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                { key: 'jmmlu', label: 'JMMLU', desc: '日本語知識 · 112 科目', fullSize: 7536, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning', fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness', fullSize: 817, sizes: [30, 50, 100, 200, 300] },
-                { key: 'arc_challenge', label: 'ARC-C', desc: 'Science reasoning', fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
-                { key: 'winogrande', label: 'Winogrande', desc: 'Coreference resolution', fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
-                { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning', fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
-                { key: 'humaneval', label: 'HumanEval', desc: 'Function completion', fullSize: 164, sizes: [30, 50, 100] },
-                { key: 'mbpp', label: 'MBPP', desc: 'Python problems', fullSize: 500, sizes: [30, 50, 100, 200, 300] },
-                { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
+            accBenchmarks: { mmlu: true, mmlu_pro: false, kmmlu: false, cmmlu: false, jmmlu: false, hellaswag: false, truthfulqa: true, arc_challenge: false, winogrande: false, gsm8k: false, mathqa: false, humaneval: true, mbpp: false, livecodebench: false, bbq: false, safetybench: false },
+            accSampleSizes: { mmlu: 1000, mmlu_pro: 300, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, mathqa: 300, humaneval: 0, mbpp: 200, livecodebench: 100, bbq: 300, safetybench: 300 },
+            accBenchmarkGroups: [
+                {
+                    name: 'Knowledge',
+                    benchmarks: [
+                        { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects', fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'mmlu_pro', label: 'MMLU-Pro', desc: 'Hard knowledge · 14 subjects (10-way)', fullSize: 12032, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'kmmlu', label: 'KMMLU', desc: '한국어 지식 · 45 과목', fullSize: 35030, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'cmmlu', label: 'CMMLU', desc: '中文知识 · 67 科目', fullSize: 11582, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'jmmlu', label: 'JMMLU', desc: '日本語知識 · 112 科目', fullSize: 7536, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                    ],
+                },
+                {
+                    name: 'Commonsense & Reasoning',
+                    benchmarks: [
+                        { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning', fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'arc_challenge', label: 'ARC-C', desc: 'Science reasoning', fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'winogrande', label: 'Winogrande', desc: 'Coreference resolution', fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness', fullSize: 817, sizes: [30, 50, 100, 200, 300] },
+                    ],
+                },
+                {
+                    name: 'Math',
+                    benchmarks: [
+                        { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning', fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'mathqa', label: 'MathQA', desc: 'Quantitative reasoning · 5-way', fullSize: 2985, sizes: [30, 50, 100, 200, 300, 500, 1000] },
+                    ],
+                },
+                {
+                    name: 'Coding',
+                    benchmarks: [
+                        { key: 'humaneval', label: 'HumanEval', desc: 'Function completion', fullSize: 164, sizes: [30, 50, 100] },
+                        { key: 'mbpp', label: 'MBPP', desc: 'Python problems', fullSize: 500, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
+                    ],
+                },
+                {
+                    name: 'Safety & Alignment',
+                    benchmarks: [
+                        { key: 'bbq', label: 'BBQ', desc: 'Social bias · 11 categories', fullSize: 10864, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'safetybench', label: 'SafetyBench', desc: 'Safety · 7 categories', fullSize: 11435, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                    ],
+                },
             ],
             accBatchSize: 1,
+            accEnableThinking: false,
             accRunning: false,
             accCurrentModel: '',
             accCurrentBenchId: null,
@@ -361,6 +420,9 @@
                 await Promise.all([
                     this.loadGlobalSettings(),
                     this.loadModels(),
+                    this.loadServerInfo(),
+                    this.loadProfileFields(),
+                    this.loadPresets(),
                     this.checkForUpdate()
                 ]);
 
@@ -567,12 +629,19 @@
                             sampling: { ...this.globalSettings.sampling, ...data.sampling },
                             mcp: { ...this.globalSettings.mcp, ...data.mcp },
                             huggingface: { ...this.globalSettings.huggingface, ...data.huggingface },
+                            network: { ...this.globalSettings.network, ...data.network },
                             auth: { ...this.globalSettings.auth, ...data.auth },
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
+                            idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = data.ui || { language: 'en' };
+
+                        // Sync idle timeout select value
+                        this.idleTimeoutValue = this.globalSettings.idle_timeout?.idle_timeout_seconds != null
+                            ? String(this.globalSettings.idle_timeout.idle_timeout_seconds)
+                            : '';
 
                         // Calculate memory percent from stored value
                         if (this.globalSettings.model.max_model_memory === 'auto') {
@@ -632,8 +701,7 @@
                 if (!s.server.host) errors.push('Host');
                 if (!s.server.port) errors.push('Port');
                 if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
-                if (!s.scheduler.max_num_seqs) errors.push('Max Sequences');
-                if (!s.scheduler.completion_batch_size) errors.push('Completion Batch Size');
+                if (!s.scheduler.max_concurrent_requests) errors.push('Max Concurrent Requests');
                 if (!s.cache.ssd_cache_max_size) errors.push('Max Cache Size');
                 if (!s.sampling.max_context_window) errors.push('Max Context Window');
                 if (!s.sampling.max_tokens) errors.push('Max Tokens');
@@ -671,13 +739,13 @@
                             model_fallback: this.globalSettings.model.model_fallback,
                             max_process_memory: this.globalSettings.memory.max_process_memory,
                             memory_prefill_memory_guard: this.globalSettings.memory.prefill_memory_guard,
-                            max_num_seqs: this.globalSettings.scheduler.max_num_seqs,
-                            completion_batch_size: this.globalSettings.scheduler.completion_batch_size,
+                            max_concurrent_requests: this.globalSettings.scheduler.max_concurrent_requests,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
                             hot_cache_max_size: this.globalSettings.cache.hot_cache_max_size,
                             initial_cache_blocks: this.globalSettings.cache.initial_cache_blocks,
+                            hot_cache_only: this.globalSettings.cache.hot_cache_only,
                             sampling_max_context_window: this.globalSettings.sampling.max_context_window,
                             sampling_max_tokens: this.globalSettings.sampling.max_tokens,
                             sampling_temperature: this.globalSettings.sampling.temperature,
@@ -685,8 +753,13 @@
                             sampling_top_k: this.globalSettings.sampling.top_k,
                             sampling_repetition_penalty: this.globalSettings.sampling.repetition_penalty,
                             mcp_config: this.globalSettings.mcp.config_path,
+                            network_http_proxy: this.globalSettings.network.http_proxy,
+                            network_https_proxy: this.globalSettings.network.https_proxy,
+                            network_no_proxy: this.globalSettings.network.no_proxy,
+                            network_ca_bundle: this.globalSettings.network.ca_bundle,
                             ...(this.globalSettings.auth.api_key ? { api_key: this.globalSettings.auth.api_key } : {}),
                             skip_api_key_verification: this.globalSettings.auth.skip_api_key_verification,
+                            idle_timeout_seconds: this.globalSettings.idle_timeout?.idle_timeout_seconds ?? null,
                         }),
                     });
 
@@ -888,7 +961,547 @@
                 }
             },
 
-            openModelSettings(model) {
+            // ===== Profiles / Templates =====
+            formValuesForProfile() {
+                const ms = this.modelSettings;
+                const out = {};
+
+                for (const k of this.profileFields.universal.concat(this.profileFields.model_specific)) {
+                    if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
+                    if (k === 'thinking_budget_enabled') {
+                        if (ms.enableThinkingBudget) out.thinking_budget_tokens = ms.thinking_budget_tokens ?? null;
+                        continue;
+                    }
+                    if (k === 'index_cache_freq') {
+                        if (ms.enableIndexCache) out.index_cache_freq = ms.index_cache_freq || 4;
+                        continue;
+                    }
+                    if (k === 'max_tool_result_tokens') {
+                        if (ms.enableToolResultLimit) out.max_tool_result_tokens = ms.max_tool_result_tokens || null;
+                        continue;
+                    }
+                    // Standard field: apply nullish coalescing; coerce string numerics
+                    let v = ms[k] ?? null;
+                    if (typeof v === 'string' && v !== '' && !isNaN(Number(v))) v = Number(v);
+                    out[k] = v;
+                }
+
+                // Build chat_template_kwargs and forced_ct_kwargs from ctKwargEntries
+                const ctk = {};
+                const forced = [];
+                for (const e of (ms.ctKwargEntries || [])) {
+                    if (e.type === 'enable_thinking') {
+                        ctk.enable_thinking = e.value === 'true';
+                        if (e.force) forced.push('enable_thinking');
+                    } else if (e.type === 'reasoning_effort') {
+                        ctk.reasoning_effort = e.value;
+                        if (e.force) forced.push('reasoning_effort');
+                    } else if (e.type === 'custom' && e.key && e.key.trim()) {
+                        let v = e.value;
+                        if (v === 'true') v = true;
+                        else if (v === 'false') v = false;
+                        else if (!isNaN(Number(v)) && String(v).trim() !== '') v = Number(v);
+                        ctk[e.key.trim()] = v;
+                        if (e.force) forced.push(e.key.trim());
+                    }
+                }
+                if (Object.keys(ctk).length > 0) out.chat_template_kwargs = ctk;
+                if (forced.length > 0) out.forced_ct_kwargs = forced;
+
+                return out;
+            },
+            formValuesForTemplate() {
+                const full = this.formValuesForProfile();
+                const out = {};
+                for (const k of this.profileFields.universal) {
+                    if (k in full) out[k] = full[k];
+                }
+                return out;
+            },
+            computeDrift() {
+                if (!this.activeProfileName) { this.profilesDrift = false; return; }
+                const active = this.profiles.find(p => p.name === this.activeProfileName);
+                if (!active) { this.profilesDrift = false; return; }
+                const form = this.formValuesForProfile();
+                for (const [k, v] of Object.entries(active.settings || {})) {
+                    if (JSON.stringify(form[k]) !== JSON.stringify(v)) {
+                        this.profilesDrift = true;
+                        return;
+                    }
+                }
+                this.profilesDrift = false;
+            },
+            matchedPreset(settings) {
+                // Return the preset whose universal-field settings match the current model
+                // settings exactly, otherwise null. Used by the models list to show "which
+                // preset was applied" as a pill without any server-side tracking.
+                if (!settings || !this.presets || this.presets.length === 0) return null;
+                const universal = this.profileFields.universal || [];
+                if (universal.length === 0) return null;
+                const canonical = v => {
+                    if (v === undefined || v === null || v === false) return null;
+                    if (typeof v === 'object') {
+                        return JSON.stringify(v, Object.keys(v).sort());
+                    }
+                    return v;
+                };
+                for (const p of this.presets) {
+                    const ps = p.settings || {};
+                    let ok = true;
+                    for (const k of universal) {
+                        if (canonical(ps[k]) !== canonical(settings[k])) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok) return p;
+                }
+                return null;
+            },
+            async loadProfilesForModel(modelId) {
+                this.profiles = [];
+                try {
+                    const r = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/profiles`);
+                    if (r.ok) {
+                        const data = await r.json();
+                        this.profiles = data.profiles || [];
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Failed to load profiles:', e);
+                }
+            },
+            async loadTemplates() {
+                try {
+                    const r = await fetch('/admin/api/profile-templates');
+                    if (r.ok) {
+                        const data = await r.json();
+                        this.templates = data.templates || [];
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Failed to load templates:', e);
+                }
+            },
+            async loadProfileFields() {
+                try {
+                    const r = await fetch('/admin/api/profile-fields');
+                    if (r.ok) {
+                        const data = await r.json();
+                        this.profileFields = {
+                            universal: data.universal || [],
+                            model_specific: data.model_specific || [],
+                        };
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Failed to load profile field definitions:', e);
+                }
+            },
+
+            async loadPresets() {
+                // Use localStorage cache if present, otherwise fall back to the bundled file.
+                const cached = localStorage.getItem('omlx_preset_cache');
+                if (cached) {
+                    try {
+                        const parsed = JSON.parse(cached);
+                        this.presets = parsed.presets || [];
+                        return;
+                    } catch (e) { /* corrupted, fall through */ }
+                }
+                try {
+                    const r = await fetch('/admin/static/omlx_preset.json');
+                    if (r.ok) {
+                        const data = await r.json();
+                        this.presets = data.presets || [];
+                    }
+                } catch (e) {
+                    console.error('Failed to load bundled presets:', e);
+                }
+            },
+
+            async refreshPresets() {
+                if (this.refreshingPresets) return;
+                this.refreshingPresets = true;
+                try {
+                    const r = await fetch('/admin/api/presets/refresh', { method: 'POST' });
+                    if (r.ok) {
+                        const data = await r.json();
+                        this.presets = data.presets || [];
+                        localStorage.setItem('omlx_preset_cache', JSON.stringify(data));
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Preset refresh failed:', e);
+                } finally {
+                    this.refreshingPresets = false;
+                }
+            },
+
+            // Floating tooltip shared by preset/profile pills (position:fixed escapes
+            // the scroll container's overflow clipping, unlike absolute+group-hover).
+            tip: { visible: false, text: '', x: 0, y: 0 },
+
+            showTip(el, text) {
+                if (!text) return;
+                const rect = el.getBoundingClientRect();
+                this.tip = {
+                    visible: true,
+                    text: text,
+                    x: rect.left + rect.width / 2,
+                    y: rect.bottom + 6,
+                };
+            },
+            hideTip() {
+                this.tip.visible = false;
+            },
+
+            _resetPresetApplicableFields() {
+                // Reset all fields a preset can touch so switching presets does not leave
+                // stale values. Intentionally does NOT touch model_alias / model_type_override
+                // / is_pinned / is_default / turboquant_* / dflash_* / specprefill_* / index_cache_*.
+                const ms = this.modelSettings;
+                ms.temperature = null;
+                ms.top_p = null;
+                ms.top_k = null;
+                ms.min_p = null;
+                ms.repetition_penalty = null;
+                ms.presence_penalty = null;
+                ms.force_sampling = false;
+                ms.max_context_window = null;
+                ms.max_tokens = null;
+                ms.reasoning_parser = null;
+                ms.ttl_seconds = null;
+                ms.enable_thinking = null;
+                ms.enableThinkingBudget = false;
+                ms.thinking_budget_tokens = null;
+                ms.enableToolResultLimit = false;
+                ms.max_tool_result_tokens = null;
+                ms.ctKwargEntries = [];
+            },
+
+            applyPresetToForm(preset) {
+                // Reset first so previous preset's fields (e.g. presence_penalty) do not stick.
+                this._resetPresetApplicableFields();
+                const s = preset.settings || {};
+                const ms = this.modelSettings;
+                for (const k of Object.keys(s)) {
+                    if (k === 'thinking_budget_enabled') {
+                        ms.enableThinkingBudget = !!s[k];
+                    } else if (k === 'max_tool_result_tokens') {
+                        ms.enableToolResultLimit = s[k] != null;
+                        ms.max_tool_result_tokens = s[k] ?? null;
+                    } else if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') {
+                        const ctk = s.chat_template_kwargs || {};
+                        const forced = new Set(s.forced_ct_kwargs || []);
+                        const entries = [];
+                        for (const [key, value] of Object.entries(ctk)) {
+                            if (key === 'enable_thinking') {
+                                entries.push({type:'enable_thinking', value:String(value), force:forced.has('enable_thinking')});
+                            } else if (key === 'reasoning_effort') {
+                                entries.push({type:'reasoning_effort', value:String(value), force:forced.has('reasoning_effort')});
+                            } else {
+                                entries.push({type:'custom', key, value:String(value), force:forced.has(key)});
+                            }
+                        }
+                        ms.ctKwargEntries = entries;
+                    } else {
+                        ms[k] = s[k];
+                    }
+                }
+                this.activeProfileName = null;
+                this.profilesDrift = false;
+            },
+
+            setScope(scope) {
+                this.profileScope = scope;
+                try { localStorage.setItem('omlx_profile_scope', scope); } catch (e) {}
+            },
+
+            async createProfile() {
+                if (!this.selectedModel) return;
+                this.profileError = '';
+                const displayName = this.newProfile.display_name.trim();
+                if (!displayName) {
+                    this.profileError = 'Name required';
+                    return;
+                }
+                // Auto-generate short unique slug (matches backend ^[a-z0-9][a-z0-9_-]{0,31}$)
+                const autoId = 'p-' + Date.now().toString(36) + '-' +
+                               Math.random().toString(36).slice(2, 6);
+                const body = {
+                    name: autoId,
+                    display_name: displayName,
+                    description: this.newProfile.description.trim() || null,
+                    settings: this.formValuesForProfile(),
+                    also_save_as_template: false,
+                };
+                try {
+                    const r = await fetch(
+                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles`,
+                        { method: 'POST', headers: {'Content-Type': 'application/json'},
+                          body: JSON.stringify(body) }
+                    );
+                    if (r.ok) {
+                        await this.loadProfilesForModel(this.selectedModel.id);
+                        if (body.also_save_as_template) await this.loadTemplates();
+                        this.showNewProfileForm = false;
+                        this.newProfile = { name: '', display_name: '', description: '', also_as_template: false };
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await r.json().catch(() => ({}));
+                        this.profileError = data.detail || 'Failed to save profile';
+                    }
+                } catch (e) {
+                    this.profileError = String(e);
+                }
+            },
+            async applyProfileToForm(profile) {
+                // Merge all profile fields into the form (no server call — user clicks Save to persist).
+                const s = profile.settings || {};
+                const ms = this.modelSettings;
+                for (const k of this.profileFields.universal.concat(this.profileFields.model_specific)) {
+                    if (!(k in s)) continue;
+                    if (k === 'thinking_budget_enabled') {
+                        ms.enableThinkingBudget = !!s[k];
+                    } else if (k === 'index_cache_freq') {
+                        ms.enableIndexCache = !!s[k];
+                        ms.index_cache_freq = s[k] || null;
+                    } else if (k === 'max_tool_result_tokens') {
+                        ms.enableToolResultLimit = !!s[k];
+                        ms.max_tool_result_tokens = s[k] || null;
+                    } else if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') {
+                        // Rebuild ctKwargEntries
+                        const ctk = s.chat_template_kwargs || {};
+                        const forced = new Set(s.forced_ct_kwargs || []);
+                        const entries = [];
+                        for (const [key, value] of Object.entries(ctk)) {
+                            if (key === 'enable_thinking') {
+                                entries.push({type:'enable_thinking', value:String(value), force:forced.has('enable_thinking')});
+                            } else if (key === 'reasoning_effort') {
+                                entries.push({type:'reasoning_effort', value:String(value), force:forced.has('reasoning_effort')});
+                            } else {
+                                entries.push({type:'custom', key, value:String(value), force:forced.has(key)});
+                            }
+                        }
+                        ms.ctKwargEntries = entries;
+                    } else {
+                        ms[k] = s[k];
+                    }
+                }
+                // Persist active_profile_name to backend before updating UI state
+                const seq = ++this._applySeq;
+                try {
+                    const r = await fetch(
+                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(profile.name)}/apply`,
+                        { method: 'POST' }
+                    );
+                    if (seq !== this._applySeq) return;  // superseded by a newer click
+                    if (r.ok) {
+                        this.activeProfileName = profile.name;
+                        this.profilesDrift = false;
+                        // Update the models list so the profile badge reflects the change
+                        const m = this.models.find(m => m.id === this.selectedModel.id);
+                        if (m) m.settings = { ...m.settings, active_profile_name: profile.name };
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Failed to apply profile:', e);
+                }
+            },
+            async applyTemplateToForm(template) {
+                // Check if a profile with this template's name already exists
+                const existingProfile = this.profiles.find(p => p.name === template.name);
+
+                if (existingProfile) {
+                    // Profile exists, just apply it (preserve user customizations)
+                    await this.applyProfileToForm(existingProfile);
+                } else {
+                    // Create a new profile from the template
+                    const body = {
+                        name: template.name,
+                        display_name: template.display_name,
+                        description: template.description || null,
+                        settings: template.settings,
+                        source_template: template.name,
+                    };
+                    
+                    try {
+                        const r = await fetch(
+                            `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles`,
+                            { method: 'POST', headers: {'Content-Type': 'application/json'},
+                              body: JSON.stringify(body) }
+                        );
+                        if (r.ok) {
+                            // Reload profiles first to include the new one
+                            await this.loadProfilesForModel(this.selectedModel.id);
+                            // Find the newly created profile in the refreshed list
+                            const newProfile = this.profiles.find(p => p.name === template.name);
+                            if (newProfile) {
+                                await this.applyProfileToForm(newProfile);
+                            }
+                        }
+                    } catch (e) {
+                        console.error('Failed to create profile from template:', e);
+                    }
+                }
+            },
+            async deleteProfile(name) {
+                if (!this.selectedModel) return;
+                try {
+                    const r = await fetch(
+                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(name)}`,
+                        { method: 'DELETE' }
+                    );
+                    if (r.ok) {
+                        if (this.activeProfileName === name) this.activeProfileName = null;
+                        await this.loadProfilesForModel(this.selectedModel.id);
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Delete profile failed:', e);
+                } finally {
+                    this.profileDeleteConfirm = null;
+                }
+            },
+            async updateProfile(name, patch) {
+                // patch: { new_name?, display_name?, description?, settings?, also_save_as_template? }
+                if (!this.selectedModel) return;
+                this.profileError = '';
+                try {
+                    const r = await fetch(
+                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(name)}`,
+                        { method: 'PUT', headers: {'Content-Type':'application/json'},
+                          body: JSON.stringify(patch) }
+                    );
+                    if (r.ok) {
+                        const data = await r.json();
+                        if (this.activeProfileName === name && patch.new_name) {
+                            this.activeProfileName = patch.new_name;
+                        }
+                        await this.loadProfilesForModel(this.selectedModel.id);
+                        if (patch.also_save_as_template) await this.loadTemplates();
+                        this.editingProfile = null;
+                        return data.profile;
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await r.json().catch(() => ({}));
+                        this.profileError = data.detail || 'Failed to update profile';
+                    }
+                } catch (e) {
+                    this.profileError = String(e);
+                }
+            },
+            async createTemplate() {
+                this.profileError = '';
+                const displayName = this.newTemplate.display_name.trim();
+                if (!displayName) {
+                    this.profileError = 'Name required';
+                    return;
+                }
+                const autoId = 't-' + Date.now().toString(36) + '-' +
+                               Math.random().toString(36).slice(2, 6);
+                const body = {
+                    name: autoId,
+                    display_name: displayName,
+                    description: this.newTemplate.description.trim() || null,
+                    // Only universal fields — server will filter again defensively.
+                    settings: this.formValuesForTemplate(),
+                };
+                try {
+                    const r = await fetch('/admin/api/profile-templates', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify(body),
+                    });
+                    if (r.ok) {
+                        await this.loadTemplates();
+                        this.showNewTemplateForm = false;
+                        this.newTemplate = { name: '', display_name: '', description: '' };
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await r.json().catch(() => ({}));
+                        this.profileError = data.detail || 'Failed to save template';
+                    }
+                } catch (e) {
+                    this.profileError = String(e);
+                }
+            },
+            async updateTemplate(name, patch) {
+                this.profileError = '';
+                try {
+                    const r = await fetch(
+                        `/admin/api/profile-templates/${encodeURIComponent(name)}`,
+                        { method: 'PUT', headers: {'Content-Type':'application/json'},
+                          body: JSON.stringify(patch) }
+                    );
+                    if (r.ok) {
+                        await this.loadTemplates();
+                        this.editingTemplate = null;
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await r.json().catch(() => ({}));
+                        this.profileError = data.detail || 'Failed to update template';
+                    }
+                } catch (e) {
+                    this.profileError = String(e);
+                }
+            },
+            async deleteTemplate(name) {
+                try {
+                    const r = await fetch(
+                        `/admin/api/profile-templates/${encodeURIComponent(name)}`,
+                        { method: 'DELETE' }
+                    );
+                    if (r.ok) {
+                        await this.loadTemplates();
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Delete template failed:', e);
+                } finally {
+                    this.templateDeleteConfirm = null;
+                }
+            },
+
+            async openModelSettings(model) {
+                this.profileError = '';
+                this.showNewProfileForm = false;
+                this.showNewTemplateForm = false;
+                this.editingProfile = null;
+                this.editingTemplate = null;
+                this.profileDeleteConfirm = null;
+                this.templateDeleteConfirm = null;
+                this.activeProfileName = (model.settings && model.settings.active_profile_name) || null;
+                try {
+                    const saved = localStorage.getItem('omlx_profile_scope');
+                    if (saved === 'preset' || saved === 'global' || saved === 'model') {
+                        this.profileScope = saved;
+                    }
+                } catch (e) {}
+                await Promise.all([
+                    this.loadProfilesForModel(model.id),
+                    this.loadTemplates(),
+                ]);
+                this.computeDrift();
+                if (this.reasoningParsers.length === 0) {
+                    try {
+                        const resp = await fetch('/admin/api/grammar/parsers');
+                        if (resp.ok) this.reasoningParsers = await resp.json();
+                        else if (resp.status === 401) window.location.href = '/admin';
+                    } catch (_) { /* network error */ }
+                }
                 this.selectedModel = model;
                 // Load existing settings if available
                 const settings = model.settings || {};
@@ -918,6 +1531,8 @@
                     min_p: settings.min_p ?? null,
                     presence_penalty: settings.presence_penalty ?? null,
                     force_sampling: settings.force_sampling || false,
+                    enable_thinking: settings.enable_thinking ?? null,
+                    thinking_default: model.thinking_default ?? null,
                     enableThinkingBudget: !!(settings.thinking_budget_tokens),
                     thinking_budget_tokens: settings.thinking_budget_tokens || null,
                     enableToolResultLimit: !!(settings.max_tool_result_tokens),
@@ -932,7 +1547,11 @@
                     specprefill_draft_model: settings.specprefill_draft_model || '',
                     specprefill_keep_pct: settings.specprefill_keep_pct ? String(settings.specprefill_keep_pct) : '0.2',
                     specprefill_threshold: settings.specprefill_threshold || null,
+                    dflash_enabled: settings.dflash_enabled || false,
+                    dflash_draft_model: settings.dflash_draft_model || '',
+                    dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
                     ctKwargEntries,
+                    trust_remote_code: settings.trust_remote_code || false,
                 };
                 this.showModelSettingsModal = true;
             },
@@ -983,6 +1602,7 @@
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)
                                     : 0,
+                                enable_thinking: this.modelSettings.enable_thinking,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)
@@ -996,7 +1616,7 @@
                                     ? forcedCtKwargs : null,
                                 turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
-                                    ? (this.modelSettings.turboquant_kv_bits || 4)
+                                    ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
@@ -1006,24 +1626,20 @@
                                 specprefill_threshold: this.modelSettings.specprefill_enabled
                                     ? (this.modelSettings.specprefill_threshold || null)
                                     : null,
+                                dflash_enabled: this.modelSettings.dflash_enabled,
+                                dflash_draft_model: this.modelSettings.dflash_draft_model || null,
+                                dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
+                                    ? parseInt(this.modelSettings.dflash_draft_quant_bits)
+                                    : null,
+                                trust_remote_code: this.modelSettings.trust_remote_code,
                             };
                         })()),
                     });
 
                     if (response.ok) {
-                        // Update local model data from server response
+                        // Refresh the model list to update badges
+                        await this.loadModels();
                         const data = await response.json();
-                        const model = this.models.find(m => m.id === this.selectedModel.id);
-                        if (model) {
-                            model.settings = data.settings || {};
-                            // Update effective model_type/engine_type from server
-                            if (data.model_type) {
-                                model.model_type = data.model_type;
-                            }
-                            if (data.engine_type) {
-                                model.engine_type = data.engine_type;
-                            }
-                        }
                         this.showModelSettingsModal = false;
                         if (data.requires_reload) {
                             alert(window.t('js.info.model_type_reload_required'));
@@ -1055,6 +1671,30 @@
                         this.modelSettings.top_p = data.top_p ?? null;
                         this.modelSettings.top_k = data.top_k ?? null;
                         this.modelSettings.repetition_penalty = data.repetition_penalty ?? null;
+                        this.modelSettings.max_tokens = null;
+                        this.modelSettings.min_p = null;
+                        this.modelSettings.presence_penalty = null;
+                        this.modelSettings.force_sampling = false;
+                        this.modelSettings.reasoning_parser = null;
+                        this.modelSettings.ttl_seconds = null;
+                        this.modelSettings.enableIndexCache = false;
+                        this.modelSettings.index_cache_freq = 0;
+                        this.modelSettings.enable_thinking = false;
+                        this.modelSettings.enableThinkingBudget = false;
+                        this.modelSettings.thinking_budget_tokens = 0;
+                        this.modelSettings.enableToolResultLimit = false;
+                        this.modelSettings.max_tool_result_tokens = 0;
+                        this.modelSettings.ctKwargEntries = [];
+                        this.modelSettings.turboquant_kv_enabled = false;
+                        this.modelSettings.turboquant_kv_bits = 4;
+                        this.modelSettings.specprefill_enabled = false;
+                        this.modelSettings.specprefill_draft_model = null;
+                        this.modelSettings.specprefill_keep_pct = 0.2;
+                        this.modelSettings.specprefill_threshold = null;
+                        this.modelSettings.dflash_enabled = false;
+                        this.modelSettings.dflash_draft_model = null;
+                        this.modelSettings.dflash_draft_quant_bits = null;
+                        this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
                     } else if (response.status === 401) {
@@ -1069,14 +1709,66 @@
                 } finally {
                     this.loadingGenDefaults = false;
                 }
+                this.activeProfileName = null;
+                this.profilesDrift = false;
             },
 
             // Status tab functions
+            // Normalizes a host string for safe URL embedding:
+            //  - unwraps existing IPv6 brackets so we can re-bracket consistently
+            //  - maps unspecified bind addresses (0.0.0.0, ::) to a placeholder
+            //    since they are not routable from a client
+            //  - maps `localhost` to 127.0.0.1 for consistency with other URLs
+            //  - bracket-wraps IPv6 addresses per RFC 3986 (`http://[::1]:8000/v1`)
+            formatDisplayHost(host) {
+                const value = (host || '').trim();
+                if (!value) return '127.0.0.1';
+
+                const unwrapped = value.startsWith('[') && value.endsWith(']')
+                    ? value.slice(1, -1)
+                    : value;
+
+                if (unwrapped === '0.0.0.0' || unwrapped === '::') return 'your-ip-address';
+                if (unwrapped === 'localhost') return '127.0.0.1';
+                if (unwrapped.includes(':')) return `[${unwrapped}]`;
+                return unwrapped;
+            },
+
             get displayHost() {
-                const host = this.stats.host || '127.0.0.1';
-                if (host === '0.0.0.0') return 'your-ip-address';
-                if (host === 'localhost') return '127.0.0.1';
-                return host;
+                const host = this.selectedAlias || this.stats.host || '127.0.0.1';
+                return this.formatDisplayHost(host);
+            },
+
+            get ttlPlaceholder() {
+                if (this.selectedModel?.pinned) return window.t('modal.model_settings.ttl_pinned');
+                const globalTtl = this.globalSettings.idle_timeout?.idle_timeout_seconds;
+                if (globalTtl) {
+                    return window.t('modal.model_settings.ttl_global_fallback').replace('{seconds}', globalTtl);
+                }
+                return window.t('modal.model_settings.ttl_no_ttl');
+            },
+
+            async loadServerInfo() {
+                try {
+                    const response = await fetch('/admin/api/server-info');
+                    if (response.ok) {
+                        const data = await response.json();
+                        const aliases = Array.isArray(data.aliases) ? data.aliases : [];
+                        this.serverAliases = aliases;
+                        // Preserve user selection across reloads if still valid;
+                        // otherwise default to the first alias when available.
+                        if (this.selectedAlias && !aliases.includes(this.selectedAlias)) {
+                            this.selectedAlias = '';
+                        }
+                        if (!this.selectedAlias && aliases.length > 0) {
+                            this.selectedAlias = aliases[0];
+                        }
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (err) {
+                    console.error('Failed to load server info:', err);
+                }
             },
 
             get llmModels() {
@@ -1171,6 +1863,16 @@
                 return parts.join(' ');
             },
 
+            get piCommand() {
+                const cli = this.stats.cli_prefix || 'omlx';
+                const model = this.globalSettings.integrations.pi_model || 'select-a-model';
+                const parts = [`${this.shellQuote(cli)} launch pi --model ${this.shellQuote(model)}`];
+                if (this.stats.api_key) {
+                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
+                }
+                return parts.join(' ');
+            },
+
             async saveIntegrationSettings() {
                 try {
                     const response = await fetch('/admin/api/global-settings', {
@@ -1180,6 +1882,7 @@
                             integrations_codex_model: this.globalSettings.integrations.codex_model,
                             integrations_opencode_model: this.globalSettings.integrations.opencode_model,
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
+                            integrations_pi_model: this.globalSettings.integrations.pi_model,
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
                         }),
                     });
@@ -1692,6 +2395,7 @@
                                 selected.map(k => [k, this.accSampleSizes[k]])
                             ),
                             batch_size: this.accBatchSize,
+                            enable_thinking: this.accEnableThinking,
                         }),
                     });
                     if (!resp.ok) {
@@ -1860,7 +2564,9 @@
 
                 // Full sizes lookup
                 const fullSizes = {};
-                for (const bl of this.accBenchmarkList) fullSizes[bl.key] = bl.fullSize;
+                for (const grp of this.accBenchmarkGroups) {
+                    for (const bl of grp.benchmarks) fullSizes[bl.key] = bl.fullSize;
+                }
 
                 // Determine column widths
                 const modelWidth = Math.max(12, ...models.map(m => m.length + 2));
@@ -1902,15 +2608,16 @@
                 for (const m of models) {
                     lines.push('');
                     lines.push('Model: ' + m);
-                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10));
-                    lines.push('-'.repeat(54));
+                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10) + pad('Think', 8));
+                    lines.push('-'.repeat(62));
                     for (const r of this.accAllResults.filter(r => r.model_id === m)) {
                         lines.push(
                             rpad(r.benchmark.toUpperCase(), 16) +
                             pad((r.accuracy * 100).toFixed(1) + '%', 10) +
                             pad(r.correct, 10) +
                             pad(r.total, 8) +
-                            pad(r.time_s, 10)
+                            pad(r.time_s, 10) +
+                            pad(r.thinking_used ? 'Yes' : 'No', 8)
                         );
                     }
                 }
@@ -1948,15 +2655,16 @@
                         correct: r.correct,
                         total: r.total,
                         time_s: r.time_s,
+                        thinking_used: r.thinking_used || false,
                         category_scores: r.category_scores || null,
                         questions: qr,
                     }, null, 2);
                     mime = 'application/json';
                 } else if (format === 'csv') {
                     const esc = s => '"' + (s || '').replace(/"/g, '""') + '"';
-                    const lines = ['id,correct,expected,predicted,question,raw_response,time_s'];
+                    const lines = ['id,category,correct,expected,predicted,question,raw_response,time_s'];
                     for (const q of qr) {
-                        lines.push([q.id, q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                        lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
                     }
                     content = lines.join('\n');
                     mime = 'text/csv';
@@ -1970,6 +2678,7 @@
                     ];
                     for (const q of qr) {
                         lines.push(`--- Q${q.id} [${q.correct ? 'CORRECT' : 'WRONG'}] ---`);
+                        if (q.category) lines.push(`Category: ${q.category}`);
                         lines.push(`Question: ${q.question || ''}`);
                         lines.push(`Expected: ${q.expected}`);
                         lines.push(`Predicted: ${q.predicted}`);
@@ -2439,15 +3148,37 @@
                 }
             },
 
-            // Theme toggle
-            toggleTheme() {
-                this.theme = this.theme === 'light' ? 'dark' : 'light';
+            // Theme select
+            setTheme(theme) {
+                this.theme = theme;
                 localStorage.setItem('omlx-chat-theme', this.theme);
                 this.applyTheme();
             },
 
             applyTheme() {
-                document.documentElement.setAttribute('data-theme', this.theme);
+                // Clean up existing listener
+                if (this.systemThemeListener) {
+                    window.matchMedia('(prefers-color-scheme: dark)').removeEventListener('change', this.systemThemeListener);
+                    this.systemThemeListener = null;
+                }
+
+                if (this.theme === 'auto') {
+                    // Detect system theme
+                    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                    this.activeTheme = prefersDark ? 'dark' : 'light';
+                    document.documentElement.setAttribute('data-theme', this.activeTheme);
+
+                    // Add listener for system theme changes
+                    this.systemThemeListener = (e) => {
+                        this.activeTheme = e.matches ? 'dark' : 'light';
+                        document.documentElement.setAttribute('data-theme', this.activeTheme);
+                    };
+                    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', this.systemThemeListener);
+                } else {
+                    // Use explicit theme
+                    this.activeTheme = this.theme;
+                    document.documentElement.setAttribute('data-theme', this.activeTheme);
+                }
             },
 
             // =================================================================
@@ -2693,15 +3424,10 @@
                         body: JSON.stringify({
                             model_path: this.oqSelectedModelPath,
                             oq_level: this.oqLevel,
-                            enable_clip: this.oqEnableClip,
                             group_size: 64,
-                            clip_num_samples: this.oqClipSamples,
-                            clip_seq_length: this.oqClipSeqLen,
-                            calib_dataset: this.oqCalibDataset,
-                            clip_batch_size: this.oqClipBatchSize,
                             sensitivity_model_path: this.oqSensitivityModelPath,
                             text_only: this.oqTextOnly,
-                            expert_batch_size: this.oqExpertBatchSize,
+                            dtype: this.oqDtype,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));
@@ -2801,11 +3527,6 @@
                 );
             },
 
-            oqSelectedModelSupportsClip() {
-                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
-                return model?.supports_clip || false;
-            },
-
             oqSelectedModelIsVLM() {
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 return model?.is_vlm || false;
@@ -2814,9 +3535,6 @@
             oqEstimatedMemory() {
                 // Use precise estimate from API if available
                 if (this.oqEstimate) {
-                    if (this.oqEnableClip) {
-                        return this.oqEstimate.memory_clip_formatted || '';
-                    }
                     // If sensitivity model selected, memory ≈ sensitivity model size × 1.5
                     if (this.oqSensitivityModelPath) {
                         const sensModel = this.oqAllModels.find(m => m.path === this.oqSensitivityModelPath);
@@ -2831,9 +3549,6 @@
                 // Fallback to rough model-level estimate
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 if (!model) return '';
-                if (this.oqEnableClip) {
-                    return model.memory_clip?.peak_formatted || '';
-                }
                 return model.memory_streaming?.peak_formatted || '';
             },
 
@@ -2924,6 +3639,7 @@
                 this.uploadModalRepoId = (this.uploadHfNamespace || this.uploadHfUsername) + '/' + model.name;
                 this.uploadReadmeSource = '';
                 this.uploadAutoReadme = true;
+                this.uploadRedownloadNotice = false;
                 this.uploadPrivate = false;
                 this.uploadStarting = false;
                 this.uploadModalOpen = true;
@@ -2943,6 +3659,7 @@
                             hf_token: this.uploadHfToken,
                             readme_source_path: this.uploadReadmeSource,
                             auto_readme: this.uploadAutoReadme,
+                            redownload_notice: this.uploadRedownloadNotice && this.uploadReadmeSource === '',
                             private: this.uploadPrivate,
                         }),
                     });

@@ -1,4 +1,4 @@
-"""Preferences window for oMLX app settings - modern macOS native design."""
+"""Settings window for oMLX app settings - modern macOS native design."""
 
 import logging
 import plistlib
@@ -51,7 +51,7 @@ WINDOW_HEIGHT = 606
 
 
 class PreferencesWindowController(NSObject):
-    """Controller for the Preferences window - modern macOS design."""
+    """Controller for the Settings window - modern macOS design."""
 
     def initWithConfig_serverManager_onSave_(
         self, config, server_manager, on_save_callback
@@ -93,7 +93,7 @@ class PreferencesWindowController(NSObject):
         return sep
 
     def showWindow(self):
-        """Create and show the preferences window."""
+        """Create and show the settings window."""
         # Sync from server settings.json (Web admin changes)
         self.config.sync_from_server_settings()
 
@@ -102,7 +102,7 @@ class PreferencesWindowController(NSObject):
         self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             frame, style, NSBackingStoreBuffered, False
         )
-        self.window.setTitle_("oMLX Preferences")
+        self.window.setTitle_("oMLX Settings")
         self.window.center()
         self.window.setReleasedWhenClosed_(False)
 
@@ -124,7 +124,7 @@ class PreferencesWindowController(NSObject):
 
         # === Title ===
         y -= 30
-        title = NSTextField.labelWithString_("Preferences")
+        title = NSTextField.labelWithString_("Settings")
         title.setFont_(NSFont.systemFontOfSize_weight_(22, 0.5))
         title.setFrame_(NSMakeRect(24, y, WINDOW_WIDTH - 48, 30))
         container.addSubview_(title)
@@ -466,7 +466,7 @@ class PreferencesWindowController(NSObject):
 
     @objc.IBAction
     def savePrefs_(self, sender):
-        """Save preferences and apply changes."""
+        """Save settings and apply changes."""
         new_base_path = str(self.base_path_label.stringValue())
         new_model_dir = str(self.model_dir_label.stringValue())
         port_str = str(self.port_field.stringValue()).strip()
@@ -556,7 +556,7 @@ class PreferencesWindowController(NSObject):
 
     @objc.IBAction
     def closePrefs_(self, sender):
-        """Close the preferences window without saving."""
+        """Close the settings window without saving."""
         self.window.close()
 
     @objc.IBAction

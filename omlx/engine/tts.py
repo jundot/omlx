@@ -43,6 +43,7 @@ class TTSEngine(BaseNonStreamingEngine):
             model_name: HuggingFace model name or local path
             **kwargs: Additional model-specific parameters
         """
+        super().__init__()
         self._model_name = model_name
         self._model = None
         self._kwargs = kwargs
@@ -70,7 +71,7 @@ class TTSEngine(BaseNonStreamingEngine):
         except ImportError as exc:
             raise ImportError(
                 "mlx-audio is required for TTS inference. "
-                "Install it with: pip install mlx-audio"
+                'Install it with: pip install "omlx[audio]"'
             ) from exc
 
         model_name = self._model_name
@@ -116,6 +117,14 @@ class TTSEngine(BaseNonStreamingEngine):
         text: str,
         voice: Optional[str] = None,
         speed: float = 1.0,
+        instructions: Optional[str] = None,
+        ref_audio: Optional[str] = None,
+        ref_text: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        max_tokens: Optional[int] = None,
         **kwargs,
     ) -> bytes:
         """
@@ -125,6 +134,14 @@ class TTSEngine(BaseNonStreamingEngine):
             text: Input text to synthesize
             voice: Optional voice/speaker identifier
             speed: Speech speed multiplier (1.0 = normal)
+            instructions: Optional voice description for instruct-capable models
+            ref_audio: Optional path to reference audio file (voice cloning)
+            ref_text: Optional transcript of the reference audio
+            temperature: Sampling temperature for generation
+            top_k: Top-k sampling parameter
+            top_p: Top-p (nucleus) sampling parameter
+            repetition_penalty: Repetition penalty for generation
+            max_tokens: Maximum number of tokens to generate
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -136,8 +153,9 @@ class TTSEngine(BaseNonStreamingEngine):
         import time
 
         logger.info(
-            "TTS synthesize: model=%s, text_len=%d, voice=%s, speed=%.1f",
+            "TTS synthesize: model=%s, text_len=%d, voice=%s, speed=%.1f, ref_audio=%s",
             self._model_name, len(text), voice, speed,
+            "yes" if ref_audio else "no",
         )
 
         model = self._model
@@ -150,27 +168,45 @@ class TTSEngine(BaseNonStreamingEngine):
                 "text": text,
                 "verbose": False,
             }
+            import inspect
+            gen_params = inspect.signature(model.generate).parameters
             if voice is not None:
-                # VoiceDesign models expect voice description in 'instruct',
-                # not 'voice'. Detect by checking if generate() accepts 'instruct'.
-                import inspect
-                gen_params = inspect.signature(model.generate).parameters
-                if "instruct" in gen_params and voice != "default":
-                    gen_kwargs["instruct"] = voice
-                else:
+                # Route voice to the correct generate() kwarg.
+                # Models with 'voice' param (CustomVoice, Kokoro) get it as
+                # a speaker name. Models with only 'instruct' (non-Qwen TTS)
+                # get it as a voice description fallback.
+                if "voice" in gen_params:
                     gen_kwargs["voice"] = voice
+                elif "instruct" in gen_params:
+                    gen_kwargs["instruct"] = voice
+            if instructions is not None and "instruct" in gen_params:
+                gen_kwargs["instruct"] = instructions
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
+            if ref_audio is not None and "ref_audio" in gen_params:
+                gen_kwargs["ref_audio"] = ref_audio
+                gen_kwargs["ref_text"] = ref_text
+            # Generation params (only add non-None values)
+            if temperature is not None:
+                gen_kwargs["temperature"] = temperature
+            if top_k is not None:
+                gen_kwargs["top_k"] = top_k
+            if top_p is not None:
+                gen_kwargs["top_p"] = top_p
+            if repetition_penalty is not None:
+                gen_kwargs["repetition_penalty"] = repetition_penalty
+            if max_tokens is not None:
+                gen_kwargs["max_tokens"] = max_tokens
             gen_kwargs.update(kwargs)
 
             results = model.generate(**gen_kwargs)
+
+            # Use model.sample_rate if available (e.g. Qwen3-TTS)
+            sample_rate = getattr(model, "sample_rate", _DEFAULT_SAMPLE_RATE)
             audio_chunks = []
-            sample_rate = _DEFAULT_SAMPLE_RATE
 
             for result in results:
                 audio_chunks.append(np.array(result.audio))
-                if hasattr(result, "sample_rate"):
-                    sample_rate = result.sample_rate
 
             if not audio_chunks:
                 raise RuntimeError("TTS model produced no audio output")
@@ -178,17 +214,27 @@ class TTSEngine(BaseNonStreamingEngine):
             audio = np.concatenate(audio_chunks, axis=0)
             return _audio_to_wav_bytes(audio, int(sample_rate))
 
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            get_mlx_executor(), _synthesize_sync
-        )
+        with self._active_lock:
+            self._active_count += 1
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                get_mlx_executor(), _synthesize_sync
+            )
 
-        elapsed = time.monotonic() - t0
-        logger.info(
-            "TTS synthesize done: model=%s, %.2fs, %d bytes output",
-            self._model_name, elapsed, len(result),
-        )
-        return result
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "TTS synthesize done: model=%s, %.2fs, %d bytes output",
+                self._model_name, elapsed, len(result),
+            )
+            return result
+        finally:
+            if self._decrement_active():
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

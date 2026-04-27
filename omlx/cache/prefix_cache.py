@@ -18,18 +18,22 @@ try:
 except ImportError:
     HAS_MLX = False
 
+from ._rotating_subclass import PrefillReadyRotatingKVCache
 from .interface import CacheManager
 from .paged_ssd_cache import PagedSSDCacheManager
-from .paged_cache import BlockTable, CacheBlock, PagedCacheManager, compute_block_hash
+from .paged_cache import (
+    BlockTable,
+    CacheBlock,
+    PagedCacheManager,
+    compute_block_hash,
+    resolve_block_extra_keys,
+)
 from .stats import BaseCacheStats, PrefixCacheStats
 from .type_handlers import CacheType, CacheTypeHandler
 from .type_registry import CacheTypeRegistry
 from .hybrid_cache import ModelCacheConfig, LayerCacheConfig
 
 logger = logging.getLogger(__name__)
-
-
-_PrefillReadyRotatingKVCache = None  # Lazily initialized RotatingKVCache subclass
 
 
 @dataclass
@@ -228,6 +232,8 @@ class BlockAwarePrefixCache(CacheManager):
         request_id: str,
         tokens: List[int],
         extra_keys: Optional[Tuple[Any, ...]] = None,
+        extra_key_token_start: Optional[int] = None,
+        extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
     ) -> Tuple[Optional[BlockTable], List[int]]:
         """
         Find cached prefix blocks for the given tokens.
@@ -247,7 +253,10 @@ class BlockAwarePrefixCache(CacheManager):
 
         # Try to find shared prefix blocks
         shared_block_ids, remaining = self.paged_cache.find_shared_prefix(
-            tokens, extra_keys=extra_keys
+            tokens,
+            extra_keys=extra_keys,
+            extra_key_token_start=extra_key_token_start,
+            extra_key_ranges=extra_key_ranges,
         )
 
         if shared_block_ids:
@@ -311,6 +320,8 @@ class BlockAwarePrefixCache(CacheManager):
         model_cache_config: Optional[ModelCacheConfig] = None,
         boundary_snapshots: Optional[Dict[int, List[Any]]] = None,
         extra_keys: Optional[Tuple[Any, ...]] = None,
+        extra_key_token_start: Optional[int] = None,
+        extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
     ) -> Optional[BlockTable]:
         """
         Store computed cache for future reuse.
@@ -433,9 +444,20 @@ class BlockAwarePrefixCache(CacheManager):
                 if prev_block and prev_block.block_hash:
                     parent_hash = prev_block.block_hash
 
+            block_extra_keys = resolve_block_extra_keys(
+                global_end,
+                extra_keys=extra_keys,
+                extra_key_token_start=extra_key_token_start,
+                extra_key_ranges=extra_key_ranges,
+            )
+
             # Check if this block already exists (deduplication)
             if len(block_tokens) == self.block_size:
-                existing_block = self.paged_cache.find_cached_block(block_tokens, parent_hash)
+                existing_block = self.paged_cache.find_cached_block(
+                    block_tokens,
+                    parent_hash,
+                    extra_keys=block_extra_keys,
+                )
                 if existing_block:
                     # Reuse existing block
                     self.paged_cache.increment_ref(existing_block.block_id)
@@ -462,13 +484,13 @@ class BlockAwarePrefixCache(CacheManager):
             # Compute chain hash for this block
             block.block_hash = compute_block_hash(
                 parent_hash, block_tokens,
-                extra_keys=extra_keys, model_name=self.paged_cache.model_name,
+                extra_keys=block_extra_keys, model_name=self.paged_cache.model_name,
             )
 
             # Register hash for full blocks (for deduplication)
             if len(block_tokens) == self.block_size:
                 self.paged_cache.register_block_hash(
-                    block, block_tokens, parent_hash, extra_keys=extra_keys
+                    block, block_tokens, parent_hash, extra_keys=block_extra_keys
                 )
 
             # Extract tensor slice and save to paged SSD
@@ -522,6 +544,31 @@ class BlockAwarePrefixCache(CacheManager):
                 )
 
                 if block_kv_data and block.block_hash:
+                    # Use per-block meta_states from boundary snapshot when
+                    # available. The shared layer_meta_states comes from the
+                    # final cache extraction and carries the end-of-request
+                    # offset (e.g. 4479) which is wrong for earlier blocks
+                    # whose tensor data was captured at an earlier boundary
+                    # (e.g. offset=512). Boundary snapshots record the
+                    # correct per-boundary meta_state synchronously during
+                    # prefill, so we prefer those.
+                    block_meta = layer_meta_states
+                    if snapshot_cache_data is not None and layer_meta_states is not None:
+                        per_block = []
+                        for lidx in range(len(layer_meta_states)):
+                            if (
+                                lidx < len(snapshot_cache_data)
+                                and isinstance(snapshot_cache_data[lidx], dict)
+                                and snapshot_cache_data[lidx].get("meta_state")
+                                and snapshot_cache_data[lidx]["meta_state"] != ()
+                            ):
+                                per_block.append(
+                                    snapshot_cache_data[lidx]["meta_state"]
+                                )
+                            else:
+                                per_block.append(layer_meta_states[lidx])
+                        block_meta = per_block
+
                     # Save to paged SSD via PagedSSDCacheManager with cache type info
                     saved = self.paged_ssd_cache.save_block(
                         block_hash=block.block_hash,
@@ -529,7 +576,7 @@ class BlockAwarePrefixCache(CacheManager):
                         token_count=block.token_count,
                         model_name=self.paged_cache.model_name,
                         layer_cache_types=layer_cache_types,
-                        layer_meta_states=layer_meta_states,
+                        layer_meta_states=block_meta,
                     )
                     if saved:
                         blocks_saved_to_ssd += 1
@@ -612,12 +659,18 @@ class BlockAwarePrefixCache(CacheManager):
 
                 state = layer_state['state']
                 keys = state[0] if isinstance(state, (list, tuple)) else state
-                # TurboQuant: keys = (k_norms, k_packed) tuple
-                if isinstance(keys, tuple) and len(keys) == 2 and hasattr(keys[0], 'shape'):
-                    k_norms = keys[0]
-                    seq_len = k_norms.shape[2] if len(k_norms.shape) >= 3 else k_norms.shape[1]
+                # TurboQuant v2: NamedTuple state with .norms attribute
+                if hasattr(keys, 'norms') and hasattr(keys.norms, 'shape'):
+                    seq_len = keys.norms.shape[2]
                     logger.debug(
                         f"Found TurboQuantKVCache at layer {layer_idx} with seq_len={seq_len}"
+                    )
+                    return seq_len
+                # TurboQuant v2: SplitState with .low/.high sub-states
+                if hasattr(keys, 'low') and hasattr(keys.low, 'norms'):
+                    seq_len = keys.low.norms.shape[2]
+                    logger.debug(
+                        f"Found TurboQuantKVCache (split) at layer {layer_idx} with seq_len={seq_len}"
                     )
                     return seq_len
                 if not hasattr(keys, 'shape'):
@@ -737,44 +790,28 @@ class BlockAwarePrefixCache(CacheManager):
                 handler = CacheTypeRegistry.get_handler_by_class_name(cache_type_name)
 
                 if cache_type_name in ('TurboQuantKVCache', 'BatchTurboQuantKVCache'):
-                    # TurboQuant: state = ((k_norms, k_packed), (v_norms, v_packed))
+                    # TurboQuant v2: NamedTuple state from mlx-vlm
+                    from ..turboquant_kv import _slice_state_range, _state_length
                     state = layer_state['state']
                     if not isinstance(state, (list, tuple)) or len(state) < 2:
                         block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                         continue
-                    k_state, v_state = state
-                    if not isinstance(k_state, (list, tuple)) or len(k_state) < 2:
-                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
-                        continue
-                    k_norms, k_packed = k_state
-                    v_norms, v_packed = v_state
-                    # Slice along axis 2 (sequence dimension)
-                    # k_norms: (B, H, T), k_packed: (B, H, T, pw)
-                    seq_len = k_norms.shape[2] if len(k_norms.shape) >= 3 else k_norms.shape[1]
+                    k_state, v_state = state[0], state[1]
+                    # Unwrap _QuantizedStateProxy if present
+                    if hasattr(k_state, '_state'):
+                        k_state = k_state._state
+                    if hasattr(v_state, '_state'):
+                        v_state = v_state._state
+                    seq_len = _state_length(k_state)
                     actual_end = min(end_idx, seq_len)
                     if start_idx >= actual_end:
                         block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                         continue
-                    if len(k_norms.shape) >= 3:
-                        kn_s = k_norms[:, :, start_idx:actual_end]
-                        kp_s = k_packed[:, :, start_idx:actual_end, :]
-                        vn_s = v_norms[:, :, start_idx:actual_end]
-                        vp_s = v_packed[:, :, start_idx:actual_end, :]
-                    else:
-                        kn_s = k_norms[:, start_idx:actual_end]
-                        kp_s = k_packed[:, start_idx:actual_end, :]
-                        vn_s = v_norms[:, start_idx:actual_end]
-                        vp_s = v_packed[:, start_idx:actual_end, :]
-                    # Store with extra metadata for reconstruction
-                    bits = layer_state.get('meta_state', (0,))
+                    ks = _slice_state_range(k_state, start_idx, actual_end)
+                    vs = _slice_state_range(v_state, start_idx, actual_end)
                     block_slices.append((
-                        '__turboquant__',
-                        (
-                            self._clone_tensor(kn_s),
-                            self._clone_tensor(kp_s),
-                            self._clone_tensor(vn_s),
-                            self._clone_tensor(vp_s),
-                        ),
+                        '__turboquant_v2__',
+                        (ks, vs),
                     ))
                 elif handler.supports_block_slicing:
                     # Standard 4D KV cache slicing
@@ -1510,49 +1547,49 @@ class BlockAwarePrefixCache(CacheManager):
                     reconstructed_caches.append(cache)
                     continue
 
-                # === TurboQuantKVCache: concat 4 tensors, reconstruct directly ===
+                # === TurboQuantKVCache: concat NamedTuple states, reconstruct ===
                 if cache_type_name in ('TurboQuantKVCache', 'BatchTurboQuantKVCache'):
-                    kn_list, kp_list, vn_list, vp_list = [], [], [], []
+                    from ..turboquant_kv import _concat_state, _state_length, _rebuild_codecs
+                    key_states, value_states = [], []
                     for block_data in all_block_data:
                         if layer_idx >= len(block_data):
                             continue
                         bd = block_data[layer_idx]
-                        # From SSD: ((kn, kp), (vn, vp)) nested tuple
                         if isinstance(bd, tuple) and len(bd) == 2:
-                            if isinstance(bd[0], str) and bd[0] == '__turboquant__':
-                                kn, kp, vn, vp = bd[1]
-                            elif isinstance(bd[0], tuple):
-                                (kn, kp), (vn, vp) = bd
+                            if isinstance(bd[0], str) and bd[0] == '__turboquant_v2__':
+                                ks, vs = bd[1]
                             else:
-                                continue
-                            kn_list.append(kn)
-                            kp_list.append(kp)
-                            vn_list.append(vn)
-                            vp_list.append(vp)
-                    if not kn_list:
+                                ks, vs = bd
+                            key_states.append(ks)
+                            value_states.append(vs)
+                    if not key_states:
                         logger.debug(f"TQ layer {layer_idx}: no block data")
                         return None
-                    cat_kn = mx.concatenate(kn_list, axis=2) if len(kn_list[0].shape) >= 3 else mx.concatenate(kn_list, axis=1)
-                    cat_kp = mx.concatenate(kp_list, axis=2) if len(kp_list[0].shape) >= 4 else mx.concatenate(kp_list, axis=1)
-                    cat_vn = mx.concatenate(vn_list, axis=2) if len(vn_list[0].shape) >= 3 else mx.concatenate(vn_list, axis=1)
-                    cat_vp = mx.concatenate(vp_list, axis=2) if len(vp_list[0].shape) >= 4 else mx.concatenate(vp_list, axis=1)
+                    # Concatenate along token dimension
+                    cat_ks = key_states[0]
+                    for s in key_states[1:]:
+                        cat_ks = _concat_state(cat_ks, s)
+                    cat_vs = value_states[0]
+                    for s in value_states[1:]:
+                        cat_vs = _concat_state(cat_vs, s)
                     try:
-                        from ..turboquant_kv import TurboQuantKVCache
+                        from mlx_vlm.turboquant import TurboQuantKVCache
                         from mlx_lm.models.cache import KVCache
-                        # Get bits from meta_state: (offset, bits, seed)
-                        tq_bits = 4
+                        tq_bits = 4.0
                         tq_seed = 0
                         ms = None
                         if first_block_meta_states and layer_idx < len(first_block_meta_states):
                             ms = first_block_meta_states[layer_idx]
                         if isinstance(ms, (list, tuple)) and len(ms) >= 3:
-                            tq_bits = int(ms[1])
+                            tq_bits = float(ms[1])
                             tq_seed = int(ms[2])
                         # Dequantize back to fp16 KVCache for merge compatibility.
                         # TQ will be re-applied at decode start (lazy quantization).
                         tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
-                        tq.state = ((cat_kn, cat_kp), (cat_vn, cat_vp))
-                        tq._quantized = True
+                        tq.keys = cat_ks
+                        tq.values = cat_vs
+                        tq.offset = _state_length(cat_ks)
+                        _rebuild_codecs(tq, cat_ks, cat_vs)
                         keys, values = tq.dequantize()
                         cache = KVCache()
                         cache.keys = keys
@@ -1831,9 +1868,9 @@ class BlockAwarePrefixCache(CacheManager):
         3. The merge creates a zero-length buffer (not zero-filled) so that
            no phantom attention positions exist during window padding reprocessing
 
-        Uses _PrefillReadyRotatingKVCache which overrides size() to return 0
-        for zero-length keys, preventing BatchRotatingKVCache.merge() from
-        allocating a zero-filled buffer without left_padding masking.
+        Uses PrefillReadyRotatingKVCache (clamped size() by buffer length)
+        so BatchRotatingKVCache.merge() never reads beyond the actual buffer
+        and never sees zero-padded positions as valid attention keys.
 
         Args:
             meta_state: RotatingKVCache meta_state tuple (keep, max_size, offset, _idx).
@@ -1843,28 +1880,6 @@ class BlockAwarePrefixCache(CacheManager):
         Returns:
             RotatingKVCache with zero-length keys/values, or None on failure.
         """
-        global _PrefillReadyRotatingKVCache
-
-        try:
-            from mlx_lm.models.cache import RotatingKVCache
-        except ImportError:
-            logger.error("mlx_lm not available for empty RotatingKVCache creation")
-            return None
-
-        # Lazily create subclass that overrides size() for correct merge behavior.
-        # Standard RotatingKVCache.size() returns min(offset, max_size) which
-        # incorrectly reports data size > 0 for zero-length keys, causing
-        # BatchRotatingKVCache.merge() to create unmasked zero-filled buffers
-        # that dilute attention scores during prefill.
-        if _PrefillReadyRotatingKVCache is None:
-            class _Impl(RotatingKVCache):
-                """RotatingKVCache that reports actual buffer size for merge."""
-                def size(self):
-                    if self.keys is not None and self.keys.shape[2] == 0:
-                        return 0
-                    return super().size()
-            _PrefillReadyRotatingKVCache = _Impl
-
         if meta_state and len(meta_state) >= 2:
             keep = int(meta_state[0])
             max_size = int(meta_state[1])
@@ -1874,7 +1889,7 @@ class BlockAwarePrefixCache(CacheManager):
             )
             return None
 
-        cache = _PrefillReadyRotatingKVCache(max_size=max_size, keep=keep)
+        cache = PrefillReadyRotatingKVCache(max_size=max_size, keep=keep)
         cache.offset = kvcache_offset
 
         # Set zero-length keys/values so empty() returns False.

@@ -411,6 +411,62 @@ class TestVLMFallback:
         ), pytest.raises(Exception, match="Load failed"):
             await pool._load_engine("model-a")
 
+    @pytest.mark.asyncio
+    async def test_force_lm_fallback_to_vlm_on_start_failure(
+        self, small_mock_model_dir
+    ):
+        """Test that force_lm failure for VLM model falls back to VLMBatchedEngine."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Force model-a to be VLM type
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+
+        # BatchedEngine (force_lm) fails on start
+        mock_batched_engine = MagicMock()
+        mock_batched_engine.start = AsyncMock(
+            side_effect=TypeError(
+                "ModelArgs.__init__() missing 1 required positional argument: "
+                "'tie_word_embeddings'"
+            )
+        )
+        mock_batched_engine.stop = AsyncMock()
+
+        # VLMBatchedEngine succeeds
+        mock_vlm_engine = MagicMock()
+        mock_vlm_engine.start = AsyncMock()
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
+        ), patch(
+            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
+        ):
+            await pool._load_engine("model-a", force_lm=True)
+
+        # Should have fallen back to VLM
+        assert entry.model_type == "vlm"
+        assert entry.engine_type == "vlm"
+        assert entry.engine is mock_vlm_engine
+
+    @pytest.mark.asyncio
+    async def test_force_lm_no_fallback_for_non_vlm(self, small_mock_model_dir):
+        """Test that force_lm failure for non-VLM model still raises."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool.get_entry("model-a")
+        assert entry.engine_type == "batched"  # LLM, not VLM
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock(side_effect=Exception("Load failed"))
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine", return_value=mock_engine
+        ), pytest.raises(Exception, match="Load failed"):
+            await pool._load_engine("model-a", force_lm=True)
+
 
 class TestEnginePoolLRU:
     """Tests for LRU eviction logic."""
@@ -443,10 +499,14 @@ class TestEnginePoolLRU:
     def test_find_lru_victim_oldest_first(self, pool_with_entries):
         """Test that oldest (lowest last_access) is selected."""
         # Simulate loaded state with different access times
-        pool_with_entries._entries["model-a"].engine = MagicMock()
+        mock_a = MagicMock()
+        mock_a.has_active_requests.return_value = False
+        pool_with_entries._entries["model-a"].engine = mock_a
         pool_with_entries._entries["model-a"].last_access = 100  # Older
 
-        pool_with_entries._entries["model-b"].engine = MagicMock()
+        mock_b = MagicMock()
+        mock_b.has_active_requests.return_value = False
+        pool_with_entries._entries["model-b"].engine = mock_b
         pool_with_entries._entries["model-b"].last_access = 200  # Newer
 
         victim = pool_with_entries._find_lru_victim()
@@ -456,16 +516,58 @@ class TestEnginePoolLRU:
         """Test that pinned models are skipped during eviction."""
         # model-a is pinned and older
         pool_with_entries._entries["model-a"].is_pinned = True
-        pool_with_entries._entries["model-a"].engine = MagicMock()
+        mock_a = MagicMock()
+        mock_a.has_active_requests.return_value = False
+        pool_with_entries._entries["model-a"].engine = mock_a
         pool_with_entries._entries["model-a"].last_access = 50
 
         # model-b is not pinned and newer
-        pool_with_entries._entries["model-b"].engine = MagicMock()
+        mock_b = MagicMock()
+        mock_b.has_active_requests.return_value = False
+        pool_with_entries._entries["model-b"].engine = mock_b
         pool_with_entries._entries["model-b"].last_access = 200
 
         victim = pool_with_entries._find_lru_victim()
         # model-a is skipped (pinned), model-b is selected
         assert victim == "model-b"
+
+    def test_find_lru_victim_skips_active_requests(self, pool_with_entries):
+        """Test that models with active requests are skipped during eviction."""
+        # model-a has active requests
+        mock_engine_a = MagicMock()
+        mock_engine_a.has_active_requests.return_value = True
+        pool_with_entries._entries["model-a"].engine = mock_engine_a
+        pool_with_entries._entries["model-a"].last_access = 50  # Older
+
+        # model-b has no active requests
+        mock_engine_b = MagicMock()
+        mock_engine_b.has_active_requests.return_value = False
+        pool_with_entries._entries["model-b"].engine = mock_engine_b
+        pool_with_entries._entries["model-b"].last_access = 200  # Newer
+
+        victim = pool_with_entries._find_lru_victim()
+        # model-a skipped (active requests), model-b selected
+        assert victim == "model-b"
+
+    def test_find_lru_victim_all_active(self, pool_with_entries):
+        """Test that None is returned when all models have active requests."""
+        for mid in ("model-a", "model-b"):
+            mock_engine = MagicMock()
+            mock_engine.has_active_requests.return_value = True
+            pool_with_entries._entries[mid].engine = mock_engine
+            pool_with_entries._entries[mid].last_access = 100
+
+        victim = pool_with_entries._find_lru_victim()
+        assert victim is None
+
+    def test_find_lru_victim_no_has_active_requests(self, pool_with_entries):
+        """Test graceful handling when engine lacks has_active_requests."""
+        mock_engine = MagicMock(spec=[])  # No has_active_requests
+        pool_with_entries._entries["model-a"].engine = mock_engine
+        pool_with_entries._entries["model-a"].last_access = 100
+
+        victim = pool_with_entries._find_lru_victim()
+        assert victim == "model-a"
 
 
 class TestEnginePoolAsync:
@@ -584,9 +686,11 @@ class TestEnginePoolEviction:
         mock_engine_a = MagicMock()
         mock_engine_a.start = AsyncMock()
         mock_engine_a.stop = AsyncMock()
+        mock_engine_a.has_active_requests.return_value = False
 
         mock_engine_b = MagicMock()
         mock_engine_b.start = AsyncMock()
+        mock_engine_b.has_active_requests.return_value = False
 
         call_count = [0]
 
@@ -656,6 +760,7 @@ class TestEnginePoolTTL:
         entry = pool._entries["model-a"]
         entry.engine = MagicMock(spec=[])
         entry.engine.stop = AsyncMock()
+        entry.engine.has_active_requests = MagicMock(return_value=False)
         entry.last_access = 100.0  # Old access time
         pool._current_model_memory = entry.estimated_size
         return pool
@@ -727,16 +832,9 @@ class TestEnginePoolTTL:
         """Test that TTL does not unload model with active requests."""
         pool = pool_with_loaded_model
 
-        # Mock a BatchedEngine with active requests
+        # Mock an engine that reports active requests
         mock_engine = MagicMock()
-        mock_engine_core = MagicMock()
-        mock_inner = MagicMock()
-        mock_inner._output_collectors = {"req1": MagicMock()}
-        mock_engine_core.engine = mock_inner
-        mock_engine._engine = mock_engine_core
-
-        from omlx.engine import BatchedEngine
-        mock_engine.__class__ = BatchedEngine
+        mock_engine.has_active_requests.return_value = True
 
         pool._entries["model-a"].engine = mock_engine
 
@@ -751,6 +849,169 @@ class TestEnginePoolTTL:
         assert expired == []
         # last_access should be refreshed
         assert pool._entries["model-a"].last_access == 200.0
+
+    @pytest.mark.asyncio
+    async def test_ttl_skips_vlm_with_active_requests(self, pool_with_loaded_model):
+        """Test that TTL does not unload VLM engine with active requests."""
+        pool = pool_with_loaded_model
+
+        mock_engine = MagicMock()
+        mock_engine.has_active_requests.return_value = True
+
+        pool._entries["model-a"].engine = mock_engine
+
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = 60
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=200.0):
+            expired = await pool.check_ttl_expirations(settings_manager)
+
+        assert expired == []
+        assert pool._entries["model-a"].last_access == 200.0
+
+    @pytest.mark.asyncio
+    async def test_ttl_skips_non_streaming_with_active_requests(
+        self, pool_with_loaded_model
+    ):
+        """Test that TTL does not unload non-streaming engine with active requests."""
+        pool = pool_with_loaded_model
+
+        mock_engine = MagicMock()
+        mock_engine.has_active_requests.return_value = True
+
+        pool._entries["model-a"].engine = mock_engine
+
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = 60
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=200.0):
+            expired = await pool.check_ttl_expirations(settings_manager)
+
+        assert expired == []
+        assert pool._entries["model-a"].last_access == 200.0
+
+    @pytest.mark.asyncio
+    async def test_ttl_falls_back_to_global_idle_timeout(self, pool_with_loaded_model):
+        """Per-model TTL None falls back to global idle timeout."""
+        pool = pool_with_loaded_model
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = None
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=200.0):  # 100s idle > 60s global
+            expired = await pool.check_ttl_expirations(
+                settings_manager, global_idle_timeout_seconds=60
+            )
+
+        assert "model-a" in expired
+        assert pool._entries["model-a"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_ttl_global_disabled_when_none(self, pool_with_loaded_model):
+        """Per-model None + global None keeps model loaded."""
+        pool = pool_with_loaded_model
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = None
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=99999.0):
+            expired = await pool.check_ttl_expirations(
+                settings_manager, global_idle_timeout_seconds=None
+            )
+
+        assert expired == []
+        assert pool._entries["model-a"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_per_model_ttl_overrides_global(self, pool_with_loaded_model):
+        """Per-model TTL wins over global idle timeout."""
+        pool = pool_with_loaded_model
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = 300  # per-model wider than global
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=200.0):  # 100s idle < 300s per-model
+            expired = await pool.check_ttl_expirations(
+                settings_manager, global_idle_timeout_seconds=60
+            )
+
+        assert expired == []
+        assert pool._entries["model-a"].engine is not None
+
+
+class TestHasActiveRequests:
+    """Tests for has_active_requests() on engine types."""
+
+    def test_base_non_streaming_engine_active_count(self):
+        """Test BaseNonStreamingEngine active request tracking."""
+        from omlx.engine.base import BaseNonStreamingEngine
+
+        class DummyEngine(BaseNonStreamingEngine):
+            @property
+            def model_name(self):
+                return "dummy"
+
+            async def start(self):
+                pass
+
+            async def stop(self):
+                pass
+
+            def get_stats(self):
+                return {}
+
+        engine = DummyEngine()
+        assert engine.has_active_requests() is False
+
+        with engine._active_lock:
+            engine._active_count += 1
+        assert engine.has_active_requests() is True
+
+        with engine._active_lock:
+            engine._active_count -= 1
+        assert engine.has_active_requests() is False
+
+    def test_batched_engine_has_active_requests(self):
+        """Test BatchedEngine.has_active_requests() via _output_collectors."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine.__new__(BatchedEngine)
+        engine._engine = None
+        assert engine.has_active_requests() is False
+
+        # Simulate engine with active collectors
+        mock_engine_core = MagicMock()
+        mock_inner = MagicMock()
+        mock_inner._output_collectors = {"req1": MagicMock()}
+        mock_engine_core.engine = mock_inner
+        engine._engine = mock_engine_core
+        assert engine.has_active_requests() is True
+
+        # Empty collectors
+        mock_inner._output_collectors = {}
+        assert engine.has_active_requests() is False
+
+    def test_vlm_engine_has_active_requests(self):
+        """Test VLMBatchedEngine.has_active_requests() via _output_collectors."""
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
+        engine._engine = None
+        assert engine.has_active_requests() is False
+
+        mock_engine_core = MagicMock()
+        mock_inner = MagicMock()
+        mock_inner._output_collectors = {"req1": MagicMock()}
+        mock_engine_core.engine = mock_inner
+        engine._engine = mock_engine_core
+        assert engine.has_active_requests() is True
 
 
 class TestResolveModelId:
@@ -862,3 +1123,281 @@ class TestResolveModelId:
         # Exact match should be returned directly
         result = pool.resolve_model_id("model-a", settings_manager=None)
         assert result == "model-a"
+
+
+class TestMemorySettleBarrier:
+    """Tests for memory settle barrier in _unload_engine()."""
+
+    @pytest.fixture
+    def pool_with_loaded_model(self, small_mock_model_dir):
+        """Create pool with a mock-loaded model for settle barrier testing.
+
+        Sets estimated_size to 5GB. With scaled tolerance
+        (max(2GB, 5% of 5GB) = max(2GB, 0.25GB) = 2GB), the barrier
+        requires at least 3GB freed.
+        """
+        pool = EnginePool(max_model_memory=100 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool._entries["model-a"]
+        entry.estimated_size = 5 * 1024**3  # 5GB (> 2GB tolerance)
+        mock_engine = MagicMock()
+        mock_engine.stop = AsyncMock()
+        mock_engine.has_active_requests = MagicMock(return_value=False)
+        entry.engine = mock_engine
+        entry.last_access = 100.0
+        pool._current_model_memory = entry.estimated_size
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_settle_succeeds_first_round(self, pool_with_loaded_model):
+        """Test that settle barrier passes on first round when memory is freed."""
+        pool = pool_with_loaded_model
+        est_size = pool._entries["model-a"].estimated_size  # 5GB
+        initial_memory = pool._current_model_memory
+
+        # Pre-unload: 10GB active. After GC: drops to 5GB (5GB freed >= 3GB needed).
+        active_memory_values = [10 * 1024**3, 5 * 1024**3]
+        call_idx = [0]
+
+        def mock_get_active():
+            val = active_memory_values[min(call_idx[0], len(active_memory_values) - 1)]
+            call_idx[0] += 1
+            return val
+
+        with patch("omlx.engine_pool.mx") as mock_mx, \
+             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            mock_mx.get_active_memory = mock_get_active
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        assert pool._entries["model-a"].engine is None
+        assert pool._current_model_memory == initial_memory - est_size
+
+    @pytest.mark.asyncio
+    async def test_settle_takes_multiple_rounds(self, pool_with_loaded_model):
+        """Test settle barrier succeeds after multiple rounds of GC."""
+        pool = pool_with_loaded_model
+        # est_size = 5GB, tolerance = 2GB, so need >= 3GB freed
+        # Pre-unload: 10GB. Need active <= 7GB to settle.
+        # Round 1: 9GB (freed=1GB < 3GB), Round 2: 8GB (freed=2GB < 3GB),
+        # Round 3: 5GB (freed=5GB >= 3GB) → settled
+        active_memory_values = [10 * 1024**3, 9 * 1024**3, 8 * 1024**3, 5 * 1024**3]
+        call_idx = [0]
+
+        def mock_get_active():
+            val = active_memory_values[min(call_idx[0], len(active_memory_values) - 1)]
+            call_idx[0] += 1
+            return val
+
+        sleep_calls = []
+
+        async def mock_sleep(duration):
+            sleep_calls.append(duration)
+
+        with patch("omlx.engine_pool.mx") as mock_mx, \
+             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
+             patch("asyncio.sleep", side_effect=mock_sleep):
+            mock_mx.get_active_memory = mock_get_active
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        # Should have slept at least once (0.5s between rounds)
+        assert any(d == 0.5 for d in sleep_calls)
+        assert pool._entries["model-a"].engine is None
+        assert pool._current_model_memory == 0
+
+    @pytest.mark.asyncio
+    async def test_settle_timeout_triggers_emergency(self, pool_with_loaded_model):
+        """Test emergency reclaim is triggered when settle barrier times out."""
+        pool = pool_with_loaded_model
+        # est_size = 5GB, tolerance = 2GB, need >= 3GB freed
+        # Memory stays at 10GB during all 10 settle rounds (0GB freed < 3GB)
+        # After emergency reclaim: drops to safe level
+        settle_calls = [0]
+
+        def mock_get_active():
+            settle_calls[0] += 1
+            # 1 pre-unload + 10 settle rounds (each calls once) = 11
+            # After emergency: return safe level
+            if settle_calls[0] <= 11:
+                return 10 * 1024**3
+            return 0
+
+        sleep_calls = []
+
+        async def mock_sleep(duration):
+            sleep_calls.append(duration)
+
+        with patch("omlx.engine_pool.mx") as mock_mx, \
+             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
+             patch("asyncio.sleep", side_effect=mock_sleep):
+            mock_mx.get_active_memory = mock_get_active
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        # Emergency reclaim uses 1.0s sleeps (3 rounds)
+        assert sleep_calls.count(1.0) == 3
+        assert pool._entries["model-a"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_emergency_reclaim_failure_logs_error(self, pool_with_loaded_model):
+        """Test error is logged when emergency reclaim fails to free enough memory."""
+        pool = pool_with_loaded_model
+
+        # Memory never drops — stays at 10GB throughout (well above 5GB threshold)
+        with patch("omlx.engine_pool.mx") as mock_mx, \
+             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            mock_mx.get_active_memory = MagicMock(return_value=10 * 1024**3)
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            with patch("omlx.engine_pool.logger") as mock_logger:
+                await pool._unload_engine("model-a")
+
+            # Should have logged an error about emergency reclaim failure
+            error_calls = [
+                str(c) for c in mock_logger.error.call_args_list
+            ]
+            assert any("Emergency reclaim failed" in s for s in error_calls)
+
+    @pytest.mark.asyncio
+    async def test_memory_counter_decremented_after_barrier(
+        self, pool_with_loaded_model
+    ):
+        """Regression test: _current_model_memory must not be decremented
+        before the settle barrier completes."""
+        pool = pool_with_loaded_model
+        est_size = pool._entries["model-a"].estimated_size  # 5GB
+        original_memory = pool._current_model_memory
+
+        memory_during_settle = []
+
+        def mock_get_active():
+            # Record the pool's memory counter state during settle polling
+            memory_during_settle.append(pool._current_model_memory)
+            # Return high value for 3 rounds, then settle
+            # Need >= 3GB freed (5GB - 2GB tolerance)
+            if len(memory_during_settle) <= 3:
+                return 10 * 1024**3  # 0GB freed
+            return 5 * 1024**3  # 5GB freed >= 3GB needed
+
+        with patch("omlx.engine_pool.mx") as mock_mx, \
+             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            mock_mx.get_active_memory = mock_get_active
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        # During settle barrier, memory counter should NOT have been decremented
+        for mem in memory_during_settle[:-1]:
+            assert mem == original_memory, (
+                f"Memory counter was {mem} during settle, expected {original_memory}. "
+                "Counter must not be decremented before barrier completes."
+            )
+
+        # After barrier, it should be decremented
+        assert pool._current_model_memory == original_memory - est_size
+
+    @pytest.mark.asyncio
+    async def test_settle_large_model_proportional_tolerance(
+        self, small_mock_model_dir
+    ):
+        """Test that settle tolerance scales with model size for large models.
+
+        For a 60GB model, 5% = 3GB > 2GB floor, so tolerance = 3GB.
+        min_expected_freed = 60GB - 3GB = 57GB.
+        """
+        pool = EnginePool(max_model_memory=200 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool._entries["model-a"]
+        entry.estimated_size = 60 * 1024**3  # 60GB
+        mock_engine = MagicMock()
+        mock_engine.stop = AsyncMock()
+        mock_engine.has_active_requests = MagicMock(return_value=False)
+        entry.engine = mock_engine
+        entry.last_access = 100.0
+        pool._current_model_memory = entry.estimated_size
+
+        # Freed = 80 - 23 = 57GB. With proportional tolerance (3GB) this
+        # settles, but would fail with the old fixed 2GB tolerance (needed 58GB).
+        active_memory_values = [80 * 1024**3, 23 * 1024**3]
+        call_idx = [0]
+
+        def mock_get_active():
+            val = active_memory_values[
+                min(call_idx[0], len(active_memory_values) - 1)
+            ]
+            call_idx[0] += 1
+            return val
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_mx.get_active_memory = mock_get_active
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        assert pool._entries["model-a"].engine is None
+        assert pool._current_model_memory == 0
+
+    @pytest.mark.asyncio
+    async def test_settle_small_model_uses_floor_tolerance(
+        self, small_mock_model_dir
+    ):
+        """Test that 2GB floor tolerance applies for small models.
+
+        For a 1GB model, 5% = 0.05GB << 2GB, so tolerance = 2GB floor.
+        min_expected_freed = max(0, 1GB - 2GB) = 0, settle is trivially true.
+        """
+        pool = EnginePool(max_model_memory=100 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool._entries["model-a"]
+        entry.estimated_size = 1 * 1024**3  # 1GB
+        mock_engine = MagicMock()
+        mock_engine.stop = AsyncMock()
+        mock_engine.has_active_requests = MagicMock(return_value=False)
+        entry.engine = mock_engine
+        entry.last_access = 100.0
+        pool._current_model_memory = entry.estimated_size
+
+        # Even 0 freed should settle (min_expected_freed = 0)
+        active_memory_values = [10 * 1024**3, 10 * 1024**3]
+        call_idx = [0]
+
+        def mock_get_active():
+            val = active_memory_values[
+                min(call_idx[0], len(active_memory_values) - 1)
+            ]
+            call_idx[0] += 1
+            return val
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_mx.get_active_memory = mock_get_active
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        assert pool._entries["model-a"].engine is None
+        assert pool._current_model_memory == 0

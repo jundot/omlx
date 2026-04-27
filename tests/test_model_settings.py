@@ -25,6 +25,21 @@ class TestModelSettings:
         assert settings.force_sampling is False
         assert settings.is_pinned is False
         assert settings.is_default is False
+        # Issue #926: opt-in per model. Default off.
+        assert settings.trust_remote_code is False
+
+    def test_trust_remote_code_roundtrip(self):
+        """Test trust_remote_code field survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(trust_remote_code=True)
+        d = original.to_dict()
+        assert d["trust_remote_code"] is True
+        restored = ModelSettings.from_dict(d)
+        assert restored.trust_remote_code is True
+
+    def test_trust_remote_code_excluded_from_profiles(self):
+        """Security flag must never propagate via profiles or templates."""
+        from omlx.model_profiles import EXCLUDED_FROM_PROFILES
+        assert "trust_remote_code" in EXCLUDED_FROM_PROFILES
 
     def test_max_context_window(self):
         """Test max_context_window field."""

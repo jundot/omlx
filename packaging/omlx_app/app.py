@@ -5,15 +5,25 @@ A native macOS menubar app for managing the oMLX LLM inference server.
 """
 
 import logging
+import os
 import platform
+import plistlib
+import subprocess
 import threading
 import time
 import webbrowser
+from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
+from typing import Optional
 
 import objc
 import requests
 from AppKit import (
+    NSAlert,
+    NSAlertFirstButtonReturn,
+    NSAlertSecondButtonReturn,
+    NSAlertThirdButtonReturn,
     NSApp,
     NSAppearanceNameDarkAqua,
     NSApplication,
@@ -22,14 +32,33 @@ from AppKit import (
     NSAttributedString,
     NSBundle,
     NSColor,
+    NSFloatingWindowLevel,
+    NSFont,
+    NSFontAttributeName,
     NSForegroundColorAttributeName,
     NSImage,
+    NSLinkAttributeName,
     NSMenu,
     NSMenuItem,
+    NSMutableParagraphStyle,
+    NSParagraphStyleAttributeName,
+    NSRightTabStopType,
     NSStatusBar,
+    NSTextField,
+    NSTextTab,
+    NSTextAlignmentCenter,
     NSVariableStatusItemLength,
+    NSView,
+    NSWorkspace,
 )
-from Foundation import NSData, NSObject, NSRunLoop, NSTimer
+from Foundation import (
+    NSData,
+    NSMutableAttributedString,
+    NSObject,
+    NSRunLoop,
+    NSTimer,
+    NSURL,
+)
 from packaging.version import InvalidVersion, Version
 
 try:
@@ -101,6 +130,15 @@ class OMLXAppDelegate(NSObject):
         self._updater = None  # AppUpdater instance during download
         self._update_progress_text = ""  # Current download progress text
         self._menu_is_open = False  # True while the status-bar menu is visible
+        # Menubar visibility tracking — Tahoe ControlCenter can hide the item
+        # silently, and isVisible() returns True even when hidden (see issue #725)
+        self._visibility_check_timer = None
+        self._warned_hidden = False
+        # One-shot auto recovery: if the initial NSStatusItem registers but
+        # isn't rendered (known Tahoe race), we try removing and recreating
+        # it exactly once before giving up and alerting the user.
+        self._recreate_attempted = False
+        self._policy_switch_timer = None
         # Weak references to dynamic menu items for in-place updates
         self._status_header_item = None
         self._stop_item = None
@@ -119,10 +157,18 @@ class OMLXAppDelegate(NSObject):
             logger.error(f"Launch failed: {e}", exc_info=True)
             self._show_fatal_error_and_quit(str(e))
 
+    def applicationShouldTerminateAfterLastWindowClosed_(self, app):
+        """Prevent termination when the last window closes."""
+        return False
+
+    def applicationShouldHandleReopen_hasVisibleWindows_(self, app, flag):
+        """Respond when user clicks the app icon while already running."""
+        if self.server_manager.is_running():
+            self.openDashboard_(None)
+        return True
+
     def _show_fatal_error_and_quit(self, message: str):
         """Show a fatal error dialog and terminate the application."""
-        from AppKit import NSAlert
-
         alert = NSAlert.alloc().init()
         alert.setMessageText_("oMLX Failed to Launch")
         alert.setInformativeText_(message)
@@ -136,11 +182,9 @@ class OMLXAppDelegate(NSObject):
         self._icon_outline = self._load_menubar_icon("menubar-outline.svg")
         self._icon_filled = self._load_menubar_icon("menubar-filled.svg")
 
-        # Create status bar item
-        self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
-            NSVariableStatusItemLength
-        )
-        self._update_menubar_icon()
+        # Create status bar item (with accessibility metadata so menu-bar
+        # managers like Bartender / Ice can enumerate it correctly).
+        self._create_status_item()
 
         # Build menu
         self._build_menu()
@@ -165,8 +209,19 @@ class OMLXAppDelegate(NSObject):
         # We start as Regular (in main()) so macOS grants full GUI access,
         # then switch here — required on macOS Tahoe where Accessory apps
         # launched via LaunchServices remain "NotVisible" otherwise.
-        NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
-        NSApp.activateIgnoringOtherApps_(True)
+        # IMPORTANT: Info.plist must NOT contain LSUIElement=true. Combining
+        # LSUIElement with this runtime policy switch causes ControlCenter
+        # to block the NSStatusItem on Sonoma+. See issue #725.
+        #
+        # Deferred by one runloop tick so the status-item registration with
+        # WindowServer settles before the activation policy changes. Doing
+        # both in the same tick seems to interleave on Tahoe and sometimes
+        # results in the item being registered but never composited.
+        self._policy_switch_timer = (
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                0.0, self, "switchToAccessoryPolicy:", None, False
+            )
+        )
 
         logger.info("oMLX menubar app launched successfully")
 
@@ -194,6 +249,662 @@ class OMLXAppDelegate(NSObject):
                 self._handle_port_conflict(result)
             else:
                 self._update_status_display()
+
+        # Delayed check: warn user if ControlCenter blocked the status item.
+        # 3s delay gives ControlCenter time to settle its visibility decision.
+        # Retain the timer reference to prevent early dealloc under PyObjC.
+        self._visibility_check_timer = (
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                3.0, self, "checkStatusItemVisibility:", None, False
+            )
+        )
+
+    def _create_status_item(self):
+        """Create the NSStatusItem and set accessibility metadata.
+
+        Pulled out so we can invoke it again from `_recreate_status_item()`
+        when Tahoe registers the item but never composites it (issue #725).
+        Each field lands in the AX tree menu-bar managers read:
+
+        - autosaveName persists the item's placement across launches and
+          gives ControlCenter a stable identity to key against.
+        - accessibility identifier / title / label fill the fields AX
+          tools show for third-party items. Without them a PyObjC-created
+          button lands as an anonymous entry that some managers skip.
+
+        Note: dev4 also tried setAccessibilityElement_ / setAccessibilityRole_
+        and NSAccessibilityPostNotification with NSAccessibilityCreatedNotification
+        in an attempt to make Bartender discover us. They made no observable
+        difference on real-device testing, so they're not here anymore.
+        Bartender's filter runs above the AX metadata we can reach.
+        """
+        self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+            NSVariableStatusItemLength
+        )
+        self.status_item.setAutosaveName_("com.omlx.app-statusItem")
+
+        button = self.status_item.button()
+        if button is not None:
+            if hasattr(button, "setAccessibilityIdentifier_"):
+                button.setAccessibilityIdentifier_(
+                    "com.omlx.app.statusItemButton"
+                )
+            if hasattr(button, "setAccessibilityTitle_"):
+                button.setAccessibilityTitle_("oMLX")
+            if hasattr(button, "setAccessibilityLabel_"):
+                button.setAccessibilityLabel_("oMLX")
+            button.setToolTip_("oMLX")
+
+        self._update_menubar_icon()
+
+    def switchToAccessoryPolicy_(self, timer):
+        """Switch activation policy on the next runloop tick (see _doFinishLaunching)."""
+        NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        NSApp.activateIgnoringOtherApps_(True)
+
+    def _recreate_status_item(self) -> None:
+        """Last-ditch recovery: remove and recreate the NSStatusItem once.
+
+        Some Tahoe launches end with button/window registered but the
+        WindowServer never composites the icon. Community reports (Maccy
+        #1224, Stats #2734) find that removing the item and re-adding it
+        sometimes re-attaches it to a visible slot. Gated by
+        `_recreate_attempted` so this runs at most once per session.
+        """
+        if self._recreate_attempted:
+            return
+        self._recreate_attempted = True
+        logger.warning(
+            "recreating NSStatusItem as a one-shot recovery attempt"
+        )
+        old = self.status_item
+        try:
+            NSStatusBar.systemStatusBar().removeStatusItem_(old)
+        except Exception as e:
+            logger.warning("removeStatusItem failed: %s", e)
+        self._create_status_item()
+        # Re-attach menu (setMenu_ is idempotent but the new item has no menu yet)
+        if self.menu is not None:
+            self.status_item.setMenu_(self.menu)
+
+    def _is_status_item_hidden(self) -> bool:
+        """Detect whether the menubar icon is actually rendered.
+
+        There's no single reliable signal on Tahoe, so we combine:
+
+        - NSStatusItem.isVisible(): app-side setVisible: flag only. Stays
+          True when Menu Bar settings hide the item, so it alone can't
+          catch Tahoe's toggle-off.
+        - button.window().isVisible: NSWindow's "attached to screen" flag;
+          tends to flip False when the status item is blocked.
+        - button.window().occlusionState & NSWindowOcclusionStateVisible:
+          finer-grained compositing flag that's cleared when macOS parks
+          the window off-screen or in the blocked list.
+
+        Treat the item as hidden if ANY of those strong signals say hidden.
+        Emit a single WARNING with the raw signals when we return True, so
+        a hidden icon always leaves a breadcrumb in menubar.log without
+        spamming the log on every check while the icon is fine.
+        """
+        NS_WINDOW_OCCLUSION_STATE_VISIBLE = 1 << 1  # NSWindowOcclusionStateVisible
+
+        button = self.status_item.button() if self.status_item else None
+        window = button.window() if button else None
+        api_visible = bool(self.status_item and self.status_item.isVisible())
+        window_visible = bool(window and window.isVisible())
+        occlusion = int(window.occlusionState()) if window else 0
+        occlusion_visible = bool(occlusion & NS_WINDOW_OCCLUSION_STATE_VISIBLE)
+
+        hidden = (
+            not button
+            or not window
+            or not api_visible
+            or not window_visible
+            or not occlusion_visible
+        )
+        if hidden:
+            frame = window.frame() if window else None
+            frame_str = (
+                f"({frame.origin.x:.1f},{frame.origin.y:.1f},"
+                f"{frame.size.width:.1f}x{frame.size.height:.1f})"
+                if frame
+                else None
+            )
+            logger.warning(
+                "status item hidden: pid=%d api_visible=%s window_visible=%s "
+                "occlusion=0x%x button=%s window=%s frame=%s recreated=%s",
+                os.getpid(),
+                api_visible,
+                window_visible,
+                occlusion,
+                bool(button),
+                bool(window),
+                frame_str,
+                self._recreate_attempted,
+            )
+        return hidden
+
+    def checkStatusItemVisibility_(self, timer):
+        """One-shot post-launch check for menubar icon visibility.
+
+        If the icon is hidden on the first probe, try the recovery path
+        (recreate the NSStatusItem) exactly once before alerting the user.
+        This covers the Tahoe case where the initial registration races
+        with WindowServer and the item never composites; users on menu-
+        bar managers (Bartender, Ice) also benefit since the recreated
+        item has full accessibility metadata attached. The check runs
+        only once at launch; mid-session probes would false-trigger when
+        macOS auto-hides the menu bar (fullscreen video, slideshow, etc.).
+        """
+        if not self._is_status_item_hidden():
+            return
+
+        if not self._recreate_attempted:
+            self._recreate_status_item()
+            # Give macOS ~1s to finish registering the new item before we
+            # re-probe. If it's still hidden, show the alert.
+            self._visibility_check_timer = (
+                NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    1.0, self, "checkStatusItemVisibilityAfterRecreate:", None, False
+                )
+            )
+            return
+
+        # Recovery already used or disabled; escalate to the user.
+        self._show_menubar_hidden_alert()
+
+    def checkStatusItemVisibilityAfterRecreate_(self, timer):
+        """Second probe after the one-shot recreate. Alerts if still hidden."""
+        if self._is_status_item_hidden():
+            self._show_menubar_hidden_alert()
+
+    def _show_menubar_hidden_alert(self):
+        """Inform the user about the hidden menubar icon and offer recovery.
+
+        Tahoe (26.x) adds a dedicated Menu Bar settings pane with per-app
+        toggles, so the alert deep-links there. It also exposes a StatusKit
+        approval mechanism (`trackedApplications` in group.com.apple.
+        controlcenter.plist) where `isAllowed: false` silently blocks the
+        icon. The Auto-Fix button flips oMLX's flag to true and restarts
+        ControlCenter, but needs Full Disk Access to touch the Group
+        Container plist.
+
+        Earlier versions of macOS have no System Settings UI for third-
+        party status items, so on Sequoia and older we drop the Settings
+        and Auto-Fix buttons entirely to avoid pointing users at dead ends.
+        """
+        if self._warned_hidden:
+            return
+        self._warned_hidden = True
+
+        try:
+            mac_major = int(platform.mac_ver()[0].split(".")[0])
+        except (ValueError, IndexError):
+            mac_major = 0
+        is_tahoe_or_newer = mac_major >= 26
+
+        # Accessory apps don't steal focus, so the alert would otherwise land
+        # behind every other window. Activate first and raise the alert window
+        # to floating level so it surfaces above the browser/editor the user
+        # is likely looking at.
+        NSApp.activateIgnoringOtherApps_(True)
+
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("oMLX Menubar Icon Hidden")
+
+        settings_label = "Open Menu Bar Settings"
+        settings_url = (
+            "x-apple.systempreferences:com.apple.ControlCenter-Settings."
+            "extension?MenuBar"
+        )
+
+        if is_tahoe_or_newer and self._is_bartender_running():
+            # Bartender's menubar filter hides oMLX regardless of StatusKit
+            # state, so swap in a Bartender-specific dialog with no
+            # Auto-Fix or System Settings buttons (neither would help here).
+            self._show_bartender_conflict_alert()
+            return
+
+        if is_tahoe_or_newer:
+            alert.setInformativeText_(
+                "The oMLX menubar icon isn't showing up.\n\n"
+                "On macOS Tahoe this is usually caused by the StatusKit "
+                "approval flag being false in the system preferences. "
+                "\"Auto-Fix\" will flip that flag and restart ControlCenter "
+                "(needs Full Disk Access), or you can toggle the app manually "
+                "in System Settings > Menu Bar."
+            )
+            alert.addButtonWithTitle_("Auto-Fix")       # 1000
+            alert.addButtonWithTitle_(settings_label)    # 1001
+            alert.addButtonWithTitle_("View Log")        # 1002
+            alert.addButtonWithTitle_("Dismiss")         # 1003
+        else:
+            alert.setInformativeText_(
+                "The oMLX menubar icon isn't showing up.\n\n"
+                "macOS before Tahoe doesn't offer a System Settings toggle "
+                "for third-party menubar apps. Try quitting and relaunching "
+                "oMLX, and check menubar manager tools like Bartender or "
+                "Ice if you use them.\n\n"
+                "Click \"View Log\" to see what the app detected."
+            )
+            alert.addButtonWithTitle_("View Log")        # 1000
+            alert.addButtonWithTitle_("Dismiss")         # 1001
+
+        alert_window = alert.window()
+        if alert_window is not None:
+            alert_window.setLevel_(NSFloatingWindowLevel)
+
+        response = alert.runModal()
+        log_path = (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "oMLX"
+            / "logs"
+            / "menubar.log"
+        )
+
+        if is_tahoe_or_newer:
+            if response == NSAlertFirstButtonReturn:
+                self._run_autofix_flow()
+            elif response == NSAlertSecondButtonReturn:
+                NSWorkspace.sharedWorkspace().openURL_(
+                    NSURL.URLWithString_(settings_url)
+                )
+            elif response == NSAlertThirdButtonReturn:
+                NSWorkspace.sharedWorkspace().openURL_(
+                    NSURL.fileURLWithPath_(str(log_path))
+                )
+        else:
+            if response == NSAlertFirstButtonReturn:
+                NSWorkspace.sharedWorkspace().openURL_(
+                    NSURL.fileURLWithPath_(str(log_path))
+                )
+
+    # --- StatusKit auto-fix ---
+
+    _STATUSKIT_PLIST_PATH = os.path.expanduser(
+        "~/Library/Group Containers/group.com.apple.controlcenter"
+        "/Library/Preferences/group.com.apple.controlcenter.plist"
+    )
+
+    def _run_autofix_flow(self) -> None:
+        """Orchestrate the StatusKit Auto-Fix: check FDA, write plist, report.
+
+        Flow: verify Full Disk Access -> patch the tracked applications
+        plist -> kill ControlCenter -> show result. If FDA is missing,
+        deep-link the user to System Settings and bail early so they can
+        grant permission and retry from a fresh launch.
+        """
+        logger.info("Auto-Fix triggered by user.")
+
+        if not self._has_full_disk_access():
+            logger.info("Auto-Fix blocked: Full Disk Access not granted.")
+            self._show_fda_request_alert()
+            return
+
+        success, message = self._fix_statuskit_permission()
+        self._show_autofix_result_alert(success, message)
+
+    def _has_full_disk_access(self) -> bool:
+        """Probe read access on the StatusKit plist to infer FDA grant.
+
+        If the plist doesn't exist, assume FDA is grantable (the write
+        step would fail loudly anyway). If opening fails with
+        PermissionError, TCC is blocking us and the user needs to add
+        oMLX to Full Disk Access in Privacy & Security.
+        """
+        if not os.path.exists(self._STATUSKIT_PLIST_PATH):
+            return True
+        try:
+            with open(self._STATUSKIT_PLIST_PATH, "rb") as f:
+                f.read(1)
+            return True
+        except PermissionError:
+            return False
+        except OSError as e:
+            logger.warning("FDA probe unexpected OSError: %s", e)
+            return False
+
+    def _open_full_disk_access_settings(self) -> None:
+        """Deep-link to System Settings > Privacy & Security > Full Disk Access."""
+        url = NSURL.URLWithString_(
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity."
+            "extension?Privacy_AllFiles"
+        )
+        NSWorkspace.sharedWorkspace().openURL_(url)
+
+    def _is_bartender_running(self) -> bool:
+        """Check whether Bartender (any version) is currently running.
+
+        Used to swap the hidden-icon dialog for a Bartender-specific one
+        when Bartender is active. Bartender's menubar filter excludes our
+        status item regardless of what we do on the AX side, so the
+        generic StatusKit Auto-Fix guidance is misleading in that case.
+        Prefix-matches `com.surteesstudios.Bartender` to cover version 4,
+        version 5 (`...Bartender 5`), and any future variants.
+        """
+        try:
+            running = NSWorkspace.sharedWorkspace().runningApplications()
+            for app in running:
+                bid = app.bundleIdentifier()
+                if bid and bid.startswith("com.surteesstudios.Bartender"):
+                    return True
+        except Exception as e:
+            logger.debug("Bartender detection failed: %s", e)
+        return False
+
+    def _show_bartender_conflict_alert(self) -> None:
+        """Tell the user Bartender is hiding oMLX and suggest alternatives.
+
+        Called from `_show_menubar_hidden_alert` when Bartender is
+        detected. No Auto-Fix or Open-Settings buttons because neither
+        resolves a Bartender filter; the only real remedies are on
+        Bartender's side (quit it, or switch to Ice).
+        """
+        NSApp.activateIgnoringOtherApps_(True)
+
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("oMLX Menubar Icon Hidden (Bartender Detected)")
+        alert.setInformativeText_(
+            "Bartender is currently running, and it appears to hide the "
+            "oMLX menubar icon regardless of oMLX's own settings. "
+            "Bartender's menubar filter excludes some apps (including "
+            "Docker for Mac and other PyObjC-based menubar apps) for "
+            "reasons that aren't configurable from oMLX's side.\n\n"
+            "What to try:\n"
+            "  • Check Bartender's item list. If oMLX is missing there, "
+            "Bartender can't see us and no toggle will bring it back.\n"
+            "  • Disable or quit Bartender while using oMLX.\n"
+            "  • Consider Ice (https://icemenubar.app), an open-source "
+            "alternative that tends to play better with PyObjC menubar "
+            "apps."
+        )
+        alert.addButtonWithTitle_("View Log")  # 1000
+        alert.addButtonWithTitle_("Dismiss")   # 1001
+
+        alert_window = alert.window()
+        if alert_window is not None:
+            alert_window.setLevel_(NSFloatingWindowLevel)
+
+        if alert.runModal() == NSAlertFirstButtonReturn:
+            log_path = (
+                Path.home()
+                / "Library"
+                / "Application Support"
+                / "oMLX"
+                / "logs"
+                / "menubar.log"
+            )
+            NSWorkspace.sharedWorkspace().openURL_(
+                NSURL.fileURLWithPath_(str(log_path))
+            )
+
+    def _show_fda_request_alert(self) -> None:
+        """Explain why FDA is needed and offer to open the right settings pane."""
+        NSApp.activateIgnoringOtherApps_(True)
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Full Disk Access Required")
+        alert.setInformativeText_(
+            "Auto-Fix needs Full Disk Access so oMLX can edit the StatusKit "
+            "approval file in your Group Containers folder. macOS blocks "
+            "that path by default.\n\n"
+            "1. Click \"Open Privacy Settings\" below.\n"
+            "2. Find oMLX in the Full Disk Access list (drag it in from "
+            "/Applications if it isn't listed).\n"
+            "3. Toggle oMLX on.\n"
+            "4. Quit oMLX and relaunch, then click Auto-Fix again."
+        )
+        alert.addButtonWithTitle_("Open Privacy Settings")
+        alert.addButtonWithTitle_("Cancel")
+        alert_window = alert.window()
+        if alert_window is not None:
+            alert_window.setLevel_(NSFloatingWindowLevel)
+        if alert.runModal() == NSAlertFirstButtonReturn:
+            self._open_full_disk_access_settings()
+
+    def _show_autofix_result_alert(self, success: bool, message: str) -> None:
+        """Surface the outcome of _fix_statuskit_permission() back to the user."""
+        NSApp.activateIgnoringOtherApps_(True)
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(
+            "Auto-Fix Succeeded" if success else "Auto-Fix Failed"
+        )
+        alert.setInformativeText_(message)
+        alert.addButtonWithTitle_("OK")
+        alert_window = alert.window()
+        if alert_window is not None:
+            alert_window.setLevel_(NSFloatingWindowLevel)
+        alert.runModal()
+
+    def _backup_statuskit_plist(self) -> Optional[Path]:
+        """Snapshot the StatusKit plist before mutating it.
+
+        Returns the backup path on success, None if the backup couldn't be
+        written. A missing original (first-ever tracked app) isn't an
+        error: we just have nothing to back up and return None.
+        """
+        src = Path(self._STATUSKIT_PLIST_PATH)
+        if not src.exists():
+            return None
+        backup_dir = (
+            Path.home() / "Library" / "Application Support" / "oMLX" / "backups"
+        )
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = backup_dir / f"statuskit-{timestamp}.plist"
+        try:
+            backup.write_bytes(src.read_bytes())
+            logger.info("StatusKit plist backed up to %s", backup)
+            return backup
+        except OSError as e:
+            logger.warning("StatusKit plist backup failed: %s", e)
+            return None
+
+    def _fix_statuskit_permission(self) -> tuple[bool, str]:
+        """Flip com.omlx.app's StatusKit isAllowed flag to True.
+
+        Steps: back up the plist, load the outer binary plist, decode the
+        nested `trackedApplications` list (either raw list or a nested
+        binary plist blob depending on the Tahoe build), locate or append
+        a com.omlx.app entry, rewrite atomically (preserving the original
+        `bytes` vs `list` format), verify by re-reading, then `killall
+        ControlCenter` so the daemon picks up the change. Returns
+        (success, message) for display in the result dialog.
+        """
+        plist_path = Path(self._STATUSKIT_PLIST_PATH)
+
+        if not plist_path.exists():
+            return (
+                False,
+                "The StatusKit preferences file does not exist on this Mac. "
+                "Your macOS version may not use the approval flow yet; "
+                "the issue is likely not auto-fixable.",
+            )
+
+        backup = self._backup_statuskit_plist()
+
+        try:
+            with open(plist_path, "rb") as f:
+                data = plistlib.load(f)
+        except PermissionError:
+            return (
+                False,
+                "Permission denied reading the StatusKit preferences. "
+                "Grant oMLX Full Disk Access in Privacy & Security.",
+            )
+        except Exception as e:
+            return False, f"Failed to read the StatusKit preferences: {e}"
+
+        raw = data.get("trackedApplications")
+        # Record the original container type so we can re-encode identically.
+        nested_as_bytes = isinstance(raw, (bytes, bytearray))
+
+        if raw is None:
+            inner: list = []
+        elif nested_as_bytes:
+            try:
+                inner = plistlib.loads(bytes(raw))
+            except Exception as e:
+                return False, f"Failed to decode trackedApplications: {e}"
+            if not isinstance(inner, list):
+                return (
+                    False,
+                    f"trackedApplications decoded to {type(inner).__name__}, "
+                    "expected list. Aborting to avoid corrupting the file.",
+                )
+        elif isinstance(raw, list):
+            inner = raw
+        else:
+            return (
+                False,
+                f"Unexpected trackedApplications type: {type(raw).__name__}.",
+            )
+
+        target = "com.omlx.app"
+        changed = False
+        found_already_allowed = False
+        original_states: list[object] = []
+        for entry in inner:
+            if not isinstance(entry, dict):
+                continue
+            bid = entry.get("location", {}).get("bundle", {}).get("_0")
+            if bid != target:
+                continue
+            original_states.append(entry.get("isAllowed", "<missing>"))
+            if entry.get("isAllowed") is True:
+                found_already_allowed = True
+                continue
+            entry["isAllowed"] = True
+            changed = True
+
+        if changed or found_already_allowed:
+            logger.info(
+                "%s found in StatusKit with prior isAllowed states %r",
+                target,
+                original_states,
+            )
+
+        appended_new = False
+        if not changed and not found_already_allowed:
+            new_entry = {
+                "location": {"bundle": {"_0": target}},
+                "menuItemLocations": [{"bundle": {"_0": target}}],
+                "isAllowed": True,
+            }
+            inner.append(new_entry)
+            changed = True
+            appended_new = True
+            logger.info(
+                "%s not in StatusKit list; appended new entry (isAllowed=True).",
+                target,
+            )
+
+        if not changed:
+            return (
+                True,
+                "oMLX is already approved in StatusKit. If the icon still "
+                "doesn't appear, the root cause is something else. Share "
+                "the latest menubar.log with the maintainer.",
+            )
+
+        # Re-encode preserving the original container format.
+        if nested_as_bytes or raw is None:
+            data["trackedApplications"] = plistlib.dumps(
+                inner, fmt=plistlib.FMT_BINARY
+            )
+        else:
+            data["trackedApplications"] = inner
+
+        tmp_path = plist_path.with_suffix(plist_path.suffix + ".omlx-tmp")
+
+        def _cleanup_tmp() -> None:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+        replaced = False
+        try:
+            with open(tmp_path, "wb") as f:
+                plistlib.dump(data, f, fmt=plistlib.FMT_BINARY)
+            os.replace(tmp_path, plist_path)
+            replaced = True
+            logger.info("StatusKit plist rewritten at %s", plist_path)
+        except PermissionError:
+            _cleanup_tmp()
+            return (
+                False,
+                "Permission denied writing the StatusKit preferences. "
+                "Full Disk Access may have been revoked mid-operation.",
+            )
+        except Exception as e:
+            _cleanup_tmp()
+            if backup is not None:
+                try:
+                    plist_path.write_bytes(backup.read_bytes())
+                    logger.warning(
+                        "Write failed (%s); restored plist from %s", e, backup
+                    )
+                except OSError as restore_err:
+                    logger.error(
+                        "Write failed and restore also failed: %s", restore_err
+                    )
+            return False, f"Failed to write the StatusKit preferences: {e}"
+
+        # Validate the file we just wrote by re-reading it. If it doesn't
+        # parse, restore from backup so we don't leave the user with a
+        # ControlCenter that can't read its own prefs.
+        if replaced:
+            try:
+                with open(plist_path, "rb") as f:
+                    plistlib.load(f)
+            except Exception as e:
+                logger.error("Post-write validation failed: %s", e)
+                if backup is not None:
+                    try:
+                        plist_path.write_bytes(backup.read_bytes())
+                        logger.warning("Restored plist from %s", backup)
+                        return (
+                            False,
+                            "Wrote a plist macOS rejected and rolled back. "
+                            "No change applied.",
+                        )
+                    except OSError as restore_err:
+                        logger.error(
+                            "Restore from backup failed: %s", restore_err
+                        )
+                return (
+                    False,
+                    "Plist post-write validation failed and the backup "
+                    "could not be restored. Check "
+                    "~/Library/Application Support/oMLX/backups for a "
+                    "manual restore.",
+                )
+
+        try:
+            subprocess.run(
+                ["killall", "ControlCenter"], timeout=5, check=False
+            )
+        except subprocess.SubprocessError as e:
+            logger.warning("killall ControlCenter failed: %s", e)
+            return (
+                True,
+                "StatusKit flag was updated but I couldn't restart "
+                "ControlCenter. Run `killall ControlCenter` manually.",
+            )
+
+        detail = (
+            "appended a new com.omlx.app entry" if appended_new
+            else "flipped the existing com.omlx.app entry to isAllowed=True"
+        )
+        return (
+            True,
+            f"Auto-Fix {detail} in StatusKit and restarted ControlCenter. "
+            "The menubar icon should appear within a few seconds. "
+            "If it still doesn't, quit and relaunch oMLX.",
+        )
 
     # --- Icon management ---
 
@@ -505,6 +1216,140 @@ class OMLXAppDelegate(NSObject):
             logger.debug(f"Failed to load SF Symbol {sf_symbol}: {e}")
         return None
 
+    def _menu_font(self) -> Optional[NSFont]:
+        """Return the default menu font for measurement and rendering."""
+        try:
+            return NSFont.menuFontOfSize_(0.0)
+        except Exception:
+            return None
+
+    def _measure_menu_text_width(self, text: str, font: Optional[NSFont]) -> float:
+        """Measure menu text width in points, with a safe fallback."""
+        try:
+            attrs = {}
+            if font is not None:
+                attrs[NSFontAttributeName] = font
+            attributed = NSAttributedString.alloc().initWithString_attributes_(
+                text, attrs
+            )
+            return float(attributed.size().width)
+        except Exception:
+            return float(max(1, len(text)) * 7)
+
+    def _compute_stats_tab_stop(self, entries: list[tuple[str, str]]) -> float:
+        """Compute right-tab position for aligned stats rows."""
+        if not entries:
+            return 240.0
+
+        font = self._menu_font()
+        max_label_width = max(
+            self._measure_menu_text_width(label, font) for label, _ in entries
+        )
+        max_value_width = max(
+            self._measure_menu_text_width(value, font) for _, value in entries
+        )
+
+        gap = 16.0
+        return max(200.0, max_label_width + gap + max_value_width)
+
+    def _format_compact_count(self, value) -> tuple[str, str]:
+        """Format large counts with compact units and return raw full value."""
+        if value is None or isinstance(value, bool):
+            return "--", "--"
+
+        try:
+            if isinstance(value, int):
+                n = Decimal(value)
+            else:
+                s = str(value).strip().replace(",", "")
+                if not s:
+                    return "--", "--"
+                n = Decimal(s)
+        except (InvalidOperation, ValueError, TypeError):
+            return "--", "--"
+
+        is_integer = n == n.to_integral_value()
+        raw_value = f"{int(n):,}" if is_integer else f"{n:,.2f}"
+
+        abs_n = abs(n)
+        units: list[tuple[str, Decimal]] = [
+            ("E", Decimal("1000000000000000000")),  # 10^18
+            ("P", Decimal("1000000000000000")),  # 10^15
+            ("T", Decimal("1000000000000")),  # 10^12
+            ("B", Decimal("1000000000")),  # 10^9
+            ("M", Decimal("1000000")),  # 10^6
+            ("K", Decimal("1000")),  # 10^3
+        ]
+        for suffix, factor in units:
+            if abs_n >= factor:
+                compact = (n / factor).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                return f"{compact}{suffix}", raw_value
+
+        if is_integer:
+            return str(int(n)), raw_value
+        return str(n.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)), raw_value
+
+    def _make_aligned_stats_item(
+        self, label: str, value: str, tab_stop: float, tooltip: Optional[str] = None
+    ) -> NSMenuItem:
+        """Create one stats row with left-aligned label and right-aligned value."""
+        plain_text = f"{label}: {value}"
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            plain_text, "noOp:", ""
+        )
+        item.setTarget_(self)
+        if tooltip and tooltip != "--":
+            try:
+                item.setToolTip_(tooltip)
+            except Exception:
+                pass
+
+        try:
+            paragraph = NSMutableParagraphStyle.alloc().init()
+            tab = NSTextTab.alloc().initWithType_location_(
+                NSRightTabStopType, tab_stop
+            )
+            paragraph.setTabStops_([tab])
+
+            attrs = {NSParagraphStyleAttributeName: paragraph}
+            font = self._menu_font()
+            if font is not None:
+                attrs[NSFontAttributeName] = font
+
+            attributed = NSAttributedString.alloc().initWithString_attributes_(
+                f"{label}\t{value}", attrs
+            )
+            item.setAttributedTitle_(attributed)
+        except Exception as e:
+            logger.debug(f"Failed to align stats row '{plain_text}': {e}")
+
+        return item
+
+    def _make_centered_stats_header(self, title: str, row_width: float) -> NSMenuItem:
+        """Create a centered, disabled header item for stats sections."""
+        text = f"── {title} ──"
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(text, None, "")
+        item.setEnabled_(False)
+        header_width = max(220.0, float(row_width))
+
+        view = NSView.alloc().initWithFrame_(((0.0, 0.0), (header_width, 20.0)))
+        label = NSTextField.alloc().initWithFrame_(((0.0, 1.0), (header_width, 18.0)))
+        label.setStringValue_(text)
+        label.setEditable_(False)
+        label.setBordered_(False)
+        label.setDrawsBackground_(False)
+        label.setSelectable_(False)
+        label.setAlignment_(NSTextAlignmentCenter)
+        label.setTextColor_(NSColor.secondaryLabelColor())
+        font = self._menu_font()
+        if font is not None:
+            label.setFont_(font)
+        view.addSubview_(label)
+        item.setView_(view)
+        return item
+
     def _get_status_display(self):
         """Return (text, color) for the current server status header."""
         status = self.server_manager.status
@@ -631,51 +1476,76 @@ class OMLXAppDelegate(NSObject):
 
         if is_running and self._cached_stats:
             s = self._cached_stats
+            a = self._cached_alltime_stats or {}
 
-            # Session stats
-            session_header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "── Session ──", None, ""
+            session_total_display, session_total_raw = self._format_compact_count(
+                s.get("total_prompt_tokens", 0)
             )
-            session_header.setEnabled_(False)
-            stats_submenu.addItem_(session_header)
+            session_cached_display, session_cached_raw = self._format_compact_count(
+                s.get("total_cached_tokens", 0)
+            )
+            alltime_total_display, alltime_total_raw = self._format_compact_count(
+                a.get("total_prompt_tokens", 0)
+            )
+            alltime_cached_display, alltime_cached_raw = self._format_compact_count(
+                a.get("total_cached_tokens", 0)
+            )
+            alltime_requests_display, alltime_requests_raw = self._format_compact_count(
+                a.get("total_requests", 0)
+            )
 
             session_entries = [
-                ("Total Tokens Processed", f"{s.get('total_prompt_tokens', 0):,}"),
-                ("Cached Tokens", f"{s.get('total_cached_tokens', 0):,}"),
-                ("Cache Efficiency", f"{s.get('cache_efficiency', 0):.1f}%"),
-                ("Avg PP Speed", f"{s.get('avg_prefill_tps', 0):.1f} tok/s"),
-                ("Avg TG Speed", f"{s.get('avg_generation_tps', 0):.1f} tok/s"),
+                (
+                    "Total Tokens Processed",
+                    session_total_display,
+                    session_total_raw,
+                ),
+                ("Cached Tokens", session_cached_display, session_cached_raw),
+                ("Cache Efficiency", f"{s.get('cache_efficiency', 0):.1f}%", None),
+                ("Avg PP Speed", f"{s.get('avg_prefill_tps', 0):.1f} tok/s", None),
+                ("Avg TG Speed", f"{s.get('avg_generation_tps', 0):.1f} tok/s", None),
             ]
-            for label, value in session_entries:
-                text = f"{label}: {value}"
-                mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                    text, "noOp:", ""
+            alltime_entries = [
+                (
+                    "Total Tokens Processed",
+                    alltime_total_display,
+                    alltime_total_raw,
+                ),
+                ("Cached Tokens", alltime_cached_display, alltime_cached_raw),
+                ("Cache Efficiency", f"{a.get('cache_efficiency', 0):.1f}%", None),
+                ("Total Requests", alltime_requests_display, alltime_requests_raw),
+            ]
+
+            # One shared tab stop keeps the right value edge aligned across both sections.
+            shared_tab_stop = self._compute_stats_tab_stop(
+                [(label, value) for label, value, _ in (session_entries + alltime_entries)]
+            )
+            header_row_width = shared_tab_stop + 28.0
+
+            # Session stats
+            session_header = self._make_centered_stats_header(
+                "Session", header_row_width
+            )
+            stats_submenu.addItem_(session_header)
+            for label, value, tooltip in session_entries:
+                stats_submenu.addItem_(
+                    self._make_aligned_stats_item(
+                        label, value, shared_tab_stop, tooltip=tooltip
+                    )
                 )
-                mi.setTarget_(self)
-                stats_submenu.addItem_(mi)
 
             # All-time stats
             stats_submenu.addItem_(NSMenuItem.separatorItem())
-            alltime_header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "── All-Time ──", None, ""
+            alltime_header = self._make_centered_stats_header(
+                "All-Time", header_row_width
             )
-            alltime_header.setEnabled_(False)
             stats_submenu.addItem_(alltime_header)
-
-            a = self._cached_alltime_stats or {}
-            alltime_entries = [
-                ("Total Tokens Processed", f"{a.get('total_prompt_tokens', 0):,}"),
-                ("Cached Tokens", f"{a.get('total_cached_tokens', 0):,}"),
-                ("Cache Efficiency", f"{a.get('cache_efficiency', 0):.1f}%"),
-                ("Total Requests", f"{a.get('total_requests', 0):,}"),
-            ]
-            for label, value in alltime_entries:
-                text = f"{label}: {value}"
-                mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                    text, "noOp:", ""
+            for label, value, tooltip in alltime_entries:
+                stats_submenu.addItem_(
+                    self._make_aligned_stats_item(
+                        label, value, shared_tab_stop, tooltip=tooltip
+                    )
                 )
-                mi.setTarget_(self)
-                stats_submenu.addItem_(mi)
         else:
             off_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 "Server is off" if not is_running else "Loading stats...",
@@ -724,9 +1594,9 @@ class OMLXAppDelegate(NSObject):
 
         self.menu.addItem_(NSMenuItem.separatorItem())
 
-        # --- Preferences ---
+        # --- Settings ---
         prefs_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Preferences...", "openPreferences:", ","
+            "Settings…", "openPreferences:", ","
         )
         prefs_item.setTarget_(self)
         prefs_icon = self._create_menu_icon("gearshape")
@@ -1155,9 +2025,9 @@ class OMLXAppDelegate(NSObject):
             alert.setInformativeText_(
                 f"Port {self.server_manager.config.port} is in use by another "
                 f"application{pid_info}.\n\n"
-                f"Change the port in Preferences."
+                f"Change the port in Settings."
             )
-            alert.addButtonWithTitle_("Open Preferences")
+            alert.addButtonWithTitle_("Open Settings")
             alert.addButtonWithTitle_("Cancel")
 
             response = alert.runModal()
@@ -1231,7 +2101,7 @@ class OMLXAppDelegate(NSObject):
 
     @objc.IBAction
     def openPreferences_(self, sender):
-        """Open the Preferences window."""
+        """Open the Settings window."""
         from .preferences import PreferencesWindowController
 
         self.preferences_controller = (
@@ -1254,41 +2124,76 @@ class OMLXAppDelegate(NSObject):
         self.welcome_controller.showWindow()
 
     def _on_prefs_saved(self):
-        """Callback after preferences are saved."""
+        """Callback after settings are saved."""
         self.server_manager.update_config(self.config)
         self._build_menu()
 
     @objc.IBAction
     def showAbout_(self, sender):
-        """Show About dialog."""
-        import webbrowser
+        """Show the standard macOS About panel with a clickable GitHub link.
 
-        from AppKit import NSAlert, NSAlertFirstButtonReturn
-
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_("About oMLX")
-
+        Using orderFrontStandardAboutPanelWithOptions_ gives the centered
+        Aqua layout that matches every other Mac app and sidesteps NSAlert's
+        left-aligned icon-plus-text rendering. The GitHub URL is embedded as
+        a real NSLinkAttributeName in the Credits NSAttributedString, so
+        AppKit renders it as a clickable hyperlink.
+        """
         try:
             from omlx._build_info import build_number
         except ImportError:
             build_number = None
 
-        version_text = f"Version: {__version__}"
+        github_url = "https://github.com/jundot/omlx"
+        # Put the build number at the top of Credits with a newline so it
+        # renders on its own line. The standard About panel keeps
+        # ApplicationVersion on a single line and doesn't respect \n
+        # inside it, but Credits accepts NSAttributedString with real line
+        # breaks.
         if build_number:
-            version_text += f"\nBuild: {build_number}"
+            credits_text = (
+                f"({build_number})\n\n"
+                "LLM inference, optimized for your Mac\n\n"
+                "Built with MLX, mlx-lm, and mlx-vlm\n"
+                "Special Thanks to 1212.H.\n\n"
+                f"{github_url}"
+            )
+        else:
+            credits_text = (
+                "LLM inference, optimized for your Mac\n\n"
+                "Built with MLX, mlx-lm, and mlx-vlm\n"
+                "Special Thanks to 1212.H.\n\n"
+                f"{github_url}"
+            )
+        credits = NSMutableAttributedString.alloc().initWithString_(credits_text)
 
-        alert.setInformativeText_(
-            "LLM inference,\n"
-            "optimized for your Mac\n\n"
-            "Built with MLX, mlx-lm, and mlx-vlm\n"
-            "Special Thanks to 1212.H.\n\n"
-            f"{version_text}"
+        # Center the whole credits block to match the panel's header alignment.
+        paragraph = NSMutableParagraphStyle.alloc().init()
+        paragraph.setAlignment_(NSTextAlignmentCenter)
+        credits.addAttribute_value_range_(
+            NSParagraphStyleAttributeName,
+            paragraph,
+            (0, credits.length()),
         )
-        alert.addButtonWithTitle_("OK")
-        alert.addButtonWithTitle_("GitHub")
 
-        if alert.runModal() != NSAlertFirstButtonReturn:
-            webbrowser.open("https://github.com/jundot")
+        # Embed the URL as a link attribute so clicking opens the browser.
+        loc = credits_text.find(github_url)
+        if loc >= 0:
+            credits.addAttribute_value_range_(
+                NSLinkAttributeName,
+                NSURL.URLWithString_(github_url),
+                (loc, len(github_url)),
+            )
+
+        options = {
+            "ApplicationName": "oMLX",
+            "ApplicationVersion": __version__,
+            "Credits": credits,
+        }
+
+        NSApp.activateIgnoringOtherApps_(True)
+        NSApplication.sharedApplication().orderFrontStandardAboutPanelWithOptions_(
+            options
+        )
 
     @objc.IBAction
     def quitApp_(self, sender):

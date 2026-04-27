@@ -33,14 +33,18 @@ class RerankerEngine(BaseNonStreamingEngine):
     since reranking is computed in a single forward pass.
     """
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, trust_remote_code: bool = False):
         """
         Initialize the reranker engine.
 
         Args:
             model_name: HuggingFace model name or local path
+            trust_remote_code: Allow loaders to execute custom Python shipped
+                with the model repo. Off by default for security (issue #926).
         """
+        super().__init__()
         self._model_name = model_name
+        self._trust_remote_code = trust_remote_code
         self._model: MLXRerankerModel | None = None
 
     @property
@@ -68,7 +72,9 @@ class RerankerEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Starting reranker engine: {self._model_name}")
-        self._model = MLXRerankerModel(self._model_name)
+        self._model = MLXRerankerModel(
+            self._model_name, trust_remote_code=self._trust_remote_code
+        )
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(get_mlx_executor(), self._model.load)
         logger.info(f"Reranker engine started: {self._model_name}")
@@ -90,8 +96,8 @@ class RerankerEngine(BaseNonStreamingEngine):
 
     async def rerank(
         self,
-        query: str,
-        documents: list[str],
+        query: "str | dict",
+        documents: "list[str] | list[dict]",
         top_n: int | None = None,
         max_length: int | None = None,
     ) -> RerankOutput:
@@ -99,8 +105,10 @@ class RerankerEngine(BaseNonStreamingEngine):
         Rerank documents by relevance to the query.
 
         Args:
-            query: The search query
-            documents: List of documents to rerank
+            query: The search query. String for text-only rerankers, or dict
+                with 'text' and/or 'image' for multimodal rerankers.
+            documents: List of documents. Strings or dicts with 'text' and/or
+                'image' keys.
             top_n: Number of top results to return (None = all)
             max_length: Maximum token length for each query-document pair.
                 If None, uses model-appropriate default (512 for encoder,
@@ -121,22 +129,32 @@ class RerankerEngine(BaseNonStreamingEngine):
                 max_length=max_length,
             )
 
-        loop = asyncio.get_running_loop()
-        output = await loop.run_in_executor(
-            get_mlx_executor(), _rerank_sync
-        )
-
-        # Apply top_n filtering if specified
-        if top_n is not None and top_n < len(output.indices):
-            top_indices = output.indices[:top_n]
-            # Keep original scores but note which indices are in top_n
-            return RerankOutput(
-                scores=output.scores,
-                indices=top_indices,
-                total_tokens=output.total_tokens,
+        with self._active_lock:
+            self._active_count += 1
+        try:
+            loop = asyncio.get_running_loop()
+            output = await loop.run_in_executor(
+                get_mlx_executor(), _rerank_sync
             )
 
-        return output
+            # Apply top_n filtering if specified
+            if top_n is not None and top_n < len(output.indices):
+                top_indices = output.indices[:top_n]
+                # Keep original scores but note which indices are in top_n
+                return RerankOutput(
+                    scores=output.scores,
+                    indices=top_indices,
+                    total_tokens=output.total_tokens,
+                )
+
+            return output
+        finally:
+            if self._decrement_active():
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

@@ -156,11 +156,27 @@ class TestVLMModelAdapter:
         vlm.language_model.__call__ = MagicMock(return_value=expected)
 
         result = adapter(input_ids, cache=cache)
-        # Cache is wrapped with _IntOffsetCacheProxy, so check args manually
         vlm.language_model.assert_called_once()
         call_args = vlm.language_model.call_args
         assert call_args[0][0] is input_ids
-        assert len(call_args[1]["cache"]) == 1
+        assert call_args[1]["cache"] is cache
+
+    def test_forward_text_only_uses_language_model_directly(self):
+        """Text-only decode passes cache directly to language_model."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+
+        input_ids = MockMXArray(shape=(1, 10))
+        cache = [MagicMock()]
+        vlm.language_model.__call__ = MagicMock(return_value=MagicMock())
+
+        adapter(input_ids, cache=cache)
+
+        vlm.language_model.assert_called_once()
+        call_args = vlm.language_model.call_args
+        assert call_args[1]["cache"] is cache
 
     def test_forward_with_embeddings(self):
         """Test forward pass with pending embeddings injects inputs_embeds."""
@@ -266,6 +282,179 @@ class TestVLMModelAdapter:
         call_args = vlm.language_model.call_args
         assert call_args.kwargs.get("inputs_embeds") is batched
 
+
+class TestMRoPEDetection:
+    """Tests for mRoPE detection and per-request position tracking."""
+
+    def test_detect_mrope_via_rope_scaling(self):
+        """Detect mRoPE via text_config.rope_scaling.mrope_section (Qwen3-VL)."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = MagicMock(spec=[])
+        vlm.config = MagicMock(spec=[])
+        vlm.config.text_config = MagicMock(spec=[])
+        vlm.config.text_config.rope_scaling = {
+            "mrope_interleaved": True,
+            "mrope_section": [24, 20, 20],
+            "rope_type": "default",
+        }
+        vlm.config.text_config.rope_parameters = None
+        assert VLMModelAdapter._detect_mrope(vlm) is True
+
+    def test_detect_mrope_via_rope_parameters(self):
+        """Detect mRoPE via text_config.rope_parameters.mrope_section (Qwen3.5)."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = MagicMock(spec=[])
+        vlm.config = MagicMock(spec=[])
+        vlm.config.text_config = MagicMock(spec=[])
+        vlm.config.text_config.rope_scaling = None
+        vlm.config.text_config.rope_parameters = {
+            "mrope_interleaved": True,
+            "mrope_section": [11, 11, 10],
+            "rope_theta": 10000000,
+        }
+        assert VLMModelAdapter._detect_mrope(vlm) is True
+
+    def test_detect_mrope_false_for_standard_rope(self):
+        """Standard RoPE (no mrope_section) should return False."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = MagicMock(spec=[])
+        vlm.config = MagicMock(spec=[])
+        vlm.config.text_config = MagicMock(spec=[])
+        vlm.config.text_config.rope_scaling = None
+        vlm.config.text_config.rope_parameters = {
+            "full_attention": {"rope_theta": 1000000.0},
+            "sliding_attention": {"rope_theta": 10000.0},
+        }
+        assert VLMModelAdapter._detect_mrope(vlm) is False
+
+    def test_detect_mrope_false_for_no_config(self):
+        """No config attribute should return False."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = MagicMock(spec=[])
+        assert VLMModelAdapter._detect_mrope(vlm) is False
+
+
+class TestPerRequestMRoPEDecode:
+    """Tests for per-request mRoPE position_ids computation during decode."""
+
+    def _make_mrope_vlm_model(self):
+        """Create a mock VLM model with mRoPE config."""
+        vlm = MagicMock()
+        vlm.language_model = MagicMock()
+        vlm.language_model.model = MagicMock()
+        vlm.language_model.model.layers = [MagicMock() for _ in range(4)]
+        vlm.language_model.args = MagicMock()
+        vlm.config = MagicMock(spec=[])
+        vlm.config.text_config = MagicMock(spec=[])
+        vlm.config.text_config.rope_scaling = {
+            "mrope_interleaved": True,
+            "mrope_section": [24, 20, 20],
+        }
+        vlm.config.text_config.rope_parameters = None
+        vlm.config.model_type = "qwen3_vl_moe"
+        return vlm
+
+    def test_mrope_decode_uses_language_model_with_position_ids(self):
+        """mRoPE decode with batch_rope_deltas should use language_model with position_ids."""
+        import mlx.core as mx
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        assert adapter._uses_mrope is True
+
+        adapter.set_batch_rope_deltas(mx.array([10.0, 0.0]))
+
+        input_ids = mx.zeros((2, 1), dtype=mx.int32)
+        cache_layer = MagicMock()
+        cache_layer.offset = mx.array([50, 30])
+        cache = [cache_layer]
+
+        adapter(input_ids, cache=cache)
+
+        vlm.language_model.assert_called_once()
+        call_kwargs = vlm.language_model.call_args[1]
+        assert "position_ids" in call_kwargs
+        assert call_kwargs["cache"][0] is cache_layer
+
+    def test_mrope_always_uses_language_model(self):
+        """mRoPE model always uses vlm language_model with position_ids."""
+        import mlx.core as mx
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+
+        cache_layer = MagicMock()
+        cache_layer.offset = mx.array([50])
+
+        input_ids = mx.zeros((1, 1), dtype=mx.int32)
+        adapter(input_ids, cache=[cache_layer])
+
+        vlm.language_model.assert_called_once()
+
+    def test_position_ids_shape_and_values(self):
+        """Verify position_ids = (3, batch, seq) with correct offset+delta values."""
+        import mlx.core as mx
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+
+        # Request 0: VLM (offset=100, delta=-50) → position=50
+        # Request 1: text-only (offset=80, delta=0) → position=80
+        adapter.set_batch_rope_deltas(mx.array([-50.0, 0.0]))
+
+        input_ids = mx.zeros((2, 1), dtype=mx.int32)
+        cache_layer = MagicMock()
+        cache_layer.offset = mx.array([100, 80])
+        cache = [cache_layer]
+
+        adapter(input_ids, cache=cache)
+
+        call_kwargs = vlm.language_model.call_args[1]
+        pos_ids = call_kwargs["position_ids"]
+        # Shape: (3, 2, 1) — 3 mRoPE dimensions, 2 requests, 1 token
+        assert pos_ids.shape == (3, 2, 1)
+        # All 3 dimensions should have same values for text-only decode
+        # Request 0: 100 + (-50) = 50
+        # Request 1: 80 + 0 = 80
+        assert pos_ids[0, 0, 0].item() == 50.0
+        assert pos_ids[0, 1, 0].item() == 80.0
+
+    def test_get_last_rope_deltas(self):
+        """get_last_rope_deltas extracts value from language model."""
+        import mlx.core as mx
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+
+        vlm.language_model._rope_deltas = mx.array(-42.0)
+        assert adapter.get_last_rope_deltas() == -42.0
+
+        vlm.language_model._rope_deltas = None
+        assert adapter.get_last_rope_deltas() == 0.0
+
+
+class TestLogitsExtraction:
+    """Tests for LanguageModelOutput.logits extraction."""
+
+    def _make_mock_vlm_model(self):
+        """Create a mock VLM model with language_model."""
+        vlm = MagicMock()
+        vlm.language_model = MagicMock()
+        vlm.language_model.model = MagicMock()
+        vlm.language_model.model.layers = [MagicMock() for _ in range(4)]
+        vlm.language_model.args = MagicMock()
+        vlm.config = MagicMock()
+        vlm.config.model_type = "test"
+        return vlm
+
     def test_logits_extraction_from_language_model_output(self):
         """Test that LanguageModelOutput.logits is extracted for BatchGenerator."""
         from omlx.models.vlm import VLMModelAdapter
@@ -298,88 +487,4 @@ class TestVLMModelAdapterModelProperty:
         assert adapter.layers is vlm.language_model.model.layers
 
 
-class TestIntOffsetCacheProxy:
-    """Tests for _IntOffsetCacheProxy offset conversion."""
 
-    def test_scalar_offset_passthrough(self):
-        """Scalar int offset is returned as-is."""
-        from omlx.models.vlm import _IntOffsetCacheProxy
-
-        cache = MagicMock(spec=[])
-        cache.offset = 42
-        proxy = _IntOffsetCacheProxy(cache)
-        assert proxy.offset == 42
-
-    def test_0d_mx_array_offset(self):
-        """0-d mx.array offset is converted to int."""
-        import mlx.core as mx
-        from omlx.models.vlm import _IntOffsetCacheProxy
-
-        cache = MagicMock(spec=[])
-        cache.offset = mx.array(7)
-        proxy = _IntOffsetCacheProxy(cache)
-        assert proxy.offset == 7
-
-    def test_batched_offset_returns_first_element(self):
-        """Proxy extracts offset[0] from mx.array — the authoritative source.
-
-        _idx/_offset are unreliable: _idx wraps at max_size for
-        BatchRotatingKVCache, _offset diverges after merge().
-        The mx.array offset is always correct per-request.
-        """
-        import mlx.core as mx
-        from omlx.models.vlm import _IntOffsetCacheProxy
-
-        cache = MagicMock(spec=[])
-        cache.offset = mx.array([625])
-        cache._idx = 42  # irrelevant, should not be used
-        proxy = _IntOffsetCacheProxy(cache)
-        assert proxy.offset == 625
-
-    def test_rotating_cache_wrap_returns_real_offset(self):
-        """After RotatingKVCache wraps, proxy returns real offset, not _idx.
-
-        BatchRotatingKVCache._idx wraps at max_size (e.g. 1024 -> 0).
-        The proxy must use offset[0] from the mx.array (Issue #353).
-        """
-        import mlx.core as mx
-        from omlx.models.vlm import _IntOffsetCacheProxy
-
-        cache = MagicMock(spec=[])
-        cache.offset = mx.array([1025])  # real per-request offset
-        cache._idx = 1  # wrapped buffer write position (1025 % 1024)
-        cache._offset = 1025  # also correct here, but proxy shouldn't rely on it
-        proxy = _IntOffsetCacheProxy(cache)
-        assert proxy.offset == 1025
-
-    def test_merged_cache_returns_real_offset(self):
-        """After SSD restore + merge, proxy returns real offset.
-
-        BatchRotatingKVCache.merge() sets _offset = keys.shape[2] (buffer
-        size), not the actual token offset. The proxy must use the mx.array
-        offset which merge() sets correctly from individual cache offsets.
-        """
-        import mlx.core as mx
-        from omlx.models.vlm import _IntOffsetCacheProxy
-
-        cache = MagicMock(spec=[])
-        cache.offset = mx.array([7168])  # real offset from merge
-        cache._offset = 1024  # wrong: merge sets this to keys.shape[2]
-        cache._idx = 1024  # also wrong: buffer size
-        proxy = _IntOffsetCacheProxy(cache)
-        assert proxy.offset == 7168
-
-    def test_multi_request_batch_returns_max_offset(self):
-        """Multi-request batch returns max offset (== _idx).
-
-        max(offset) equals _idx because the longest request has zero
-        left_padding.  This is correct for mask sizing in mlx-vlm
-        attention (kv_seq_len uses cache.offset before update_and_fetch).
-        """
-        import mlx.core as mx
-        from omlx.models.vlm import _IntOffsetCacheProxy
-
-        cache = MagicMock(spec=[])
-        cache.offset = mx.array([500, 625])
-        proxy = _IntOffsetCacheProxy(cache)
-        assert proxy.offset == 625

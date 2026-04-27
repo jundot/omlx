@@ -33,9 +33,10 @@ _current_model: Optional[str] = None
 _engine_pool_ref: Any = None
 
 VALID_BENCHMARKS = [
-    "mmlu", "kmmlu", "cmmlu", "jmmlu",
+    "mmlu", "mmlu_pro", "kmmlu", "cmmlu", "jmmlu",
     "hellaswag", "truthfulqa", "arc_challenge", "winogrande",
-    "gsm8k", "humaneval", "mbpp", "livecodebench",
+    "gsm8k", "mathqa", "humaneval", "mbpp", "livecodebench",
+    "bbq", "safetybench",
 ]
 
 
@@ -45,6 +46,7 @@ class AccuracyBenchmarkRequest(BaseModel):
     model_id: str
     benchmarks: dict[str, int]  # name -> sample_size (0 = full dataset)
     batch_size: int = 1
+    enable_thinking: bool = False
 
     @field_validator("batch_size")
     @classmethod
@@ -403,6 +405,7 @@ async def run_accuracy_benchmark(
                     engine, items, on_progress,
                     batch_size=request.batch_size,
                     sampling_kwargs=sampling_kwargs,
+                    enable_thinking=request.enable_thinking,
                 )
             except asyncio.CancelledError:
                 run.status = "cancelled"
@@ -426,6 +429,7 @@ async def run_accuracy_benchmark(
                 "model_id": request.model_id,
                 "benchmark": result.benchmark_name,
                 "accuracy": round(result.accuracy, 4),
+                "thinking_used": result.thinking_used,
                 "total": result.total_questions,
                 "correct": result.correct_count,
                 "time_s": round(result.time_seconds, 1),
@@ -437,6 +441,7 @@ async def run_accuracy_benchmark(
                         "predicted": qr.predicted,
                         "question": qr.question_text,
                         "raw_response": qr.raw_response,
+                        "category": qr.category,
                         "time_s": round(qr.time_seconds, 3),
                     }
                     for qr in result.question_results

@@ -71,6 +71,72 @@ def _compute_max_pending_writes() -> int:
 _MAX_PENDING_WRITES = _compute_max_pending_writes()
 
 
+# Cache format version. Bump when on-disk layout or RotatingKVCache meta_state
+# semantics change in a way that older blocks become unsafe to load.
+#
+# Version "2": added with the mlx-lm 0.31.3 contract fix (issues #934 / #903).
+# Version "1" / unset: pre-fix blocks. RotatingKVCache layers may have been
+#   zero-padded to max_size, which after the fix would leak zero positions
+#   into attention. Treat such blocks as a cache miss instead of migrating.
+_CACHE_FORMAT_VERSION = "2"
+
+
+# Layer cache type names whose meta_state should be clamped on save so the
+# rotating buffer's _idx never exceeds the actual buffer length. Restoring a
+# cache where _idx > keys.shape[2] makes BatchRotatingKVCache.merge() either
+# overshoot the RHS or (when omlx pads) leak zero positions into attention.
+_ROTATING_CACHE_TYPES = ("RotatingKVCache", "BatchRotatingKVCache")
+
+
+def _clamp_rotating_meta_states(
+    cache_data: List[Any],
+    layer_cache_types: Optional[List[str]],
+    layer_meta_states: Optional[List[Tuple]],
+) -> Optional[List[Tuple]]:
+    """Clamp ``_idx`` to ``keys.shape[2]`` for RotatingKVCache layers.
+
+    RotatingKVCache.meta_state is ``(keep, max_size, offset, _idx)``. When
+    we save a snapshot, ``_idx`` must reflect the actual buffer length so
+    the restored cache lands in case 1 of ``_temporal_order``. Older code
+    paths could leave ``_idx == max_size`` after zero-padding the buffer;
+    by clamping at write time we ensure newer blocks are always safe to
+    restore.
+    """
+    if not layer_meta_states or not layer_cache_types:
+        return layer_meta_states
+
+    clamped: List[Tuple] = []
+    for i, meta in enumerate(layer_meta_states):
+        if (
+            i < len(layer_cache_types)
+            and layer_cache_types[i] in _ROTATING_CACHE_TYPES
+            and meta
+            and len(meta) >= 4
+            and i < len(cache_data)
+        ):
+            layer_data = cache_data[i]
+            seq_len: Optional[int] = None
+            if (
+                isinstance(layer_data, tuple)
+                and len(layer_data) == 2
+                and not (isinstance(layer_data[0], str) and layer_data[0].startswith("__"))
+            ):
+                keys = layer_data[0]
+                if hasattr(keys, "shape") and len(keys.shape) >= 3:
+                    seq_len = int(keys.shape[2])
+            if seq_len is not None:
+                try:
+                    keep, max_size, offset, idx = meta[:4]
+                    idx_int = int(idx)
+                    if idx_int > seq_len:
+                        clamped.append((keep, max_size, offset, str(seq_len)))
+                        continue
+                except (TypeError, ValueError):
+                    pass
+        clamped.append(meta)
+    return clamped
+
+
 def _has_zero_dim(tensor: Any) -> bool:
     """Check if a tensor has any zero-dimension axis (unsupported by safetensors)."""
     return hasattr(tensor, "shape") and any(d == 0 for d in tensor.shape)
@@ -501,6 +567,11 @@ class PagedSSDCacheIndex:
         with self._lock:
             return list(self._index.keys())
 
+    def get_all_metadata(self) -> List[PagedSSDBlockMetadata]:
+        """Get a snapshot of all indexed block metadata."""
+        with self._lock:
+            return list(self._index.values())
+
 
 class PagedSSDCacheManager(CacheManager):
     """
@@ -528,9 +599,10 @@ class PagedSSDCacheManager(CacheManager):
 
     def __init__(
         self,
-        cache_dir: Path,
+        cache_dir: Optional[Path],
         max_size_bytes: int,
         hot_cache_max_bytes: int = 0,
+        hot_cache_only: bool = False,
     ):
         """
         Initialize the SSD cache manager.
@@ -540,10 +612,14 @@ class PagedSSDCacheManager(CacheManager):
             max_size_bytes: Maximum total size of SSD cache.
             hot_cache_max_bytes: Maximum in-memory hot cache size in bytes.
                 0 means disabled (default).
+            hot_cache_only: When True, skip directory init and writer thread.
+                All data is stored exclusively in the hot cache (RAM only).
+                No SSD I/O is performed.
         """
-        self._cache_dir = Path(cache_dir)
+        self._cache_dir = cache_dir
         self._max_size = max_size_bytes
         self._index = PagedSSDCacheIndex(max_size_bytes)
+        self._hot_cache_only = hot_cache_only
         self._lock = threading.RLock()
 
         # Disk usage cache for dynamic effective max size (30s TTL)
@@ -572,8 +648,10 @@ class PagedSSDCacheManager(CacheManager):
         self._hot_cache_lock = threading.Lock()
 
         # Initialize directory structure and scan existing files
-        self._init_directories()
-        self._scan_existing_files()
+        # Skip in hot_cache_only mode: no SSD I/O, so no directories needed.
+        if self._cache_dir and not self._hot_cache_only:
+            self._init_directories()
+            self._scan_existing_files()
 
         # --- Background writer for non-blocking saves ---
         self._write_queue: queue.Queue = queue.Queue(maxsize=_MAX_PENDING_WRITES)
@@ -581,25 +659,30 @@ class PagedSSDCacheManager(CacheManager):
         self._pending_write_hashes: set = set()
         self._pending_write_hashes_lock = threading.Lock()
         self._writer_shutdown = threading.Event()
-        self._writer_thread = threading.Thread(
-            target=self._writer_loop,
-            name="ssd-cache-writer",
-            daemon=True,
-        )
-        self._writer_thread.start()
+        # Writer thread is only needed when writing to SSD.
+        self._writer_thread = None
+        if not self._hot_cache_only:
+            self._writer_thread = threading.Thread(
+                target=self._writer_loop,
+                name="ssd-cache-writer",
+                daemon=True,
+            )
+            self._writer_thread.start()
 
         hot_info = ""
         if self._hot_cache_enabled:
             hot_info = f", hot_cache={format_bytes(hot_cache_max_bytes)}"
         # Log initialization with disk space info
-        try:
-            du = shutil.disk_usage(self._cache_dir)
-            disk_info = (
-                f", disk_free={format_bytes(du.free)}, "
-                f"cache_used={format_bytes(self._index.total_size)}"
-            )
-        except OSError:
-            disk_info = ""
+        disk_info = ""
+        if self._cache_dir:
+            try:
+                du = shutil.disk_usage(self._cache_dir)
+                disk_info = (
+                    f", disk_free={format_bytes(du.free)}, "
+                    f"cache_used={format_bytes(self._index.total_size)}"
+                )
+            except OSError:
+                pass
         logger.info(
             f"PagedSSDCacheManager initialized: dir={self._cache_dir}, "
             f"max_size={format_bytes(max_size_bytes)}{hot_info}, "
@@ -609,24 +692,31 @@ class PagedSSDCacheManager(CacheManager):
     # --- Hot cache helpers ---
 
     @staticmethod
-    def _hot_cache_entry_size(tensors_raw: Dict[str, tuple]) -> int:
-        """Calculate memory footprint of a hot cache entry (sum of raw bytes)."""
-        return sum(len(raw) for raw, _, _ in tensors_raw.values())
+    def _hot_cache_entry_size(entry: Dict) -> int:
+        """Calculate memory footprint of a hot cache entry.
+
+        Entries from save_block() use 'tensors_raw' (raw bytes).
+        Entries from _promote_to_hot_cache() may use 'arrays' (mx.array objects
+        loaded from SSD, not from active inference — safe to retain).
+        """
+        if 'arrays' in entry:
+            return sum(arr.nbytes for arr in entry['arrays'].values())
+        if 'tensors_raw' in entry:
+            return sum(len(raw) for raw, _, _ in entry['tensors_raw'].values())
+        return 0
 
     def _hot_cache_put(self, block_hash: bytes, entry: Dict) -> None:
         """Add entry to hot cache, evicting LRU entries if capacity exceeded.
 
         Evicted entries are flushed to SSD via the background writer thread.
         """
-        entry_size = self._hot_cache_entry_size(entry['tensors_raw'])
+        entry_size = self._hot_cache_entry_size(entry)
         evicted_entries: list = []
         with self._hot_cache_lock:
             # Remove old entry if updating
             if block_hash in self._hot_cache:
                 old = self._hot_cache.pop(block_hash)
-                self._hot_cache_total_bytes -= self._hot_cache_entry_size(
-                    old['tensors_raw']
-                )
+                self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
 
             # Evict LRU entries until we have room
             while (
@@ -634,9 +724,7 @@ class PagedSSDCacheManager(CacheManager):
                 and self._hot_cache
             ):
                 evicted_hash, evicted = self._hot_cache.popitem(last=False)
-                self._hot_cache_total_bytes -= self._hot_cache_entry_size(
-                    evicted['tensors_raw']
-                )
+                self._hot_cache_total_bytes -= self._hot_cache_entry_size(evicted)
                 self._stats["hot_cache_evictions"] += 1
                 evicted_entries.append((evicted_hash, evicted))
 
@@ -653,11 +741,16 @@ class PagedSSDCacheManager(CacheManager):
         Used when evicting from hot cache or flushing on shutdown.
         Adds block to SSD index before enqueueing write.
         """
+        if self._hot_cache_only:
+            return False
+
         blk_meta = entry.get('block_metadata')
         if blk_meta is None:
             return False
         file_path = blk_meta.file_path
-        tensors_raw = entry['tensors_raw']
+        tensors_raw = entry.get('tensors_raw', {})
+        if not tensors_raw:
+            return False
         metadata = entry['file_metadata']
 
         # Add to SSD index now that block is being written to SSD
@@ -801,6 +894,21 @@ class PagedSSDCacheManager(CacheManager):
 
             block_hash_hex = metadata.get("block_hash", "")
             if not block_hash_hex:
+                return None
+
+            # Reject pre-fix blocks. RotatingKVCache layers in those files
+            # may have been zero-padded to max_size, which the new merge
+            # contract would treat as real attention keys. See #934 / #903
+            # and the _CACHE_FORMAT_VERSION docstring for context.
+            cache_version = metadata.get("omlx_cache_format_version")
+            if cache_version != _CACHE_FORMAT_VERSION:
+                logger.debug(
+                    "Skipping cache block with unsupported format version "
+                    "%r (expected %r): %s",
+                    cache_version,
+                    _CACHE_FORMAT_VERSION,
+                    file_path,
+                )
                 return None
 
             file_stat = file_path.stat()
@@ -1013,14 +1121,22 @@ class PagedSSDCacheManager(CacheManager):
                     cache_list_meta[f"layer_{i}_sub_count"] = str(len(sub_tensors))
                 elif (isinstance(layer_data, tuple) and len(layer_data) == 2
                         and isinstance(layer_data[0], str)
-                        and layer_data[0] == '__turboquant__'):
-                    # TurboQuant: 4 tensors (k_norms, k_packed, v_norms, v_packed)
-                    k_norms, k_packed, v_norms, v_packed = layer_data[1]
-                    arrays[f"layer_{i}_k_norms"] = k_norms
-                    arrays[f"layer_{i}_k_packed"] = k_packed
-                    arrays[f"layer_{i}_v_norms"] = v_norms
-                    arrays[f"layer_{i}_v_packed"] = v_packed
-                    cache_list_meta[f"layer_{i}_turboquant"] = "1"
+                        and layer_data[0] in ('__turboquant__', '__turboquant_v2__')):
+                    # TurboQuant v2: NamedTuple states (ks, vs)
+                    ks, vs = layer_data[1]
+                    # Flatten NamedTuple fields into individual tensors
+                    tq_tensor_idx = 0
+                    for prefix, state in [("k", ks), ("v", vs)]:
+                        for field_name in state._fields:
+                            val = getattr(state, field_name)
+                            if isinstance(val, mx.array):
+                                arrays[f"layer_{i}_tq_{prefix}_{field_name}"] = val
+                                tq_tensor_idx += 1
+                    cache_list_meta[f"layer_{i}_turboquant_v2"] = "1"
+                    cache_list_meta[f"layer_{i}_tq_key_type"] = type(ks).__name__
+                    cache_list_meta[f"layer_{i}_tq_value_type"] = type(vs).__name__
+                    cache_list_meta[f"layer_{i}_tq_key_fields"] = ",".join(ks._fields)
+                    cache_list_meta[f"layer_{i}_tq_value_fields"] = ",".join(vs._fields)
                 else:
                     keys, values = layer_data
                     if _has_zero_dim(keys):
@@ -1040,6 +1156,7 @@ class PagedSSDCacheManager(CacheManager):
 
             # Prepare metadata
             metadata = {
+                "omlx_cache_format_version": _CACHE_FORMAT_VERSION,
                 "block_hash": block_hash.hex(),
                 "token_count": str(token_count),
                 "num_layers": str(len(cache_data)),
@@ -1051,8 +1168,11 @@ class PagedSSDCacheManager(CacheManager):
             if layer_cache_types:
                 metadata["layer_cache_types"] = json.dumps(layer_cache_types)
             if layer_meta_states:
+                clamped_meta_states = _clamp_rotating_meta_states(
+                    cache_data, layer_cache_types, layer_meta_states
+                )
                 metadata["layer_meta_states"] = json.dumps(
-                    [list(m) if m else [] for m in layer_meta_states]
+                    [list(m) if m else [] for m in clamped_meta_states]
                 )
 
             # Merge CacheList sub_count metadata
@@ -1092,8 +1212,13 @@ class PagedSSDCacheManager(CacheManager):
             )
 
             # Store in hot cache (or temporary buffer) for immediate read-back.
-            # Uses raw bytes (not mx tensors) so mx.arrays can be GC'd,
-            # releasing Metal resources sooner.
+            # Uses raw bytes (not mx.array objects) so Metal GPU memory can be
+            # released as soon as the inference thread is done with the arrays.
+            # NOTE: _promote_to_hot_cache() stores mx.array objects directly
+            # because those are freshly loaded from SSD (not active inference),
+            # so they don't tie up Metal allocations from the inference pipeline.
+            # Storing live inference arrays here would accumulate GPU memory
+            # under a large hot cache and cause kernel panics (IOGPUMemory underflow).
             cache_entry = {
                 'tensors_raw': tensors_raw,
                 'file_metadata': metadata,
@@ -1109,6 +1234,10 @@ class PagedSSDCacheManager(CacheManager):
                 self._hot_cache_put(block_hash, cache_entry)
                 self._stats["saves"] += 1
                 return True
+
+            if self._hot_cache_only:
+                # Hot cache disabled but hot_cache_only set: block is not retained.
+                return False
 
             # SSD path: add to index for SSD file tracking
             self._index.add(block_metadata)
@@ -1215,20 +1344,37 @@ class PagedSSDCacheManager(CacheManager):
                         logger.error(f"Missing keys/values for layer {i}")
                         return None
                     cache_data.append((arrays[keys_key], arrays[values_key]))
-            elif (file_metadata and f"layer_{i}_turboquant" in file_metadata) or (
-                cache_type in ('TurboQuantKVCache', 'BatchTurboQuantKVCache')
-                and f"layer_{i}_k_norms" in arrays
-            ):
-                # TurboQuant: 4 tensors
-                kn = arrays.get(f"layer_{i}_k_norms")
-                kp = arrays.get(f"layer_{i}_k_packed")
-                vn = arrays.get(f"layer_{i}_v_norms")
-                vp = arrays.get(f"layer_{i}_v_packed")
-                if kn is None or kp is None or vn is None or vp is None:
-                    logger.error(f"Missing TurboQuant tensors for layer {i}")
+            elif file_metadata and f"layer_{i}_turboquant_v2" in file_metadata:
+                # TurboQuant v2: reconstruct NamedTuple states from flattened tensors
+                from ..turboquant_kv import (
+                    TurboQuantMSEState,
+                    TurboQuantProdState,
+                    TurboQuantPolarState,
+                    TurboQuantPolarProdState,
+                    TurboQuantSplitState,
+                )
+                key_type = file_metadata.get(f"layer_{i}_tq_key_type", "")
+                value_type = file_metadata.get(f"layer_{i}_tq_value_type", "")
+                key_fields = file_metadata.get(f"layer_{i}_tq_key_fields", "").split(",")
+                value_fields = file_metadata.get(f"layer_{i}_tq_value_fields", "").split(",")
+                _type_map = {
+                    "TurboQuantMSEState": TurboQuantMSEState,
+                    "TurboQuantProdState": TurboQuantProdState,
+                    "TurboQuantPolarState": TurboQuantPolarState,
+                    "TurboQuantPolarProdState": TurboQuantPolarProdState,
+                    "TurboQuantSplitState": TurboQuantSplitState,
+                }
+                try:
+                    k_cls = _type_map[key_type]
+                    v_cls = _type_map[value_type]
+                    k_tensors = [arrays[f"layer_{i}_tq_k_{f}"] for f in key_fields]
+                    v_tensors = [arrays[f"layer_{i}_tq_v_{f}"] for f in value_fields]
+                    ks = k_cls(*k_tensors)
+                    vs = v_cls(*v_tensors)
+                    cache_data.append(('__turboquant_v2__', (ks, vs)))
+                except (KeyError, TypeError) as e:
+                    logger.error(f"TurboQuant v2 layer {i}: reconstruction failed: {e}")
                     return None
-                # Return as nested tuple matching TurboQuantKVCache state format
-                cache_data.append(((kn, kp), (vn, vp)))
             else:
                 keys_key = f"layer_{i}_keys"
                 values_key = f"layer_{i}_values"
@@ -1292,7 +1438,10 @@ class PagedSSDCacheManager(CacheManager):
         # Check hot cache first (in-memory, no I/O)
         entry = self._hot_cache_get(block_hash)
         if entry is not None:
-            arrays = self._arrays_from_tensors_raw(entry['tensors_raw'])
+            # Entries from _promote_to_hot_cache() store mx.array objects directly
+            # (safe — they come from SSD loads, not active inference).
+            # Entries from save_block() use tensors_raw (raw bytes).
+            arrays = entry.get('arrays') or self._arrays_from_tensors_raw(entry['tensors_raw'])
             cache_data = self._reconstruct_cache_data(
                 arrays, entry['file_metadata'],
                 entry['num_layers'], entry['layer_cache_types'],
@@ -1328,6 +1477,15 @@ class PagedSSDCacheManager(CacheManager):
             # mx.load() in a worker thread contested Metal GPU resources
             # with the main inference thread.
             arrays, file_metadata = mx.load(str(file_path), return_metadata=True)
+
+            # Defensive: even if the index is stale (e.g. from a previous
+            # run that pre-dates the format version field), reject blocks
+            # without the expected version marker before they can poison
+            # the hot cache or downstream merge logic.
+            if file_metadata and file_metadata.get("omlx_cache_format_version") != _CACHE_FORMAT_VERSION:
+                self._index.remove(block_hash)
+                self._stats["misses"] += 1
+                return None
 
             # Get layer_cache_types for CacheList detection
             layer_cache_types = metadata.layer_cache_types
@@ -1400,7 +1558,7 @@ class PagedSSDCacheManager(CacheManager):
         entry = self._hot_cache_get(block_hash)
         if entry is not None:
             blk_meta = entry['block_metadata']
-            arrays = self._arrays_from_tensors_raw(entry['tensors_raw'])
+            arrays = entry.get('arrays') or self._arrays_from_tensors_raw(entry['tensors_raw'])
             cache_data = self._reconstruct_cache_data(
                 arrays, entry['file_metadata'],
                 entry['num_layers'], entry['layer_cache_types'],
@@ -1444,6 +1602,12 @@ class PagedSSDCacheManager(CacheManager):
             # Load directly on the inference thread (Metal-safe).
             # See load_block() for rationale on removing the executor.
             arrays, file_metadata = mx.load(str(file_path), return_metadata=True)
+
+            # Defensive version check, mirrors load_block().
+            if file_metadata and file_metadata.get("omlx_cache_format_version") != _CACHE_FORMAT_VERSION:
+                self._index.remove(block_hash)
+                self._stats["misses"] += 1
+                return None, None
 
             # Parse layer_cache_types early for CacheList detection
             layer_cache_types = block_metadata.layer_cache_types
@@ -1575,6 +1739,9 @@ class PagedSSDCacheManager(CacheManager):
 
         Uses a 30-second TTL cache for shutil.disk_usage() results.
         """
+        if self._cache_dir is None:
+            return self._max_size
+
         now = time.monotonic()
         if (
             self._disk_usage_cache is None
@@ -1711,6 +1878,64 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
             )
 
+    def get_stats_for_model(self, model_name: str) -> PagedSSDCacheStats:
+        """Get model-scoped SSD cache statistics.
+
+        The SSD cache directory can be shared across multiple loaded models, so
+        dashboard per-model rows must be filtered by block metadata rather than
+        reusing the global cache totals.
+        """
+        normalized_name = model_name.rstrip("/")
+        basename = os.path.basename(normalized_name) if normalized_name else ""
+
+        def _matches(candidate: str) -> bool:
+            candidate = candidate.rstrip("/")
+            if not candidate:
+                return False
+            if candidate == normalized_name:
+                return True
+            if basename and os.path.basename(candidate) == basename:
+                return True
+            return False
+
+        with self._lock:
+            indexed_entries = [
+                metadata
+                for metadata in self._index.get_all_metadata()
+                if _matches(metadata.model_name)
+            ]
+            indexed_size = sum(metadata.file_size for metadata in indexed_entries)
+            indexed_count = len(indexed_entries)
+
+            with self._hot_cache_lock:
+                hot_entries = []
+                hot_size = 0
+                for entry in self._hot_cache.values():
+                    blk_meta = entry.get("block_metadata")
+                    if blk_meta is None or not _matches(blk_meta.model_name):
+                        continue
+                    hot_entries.append(entry)
+                    hot_size += self._hot_cache_entry_size(entry["tensors_raw"])
+
+            return PagedSSDCacheStats(
+                hits=self._stats["hits"],
+                misses=self._stats["misses"],
+                evictions=self._stats["evictions"],
+                saves=self._stats["saves"],
+                loads=self._stats["loads"],
+                errors=self._stats["errors"],
+                total_size_bytes=indexed_size,
+                max_size_bytes=self._get_effective_max_size(),
+                configured_max_size_bytes=self._max_size,
+                num_files=indexed_count,
+                hot_cache_entries=len(hot_entries),
+                hot_cache_size_bytes=hot_size,
+                hot_cache_max_bytes=self._hot_cache_max_bytes,
+                hot_cache_hits=self._stats["hot_cache_hits"],
+                hot_cache_evictions=self._stats["hot_cache_evictions"],
+                hot_cache_promotions=self._stats["hot_cache_promotions"],
+            )
+
     def get_stats_dict(self) -> Dict[str, Any]:
         """
         Get SSD cache statistics as a dictionary.
@@ -1726,7 +1951,7 @@ class PagedSSDCacheManager(CacheManager):
                 hot_size = self._hot_cache_total_bytes
             effective_max = self._get_effective_max_size()
             return {
-                "cache_dir": str(self._cache_dir),
+                "cache_dir": str(self._cache_dir) if self._cache_dir else "None",
                 "max_size": effective_max,
                 "max_size_formatted": format_bytes(effective_max),
                 "configured_max_size": self._max_size,
@@ -1769,21 +1994,22 @@ class PagedSSDCacheManager(CacheManager):
                 )
 
         # Signal writer thread to stop (after processing remaining queue)
-        self._writer_shutdown.set()
+        if self._writer_thread:
+            self._writer_shutdown.set()
 
-        # Send sentinel to unblock the writer if it's waiting on the queue
-        try:
-            self._write_queue.put_nowait(None)
-        except queue.Full:
-            pass  # Writer will check shutdown flag on next iteration
+            # Send sentinel to unblock the writer if it's waiting on the queue
+            try:
+                self._write_queue.put_nowait(None)
+            except queue.Full:
+                pass  # Writer will check shutdown flag on next iteration
 
-        # Wait for writer to finish — longer timeout to allow flush
-        timeout = 120 if self._hot_cache_enabled else 60
-        self._writer_thread.join(timeout=timeout)
-        if self._writer_thread.is_alive():
-            logger.warning(
-                f"SSD cache writer thread did not stop within {timeout}s"
-            )
+            # Wait for writer to finish — longer timeout to allow flush
+            timeout = 120 if self._hot_cache_enabled else 60
+            self._writer_thread.join(timeout=timeout)
+            if self._writer_thread.is_alive():
+                logger.warning(
+                    f"SSD cache writer thread did not stop within {timeout}s"
+                )
 
         # Clear hot cache
         with self._hot_cache_lock:
@@ -1893,5 +2119,4 @@ class PagedSSDCacheManager(CacheManager):
             Configured maximum cache size in bytes.
         """
         return self._max_size
-
 

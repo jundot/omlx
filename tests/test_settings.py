@@ -20,6 +20,7 @@ from omlx.settings import (
     MCPSettings,
     MemorySettings,
     ModelSettings,
+    NetworkSettings,
     SamplingSettings,
     SchedulerSettings,
     ServerSettings,
@@ -65,6 +66,7 @@ class TestServerSettings:
             "port": 8000,
             "log_level": "info",
             "cors_origins": ["*"],
+            "server_aliases": [],
         }
 
     def test_from_dict(self):
@@ -249,35 +251,36 @@ class TestSchedulerSettings:
     def test_defaults(self):
         """Test default values."""
         settings = SchedulerSettings()
-        assert settings.max_num_seqs == 8
-        assert settings.completion_batch_size == 8
+        assert settings.max_concurrent_requests == 8
 
     def test_custom_values(self):
         """Test custom values."""
-        settings = SchedulerSettings(
-            max_num_seqs=128, completion_batch_size=16
-        )
-        assert settings.max_num_seqs == 128
-        assert settings.completion_batch_size == 16
+        settings = SchedulerSettings(max_concurrent_requests=128)
+        assert settings.max_concurrent_requests == 128
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
         settings = SchedulerSettings()
         result = settings.to_dict()
         assert result == {
-            "max_num_seqs": 8,
-            "completion_batch_size": 8,
+            "max_concurrent_requests": 8,
         }
 
     def test_from_dict(self):
         """Test creation from dictionary."""
-        data = {
-            "max_num_seqs": 512,
-            "completion_batch_size": 64,
-        }
+        data = {"max_concurrent_requests": 512}
         settings = SchedulerSettings.from_dict(data)
-        assert settings.max_num_seqs == 512
-        assert settings.completion_batch_size == 64
+        assert settings.max_concurrent_requests == 512
+
+    def test_from_dict_backwards_compat(self):
+        """Test creation from dictionary with old keys."""
+        data = {"max_num_seqs": 64}
+        settings = SchedulerSettings.from_dict(data)
+        assert settings.max_concurrent_requests == 64
+
+        data = {"completion_batch_size": 32}
+        settings = SchedulerSettings.from_dict(data)
+        assert settings.max_concurrent_requests == 32
 
 
 class TestCacheSettings:
@@ -325,6 +328,7 @@ class TestCacheSettings:
         result = settings.to_dict()
         assert result == {
             "enabled": False,
+            "hot_cache_only": False,
             "ssd_cache_dir": "/cache",
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",
@@ -493,6 +497,61 @@ class TestHuggingFaceSettings:
         assert settings.endpoint == ""
 
 
+class TestNetworkSettings:
+    """Tests for NetworkSettings dataclass."""
+
+    def test_defaults(self):
+        """Test default values."""
+        settings = NetworkSettings()
+        assert settings.http_proxy == ""
+        assert settings.https_proxy == ""
+        assert settings.no_proxy == ""
+        assert settings.ca_bundle == ""
+
+    def test_custom_values(self):
+        """Test custom values."""
+        settings = NetworkSettings(
+            http_proxy="http://proxy:8080",
+            https_proxy="http://proxy:8080",
+            no_proxy="localhost,127.0.0.1",
+            ca_bundle="/tmp/corp-ca.pem",
+        )
+        assert settings.http_proxy == "http://proxy:8080"
+        assert settings.https_proxy == "http://proxy:8080"
+        assert settings.no_proxy == "localhost,127.0.0.1"
+        assert settings.ca_bundle == "/tmp/corp-ca.pem"
+
+    def test_to_dict(self):
+        """Test conversion to dictionary."""
+        settings = NetworkSettings(
+            http_proxy="http://proxy:8080",
+            https_proxy="http://proxy:8080",
+            no_proxy="localhost",
+            ca_bundle="/tmp/ca.pem",
+        )
+        result = settings.to_dict()
+        assert result == {
+            "http_proxy": "http://proxy:8080",
+            "https_proxy": "http://proxy:8080",
+            "no_proxy": "localhost",
+            "ca_bundle": "/tmp/ca.pem",
+        }
+
+    def test_from_dict(self):
+        """Test creation from dictionary."""
+        data = {
+            "http_proxy": "http://proxy:8080",
+            "https_proxy": "http://proxy:8080",
+            "no_proxy": "localhost",
+            "ca_bundle": "/tmp/ca.pem",
+        }
+        settings = NetworkSettings.from_dict(data)
+        assert settings.http_proxy == "http://proxy:8080"
+        assert settings.https_proxy == "http://proxy:8080"
+        assert settings.no_proxy == "localhost"
+        assert settings.ca_bundle == "/tmp/ca.pem"
+
+
 class TestLoggingSettings:
     """Tests for LoggingSettings dataclass."""
 
@@ -643,7 +702,7 @@ class TestGlobalSettings:
             assert settings.server.host == "127.0.0.1"
             assert settings.server.port == 8000
             assert settings.model.max_model_memory == "auto"
-            assert settings.scheduler.max_num_seqs == 8
+            assert settings.scheduler.max_concurrent_requests == 8
             assert settings.cache.enabled is True
             assert settings.auth.api_key is None
             assert settings.mcp.config_path is None
@@ -678,8 +737,7 @@ class TestGlobalSettings:
                         "server": {"host": "0.0.0.0", "port": 9000, "log_level": "debug"},
                         "model": {"model_dir": "/models", "max_model_memory": "64GB"},
                         "scheduler": {
-                            "max_num_seqs": 128,
-                            "completion_batch_size": 16,
+                            "max_concurrent_requests": 128,
                         },
                         "cache": {
                             "enabled": False,
@@ -699,7 +757,7 @@ class TestGlobalSettings:
             assert settings.model.model_dirs == ["/models"]  # Migrated from model_dir
             assert settings.model.model_dir == "/models"  # Backward compat field
             assert settings.model.max_model_memory == "64GB"
-            assert settings.scheduler.max_num_seqs == 128
+            assert settings.scheduler.max_concurrent_requests == 128
             assert settings.cache.enabled is False
             assert settings.cache.ssd_cache_dir == "/cache"
             assert settings.auth.api_key == "secret"
@@ -897,14 +955,9 @@ class TestGlobalSettings:
     def test_validate_invalid_scheduler_values(self):
         """Test validation catches invalid scheduler values."""
         settings = GlobalSettings()
-        settings.scheduler.max_num_seqs = 0
+        settings.scheduler.max_concurrent_requests = 0
         errors = settings.validate()
-        assert any("max_num_seqs" in e.lower() for e in errors)
-
-        settings = GlobalSettings()
-        settings.scheduler.completion_batch_size = 0
-        errors = settings.validate()
-        assert any("completion_batch_size" in e.lower() for e in errors)
+        assert any("max_concurrent_requests" in e.lower() for e in errors)
 
     def test_validate_invalid_cache_size(self):
         """Test validation catches invalid cache size."""
@@ -929,7 +982,7 @@ class TestGlobalSettings:
         """Test validation returns multiple errors."""
         settings = GlobalSettings()
         settings.server.port = 0
-        settings.scheduler.max_num_seqs = -1
+        settings.scheduler.max_concurrent_requests = -1
         settings.model.max_model_memory = "invalid"
         errors = settings.validate()
         assert len(errors) >= 3
@@ -992,15 +1045,22 @@ class TestGlobalSettings:
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict(
                 os.environ,
-                {
-                    "OMLX_MAX_NUM_SEQS": "512",
-                    "OMLX_COMPLETION_BATCH_SIZE": "64",
-                },
+                {"OMLX_MAX_CONCURRENT_REQUESTS": "512"},
                 clear=False,
             ):
                 settings = GlobalSettings.load(base_path=tmpdir)
-                assert settings.scheduler.max_num_seqs == 512
-                assert settings.scheduler.completion_batch_size == 64
+                assert settings.scheduler.max_concurrent_requests == 512
+
+    def test_env_override_scheduler_legacy_fallback(self):
+        """Test legacy OMLX_MAX_NUM_SEQS env var is accepted as fallback."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {"OMLX_MAX_NUM_SEQS": "256"},
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.scheduler.max_concurrent_requests == 256
 
     def test_env_override_cache(self):
         """Test environment variable override for cache settings."""
@@ -1074,6 +1134,25 @@ class TestGlobalSettings:
                 settings = GlobalSettings.load(base_path=tmpdir)
                 assert settings.huggingface.endpoint == "https://hf-mirror.com"
 
+    def test_env_override_network(self):
+        """Test environment variable override for network proxy settings."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {
+                    "OMLX_HTTP_PROXY": "http://proxy.company.com:8080",
+                    "OMLX_HTTPS_PROXY": "http://proxy.company.com:8443",
+                    "OMLX_NO_PROXY": "localhost,127.0.0.1",
+                    "OMLX_CA_BUNDLE": "/tmp/corp-ca.pem",
+                },
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.network.http_proxy == "http://proxy.company.com:8080"
+                assert settings.network.https_proxy == "http://proxy.company.com:8443"
+                assert settings.network.no_proxy == "localhost,127.0.0.1"
+                assert settings.network.ca_bundle == "/tmp/corp-ca.pem"
+
     def test_env_override_invalid_port_logs_warning(self):
         """Test invalid OMLX_PORT logs warning and keeps default."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1127,13 +1206,9 @@ class TestGlobalSettings:
     def test_cli_override_scheduler(self):
         """Test CLI override for scheduler settings."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            args = Namespace(
-                max_num_seqs=64,
-                completion_batch_size=8,
-            )
+            args = Namespace(max_concurrent_requests=64)
             settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
-            assert settings.scheduler.max_num_seqs == 64
-            assert settings.scheduler.completion_batch_size == 8
+            assert settings.scheduler.max_concurrent_requests == 64
 
     def test_cli_override_cache(self):
         """Test CLI override for cache settings."""
@@ -1161,6 +1236,44 @@ class TestGlobalSettings:
             args = Namespace(mcp_config="/cli/mcp.json")
             settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
             assert settings.mcp.config_path == "/cli/mcp.json"
+
+    def test_cli_override_network(self):
+        """Test CLI override for network proxy settings."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = Namespace(
+                http_proxy="http://proxy.company.com:8080",
+                https_proxy="http://proxy.company.com:8443",
+                no_proxy="localhost,127.0.0.1",
+                ca_bundle="/tmp/corp-ca.pem",
+            )
+            settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
+            assert settings.network.http_proxy == "http://proxy.company.com:8080"
+            assert settings.network.https_proxy == "http://proxy.company.com:8443"
+            assert settings.network.no_proxy == "localhost,127.0.0.1"
+            assert settings.network.ca_bundle == "/tmp/corp-ca.pem"
+
+    def test_validate_invalid_http_proxy(self):
+        """Test invalid http_proxy fails validation."""
+        settings = GlobalSettings()
+        settings.network.http_proxy = "proxy.company.com:8080"
+        errors = settings.validate()
+        assert any("http_proxy" in e.lower() for e in errors)
+
+    def test_validate_invalid_https_proxy(self):
+        """Test invalid https_proxy fails validation."""
+        settings = GlobalSettings()
+        settings.network.https_proxy = "proxy.company.com:8443"
+        errors = settings.validate()
+        assert any("https_proxy" in e.lower() for e in errors)
+
+    def test_validate_valid_network_proxy(self):
+        """Test valid network proxy values pass validation."""
+        settings = GlobalSettings()
+        settings.network.http_proxy = "http://proxy.company.com:8080"
+        settings.network.https_proxy = "http://proxy.company.com:8443"
+        errors = settings.validate()
+        assert not any("http_proxy" in e.lower() for e in errors)
+        assert not any("https_proxy" in e.lower() for e in errors)
 
     def test_priority_cli_over_env_over_file(self):
         """Test that CLI > env > file > defaults priority is respected."""
@@ -1203,12 +1316,11 @@ class TestGlobalSettings:
     def test_to_scheduler_config(self):
         """Test conversion to SchedulerConfig."""
         settings = GlobalSettings()
-        settings.scheduler.max_num_seqs = 128
-        settings.scheduler.completion_batch_size = 16
+        settings.scheduler.max_concurrent_requests = 128
 
         scheduler_config = settings.to_scheduler_config()
         assert scheduler_config.max_num_seqs == 128
-        assert scheduler_config.completion_batch_size == 16
+        assert scheduler_config.completion_batch_size == 128
         assert scheduler_config.initial_cache_blocks == 256  # default
 
     def test_to_scheduler_config_initial_cache_blocks(self):

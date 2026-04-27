@@ -73,6 +73,10 @@ class MockBaseEngine:
     def model_type(self) -> Optional[str]:
         return self._model_type
 
+    @property
+    def prefix_cache_enabled(self) -> bool:
+        return False
+
     def set_stream_outputs(self, outputs: List[MockGenerationOutput]):
         """Set custom streaming outputs for testing."""
         self._stream_outputs = outputs

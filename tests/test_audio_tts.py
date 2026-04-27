@@ -8,6 +8,7 @@ All unit tests run with mocked TTSEngine and EnginePool — mlx-audio is not
 required. Integration tests (marked @pytest.mark.slow) need a real model.
 """
 
+import base64
 import io
 import wave
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -56,6 +57,7 @@ def _make_mock_pool(tts_engine=None, model_id: str = "qwen3-tts") -> MagicMock:
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
+    pool.resolve_model_id = MagicMock(side_effect=lambda m, _: m)
     return pool
 
 
@@ -239,6 +241,538 @@ class TestTTSEndpointErrors:
             json={"input": "No model specified"},
         )
         assert response.status_code >= 400
+
+
+# ---------------------------------------------------------------------------
+# TestTTSModelAliasResolution
+# ---------------------------------------------------------------------------
+
+
+class TestTTSModelAliasResolution:
+    """Verify that audio endpoints resolve model aliases (#489)."""
+
+    def test_speech_resolves_alias(self):
+        """POST /v1/audio/speech with alias resolves to real model ID."""
+        from omlx.server import app
+
+        _ensure_audio_routes(app)
+
+        mock_pool = _make_mock_pool(model_id="Qwen3-TTS-12Hz-1.7B-Base-bf16")
+        # Configure alias resolution on the pool
+        mock_pool.resolve_model_id = MagicMock(
+            return_value="Qwen3-TTS-12Hz-1.7B-Base-bf16"
+        )
+
+        mock_settings_manager = MagicMock()
+
+        with patch("omlx.server._server_state") as mock_state:
+            mock_state.engine_pool = mock_pool
+            mock_state.global_settings = None
+            mock_state.process_memory_enforcer = None
+            mock_state.hf_downloader = None
+            mock_state.ms_downloader = None
+            mock_state.mcp_manager = None
+            mock_state.api_key = None
+            mock_state.settings_manager = mock_settings_manager
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/v1/audio/speech",
+                    json={"model": "qwen3-tts", "input": "Hello"},
+                )
+                assert response.status_code == 200
+                # Verify pool.get_engine was called with the resolved ID
+                mock_pool.get_engine.assert_awaited_once_with(
+                    "Qwen3-TTS-12Hz-1.7B-Base-bf16"
+                )
+
+    def test_speech_direct_model_id(self):
+        """POST /v1/audio/speech with direct model ID works without alias."""
+        from omlx.server import app
+
+        _ensure_audio_routes(app)
+
+        mock_pool = _make_mock_pool(model_id="Qwen3-TTS-12Hz-1.7B-Base-bf16")
+        mock_pool.resolve_model_id = MagicMock(
+            return_value="Qwen3-TTS-12Hz-1.7B-Base-bf16"
+        )
+
+        with patch("omlx.server._server_state") as mock_state:
+            mock_state.engine_pool = mock_pool
+            mock_state.global_settings = None
+            mock_state.process_memory_enforcer = None
+            mock_state.hf_downloader = None
+            mock_state.ms_downloader = None
+            mock_state.mcp_manager = None
+            mock_state.api_key = None
+            mock_state.settings_manager = MagicMock()
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/v1/audio/speech",
+                    json={
+                        "model": "Qwen3-TTS-12Hz-1.7B-Base-bf16",
+                        "input": "Hello",
+                    },
+                )
+                assert response.status_code == 200
+                mock_pool.get_engine.assert_awaited_once_with(
+                    "Qwen3-TTS-12Hz-1.7B-Base-bf16"
+                )
+
+
+# ---------------------------------------------------------------------------
+# TestTTSVoiceRouting — unit tests for voice/instruct parameter dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestTTSVoiceRouting:
+    """Verify that the voice value is routed to the correct generate() kwarg."""
+
+    @pytest.fixture
+    def _run_synthesize(self):
+        """Helper: run TTSEngine.synthesize and return the kwargs passed to generate().
+
+        Uses a plain FakeModel (not MagicMock) so that hasattr() checks for
+        generate_voice_design work correctly — MagicMock auto-creates attributes.
+        """
+        import asyncio
+        from omlx.engine.tts import TTSEngine
+
+        def _run(generate_sig_params, voice_value=None, instructions_value=None,
+                 **synth_kwargs):
+            engine = TTSEngine("test-model")
+
+            import inspect
+            sig_params = {
+                "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                "verbose": inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
+            }
+            for p in generate_sig_params:
+                sig_params[p] = inspect.Parameter(p, inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None)
+
+            generate_mock = MagicMock()
+            generate_mock.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
+            generate_mock.return_value = []  # no audio chunks
+
+            # Plain object — hasattr only returns True for explicitly set attrs
+            class FakeModel:
+                pass
+
+            fake_model = FakeModel()
+            fake_model.generate = generate_mock
+
+            engine._model = fake_model
+
+            try:
+                asyncio.run(engine.synthesize(
+                    "Hello", voice=voice_value, instructions=instructions_value,
+                    **synth_kwargs,
+                ))
+            except RuntimeError:
+                pass  # "no audio output" is expected with empty generate
+
+            return fake_model.generate.call_args
+
+        return _run
+
+    def test_customvoice_routes_to_voice(self, _run_synthesize):
+        """Model with both params: voice goes to voice only, not instruct."""
+        call = _run_synthesize(["voice", "instruct"], voice_value="Vivian")
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("voice") == "Vivian"
+        assert "instruct" not in kwargs
+
+    def test_voicedesign_routes_to_instruct(self, _run_synthesize):
+        """Model with only 'instruct' param: value goes to instruct."""
+        call = _run_synthesize(["instruct"], voice_value="female, calm, slow")
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("instruct") == "female, calm, slow"
+        assert "voice" not in kwargs
+
+    def test_voice_only_model(self, _run_synthesize):
+        """Model with only 'voice' param (e.g. Kokoro): value goes to voice."""
+        call = _run_synthesize(["voice"], voice_value="af_heart")
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("voice") == "af_heart"
+
+    def test_voice_none_skips_routing(self, _run_synthesize):
+        """voice=None should not add voice or instruct kwargs."""
+        call = _run_synthesize(["voice", "instruct"], voice_value=None)
+        kwargs = call.kwargs if call else {}
+        assert "voice" not in kwargs
+        assert "instruct" not in kwargs
+
+    def test_instructions_routes_to_instruct(self, _run_synthesize):
+        """instructions value should be routed to the instruct kwarg."""
+        call = _run_synthesize(
+            ["voice", "instruct"],
+            instructions_value="female, calm, slow",
+        )
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("instruct") == "female, calm, slow"
+        assert "voice" not in kwargs
+
+    def test_voice_and_instructions_both_passed(self, _run_synthesize):
+        """CustomVoice: voice→voice kwarg, instructions→instruct kwarg."""
+        call = _run_synthesize(
+            ["voice", "instruct"],
+            voice_value="Vivian",
+            instructions_value="female, calm, slow",
+        )
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("voice") == "Vivian"
+        assert kwargs.get("instruct") == "female, calm, slow"
+
+
+# ---------------------------------------------------------------------------
+# TestTTSVoiceClonePassthrough — unit tests for ref_audio/ref_text passthrough
+# ---------------------------------------------------------------------------
+
+
+class TestTTSVoiceClonePassthrough:
+    """Verify ref_audio and ref_text are forwarded to model.generate()."""
+
+    @pytest.fixture
+    def _run_synthesize_clone(self):
+        """Helper: run TTSEngine.synthesize with ref_audio/ref_text and return generate() kwargs."""
+        import asyncio
+        from omlx.engine.tts import TTSEngine
+
+        def _run(ref_audio_path=None, ref_text=None):
+            engine = TTSEngine("test-model")
+
+            import inspect
+            sig_params = {
+                "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                "verbose": inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
+                "voice": inspect.Parameter("voice", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
+                "ref_audio": inspect.Parameter("ref_audio", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
+                "ref_text": inspect.Parameter("ref_text", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
+            }
+
+            generate_mock = MagicMock()
+            generate_mock.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
+            generate_mock.return_value = []
+
+            class FakeModel:
+                pass
+
+            fake_model = FakeModel()
+            fake_model.generate = generate_mock
+
+            engine._model = fake_model
+
+            try:
+                asyncio.run(engine.synthesize(
+                    "Hello", ref_audio=ref_audio_path, ref_text=ref_text,
+                ))
+            except RuntimeError:
+                pass  # "no audio output" expected
+
+            return fake_model.generate.call_args
+
+        return _run
+
+    def test_ref_audio_passed_to_generate(self, _run_synthesize_clone):
+        """ref_audio path is forwarded to model.generate()."""
+        call = _run_synthesize_clone(ref_audio_path="/tmp/ref.wav", ref_text="hello")
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("ref_audio") == "/tmp/ref.wav"
+        assert kwargs.get("ref_text") == "hello"
+
+    def test_ref_audio_none_not_passed(self, _run_synthesize_clone):
+        """When ref_audio is None, neither ref_audio nor ref_text appear in kwargs."""
+        call = _run_synthesize_clone(ref_audio_path=None, ref_text=None)
+        kwargs = call.kwargs if call else {}
+        assert "ref_audio" not in kwargs
+        assert "ref_text" not in kwargs
+
+    def test_ref_audio_without_ref_text(self, _run_synthesize_clone):
+        """ref_audio without ref_text passes ref_audio and ref_text=None."""
+        call = _run_synthesize_clone(ref_audio_path="/tmp/ref.wav", ref_text=None)
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("ref_audio") == "/tmp/ref.wav"
+        assert kwargs.get("ref_text") is None
+
+
+# ---------------------------------------------------------------------------
+# TestTTSVoiceCloneEndpoint — base64 ref_audio handling in the route layer
+# ---------------------------------------------------------------------------
+
+
+class TestTTSVoiceCloneEndpoint:
+    """POST /v1/audio/speech with ref_audio base64."""
+
+    @pytest.fixture
+    def clone_client(self):
+        """TestClient with mocked TTS pool for voice clone tests."""
+        from omlx.server import app
+
+        _ensure_audio_routes(app)
+        mock_pool = _make_mock_pool()
+
+        with patch("omlx.server._server_state") as mock_state:
+            mock_state.engine_pool = mock_pool
+            mock_state.global_settings = None
+            mock_state.process_memory_enforcer = None
+            mock_state.hf_downloader = None
+            mock_state.ms_downloader = None
+            mock_state.mcp_manager = None
+            mock_state.api_key = None
+            mock_state.settings_manager = MagicMock()
+            with TestClient(app, raise_server_exceptions=False) as client:
+                yield client, mock_pool
+
+    def test_ref_audio_base64_accepted(self, clone_client):
+        """Valid base64 ref_audio returns 200."""
+        client, _ = clone_client
+        wav_b64 = base64.b64encode(_make_wav_bytes(0.5)).decode()
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Clone this voice",
+                "ref_audio": wav_b64,
+                "ref_text": "Reference text",
+            },
+        )
+        assert response.status_code == 200
+
+    def test_ref_audio_forwarded_to_synthesize(self, clone_client):
+        """ref_audio is decoded and passed as a file path to engine.synthesize()."""
+        client, mock_pool = clone_client
+        wav_b64 = base64.b64encode(_make_wav_bytes(0.5)).decode()
+        client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Clone test",
+                "ref_audio": wav_b64,
+                "ref_text": "Hello",
+            },
+        )
+        synthesize: AsyncMock = mock_pool.get_engine.return_value.synthesize
+        assert synthesize.called
+        call_kwargs = synthesize.call_args.kwargs
+        assert call_kwargs.get("ref_text") == "Hello"
+        # ref_audio should be a temp file path string
+        ref_path = call_kwargs.get("ref_audio")
+        assert ref_path is not None
+        assert isinstance(ref_path, str)
+
+    def test_invalid_base64_returns_400(self, clone_client):
+        """Malformed base64 in ref_audio returns 400."""
+        client, _ = clone_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Bad audio",
+                "ref_audio": "not-valid-base64!!!",
+                "ref_text": "Hello",
+            },
+        )
+        assert response.status_code == 400
+        body = response.json()
+        # The server wraps errors as {"error": {"message": ...}} or {"detail": ...}
+        message = (
+            body.get("detail")
+            or body.get("error", {}).get("message", "")
+        )
+        assert "base64" in message.lower()
+
+    def test_oversized_ref_audio_returns_413(self, clone_client):
+        """ref_audio exceeding size limit returns 413."""
+        client, _ = clone_client
+        from omlx.api.audio_routes import MAX_REF_AUDIO_BASE64_BYTES
+        # Create a base64 string just over the limit
+        huge_b64 = base64.b64encode(b"\x00" * (MAX_REF_AUDIO_BASE64_BYTES)).decode()
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Too big",
+                "ref_audio": huge_b64,
+                "ref_text": "some text",
+            },
+        )
+        assert response.status_code == 413
+
+    def test_temp_file_cleaned_up(self, clone_client):
+        """Temp file is deleted after synthesis completes."""
+        client, mock_pool = clone_client
+        wav_b64 = base64.b64encode(_make_wav_bytes(0.5)).decode()
+        client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Cleanup test",
+                "ref_audio": wav_b64,
+            },
+        )
+        synthesize = mock_pool.get_engine.return_value.synthesize
+        if synthesize.called:
+            ref_path = synthesize.call_args.kwargs.get("ref_audio")
+            if ref_path:
+                import os
+                assert not os.path.exists(ref_path), "Temp file should be deleted"
+
+    def test_ref_audio_without_ref_text_returns_400(self, clone_client):
+        """ref_audio without ref_text returns 400."""
+        client, _ = clone_client
+        wav_b64 = base64.b64encode(_make_wav_bytes(0.5)).decode()
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Missing ref_text",
+                "ref_audio": wav_b64,
+            },
+        )
+        assert response.status_code == 400
+        detail = response.json().get("detail") or response.json().get("error", {}).get("message", "")
+        assert "ref_text" in detail.lower()
+
+    def test_no_ref_audio_unchanged_behavior(self, clone_client):
+        """Normal TTS (no ref_audio) still works as before."""
+        client, mock_pool = clone_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Normal TTS"},
+        )
+        assert response.status_code == 200
+        synthesize = mock_pool.get_engine.return_value.synthesize
+        if synthesize.called:
+            call_kwargs = synthesize.call_args.kwargs
+            assert call_kwargs.get("ref_audio") is None
+
+
+# ---------------------------------------------------------------------------
+# TestTTSGenerationParams — generation param passthrough to standard path
+# ---------------------------------------------------------------------------
+
+
+class TestTTSGenerationParams:
+    """Verify generation params are forwarded to model.generate()."""
+
+    def test_temperature_forwarded(self, _run_synthesize):
+        """temperature is passed to generate()."""
+        call = _run_synthesize(["voice"], temperature=0.9)
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("temperature") == 0.9
+
+    def test_top_k_forwarded(self, _run_synthesize):
+        """top_k is passed to generate()."""
+        call = _run_synthesize(["voice"], top_k=50)
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("top_k") == 50
+
+    def test_top_p_forwarded(self, _run_synthesize):
+        """top_p is passed to generate()."""
+        call = _run_synthesize(["voice"], top_p=0.95)
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("top_p") == 0.95
+
+    def test_repetition_penalty_forwarded(self, _run_synthesize):
+        """repetition_penalty is passed to generate()."""
+        call = _run_synthesize(["voice"], repetition_penalty=1.05)
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("repetition_penalty") == 1.05
+
+    def test_max_tokens_forwarded(self, _run_synthesize):
+        """max_tokens is passed to generate()."""
+        call = _run_synthesize(["voice"], max_tokens=2048)
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("max_tokens") == 2048
+
+    def test_none_params_not_forwarded(self, _run_synthesize):
+        """None generation params are not included in kwargs."""
+        call = _run_synthesize(["voice"])
+        kwargs = call.kwargs if call else {}
+        for key in ("temperature", "top_k", "top_p", "repetition_penalty", "max_tokens"):
+            assert key not in kwargs
+
+    @pytest.fixture
+    def _run_synthesize(self):
+        """Reuse voice routing fixture pattern for gen param tests."""
+        import asyncio
+        from omlx.engine.tts import TTSEngine
+
+        def _run(generate_sig_params, **synth_kwargs):
+            engine = TTSEngine("test-model")
+
+            import inspect
+            sig_params = {
+                "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                "verbose": inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
+            }
+            for p in generate_sig_params:
+                sig_params[p] = inspect.Parameter(p, inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None)
+
+            generate_mock = MagicMock()
+            generate_mock.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
+            generate_mock.return_value = []
+
+            class FakeModel:
+                pass
+
+            fake_model = FakeModel()
+            fake_model.generate = generate_mock
+            engine._model = fake_model
+
+            try:
+                asyncio.run(engine.synthesize("Hello", **synth_kwargs))
+            except RuntimeError:
+                pass
+
+            return fake_model.generate.call_args
+
+        return _run
+
+
+# ---------------------------------------------------------------------------
+# TestTTSGenParamsEndpoint — generation params accepted via API
+# ---------------------------------------------------------------------------
+
+
+class TestTTSGenParamsEndpoint:
+    """Verify generation params are accepted and forwarded by the endpoint."""
+
+    def test_gen_params_forwarded_to_synthesize(self, server_tts_client):
+        """Generation params from request body reach engine.synthesize()."""
+        client, mock_pool = server_tts_client
+        client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Hello",
+                "temperature": 0.8,
+                "top_k": 30,
+                "top_p": 0.95,
+                "repetition_penalty": 1.1,
+                "max_tokens": 1024,
+            },
+        )
+        synthesize: AsyncMock = mock_pool.get_engine.return_value.synthesize
+        assert synthesize.called
+        call_kwargs = synthesize.call_args.kwargs
+        assert call_kwargs.get("temperature") == 0.8
+        assert call_kwargs.get("top_k") == 30
+        assert call_kwargs.get("top_p") == 0.95
+        assert call_kwargs.get("repetition_penalty") == 1.1
+        assert call_kwargs.get("max_tokens") == 1024
+
+    def test_gen_params_default_none(self, server_tts_client):
+        """Without gen params in request, they're passed as None."""
+        client, mock_pool = server_tts_client
+        client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hello"},
+        )
+        synthesize: AsyncMock = mock_pool.get_engine.return_value.synthesize
+        assert synthesize.called
+        call_kwargs = synthesize.call_args.kwargs
+        assert call_kwargs.get("temperature") is None
+        assert call_kwargs.get("top_k") is None
 
 
 # ---------------------------------------------------------------------------

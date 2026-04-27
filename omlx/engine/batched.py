@@ -40,7 +40,7 @@ class BatchedEngine(BaseEngine):
     def __init__(
         self,
         model_name: str,
-        trust_remote_code: bool = True,
+        trust_remote_code: bool = False,
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
@@ -106,6 +106,26 @@ class BatchedEngine(BaseEngine):
         return None
 
     @property
+    def message_extractor(self):
+        """Return the model-specific message extractor function, or ``None``.
+
+        ``None`` means the server should use its default extractor
+        (``extract_text_content`` or ``extract_multimodal_content``).
+        """
+        try:
+            from ..adapter.output_parser import detect_message_extractor
+            model_config = None
+            if self._model is not None and hasattr(self._model, "config"):
+                cfg = self._model.config
+                if hasattr(cfg, "model_type"):
+                    model_config = {"model_type": cfg.model_type}
+                elif isinstance(cfg, dict):
+                    model_config = cfg
+            return detect_message_extractor(self._model_name, model_config)
+        except Exception:
+            return None
+
+    @property
     def grammar_compiler(self):
         """Lazily create and return a GrammarCompiler for this model.
 
@@ -121,9 +141,37 @@ class BatchedEngine(BaseEngine):
 
             self._grammar_compiler = create_grammar_compiler(self._tokenizer, self._model)
             logger.info("GrammarCompiler initialized for %s", self._model_name)
-        except Exception as e:
-            logger.warning("Failed to initialize GrammarCompiler: %s", e)
+        except Exception:
+            from ..utils.install import get_install_method
+
+            method = get_install_method()
+            if method == "dmg":
+                logger.info(
+                    "Structured output is not available in the DMG version "
+                    "(xgrammar requires torch which significantly increases app size). "
+                    "Use the pip or Homebrew version for structured output support."
+                )
+            elif method == "homebrew":
+                logger.info(
+                    "Structured output requires xgrammar. "
+                    "Reinstall with: brew reinstall omlx --with-grammar"
+                )
+            else:
+                logger.info(
+                    "Structured output requires xgrammar. "
+                    "Install with: pip install 'omlx[grammar]'"
+                )
         return self._grammar_compiler
+
+    @property
+    def prefix_cache_enabled(self) -> bool:
+        """True when the scheduler has a BlockAwarePrefixCache wired up."""
+        if self._engine is None:
+            return False
+        try:
+            return self._engine.engine.scheduler.block_aware_cache is not None
+        except AttributeError:
+            return False
 
     def _preprocess_messages(
         self, messages: list[dict[str, Any]]
@@ -189,7 +237,7 @@ class BatchedEngine(BaseEngine):
             if tq_enabled:
                 from ..patches.turboquant_attention import apply_turboquant_attention_patch
                 apply_turboquant_attention_patch()
-                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 
         # Create engine config (copy to avoid mutating the shared instance)
@@ -214,8 +262,11 @@ class BatchedEngine(BaseEngine):
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled:
-                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
+                self._engine.engine.scheduler._turboquant_skip_last = getattr(
+                    self._model_settings, "turboquant_skip_last", True
+                )
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
@@ -241,7 +292,11 @@ class BatchedEngine(BaseEngine):
         """Stop the engine and cleanup resources."""
         if self._engine:
             await self._engine.stop()
-            self._engine.engine.close()
+            if hasattr(self._engine, 'engine') and self._engine.engine is not None:
+                try:
+                    self._engine.engine.close()
+                except Exception as e:
+                    logger.warning(f"Error closing engine: {e}")
         self._engine = None
         self._model = None
         self._tokenizer = None
@@ -372,6 +427,7 @@ class BatchedEngine(BaseEngine):
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
+            seed=kwargs.get("seed", None),
         )
 
         output = await self._engine.generate(
@@ -440,6 +496,7 @@ class BatchedEngine(BaseEngine):
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
+            seed=kwargs.get("seed", None),
         )
 
         # SpecPrefill: pass per-request overrides to engine
@@ -599,7 +656,8 @@ class BatchedEngine(BaseEngine):
         # SpecPrefill: compute system prompt token count for protection.
         # Can't template system-only messages (most templates require user),
         # so compute by subtracting non-system from full prompt tokens.
-        if kwargs.get("specprefill") is not False:
+        specprefill_model_enabled = getattr(self._model_settings, "specprefill_enabled", False) if self._model_settings else False
+        if specprefill_model_enabled and kwargs.get("specprefill") is not False:
             non_system = [m for m in messages if m.get("role") not in ("system", "developer")]
             if len(non_system) < len(messages) and non_system:
                 try:
@@ -626,6 +684,16 @@ class BatchedEngine(BaseEngine):
             **kwargs,
         ):
             yield output
+
+    def has_active_requests(self) -> bool:
+        """Check if the engine has active in-flight requests."""
+        engine_core = getattr(self, "_engine", None)
+        if engine_core is not None:
+            inner = getattr(engine_core, "engine", None)
+            if inner is not None:
+                collectors = getattr(inner, "_output_collectors", {})
+                return len(collectors) > 0
+        return False
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""

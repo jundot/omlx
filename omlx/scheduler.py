@@ -22,15 +22,16 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import mlx.core as mx
 from mlx_lm.generate import (
-    Batch as MLXBatch,
     BatchGenerator,
-    _left_pad_prompts,
-    _make_cache,
-    _merge_caches,
-    _right_pad_prompts,
+    GenerationBatch,
+    PromptProcessingBatch,
+    SequenceStateMachine,
     generation_stream,
 )
-from mlx_lm.sample_utils import make_sampler, make_logits_processors, make_presence_penalty
+from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.sample_utils import make_logits_processors
+
+from .utils.sampling import make_sampler as omlx_make_sampler
 
 from pathlib import Path
 
@@ -49,9 +50,16 @@ def _sync_and_clear_cache():
     'completeMemory() prepare count underflow' kernel panic on M4 hardware
     (and SIGSEGV/SIGABRT on M3).
 
-    See: https://github.com/jundot/omlx/issues/300
+    See: https://github.com/jundot/omlx/issues/300, #888
     """
-    mx.synchronize(generation_stream)
+    # Generation_stream may not have in-flight work on the current thread
+    # (e.g. external prefill submits to the default stream). On some MLX
+    # builds mx.synchronize raises "There is no Stream(gpu, 0) in current
+    # thread" in that case; swallow it since there is nothing to drain.
+    try:
+        mx.synchronize(generation_stream)
+    except RuntimeError:
+        pass
     mx.synchronize()  # default stream
     mx.clear_cache()
 
@@ -84,17 +92,16 @@ try:
 except ImportError:
     NaiveStreamingDetokenizer = None
 
-# Import Harmony adapter for gpt-oss models
+# Import protocol-specific output parser support
 try:
-    from .adapter.harmony import HarmonyStreamingParser, parse_tool_calls_from_tokens
-    from .utils.tokenizer import is_harmony_model
+    from .adapter.output_parser import OutputParserFactory, OutputParserSession, detect_output_parser
 
-    HAS_HARMONY_ADAPTER = True
+    HAS_OUTPUT_PARSER = True
 except ImportError:
-    HarmonyStreamingParser = None
-    parse_tool_calls_from_tokens = None
-    is_harmony_model = None
-    HAS_HARMONY_ADAPTER = False
+    OutputParserFactory = None
+    OutputParserSession = None
+    detect_output_parser = None
+    HAS_OUTPUT_PARSER = False
 
 logger = logging.getLogger(__name__)
 
@@ -111,903 +118,153 @@ class _PrefillAbortedError(Exception):
         )
 
 
-class _BoundarySnapshotBatchGenerator(BatchGenerator):
-    """BatchGenerator with boundary-aligned prefill snapshot callbacks."""
+# ---------------------------------------------------------------------------
+# Monkey-patch GenerationBatch._step to call grammar accept_token() after
+# sampling.  In the pipelined _step(), logits processors fill the bitmask
+# (constrain NEXT token) but can't know which token was just sampled.
+# After _original_step returns, self._next_tokens holds the freshly sampled
+# tokens.  We eval them synchronously and accept in grammar processors.
+# ---------------------------------------------------------------------------
+_original_generation_batch_step = GenerationBatch._step
 
-    def __init__(
-        self,
-        *args: Any,
-        boundary_block_size: int = 0,
-        prefill_boundary_callback: Optional[Callable[[int, List[Any], int], None]] = None,
-        abort_check_callback: Optional[Callable[[List[int]], List[int]]] = None,
-        **kwargs: Any,
-    ):
-        super().__init__(*args, **kwargs)
-        self._boundary_block_size = max(0, int(boundary_block_size))
-        self._prefill_boundary_callback = prefill_boundary_callback
-        self._abort_check_callback = abort_check_callback
-        self._turboquant_kv_bits: Optional[float] = None  # Set by Scheduler if enabled
-        # Memory limits for inline prefill checking (set by Scheduler).
-        # mx.get_active_memory() is ~20ns, negligible vs ~5s prefill chunks.
-        self._memory_limit_bytes: int = 0  # soft limit, 0 = disabled
-        self._memory_hard_limit_bytes: int = 0  # hard limit (system_ram - 4GB)
-        # Per-UID VLM embeddings for batched prefill.
-        # uid → (inputs_embeds, extra_kwargs, start_offset)
-        self._vlm_pending: Dict[int, Tuple[mx.array, Dict[str, Any], int]] = {}
+def _patched_generation_batch_step(self):
+    # Build per-batch mRoPE deltas from UID mapping before each step.
+    # This handles batch size changes during prompt split/generate.
+    model = self.model
+    if (getattr(model, "_uses_mrope", False)
+            and getattr(model, "_uid_rope_deltas", None)
+            and self.uids):
+        deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
+        model.set_batch_rope_deltas(mx.array(deltas))
 
-    # Cache class names known to be sliceable (no boundary snapshots needed).
-    _KNOWN_SLICEABLE = frozenset({
-        "KVCache", "BatchKVCache", "QuantizedKVCache",
-        "TurboQuantKVCache", "BatchTurboQuantKVCache",
-    })
+    result = _original_generation_batch_step(self)
 
-    def _apply_turboquant_kv(self, prompt_cache: List[Any]) -> None:
-        """Convert BatchKVCache layers to BatchTurboQuantKVCache."""
-        from .turboquant_kv import BatchTurboQuantKVCache, TurboQuantKVCache
-        from mlx_lm.models.cache import KVCache, CacheList
-
-        converted = 0
-
-        bits = int(self._turboquant_kv_bits)
-        for i, cache_obj in enumerate(prompt_cache):
-            cls_name = type(cache_obj).__name__
-            if cls_name == "BatchKVCache":
-                left_padding = cache_obj.left_padding.tolist()
-                prompt_cache[i] = BatchTurboQuantKVCache(left_padding, bits=bits)
-                converted += 1
-            elif isinstance(cache_obj, KVCache):
-                prompt_cache[i] = TurboQuantKVCache(bits=bits)
-                converted += 1
-            elif isinstance(cache_obj, CacheList):
-                new_caches = []
-                for c in cache_obj.caches:
-                    c_name = type(c).__name__
-                    if c_name == "BatchKVCache":
-                        left_padding = c.left_padding.tolist()
-                        new_caches.append(BatchTurboQuantKVCache(left_padding, bits=bits))
-                        converted += 1
-                    elif isinstance(c, KVCache):
-                        new_caches.append(TurboQuantKVCache(bits=bits))
-                        converted += 1
-                    else:
-                        new_caches.append(c)
-                cache_obj.caches = tuple(new_caches)
-        if converted > 0:
-            logger.info(f"TurboQuant: converted {converted}/{len(prompt_cache)} cache layers to {bits}-bit")
-
-    def _boundary_capture_enabled(self) -> bool:
-        return (
-            self._boundary_block_size > 0
-            and self._prefill_boundary_callback is not None
-        )
-
-    @staticmethod
-    def _prompt_cache_needs_snapshots(prompt_cache: List[Any]) -> bool:
-        """Return True if any layer cache is non-sliceable (needs snapshots).
-
-        Checks the batch cache objects created during prefill. If all layers
-        are known-sliceable types (e.g. BatchKVCache), boundary snapshots
-        are unnecessary and can be skipped entirely.
-        """
-        known = _BoundarySnapshotBatchGenerator._KNOWN_SLICEABLE
-        for cache_obj in prompt_cache:
-            # Handle CacheList which nests sub-caches.
-            sub_caches = getattr(cache_obj, "caches", None)
-            if isinstance(sub_caches, (list, tuple)):
-                for sub in sub_caches:
-                    if type(sub).__name__ not in known:
-                        return True
-            elif type(cache_obj).__name__ not in known:
-                return True
-        return False
-
-    @staticmethod
-    def _cache_layer_token_count(cache_obj: Any) -> int:
-        sub_caches = getattr(cache_obj, "caches", None)
-        if isinstance(sub_caches, (list, tuple)) and sub_caches:
-            return max(
-                _BoundarySnapshotBatchGenerator._cache_layer_token_count(sub_cache)
-                for sub_cache in sub_caches
-            )
-
-        offset = getattr(cache_obj, "offset", None)
-        if isinstance(offset, (int, float)):
-            return int(offset)
-
-        size_fn = getattr(cache_obj, "size", None)
-        if callable(size_fn):
-            try:
-                return int(size_fn())
-            except Exception:
-                return 0
-
-        return 0
-
-    @staticmethod
-    def _cache_base_sizes(caches: Tuple[List[Any], ...]) -> List[int]:
-        base_sizes: List[int] = []
-        for cache_list in caches:
-            try:
-                base_sizes.append(
-                    max(
-                        _BoundarySnapshotBatchGenerator._cache_layer_token_count(c)
-                        for c in cache_list
-                    )
-                )
-            except Exception:
-                base_sizes.append(0)
-        return base_sizes
-
-    def _next_boundary_limited_step(
-        self,
-        processed_tokens: int,
-        lengths: List[int],
-        base_sizes: List[int],
-        max_allowed: int,
-        target_boundaries: List[Optional[int]],
-        all_boundaries: bool = False,
-    ) -> int:
-        n_to_process = min(self.prefill_step_size, max_allowed)
-        if n_to_process <= 1:
-            return max(1, n_to_process)
-
-        next_delta: Optional[int] = None
-        block_size = self._boundary_block_size
-
-        for length, base, target_boundary in zip(lengths, base_sizes, target_boundaries):
-            if target_boundary is None:
-                continue
-
-            prefill_limit = max(length - 1, 0)
-            if processed_tokens >= prefill_limit:
-                continue
-
-            current_prefill = min(processed_tokens, prefill_limit)
-            current_total = base + current_prefill
-            if current_total >= target_boundary:
-                continue
-
-            if all_boundaries and block_size > 0:
-                # Stop at the NEXT block boundary (not just the final target).
-                # This ensures boundary snapshots are captured at every block
-                # boundary for hybrid models (ArraysCache + KVCache).
-                next_boundary = ((current_total // block_size) + 1) * block_size
-                next_boundary = min(next_boundary, target_boundary)
-                delta = (next_boundary - base) - processed_tokens
-            else:
-                target_prefill = target_boundary - base
-                delta = target_prefill - processed_tokens
-
-            if delta <= 0:
-                continue
-
-            next_delta = delta if next_delta is None else min(next_delta, delta)
-
-        if next_delta is not None:
-            n_to_process = min(n_to_process, next_delta)
-
-        return max(1, n_to_process)
-
-    def _emit_boundary_snapshots(
-        self,
-        *,
-        uids: List[int],
-        lengths: List[int],
-        base_sizes: List[int],
-        prompt_cache: List[Any],
-        emitted: Dict[int, int],
-        processed_tokens: Optional[int] = None,
-        use_full_prompt_lengths: bool = False,
-    ) -> None:
-        if not self._boundary_capture_enabled() or self._prefill_boundary_callback is None:
-            return
-
-        for idx, uid in enumerate(uids):
-            length = lengths[idx]
-            base = base_sizes[idx]
-            if use_full_prompt_lengths:
-                total_tokens = base + max(length, 0)
-            else:
-                if processed_tokens is None:
-                    continue
-                prefill_done = min(processed_tokens, max(length - 1, 0))
-                total_tokens = base + prefill_done
-
-            if total_tokens <= 0 or total_tokens % self._boundary_block_size != 0:
-                continue
-            if emitted.get(uid, -1) >= total_tokens:
-                continue
-
-            try:
-                # Only extract non-sliceable layers (e.g. ArraysCache).
-                # Sliceable layers (KVCache) can be reconstructed from the
-                # final cache via block slicing, so we skip their costly
-                # mx.contiguous() deep-copy to avoid O(n^2) memory growth
-                # during long prefills.
-                snapshot_cache = [
-                    c.extract(idx)
-                    if type(c).__name__ not in self._KNOWN_SLICEABLE
-                    else None
-                    for c in prompt_cache
-                ]
-                self._prefill_boundary_callback(uid, snapshot_cache, total_tokens)
-                emitted[uid] = total_tokens
-            except Exception as e:
-                logger.debug(
-                    f"Prefill boundary snapshot callback failed for uid={uid}: {e}"
-                )
-
-    def _step(
-        self,
-        input_tokens: mx.array,
-        prompt_cache: List[Any],
-        samplers: list,
-        logits_processors: list,
-        tokens: List[mx.array],
-        **kwargs: Any,
-    ):
-        """Override to pass VLM kwargs and use batched grammar bitmask fill.
-
-        When grammar-constrained requests are present in the batch:
-        1. Queue model forward (MLX lazy eval)
-        2. Kick off Metal evaluation asynchronously
-        3. Advance grammar state + batch-fill bitmasks on CPU (overlaps
-           with Metal)
-        4. Apply the batched bitmask to all logits at once
-        5. Run remaining (non-grammar) logits processors per-request
-        """
-        batch_size = input_tokens.shape[0]
-
-        logits = self.model(input_tokens, cache=prompt_cache, **kwargs)
-        logits = logits[:, -1, :]
-
-        if any(logits_processors):
-            logits = self._apply_logits_processors(
-                logits, logits_processors, tokens, batch_size,
-            )
-
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        if any(samplers):
-            all_samples = []
-            for e in range(batch_size):
-                sample_sampler = samplers[e] or self.sampler
-                sampled = sample_sampler(logprobs[e : e + 1])
-                all_samples.append(sampled)
-            sampled = mx.concatenate(all_samples, axis=0)
-        else:
-            sampled = self.sampler(logprobs)
-
-        return sampled, list(logprobs)
-
-    def _apply_logits_processors(
-        self,
-        logits: mx.array,
-        logits_processors: list,
-        tokens: List[mx.array],
-        batch_size: int,
-    ) -> mx.array:
-        """Apply logits processors, using batched grammar fill when possible.
-
-        Separates grammar processors from other processors.  Grammar
-        bitmasks are filled in parallel via ``BatchGrammarMatcher`` while
-        Metal evaluates the model forward pass.  Other processors (e.g.
-        ``ThinkingBudgetProcessor``) run per-request as before.
-        """
+    # self._next_tokens contains the just-sampled tokens (async eval pending).
+    # We need to accept them NOW so the next __call__ fills the correct bitmask.
+    if any(self.logits_processors):
         from .api.grammar import GrammarConstraintProcessor
 
-        grammar_procs: list[tuple[int, GrammarConstraintProcessor]] = []
-        other_procs: list[list] = [[] for _ in range(batch_size)]
+        has_grammar = any(
+            isinstance(p, GrammarConstraintProcessor)
+            for procs in self.logits_processors
+            for p in procs
+        )
+        if has_grammar:
+            # Force eval of the sampled tokens so we can read them.
+            mx.eval(self._next_tokens)
+            sampled = self._next_tokens.tolist()
+            for e in range(len(self.uids)):
+                for proc in self.logits_processors[e]:
+                    if isinstance(proc, GrammarConstraintProcessor):
+                        proc.accept_token(sampled[e])
 
-        for e in range(batch_size):
-            for proc in logits_processors[e]:
-                if isinstance(proc, GrammarConstraintProcessor):
-                    grammar_procs.append((e, proc))
-                else:
-                    other_procs[e].append(proc)
+    return result
 
-        if grammar_procs:
-            logits = self._apply_batched_grammar(
-                logits, grammar_procs, tokens, batch_size,
-            )
+GenerationBatch._step = _patched_generation_batch_step
 
-        if any(other_procs):
-            processed_logits = []
-            for e in range(batch_size):
-                sample_logits = logits[e : e + 1]
-                for processor in other_procs[e]:
-                    sample_logits = processor(tokens[e], sample_logits)
-                processed_logits.append(sample_logits)
-            logits = mx.concatenate(processed_logits, axis=0)
 
-        return logits
+# Monkey-patch TurboQuantKVCache.merge so _merge_caches() works
+try:
+    from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
+    from .turboquant_kv import BatchTurboQuantKVCache as _BTQCache
+    if not hasattr(_TQCache, "merge"):
+        _TQCache.merge = _BTQCache.merge
+except ImportError:
+    pass
 
-    def _apply_batched_grammar(
-        self,
-        logits: mx.array,
-        grammar_procs: list,
-        tokens: List[mx.array],
-        batch_size: int,
-    ) -> mx.array:
-        """Advance grammar state and apply bitmasks using BatchGrammarMatcher.
 
-        Kicks off ``mx.async_eval(logits)`` before CPU-side bitmask
-        computation so that Metal and CPU work overlap.
-        """
-        from xgrammar.kernels.apply_token_bitmask_mlx import apply_token_bitmask_mlx
+# ---------------------------------------------------------------------------
+# Monkey-patch PromptProcessingBatch.prompt to set mRoPE deltas before the
+# prompt processing loop.  Without this, batched VLM prompt processing
+# (e.g. the 1-token final prompt after external prefill) would use
+# per-request offsets without rope_deltas, corrupting attention masks
+# for concurrent VLM requests.
+# ---------------------------------------------------------------------------
+_original_ppb_prompt = PromptProcessingBatch.prompt
 
-        mx.async_eval(logits)
 
-        active_matchers = []
-        active_batch_indices = []
-        for batch_idx, proc in grammar_procs:
-            if proc.advance(tokens[batch_idx]):
-                active_matchers.append(proc.matcher)
-                active_batch_indices.append(batch_idx)
+def _patched_ppb_prompt(self, tokens):
+    model = self.model
+    if (getattr(model, "_uses_mrope", False)
+            and getattr(model, "_uid_rope_deltas", None)
+            and self.uids):
+        deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
+        model.set_batch_rope_deltas(mx.array(deltas))
+    return _original_ppb_prompt(self, tokens)
 
-        if not active_matchers:
-            return logits
 
-        vocab_size = grammar_procs[0][1]._vocab_size
-        bitmask_width = (vocab_size + 31) // 32
+PromptProcessingBatch.prompt = _patched_ppb_prompt
 
-        bitmask = self._get_grammar_bitmask(batch_size, bitmask_width)
-        bitmask[:batch_size] = -1
 
-        if len(active_matchers) >= self._BATCH_GRAMMAR_THRESHOLD:
-            batch_matcher = self._get_batch_grammar_matcher()
-            batch_matcher.batch_fill_next_token_bitmask(
-                active_matchers, bitmask, indices=active_batch_indices,
-            )
-        else:
-            for matcher, idx in zip(active_matchers, active_batch_indices):
-                matcher.fill_next_token_bitmask(bitmask, idx)
+# Cache class names known to be sliceable (no boundary snapshots needed).
+_KNOWN_SLICEABLE_CACHE_TYPES = frozenset({
+    "KVCache", "BatchKVCache", "QuantizedKVCache",
+    "TurboQuantKVCache", "BatchTurboQuantKVCache",
+})
 
-        mx_bitmask = mx.array(bitmask[:batch_size])
-        return apply_token_bitmask_mlx(mx_bitmask, logits, vocab_size)
 
-    _BATCH_GRAMMAR_THRESHOLD = 64
+def _prompt_cache_needs_snapshots(prompt_cache: List[Any]) -> bool:
+    """Return True if any layer cache is non-sliceable (needs snapshots).
 
-    def _get_batch_grammar_matcher(self):
-        """Return a shared ``BatchGrammarMatcher`` (lazy-initialized)."""
-        if not hasattr(self, '_batch_grammar_matcher'):
-            import xgrammar as xgr
-            self._batch_grammar_matcher = xgr.BatchGrammarMatcher()
-        return self._batch_grammar_matcher
+    Checks the cache objects created during prefill. If all layers
+    are known-sliceable types (e.g. KVCache), boundary snapshots
+    are unnecessary and can be skipped entirely.
+    """
+    for cache_obj in prompt_cache:
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)):
+            for sub in sub_caches:
+                if type(sub).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES:
+                    return True
+        elif type(cache_obj).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES:
+            return True
+    return False
 
-    def _get_grammar_bitmask(self, batch_size: int, bitmask_width: int):
-        """Return a reusable numpy bitmask buffer, resizing if needed."""
-        buf = getattr(self, '_grammar_bitmask_buf', None)
-        if buf is None or buf.shape[0] < batch_size or buf.shape[1] < bitmask_width:
-            import numpy as np
-            self._grammar_bitmask_buf = np.full(
-                (max(batch_size, 8), bitmask_width), -1, dtype=np.int32,
-            )
-        return self._grammar_bitmask_buf
 
-    def _process_prompts(self, prompts):
-        # Clear stale mRoPE position state from prior _process_prompts() call.
-        # With prefill_batch_size=1, _next() calls _process_prompts() once per
-        # prompt sequentially; the previous call's cached _position_ids would
-        # cause shape mismatches for mRoPE models (e.g. Qwen3.5).
-        if hasattr(self.model, "clear_vlm_position_state"):
-            self.model.clear_vlm_position_state()
-
-        (
-            uids,
-            inputs,
-            max_tokens,
-            caches,
-            samplers,
-            logits_processors,
-            prompt_checkpoints,
-        ) = zip(*prompts)
-
-        lengths = [len(p) for p in inputs]
-        max_length = max(lengths)
-        padding = [max_length - l for l in lengths]
-
-        # Compute effective prompt checkpoint exactly as upstream BatchGenerator does.
-        # When prompt_checkpoints are default (-1), this yields 1 — matching old behavior.
-        prompt_checkpoints_offsets = [
-            (l - pc if pc > 0 else -pc) for l, pc in zip(lengths, prompt_checkpoints)
-        ]
-        prompt_checkpoint = max(1, max(prompt_checkpoints_offsets))
-
-        # Collect per-UID VLM embeddings registered by _schedule_waiting().
-        vlm_embeds_map: Dict[int, Tuple[mx.array, Dict[str, Any], int]] = {}
-        for uid in uids:
-            if uid in self._vlm_pending:
-                vlm_embeds_map[uid] = self._vlm_pending.pop(uid)
-
-        self._stats.prompt_tokens += sum(lengths)
-
-        tokens = [mx.array(inp) for inp in inputs]
-        processed_tokens = 0
-        boundary_enabled = self._boundary_capture_enabled()
-        base_sizes = self._cache_base_sizes(caches) if boundary_enabled else []
-        target_boundaries: List[Optional[int]] = []
-        # all_boundaries mode: stop at EVERY block boundary (not just last)
-        # for hybrid models with non-sliceable caches (ArraysCache).
-        # Determined after cache is created and checked.
-        all_boundaries = False
-        if boundary_enabled:
-            block_size = self._boundary_block_size
-            for length, base in zip(lengths, base_sizes):
-                full_total = base + max(length, 0)
-                if full_total <= 0:
-                    target_boundaries.append(None)
-                    continue
-
-                # Compute the last full boundary below the full prompt length.
-                target_boundary = (full_total // block_size) * block_size
-                if target_boundary <= base:
-                    target_boundaries.append(None)
-                elif full_total % block_size == 0:
-                    # Prompt lands exactly on boundary. Still need a target
-                    # for all_boundaries mode to stop at intermediate ones.
-                    target_boundaries.append(target_boundary)
-                else:
-                    target_boundaries.append(target_boundary)
-
-        emitted_boundaries: Dict[int, int] = {uid: -1 for uid in uids}
-
-        # VLM batched embeddings (built per-path, used in _step at the end).
-        batched_embeds: Optional[mx.array] = None
-        batched_extra: Optional[Dict[str, Any]] = None
-
-        # New prompts so
-        #   1. Left-pad the inputs
-        #   2. Process
-        if all(c[0].empty() for c in caches):
-            inputs = _left_pad_prompts(inputs, max_length=max_length)
-            prompt_cache = _make_cache(self.model, padding, self.max_kv_size)
-
-            # TurboQuant KV cache: convert KVCache layers to TurboQuantKVCache
-            if self._turboquant_kv_bits is not None:
-                self._apply_turboquant_kv(prompt_cache)
-
-            # Build left-padded VLM embeddings batch (matching token padding).
-            batched_embeds, batched_extra = self._build_left_padded_vlm_batch(
-                vlm_embeds_map, list(uids), lengths, max_length
-            )
-
-            # Disable boundary capture if all layers are sliceable (e.g.
-            # pure BatchKVCache models).  This avoids unnecessary prefill
-            # step-size limiting and expensive cache extraction.
-            if boundary_enabled and not self._prompt_cache_needs_snapshots(prompt_cache):
-                boundary_enabled = False
-            elif boundary_enabled:
-                # Hybrid model: stop at every block boundary to capture
-                # per-block ArraysCache snapshots.
-                all_boundaries = True
-
-            while inputs.shape[1] > prompt_checkpoint:
-                max_allowed = inputs.shape[1] - prompt_checkpoint
-                if boundary_enabled:
-                    n_to_process = self._next_boundary_limited_step(
-                        processed_tokens,
-                        lengths,
-                        base_sizes,
-                        max_allowed,
-                        target_boundaries,
-                        all_boundaries=all_boundaries,
-                    )
-                else:
-                    n_to_process = min(self.prefill_step_size, max_allowed)
-
-                model_kwargs = {}
-                if batched_embeds is not None:
-                    model_kwargs["inputs_embeds"] = batched_embeds[:, :n_to_process]
-                    if batched_extra:
-                        model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
-                            batched_extra, n_to_process
-                        )
-                self.model(inputs[:, :n_to_process], cache=prompt_cache, **model_kwargs)
-                mx.eval([c.state for c in prompt_cache])
-                inputs = inputs[:, n_to_process:]
-                if batched_embeds is not None:
-                    batched_embeds = batched_embeds[:, n_to_process:]
-                    if batched_extra:
-                        batched_extra = _advance_vlm_extra(batched_extra, n_to_process)
-                processed_tokens += n_to_process
-                self.prompt_progress_callback(
-                    [
-                        (uid, processed_tokens, length)
-                        for uid, length in zip(uids, lengths)
-                    ]
-                )
-                self._emit_boundary_snapshots(
-                    uids=list(uids),
-                    lengths=lengths,
-                    base_sizes=base_sizes,
-                    prompt_cache=prompt_cache,
-                    emitted=emitted_boundaries,
-                    processed_tokens=processed_tokens,
-                )
-
-                if self._memory_limit_bytes > 0:
-                    active = mx.get_active_memory()
-                    if (
-                        self._memory_hard_limit_bytes > 0
-                        and active > self._memory_hard_limit_bytes
-                    ):
-                        logger.warning(
-                            f"Prefill force-stopped at {processed_tokens} "
-                            f"tokens: memory {active / 1024**3:.1f}GB "
-                            f"exceeds hard limit "
-                            f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
-                        )
-                        raise RuntimeError(
-                            "Memory limit exceeded during prefill"
-                        )
-                    elif active > self._memory_limit_bytes:
-                        logger.warning(
-                            f"Prefill memory soft limit exceeded at "
-                            f"{processed_tokens} tokens: "
-                            f"{active / 1024**3:.1f}GB > "
-                            f"{self._memory_limit_bytes / 1024**3:.1f}GB "
-                            f"(hard limit: "
-                            f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
-                        )
-
-                # Check for pending aborts between prefill chunks.
-                # GIL guarantees _pending_abort_ids.add() is atomic,
-                # so reading from the executor thread is safe.
-                if self._abort_check_callback is not None:
-                    abort_uids = self._abort_check_callback(list(uids))
-                    if abort_uids:
-                        logger.info(
-                            f"Prefill interrupted at {processed_tokens}/"
-                            f"{max(lengths)} tokens: "
-                            f"{len(abort_uids)} request(s) aborted"
-                        )
-                        raise _PrefillAbortedError(
-                            abort_uids, processed_tokens
-                        )
-
-                # Reclaim Metal intermediates between prefill chunks.
-                # Placed after memory check so mx.get_active_memory()
-                # reads pre-clear values, avoiding fragmentation-inflated
-                # readings that caused false model eviction (#396).
-                _sync_and_clear_cache()
-
-        # Further prompt processing so we need to
-        #   1. Merge the KV caches and prepare for right padded prompts
-        #   2. Right pad the inputs
-        #   2. Process
-        #   3. Finalize the KV caches so they are left padded again
-        else:
-            last_inputs = mx.array([p[-prompt_checkpoint:] for p in inputs])
-            inputs = _right_pad_prompts(inputs, max_length=max_length)
-            prompt_cache = _merge_caches(caches)
-
-            # TurboQuant KV cache: convert merged BatchKVCache to
-            # BatchTurboQuantKVCache so cache types stay consistent with
-            # the active batch (prevents _quantized AttributeError in
-            # BatchTurboQuantKVCache.extend()).
-            if self._turboquant_kv_bits is not None:
-                self._apply_turboquant_kv(prompt_cache)
-
-            # Build right-padded VLM embeddings batch (matching token padding).
-            batched_embeds, batched_extra = self._build_right_padded_vlm_batch(
-                vlm_embeds_map, list(uids), lengths, max_length
-            )
-
-            # Disable boundary capture for sliceable-only caches.
-            if boundary_enabled and not self._prompt_cache_needs_snapshots(prompt_cache):
-                boundary_enabled = False
-            elif boundary_enabled:
-                # Hybrid model: stop at every block boundary.
-                all_boundaries = True
-
-            for c in prompt_cache:
-                # subtract prompt_checkpoint from lengths since we don't process
-                # the last prompt_checkpoint tokens during prefill
-                c.prepare(
-                    lengths=[max(0, l - prompt_checkpoint) for l in lengths],
-                    right_padding=padding,
-                )
-
-            while inputs.shape[1] > prompt_checkpoint:
-                max_allowed = inputs.shape[1] - prompt_checkpoint
-                if boundary_enabled:
-                    n_to_process = self._next_boundary_limited_step(
-                        processed_tokens,
-                        lengths,
-                        base_sizes,
-                        max_allowed,
-                        target_boundaries,
-                        all_boundaries=all_boundaries,
-                    )
-                else:
-                    n_to_process = min(self.prefill_step_size, max_allowed)
-
-                model_kwargs = {}
-                if batched_embeds is not None:
-                    model_kwargs["inputs_embeds"] = batched_embeds[:, :n_to_process]
-                    if batched_extra:
-                        model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
-                            batched_extra, n_to_process
-                        )
-                self.model(inputs[:, :n_to_process], cache=prompt_cache, **model_kwargs)
-                mx.eval([c.state for c in prompt_cache])
-                inputs = inputs[:, n_to_process:]
-                if batched_embeds is not None:
-                    batched_embeds = batched_embeds[:, n_to_process:]
-                    if batched_extra:
-                        batched_extra = _advance_vlm_extra(batched_extra, n_to_process)
-                processed_tokens += n_to_process
-                self.prompt_progress_callback(
-                    [
-                        (uid, processed_tokens, length)
-                        for uid, length in zip(uids, lengths)
-                    ]
-                )
-                self._emit_boundary_snapshots(
-                    uids=list(uids),
-                    lengths=lengths,
-                    base_sizes=base_sizes,
-                    prompt_cache=prompt_cache,
-                    emitted=emitted_boundaries,
-                    processed_tokens=processed_tokens,
-                )
-
-                if self._memory_limit_bytes > 0:
-                    active = mx.get_active_memory()
-                    if (
-                        self._memory_hard_limit_bytes > 0
-                        and active > self._memory_hard_limit_bytes
-                    ):
-                        logger.warning(
-                            f"Prefill force-stopped at {processed_tokens} "
-                            f"tokens: memory {active / 1024**3:.1f}GB "
-                            f"exceeds hard limit "
-                            f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
-                        )
-                        raise RuntimeError(
-                            "Memory limit exceeded during prefill"
-                        )
-                    elif active > self._memory_limit_bytes:
-                        logger.warning(
-                            f"Prefill memory soft limit exceeded at "
-                            f"{processed_tokens} tokens: "
-                            f"{active / 1024**3:.1f}GB > "
-                            f"{self._memory_limit_bytes / 1024**3:.1f}GB "
-                            f"(hard limit: "
-                            f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
-                        )
-
-                # Check for pending aborts between prefill chunks.
-                if self._abort_check_callback is not None:
-                    abort_uids = self._abort_check_callback(list(uids))
-                    if abort_uids:
-                        logger.info(
-                            f"Prefill interrupted at {processed_tokens}/"
-                            f"{max(lengths)} tokens: "
-                            f"{len(abort_uids)} request(s) aborted"
-                        )
-                        raise _PrefillAbortedError(
-                            abort_uids, processed_tokens
-                        )
-
-                _sync_and_clear_cache()
-
-            mx.eval([c.state for c in prompt_cache])
-            inputs = last_inputs
-
-        for c in prompt_cache:
-            c.finalize()
-
-        # Emit prompt checkpoint callback for upstream parity.
-        # When prompt_checkpoint > 1, process remaining tokens before _step.
-        if self.prompt_checkpoint_callback is not None:
-            self.prompt_checkpoint_callback(
-                [
-                    (uid, prompt_checkpoint, tuple(c.extract(i) for c in prompt_cache))
-                    for i, uid in enumerate(uids)
-                ]
-            )
-        if prompt_checkpoint > 1:
-            model_kwargs_cp = {}
-            if batched_embeds is not None and batched_embeds.shape[1] >= (prompt_checkpoint - 1):
-                # Slice VLM embeds for the checkpoint-to-last-1 range
-                model_kwargs_cp["inputs_embeds"] = batched_embeds[:, :prompt_checkpoint - 1]
-                if batched_extra:
-                    model_kwargs_cp["vlm_extra_kwargs"] = _slice_vlm_extra(
-                        batched_extra, prompt_checkpoint - 1
-                    )
-            self.model(inputs[:, :prompt_checkpoint - 1], cache=prompt_cache, **model_kwargs_cp)
-            mx.eval([c.state for c in prompt_cache])
-            inputs = inputs[:, prompt_checkpoint - 1:]
-            if batched_embeds is not None:
-                batched_embeds = batched_embeds[:, prompt_checkpoint - 1:]
-                if batched_extra:
-                    batched_extra = _advance_vlm_extra(batched_extra, prompt_checkpoint - 1)
-
-        _sync_and_clear_cache()
-
-        # Pass remaining VLM embeddings (last token) to _step if available.
-        step_kwargs: Dict[str, Any] = {}
-        if batched_embeds is not None and batched_embeds.shape[1] > 0:
-            step_kwargs["inputs_embeds"] = batched_embeds
-            if batched_extra:
-                step_kwargs["vlm_extra_kwargs"] = batched_extra
-        y, logprobs = self._step(
-            inputs, prompt_cache, samplers, logits_processors, tokens,
-            **step_kwargs,
+def _cache_layer_token_count(cache_obj: Any) -> int:
+    """Return the number of tokens stored in a single cache layer."""
+    sub_caches = getattr(cache_obj, "caches", None)
+    if isinstance(sub_caches, (list, tuple)) and sub_caches:
+        return max(
+            _cache_layer_token_count(sub_cache)
+            for sub_cache in sub_caches
         )
 
-        self._emit_boundary_snapshots(
-            uids=list(uids),
-            lengths=lengths,
-            base_sizes=base_sizes,
-            prompt_cache=prompt_cache,
-            emitted=emitted_boundaries,
-            use_full_prompt_lengths=True,
-        )
+    offset = getattr(cache_obj, "offset", None)
+    if isinstance(offset, (int, float)):
+        return int(offset)
 
-        mx.async_eval(y, logprobs)
+    size_fn = getattr(cache_obj, "size", None)
+    if callable(size_fn):
+        try:
+            return int(size_fn())
+        except Exception:
+            return 0
 
-        return MLXBatch(
-            list(uids),
-            y,
-            logprobs,
-            list(max_tokens),
-            [0] * len(uids),
-            prompt_cache,
-            list(samplers),
-            list(logits_processors),
-            tokens,
-        )
+    return 0
 
-    # ------------------------------------------------------------------
-    # VLM batched-prefill helpers
-    # ------------------------------------------------------------------
 
-    def _build_left_padded_vlm_batch(
-        self,
-        vlm_embeds_map: Dict[int, Tuple[mx.array, Dict[str, Any], int]],
-        uids: List[int],
-        lengths: List[int],
-        max_length: int,
-    ) -> Tuple[Optional[mx.array], Optional[Dict[str, Any]]]:
-        """Build left-padded VLM embeddings batch matching token left-padding."""
-        if not vlm_embeds_map:
-            return None, None
+def _cache_base_sizes(caches: List[Any]) -> int:
+    """Return the base token count of a single-request cache list."""
+    if not caches:
+        return 0
+    try:
+        return max(_cache_layer_token_count(c) for c in caches)
+    except Exception:
+        return 0
 
-        hidden_dim = next(iter(vlm_embeds_map.values()))[0].shape[-1]
-        padded: List[mx.array] = []
-        for uid in uids:
-            if uid not in vlm_embeds_map:
-                # Text-only request in a mixed batch should not happen
-                # (VLM/text batches are separated in _schedule_waiting),
-                # but handle gracefully with zero embeddings.
-                padded.append(mx.zeros((1, max_length, hidden_dim)))
-                continue
-            embeds, _, start_offset = vlm_embeds_map[uid]
-            embeds = embeds[:, start_offset:]  # skip cached portion
-            pad_len = max_length - embeds.shape[1]
-            if pad_len > 0:
-                pad = mx.zeros((1, pad_len, hidden_dim))
-                padded.append(mx.concatenate([pad, embeds], axis=1))
-            else:
-                padded.append(embeds[:, :max_length])
 
-        batched = mx.concatenate(padded, axis=0)
-        batched_extra = self._batch_vlm_extra_kwargs(
-            vlm_embeds_map, uids, max_length, "left"
-        )
-        return batched, batched_extra
+def _vlm_extra_seq_slice(val: mx.array, s: slice) -> mx.array:
+    """Slice a VLM extra tensor along its seq dimension.
 
-    def _build_right_padded_vlm_batch(
-        self,
-        vlm_embeds_map: Dict[int, Tuple[mx.array, Dict[str, Any], int]],
-        uids: List[int],
-        lengths: List[int],
-        max_length: int,
-    ) -> Tuple[Optional[mx.array], Optional[Dict[str, Any]]]:
-        """Build right-padded VLM embeddings batch matching token right-padding."""
-        if not vlm_embeds_map:
-            return None, None
-
-        hidden_dim = next(iter(vlm_embeds_map.values()))[0].shape[-1]
-        padded: List[mx.array] = []
-        for uid in uids:
-            if uid not in vlm_embeds_map:
-                padded.append(mx.zeros((1, max_length, hidden_dim)))
-                continue
-            embeds, _, start_offset = vlm_embeds_map[uid]
-            embeds = embeds[:, start_offset:]  # skip cached portion
-            pad_len = max_length - embeds.shape[1]
-            if pad_len > 0:
-                pad = mx.zeros((1, pad_len, hidden_dim))
-                padded.append(mx.concatenate([embeds, pad], axis=1))
-            else:
-                padded.append(embeds[:, :max_length])
-
-        batched = mx.concatenate(padded, axis=0)
-        batched_extra = self._batch_vlm_extra_kwargs(
-            vlm_embeds_map, uids, max_length, "right"
-        )
-        return batched, batched_extra
-
-    @staticmethod
-    def _batch_vlm_extra_kwargs(
-        vlm_embeds_map: Dict[int, Tuple[mx.array, Dict[str, Any], int]],
-        uids: List[int],
-        max_length: int,
-        pad_side: str,
-    ) -> Optional[Dict[str, Any]]:
-        """Batch model-specific VLM kwargs (position_ids, attention_mask, etc.).
-
-        For tensor kwargs: pad and concatenate along batch dim.
-        For scalar kwargs: use shared value if all identical, else skip.
-        Returns None if no extra kwargs or if heterogeneous (can't batch).
-        """
-        all_keys: set = set()
-        for uid in uids:
-            if uid not in vlm_embeds_map:
-                continue
-            _, extra_kw, _ = vlm_embeds_map[uid]
-            all_keys.update(extra_kw.keys())
-        if not all_keys:
-            return None
-
-        batched: Dict[str, Any] = {}
-        for key in all_keys:
-            values: List[Any] = []
-            for uid in uids:
-                if uid not in vlm_embeds_map:
-                    return None  # mixed VLM/text → can't batch extras
-                _, extra_kw, start_offset = vlm_embeds_map[uid]
-                val = extra_kw.get(key)
-                if val is None:
-                    return None  # heterogeneous → skip batching
-                if isinstance(val, mx.array) and val.ndim >= 2:
-                    if val.ndim >= 3:
-                        # 3D+ tensors (e.g. mRoPE position_ids (3,1,seq)):
-                        # seq is last axis, batch is axis 1.
-                        val = val[..., start_offset:]
-                        pad_len = max_length - val.shape[-1]
-                        if pad_len > 0:
-                            pad_shape = val.shape[:-1] + (pad_len,)
-                            pad = mx.zeros(pad_shape, dtype=val.dtype)
-                            if pad_side == "left":
-                                val = mx.concatenate([pad, val], axis=-1)
-                            else:
-                                val = mx.concatenate([val, pad], axis=-1)
-                        else:
-                            val = val[..., :max_length]
-                    else:
-                        # 2D tensors (batch, seq): existing behavior.
-                        val = val[:, start_offset:]
-                        pad_len = max_length - val.shape[1]
-                        if pad_len > 0:
-                            pad = mx.zeros_like(
-                                mx.zeros(
-                                    (val.shape[0], pad_len) + val.shape[2:]
-                                )
-                            )
-                            if pad_side == "left":
-                                val = mx.concatenate([pad, val], axis=1)
-                            else:
-                                val = mx.concatenate([val, pad], axis=1)
-                        else:
-                            val = val[:, :max_length]
-                values.append(val)
-
-            if all(isinstance(v, mx.array) for v in values):
-                # For 3D+ tensors, batch dim is axis 1; for 2D, axis 0.
-                concat_axis = 1 if values[0].ndim >= 3 else 0
-                batched[key] = mx.concatenate(values, axis=concat_axis)
-            else:
-                # Scalar values: use if all identical
-                if len(set(str(v) for v in values)) == 1:
-                    batched[key] = values[0]
-                else:
-                    return None  # heterogeneous scalars → can't batch
-
-        return batched if batched else None
+    Standard layout (batch=1, seq, ...): seq at dim 1.
+    Special layout (e.g. mRoPE (3, batch, seq)): seq at last dim.
+    """
+    if val.ndim >= 3 and val.shape[0] == 1:
+        return val[:, s]
+    if val.ndim >= 3:
+        return val[..., s]
+    return val[:, s]
 
 
 def _slice_vlm_extra(
@@ -1016,10 +273,8 @@ def _slice_vlm_extra(
     """Slice VLM extra kwargs to first n tokens along seq dimension."""
     sliced: Dict[str, Any] = {}
     for key, val in extra.items():
-        if isinstance(val, mx.array) and val.ndim >= 3:
-            sliced[key] = val[..., :n]
-        elif isinstance(val, mx.array) and val.ndim == 2:
-            sliced[key] = val[:, :n]
+        if isinstance(val, mx.array) and val.ndim >= 2:
+            sliced[key] = _vlm_extra_seq_slice(val, slice(None, n))
         else:
             sliced[key] = val
     return sliced
@@ -1031,10 +286,8 @@ def _advance_vlm_extra(
     """Advance VLM extra kwargs past first n tokens along seq dimension."""
     advanced: Dict[str, Any] = {}
     for key, val in extra.items():
-        if isinstance(val, mx.array) and val.ndim >= 3:
-            advanced[key] = val[..., n:]
-        elif isinstance(val, mx.array) and val.ndim == 2:
-            advanced[key] = val[:, n:]
+        if isinstance(val, mx.array) and val.ndim >= 2:
+            advanced[key] = _vlm_extra_seq_slice(val, slice(n, None))
         else:
             advanced[key] = val
     return advanced
@@ -1072,6 +325,7 @@ class SchedulerConfig:
     # When paged_ssd_cache_dir is set, oMLX stores KV cache on paged SSD for prefix reuse.
     # When None, no oMLX caching (mlx-lm BatchGenerator manages KV internally).
     paged_ssd_cache_dir: Optional[str] = None  # Path for paged SSD cache storage (None = disabled)
+    hot_cache_only: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
 
@@ -1187,7 +441,13 @@ class Scheduler:
             config: Scheduler configuration
         """
         self.model = model
-        self.tokenizer = tokenizer
+        # Deep-copy the tokenizer so the scheduler owns an independent Rust
+        # tokenizer backend.  Without this, concurrent access from the asyncio
+        # event loop (encode/apply_chat_template in engine handlers) and the
+        # MLX executor thread (scheduler.step) causes
+        # "RuntimeError: Already borrowed" from the HuggingFace tokenizers
+        # Rust RefCell.  See: https://github.com/huggingface/tokenizers/issues/537
+        self.tokenizer = copy.deepcopy(tokenizer)
         self.config = copy.copy(config) if config else SchedulerConfig()
 
         # Load additional EOS tokens from generation_config.json.
@@ -1204,6 +464,7 @@ class Scheduler:
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: Optional[float] = None
+        self._turboquant_skip_last: bool = True
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -1289,13 +550,12 @@ class Scheduler:
         # NOTE: No pooling - each request gets a fresh instance to prevent state contamination
         self._request_detokenizers: Dict[str, Any] = {}  # request_id → active detokenizer
 
-        # Harmony model support (gpt-oss)
-        self._harmony_parser: Optional["HarmonyStreamingParser"] = None
+        # Protocol-specific output parser support (e.g. Harmony, Gemma 4)
+        self._output_parser_factory: Optional["OutputParserFactory"] = None
+        self._output_parser_kind: Optional[str] = None
+        self._output_parser_sessions: Dict[str, "OutputParserSession"] = {}
         self._is_harmony_model: bool = False
-        self._harmony_parsers: Dict[str, "HarmonyStreamingParser"] = {}  # Per-request parsers
-        self._harmony_stop_tokens: Optional[Set[int]] = None  # Cached stop tokens
-        if HAS_HARMONY_ADAPTER and is_harmony_model is not None:
-            # Check if model uses Harmony format
+        if HAS_OUTPUT_PARSER and detect_output_parser is not None:
             try:
                 model_config = None
                 if hasattr(model, 'config'):
@@ -1321,18 +581,24 @@ class Scheduler:
                     except Exception as e:
                         logger.debug(f"Failed to extract model.args: {e}")
 
-                if is_harmony_model(self.config.model_name, model_config):
-                    self._is_harmony_model = True
-                    # Cache Harmony stop tokens to avoid creating temporary parsers
-                    temp_parser = HarmonyStreamingParser(self.tokenizer)
-                    self._harmony_stop_tokens = temp_parser.get_stop_token_ids()
+                self._output_parser_factory = detect_output_parser(
+                    self.config.model_name,
+                    self.tokenizer,
+                    model_config,
+                )
+                if self._output_parser_factory is not None:
+                    self._output_parser_kind = self._output_parser_factory.kind
+                    self._is_harmony_model = self._output_parser_kind == "harmony"
                     logger.info(
-                        f"Harmony model detected: {self.config.model_name}, "
-                        f"stop_tokens={self._harmony_stop_tokens}, "
-                        "streaming parser will be used for each request"
+                        "Output parser detected: %s for %s, stop_tokens=%s",
+                        self._output_parser_kind,
+                        self.config.model_name,
+                        sorted(self._output_parser_factory.stop_token_ids),
                     )
             except Exception as e:
-                logger.warning(f"Error detecting Harmony model: {e}, assuming non-Harmony")
+                logger.warning(f"Error detecting output parser: {e}, assuming none")
+                self._output_parser_factory = None
+                self._output_parser_kind = None
                 self._is_harmony_model = False
 
         # Statistics
@@ -1347,8 +613,17 @@ class Scheduler:
         # IOKit's asynchronous completeMemory() callbacks, causing
         # 'prepare count underflow' kernel panics. Deferring the clear
         # by a few generation steps gives IOKit time to process callbacks.
-        # None = no deferred clear pending; int = steps since last finish.
-        self._deferred_clear_steps: Optional[int] = None
+        #
+        # Stored as the absolute step number at which the clear should fire,
+        # rather than a countdown integer.  This avoids the burst-completion
+        # bug (#557): with max_num_seqs > 1 two requests can finish in the
+        # same batch.  The old "only set if None" guard meant the second
+        # completion never extended the window, so the first request's KV
+        # cache blocks could be re-allocated before IOKit finished its
+        # completeMemory() callbacks.  Using max() ensures the window always
+        # covers the *latest* completion.
+        # None = no deferred clear pending; int = step at which to fire.
+        self._deferred_clear_at: Optional[int] = None
 
         # Cache XTC special tokens (newline + EOS) — stable per tokenizer.
         # Must be after _is_harmony_model / _generation_config_eos init
@@ -1612,32 +887,14 @@ class Scheduler:
         if self._generation_config_eos is not None:
             stop_tokens.update(self._generation_config_eos)
 
-        # Add Harmony stop tokens for gpt-oss models (use cached tokens)
-        if self._is_harmony_model and self._harmony_stop_tokens:
-            stop_tokens.update(self._harmony_stop_tokens)
+        # Add protocol-specific stop tokens (e.g. Harmony action stops)
+        if self._output_parser_factory is not None:
+            stop_tokens.update(self._output_parser_factory.stop_token_ids)
 
         return stop_tokens
 
-    def _update_stop_tokens(self):
-        """
-        Update BatchGenerator.stop_tokens to union of all running requests.
-
-        This prevents stop token pollution where tokens from completed requests
-        persist and affect new requests.
-        """
-        if self.batch_generator is None:
-            return
-
-        # Start with base stop tokens from tokenizer
-        stop_tokens = self._get_stop_tokens()
-
-        # Add custom stop tokens from all currently running requests
-        for request in self.running.values():
-            if request.sampling_params.stop_token_ids:
-                stop_tokens.update(request.sampling_params.stop_token_ids)
-
-        # Update BatchGenerator's stop tokens
-        self.batch_generator.stop_tokens = stop_tokens
+    # _update_stop_tokens deleted — per-request stop tokens are now
+    # handled via SequenceStateMachine passed to insert().
 
     def _get_detokenizer(self, request_id: str):
         """Get or create a streaming detokenizer for a request.
@@ -1672,52 +929,22 @@ class Scheduler:
         detok = self._request_detokenizers.pop(request_id, None)
         # Let GC collect - no pooling to prevent state contamination
 
-    def _get_harmony_parser(self, request_id: str) -> Optional["HarmonyStreamingParser"]:
-        """Get or create a Harmony parser for a request.
-
-        Each request gets its own parser instance to maintain independent state.
-        """
-        if not self._is_harmony_model or not HAS_HARMONY_ADAPTER:
+    def _get_output_parser_session(
+        self, request_id: str
+    ) -> Optional["OutputParserSession"]:
+        """Get or create a protocol-specific output parser session."""
+        if self._output_parser_factory is None:
             return None
 
-        if request_id not in self._harmony_parsers:
-            self._harmony_parsers[request_id] = HarmonyStreamingParser(self.tokenizer)
-        return self._harmony_parsers[request_id]
+        if request_id not in self._output_parser_sessions:
+            self._output_parser_sessions[request_id] = (
+                self._output_parser_factory.create_session(self.tokenizer)
+            )
+        return self._output_parser_sessions[request_id]
 
-    def _get_harmony_detokenizer(self, request_id: str) -> Any:
-        """Get or create a streaming detokenizer for Harmony.
-
-        Uses a single detokenizer per request since we process tokens sequentially.
-        For final channel where stream_token == visible_token, we decode once
-        and reuse the result.
-
-        This ensures proper UTF-8 handling for multi-byte characters.
-        """
-        key = f"{request_id}_harmony"
-
-        if key not in self._request_detokenizers:
-            if NaiveStreamingDetokenizer is not None:
-                detok = NaiveStreamingDetokenizer(self.tokenizer)
-            elif hasattr(self.tokenizer, 'detokenizer'):
-                detok = self.tokenizer.detokenizer
-            else:
-                return None
-
-            detok.reset()
-            self._request_detokenizers[key] = detok
-
-        return self._request_detokenizers.get(key)
-
-    def _cleanup_harmony_parser(self, request_id: str):
-        """Clean up Harmony parser and detokenizer for a finished request."""
-        parser = self._harmony_parsers.pop(request_id, None)
-        if parser is not None:
-            try:
-                # Ensure parser is finalized before cleanup
-                parser.finalize()
-            except Exception as e:
-                logger.debug(f"Error finalizing Harmony parser for {request_id}: {e}")
-        self._request_detokenizers.pop(f"{request_id}_harmony", None)
+    def _cleanup_output_parser_session(self, request_id: str):
+        """Remove any per-request protocol parser session."""
+        self._output_parser_sessions.pop(request_id, None)
 
     def _get_xtc_special_tokens(self) -> list[int]:
         """Get special tokens to exclude from XTC sampling (newline + EOS).
@@ -1731,7 +958,7 @@ class Scheduler:
 
     def _create_batch_generator(self, sampling_params: SamplingParams) -> BatchGenerator:
         """Create a BatchGenerator with the given sampling parameters."""
-        sampler = make_sampler(
+        sampler = omlx_make_sampler(
             temp=sampling_params.temperature,
             top_p=sampling_params.top_p,
             min_p=sampling_params.min_p,
@@ -1754,35 +981,23 @@ class Scheduler:
             else None,
         )
 
-        stop_tokens = self._get_stop_tokens()
-        # Add custom stop token IDs
+        # Convert stop tokens from Set[int] to Sequence[Sequence[int]]
+        # for the new BatchGenerator API (each stop token is a sequence).
+        stop_tokens_set = self._get_stop_tokens()
         if sampling_params.stop_token_ids:
-            stop_tokens.update(sampling_params.stop_token_ids)
+            stop_tokens_set.update(sampling_params.stop_token_ids)
+        stop_tokens_seq = [[t] for t in stop_tokens_set] if stop_tokens_set else None
 
-        bg = _BoundarySnapshotBatchGenerator(
+        bg = BatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
-            stop_tokens=stop_tokens,
+            stop_tokens=stop_tokens_seq,
             sampler=sampler,
             logits_processors=logits_processors if logits_processors else None,
             prefill_batch_size=1,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
-            prompt_progress_callback=self._on_prompt_progress,
-            boundary_block_size=self.config.paged_cache_block_size,
-            prefill_boundary_callback=(
-                self._on_prefill_boundary_snapshot
-                if self.block_aware_cache is not None
-                else None
-            ),
-            abort_check_callback=self._check_pending_aborts_for_uids,
         )
-        bg._memory_limit_bytes = self._memory_limit_bytes
-        bg._memory_hard_limit_bytes = self._memory_hard_limit_bytes
-
-        # TurboQuant KV cache: propagate bits setting from Scheduler config
-        if hasattr(self, "_turboquant_kv_bits") and self._turboquant_kv_bits is not None:
-            bg._turboquant_kv_bits = self._turboquant_kv_bits
 
         return bg
 
@@ -1814,11 +1029,373 @@ class Scheduler:
                 model_id=model_id,
             )
 
+    # ------------------------------------------------------------------
+    # External prefill (composition pattern — replaces _process_prompts)
+    # ------------------------------------------------------------------
+
+    def _apply_turboquant_kv_empty(self, prompt_cache: List[Any]) -> None:
+        """Replace KVCache with empty TurboQuantKVCache before prefill.
+
+        NOTE: Not currently called -- see #771. Kept for future use when
+        TurboQuantKVCache implements merge()/maybe_trim_front().
+
+        Tokens are quantized on the fly during update_and_fetch, avoiding
+        the peak memory spike from storing full-precision KV then converting.
+        Skips the last KVCache layer if turboquant_skip_last is set.
+        """
+        from mlx_vlm.turboquant import TurboQuantKVCache
+        from mlx_lm.models.cache import KVCache, CacheList
+
+        kv_indices = [i for i, c in enumerate(prompt_cache) if isinstance(c, KVCache)]
+        skip_last = self._turboquant_skip_last and len(kv_indices) > 1
+        last_kv_idx = kv_indices[-1] if skip_last else -1
+
+        converted = 0
+        bits = float(self._turboquant_kv_bits)
+        for i, cache_obj in enumerate(prompt_cache):
+            if isinstance(cache_obj, KVCache):
+                if i == last_kv_idx:
+                    continue
+                prompt_cache[i] = TurboQuantKVCache(bits=bits)
+                converted += 1
+            elif isinstance(cache_obj, CacheList):
+                new_caches = []
+                for c in cache_obj.caches:
+                    if isinstance(c, KVCache):
+                        new_caches.append(TurboQuantKVCache(bits=bits))
+                        converted += 1
+                    else:
+                        new_caches.append(c)
+                cache_obj.caches = tuple(new_caches)
+        if converted > 0:
+            skip_msg = ", skipped last KVCache layer" if skip_last else ""
+            logger.info(
+                f"TurboQuant: {converted}/{len(prompt_cache)} "
+                f"cache layers set to {bits}-bit{skip_msg}"
+            )
+
+    def _apply_turboquant_kv_convert(self, prompt_cache: List[Any]) -> None:
+        """Convert existing KVCache data to TurboQuantKVCache via from_cache().
+
+        NOTE: Not currently called -- see #771. Kept for future use when
+        TurboQuantKVCache implements merge()/maybe_trim_front().
+
+        Used when an existing cache is provided (e.g. from SSD prefix cache).
+        Uses from_cache() to quantize the existing KV data.
+        """
+        from mlx_vlm.turboquant import TurboQuantKVCache
+        from mlx_lm.models.cache import KVCache, CacheList
+
+        kv_indices = [i for i, c in enumerate(prompt_cache) if isinstance(c, KVCache)]
+        skip_last = self._turboquant_skip_last and len(kv_indices) > 1
+        last_kv_idx = kv_indices[-1] if skip_last else -1
+
+        converted = 0
+        bits = float(self._turboquant_kv_bits)
+        for i, cache_obj in enumerate(prompt_cache):
+            if isinstance(cache_obj, KVCache):
+                if i == last_kv_idx:
+                    continue
+                prompt_cache[i] = TurboQuantKVCache.from_cache(cache_obj, bits=bits)
+                converted += 1
+            elif isinstance(cache_obj, CacheList):
+                new_caches = []
+                for c in cache_obj.caches:
+                    if isinstance(c, KVCache):
+                        new_caches.append(TurboQuantKVCache.from_cache(c, bits=bits))
+                        converted += 1
+                    else:
+                        new_caches.append(c)
+                cache_obj.caches = tuple(new_caches)
+        if converted > 0:
+            skip_msg = ", skipped last KVCache layer" if skip_last else ""
+            logger.info(
+                f"TurboQuant: converted {converted}/{len(prompt_cache)} "
+                f"cache layers to {bits}-bit{skip_msg}"
+            )
+
+    def _do_external_prefill(
+        self,
+        request: "Request",
+        tokens: List[int],
+        existing_cache: Optional[List[Any]],
+        vlm_embeds: Optional[Tuple[mx.array, Dict[str, Any], int]] = None,
+    ) -> Tuple[List[Any], List[int]]:
+        """Run prefill externally (outside BatchGenerator) for a single request.
+
+        Processes tokens[0:N-1] through the model. The last token tokens[N-1]
+        is NOT processed here — it will be passed to BatchGenerator.insert()
+        so that the first decode step produces the correct logit.
+
+        Args:
+            request: The request being prefilled.
+            tokens: Full token list to prefill.
+            existing_cache: Restored cache from paged SSD (or None).
+            vlm_embeds: Optional (inputs_embeds, extra_kwargs, start_offset)
+                tuple for VLM requests.
+
+        Returns:
+            (prefilled_cache, last_token_list) where last_token_list contains
+            the single last token to pass to insert().
+
+        Raises:
+            _PrefillAbortedError: If prefill is interrupted by a pending abort.
+            RuntimeError: If memory limit exceeded during prefill.
+        """
+        n_tokens = len(tokens)
+        if n_tokens <= 1:
+            # Nothing to prefill, return cache + tokens as-is
+            cache = existing_cache or make_prompt_cache(self.model)
+            # NOTE: Do NOT apply TurboQuant here. TurboQuantKVCache does not
+            # support merge(), which is called by _merge_caches() inside
+            # BatchGenerator when insert() creates a PromptProcessingBatch.
+            # TurboQuant conversion must happen inside BatchGenerator after
+            # the batch cache is created, not on individual per-request caches.
+            return cache, tokens
+
+        # Create or reuse cache
+        if existing_cache is not None:
+            prompt_cache = existing_cache
+        else:
+            prompt_cache = make_prompt_cache(self.model)
+
+        # NOTE: TurboQuant conversion is NOT applied during external prefill.
+        # TurboQuantKVCache does not support merge() or maybe_trim_front(),
+        # so passing it to insert() would fail in _merge_caches() or cause
+        # AttributeError in chunked-attention models (e.g. Llama-4-Scout).
+        # Additionally, on-the-fly quantization during prefill causes
+        # precision loss that corrupts hidden states across layers (#771).
+        # Prefill runs with standard KVCache; TurboQuant quantization
+        # happens inside BatchGenerator during the decode phase.
+
+        # Clear stale mRoPE position state for text-only requests.
+        if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
+            self.model.clear_vlm_position_state()
+
+        # Boundary snapshot setup
+        block_size = self.config.paged_cache_block_size
+        boundary_enabled = (
+            block_size > 0
+            and self.block_aware_cache is not None
+            and _prompt_cache_needs_snapshots(prompt_cache)
+        )
+        all_boundaries = boundary_enabled  # always stop at every boundary for hybrid models
+        base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
+        # Sanity check: base_size from cache offsets should match the number
+        # of tokens actually cached. A mismatch indicates stale meta_state
+        # in a restored RotatingKVCache (e.g. shared layer_meta_states from
+        # an earlier store_cache bug). Use cached_tokens which is always
+        # derived from block_table.num_tokens and therefore trustworthy.
+        if boundary_enabled and hasattr(request, "cached_tokens") and request.cached_tokens > 0:
+            if base_size != request.cached_tokens:
+                logger.debug(
+                    "Cache base_size mismatch: computed %d, expected %d "
+                    "(cached_tokens). Using cached_tokens for boundary "
+                    "alignment.",
+                    base_size,
+                    request.cached_tokens,
+                )
+                base_size = request.cached_tokens
+
+        # Prepare VLM embeddings for prefill
+        embeds_array: Optional[mx.array] = None
+        extra_kwargs: Optional[Dict[str, Any]] = None
+        if vlm_embeds is not None:
+            embeds_array, extra_kwargs, start_offset = vlm_embeds
+            embeds_array = embeds_array[:, start_offset:]  # skip cached portion
+            if start_offset > 0 and extra_kwargs:
+                extra_kwargs = _advance_vlm_extra(extra_kwargs, start_offset)
+            # Force _position_ids path in language model for cached VLM
+            # prefill. Without this, the delta approach gives sequential
+            # positions to image tokens that need 3D mRoPE positions.
+            # Setting _rope_deltas=None makes the language model use
+            # _position_ids (set by get_input_embeddings) instead.
+            # Saved and restored after prefill for decode rope_deltas capture.
+            # Only applies to mRoPE VLMs (Qwen2-VL, Qwen2.5-VL, GLM-4V, etc.);
+            # non-mRoPE VLMs like Gemma 4 have no _rope_deltas attribute.
+            _saved_rope_deltas = None
+            if start_offset > 0:
+                lm = getattr(self.model, "_language_model", None)
+                if lm is not None and hasattr(lm, "_rope_deltas"):
+                    _saved_rope_deltas = lm._rope_deltas
+                    lm._rope_deltas = None
+
+        # Prefill tokens[0:N-1] (leave last token for insert())
+        prefill_tokens = tokens[:-1]
+        last_token = tokens[-1:]
+        total_length = len(tokens)
+
+        input_arr = mx.array(prefill_tokens)[None]  # (1, seq_len)
+        processed_tokens = 0
+        prefill_step_size = self.config.prefill_step_size
+        uid = self.request_id_to_uid.get(request.request_id)
+
+        emitted_boundaries: Dict[int, int] = {}
+
+        while input_arr.shape[1] > 0:
+            remaining = input_arr.shape[1]
+            n_to_process = min(prefill_step_size, remaining)
+
+            # Boundary-limited step size
+            if boundary_enabled and block_size > 0:
+                current_total = base_size + processed_tokens
+                next_boundary = ((current_total // block_size) + 1) * block_size
+                target_boundary_prefill = next_boundary - base_size
+                delta = target_boundary_prefill - processed_tokens
+                if delta > 0:
+                    n_to_process = min(n_to_process, delta)
+                n_to_process = max(1, n_to_process)
+
+            model_kwargs: Dict[str, Any] = {}
+            if embeds_array is not None and embeds_array.shape[1] > 0:
+                model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
+                if extra_kwargs:
+                    model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
+                        extra_kwargs, n_to_process
+                    )
+
+            self.model(
+                input_arr[:, :n_to_process], cache=prompt_cache, **model_kwargs
+            )
+            mx.eval([c.state for c in prompt_cache])
+
+            input_arr = input_arr[:, n_to_process:]
+            if embeds_array is not None:
+                embeds_array = embeds_array[:, n_to_process:]
+                if extra_kwargs:
+                    extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
+            processed_tokens += n_to_process
+
+            # Progress callback
+            if uid is not None:
+                self._on_prompt_progress(
+                    [(uid, processed_tokens, total_length)]
+                )
+
+            # Boundary snapshot emission
+            if boundary_enabled:
+                total_tokens = base_size + processed_tokens
+                if (
+                    total_tokens > 0
+                    and total_tokens % block_size == 0
+                    and emitted_boundaries.get(request.request_id, -1) < total_tokens
+                ):
+                    self._emit_prefill_boundary_snapshot(
+                        request, prompt_cache, total_tokens
+                    )
+                    emitted_boundaries[request.request_id] = total_tokens
+
+            # Memory monitoring
+            if self._memory_limit_bytes > 0:
+                active = mx.get_active_memory()
+                if (
+                    self._memory_hard_limit_bytes > 0
+                    and active > self._memory_hard_limit_bytes
+                ):
+                    logger.warning(
+                        f"Prefill force-stopped at {processed_tokens} "
+                        f"tokens: memory {active / 1024**3:.1f}GB "
+                        f"exceeds hard limit "
+                        f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
+                    )
+                    raise RuntimeError("Memory limit exceeded during prefill")
+                elif active > self._memory_limit_bytes:
+                    logger.warning(
+                        f"Prefill memory soft limit exceeded at "
+                        f"{processed_tokens} tokens: "
+                        f"{active / 1024**3:.1f}GB > "
+                        f"{self._memory_limit_bytes / 1024**3:.1f}GB "
+                        f"(hard limit: "
+                        f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
+                    )
+
+            # Check for pending aborts between prefill chunks.
+            abort_uids = self._check_pending_aborts_for_uids(
+                [uid] if uid is not None else []
+            )
+            if abort_uids:
+                logger.info(
+                    f"Prefill interrupted at {processed_tokens}/"
+                    f"{total_length} tokens: "
+                    f"{len(abort_uids)} request(s) aborted"
+                )
+                raise _PrefillAbortedError(abort_uids, processed_tokens)
+
+            # Reclaim Metal intermediates between prefill chunks.
+            _sync_and_clear_cache()
+
+        # Emit final boundary snapshot if prompt lands exactly on boundary.
+        if boundary_enabled:
+            total_tokens = base_size + processed_tokens
+            if (
+                total_tokens > 0
+                and total_tokens % block_size == 0
+                and emitted_boundaries.get(request.request_id, -1) < total_tokens
+            ):
+                self._emit_prefill_boundary_snapshot(
+                    request, prompt_cache, total_tokens
+                )
+
+        _sync_and_clear_cache()
+
+        # Restore _rope_deltas after cached VLM prefill (for decode capture)
+        if vlm_embeds is not None and _saved_rope_deltas is not None:
+            self.model._language_model._rope_deltas = _saved_rope_deltas
+
+        return prompt_cache, last_token
+
+    def _build_state_machine(self, request: "Request") -> SequenceStateMachine:
+        """Build a SequenceStateMachine for per-request stop tokens.
+
+        Combines base stop tokens (EOS, Harmony) with request-specific
+        stop_token_ids into a single state machine that tells
+        BatchGenerator when to stop generating for this request.
+        """
+        stop_tokens_set = self._get_stop_tokens()
+        if request.sampling_params.stop_token_ids:
+            stop_tokens_set.update(request.sampling_params.stop_token_ids)
+
+        if stop_tokens_set:
+            # Each stop token is a single-element sequence.
+            transitions = {
+                "normal": [([t], None) for t in stop_tokens_set]
+            }
+            return SequenceStateMachine(transitions, initial="normal")
+        return SequenceStateMachine({}, initial="normal")
+
+    def _emit_prefill_boundary_snapshot(
+        self,
+        request: "Request",
+        prompt_cache: List[Any],
+        total_tokens: int,
+    ) -> None:
+        """Capture boundary snapshot from individual (non-batch) cache.
+
+        During external prefill we have direct access to per-layer cache
+        objects (not BatchKVCache). Extract non-sliceable layers for
+        boundary snapshot storage.
+        """
+        snapshot_cache = [
+            c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES else None
+            for c in prompt_cache
+        ]
+        self._on_prefill_boundary_snapshot(
+            self.request_id_to_uid.get(request.request_id, -1),
+            snapshot_cache,
+            total_tokens,
+        )
+
     def _build_sampler_and_processors(
         self, sampling_params: SamplingParams, request: Any = None
     ) -> Tuple[Callable[[mx.array], mx.array], List[Callable]]:
         """Build per-request sampler and logits processors."""
-        sampler = make_sampler(
+        # Use omlx.utils.sampling.make_sampler instead of mlx_lm.sample_utils.
+        # The mlx-lm version decorates categorical_sampling and apply_* with
+        # @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state),
+        # which fails to advance the RNG state after the first call in this
+        # server environment. Identical prompts then produce identical output
+        # even at temperature > 1.
+        sampler = omlx_make_sampler(
             temp=sampling_params.temperature,
             top_p=sampling_params.top_p,
             min_p=sampling_params.min_p,
@@ -1850,7 +1427,7 @@ class Scheduler:
             if think_end_ids:
                 from .api.thinking import ThinkingBudgetProcessor
 
-                think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+                think_start_id = self._get_think_token_id('think_start_id')
                 leading_ids, trailing_ids = self._resolve_think_close_pattern()
                 processor = ThinkingBudgetProcessor(
                     think_end_token_ids=think_end_ids,
@@ -1889,6 +1466,21 @@ class Scheduler:
 
         return resolve_vocab_size(self.model)
 
+    def _get_think_token_id(self, attr: str) -> int | None:
+        """Safely read a think token id from the tokenizer.
+
+        mlx-lm tokenizers expose ``think_start_id`` / ``think_end_id`` as
+        properties that may raise ``ValueError`` (multi-token sequence) or
+        ``TypeError`` (``_think_start_tokens`` is ``None`` for models without
+        thinking support, e.g. context-1 / harmony parser).
+
+        Returns the token id, or ``None`` when unavailable.
+        """
+        try:
+            return getattr(self.tokenizer, attr, None)
+        except (ValueError, TypeError):
+            return None
+
     def _resolve_think_end_token_ids(self) -> list[int] | None:
         """Resolve token ID(s) for the close-think tag.
 
@@ -1896,7 +1488,7 @@ class Scheduler:
         </think> and </longcat_think> automatically.
         """
         # Tier 1: mlx-lm tokenizer attribute (covers all known think variants)
-        think_end_id = getattr(self.tokenizer, 'think_end_id', None)
+        think_end_id = self._get_think_token_id('think_end_id')
         if think_end_id is not None:
             return [think_end_id]
 
@@ -2005,7 +1597,7 @@ class Scheduler:
         Returns False for disabled-thinking patterns like <think></think>
         where </think> immediately follows <think> in the prompt tail.
         """
-        think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+        think_start_id = self._get_think_token_id('think_start_id')
         if think_start_id is None:
             try:
                 think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
@@ -2155,22 +1747,29 @@ class Scheduler:
         """
         Determine whether boundary snapshots are needed for the current model.
 
-        This is evaluated lazily from the active batch cache structure.
+        Evaluated lazily by inspecting model.make_cache() output instead of
+        the active batch (which no longer exists in the new API).
         """
         if self._boundary_snapshot_required is not None:
             return self._boundary_snapshot_required
 
-        if self.batch_generator is None or self.batch_generator.active_batch is None:
+        if not hasattr(self.model, "make_cache"):
+            self._boundary_snapshot_required = False
             return False
 
-        batch_cache = getattr(self.batch_generator.active_batch, "cache", None)
-        if not batch_cache:
+        try:
+            cache_list = self.model.make_cache()
+        except Exception:
+            self._boundary_snapshot_required = False
+            return False
+
+        if not cache_list:
             self._boundary_snapshot_required = False
             return False
 
         self._boundary_snapshot_required = any(
             self._cache_tree_has_stateful_non_sliceable(layer_cache)
-            for layer_cache in batch_cache
+            for layer_cache in cache_list
         )
 
         if self._boundary_snapshot_required:
@@ -2187,40 +1786,29 @@ class Scheduler:
         return self._boundary_snapshot_required
 
     def _extract_boundary_snapshot(self, uid: int) -> Optional[List[Any]]:
-        """Extract a per-request prompt cache snapshot from the active batch."""
-        if self.batch_generator is None or self.batch_generator.active_batch is None:
-            return None
+        """Extract a per-request prompt cache snapshot via extract_cache().
 
-        batch = self.batch_generator.active_batch
-        uids = getattr(batch, "uids", None)
-        if not isinstance(uids, list):
-            return None
-
-        try:
-            idx = uids.index(uid)
-        except ValueError:
+        Uses BatchGenerator.extract_cache() which returns
+        Dict[uid, (cache_list, tokens_list)].
+        """
+        if self.batch_generator is None:
             return None
 
         try:
             # Synchronize pending generation_stream operations before
             # accessing batch cache tensors.
-            # BatchGenerator.next() uses mx.async_eval on generation_stream,
-            # and accessing the same batch.cache arrays from a different
-            # stream causes Metal command buffer conflicts.
             mx.synchronize(generation_stream)
-            # Keep extraction on generation_stream as well. ArraysCache layers
-            # can return tensor views that alias active batch buffers; creating
-            # and later evaluating those views on a different stream can still
-            # trigger Metal command buffer races.
             with mx.stream(generation_stream):
+                result = self.batch_generator.extract_cache([uid])
+                if uid not in result:
+                    return None
+                cache_list, _tokens = result[uid]
                 # Only extract non-sliceable layers to avoid costly
                 # deep-copy accumulation (same rationale as prefill path).
-                known = _BoundarySnapshotBatchGenerator._KNOWN_SLICEABLE
                 return [
-                    c.extract(idx)
-                    if type(c).__name__ not in known
+                    c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES
                     else None
-                    for c in batch.cache
+                    for c in cache_list
                 ]
         except Exception as e:
             logger.debug(f"Failed to extract boundary cache snapshot for uid={uid}: {e}")
@@ -2499,13 +2087,13 @@ class Scheduler:
                 pass
 
         normalized_len = int(normalized_keys.shape[2]) if len(normalized_keys.shape) >= 3 else 0
-        effective_offset = max(0, offset)
-        if max_size > 0 and effective_offset >= max_size:
-            normalized_idx = min(normalized_len, max_size)
-        elif effective_offset > 0:
-            normalized_idx = min(normalized_len, effective_offset)
-        else:
-            normalized_idx = min(normalized_len, max(0, idx))
+        # Force case 1 of _temporal_order: _idx == keys.shape[2] means the
+        # buffer is already in temporal order (which is exactly what the
+        # oversized trim above produces — the contiguous tail of the most
+        # recent tokens). Anything else lets _temporal_order re-slice the
+        # buffer in the rotated branch (case 2), which is wasted work and
+        # obscures the merge contract. See cache.py:431-447 for the branches.
+        normalized_idx = normalized_len
 
         normalized_meta = (
             str(keep),
@@ -2734,15 +2322,12 @@ class Scheduler:
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
             # Use paged cache
-            # Build extra_keys for VLM image hash prefix cache isolation
-            extra_keys = None
-            if request.vlm_image_hash:
-                extra_keys = (request.vlm_image_hash,)
-
             block_table, remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
                 request.prompt_token_ids,
-                extra_keys=extra_keys,
+                extra_keys=request.vlm_extra_keys_for_cache,
+                extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
             )
             if block_table and block_table.num_tokens > 0:
                 # Reconstruct actual KVCache objects from stored tensor data
@@ -2993,9 +2578,12 @@ class Scheduler:
                 except Exception as e:
                     logger.debug(f"SpecPrefill: draft cache store failed: {e}")
 
-            # Free draft cache from memory
+            # Free draft cache from memory.  Use _sync_and_clear_cache() so
+            # the generation_stream is drained before Metal buffers are
+            # returned to the pool — a bare mx.clear_cache() here can race
+            # with in-flight async evals and trigger a kernel panic (#557).
             del used_cache
-            mx.clear_cache()
+            _sync_and_clear_cache()
 
         except Exception as e:
             logger.error(f"SpecPrefill scoring failed, falling back to normal path: {e}")
@@ -3038,16 +2626,8 @@ class Scheduler:
             return False
 
     def _remove_uid_from_active_batch(self, uid: int) -> None:
-        """Remove UID from active batch safely on generation_stream."""
+        """Remove UID from BatchGenerator safely."""
         if self.batch_generator is None:
-            return
-
-        batch = self.batch_generator.active_batch
-        if batch is None:
-            return
-
-        batch_uids = getattr(batch, "uids", None)
-        if not isinstance(batch_uids, list) or uid not in batch_uids:
             return
 
         self.batch_generator.remove([uid])
@@ -3055,7 +2635,7 @@ class Scheduler:
     def _check_pending_aborts_for_uids(self, uids: List[int]) -> List[int]:
         """Return UIDs that have pending aborts.
 
-        Called from _process_prompts() during prefill to detect aborted
+        Called during prefill to detect aborted
         requests between chunks. GIL guarantees thread-safe reads of
         _pending_abort_ids from the executor thread.
         """
@@ -3120,17 +2700,15 @@ class Scheduler:
         # Remove from running (BatchGenerator)
         if request.request_id in self.request_id_to_uid:
             uid = self.request_id_to_uid[request.request_id]
-            # Clean up pending VLM embeddings not yet consumed by prefill.
-            if self.batch_generator is not None:
-                self.batch_generator._vlm_pending.pop(uid, None)
             # Synchronize in-flight GPU work before modifying batch state.
             # batch_generator.remove() triggers lazy KV cache array slicing
-            # (BatchKVCache.filter) that replaces references to arrays still
-            # used by in-flight Metal command buffers from the previous
-            # batch_generator.next() call.  Without this barrier the Metal
-            # driver can hit 'completeMemory() prepare count underflow'.
+            # that replaces references to arrays still used by in-flight
+            # Metal command buffers.  Without this barrier the Metal driver
+            # can hit 'completeMemory() prepare count underflow'.
             mx.synchronize(generation_stream)
             self._remove_uid_from_active_batch(uid)
+            if hasattr(self.model, "unregister_rope_delta"):
+                self.model.unregister_rope_delta(uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
 
@@ -3159,8 +2737,8 @@ class Scheduler:
         # Clean up streaming detokenizer to prevent state contamination
         self._cleanup_detokenizer(request_id)
 
-        # Clean up Harmony parser
-        self._cleanup_harmony_parser(request_id)
+        # Clean up protocol-specific output parser session
+        self._cleanup_output_parser_session(request_id)
 
         # Clean up VLM adapter state to prevent contamination
         if hasattr(self.model, 'clear_vlm_position_state'):
@@ -3199,11 +2777,11 @@ class Scheduler:
 
         Also returns True when a deferred Metal cache clear is pending,
         so that the engine loop keeps calling step() until the clear fires.
-        Without this, an idle server would never increment the deferred
-        counter and stale buffers would accumulate indefinitely.
+        Without this, an idle server would never reach the target step and
+        stale buffers would accumulate indefinitely.
         """
         return bool(self.waiting or self.running
-                     or self._deferred_clear_steps is not None)
+                     or self._deferred_clear_at is not None)
 
     def fail_all_requests(self) -> List[str]:
         """Remove all running and waiting requests after unrecoverable error.
@@ -3310,9 +2888,10 @@ class Scheduler:
         """
         Move requests from waiting queue to running.
 
-        Note: mlx-lm's _merge_caches has a bug where mixing cached and non-cached
-        requests causes TypeError. To work around this, we only schedule requests
-        with the same cache status (all with cache or all without) in a single batch.
+        Each request is prefilled externally before being inserted into
+        BatchGenerator, so prefill_batch_size=1 is always used. Cache
+        status homogeneity tracking is kept for safety since it affects
+        how we handle the existing_cache argument.
 
         Returns:
             Tuple of (scheduled requests, rejected error outputs)
@@ -3415,7 +2994,7 @@ class Scheduler:
                 )
                 break
 
-            # Check cache status homogeneity to avoid mlx-lm _merge_caches bug
+            # Check cache status homogeneity (kept for consistent prefill behavior)
             request_has_cache = cache_to_use is not None
             if batch_cache_status is None:
                 batch_cache_status = request_has_cache
@@ -3462,11 +3041,6 @@ class Scheduler:
                 )
                 continue
 
-            # Clear stale mRoPE position state to prevent position
-            # contamination from prior requests (VLM or text-only).
-            if hasattr(self.model, "clear_vlm_position_state"):
-                self.model.clear_vlm_position_state()
-
             # SpecPrefill: replace tokens with selected subset and pre-fill
             # cache via sparse_prefill before inserting into BatchGenerator.
             #
@@ -3479,8 +3053,8 @@ class Scheduler:
             # Position math:
             #   sparse_prefill: N' tokens, adjustment = M - N'
             #   We subtract 1: adjustment = M - N' - 1
-            #   BatchGenerator last token: pos = N' + (M - N' - 1) = M - 1 ✓
-            #   First gen token: pos = (N'+1) + (M - N' - 1) = M ✓
+            #   BatchGenerator last token: pos = N' + (M - N' - 1) = M - 1
+            #   First gen token: pos = (N'+1) + (M - N' - 1) = M
             if request.specprefill_indices is not None:
                 try:
                     from .patches.specprefill import (
@@ -3488,7 +3062,6 @@ class Scheduler:
                         _find_attention_layers, _get_attn_module,
                         _OffsetAdjustedRoPE,
                     )
-                    from mlx_lm.models.cache import make_prompt_cache
 
                     import time
                     t0 = time.monotonic()
@@ -3505,7 +3078,14 @@ class Scheduler:
                             self.model(sys_arr[:step][None], cache=sp_cache)
                             mx.eval([c.state for c in sp_cache])
                             sys_arr = sys_arr[step:]
-                            mx.clear_cache()
+                            # Use _sync_and_clear_cache() instead of bare
+                            # mx.clear_cache() to flush the generation_stream
+                            # before releasing Metal buffers.  A bare call here
+                            # can race with in-flight command buffers submitted
+                            # by the preceding mx.eval(), triggering the same
+                            # 'completeMemory() prepare count underflow' kernel
+                            # panic that #435 fixed elsewhere (#557).
+                            _sync_and_clear_cache()
                         if sys_arr.size > 0:
                             self.model(sys_arr[None], cache=sp_cache)
                             mx.eval([c.state for c in sp_cache])
@@ -3565,32 +3145,107 @@ class Scheduler:
                     request.specprefill_indices = None
                     # Fall through to normal prefill
 
-            # Insert into BatchGenerator with optional cache
+            # External prefill: process tokens[0:N-1] outside BatchGenerator.
+            # Only the last token goes to insert() for the first decode step.
+            # SpecPrefill already handled its own prefill above, so skip for those.
+            if request.specprefill_indices is None and len(tokens_to_process) > 1:
+                # Assign UID early so progress callbacks can map uid->request_id
+                # during external prefill. Use a temporary UID that will be replaced
+                # by the real one from insert().
+                temp_uid = id(request)  # unique, won't collide with BatchGenerator UIDs
+                self.request_id_to_uid[request.request_id] = temp_uid
+                self.uid_to_request_id[temp_uid] = request.request_id
+
+                vlm_embeds = None
+                if request.vlm_inputs_embeds is not None:
+                    vlm_embeds = (
+                        request.vlm_inputs_embeds,
+                        request.vlm_extra_kwargs or {},
+                        request.cached_tokens,
+                    )
+
+                prefilled_cache, last_token = self._do_external_prefill(
+                    request,
+                    tokens_to_process,
+                    cache_to_use,
+                    vlm_embeds=vlm_embeds,
+                )
+
+                # Clean up temp UID mapping
+                del self.uid_to_request_id[temp_uid]
+                del self.request_id_to_uid[request.request_id]
+
+                # Prefill complete: remove from progress tracker so dashboard
+                # shows "generating" instead of "PP" during decode.
+                from .prefill_progress import get_prefill_tracker
+
+                get_prefill_tracker().remove(request.request_id)
+
+                cache_to_use = prefilled_cache
+                tokens_to_process = last_token
+
+            # Capture per-request mRoPE rope_deltas for decode.
+            # Prefer _captured_rope_deltas from per-request extra_kwargs
+            # (set during get_input_embeddings), since the global
+            # _rope_deltas may be stale when explicit position_ids are used.
+            if request.vlm_inputs_embeds is not None:
+                extra = request.vlm_extra_kwargs or {}
+                captured = extra.get("_captured_rope_deltas")
+                if captured is not None:
+                    if hasattr(captured, "item"):
+                        request.rope_deltas = float(captured.item())
+                    else:
+                        request.rope_deltas = float(captured)
+                elif hasattr(self.model, "get_last_rope_deltas"):
+                    request.rope_deltas = self.model.get_last_rope_deltas()
+
+            # Build per-request state machine for stop tokens
+            sm = self._build_state_machine(request)
+
+            # Set random seed for reproducible generation (best-effort).
+            # This affects global MLX random state, so concurrent requests
+            # may interfere. Matches OpenAI's best-effort seed semantics.
+            if request.sampling_params.seed is not None:
+                mx.random.seed(request.sampling_params.seed)
+
+            # NOTE: TurboQuant KV conversion is not applied during prefill.
+            # See _do_external_prefill() comment for rationale (#771).
+
+            # Insert into BatchGenerator with pre-filled cache + last token.
+            # BatchGenerator only handles decode from here.
+            #
+            # IMPORTANT: ``logits_processors`` MUST be passed as a per-row
+            # list (possibly empty), never None.  mlx-lm's
+            # GenerationBatch._step does ``for p in self.logits_processors[e]``
+            # in any branch where ``any(self.logits_processors)`` is True
+            # (e.g., heterogeneous merge with another row that has a
+            # processor).  A None slot crashes that loop with
+            # ``TypeError: 'NoneType' object is not iterable``, which then
+            # bubbles into the engine retry loop and presents as a hang.
+            # See vllm-mlx-patched commit 8d4052b for the same root cause
+            # in a sibling project, and #934 for the user-visible symptom.
+            per_row_lps = list(logits_processors) if logits_processors else []
             uids = self.batch_generator.insert(
                 [tokens_to_process],
                 max_tokens=[request.sampling_params.max_tokens],
                 caches=[cache_to_use] if cache_to_use else None,
                 samplers=[sampler],
-                logits_processors=[logits_processors],
+                logits_processors=[per_row_lps],
+                state_machines=[sm],
             )
 
             if uids:
                 uid = uids[0]
-
-                # Store VLM embeddings per-UID for batched prefill.
-                # _process_prompts() will collect these and build a padded batch.
-                if request.vlm_inputs_embeds is not None:
-                    self.batch_generator._vlm_pending[uid] = (
-                        request.vlm_inputs_embeds,
-                        request.vlm_extra_kwargs or {},
-                        request.cached_tokens,
-                    )
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
                 request.batch_uid = uid
                 request.status = RequestStatus.RUNNING
                 self.running[request.request_id] = request
                 scheduled.append(request)
+
+                # Register per-UID rope_delta for mRoPE decode.
+                if hasattr(self.model, "register_rope_delta"):
+                    self.model.register_rope_delta(uid, request.rope_deltas)
 
                 self.total_prompt_tokens += request.num_prompt_tokens
                 cache_info = f", {request.cached_tokens} cached" if request.cached_tokens > 0 else ""
@@ -3600,10 +3255,6 @@ class Scheduler:
                     f"with {len(tokens_to_process)} tokens to process "
                     f"({request.num_prompt_tokens} total){cache_info}, {cache_used}"
                 )
-
-        # Update stop tokens to reflect currently running requests
-        if scheduled:
-            self._update_stop_tokens()
 
         return scheduled, rejected_outputs
 
@@ -3645,57 +3296,30 @@ class Scheduler:
             # Only append token if not stopping due to EOS token
             new_text = ""
 
-            # Check if this request uses Harmony format
-            harmony_parser = self._get_harmony_parser(request_id)
+            # Check if this request uses a protocol-specific output parser
+            parser_session = self._get_output_parser_session(request_id)
 
-            if harmony_parser is not None:
-                # Harmony model: process token through parser
-                # Returns: (control_text, stream_token, visible_token, is_stop)
-                control_text, stream_token, visible_token, harmony_is_stop = (
-                    harmony_parser.process_token(response.token)
-                )
+            if parser_session is not None:
+                parser_result = parser_session.process_token(response.token)
+                new_text = parser_result.stream_text
+                if parser_result.visible_text:
+                    request.output_text += parser_result.visible_text
 
-                # Start with control text (e.g., <think>, </think>)
-                new_text = control_text
-
-                # Get Harmony detokenizer for proper UTF-8 handling
-                harmony_detok = self._get_harmony_detokenizer(request_id)
-
-                # Decode stream token if present
-                if stream_token is not None:
-                    if harmony_detok is not None:
-                        harmony_detok.add_token(stream_token)
-                        decoded_text = harmony_detok.last_segment
-                    else:
-                        # Fallback to single-token decode (may break UTF-8)
-                        decoded_text = self.tokenizer.decode([stream_token])
-
-                    new_text += decoded_text
-
-                    # For final channel, stream_token == visible_token
-                    # Reuse decoded text instead of decoding again
-                    if visible_token is not None:
-                        request.output_text += decoded_text
-                elif visible_token is not None:
-                    # This case shouldn't happen in current design but handle it
-                    if harmony_detok is not None:
-                        harmony_detok.add_token(visible_token)
-                        request.output_text += harmony_detok.last_segment
-                    else:
-                        request.output_text += self.tokenizer.decode([visible_token])
-
-                # Harmony stop token can override finish reason
-                if harmony_is_stop and not is_finished:
+                # Parser-defined stop token can override finish reason
+                if parser_result.is_stop and not is_finished:
                     is_finished = True
                     is_stop = True
 
-                # For Harmony, always track all tokens including stop tokens
-                # This is needed for tool call parsing (parse_tool_calls_from_tokens)
-                # which requires the complete token sequence including <|call|>/<|return|>
-                request.append_output_token(response.token)
+                should_record_token = (
+                    parser_result.record_token
+                    if parser_result.record_token is not None
+                    else not is_stop
+                )
+                if should_record_token:
+                    request.append_output_token(response.token)
 
             elif not is_stop:
-                # Non-Harmony: standard processing
+                # Standard processing without a protocol parser
                 request.append_output_token(response.token)
 
                 # Decode the new token using streaming detokenizer for proper UTF-8 handling
@@ -3708,8 +3332,8 @@ class Scheduler:
                     new_text = self.tokenizer.decode([response.token])
 
             # Prepend <think> tag for first chunk if this is a reasoning model
-            # (skip for Harmony models - parser handles <think> for analysis channel)
-            if harmony_parser is None and getattr(request, 'needs_think_prefix', False):
+            # (skip when a protocol parser already manages reasoning formatting)
+            if parser_session is None and getattr(request, 'needs_think_prefix', False):
                 if not getattr(request, 'think_prefix_sent', False):
                     think_tag = getattr(self.tokenizer, 'think_start', '<think>')
                     new_text = think_tag + "\n" + new_text
@@ -3749,43 +3373,23 @@ class Scheduler:
                 output.finish_reason = response.finish_reason
                 finished_ids.add(request_id)
 
-                if harmony_parser is not None:
-                    # Harmony: finalize parser and get any remaining stream output
-                    logger.info(
-                        f"Harmony finished: channel={harmony_parser.current_channel}, "
-                        f"output_text='{request.output_text[:100]}...'"
-                    )
-                    final_control = harmony_parser.finalize()
-                    if final_control:
-                        output.new_text += final_control
-
-                    # Finalize Harmony detokenizer to flush any remaining bytes
-                    harmony_detok = self._get_harmony_detokenizer(request_id)
-                    if harmony_detok is not None:
-                        harmony_detok.finalize()
-                        final_text = harmony_detok.last_segment
-                        if final_text:
-                            output.new_text += final_text
-                            # If we were in final channel, also add to output_text
-                            if harmony_parser.current_channel == "final":
-                                request.output_text += final_text
-
-                    # Extract tool calls using parse_tool_calls_from_tokens (non-streaming)
-                    if parse_tool_calls_from_tokens is not None:
-                        token_ids = list(request.output_token_ids)
-                        logger.info(
-                            f"Harmony parse_tool_calls_from_tokens: {len(token_ids)} tokens"
+                if parser_session is not None:
+                    final_result = parser_session.finalize()
+                    if final_result.stream_text:
+                        output.new_text += final_result.stream_text
+                    if final_result.visible_text:
+                        request.output_text += final_result.visible_text
+                    if final_result.output_text_prefix:
+                        request.output_text = (
+                            final_result.output_text_prefix + request.output_text
                         )
-                        _, tool_calls = parse_tool_calls_from_tokens(token_ids)
-                        logger.info(f"Harmony tool_calls extracted: {tool_calls}")
-                        if tool_calls:
-                            output.tool_calls = tool_calls
-                            output.finish_reason = "tool_calls"
-
-                    # For Harmony, output_text is already accumulated (final channel only)
+                    if final_result.tool_calls:
+                        output.tool_calls = final_result.tool_calls
+                    if final_result.finish_reason:
+                        output.finish_reason = final_result.finish_reason
                     output.output_text = request.output_text
                 else:
-                    # Non-Harmony: standard finalization
+                    # Standard finalization without a protocol parser
                     # Finalize detokenizer to flush any remaining bytes
                     detokenizer = self._get_detokenizer(request_id)
                     if detokenizer is not None:
@@ -3798,38 +3402,31 @@ class Scheduler:
                     output.output_text = self.tokenizer.decode(request.output_token_ids)
                     request.output_text = output.output_text
 
-                # Extract cache for future reuse
-                if hasattr(response, 'prompt_cache'):
+                # Extract cache for future reuse.
+                # In the new API, prompt_cache is a direct value (not callable).
+                raw_cache = getattr(response, 'prompt_cache', None)
+                if raw_cache is not None:
                     try:
-                        # prompt_cache may be callable or direct attribute
-                        if callable(response.prompt_cache):
-                            raw_cache = response.prompt_cache()
+                        # SpecPrefill: sparse KV data can't be stored in
+                        # paged cache (hash mismatch with full token IDs).
+                        if request.specprefill_indices is not None:
+                            raw_cache = None
+
+                        # For paged cache, extract actual tensor states
+                        # This allows cache to survive BatchGenerator recreation
+                        elif self.block_aware_cache is not None:
+                            extracted_cache, model_cache_config = self._extract_cache_states(raw_cache)
+                            if extracted_cache:
+                                request._extracted_cache = extracted_cache
+                                request._model_cache_config = model_cache_config
+                                logger.debug(
+                                    f"Extracted {len(extracted_cache)} layer states "
+                                    f"for request {request_id}"
+                                )
                         else:
-                            raw_cache = response.prompt_cache
-
-                        if raw_cache:
-                            # SpecPrefill: sparse KV data can't be stored in
-                            # paged cache (hash mismatch with full token IDs).
-                            # Prefix blocks from prior normal requests are
-                            # already in paged cache and unaffected.
-                            if request.specprefill_indices is not None:
-                                raw_cache = None
-
-                            # For paged cache, extract actual tensor states
-                            # This allows cache to survive BatchGenerator recreation
-                            elif self.block_aware_cache is not None:
-                                extracted_cache, model_cache_config = self._extract_cache_states(raw_cache)
-                                if extracted_cache:
-                                    request._extracted_cache = extracted_cache
-                                    request._model_cache_config = model_cache_config
-                                    logger.debug(
-                                        f"Extracted {len(extracted_cache)} layer states "
-                                        f"for request {request_id}"
-                                    )
-                            else:
-                                # Standard cache stores object references
-                                request._extracted_cache = raw_cache
-                                request._model_cache_config = None
+                            # Standard cache stores object references
+                            request._extracted_cache = raw_cache
+                            request._model_cache_config = None
                     except Exception as e:
                         logger.debug(f"Failed to extract cache for {request_id}: {e}")
 
@@ -3851,8 +3448,6 @@ class Scheduler:
         # Synchronize pending generation_stream operations before cache storage.
         # store_cache -> mx.save_safetensors triggers implicit mx.eval() which
         # can conflict with async Metal operations on the generation stream.
-        # This is needed even when active_batch is None, because _next() sets
-        # active_batch = None after mx.async_eval when all requests finish.
         if finished_ids:
             mx.synchronize(generation_stream)
 
@@ -3928,18 +3523,15 @@ class Scheduler:
                                         f"intermediate snapshots)"
                                     )
 
-                                # Build extra_keys for VLM image hash
-                                store_extra_keys = None
-                                if request.vlm_image_hash:
-                                    store_extra_keys = (request.vlm_image_hash,)
-
                                 block_table = self.block_aware_cache.store_cache(
                                     request_id,
                                     token_sequence_to_store,
                                     cache_to_store,
                                     model_cache_config=model_cache_config,
                                     boundary_snapshots=intermediate_snapshots,
-                                    extra_keys=store_extra_keys,
+                                    extra_keys=request.vlm_extra_keys_for_cache,
+                                    extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                                    extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
                                 )
                             logger.debug(
                                 f"Stored paged cache for request {request_id} "
@@ -3991,6 +3583,8 @@ class Scheduler:
                 # (Mirrors the fix in _do_abort_request, commit 634603f)
                 mx.synchronize(generation_stream)
                 self._remove_uid_from_active_batch(uid)
+                if hasattr(self.model, "unregister_rope_delta"):
+                    self.model.unregister_rope_delta(uid)
                 if uid in self.uid_to_request_id:
                     del self.uid_to_request_id[uid]
                 del self.request_id_to_uid[request_id]
@@ -3998,8 +3592,8 @@ class Scheduler:
             # Clean up streaming detokenizer
             self._cleanup_detokenizer(request_id)
 
-            # Clean up Harmony parser
-            self._cleanup_harmony_parser(request_id)
+            # Clean up protocol-specific output parser session
+            self._cleanup_output_parser_session(request_id)
 
             # Clean up VLM adapter state (position_ids, rope_deltas, pending embeddings)
             if hasattr(self.model, 'clear_vlm_position_state'):
@@ -4022,9 +3616,8 @@ class Scheduler:
                 req_to_remove._extracted_cache = None
                 req_to_remove.prompt_cache = None
 
-        # Update stop tokens after cleaning up finished requests
+        # Schedule deferred Metal cache cleanup after request completion.
         if finished_ids:
-            self._update_stop_tokens()
             # Schedule deferred Metal cache cleanup instead of clearing immediately.
             # Immediate mx.clear_cache() after request completion races with IOKit's
             # asynchronous completeMemory() callbacks — the kernel-level GPU memory
@@ -4033,10 +3626,16 @@ class Scheduler:
             # Deferring by _DEFERRED_CLEAR_DELAY generation steps (~10-40 ms) gives
             # IOKit time to process callbacks while still reclaiming buffers fast
             # enough to prevent TTFT spikes from pool bloat (#411).
-            # Only set if not already pending — otherwise burst completions
-            # would keep resetting the counter and indefinitely postpone clearing.
-            if self._deferred_clear_steps is None:
-                self._deferred_clear_steps = 0
+            #
+            # Use max() so that concurrent completions (max_num_seqs > 1) each get
+            # a full _DEFERRED_CLEAR_DELAY window counted from *their own* finish
+            # step.  The old "only set if None" guard meant the second request's
+            # window was anchored to the first request's finish step, allowing the
+            # second request's KV cache blocks to be re-allocated before IOKit
+            # finished their completeMemory() callbacks (#557).
+            target = self._step_counter + self._DEFERRED_CLEAR_DELAY
+            if self._deferred_clear_at is None or target > self._deferred_clear_at:
+                self._deferred_clear_at = target
 
     def _is_cache_corruption_error(self, error: Exception) -> bool:
         """Check if an error indicates cache corruption."""
@@ -4069,13 +3668,13 @@ class Scheduler:
         self.uid_to_request_id.clear()
 
         # Cancel any pending deferred Metal cache clear
-        self._deferred_clear_steps = None
+        self._deferred_clear_at = None
 
         # Clear detokenizer state to prevent contamination after recovery
         self._request_detokenizers.clear()
 
-        # Clear Harmony parsers
-        self._harmony_parsers.clear()
+        # Clear protocol-specific output parser sessions
+        self._output_parser_sessions.clear()
 
         logger.info("Cache recovery completed")
 
@@ -4171,9 +3770,11 @@ class Scheduler:
                 output.outputs.extend(rejected)
                 output.has_work = True
 
-            # Run generation step if we have running requests
+            # Run generation step if we have running requests.
+            # Use next_generated() which returns only GenerationBatch.Response
+            # objects (prefill is handled externally before insert).
             if self.batch_generator is not None and self.running:
-                responses = self.batch_generator.next()
+                responses = self.batch_generator.next_generated()
                 output.has_work = True
 
                 if responses:
@@ -4249,14 +3850,11 @@ class Scheduler:
             and self._step_counter % self.config.mlx_cache_cleanup_interval == 0
         ):
             should_clear = True
-        # Deferred post-completion cleanup: wait _DEFERRED_CLEAR_DELAY steps
-        # after the last request completion to give IOKit time to process
-        # completeMemory() callbacks before releasing Metal buffers (#435).
-        if self._deferred_clear_steps is not None:
-            self._deferred_clear_steps += 1
-            if self._deferred_clear_steps >= self._DEFERRED_CLEAR_DELAY:
-                should_clear = True
-                self._deferred_clear_steps = None
+        # Deferred post-completion cleanup: fire once the step counter reaches
+        # the target set by _cleanup_finished() (#435, #557).
+        if self._deferred_clear_at is not None and self._step_counter >= self._deferred_clear_at:
+            should_clear = True
+            self._deferred_clear_at = None
         if should_clear:
             _sync_and_clear_cache()
         if (
@@ -4324,11 +3922,11 @@ class Scheduler:
         # Clear detokenizers
         self._request_detokenizers.clear()
 
-        # Clear Harmony parsers
-        self._harmony_parsers.clear()
+        # Clear protocol-specific output parser sessions
+        self._output_parser_sessions.clear()
 
         # Cancel any pending deferred Metal cache clear
-        self._deferred_clear_steps = None
+        self._deferred_clear_at = None
 
     def deep_reset(self) -> None:
         """
@@ -4489,11 +4087,14 @@ class Scheduler:
             return
 
         try:
+            cache_dir = Path(self.config.paged_ssd_cache_dir) if self.config.paged_ssd_cache_dir else None
+
             # Initialize paged SSD cache manager for SSD storage
             self.paged_ssd_cache_manager = PagedSSDCacheManager(
-                cache_dir=Path(self.config.paged_ssd_cache_dir),
+                cache_dir=cache_dir,
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
+                hot_cache_only=self.config.hot_cache_only,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager
@@ -4506,7 +4107,8 @@ class Scheduler:
 
             # Initialize boundary snapshot SSD store for offloading
             # non-sliceable cache snapshots during prefill.
-            if BoundarySnapshotSSDStore is not None:
+            # Skip in hot_cache_only mode since snapshots would never be written.
+            if BoundarySnapshotSSDStore is not None and not self.config.hot_cache_only:
                 try:
                     self._boundary_snapshot_store = BoundarySnapshotSSDStore(
                         base_dir=Path(self.config.paged_ssd_cache_dir)

@@ -105,7 +105,9 @@ class ServerManager:
 
     def check_health(self) -> bool:
         try:
-            response = requests.get(self._get_health_url(), timeout=2)
+            session = requests.Session()
+            session.trust_env = False
+            response = session.get(self._get_health_url(), timeout=2)
             return response.status_code == 200
         except requests.RequestException:
             return False
@@ -232,7 +234,9 @@ class ServerManager:
     def _is_omlx_server(self) -> bool:
         """Check if the process on the port is an oMLX server."""
         try:
-            resp = requests.get(self._get_health_url(), timeout=2)
+            session = requests.Session()
+            session.trust_env = False
+            resp = session.get(self._get_health_url(), timeout=2)
             return resp.status_code == 200
         except requests.RequestException:
             return False
@@ -316,8 +320,24 @@ class ServerManager:
             python_exe = get_bundled_python()
             cmd = [python_exe, "-m", "omlx.cli"] + args
 
+            # Ensure Homebrew paths are visible to the server process.
+            # GUI apps inherit a minimal PATH from launchd that excludes
+            # /opt/homebrew/bin, so tools like ffmpeg would not be found.
+            env = os.environ.copy()
+            homebrew_paths = [
+                "/opt/homebrew/bin",
+                "/opt/homebrew/sbin",
+                "/usr/local/bin",
+            ]
+            current = env.get("PATH", "")
+            for p in homebrew_paths:
+                if p not in current:
+                    current = p + ":" + current
+            env["PATH"] = current
+
             self._process = subprocess.Popen(
                 cmd,
+                env=env,
                 stdout=self._log_file_handle,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,

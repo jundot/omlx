@@ -4,6 +4,7 @@ Tests for MCP client manager (omlx/mcp/manager.py).
 """
 
 import asyncio
+import json
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -535,3 +536,35 @@ class TestMCPClientManagerRefreshReconnect:
         # Should not raise and no clients should be affected
         for client in manager._clients.values():
             client.disconnect.assert_not_called()
+
+
+class TestInitMCPGracefulFallback:
+    """Tests for init_mcp() graceful fallback on config errors (issue #474)."""
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_does_not_crash(self, tmp_path):
+        """init_mcp should not raise on malformed JSON config."""
+        bad_config = tmp_path / "mcp.json"
+        bad_config.write_text("{invalid json")
+
+        from omlx.server import init_mcp
+
+        # Should return gracefully, not raise
+        await init_mcp(str(bad_config))
+
+    @pytest.mark.asyncio
+    async def test_missing_file_does_not_crash(self):
+        """init_mcp should not raise on nonexistent config path."""
+        from omlx.server import init_mcp
+
+        await init_mcp("/nonexistent/mcp.json")
+
+    @pytest.mark.asyncio
+    async def test_invalid_config_structure_does_not_crash(self, tmp_path):
+        """init_mcp should not raise on invalid config structure."""
+        bad_config = tmp_path / "mcp.json"
+        bad_config.write_text(json.dumps("not a dict"))
+
+        from omlx.server import init_mcp
+
+        await init_mcp(str(bad_config))

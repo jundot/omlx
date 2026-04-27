@@ -277,6 +277,48 @@ class TestStripThinkTags:
         assert BaseBenchmark._strip_think_tags("<think>still thinking") == "<think>still thinking"
 
 
+# --- Thinking Mode Tests ---
+
+
+class TestThinkingMode:
+    def test_benchmark_result_thinking_used_default(self):
+        from omlx.eval.base import BenchmarkResult
+        result = BenchmarkResult(
+            benchmark_name="test",
+            accuracy=0.5,
+            total_questions=2,
+            correct_count=1,
+            time_seconds=1.0,
+        )
+        assert result.thinking_used is False
+
+    def test_benchmark_result_thinking_used_true(self):
+        from omlx.eval.base import BenchmarkResult
+        result = BenchmarkResult(
+            benchmark_name="test",
+            accuracy=0.5,
+            total_questions=2,
+            correct_count=1,
+            time_seconds=1.0,
+            thinking_used=True,
+        )
+        assert result.thinking_used is True
+
+    def test_thinking_token_constants(self):
+        from omlx.eval.base import THINKING_MIN_TOKENS, THINKING_MAX_TOKENS
+        assert THINKING_MIN_TOKENS == 8192
+        assert THINKING_MAX_TOKENS == 32768
+        assert THINKING_MIN_TOKENS < THINKING_MAX_TOKENS
+
+    def test_strip_think_tags_with_answer(self):
+        """Thinking content is stripped, leaving only the answer."""
+        from omlx.eval.base import BaseBenchmark
+        text = "<think>\nLet me analyze option A vs B.\nA seems correct.\n</think>\nThe answer is A"
+        result = BaseBenchmark._strip_think_tags(text)
+        assert "<think>" not in result
+        assert "The answer is A" in result
+
+
 # --- Dataset Sampling Tests ---
 
 
@@ -325,3 +367,40 @@ class TestSampling:
         # big should get ~20, small should get ~2
         assert big_count > small_count
         assert small_count >= 1
+
+
+# --- Benchmark Registry Smoke Tests ---
+
+
+class TestBenchmarkRegistry:
+    """Cover every registered benchmark with cheap checks.
+
+    Regression guard against silent bugs like registration drift or
+    load_dataset() crashes on the sampling path.
+    """
+
+    def test_parity(self):
+        """BENCHMARKS dict and VALID_BENCHMARKS list must be in sync."""
+        from omlx.admin.accuracy_benchmark import VALID_BENCHMARKS
+        from omlx.eval import BENCHMARKS
+        assert set(BENCHMARKS.keys()) == set(VALID_BENCHMARKS)
+
+    def test_instantiate_all(self):
+        """Every registered class instantiates without error."""
+        from omlx.eval import BENCHMARKS
+        for cls in BENCHMARKS.values():
+            cls()
+
+
+def _registered_benchmark_names():
+    from omlx.eval import BENCHMARKS
+    return sorted(BENCHMARKS.keys())
+
+
+@pytest.mark.parametrize("name", _registered_benchmark_names())
+async def test_load_sample_per_benchmark(name):
+    """Each registered benchmark loads a 10-row sample without crashing."""
+    from omlx.eval import BENCHMARKS
+    items = await BENCHMARKS[name]().load_dataset(sample_size=10)
+    assert items, f"{name} returned empty list"
+    assert len(items) <= 10, f"{name} returned {len(items)} items"

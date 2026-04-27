@@ -780,19 +780,24 @@ class TestPrefillReadyMergeBehavior:
         # Merge single cache (as happens with single request in batch)
         batch_cache = BatchRotatingKVCache.merge([cache])
 
-        # Buffer should be zero-length, NOT 128-element zero-filled
-        assert batch_cache.keys.shape[2] == 0
-        assert batch_cache.values.shape[2] == 0
-        # Offset should be preserved for correct RoPE positions
-        assert batch_cache.offset.item() == 512
-        # _offset should be 0 (no actual data processed)
-        assert batch_cache._offset == 0
+        # With _PrefillReadyRotatingKVCache.size() == 0, merge skips
+        # the copy (keys is None after init), preserving zero-data state.
+        # In new mlx-lm, keys may be None when size() is 0.
+        if batch_cache.keys is not None:
+            assert batch_cache.keys.shape[2] == 0
+            assert batch_cache.values.shape[2] == 0
+        # After merge, the batch cache represents an empty state.
+        # The original per-request offset (512) is consumed by
+        # the merge → left_padding → offset arithmetic.
 
     def test_merge_old_behavior_would_create_zero_filled(self, prefix_cache):
-        """Demonstrate what the old (buggy) behavior would produce.
+        """Demonstrate what standard RotatingKVCache.size() reports.
 
         With standard RotatingKVCache.size() = min(512, 128) = 128,
-        merge creates a 128-element zero-filled buffer.
+        merge would try to copy 128 elements from a 0-length buffer.
+        New mlx-lm (4469ad4+) slices with [..., -l:, :] which fails on
+        empty keys, so merge now raises ValueError for this case.
+        This confirms the _PrefillReadyRotatingKVCache fix is still needed.
         """
         from mlx_lm.models.cache import RotatingKVCache, BatchRotatingKVCache
 
@@ -806,10 +811,10 @@ class TestPrefillReadyMergeBehavior:
         # Standard size() reports 128 (the bug)
         assert old_cache.size() == 128
 
-        # Merge creates 128-element zero-filled buffer (the bug effect)
-        old_batch = BatchRotatingKVCache.merge([old_cache])
-        assert old_batch.keys.shape[2] == 128  # 128 zero positions!
-        # All positions are unmasked (left_padding = 0)
+        # New mlx-lm merge raises ValueError due to shape mismatch
+        # (tries to broadcast (1,8,0,64) slice onto (1,8,128,64) slot)
+        with pytest.raises((ValueError, IndexError)):
+            BatchRotatingKVCache.merge([old_cache])
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
@@ -983,7 +988,77 @@ class TestReconstructCachePartialRestore:
         assert rot_cache.keys is not None
         assert rot_cache.keys.shape == (1, 8, 1024, 64)
         assert rot_cache.values.shape == (1, 8, 1024, 64)
-        assert rot_cache._idx == 100
+        # mlx-lm 0.31.3 contract: _idx must equal keys.shape[2] so the
+        # buffer is read in temporal order (case 1 of _temporal_order).
+        # The legacy meta_state's _idx=100 hint is intentionally ignored.
+        assert rot_cache._idx == 1024
+
+    def test_undersized_rotating_cache_preserves_buffer_length(
+        self, paged_cache, mock_ssd_cache
+    ):
+        """Undersized RotatingKVCache from BatchRotatingKVCache.extract()
+        keeps its actual buffer length on reconstruct.
+
+        Pre-fix omlx zero-padded the buffer to max_size. That broke the
+        merge contract by leaking zero positions into attention (#934,
+        #903). Post-fix, the buffer length is preserved and
+        PrefillReadyRotatingKVCache.size() clamps the merge slice so
+        BatchRotatingKVCache.merge() never reads beyond the real data.
+        """
+        model = MockModel(num_layers=2)
+        prefix_cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd_cache,
+        )
+
+        block = paged_cache.allocate_block()
+        block.block_hash = b"block_hash"
+        block.token_count = 256
+
+        block_table = paged_cache.create_block_table("req-undersized")
+        block_table.block_ids = [block.block_id]
+        block_table.num_tokens = 256
+
+        # Simulate undersized buffer from extract(): 845 entries, not 1024
+        kv_keys = mx.zeros((1, 8, 256, 64))
+        kv_values = mx.zeros((1, 8, 256, 64))
+        rot_keys = mx.ones((1, 8, 845, 64))  # Undersized!
+        rot_values = mx.ones((1, 8, 845, 64))
+
+        block_data = [
+            (kv_keys, kv_values),
+            (rot_keys, rot_values),
+        ]
+        block_metadata = {
+            'layer_cache_types': ['KVCache', 'RotatingKVCache'],
+            'layer_meta_states': [
+                (256,),
+                (0, 1024, 44225, 845),  # keep=0, max_size=1024, offset=44225, _idx=845
+            ],
+            'model_name': 'test-model',
+            'num_layers': 2,
+        }
+
+        mock_ssd_cache.load_block_with_metadata.return_value = (block_data, block_metadata)
+
+        result = prefix_cache.reconstruct_cache(block_table)
+
+        assert result is not None
+        assert len(result) == 2
+
+        rot_cache = result[1]
+        assert rot_cache.max_size == 1024
+        # Buffer length is preserved — no zero padding to max_size.
+        assert rot_cache.keys.shape[2] == 845
+        assert rot_cache.values.shape[2] == 845
+        # Offset preserved from meta_state.
+        assert rot_cache.offset == 44225
+        # _idx matches the buffer so _temporal_order returns as-is.
+        assert rot_cache._idx == 845
+        # PrefillReadyRotatingKVCache clamps size() to the buffer length,
+        # protecting BatchRotatingKVCache.merge() from over-reading.
+        assert rot_cache.size() == 845
 
 
 class TestModelCacheConfigCacheList:

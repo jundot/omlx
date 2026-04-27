@@ -6,6 +6,7 @@ import pytest
 from omlx.utils.tokenizer import (
     apply_qwen3_fix,
     get_tokenizer_config,
+    is_gemma4_model,
     is_harmony_model,
     is_qwen3_model,
 )
@@ -55,6 +56,27 @@ class TestIsHarmonyModel:
         """Test with empty config dict."""
         assert is_harmony_model("gpt-oss", {}) is True
         assert is_harmony_model("llama", {}) is False
+
+
+class TestIsGemma4Model:
+    """Test cases for is_gemma4_model function."""
+
+    def test_gemma4_model_via_config_model_type(self):
+        config = {"model_type": "gemma4"}
+        assert is_gemma4_model("some-model", config) is True
+
+    def test_gemma4_model_via_name(self):
+        assert is_gemma4_model("google/gemma-4b", None) is True
+        assert is_gemma4_model("GEMMA-4-27B", None) is True
+        assert is_gemma4_model("my-gemma4-model", None) is True
+
+    def test_not_gemma4_model(self):
+        assert is_gemma4_model("gemma-3-27b", None) is False
+        assert is_gemma4_model("llama-3.1-8b", None) is False
+
+    def test_not_gemma4_with_different_model_type(self):
+        config = {"model_type": "gemma"}
+        assert is_gemma4_model("some-model", config) is False
 
 
 class TestIsQwen3Model:

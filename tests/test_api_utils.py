@@ -9,6 +9,8 @@ text processing, content extraction, and format conversion.
 from omlx.api.utils import (
     SPECIAL_TOKENS_PATTERN,
     _consolidate_system_messages,
+    _drop_void_assistant_messages,
+    _extract_multimodal_content_list,
     _merge_consecutive_roles,
     clean_output_text,
     detect_and_strip_partial,
@@ -38,6 +40,7 @@ from omlx.api.anthropic_models import (
     AnthropicTool,
     ContentBlockDocument,
     ContentBlockText,
+    ContentBlockThinking,
     ContentBlockToolResult,
     ContentBlockToolUse,
     MessagesRequest,
@@ -249,11 +252,20 @@ class TestExtractTextContent:
         assert isinstance(result[0]["content"], str)
 
     def test_none_content(self):
-        """Test extracting message with None content."""
+        """Test that assistant with None content and no tool_calls is dropped (void message)."""
         messages = [Message(role="assistant", content=None)]
 
         result = extract_text_content(messages)
 
+        assert len(result) == 0
+
+    def test_none_content_non_assistant_preserved(self):
+        """Test that non-assistant messages with None content are preserved."""
+        messages = [Message(role="user", content=None)]
+
+        result = extract_text_content(messages)
+
+        assert len(result) == 1
         assert result[0]["content"] == ""
 
     def test_tool_response_message(self):
@@ -376,6 +388,7 @@ class TestExtractTextContent:
     def test_assistant_tool_calls_with_content_array(self):
         """Content array in assistant+tool_calls should be converted to string."""
         from unittest.mock import MagicMock
+
         mock_tokenizer = MagicMock(spec=[])
         mock_tokenizer.has_tool_calling = True
 
@@ -407,6 +420,154 @@ class TestExtractTextContent:
         assert len(result) == 2
         assert result[0]["role"] == "system"
         assert result[0]["content"] == "You are a coding assistant."
+
+
+class TestExtractTextContentReasoningReconstruction:
+    """Tests that extract_text_content reassembles <think> from reasoning_content.
+
+    External clients (e.g. Pi) receive reasoning in the OpenAI reasoning_content
+    field but echo it back alongside normal content on subsequent turns.  For
+    models whose chat template exposes preserve_thinking=True (Qwen 3.6+), we
+    must inject <think>…</think> back into the assistant message so the
+    template has something to preserve — otherwise thinking is silently dropped
+    from conversation history.
+    """
+
+    def test_reasoning_and_content_merged_on_assistant(self):
+        """reasoning_content + content string should produce a <think>…</think> prefix."""
+        messages = [
+            Message(role="assistant", reasoning_content="R", content="A"),
+        ]
+        result = extract_text_content(messages)
+        assert len(result) == 1
+        assert result[0]["role"] == "assistant"
+        assert result[0]["content"] == "<think>\nR\n</think>\n\nA"
+
+    def test_reasoning_with_none_content(self):
+        """reasoning_content with content=None should still emit the <think> block."""
+        messages = [
+            Message(role="assistant", reasoning_content="R", content=None),
+        ]
+        result = extract_text_content(messages)
+        # Non-empty content after reconstruction keeps the message alive.
+        assert len(result) == 1
+        assert result[0]["content"] == "<think>\nR\n</think>\n\n"
+
+    def test_reasoning_with_content_list(self):
+        """reasoning_content + list content should extract text parts and prefix <think>."""
+        messages = [
+            Message(
+                role="assistant",
+                reasoning_content="R",
+                content=[{"type": "text", "text": "A"}],
+            ),
+        ]
+        result = extract_text_content(messages)
+        assert len(result) == 1
+        assert result[0]["content"] == "<think>\nR\n</think>\n\nA"
+
+    def test_reasoning_on_non_assistant_passthrough(self):
+        """reasoning_content on a user message must NOT trigger reconstruction."""
+        messages = [
+            Message(role="user", reasoning_content="R", content="A"),
+        ]
+        result = extract_text_content(messages)
+        assert len(result) == 1
+        # User content left untouched — no <think> wrapper.
+        assert result[0]["content"] == "A"
+
+    def test_no_reasoning_content_passthrough(self):
+        """Without reasoning_content the assistant message should pass through unchanged."""
+        messages = [
+            Message(role="assistant", content="A"),
+        ]
+        result = extract_text_content(messages)
+        assert len(result) == 1
+        assert result[0]["content"] == "A"
+
+
+class TestExtractTextContentNativeReasoningContent:
+    """Tests that extract_text_content forwards reasoning_content as a field
+    when the caller opts into native mode.
+
+    Qwen 3.6+ chat templates read ``message.reasoning_content`` directly.
+    Passing reasoning as a separate field avoids the whitespace round-trip
+    that the fallback ``<think>`` reconstruction introduces, which improves
+    KV prefix cache reuse.
+    """
+
+    def test_native_mode_passes_reasoning_as_field(self):
+        """Content stays clean; reasoning rides as a top-level field."""
+        messages = [
+            Message(role="assistant", reasoning_content="R", content="A"),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        assert result[0]["role"] == "assistant"
+        assert result[0]["content"] == "A"
+        assert result[0]["reasoning_content"] == "R"
+        # No <think> tag in content
+        assert "<think>" not in result[0]["content"]
+
+    def test_native_mode_with_none_content(self):
+        """None content + reasoning_content still emits the field (and empty content)."""
+        messages = [
+            Message(role="assistant", reasoning_content="R", content=None),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        # Empty content but message survives because reasoning_content exists.
+        # Note: _drop_void_assistant_messages may still drop this; verify it's
+        # retained via the reasoning_content presence.
+        assert result[0]["reasoning_content"] == "R"
+
+    def test_native_mode_with_list_content(self):
+        """List content gets flattened to text; reasoning kept separate."""
+        messages = [
+            Message(
+                role="assistant",
+                reasoning_content="R",
+                content=[{"type": "text", "text": "A"}],
+            ),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        assert result[0]["content"] == "A"
+        assert result[0]["reasoning_content"] == "R"
+
+    def test_native_mode_with_tool_calls(self):
+        """Assistant with tool_calls + reasoning_content: field survives alongside tool_calls."""
+        messages = [
+            Message(
+                role="assistant",
+                reasoning_content="R",
+                content="calling",
+                tool_calls=[{"id": "c1", "function": {"name": "fn", "arguments": "{}"}}],
+            ),
+        ]
+
+        class NativeToolTokenizer:
+            has_tool_calling = True
+
+        result = extract_text_content(
+            messages,
+            tokenizer=NativeToolTokenizer(),
+            native_reasoning_content=True,
+        )
+        assert len(result) == 1
+        assert result[0]["content"] == "calling"
+        assert result[0]["reasoning_content"] == "R"
+        assert result[0]["tool_calls"][0]["function"]["name"] == "fn"
+
+    def test_native_mode_non_assistant_does_not_emit_field(self):
+        """reasoning_content on a user message must not produce a field."""
+        messages = [
+            Message(role="user", reasoning_content="R", content="A"),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        assert result[0]["content"] == "A"
+        assert "reasoning_content" not in result[0]
 
 
 class TestConvertAnthropicToInternal:
@@ -562,6 +723,7 @@ class TestConvertAnthropicToInternal:
 
     def test_native_tool_calling_preserves_structured_tool_history(self):
         """Tool use/result blocks should stay structured when tokenizer supports tools."""
+
         class NativeToolTokenizer:
             has_tool_calling = True
 
@@ -689,6 +851,7 @@ class TestConvertAnthropicToInternal:
 
     def test_tool_result_with_image_native_path(self):
         """Images in tool_result are preserved in native tool calling path."""
+
         class NativeToolTokenizer:
             has_tool_calling = True
 
@@ -812,6 +975,118 @@ class TestConvertAnthropicToInternal:
         assert "manual.pdf" in content
         assert "oMLX does not provide PDF parsing" in content
 
+    def test_thinking_block_reconstructed_as_think_tag(self):
+        """Single Anthropic thinking block should be reassembled into a <think> wrapper."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking",
+                            thinking="step by step",
+                            signature="",
+                        ),
+                        ContentBlockText(text="Answer"),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert "<think>\nstep by step\n</think>" in content
+        assert "Answer" in content
+        # <think> must come before the answer text
+        assert content.index("<think>") < content.index("Answer")
+
+    def test_multiple_thinking_blocks_preserve_source_order(self):
+        """Multiple thinking blocks must appear in Anthropic source order (regression guard).
+
+        Earlier drafts inserted at position 0, which reversed the order of
+        consecutive thinking blocks.  Appending preserves natural ordering.
+        """
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking",
+                            thinking="FIRST",
+                            signature="",
+                        ),
+                        ContentBlockThinking(
+                            type="thinking",
+                            thinking="SECOND",
+                            signature="",
+                        ),
+                        ContentBlockText(text="Answer"),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        content = result[0]["content"]
+        assert content.index("FIRST") < content.index("SECOND")
+        assert content.index("SECOND") < content.index("Answer")
+
+    def test_thinking_block_native_tool_calling_assistant(self):
+        """Native-tool-calling assistant path must also reconstruct thinking blocks.
+
+        Most Qwen 3.6+ models hit this branch (has_tool_calling=True).  Before
+        the fix, the branch silently dropped thinking content, so
+        preserve_thinking=True in the chat template had nothing to preserve.
+        """
+
+        class NativeToolTokenizer:
+            has_tool_calling = True
+
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking",
+                            thinking="deliberating",
+                            signature="",
+                        ),
+                        ContentBlockText(text="Let me check."),
+                        ContentBlockToolUse(
+                            id="toolu_1",
+                            name="get_weather",
+                            input={"location": "Tokyo"},
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(
+            request,
+            tokenizer=NativeToolTokenizer(),
+        )
+
+        assert len(result) == 1
+        assert result[0]["role"] == "assistant"
+        # tool_calls still structured for native rendering
+        assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        # <think> wrapper present in the text content
+        content = result[0]["content"]
+        assert "<think>\ndeliberating\n</think>" in content
+        assert "Let me check." in content
+
     def test_document_block_mixed_with_text(self):
         """Test document block alongside text blocks."""
         import base64
@@ -843,6 +1118,127 @@ class TestConvertAnthropicToInternal:
         content = result[0]["content"]
         assert "Please read this:" in content
         assert "Doc content here" in content
+
+
+class TestConvertAnthropicToInternalNativeReasoning:
+    """Tests that convert_anthropic_to_internal forwards Anthropic thinking
+    blocks as ``reasoning_content`` when ``native_reasoning_content=True``.
+
+    Matches Qwen 3.6+ chat template expectations (first-class field over
+    fallback ``<think>`` parsing in content).
+    """
+
+    def test_native_mode_thinking_becomes_reasoning_field(self):
+        """Single thinking block surfaces as reasoning_content, not in content."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking",
+                            thinking="step by step",
+                            signature="",
+                        ),
+                        ContentBlockText(text="Answer"),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, native_reasoning_content=True)
+
+        assert len(result) == 1
+        assert result[0]["content"] == "Answer"
+        assert result[0]["reasoning_content"] == "step by step"
+        assert "<think>" not in result[0]["content"]
+
+    def test_native_mode_multiple_thinking_blocks_joined(self):
+        """Multiple thinking blocks concatenate with newline into one field."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking", thinking="FIRST", signature=""
+                        ),
+                        ContentBlockThinking(
+                            type="thinking", thinking="SECOND", signature=""
+                        ),
+                        ContentBlockText(text="Answer"),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, native_reasoning_content=True)
+
+        assert result[0]["content"] == "Answer"
+        assert result[0]["reasoning_content"] == "FIRST\nSECOND"
+
+    def test_native_mode_tool_calling_assistant(self):
+        """Native-tool-calling path: tool_calls structure + reasoning_content field."""
+
+        class NativeToolTokenizer:
+            has_tool_calling = True
+
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking",
+                            thinking="deliberating",
+                            signature="",
+                        ),
+                        ContentBlockText(text="Let me check."),
+                        ContentBlockToolUse(
+                            id="toolu_1",
+                            name="get_weather",
+                            input={"location": "Tokyo"},
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(
+            request,
+            tokenizer=NativeToolTokenizer(),
+            native_reasoning_content=True,
+        )
+
+        assert len(result) == 1
+        assert result[0]["content"] == "Let me check."
+        assert result[0]["reasoning_content"] == "deliberating"
+        assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert "<think>" not in result[0]["content"]
+
+    def test_native_mode_no_thinking_no_field(self):
+        """Assistant without thinking blocks gets no reasoning_content field."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[ContentBlockText(text="Just a reply")],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, native_reasoning_content=True)
+
+        assert result[0]["content"] == "Just a reply"
+        assert "reasoning_content" not in result[0]
 
 
 class TestConvertAnthropicToolsToInternal:
@@ -967,6 +1363,38 @@ class TestConvertInternalToAnthropicResponse:
         # Should have at least one content block
         assert len(result.content) >= 1
 
+    def test_prefix_cache_disabled_legacy_shape(self):
+        """Caching off: usage keeps the legacy shape (input=prompt, cache=0)."""
+        result = convert_internal_to_anthropic_response(
+            text="hi",
+            model="claude-3",
+            prompt_tokens=100,
+            completion_tokens=5,
+            finish_reason="stop",
+            cached_tokens=40,
+            prefix_cache_enabled=False,
+        )
+
+        assert result.usage.input_tokens == 100
+        assert result.usage.cache_creation_input_tokens == 0
+        assert result.usage.cache_read_input_tokens == 0
+
+    def test_prefix_cache_enabled_splits_prompt(self):
+        """Caching on: prompt splits into input(0) + creation + read."""
+        result = convert_internal_to_anthropic_response(
+            text="hi",
+            model="claude-3",
+            prompt_tokens=100,
+            completion_tokens=5,
+            finish_reason="stop",
+            cached_tokens=20,
+            prefix_cache_enabled=True,
+        )
+
+        assert result.usage.input_tokens == 0
+        assert result.usage.cache_creation_input_tokens == 80
+        assert result.usage.cache_read_input_tokens == 20
+
 
 class TestMapFinishReasonToStopReason:
     """Tests for map_finish_reason_to_stop_reason function."""
@@ -1072,6 +1500,20 @@ class TestSSEEventFormatters:
         result = create_message_delta_event("end_turn", 10, input_tokens=100)
 
         assert '"input_tokens": 100' in result
+
+    def test_create_message_delta_event_prefix_cache_enabled(self):
+        """With caching active, usage splits into disjoint cache fields."""
+        result = create_message_delta_event(
+            "end_turn",
+            10,
+            input_tokens=100,
+            cached_tokens=30,
+            prefix_cache_enabled=True,
+        )
+
+        assert '"input_tokens": 0' in result
+        assert '"cache_creation_input_tokens": 70' in result
+        assert '"cache_read_input_tokens": 30' in result
 
     def test_create_message_stop_event(self):
         """Test creating message_stop event."""
@@ -1206,6 +1648,72 @@ class TestExtractHarmonyMessages:
         assert content["result"] == "success"
 
 
+    # -- dict input tests (issue #683) --
+
+    def test_simple_dict_message(self):
+        """Plain dict messages should work (Anthropic endpoint path)."""
+        messages = [{"role": "user", "content": "Hello"}]
+
+        result = extract_harmony_messages(messages)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert result[0]["content"] == "Hello"
+
+    def test_tool_dict_message(self):
+        """Tool messages as dicts should preserve role and tool_call_id."""
+        messages = [
+            {
+                "role": "tool",
+                "content": '{"result": "ok"}',
+                "tool_call_id": "call_abc",
+            }
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert result[0]["role"] == "tool"
+        assert result[0]["tool_call_id"] == "call_abc"
+        assert isinstance(result[0]["content"], dict)
+
+    def test_assistant_tool_calls_dict(self):
+        """Assistant messages with tool_calls as dicts should work."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city": "Tokyo"}',
+                        },
+                    }
+                ],
+            }
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert "tool_calls" in result[0]
+        assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert isinstance(result[0]["tool_calls"][0]["function"]["arguments"], dict)
+
+    def test_mixed_pydantic_and_dict_messages(self):
+        """Mixed Pydantic Message and dict inputs should both work."""
+        messages = [
+            Message(role="system", content="You are helpful."),
+            {"role": "user", "content": "Hi"},
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert result[1]["role"] == "user"
+
+
 class TestConsolidateSystemMessages:
     """Tests for system message consolidation."""
 
@@ -1304,6 +1812,20 @@ class TestConsolidateSystemMessages:
         assert "Be helpful" in result[0]["content"]
         assert "Extra instruction" in result[0]["content"]
         assert result[1]["role"] == "user"
+
+    def test_system_message_with_list_content(self):
+        """System message with list content should extract text without crashing."""
+        msgs = [
+            {"role": "system", "content": [
+                {"type": "text", "text": "Be helpful"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]},
+            {"role": "user", "content": "Hello"},
+        ]
+        result = _consolidate_system_messages(msgs)
+        assert result[0]["role"] == "system"
+        assert isinstance(result[0]["content"], str)
+        assert "Be helpful" in result[0]["content"]
 
 
 class TestMergeConsecutiveRoles:
@@ -1425,6 +1947,70 @@ class TestMergeConsecutiveRoles:
         assert msgs[0]["content"] == original_first
         assert len(msgs) == 2
 
+    def test_merge_list_content_with_string(self):
+        """Merging list content (image) with string content should not crash."""
+        msgs = [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Look at this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]},
+            {"role": "user", "content": "What do you think?"},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        types = [p["type"] for p in content]
+        assert "image_url" in types
+        assert "text" in types
+        texts = [p["text"] for p in content if p["type"] == "text"]
+        assert "Look at this" in texts
+        assert "What do you think?" in texts
+
+    def test_merge_string_with_list_content(self):
+        """String content followed by list content should merge correctly."""
+        msgs = [
+            {"role": "user", "content": "Context text"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "See image"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,def"}},
+            ]},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        assert len(content) == 3  # text + text + image_url
+
+    def test_merge_two_list_contents(self):
+        """Two list contents should concatenate."""
+        msgs = [
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,def"}},
+            ]},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        assert len(content) == 2
+
+    def test_merge_empty_string_with_list_content(self):
+        """Empty string + list content should take the list content."""
+        msgs = [
+            {"role": "user", "content": ""},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+
     # --- Integration tests through extract_text_content ---
 
     def test_extract_text_content_merges_consecutive_user(self):
@@ -1514,7 +2100,10 @@ class TestExtractMultimodalContent:
                 role="user",
                 content=[
                     {"type": "text", "text": "Analyze"},
-                    {"type": "input_image", "image_url": {"url": "https://example.com/a.png"}},
+                    {
+                        "type": "input_image",
+                        "image_url": {"url": "https://example.com/a.png"},
+                    },
                 ],
             )
         ]
@@ -1524,6 +2113,45 @@ class TestExtractMultimodalContent:
         content = result[0]["content"]
         assert content[1]["type"] == "image_url"
         assert content[1]["image_url"]["url"] == "https://example.com/a.png"
+
+    def test_normalizes_image_url_from_model_dump(self):
+        """image_url items from model_dump should be normalized (strip extra keys)."""
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "What is this?"},
+                    {
+                        "type": "image_url",
+                        "text": None,
+                        "image_url": {"url": "data:image/png;base64,abc", "detail": "auto"},
+                    },
+                ],
+            )
+        ]
+        result = extract_multimodal_content(messages)
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        img_part = content[1]
+        assert img_part == {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+        assert "text" not in img_part
+        assert "detail" not in img_part.get("image_url", {})
+
+    def test_normalizes_image_url_string_form(self):
+        """image_url with string value (not nested dict) should be normalized."""
+        parts = _extract_multimodal_content_list([
+            {"type": "image_url", "image_url": "data:image/png;base64,abc"},
+        ])
+        assert len(parts) == 1
+        assert parts[0] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+
+    def test_image_url_missing_url_dropped(self):
+        """image_url item with no extractable URL should be dropped."""
+        parts = _extract_multimodal_content_list([
+            {"type": "image_url", "image_url": None},
+            {"type": "image_url"},
+        ])
+        assert len(parts) == 0
 
 
 # =============================================================================
@@ -1614,7 +2242,9 @@ class TestExtractTextContentPreservesNamePartial:
                 role="assistant",
                 content="Let me call a tool",
                 name="Kimi",
-                tool_calls=[{"id": "1", "function": {"name": "search", "arguments": "{}"}}],
+                tool_calls=[
+                    {"id": "1", "function": {"name": "search", "arguments": "{}"}}
+                ],
             ),
         ]
         result = extract_text_content(messages)
@@ -1722,3 +2352,109 @@ class TestNameFieldSchemaAcceptance:
         msgs = [Message(role="user", content="Hello")]
         result = extract_text_content(msgs)
         assert "name" not in result[0]
+
+
+class TestDropVoidAssistantMessages:
+    """Tests for _drop_void_assistant_messages."""
+
+    def test_drops_empty_content_no_tool_calls(self):
+        """Assistant message with empty content and no tool_calls should be dropped."""
+        msgs = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "Again"},
+        ]
+        result = _drop_void_assistant_messages(msgs)
+        assert len(result) == 2
+        assert result[0]["role"] == "user"
+        assert result[1]["role"] == "user"
+
+    def test_drops_none_content_no_tool_calls(self):
+        """Assistant message with None content and no tool_calls should be dropped."""
+        msgs = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": None},
+            {"role": "user", "content": "Again"},
+        ]
+        result = _drop_void_assistant_messages(msgs)
+        assert len(result) == 2
+
+    def test_keeps_assistant_with_content(self):
+        """Assistant message with non-empty content should be kept."""
+        msgs = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+            {"role": "user", "content": "Thanks"},
+        ]
+        result = _drop_void_assistant_messages(msgs)
+        assert len(result) == 3
+
+    def test_keeps_assistant_with_tool_calls(self):
+        """Assistant message with tool_calls should be kept even if content is empty."""
+        msgs = [
+            {"role": "user", "content": "List files"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "1", "function": {"name": "ls"}}],
+            },
+            {"role": "user", "content": "Thanks"},
+        ]
+        result = _drop_void_assistant_messages(msgs)
+        assert len(result) == 3
+
+    def test_preserves_other_roles(self):
+        """Non-assistant messages should never be dropped."""
+        msgs = [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": ""},
+            {"role": "tool", "content": ""},
+        ]
+        result = _drop_void_assistant_messages(msgs)
+        assert len(result) == 3
+
+    def test_extract_text_content_drops_void_assistant(self):
+        """Integration: extract_text_content should drop void assistant messages."""
+        msgs = [
+            Message(role="user", content="Hello"),
+            Message(role="assistant", content=None),
+            Message(role="user", content="Tell me about this repo"),
+        ]
+        result = extract_text_content(msgs)
+        # The void assistant message should be dropped, and the two user
+        # messages merged by _merge_consecutive_roles
+        assert all(m["role"] != "assistant" or m.get("content") for m in result)
+
+    def test_void_drop_then_merge_consecutive_users(self):
+        """Dropping a void assistant between two users should merge them."""
+        msgs = [
+            Message(role="user", content="hello"),
+            Message(role="assistant", content=None),
+            Message(role="user", content="world"),
+        ]
+        result = extract_text_content(msgs)
+        # void assistant dropped, then consecutive users merged
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert "hello" in result[0]["content"]
+        assert "world" in result[0]["content"]
+
+    def test_multiple_void_assistants_merge_surrounding_users(self):
+        """Multiple void assistants should be dropped and adjacent users merged."""
+        msgs = [
+            Message(role="user", content="a"),
+            Message(role="assistant", content=None),
+            Message(role="user", content="b"),
+            Message(role="assistant", content="reply"),
+            Message(role="user", content="c"),
+            Message(role="assistant", content=None),
+            Message(role="user", content="d"),
+        ]
+        result = extract_text_content(msgs)
+        assert len(result) == 3
+        assert result[0]["role"] == "user"
+        assert "a" in result[0]["content"] and "b" in result[0]["content"]
+        assert result[1]["role"] == "assistant"
+        assert result[1]["content"] == "reply"
+        assert result[2]["role"] == "user"
+        assert "c" in result[2]["content"] and "d" in result[2]["content"]

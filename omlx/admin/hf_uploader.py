@@ -66,12 +66,27 @@ def _is_oq_model(name: str) -> bool:
     return "oQ" in name[-5:]
 
 
-def _generate_model_card(model_name: str, config: dict) -> str:
+def _generate_model_card(
+    model_name: str, config: dict, redownload_notice: bool = False,
+) -> str:
     """Generate a minimal HuggingFace model card for an oQ model."""
+    from omlx._version import __version__
+
     model_type = config.get("model_type", "unknown")
     quant = config.get("quantization", {})
     bits = quant.get("bits", "?")
     group_size = quant.get("group_size", "?")
+
+    notice = ""
+    if redownload_notice:
+        from datetime import date
+
+        today = date.today().strftime("%Y-%m-%d")
+        notice = f"""> [!IMPORTANT]
+> This quantization was uploaded on **{today}** and replaces a previous version.
+> If you downloaded this model before this date, please re-download for the updated weights.
+
+"""
 
     return f"""---
 library_name: mlx
@@ -81,9 +96,9 @@ tags:
 - quantized
 ---
 
-# {model_name}
+{notice}# {model_name}
 
-This model was quantized using [oQ](https://github.com/jundot/omlx) mixed-precision quantization.
+This model was quantized using [oQ](https://github.com/jundot/omlx) (oMLX v{__version__}) mixed-precision quantization.
 
 ## Quantization details
 
@@ -295,6 +310,7 @@ class HFUploader:
         token: str,
         readme_source_path: str = "",
         auto_readme: bool = True,
+        redownload_notice: bool = False,
         private: bool = False,
     ) -> UploadTask:
         """Queue a model upload to HuggingFace Hub.
@@ -350,7 +366,7 @@ class HFUploader:
         self._tasks[task_id] = task
 
         self._active_tasks[task_id] = asyncio.create_task(
-            self._run_upload(task_id, token, readme_source_path, auto_readme, private)
+            self._run_upload(task_id, token, readme_source_path, auto_readme, redownload_notice, private)
         )
 
         logger.info(f"Upload queued: {model_name} -> {repo_id} (task_id={task_id})")
@@ -426,6 +442,7 @@ class HFUploader:
         token: str,
         readme_source_path: str,
         auto_readme: bool,
+        redownload_notice: bool,
         private: bool,
     ) -> None:
         """Execute an upload task with semaphore-guarded sequential processing."""
@@ -470,7 +487,10 @@ class HFUploader:
                             config = json.load(f)
                     except Exception:
                         config = {}
-                    readme_content = _generate_model_card(task.model_name, config)
+                    readme_content = _generate_model_card(
+                        task.model_name, config,
+                        redownload_notice=redownload_notice,
+                    )
                     readme_in_model.write_text(readme_content, encoding="utf-8")
                     tmp_readme = readme_in_model
 

@@ -28,14 +28,15 @@ classifiers = [
 ]
 
 dependencies = [
-    "mlx>=0.31.1",
-    # mlx-lm from latest commit (564281f)
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@564281f",
+    "mlx>=0.31.2",
+    # mlx-lm from commit (ed1fca4, v0.31.3) - thread-local generation stream + ArraysCache batch dim fixes + think token None safety
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
+    # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
+    "regex",
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
-    # transformers version aligned with mlx-lm requirement
-    # 5.4.0 broke VLM: Qwen2VLImageProcessor now hard-requires torch (#431)
-    "transformers>=5.0.0,<5.4.0",
+    # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
+    "transformers>=5.0.0",
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
     "numpy>=1.24.0",
@@ -59,14 +60,18 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (7f7a04c)
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@7f7a04ce20337996da335ab17cdfee0ba51d6610",
+    # mlx-vlm from commit (e41cd25) - thread-local stream, DFlash GPU hang fix, hunyuan_vl/gemma3n cleanup
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e41cd25565861500e48c076ab31aaeafee0ed80f",
     "Pillow>=9.0.0",
-    # Grammar-constrained decoding for structured output
-    "xgrammar>=0.1.32",
+    # dflash-mlx v0.1.3 (814c4a1) — block diffusion speculative decoding + temperature sampling
+    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@814c4a1",
 ]
 
 [project.optional-dependencies]
+grammar = [
+    # Grammar-constrained decoding for structured output (requires torch ~2GB)
+    "xgrammar>=0.1.32",
+]
 mcp = [
     "mcp>=1.0.0",
 ]
@@ -74,8 +79,11 @@ modelscope = [
     "modelscope>=1.10.0",
 ]
 audio = [
-    # mlx-audio from commit (6408d2a)
-    "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@6408d2a410eb8c57464e07725b92271860199250",
+    # mlx-audio from commit (5175326) with tts/stt/sts extras
+    # tts extra: misaki, num2words, spacy, phonemizer-fork, espeakng-loader, sentencepiece
+    # stt extra: tiktoken, mistral-common[audio]
+    # sts extra: tts deps + stt deps + webrtcvad
+    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
     "python-multipart>=0.0.5",
 ]
 dev = [
@@ -118,6 +126,13 @@ include = ["omlx*"]
 "omlx" = ["oq_calibration_data.json"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
+
+[tool.uv]
+# mlx-lm is pinned to a git commit; override transitive pins
+# (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
+override-dependencies = [
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
+]
 
 [tool.black]
 line-length = 88

@@ -192,7 +192,9 @@ class TestAudioLRUEviction:
         pool = pool_with_audio
 
         # Mark whisper-tiny as loaded and older than all others
-        pool._entries["whisper-tiny"].engine = MagicMock()
+        mock_engine = MagicMock()
+        mock_engine.has_active_requests.return_value = False
+        pool._entries["whisper-tiny"].engine = mock_engine
         pool._entries["whisper-tiny"].last_access = 10.0
 
         victim = pool._find_lru_victim()
@@ -202,10 +204,14 @@ class TestAudioLRUEviction:
         """_find_lru_victim() picks the oldest entry regardless of model type."""
         pool = pool_with_audio
 
-        pool._entries["whisper-tiny"].engine = MagicMock()
+        mock_stt = MagicMock()
+        mock_stt.has_active_requests.return_value = False
+        pool._entries["whisper-tiny"].engine = mock_stt
         pool._entries["whisper-tiny"].last_access = 50.0  # Older
 
-        pool._entries["llama-3b"].engine = MagicMock()
+        mock_llm = MagicMock()
+        mock_llm.has_active_requests.return_value = False
+        pool._entries["llama-3b"].engine = mock_llm
         pool._entries["llama-3b"].last_access = 100.0  # Newer
 
         victim = pool._find_lru_victim()
@@ -215,11 +221,15 @@ class TestAudioLRUEviction:
         """Pinned audio engine is skipped by _find_lru_victim()."""
         pool = pool_with_audio
 
-        pool._entries["whisper-tiny"].engine = MagicMock()
+        mock_stt = MagicMock()
+        mock_stt.has_active_requests.return_value = False
+        pool._entries["whisper-tiny"].engine = mock_stt
         pool._entries["whisper-tiny"].last_access = 50.0
         pool._entries["whisper-tiny"].is_pinned = True  # pinned
 
-        pool._entries["llama-3b"].engine = MagicMock()
+        mock_llm = MagicMock()
+        mock_llm.has_active_requests.return_value = False
+        pool._entries["llama-3b"].engine = mock_llm
         pool._entries["llama-3b"].last_access = 100.0  # Newer but not pinned
 
         victim = pool._find_lru_victim()
@@ -295,10 +305,12 @@ class TestAudioPreLoadEviction:
         mock_llm = MagicMock()
         mock_llm.start = AsyncMock()
         mock_llm.stop = AsyncMock()
+        mock_llm.has_active_requests.return_value = False
 
         mock_stt = MagicMock()
         mock_stt.start = AsyncMock()
         mock_stt.stop = AsyncMock()
+        mock_stt.has_active_requests.return_value = False
 
         with patch("omlx.engine_pool.BatchedEngine", return_value=mock_llm):
             await pool.get_engine("llama-3b")

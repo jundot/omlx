@@ -23,6 +23,12 @@ def audio_to_wav_bytes(audio_array, sample_rate: int) -> bytes:
     """
     # Ensure we have a numpy array for the wave module
     if not isinstance(audio_array, np.ndarray):
+        # NumPy doesn't support bfloat16 — cast to float32 first
+        if hasattr(audio_array, "dtype"):
+            import mlx.core as mx
+
+            if audio_array.dtype == mx.bfloat16:
+                audio_array = audio_array.astype(mx.float32)
         audio_array = np.array(audio_array)
 
     # Flatten to 1-D (mono)

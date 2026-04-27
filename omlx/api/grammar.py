@@ -79,25 +79,30 @@ class GrammarConstraintProcessor:
     # Per-request mode (original interface)
     # ------------------------------------------------------------------
 
-    def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
+    def __call__(self, tokens, logits: mx.array) -> mx.array:
+        """Fill bitmask and apply to logits.
+
+        Accept is handled by the monkey-patched GenerationBatch._step()
+        which reads _next_tokens after sampling and calls accept_token().
+        This method only fills the bitmask and applies it.
+        """
         if self._terminated:
             return logits
-
-        if self._first_call:
-            self._first_call = False
-        elif tokens.size > 0:
-            last_token = tokens[-1].item()
-            if not self._matcher.accept_token(last_token):
-                logger.warning("GrammarMatcher rejected token %d", last_token)
-            if self._matcher.is_terminated():
-                self._terminated = True
-                return logits
 
         self._bitmask.fill(-1)
         self._matcher.fill_next_token_bitmask(self._bitmask)
 
         mx_bitmask = mx.array(self._bitmask)
         return self._apply_mask(mx_bitmask, logits, self._vocab_size)
+
+    def accept_token(self, token_id: int) -> None:
+        """Accept a generated token to advance matcher state."""
+        if self._terminated:
+            return
+        if not self._matcher.accept_token(token_id):
+            logger.warning("GrammarMatcher rejected token %d", token_id)
+        if self._matcher.is_terminated():
+            self._terminated = True
 
     # ------------------------------------------------------------------
     # Batched mode helpers
@@ -125,8 +130,8 @@ class GrammarConstraintProcessor:
 
         if self._first_call:
             self._first_call = False
-        elif tokens.size > 0:
-            last_token = tokens[-1].item()
+        elif len(tokens) > 0:
+            last_token = int(tokens[-1])
             if not self._matcher.accept_token(last_token):
                 logger.warning("GrammarMatcher rejected token %d", last_token)
             if self._matcher.is_terminated():

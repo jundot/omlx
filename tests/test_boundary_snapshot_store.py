@@ -203,6 +203,42 @@ class TestBoundarySnapshotSSDStore:
         assert not orphan_dir.exists()
         store2.shutdown()
 
+    def test_cleanup_request_skips_queued_writes(self):
+        """Writer thread should skip items for a cleaned-up request."""
+        import time
+
+        self.store.save("req-1", 1024, [MagicMock()], _mock_extract_cache_states)
+        self.store.save("req-1", 2048, [MagicMock()], _mock_extract_cache_states)
+
+        # Cleanup before writer thread processes items.
+        self.store.cleanup_request("req-1")
+
+        # Wait for writer to process remaining queue items.
+        time.sleep(1.0)
+
+        # No files should have been written for req-1.
+        req_dir = self.base_dir / "_boundary_snapshots" / "req-1"
+        assert not req_dir.exists()
+
+    def test_cleanup_all_drains_queue(self):
+        """cleanup_all should drain write queue before deleting directory."""
+        import time
+
+        self.store.save("req-1", 1024, [MagicMock()], _mock_extract_cache_states)
+        self.store.save("req-2", 2048, [MagicMock()], _mock_extract_cache_states)
+
+        # Cleanup all before writer thread processes items.
+        self.store.cleanup_all()
+
+        # Wait for writer to finish any in-flight work.
+        time.sleep(1.0)
+
+        # Snapshot directory should be clean (recreated but empty).
+        snapshot_dir = self.base_dir / "_boundary_snapshots"
+        assert snapshot_dir.exists()
+        children = list(snapshot_dir.iterdir())
+        assert len(children) == 0
+
 
 # ---------------------------------------------------------------------------
 # _BoundarySnapshotProvider tests

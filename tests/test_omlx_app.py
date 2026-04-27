@@ -450,30 +450,37 @@ class TestServerManager:
 
         assert manager.is_running() is False
 
-    @patch("omlx_app.server_manager.requests.get")
-    def test_check_health_success(self, mock_get, manager: ServerManager):
+    @patch("omlx_app.server_manager.requests.Session")
+    def test_check_health_success(self, mock_session_cls, manager: ServerManager):
         """Test successful health check."""
+        mock_session = Mock()
         mock_response = Mock()
         mock_response.status_code = 200
-        mock_get.return_value = mock_response
+        mock_session.get.return_value = mock_response
+        mock_session_cls.return_value = mock_session
 
         assert manager.check_health() is True
-        mock_get.assert_called_once_with("http://127.0.0.1:8765/health", timeout=2)
+        mock_session.get.assert_called_once_with("http://127.0.0.1:8765/health", timeout=2)
+        assert mock_session.trust_env is False
 
-    @patch("omlx_app.server_manager.requests.get")
-    def test_check_health_failure(self, mock_get, manager: ServerManager):
+    @patch("omlx_app.server_manager.requests.Session")
+    def test_check_health_failure(self, mock_session_cls, manager: ServerManager):
         """Test failed health check (non-200 status)."""
+        mock_session = Mock()
         mock_response = Mock()
         mock_response.status_code = 500
-        mock_get.return_value = mock_response
+        mock_session.get.return_value = mock_response
+        mock_session_cls.return_value = mock_session
 
         assert manager.check_health() is False
 
-    @patch("omlx_app.server_manager.requests.get")
-    def test_check_health_connection_error(self, mock_get, manager: ServerManager):
+    @patch("omlx_app.server_manager.requests.Session")
+    def test_check_health_connection_error(self, mock_session_cls, manager: ServerManager):
         """Test health check with connection error."""
         import requests
-        mock_get.side_effect = requests.RequestException("Connection refused")
+        mock_session = Mock()
+        mock_session.get.side_effect = requests.RequestException("Connection refused")
+        mock_session_cls.return_value = mock_session
 
         assert manager.check_health() is False
 
