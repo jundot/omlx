@@ -672,7 +672,7 @@ class TestEmbeddingEngine:
 
             asyncio.run(engine.start())
 
-            MockModel.assert_called_once_with("test-model")
+            MockModel.assert_called_once_with("test-model", trust_remote_code=False)
             mock_model.load.assert_called_once()
 
             asyncio.run(engine.stop())

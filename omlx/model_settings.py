@@ -113,6 +113,11 @@ class ModelSettings:
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default
 
+    # Security: opt-in per model. When True, mlx-lm/mlx-vlm/mlx-embeddings/reranker
+    # loaders are allowed to execute custom Python from the model repository
+    # (modeling_*.py, tokenization_*.py). Off by default — see issue #926.
+    trust_remote_code: bool = False
+
     # Metadata
     display_name: Optional[str] = None
     description: Optional[str] = None

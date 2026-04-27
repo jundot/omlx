@@ -421,6 +421,8 @@
   "modal.model_settings.index_cache_freq": "Frequency (every Nth layer keeps indexer)",
   "modal.model_settings.force_sampling": "Force Sampling",
   "modal.model_settings.force_sampling_hint": "Override request sampling parameters with configured values",
+  "modal.model_settings.trust_remote_code": "Trust Remote Code",
+  "modal.model_settings.trust_remote_code_hint": "Lets the model repo run arbitrary Python at load. Only enable for trusted publishers.",
   "modal.model_settings.chat_template_kwargs": "Chat Template Kwargs",
   "modal.model_settings.chat_template_kwargs_hint": "Parameters passed to chat template",
   "modal.model_settings.add_kwarg": "+ Add",

@@ -221,7 +221,7 @@ class VLMBatchedEngine(BaseEngine):
     def __init__(
         self,
         model_name: str,
-        trust_remote_code: bool = True,
+        trust_remote_code: bool = False,
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
@@ -362,7 +362,9 @@ class VLMBatchedEngine(BaseEngine):
 
         def _load_vlm_sync():
             _patch_video_processor_bug()
-            return vlm_load(self._model_name)
+            return vlm_load(
+                self._model_name, trust_remote_code=self._trust_remote_code
+            )
 
         loop = asyncio.get_running_loop()
         self._vlm_model, self._processor = await loop.run_in_executor(

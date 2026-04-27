@@ -61,6 +61,8 @@ EXCLUDED_FROM_PROFILES = frozenset({
     "model_type_override",
     "active_profile_name",
     "ttl_seconds",
+    # Security flag must be explicit per model — never propagated via profiles.
+    "trust_remote_code",
 })
 
 

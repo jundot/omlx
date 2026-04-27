@@ -421,6 +421,8 @@
   "modal.model_settings.index_cache_freq": "頻度（N番目のレイヤーごとにインデクサーを保持）",
   "modal.model_settings.force_sampling": "強制サンプリング",
   "modal.model_settings.force_sampling_hint": "設定値でリクエストのサンプリングパラメータを上書きします",
+  "modal.model_settings.trust_remote_code": "Trust Remote Code",
+  "modal.model_settings.trust_remote_code_hint": "Lets the model repo run arbitrary Python at load. Only enable for trusted publishers.",
   "modal.model_settings.chat_template_kwargs": "チャットテンプレート引数",
   "modal.model_settings.chat_template_kwargs_hint": "チャットテンプレートに渡すパラメータ",
   "modal.model_settings.add_kwarg": "+ 追加",
