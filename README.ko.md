@@ -34,7 +34,8 @@
   <a href="README.md">English</a> ·
   <a href="README.zh.md">中文</a> ·
   <b>한국어</b> ·
-  <a href="README.ja.md">日本語</a>
+  <a href="README.ja.md">日本語</a> ·
+  <a href="README.ru.md">Русский</a>
 </p>
 
 ---
