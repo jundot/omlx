@@ -125,7 +125,7 @@ Supports text LLMs, vision-language models (VLM), OCR models, embeddings, and re
 
 ### Admin Dashboard
 
-Web UI at `/admin` for real-time monitoring, model management, chat, benchmark, and per-model settings. Supports English, Korean, Japanese, and Chinese. All CDN dependencies are vendored for fully offline operation.
+Web UI at `/admin` for real-time monitoring, model management, chat, benchmark, and per-model settings. Supports English, Korean, Japanese, Chinese, and Russian. All CDN dependencies are vendored for fully offline operation.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX Admin Dashboard" width="720">
