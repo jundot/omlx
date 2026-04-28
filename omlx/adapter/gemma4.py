@@ -283,9 +283,20 @@ class Gemma4OutputParserSession:
         visible_parts.append(text)
 
     def _active_markers(self) -> list[str]:
-        markers = [_TURN_END_MARKER, _TOOL_RESPONSE_OPEN, _TOOL_RESPONSE_CLOSE]
-        markers.append(_CLOSE_MARKER if self._in_thought else _OPEN_MARKER)
-        return markers
+        # Channel open/close are tracked unconditionally so a stray
+        # ``<channel|>`` outside a thought block (occasionally emitted in long
+        # multi-turn contexts) is absorbed instead of leaking into visible
+        # text. Tool-call markup is intentionally not tracked here — the
+        # downstream ``ToolCallStreamFilter`` removes it from stream deltas
+        # while ``parse_tool_calls`` still sees the raw markers in
+        # ``output_text`` for extraction.
+        return [
+            _OPEN_MARKER,
+            _CLOSE_MARKER,
+            _TURN_END_MARKER,
+            _TOOL_RESPONSE_OPEN,
+            _TOOL_RESPONSE_CLOSE,
+        ]
 
     @staticmethod
     def _find_next_marker(
@@ -337,15 +348,21 @@ class Gemma4OutputParserSession:
             self._append_text(stream_parts, visible_parts, source[pos:idx])
 
             if marker == _OPEN_MARKER:
-                stream_parts.append(_THINK_OPEN)
-                visible_parts.append(_THINK_OPEN)
-                self._in_thought = True
+                # Nested open while already in a thought block: drop the stray
+                # marker without re-emitting ``<think>`` to keep the structure
+                # well-formed.
+                if not self._in_thought:
+                    stream_parts.append(_THINK_OPEN)
+                    visible_parts.append(_THINK_OPEN)
+                    self._in_thought = True
             elif marker == _CLOSE_MARKER:
-                stream_parts.append(_THINK_CLOSE)
-                visible_parts.append(_THINK_CLOSE)
-                self._in_thought = False
-            elif marker == _TURN_END_MARKER:
-                pass
+                # Stray close outside a thought block: drop silently to keep
+                # the marker out of visible content.
+                if self._in_thought:
+                    stream_parts.append(_THINK_CLOSE)
+                    visible_parts.append(_THINK_CLOSE)
+                    self._in_thought = False
+            # _TURN_END_MARKER, _TOOL_RESPONSE_OPEN / _CLOSE: silent drop.
 
             pos = idx + len(marker)
 
