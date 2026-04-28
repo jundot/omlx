@@ -62,6 +62,8 @@ from Foundation import (
     NSURL,
 )
 
+from omlx.utils.release_check import select_latest_stable_release
+
 from .config import ServerConfig
 from .server_manager import PortConflict, ServerManager, ServerStatus
 
@@ -988,28 +990,35 @@ class OMLXAppDelegate(NSObject):
             return  # Use cached result
 
         try:
-            # GitHub Releases API
+            # Pull a page of releases instead of /releases/latest. GitHub's
+            # "latest" endpoint only honors the prerelease flag, but dev/rc
+            # tags here have historically been published with that flag
+            # unset. Pick the latest stable PEP 440 tag from the list.
             resp = requests.get(
-                "https://api.github.com/repos/jundot/omlx/releases/latest",
+                "https://api.github.com/repos/jundot/omlx/releases",
+                params={"per_page": 20},
                 timeout=5,
             )
             if resp.status_code == 200:
-                data = resp.json()
-                latest = data["tag_name"].lstrip("v")
-                current = __version__
+                data = select_latest_stable_release(resp.json())
+                if data is not None:
+                    latest = data["tag_name"].lstrip("v")
+                    current = __version__
 
-                if self._is_newer_version(latest, current):
-                    # Find DMG asset matching current macOS version
-                    dmg_url = _find_matching_dmg(data.get("assets", []))
+                    if self._is_newer_version(latest, current):
+                        # Find DMG asset matching current macOS version
+                        dmg_url = _find_matching_dmg(data.get("assets", []))
 
-                    self._update_info = {
-                        "version": latest,
-                        "url": data["html_url"],
-                        "dmg_url": dmg_url,
-                        "notes": data.get("body", ""),
-                    }
-                    logger.info(f"Update available: {latest}")
-                    self._build_menu()
+                        self._update_info = {
+                            "version": latest,
+                            "url": data["html_url"],
+                            "dmg_url": dmg_url,
+                            "notes": data.get("body", ""),
+                        }
+                        logger.info(f"Update available: {latest}")
+                        self._build_menu()
+                    else:
+                        self._update_info = None
                 else:
                     self._update_info = None
             else:
@@ -1021,12 +1030,11 @@ class OMLXAppDelegate(NSObject):
             self._update_info = None
 
     def _is_newer_version(self, latest: str, current: str) -> bool:
-        """PEP 440 version comparison. Ignores pre-release versions."""
+        """PEP 440 version comparison. Caller must pre-filter prereleases."""
         try:
             from packaging.version import Version
 
-            latest_ver = Version(latest)
-            return latest_ver > Version(current) and not latest_ver.is_prerelease
+            return Version(latest) > Version(current)
         except Exception:
             return False
 

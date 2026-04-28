@@ -38,6 +38,7 @@ from .auth import (
 )
 from ..settings import SubKeyEntry
 from ..model_profiles import EXCLUDED_FROM_PROFILES
+from ..utils.release_check import select_latest_stable_release
 
 logger = logging.getLogger(__name__)
 
@@ -4402,9 +4403,14 @@ async def check_update(
     }
 
     try:
+        # Use the releases list (not /releases/latest) and pick the highest
+        # stable PEP 440 tag. Dev/rc tags here have historically been
+        # published with the GitHub prerelease flag unset, which makes
+        # /releases/latest return them as if they were stable.
         resp = await asyncio.to_thread(
             requests.get,
-            "https://api.github.com/repos/jundot/omlx/releases/latest",
+            "https://api.github.com/repos/jundot/omlx/releases",
+            params={"per_page": 20},
             timeout=5,
         )
         if resp.status_code != 200:
@@ -4412,17 +4418,18 @@ async def check_update(
             _update_cache_time = now
             return _update_cache
 
-        data = resp.json()
+        data = select_latest_stable_release(resp.json())
+        if data is None:
+            _update_cache = no_update
+            _update_cache_time = now
+            return _update_cache
+
         latest = data["tag_name"].lstrip("v")
 
         try:
             from packaging.version import Version
 
-            latest_ver = Version(latest)
-            update_available = (
-                latest_ver > Version(_omlx_version)
-                and not latest_ver.is_prerelease
-            )
+            update_available = Version(latest) > Version(_omlx_version)
         except Exception:
             update_available = False
 
