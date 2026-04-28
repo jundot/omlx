@@ -244,6 +244,8 @@ class ChatCompletionRequest(BaseModel):
     response_format: Optional[Union[ResponseFormat, dict]] = None
     # vLLM-compatible structured output (grammar, regex, choice, json)
     structured_outputs: Optional[Union[StructuredOutputOptions, dict]] = None
+    # vLLM/OpenAI-compatible grammar alias, normalized to structured_outputs
+    guided_grammar: Optional[str] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     # Thinking budget (max thinking tokens, None = unlimited)

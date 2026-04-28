@@ -128,6 +128,8 @@ class ModelSettingsRequest(BaseModel):
     dflash_draft_model: Optional[str] = None
     dflash_draft_quant_bits: Optional[int] = None
     reasoning_parser: Optional[str] = None
+    guided_grammar_enabled: Optional[bool] = None
+    guided_grammar: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
@@ -1418,6 +1420,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "thinking_budget_enabled": settings.thinking_budget_enabled,
                 "thinking_budget_tokens": settings.thinking_budget_tokens,
                 "reasoning_parser": settings.reasoning_parser,
+                "guided_grammar_enabled": settings.guided_grammar_enabled,
+                "guided_grammar": settings.guided_grammar,
                 "chat_template_kwargs": settings.chat_template_kwargs,
                 "forced_ct_kwargs": settings.forced_ct_kwargs,
                 "ttl_seconds": settings.ttl_seconds,
@@ -1662,6 +1666,11 @@ async def update_model_settings(
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
+    if "guided_grammar_enabled" in sent:
+        current_settings.guided_grammar_enabled = request.guided_grammar_enabled or False
+    if "guided_grammar" in sent:
+        grammar = request.guided_grammar.strip() if request.guided_grammar else None
+        current_settings.guided_grammar = grammar or None
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry

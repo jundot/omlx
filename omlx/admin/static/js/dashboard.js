@@ -980,6 +980,16 @@
                         if (ms.enableToolResultLimit) out.max_tool_result_tokens = ms.max_tool_result_tokens || null;
                         continue;
                     }
+                    if (k === 'guided_grammar_enabled') {
+                        out.guided_grammar_enabled = !!ms.guided_grammar_enabled;
+                        continue;
+                    }
+                    if (k === 'guided_grammar') {
+                        out.guided_grammar = ms.guided_grammar_enabled
+                            ? ((ms.guided_grammar || '').trim() || null)
+                            : null;
+                        continue;
+                    }
                     // Standard field: apply nullish coalescing; coerce string numerics
                     let v = ms[k] ?? null;
                     if (typeof v === 'string' && v !== '' && !isNaN(Number(v))) v = Number(v);
@@ -1175,6 +1185,8 @@
                 ms.max_context_window = null;
                 ms.max_tokens = null;
                 ms.reasoning_parser = null;
+                ms.guided_grammar_enabled = false;
+                ms.guided_grammar = '';
                 ms.ttl_seconds = null;
                 ms.enable_thinking = null;
                 ms.enableThinkingBudget = false;
@@ -1195,6 +1207,10 @@
                     } else if (k === 'max_tool_result_tokens') {
                         ms.enableToolResultLimit = s[k] != null;
                         ms.max_tool_result_tokens = s[k] ?? null;
+                    } else if (k === 'guided_grammar_enabled') {
+                        ms.guided_grammar_enabled = !!s[k];
+                    } else if (k === 'guided_grammar') {
+                        ms.guided_grammar = s[k] || '';
                     } else if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') {
                         const ctk = s.chat_template_kwargs || {};
                         const forced = new Set(s.forced_ct_kwargs || []);
@@ -1275,6 +1291,10 @@
                     } else if (k === 'max_tool_result_tokens') {
                         ms.enableToolResultLimit = !!s[k];
                         ms.max_tool_result_tokens = s[k] || null;
+                    } else if (k === 'guided_grammar_enabled') {
+                        ms.guided_grammar_enabled = !!s[k];
+                    } else if (k === 'guided_grammar') {
+                        ms.guided_grammar = s[k] || '';
                     } else if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') {
                         // Rebuild ctKwargEntries
                         const ctk = s.chat_template_kwargs || {};
@@ -1535,6 +1555,8 @@
                     thinking_default: model.thinking_default ?? null,
                     enableThinkingBudget: !!(settings.thinking_budget_tokens),
                     thinking_budget_tokens: settings.thinking_budget_tokens || null,
+                    guided_grammar_enabled: settings.guided_grammar_enabled || false,
+                    guided_grammar: settings.guided_grammar || '',
                     enableToolResultLimit: !!(settings.max_tool_result_tokens),
                     max_tool_result_tokens: settings.max_tool_result_tokens || null,
                     reasoning_parser: settings.reasoning_parser || '',
@@ -1607,6 +1629,10 @@
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)
                                     : 0,
+                                guided_grammar_enabled: this.modelSettings.guided_grammar_enabled,
+                                guided_grammar: this.modelSettings.guided_grammar_enabled
+                                    ? (this.modelSettings.guided_grammar || null)
+                                    : null,
                                 max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                     ? (this.modelSettings.max_tool_result_tokens || null)
                                     : 0,
@@ -1676,6 +1702,8 @@
                         this.modelSettings.presence_penalty = null;
                         this.modelSettings.force_sampling = false;
                         this.modelSettings.reasoning_parser = null;
+                        this.modelSettings.guided_grammar_enabled = false;
+                        this.modelSettings.guided_grammar = '';
                         this.modelSettings.ttl_seconds = null;
                         this.modelSettings.enableIndexCache = false;
                         this.modelSettings.index_cache_freq = 0;

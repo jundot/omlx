@@ -258,6 +258,22 @@ class TestModelsResponseActiveProfile:
         entry = next(m for m in models if m["id"] == "model-a")
         assert entry["settings"]["active_profile_name"] == "coding"
 
+    def test_guided_grammar_surfaces_in_list_models(self, client):
+        c, _ = client
+        r = c.put("/admin/api/models/model-a/settings", json={
+            "guided_grammar_enabled": True,
+            "guided_grammar": '  root ::= "YES"  ',
+        })
+        assert r.status_code == 200
+        assert r.json()["settings"]["guided_grammar_enabled"] is True
+        assert r.json()["settings"]["guided_grammar"] == 'root ::= "YES"'
+
+        r = c.get("/admin/api/models")
+        assert r.status_code == 200
+        entry = next(m for m in r.json()["models"] if m["id"] == "model-a")
+        assert entry["settings"]["guided_grammar_enabled"] is True
+        assert entry["settings"]["guided_grammar"] == 'root ::= "YES"'
+
 
 class TestActiveProfileDriftClearing:
     def test_active_preserved_when_no_drift(self, client):

@@ -1951,10 +1951,12 @@ async def create_chat_completion(
     merged_ct_kwargs = {}
     forced_keys: set[str] = set()
     reasoning_parser = None
+    settings_guided_grammar = None
     if _server_state.settings_manager:
         ms = _server_state.settings_manager.get_settings(resolved_model)
         max_tool_result_tokens = ms.max_tool_result_tokens
         reasoning_parser = ms.reasoning_parser
+        settings_guided_grammar = _settings_guided_grammar(ms)
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
         forced_keys = set(ms.forced_ct_kwargs or [])
@@ -1999,11 +2001,21 @@ async def create_chat_completion(
     # Compile grammar for structured output (logit-level enforcement).
     # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
     response_format = request.response_format
-    if request.structured_outputs is not None or response_format:
+    guided_grammar = _effective_guided_grammar(
+        structured_outputs=request.structured_outputs,
+        response_format=response_format,
+        request_guided_grammar=request.guided_grammar,
+        settings_guided_grammar=settings_guided_grammar,
+    )
+    structured_outputs = _normalize_structured_outputs(
+        request.structured_outputs,
+        guided_grammar,
+    )
+    if structured_outputs is not None or response_format:
         await engine.start()
     compiled_grammar = _compile_grammar_for_request(
         engine,
-        structured_outputs=request.structured_outputs,
+        structured_outputs=structured_outputs,
         response_format=response_format,
         chat_template_kwargs=merged_ct_kwargs or None,
         reasoning_parser=reasoning_parser,
@@ -2272,6 +2284,42 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
         messages.insert(0, {"role": "system", "content": instruction})
 
     return messages
+
+
+def _normalize_structured_outputs(structured_outputs=None, guided_grammar: str | None = None):
+    """Fold guided_grammar into the existing structured_outputs grammar shape."""
+    if structured_outputs is not None:
+        return structured_outputs
+    if guided_grammar:
+        return {"grammar": guided_grammar}
+    return None
+
+
+def _settings_guided_grammar(settings) -> str | None:
+    """Return a non-empty enabled model-level guided grammar."""
+    if not settings:
+        return None
+    if not getattr(settings, "guided_grammar_enabled", False):
+        return None
+    grammar = getattr(settings, "guided_grammar", None)
+    if not grammar:
+        return None
+    grammar = grammar.strip()
+    return grammar or None
+
+
+def _effective_guided_grammar(
+    structured_outputs=None,
+    response_format=None,
+    request_guided_grammar: str | None = None,
+    settings_guided_grammar: str | None = None,
+) -> str | None:
+    """Choose the request grammar alias or eligible model default."""
+    if request_guided_grammar:
+        return request_guided_grammar
+    if structured_outputs is None and response_format is None:
+        return settings_guided_grammar
+    return None
 
 
 def _build_format_element(structured_outputs=None, response_format=None):
