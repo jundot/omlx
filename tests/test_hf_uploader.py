@@ -35,16 +35,32 @@ class TestIsOqModel:
         assert _is_oq_model("Model-oQ3") is True
         assert _is_oq_model("Model-oQ8") is True
 
+    def test_long_oq_suffixes(self):
+        # Suffixes longer than 3 chars after 'oQ' must still be detected.
+        assert _is_oq_model("Qwen3.6-27B-oQ3.5e") is True
+        assert (
+            _is_oq_model(
+                "Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-oQ3.5e"
+            )
+            is True
+        )
+
+    def test_oq_anywhere_in_name(self):
+        # 'oQ' anywhere in the folder name counts.
+        assert _is_oq_model("oQ-model-name") is True
+        assert _is_oq_model("oQ4") is True
+
     def test_non_oq_names(self):
         assert _is_oq_model("Qwen3.5-122B") is False
         assert _is_oq_model("Llama-3B-4bit") is False
-        assert _is_oq_model("oQ-model-name") is False  # oQ not in last 5
+        assert _is_oq_model("ABCDE") is False
+        # Case-sensitive: lowercase 'oq' or uppercase 'OQ' must not match.
+        assert _is_oq_model("Llama-oq4") is False
+        assert _is_oq_model("Llama-OQ4") is False
 
     def test_edge_cases(self):
         assert _is_oq_model("X-oQ2") is True
-        assert _is_oq_model("oQ4") is True  # short name, still has oQ in last 5
-        assert _is_oq_model("12oQ4") is True  # exactly 5 chars, oQ at pos 2
-        assert _is_oq_model("ABCDE") is False
+        assert _is_oq_model("12oQ4") is True
 
 
 class TestHasMeaningfulReadme:
