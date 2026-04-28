@@ -11,6 +11,7 @@ when mlx-audio is not installed.
 import asyncio
 import gc
 import logging
+from collections.abc import AsyncIterator
 from typing import Any, Dict, Optional
 
 import mlx.core as mx
@@ -48,10 +49,28 @@ class TTSEngine(BaseNonStreamingEngine):
         self._model = None
         self._kwargs = kwargs
 
+    @staticmethod
+    def _audio_array_to_pcm_bytes(audio: Any) -> bytes:
+        audio_array = np.array(audio).flatten()
+        audio_array = np.clip(audio_array, -1.0, 1.0)
+        return (audio_array * 32767).astype(np.int16).tobytes()
+
     @property
     def model_name(self) -> str:
         """Get the model name."""
         return self._model_name
+
+    def supports_native_tts_streaming(self) -> bool:
+        """Return whether the loaded model exposes model-native audio streaming."""
+        if self._model is None:
+            return False
+        import inspect
+
+        try:
+            gen_params = inspect.signature(self._model.generate).parameters
+        except (TypeError, ValueError):
+            return False
+        return "stream" in gen_params and "streaming_interval" in gen_params
 
     async def start(self) -> None:
         """Start the engine (load model if not loaded).
@@ -161,9 +180,7 @@ class TTSEngine(BaseNonStreamingEngine):
         model = self._model
         t0 = time.monotonic()
 
-        def _synthesize_sync():
-            # model.generate() returns an iterable of results,
-            # each with .audio (array) and .sample_rate (int).
+        def _build_generate_kwargs() -> Dict[str, Any]:
             gen_kwargs: Dict[str, Any] = {
                 "text": text,
                 "verbose": False,
@@ -198,6 +215,12 @@ class TTSEngine(BaseNonStreamingEngine):
             if max_tokens is not None:
                 gen_kwargs["max_tokens"] = max_tokens
             gen_kwargs.update(kwargs)
+            return gen_kwargs
+
+        def _synthesize_sync():
+            # model.generate() returns an iterable of results,
+            # each with .audio (array) and .sample_rate (int).
+            gen_kwargs = _build_generate_kwargs()
 
             results = model.generate(**gen_kwargs)
 
@@ -235,6 +258,122 @@ class TTSEngine(BaseNonStreamingEngine):
                     get_mlx_executor(),
                     lambda: (mx.synchronize(), mx.clear_cache()),
                 )
+
+    async def stream_synthesize_pcm(
+        self,
+        text: str,
+        voice: Optional[str] = None,
+        speed: float = 1.0,
+        instructions: Optional[str] = None,
+        ref_audio: Optional[str] = None,
+        ref_text: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        streaming_interval: float = 0.4,
+        **kwargs,
+    ) -> AsyncIterator[tuple[int, int, int, bytes]]:
+        """Stream synthesized PCM chunks from models that natively support it."""
+        if self._model is None:
+            raise RuntimeError("Engine not started. Call start() first.")
+        if not self.supports_native_tts_streaming():
+            raise NotImplementedError("Loaded TTS model does not expose native streaming")
+
+        import inspect
+        import time
+
+        logger.info(
+            "TTS native stream start: model=%s, text_len=%d, voice=%s, interval=%.2fs",
+            self._model_name, len(text), voice, streaming_interval,
+        )
+
+        model = self._model
+        t0 = time.monotonic()
+
+        def _build_generate_kwargs() -> Dict[str, Any]:
+            gen_kwargs: Dict[str, Any] = {
+                "text": text,
+                "verbose": False,
+                "stream": True,
+            }
+            gen_params = inspect.signature(model.generate).parameters
+            if "streaming_interval" in gen_params:
+                gen_kwargs["streaming_interval"] = streaming_interval
+            if voice is not None:
+                if "voice" in gen_params:
+                    gen_kwargs["voice"] = voice
+                elif "instruct" in gen_params:
+                    gen_kwargs["instruct"] = voice
+            if instructions is not None and "instruct" in gen_params:
+                gen_kwargs["instruct"] = instructions
+            if speed != 1.0:
+                gen_kwargs["speed"] = speed
+            if ref_audio is not None and "ref_audio" in gen_params:
+                gen_kwargs["ref_audio"] = ref_audio
+                gen_kwargs["ref_text"] = ref_text
+            if temperature is not None:
+                gen_kwargs["temperature"] = temperature
+            if top_k is not None:
+                gen_kwargs["top_k"] = top_k
+            if top_p is not None:
+                gen_kwargs["top_p"] = top_p
+            if repetition_penalty is not None:
+                gen_kwargs["repetition_penalty"] = repetition_penalty
+            if max_tokens is not None:
+                gen_kwargs["max_tokens"] = max_tokens
+            gen_kwargs.update(kwargs)
+            return gen_kwargs
+
+        iterator: Any = None
+        sentinel = object()
+        chunk_count = 0
+        total_bytes = 0
+
+        def _next_pcm_chunk():
+            nonlocal iterator
+            if iterator is None:
+                iterator = iter(model.generate(**_build_generate_kwargs()))
+            try:
+                result = next(iterator)
+            except StopIteration:
+                return sentinel
+            audio = getattr(result, "audio", None)
+            if audio is None:
+                return None
+            sample_rate = int(
+                getattr(result, "sample_rate", getattr(model, "sample_rate", _DEFAULT_SAMPLE_RATE))
+            )
+            return sample_rate, 1, 2, self._audio_array_to_pcm_bytes(audio)
+
+        with self._active_lock:
+            self._active_count += 1
+        try:
+            loop = asyncio.get_running_loop()
+            while True:
+                chunk = await loop.run_in_executor(get_mlx_executor(), _next_pcm_chunk)
+                if chunk is sentinel:
+                    break
+                if chunk is None:
+                    continue
+                sample_rate, channels, sample_width, pcm_bytes = chunk
+                if not pcm_bytes:
+                    continue
+                chunk_count += 1
+                total_bytes += len(pcm_bytes)
+                yield sample_rate, channels, sample_width, pcm_bytes
+        finally:
+            if self._decrement_active():
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
+            logger.info(
+                "TTS native stream done: model=%s, %.2fs, chunks=%d, pcm_bytes=%d",
+                self._model_name, time.monotonic() - t0, chunk_count, total_bytes,
+            )
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

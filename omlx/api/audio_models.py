@@ -43,6 +43,8 @@ class AudioSpeechRequest(BaseModel):
     top_p: Optional[float] = None
     repetition_penalty: Optional[float] = None
     max_tokens: Optional[int] = None
+    stream: Optional[bool] = False
+    streaming_interval: Optional[float] = None
 
 
 class AudioProcessRequest(BaseModel):

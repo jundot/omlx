@@ -49,6 +49,9 @@ coverage.xml
 .pytest_cache/
 cover/
 
+# Local generated artifacts
+artifacts/
+
 # Translations
 *.mo
 *.pot
