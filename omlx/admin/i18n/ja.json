@@ -96,16 +96,8 @@
   "status.claude_code.target_context_size": "目標コンテキストサイズ",
   "status.claude_code.tokens_unit": "tokens",
   "status.claude_code.context_scaling_description": "トークン使用量をスケーリングし、小さなコンテキストモデルでClaude Codeの自動圧縮が正しく動作するようにします。",
-  "status.integrations.section_label": "その他の統合",
-  "status.integrations.model": "モデル",
-  "status.integrations.select_model": "— モデルを選択 —",
-  "status.integrations.model_unavailable": "保存されたモデルは利用できません",
-  "status.integrations.command": "コマンド",
+  "status.integrations.section_label": "アプリケーション",
   "status.integrations.copy_command_tooltip": "コマンドをコピー",
-  "status.integrations.opencode_desc": "ターミナルAIコーディングアシスタント",
-  "status.integrations.openclaw_desc": "メッセージング統合AIアシスタント",
-  "status.integrations.pi_desc": "Terminal AI coding agent",
-  "status.integrations.openclaw_tools_profile": "ツール",
   "status.engines.section_label": "エンジンバージョン",
   "status.engines.unknown_version": "不明",
   "models.tab.manager": "管理",
@@ -652,5 +644,6 @@
   "js.error.delete_model_failed": "モデルの削除に失敗しました",
   "js.error.delete_model_connection": "モデルの削除に失敗しました。サーバー接続を確認してください。",
   "js.success.download_started": "ダウンロード開始: {repo_id}",
-  "js.success.settings_saved": "設定が保存されました"
+  "js.success.settings_saved": "設定が保存されました",
+  "settings.language.es": "スペイン語"
 }
