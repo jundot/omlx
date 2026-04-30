@@ -969,6 +969,23 @@ class PagedSSDCacheManager(CacheManager):
             if item is None:  # Sentinel for shutdown
                 break
 
+            # Unlink task: tuple ('unlink', file_path). Used to defer LRU file
+            # deletion off the inference thread (see _enforce_size_limit_for_new_block).
+            # Sequential queue processing prevents race with subsequent writes
+            # to the same block_hash (write tasks always queued after unlink).
+            if isinstance(item[0], str) and item[0] == 'unlink':
+                _, unlink_path = item
+                try:
+                    if unlink_path.exists():
+                        unlink_path.unlink()
+                        self._stats["evictions"] += 1
+                        logger.debug(f"Evicted SSD cache file (async): {unlink_path}")
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to delete evicted file {unlink_path}: {e}")
+                continue
+
             block_hash, tensors_raw, metadata, file_path = item
             temp_path = None
 
@@ -1786,18 +1803,24 @@ class PagedSSDCacheManager(CacheManager):
 
         if self._index.total_size > target_size:
             evicted = self._index.evict_until_size(target_size)
+            # Defer file unlink to the writer thread to avoid blocking the
+            # inference thread with N file delete syscalls. Sequential queue
+            # processing keeps unlink ordered before any later write of the
+            # same block_hash. Hot cache is NOT touched here — see
+            # original comment about delete_block() being the only path that
+            # clears both tiers.
             for metadata in evicted:
-                # Do NOT remove from hot cache — the hot cache can still
-                # serve this block from memory even though the SSD file
-                # is being deleted.  Only delete_block() (explicit removal)
-                # should clear both hot cache and SSD.
                 try:
-                    if metadata.file_path.exists():
-                        metadata.file_path.unlink()
-                        self._stats["evictions"] += 1
-                        logger.debug(f"Evicted SSD cache file: {metadata.file_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to delete evicted file: {e}")
+                    self._write_queue.put_nowait(('unlink', metadata.file_path))
+                except queue.Full:
+                    # Queue saturated — fall back to inline unlink so size
+                    # accounting stays consistent. Rare path.
+                    try:
+                        if metadata.file_path.exists():
+                            metadata.file_path.unlink()
+                            self._stats["evictions"] += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to delete evicted file: {e}")
 
     def enforce_size_limit(self) -> int:
         """
