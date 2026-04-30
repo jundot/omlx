@@ -24,8 +24,10 @@ _TOOL_RESPONSE_CLOSE = "<tool_response|>"
 _THINK_OPEN = "<think>\n"
 _THINK_CLOSE = "</think>\n"
 
-_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
-_CHANNEL_BLOCK_RE = re.compile(r"<\|channel>.*?<channel\|>\s*", re.DOTALL)
+_LEADING_THOUGHT_RE = re.compile(
+    r"\A\s*(?:(?:<think>.*?</think>|<\|channel>.*?<channel\|>)\s*)+",
+    re.DOTALL,
+)
 
 
 def _try_parse_json(s: str) -> Any:
@@ -42,7 +44,7 @@ def _try_parse_json(s: str) -> Any:
 
 
 def _strip_thinking(text: Any) -> Any:
-    """Remove ``<think>...</think>`` and raw ``<|channel>...<channel|>`` spans.
+    """Remove leading ``<think>...</think>`` or raw ``<|channel>...<channel|>`` spans.
 
     Gemma 4's multi-turn rule requires that only the final visible answer
     is kept in chat history. Clients such as Open WebUI replay the full
@@ -50,12 +52,15 @@ def _strip_thinking(text: Any) -> Any:
     raw protocol form when a client preserves it). Feeding prior thought
     blocks back primes the model to emit malformed channel markers on the
     next turn, which then leak into user-facing output.
+
+    The match is anchored to the start of the message: the rendered thought
+    block always precedes the visible answer, so this catches every
+    legitimate occurrence while leaving inline mentions (e.g. an assistant
+    explaining how ``<think>`` tags work) untouched.
     """
     if not isinstance(text, str) or not text:
         return text
-    text = _CHANNEL_BLOCK_RE.sub("", text)
-    text = _THINK_BLOCK_RE.sub("", text)
-    return text.lstrip()
+    return _LEADING_THOUGHT_RE.sub("", text, count=1)
 
 
 def extract_gemma4_messages(
