@@ -35,6 +35,17 @@ class TestSSEKeepaliveExceptionHandling:
         assert "data: chunk2\n\n" in items
 
     @pytest.mark.asyncio
+    async def test_comments_can_be_disabled_for_strict_clients(self):
+        """Strict OpenAI-compatible SSE clients can opt out of comment frames."""
+
+        async def gen():
+            yield "data: chunk1\n\n"
+            yield "data: [DONE]\n\n"
+
+        items = await _collect(_with_sse_keepalive(gen(), send_comments=False))
+        assert items == ["data: chunk1\n\n", "data: [DONE]\n\n"]
+
+    @pytest.mark.asyncio
     async def test_generator_exception_yields_error_sse(self):
         """When inner generator raises, keepalive wrapper should yield
         error SSE data and [DONE] instead of propagating the exception."""

@@ -1302,6 +1302,7 @@ async def _with_sse_keepalive(
     http_request: Optional["FastAPIRequest"] = None,
     interval: float = 10.0,
     disconnect_poll: float = 2.0,
+    send_comments: bool = True,
 ) -> AsyncIterator[str]:
     """Wrap an SSE generator to send periodic keep-alive comments.
 
@@ -1321,7 +1322,8 @@ async def _with_sse_keepalive(
 
     # Send initial keepalive immediately so clients with short read
     # timeouts (e.g. openclaw ~15s) don't disconnect during prefill.
-    yield ": keep-alive\n\n"
+    if send_comments:
+        yield ": keep-alive\n\n"
 
     try:
         while True:
@@ -1351,7 +1353,7 @@ async def _with_sse_keepalive(
                         pass  # is_disconnected() can fail if scope is already closed
                 # Send keepalive at the configured interval
                 keepalive_elapsed += wait_time
-                if keepalive_elapsed >= interval:
+                if send_comments and keepalive_elapsed >= interval:
                     keepalive_elapsed = 0.0
                     yield ": keep-alive\n\n"
             if task.done():
@@ -1862,6 +1864,7 @@ async def create_completion(
             _with_sse_keepalive(
                 stream_completion(engine, prompts[0], request, model_load_duration=model_load_duration),
                 http_request=http_request,
+                send_comments=False,
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -2181,6 +2184,7 @@ async def create_chat_completion(
             _with_sse_keepalive(
                 stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, **chat_kwargs),
                 http_request=http_request,
+                send_comments=False,
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -3848,6 +3852,7 @@ async def create_response(
                     **chat_kwargs,
                 ),
                 http_request=http_request,
+                send_comments=False,
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
