@@ -1339,7 +1339,8 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
             {"value": style, "label": style, "models": models}
             for style, models in supported.items()
         ]
-    except ImportError:
+    except Exception as e:
+        logger.warning("xgrammar parser discovery unavailable: %s", e)
         return []
 
 
