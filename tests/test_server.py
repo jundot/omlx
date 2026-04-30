@@ -9,8 +9,16 @@ from fastapi.testclient import TestClient
 
 from omlx.exceptions import ModelNotFoundError
 from omlx.model_settings import ModelSettings, ModelSettingsManager
-from omlx.server import EngineType, SamplingDefaults, ServerState, app, get_engine, get_sampling_params
-from omlx.settings import GlobalSettings, ModelSettings as GlobalModelSettings
+from omlx.server import (
+    EngineType,
+    SamplingDefaults,
+    ServerState,
+    app,
+    get_engine,
+    get_sampling_params,
+    resolve_model_id,
+)
+from omlx.settings import ClaudeCodeSettings, GlobalSettings
 
 
 class TestGetSamplingParams:
@@ -322,6 +330,76 @@ class TestModelFallback:
         with pytest.raises(HTTPException) as exc_info:
             await get_engine("unknown-model", EngineType.EMBEDDING)
         assert exc_info.value.status_code == 404
+
+
+class TestResolveModelId:
+    """Tests for server-level model ID translation before engine-pool resolution."""
+
+    @pytest.fixture(autouse=True)
+    def setup_server_state(self):
+        state = ServerState()
+        with patch("omlx.server._server_state", state):
+            self._state = state
+            yield
+
+    def _setup_pool(self, aliases=None):
+        aliases = aliases or {}
+        pool = MagicMock()
+        pool.resolve_model_id.side_effect = lambda mid, _sm: aliases.get(mid, mid)
+        self._state.engine_pool = pool
+        return pool
+
+    def test_claude_code_local_opus_routes_to_configured_model(self):
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.claude_code = ClaudeCodeSettings(
+            mode="local",
+            opus_model="mlx-community/Qwen3-30B-A3B-4bit",
+        )
+        pool = self._setup_pool()
+
+        result = resolve_model_id("claude-opus-4-20250514")
+
+        assert result == "mlx-community/Qwen3-30B-A3B-4bit"
+        pool.resolve_model_id.assert_called_once_with(
+            "mlx-community/Qwen3-30B-A3B-4bit",
+            self._state.settings_manager,
+        )
+
+    def test_claude_code_local_sonnet_routes_anthropic_versioned_model(self):
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.claude_code = ClaudeCodeSettings(
+            mode="local",
+            sonnet_model="local-sonnet",
+        )
+        self._setup_pool(aliases={"local-sonnet": "qwen3-coder"})
+
+        result = resolve_model_id("claude-3-5-sonnet-20241022")
+
+        assert result == "qwen3-coder"
+
+    def test_claude_code_cloud_mode_does_not_translate(self):
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.claude_code = ClaudeCodeSettings(
+            mode="cloud",
+            haiku_model="local-haiku",
+        )
+        self._setup_pool()
+
+        result = resolve_model_id("claude-3-haiku-20240307")
+
+        assert result == "claude-3-haiku-20240307"
+
+    def test_claude_code_missing_configured_model_falls_through(self):
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.claude_code = ClaudeCodeSettings(
+            mode="local",
+            sonnet_model=None,
+        )
+        self._setup_pool()
+
+        result = resolve_model_id("claude-sonnet-4-5-20250929")
+
+        assert result == "claude-sonnet-4-5-20250929"
 
 
 class TestGetEngineLLMTypeValidation:
