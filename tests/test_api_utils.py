@@ -486,6 +486,90 @@ class TestExtractTextContentReasoningReconstruction:
         assert result[0]["content"] == "A"
 
 
+class TestExtractTextContentNativeReasoningContent:
+    """Tests that extract_text_content forwards reasoning_content as a field
+    when the caller opts into native mode.
+
+    Qwen 3.6+ chat templates read ``message.reasoning_content`` directly.
+    Passing reasoning as a separate field avoids the whitespace round-trip
+    that the fallback ``<think>`` reconstruction introduces, which improves
+    KV prefix cache reuse.
+    """
+
+    def test_native_mode_passes_reasoning_as_field(self):
+        """Content stays clean; reasoning rides as a top-level field."""
+        messages = [
+            Message(role="assistant", reasoning_content="R", content="A"),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        assert result[0]["role"] == "assistant"
+        assert result[0]["content"] == "A"
+        assert result[0]["reasoning_content"] == "R"
+        # No <think> tag in content
+        assert "<think>" not in result[0]["content"]
+
+    def test_native_mode_with_none_content(self):
+        """None content + reasoning_content still emits the field (and empty content)."""
+        messages = [
+            Message(role="assistant", reasoning_content="R", content=None),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        # Empty content but message survives because reasoning_content exists.
+        # Note: _drop_void_assistant_messages may still drop this; verify it's
+        # retained via the reasoning_content presence.
+        assert result[0]["reasoning_content"] == "R"
+
+    def test_native_mode_with_list_content(self):
+        """List content gets flattened to text; reasoning kept separate."""
+        messages = [
+            Message(
+                role="assistant",
+                reasoning_content="R",
+                content=[{"type": "text", "text": "A"}],
+            ),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        assert result[0]["content"] == "A"
+        assert result[0]["reasoning_content"] == "R"
+
+    def test_native_mode_with_tool_calls(self):
+        """Assistant with tool_calls + reasoning_content: field survives alongside tool_calls."""
+        messages = [
+            Message(
+                role="assistant",
+                reasoning_content="R",
+                content="calling",
+                tool_calls=[{"id": "c1", "function": {"name": "fn", "arguments": "{}"}}],
+            ),
+        ]
+
+        class NativeToolTokenizer:
+            has_tool_calling = True
+
+        result = extract_text_content(
+            messages,
+            tokenizer=NativeToolTokenizer(),
+            native_reasoning_content=True,
+        )
+        assert len(result) == 1
+        assert result[0]["content"] == "calling"
+        assert result[0]["reasoning_content"] == "R"
+        assert result[0]["tool_calls"][0]["function"]["name"] == "fn"
+
+    def test_native_mode_non_assistant_does_not_emit_field(self):
+        """reasoning_content on a user message must not produce a field."""
+        messages = [
+            Message(role="user", reasoning_content="R", content="A"),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        assert result[0]["content"] == "A"
+        assert "reasoning_content" not in result[0]
+
+
 class TestConvertAnthropicToInternal:
     """Tests for convert_anthropic_to_internal function."""
 
@@ -1036,6 +1120,127 @@ class TestConvertAnthropicToInternal:
         assert "Doc content here" in content
 
 
+class TestConvertAnthropicToInternalNativeReasoning:
+    """Tests that convert_anthropic_to_internal forwards Anthropic thinking
+    blocks as ``reasoning_content`` when ``native_reasoning_content=True``.
+
+    Matches Qwen 3.6+ chat template expectations (first-class field over
+    fallback ``<think>`` parsing in content).
+    """
+
+    def test_native_mode_thinking_becomes_reasoning_field(self):
+        """Single thinking block surfaces as reasoning_content, not in content."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking",
+                            thinking="step by step",
+                            signature="",
+                        ),
+                        ContentBlockText(text="Answer"),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, native_reasoning_content=True)
+
+        assert len(result) == 1
+        assert result[0]["content"] == "Answer"
+        assert result[0]["reasoning_content"] == "step by step"
+        assert "<think>" not in result[0]["content"]
+
+    def test_native_mode_multiple_thinking_blocks_joined(self):
+        """Multiple thinking blocks concatenate with newline into one field."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking", thinking="FIRST", signature=""
+                        ),
+                        ContentBlockThinking(
+                            type="thinking", thinking="SECOND", signature=""
+                        ),
+                        ContentBlockText(text="Answer"),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, native_reasoning_content=True)
+
+        assert result[0]["content"] == "Answer"
+        assert result[0]["reasoning_content"] == "FIRST\nSECOND"
+
+    def test_native_mode_tool_calling_assistant(self):
+        """Native-tool-calling path: tool_calls structure + reasoning_content field."""
+
+        class NativeToolTokenizer:
+            has_tool_calling = True
+
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking",
+                            thinking="deliberating",
+                            signature="",
+                        ),
+                        ContentBlockText(text="Let me check."),
+                        ContentBlockToolUse(
+                            id="toolu_1",
+                            name="get_weather",
+                            input={"location": "Tokyo"},
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(
+            request,
+            tokenizer=NativeToolTokenizer(),
+            native_reasoning_content=True,
+        )
+
+        assert len(result) == 1
+        assert result[0]["content"] == "Let me check."
+        assert result[0]["reasoning_content"] == "deliberating"
+        assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert "<think>" not in result[0]["content"]
+
+    def test_native_mode_no_thinking_no_field(self):
+        """Assistant without thinking blocks gets no reasoning_content field."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[ContentBlockText(text="Just a reply")],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, native_reasoning_content=True)
+
+        assert result[0]["content"] == "Just a reply"
+        assert "reasoning_content" not in result[0]
+
+
 class TestConvertAnthropicToolsToInternal:
     """Tests for convert_anthropic_tools_to_internal function."""
 
@@ -1158,6 +1363,38 @@ class TestConvertInternalToAnthropicResponse:
         # Should have at least one content block
         assert len(result.content) >= 1
 
+    def test_prefix_cache_disabled_legacy_shape(self):
+        """Caching off: usage keeps the legacy shape (input=prompt, cache=0)."""
+        result = convert_internal_to_anthropic_response(
+            text="hi",
+            model="claude-3",
+            prompt_tokens=100,
+            completion_tokens=5,
+            finish_reason="stop",
+            cached_tokens=40,
+            prefix_cache_enabled=False,
+        )
+
+        assert result.usage.input_tokens == 100
+        assert result.usage.cache_creation_input_tokens == 0
+        assert result.usage.cache_read_input_tokens == 0
+
+    def test_prefix_cache_enabled_splits_prompt(self):
+        """Caching on: prompt splits into input(0) + creation + read."""
+        result = convert_internal_to_anthropic_response(
+            text="hi",
+            model="claude-3",
+            prompt_tokens=100,
+            completion_tokens=5,
+            finish_reason="stop",
+            cached_tokens=20,
+            prefix_cache_enabled=True,
+        )
+
+        assert result.usage.input_tokens == 0
+        assert result.usage.cache_creation_input_tokens == 80
+        assert result.usage.cache_read_input_tokens == 20
+
 
 class TestMapFinishReasonToStopReason:
     """Tests for map_finish_reason_to_stop_reason function."""
@@ -1263,6 +1500,20 @@ class TestSSEEventFormatters:
         result = create_message_delta_event("end_turn", 10, input_tokens=100)
 
         assert '"input_tokens": 100' in result
+
+    def test_create_message_delta_event_prefix_cache_enabled(self):
+        """With caching active, usage splits into disjoint cache fields."""
+        result = create_message_delta_event(
+            "end_turn",
+            10,
+            input_tokens=100,
+            cached_tokens=30,
+            prefix_cache_enabled=True,
+        )
+
+        assert '"input_tokens": 0' in result
+        assert '"cache_creation_input_tokens": 70' in result
+        assert '"cache_read_input_tokens": 30' in result
 
     def test_create_message_stop_event(self):
         """Test creating message_stop event."""

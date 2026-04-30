@@ -387,6 +387,165 @@ class TestSTTModelAliasResolution:
 
 
 # ---------------------------------------------------------------------------
+# TestSTTProcessorErrors — actionable errors for MLX STT models (#800)
+# ---------------------------------------------------------------------------
+
+
+class TestSTTProcessorErrors:
+    """Issue #800: STT with MLX-packaged whisper/Qwen3-ASR fails opaquely.
+
+    Root cause: the MLX-converted repos (``mlx-community/whisper-*``,
+    ``Qwen3-ASR-*-MLX-*``) usually omit the HuggingFace processor files
+    (``preprocessor_config.json``, ``tokenizer.json`` …) so:
+      * Whisper: model loads but ``_processor`` is ``None``; transcribe
+        later fails with ``ValueError: Processor not found``.
+      * Qwen3-ASR: ``load_model`` itself raises
+        ``OSError: Can't load feature extractor for '<path>' …
+        preprocessor_config.json``.
+
+    Both paths surface to users as a bare HTTP 500. The fix re-wraps these
+    into a clear ``RuntimeError`` pointing at the missing config so the
+    user knows which files to add / which variant to download.
+    """
+
+    def _stt_engine(self, model_name: str = "mlx-community/whisper-large-v3-turbo"):
+        from omlx.engine.stt import STTEngine
+
+        return STTEngine(model_name)
+
+    def test_qwen3_asr_missing_feature_extractor_raises_actionable_error(
+        self, monkeypatch
+    ):
+        """``load_model`` raising ``Can't load feature extractor`` becomes a
+        clear message pointing at ``preprocessor_config.json``."""
+        import asyncio
+
+        from omlx.engine import stt as stt_mod
+
+        def _failing_load(*args, **kwargs):
+            raise OSError(
+                "Can't load feature extractor for '/models/Qwen3-ASR-0.6B-MLX-4bit'. "
+                "If you were trying to load it from 'https://huggingface.co/models', "
+                "make sure you don't have a local directory with the same name. "
+                "Otherwise, make sure '/models/Qwen3-ASR-0.6B-MLX-4bit' is the "
+                "correct path to a directory containing a preprocessor_config.json file"
+            )
+
+        import sys
+        import types
+        fake_utils = types.ModuleType("mlx_audio.stt.utils")
+        fake_utils.load_model = _failing_load
+        fake_stt = sys.modules.setdefault("mlx_audio.stt", types.ModuleType("mlx_audio.stt"))
+        fake_audio = sys.modules.setdefault("mlx_audio", types.ModuleType("mlx_audio"))
+        monkeypatch.setitem(sys.modules, "mlx_audio", fake_audio)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt", fake_stt)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", fake_utils)
+
+        engine = self._stt_engine("Qwen3-ASR-0.6B-MLX-4bit")
+        with pytest.raises(RuntimeError) as exc_info:
+            asyncio.run(engine.start())
+
+        message = str(exc_info.value).lower()
+        assert "preprocessor_config.json" in message
+        assert "qwen3-asr-0.6b-mlx-4bit" in message
+
+    def test_whisper_without_processor_fails_start_with_actionable_error(
+        self, monkeypatch
+    ):
+        """Whisper models that load without a HuggingFace processor must
+        fail fast at ``start()`` with a clear message, not silently later."""
+        import asyncio
+        import sys
+        import types
+
+        # Build a fake whisper-like model that mimics mlx-audio's Whisper
+        # (missing _processor => None).
+        class FakeWhisperModel:
+            """Masquerade as mlx_audio.stt.models.whisper.whisper.Model."""
+            _processor = None
+
+            def generate(self, *args, **kwargs):  # pragma: no cover
+                raise AssertionError("transcribe should not run")
+
+        FakeWhisperModel.__module__ = "mlx_audio.stt.models.whisper.whisper"
+        FakeWhisperModel.__qualname__ = "Model"
+
+        def _load_returning_no_processor(*args, **kwargs):
+            return FakeWhisperModel()
+
+        fake_utils = types.ModuleType("mlx_audio.stt.utils")
+        fake_utils.load_model = _load_returning_no_processor
+        fake_stt = sys.modules.setdefault("mlx_audio.stt", types.ModuleType("mlx_audio.stt"))
+        fake_audio = sys.modules.setdefault("mlx_audio", types.ModuleType("mlx_audio"))
+        monkeypatch.setitem(sys.modules, "mlx_audio", fake_audio)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt", fake_stt)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", fake_utils)
+
+        engine = self._stt_engine("mlx-community/whisper-large-v3-turbo")
+        with pytest.raises(RuntimeError) as exc_info:
+            asyncio.run(engine.start())
+
+        message = str(exc_info.value).lower()
+        assert "processor" in message
+        assert "preprocessor_config.json" in message or "hugging" in message
+
+    def test_whisper_with_processor_starts_successfully(self, monkeypatch):
+        """A whisper-like model that *does* have a processor loads without error."""
+        import asyncio
+        import sys
+        import types
+
+        class FakeWhisperModel:
+            _processor = object()  # any non-None value
+
+            def generate(self, *args, **kwargs):  # pragma: no cover
+                raise AssertionError("transcribe should not run")
+
+        FakeWhisperModel.__module__ = "mlx_audio.stt.models.whisper.whisper"
+        FakeWhisperModel.__qualname__ = "Model"
+
+        fake_utils = types.ModuleType("mlx_audio.stt.utils")
+        fake_utils.load_model = lambda *a, **kw: FakeWhisperModel()
+        fake_stt = sys.modules.setdefault("mlx_audio.stt", types.ModuleType("mlx_audio.stt"))
+        fake_audio = sys.modules.setdefault("mlx_audio", types.ModuleType("mlx_audio"))
+        monkeypatch.setitem(sys.modules, "mlx_audio", fake_audio)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt", fake_stt)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", fake_utils)
+
+        engine = self._stt_engine("mlx-community/whisper-tiny")
+        # Should not raise.
+        asyncio.run(engine.start())
+        asyncio.run(engine.stop())
+
+    def test_non_whisper_model_without_processor_attribute_starts(self, monkeypatch):
+        """Models that legitimately don't use _processor (non-whisper families)
+        must not be incorrectly rejected."""
+        import asyncio
+        import sys
+        import types
+
+        class FakeParakeetModel:
+            # no _processor attribute at all
+            def generate(self, *args, **kwargs):  # pragma: no cover
+                raise AssertionError("transcribe should not run")
+
+        FakeParakeetModel.__module__ = "mlx_audio.stt.models.parakeet.parakeet"
+        FakeParakeetModel.__qualname__ = "Model"
+
+        fake_utils = types.ModuleType("mlx_audio.stt.utils")
+        fake_utils.load_model = lambda *a, **kw: FakeParakeetModel()
+        fake_stt = sys.modules.setdefault("mlx_audio.stt", types.ModuleType("mlx_audio.stt"))
+        fake_audio = sys.modules.setdefault("mlx_audio", types.ModuleType("mlx_audio"))
+        monkeypatch.setitem(sys.modules, "mlx_audio", fake_audio)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt", fake_stt)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", fake_utils)
+
+        engine = self._stt_engine("mlx-community/parakeet-tdt")
+        asyncio.run(engine.start())
+        asyncio.run(engine.stop())
+
+
+# ---------------------------------------------------------------------------
 # Integration test (slow, requires mlx-audio)
 # ---------------------------------------------------------------------------
 

@@ -65,7 +65,9 @@ class ModelConfig:
     """Model configuration."""
 
     model_name: str = ""
-    trust_remote_code: bool = True
+    # Security: default off. HuggingFace repos can ship arbitrary modeling_*.py
+    # that gets executed at load time when this is True. Issue #926.
+    trust_remote_code: bool = False
     model_path: Optional[str] = None
 
 
@@ -103,6 +105,7 @@ class PagedSSDCacheConfig:
     """Paged SSD cache configuration. oMLX only supports paged SSD-based caching."""
 
     enabled: bool = False
+    hot_cache_only: bool = False
     cache_dir: Optional[Path] = None
     max_size: str = "100GB"
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
@@ -163,7 +166,7 @@ class OMLXConfig:
         # Model settings
         config.model.model_name = os.getenv("OMLX_MODEL", config.model.model_name)
         config.model.trust_remote_code = os.getenv(
-            "OMLX_TRUST_REMOTE_CODE", "true"
+            "OMLX_TRUST_REMOTE_CODE", "false"
         ).lower() == "true"
 
         # Generation settings
@@ -175,6 +178,7 @@ class OMLXConfig:
         )
 
         # Paged SSD cache settings
+        config.paged_ssd_cache.hot_cache_only = os.getenv("OMLX_HOT_CACHE_ONLY", "false").lower() == "true"
         paged_ssd_dir = os.getenv("OMLX_PAGED_SSD_CACHE_DIR")
         if paged_ssd_dir:
             config.paged_ssd_cache.enabled = True
@@ -235,6 +239,8 @@ class OMLXConfig:
             config.continuous_batching = args.continuous_batching
 
         # Paged SSD cache settings
+        if hasattr(args, "hot_cache_only") and args.hot_cache_only is not None:
+            config.paged_ssd_cache.hot_cache_only = args.hot_cache_only
         if hasattr(args, "paged_ssd_cache_dir") and args.paged_ssd_cache_dir:
             config.paged_ssd_cache.enabled = True
             config.paged_ssd_cache.cache_dir = Path(args.paged_ssd_cache_dir)

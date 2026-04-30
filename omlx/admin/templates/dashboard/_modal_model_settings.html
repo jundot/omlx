@@ -33,55 +33,107 @@
                     </button>
                 </div>
 
-                <!-- Profiles / Templates section -->
+                <!-- Profiles / Templates / Presets section -->
                 <div class="mb-6 p-4 bg-neutral-50 rounded-xl border border-neutral-200"
                      @input.stop="computeDrift()"
                      @change.stop="computeDrift()">
-                    <div class="flex items-center justify-between mb-3">
+                    <div class="flex items-center justify-between mb-3 gap-3 flex-wrap">
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400">{{ t('modal.model_settings.profiles.section_label') }}</h3>
-                        <span x-show="profileError" x-cloak class="text-xs text-red-600" x-text="profileError"></span>
-                    </div>
-
-                    <!-- Templates row -->
-                    <div class="flex items-center flex-wrap gap-2 mb-3">
-                        <span class="text-xs text-neutral-500 mr-2">{{ t('modal.model_settings.profiles.templates_row') }}</span>
-                        <template x-for="tmpl in templates" :key="tmpl.name">
-                            <div class="inline-flex items-center gap-1">
-                                <button type="button" @click="applyTemplateToForm(tmpl)"
-                                        class="px-2.5 py-1 text-xs rounded-full border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 transition-all"
-                                        x-text="tmpl.display_name || tmpl.name"></button>
-                                <button type="button" @click="editingTemplate = tmpl.name"
-                                        class="p-0.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 rounded transition-colors"
-                                        :title="t('modal.model_settings.profiles.update_from_form')">
-                                    <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+                        <div class="flex items-center gap-2">
+                            <span x-show="profileError" x-cloak class="text-xs text-red-600" x-text="profileError"></span>
+                            <!-- Scope toggle -->
+                            <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5">
+                                <button type="button" @click="setScope('preset')"
+                                        :class="profileScope === 'preset' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
+                                        class="px-3 py-1 text-xs font-medium rounded-md transition-all">
+                                    {{ t('modal.model_settings.profiles.scope_preset') }}
                                 </button>
-                                <button type="button" @click="templateDeleteConfirm = tmpl.name"
-                                        class="p-0.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded transition-colors"
-                                        :title="t('modal.model_settings.profiles.delete')">
-                                    <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
+                                <button type="button" @click="setScope('global')"
+                                        :class="profileScope === 'global' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
+                                        class="px-3 py-1 text-xs font-medium rounded-md transition-all">
+                                    {{ t('modal.model_settings.profiles.scope_global') }}
                                 </button>
-                                <span x-show="templateDeleteConfirm === tmpl.name" x-cloak class="flex items-center gap-1">
-                                    <button type="button" @click="deleteTemplate(tmpl.name)"
-                                            class="px-1.5 py-0.5 text-[10px] text-white bg-red-500 rounded">{{ t('models.manager.delete_yes') }}</button>
-                                    <button type="button" @click="templateDeleteConfirm = null"
-                                            class="px-1.5 py-0.5 text-[10px] text-neutral-600">{{ t('models.manager.delete_no') }}</button>
-                                </span>
+                                <button type="button" @click="setScope('model')"
+                                        :class="profileScope === 'model' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
+                                        class="px-3 py-1 text-xs font-medium rounded-md transition-all">
+                                    {{ t('modal.model_settings.profiles.scope_model') }}
+                                </button>
                             </div>
-                        </template>
-                        <button type="button" @click="showNewTemplateForm = true; newTemplate = {name:'',display_name:'',description:''}"
-                                class="px-2.5 py-1 text-xs rounded-full border border-dashed border-neutral-300 text-neutral-500 hover:text-neutral-900 hover:border-neutral-500 transition-all">
-                            {{ t('modal.model_settings.profiles.new_template') }}
-                        </button>
+                            <!-- Refresh button (only in Preset scope) -->
+                            <button type="button" x-show="profileScope === 'preset'"
+                                    @click="refreshPresets()"
+                                    :disabled="refreshingPresets"
+                                    @mouseenter="showTip($event.currentTarget, 'Fetch latest presets from omlx.ai')"
+                                    @mouseleave="hideTip()"
+                                    class="p-1 rounded-full text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all disabled:opacity-50">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                                     :class="refreshingPresets ? 'animate-spin' : ''" class="w-3.5 h-3.5">
+                                    <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>
+                                    <path d="M21 3v5h-5"/>
+                                    <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>
+                                    <path d="M3 21v-5h5"/>
+                                </svg>
+                            </button>
+                        </div>
                     </div>
 
-                    <!-- New template inline form -->
-                    <div x-show="showNewTemplateForm" x-cloak class="mb-3 p-3 bg-white border border-neutral-200 rounded-lg space-y-2">
-                        <div class="flex gap-2">
-                            <input type="text" x-model="newTemplate.name" :placeholder="t('modal.model_settings.profiles.name_placeholder')"
-                                   class="flex-1 px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
-                            <input type="text" x-model="newTemplate.display_name" :placeholder="t('modal.model_settings.profiles.display_name_label')"
-                                   class="flex-1 px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
+                    <!-- Preset scope: read-only pills with hover tooltip.
+                         Inline style used so the height clamp is immune to any tailwind
+                         cache / specificity issue that was previously letting 3+ rows show. -->
+                    <div x-show="profileScope === 'preset'" x-cloak
+                         style="max-height: 72px; overflow-y: auto;"
+                         class="pills-scrollbar">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <template x-for="p in presets" :key="p.name">
+                                <button type="button" @click="applyPresetToForm(p)"
+                                        @mouseenter="showTip($event.currentTarget, p.description)"
+                                        @mouseleave="hideTip()"
+                                        class="px-2.5 py-1 text-xs rounded-full border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 transition-all"
+                                        x-text="p.display_name || p.name"></button>
+                            </template>
+                            <span x-show="presets.length === 0" x-cloak class="text-xs text-neutral-400 italic">no presets available</span>
                         </div>
+                    </div>
+
+                    <!-- Global scope: templates row -->
+                    <div x-show="profileScope === 'global'" x-cloak
+                         style="max-height: 72px; overflow-y: auto;"
+                         class="pills-scrollbar">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <template x-for="tmpl in templates" :key="tmpl.name">
+                                <div class="inline-flex items-center gap-1">
+                                    <button type="button" @click="applyTemplateToForm(tmpl)"
+                                            class="px-2.5 py-1 text-xs rounded-full border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 transition-all"
+                                            x-text="tmpl.display_name || tmpl.name"></button>
+                                    <button type="button" @click="editingTemplate = tmpl.name"
+                                            class="p-0.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 rounded transition-colors"
+                                            :title="t('modal.model_settings.profiles.update_from_form')">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+                                    </button>
+                                    <button type="button" @click="templateDeleteConfirm = tmpl.name"
+                                            class="p-0.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded transition-colors"
+                                            :title="t('modal.model_settings.profiles.delete')">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
+                                    </button>
+                                    <span x-show="templateDeleteConfirm === tmpl.name" x-cloak class="flex items-center gap-1">
+                                        <button type="button" @click="deleteTemplate(tmpl.name)"
+                                                class="px-1.5 py-0.5 text-[10px] text-white bg-red-500 rounded">{{ t('models.manager.delete_yes') }}</button>
+                                        <button type="button" @click="templateDeleteConfirm = null"
+                                                class="px-1.5 py-0.5 text-[10px] text-neutral-600">{{ t('models.manager.delete_no') }}</button>
+                                    </span>
+                                </div>
+                            </template>
+                            <button type="button" @click="showNewTemplateForm = true; newTemplate = {name:'',display_name:'',description:''}"
+                                    class="px-2.5 py-1 text-xs rounded-full border border-dashed border-neutral-300 text-neutral-500 hover:text-neutral-900 hover:border-neutral-500 transition-all">
+                                {{ t('modal.model_settings.profiles.new_template') }}
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- New template inline form (global scope) -->
+                    <div x-show="profileScope === 'global' && showNewTemplateForm" x-cloak class="mt-3 p-3 bg-white border border-neutral-200 rounded-lg space-y-2">
+                        <input type="text" x-model="newTemplate.display_name" :placeholder="t('modal.model_settings.profiles.display_name_label')"
+                               class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
                         <input type="text" x-model="newTemplate.description" :placeholder="t('modal.model_settings.profiles.description_label')"
                                class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
                         <div class="flex justify-end gap-2">
@@ -92,9 +144,9 @@
                         </div>
                     </div>
 
-                    <!-- Edit template inline dialog -->
+                    <!-- Edit template inline dialog (global scope) -->
                     <template x-for="tmpl in templates" :key="'edit-'+tmpl.name">
-                        <div x-show="editingTemplate === tmpl.name" x-cloak class="mb-3 p-3 bg-white border border-neutral-200 rounded-lg space-y-2">
+                        <div x-show="profileScope === 'global' && editingTemplate === tmpl.name" x-cloak class="mt-3 p-3 bg-white border border-neutral-200 rounded-lg space-y-2">
                             <input type="text" :value="tmpl.display_name" @input="tmpl.display_name = $event.target.value"
                                    class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
                             <div class="flex justify-between gap-2">
@@ -111,58 +163,55 @@
                         </div>
                     </template>
 
-                    <!-- Profiles row -->
-                    <div class="flex items-center flex-wrap gap-2">
-                        <span class="text-xs text-neutral-500 mr-2">{{ t('modal.model_settings.profiles.profiles_row') }}</span>
-                        <template x-for="p in profiles" :key="p.name">
-                            <div class="inline-flex items-center gap-1">
-                                <button type="button" @click="applyProfileToForm(p)"
-                                        :class="activeProfileName === p.name
-                                            ? 'bg-emerald-500 text-white border border-emerald-500'
-                                            : 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100'"
-                                        class="px-2.5 py-1 text-xs rounded-full transition-all flex items-center gap-1">
-                                    <span x-text="p.display_name || p.name"></span>
-                                    <span x-show="activeProfileName === p.name && profilesDrift"
-                                          class="w-1.5 h-1.5 rounded-full bg-white"
-                                          :title="t('modal.model_settings.profiles.drift_hint')"></span>
-                                </button>
-                                <button type="button" @click="editingProfile = p.name"
-                                        class="p-0.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 rounded transition-colors">
-                                    <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
-                                </button>
-                                <button type="button" @click="profileDeleteConfirm = p.name"
-                                        class="p-0.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded transition-colors">
-                                    <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
-                                </button>
-                                <span x-show="profileDeleteConfirm === p.name" x-cloak class="flex items-center gap-1">
-                                    <button type="button" @click="deleteProfile(p.name)"
-                                            class="px-1.5 py-0.5 text-[10px] text-white bg-red-500 rounded">{{ t('models.manager.delete_yes') }}</button>
-                                    <button type="button" @click="profileDeleteConfirm = null"
-                                            class="px-1.5 py-0.5 text-[10px] text-neutral-600">{{ t('models.manager.delete_no') }}</button>
-                                </span>
-                            </div>
-                        </template>
-                        <button type="button"
-                                @click="showNewProfileForm = true; newProfile = {name:'',display_name:'',description:'',also_as_template:false}"
-                                class="px-2.5 py-1 text-xs rounded-full border border-dashed border-neutral-300 text-neutral-500 hover:text-neutral-900 hover:border-neutral-500 transition-all">
-                            {{ t('modal.model_settings.profiles.new_profile') }}
-                        </button>
+                    <!-- Model scope: per-model profiles -->
+                    <div x-show="profileScope === 'model'" x-cloak
+                         style="max-height: 72px; overflow-y: auto;"
+                         class="pills-scrollbar">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <template x-for="p in profiles" :key="p.name">
+                                <div class="inline-flex items-center gap-1">
+                                    <button type="button" @click="applyProfileToForm(p)"
+                                            @mouseenter="showTip($event.currentTarget, p.description)"
+                                            @mouseleave="hideTip()"
+                                            :class="activeProfileName === p.name
+                                                ? 'bg-emerald-500 text-white border border-emerald-500'
+                                                : 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100'"
+                                            class="px-2.5 py-1 text-xs rounded-full transition-all flex items-center gap-1">
+                                        <span x-text="p.display_name || p.name"></span>
+                                        <span x-show="activeProfileName === p.name && profilesDrift"
+                                              class="w-1.5 h-1.5 rounded-full bg-white"
+                                              :title="t('modal.model_settings.profiles.drift_hint')"></span>
+                                    </button>
+                                    <button type="button" @click="editingProfile = p.name"
+                                            class="p-0.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 rounded transition-colors">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+                                    </button>
+                                    <button type="button" @click="profileDeleteConfirm = p.name"
+                                            class="p-0.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded transition-colors">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
+                                    </button>
+                                    <span x-show="profileDeleteConfirm === p.name" x-cloak class="flex items-center gap-1">
+                                        <button type="button" @click="deleteProfile(p.name)"
+                                                class="px-1.5 py-0.5 text-[10px] text-white bg-red-500 rounded">{{ t('models.manager.delete_yes') }}</button>
+                                        <button type="button" @click="profileDeleteConfirm = null"
+                                                class="px-1.5 py-0.5 text-[10px] text-neutral-600">{{ t('models.manager.delete_no') }}</button>
+                                    </span>
+                                </div>
+                            </template>
+                            <button type="button"
+                                    @click="showNewProfileForm = true; newProfile = {name:'',display_name:'',description:'',also_as_template:false}"
+                                    class="px-2.5 py-1 text-xs rounded-full border border-dashed border-neutral-300 text-neutral-500 hover:text-neutral-900 hover:border-neutral-500 transition-all">
+                                {{ t('modal.model_settings.profiles.new_profile') }}
+                            </button>
+                        </div>
                     </div>
 
-                    <!-- New profile inline form -->
-                    <div x-show="showNewProfileForm" x-cloak class="mt-3 p-3 bg-white border border-neutral-200 rounded-lg space-y-2">
-                        <div class="flex gap-2">
-                            <input type="text" x-model="newProfile.name" :placeholder="t('modal.model_settings.profiles.name_placeholder')"
-                                   class="flex-1 px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
-                            <input type="text" x-model="newProfile.display_name" :placeholder="t('modal.model_settings.profiles.display_name_label')"
-                                   class="flex-1 px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
-                        </div>
+                    <!-- New profile inline form (model scope) -->
+                    <div x-show="profileScope === 'model' && showNewProfileForm" x-cloak class="mt-3 p-3 bg-white border border-neutral-200 rounded-lg space-y-2">
+                        <input type="text" x-model="newProfile.display_name" :placeholder="t('modal.model_settings.profiles.display_name_label')"
+                               class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
                         <input type="text" x-model="newProfile.description" :placeholder="t('modal.model_settings.profiles.description_label')"
                                class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
-                        <label class="flex items-center gap-2 text-xs text-neutral-600">
-                            <input type="checkbox" x-model="newProfile.also_as_template">
-                            <span>{{ t('modal.model_settings.profiles.also_as_template') }}</span>
-                        </label>
                         <div class="flex justify-end gap-2">
                             <button type="button" @click="showNewProfileForm = false"
                                     class="px-3 py-1 text-xs text-neutral-600 hover:bg-neutral-100 rounded">{{ t('modal.model_settings.profiles.cancel') }}</button>
@@ -171,9 +220,9 @@
                         </div>
                     </div>
 
-                    <!-- Edit profile inline dialog -->
+                    <!-- Edit profile inline dialog (model scope) -->
                     <template x-for="p in profiles" :key="'edit-'+p.name">
-                        <div x-show="editingProfile === p.name" x-cloak class="mt-3 p-3 bg-white border border-neutral-200 rounded-lg space-y-2">
+                        <div x-show="profileScope === 'model' && editingProfile === p.name" x-cloak class="mt-3 p-3 bg-white border border-neutral-200 rounded-lg space-y-2">
                             <input type="text" :value="p.display_name" @input="p.display_name = $event.target.value"
                                    class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
                             <div class="flex justify-between gap-2 flex-wrap">
@@ -195,6 +244,12 @@
                         </div>
                     </template>
                 </div>
+
+                <!-- Floating tooltip for preset/profile pill hover.
+                     position:fixed escapes the scroll container's overflow clipping. -->
+                <div x-show="tip.visible" x-cloak x-text="tip.text"
+                     class="fixed z-50 px-2.5 py-1 text-xs font-medium text-white bg-neutral-800 rounded-md whitespace-nowrap pointer-events-none -translate-x-1/2"
+                     :style="`top: ${tip.y}px; left: ${tip.x}px`"></div>
 
                 <!-- Two-column layout -->
                 <div class="flex flex-col lg:flex-row">
@@ -298,7 +353,7 @@
                                 <div>
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.ttl_seconds') }}</label>
                                     <input type="number" x-model.number="modelSettings.ttl_seconds"
-                                           :placeholder="selectedModel?.pinned ? window.t('modal.model_settings.ttl_pinned') : window.t('modal.model_settings.ttl_no_ttl')"
+                                           :placeholder="ttlPlaceholder"
                                            :disabled="selectedModel?.pinned"
                                            min="0" step="60"
                                            :class="selectedModel?.pinned ? 'bg-neutral-100 text-neutral-400 cursor-not-allowed' : ''"
@@ -401,6 +456,22 @@
                                             :class="modelSettings.force_sampling ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.force_sampling ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Trust Remote Code (security-sensitive) -->
+                            <div class="p-4 bg-red-50 rounded-xl border border-red-100">
+                                <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                        <span class="text-sm font-medium text-red-700">{{ t('modal.model_settings.trust_remote_code') }}</span>
+                                        <p class="text-xs text-red-600 mt-0.5">{{ t('modal.model_settings.trust_remote_code_hint') }}</p>
+                                    </div>
+                                    <button type="button" @click="modelSettings.trust_remote_code = !modelSettings.trust_remote_code"
+                                            :class="modelSettings.trust_remote_code ? 'bg-red-600' : 'bg-neutral-200'"
+                                            class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">
+                                        <span :class="modelSettings.trust_remote_code ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>

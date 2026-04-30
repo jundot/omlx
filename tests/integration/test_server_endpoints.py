@@ -163,6 +163,10 @@ class MockBaseEngine:
     def model_type(self) -> Optional[str]:
         return self._model_type
 
+    @property
+    def prefix_cache_enabled(self) -> bool:
+        return False
+
     async def start(self) -> None:
         pass
 
@@ -608,6 +612,27 @@ class TestCompletionEndpoint:
         data = response.json()
         assert "choices" in data
 
+    def test_completion_includes_cached_tokens_on_cache_hit(self, client, mock_llm_engine):
+        """Non-streaming completion responses should expose cached token counts."""
+        mock_llm_engine.generate = AsyncMock(return_value=MockGenerationOutput(
+            text="Generated response.",
+            prompt_tokens=2215,
+            completion_tokens=5,
+            cached_tokens=2048,
+        ))
+
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "Cache hit prompt",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["usage"]["prompt_tokens_details"]["cached_tokens"] == 2048
+
 
 class TestChatCompletionEndpoint:
     """Tests for the /v1/chat/completions endpoint."""
@@ -662,6 +687,29 @@ class TestChatCompletionEndpoint:
         )
 
         assert response.status_code == 200
+
+    def test_chat_completion_includes_cached_tokens_on_cache_hit(self, client, mock_llm_engine):
+        """Non-streaming chat responses should expose cached token counts."""
+        mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
+            text="Chat response.",
+            prompt_tokens=2215,
+            completion_tokens=5,
+            cached_tokens=2048,
+            finish_reason="stop",
+            finished=True,
+        ))
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Cache hit prompt"}],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["usage"]["prompt_tokens_details"]["cached_tokens"] == 2048
 
     def test_chat_completion_sanitizes_reasoning_tool_call_markup(self, client, mock_llm_engine):
         """Thinking-only tool calls should become structured tool_calls without leaked markup."""

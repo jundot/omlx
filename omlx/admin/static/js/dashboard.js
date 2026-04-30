@@ -34,7 +34,7 @@
                 model: { model_dirs: [''], max_model_memory: '' },
                 memory: { max_process_memory: 'auto', prefill_memory_guard: true },
                 scheduler: { max_concurrent_requests: 8 },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256 },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
                 huggingface: { endpoint: '' },
@@ -43,6 +43,7 @@
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
                 integrations: { codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
                 ui: { language: 'en' },
+                idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
 
@@ -61,6 +62,9 @@
             editingProcessMemory: false,
             editingModelMemory: false,
             editingHotCache: false,
+
+            // Idle timeout string value for select binding (null ↔ '')
+            idleTimeoutValue: '',
 
             // Models
             models: [],
@@ -103,15 +107,19 @@
                 enableToolResultLimit: false,
                 max_tool_result_tokens: null,
                 ctKwargEntries: [],
+                trust_remote_code: false,
             },
             savingModelSettings: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
 
-            // Profile / template state
+            // Profile / template / preset state
             profiles: [],                // per-model profiles for selectedModel
             templates: [],               // global templates
+            presets: [],                 // curated presets (bundled + remote refresh)
             profileFields: { universal: [], model_specific: [] },  // loaded from /api/profile-fields
+            profileScope: 'model',       // 'preset' | 'global' | 'model'
+            refreshingPresets: false,
             activeProfileName: null,     // currently-active profile for the form
             profilesDrift: false,        // true if form values differ from active profile
             _applySeq: 0,               // monotonic counter for apply race guard
@@ -414,6 +422,7 @@
                     this.loadModels(),
                     this.loadServerInfo(),
                     this.loadProfileFields(),
+                    this.loadPresets(),
                     this.checkForUpdate()
                 ]);
 
@@ -624,9 +633,15 @@
                             auth: { ...this.globalSettings.auth, ...data.auth },
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
+                            idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = data.ui || { language: 'en' };
+
+                        // Sync idle timeout select value
+                        this.idleTimeoutValue = this.globalSettings.idle_timeout?.idle_timeout_seconds != null
+                            ? String(this.globalSettings.idle_timeout.idle_timeout_seconds)
+                            : '';
 
                         // Calculate memory percent from stored value
                         if (this.globalSettings.model.max_model_memory === 'auto') {
@@ -730,6 +745,7 @@
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
                             hot_cache_max_size: this.globalSettings.cache.hot_cache_max_size,
                             initial_cache_blocks: this.globalSettings.cache.initial_cache_blocks,
+                            hot_cache_only: this.globalSettings.cache.hot_cache_only,
                             sampling_max_context_window: this.globalSettings.sampling.max_context_window,
                             sampling_max_tokens: this.globalSettings.sampling.max_tokens,
                             sampling_temperature: this.globalSettings.sampling.temperature,
@@ -743,6 +759,7 @@
                             network_ca_bundle: this.globalSettings.network.ca_bundle,
                             ...(this.globalSettings.auth.api_key ? { api_key: this.globalSettings.auth.api_key } : {}),
                             skip_api_key_verification: this.globalSettings.auth.skip_api_key_verification,
+                            idle_timeout_seconds: this.globalSettings.idle_timeout?.idle_timeout_seconds ?? null,
                         }),
                     });
 
@@ -1014,6 +1031,33 @@
                 }
                 this.profilesDrift = false;
             },
+            matchedPreset(settings) {
+                // Return the preset whose universal-field settings match the current model
+                // settings exactly, otherwise null. Used by the models list to show "which
+                // preset was applied" as a pill without any server-side tracking.
+                if (!settings || !this.presets || this.presets.length === 0) return null;
+                const universal = this.profileFields.universal || [];
+                if (universal.length === 0) return null;
+                const canonical = v => {
+                    if (v === undefined || v === null || v === false) return null;
+                    if (typeof v === 'object') {
+                        return JSON.stringify(v, Object.keys(v).sort());
+                    }
+                    return v;
+                };
+                for (const p of this.presets) {
+                    const ps = p.settings || {};
+                    let ok = true;
+                    for (const k of universal) {
+                        if (canonical(ps[k]) !== canonical(settings[k])) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok) return p;
+                }
+                return null;
+            },
             async loadProfilesForModel(modelId) {
                 this.profiles = [];
                 try {
@@ -1058,15 +1102,143 @@
                 }
             },
 
+            async loadPresets() {
+                // Use localStorage cache if present, otherwise fall back to the bundled file.
+                const cached = localStorage.getItem('omlx_preset_cache');
+                if (cached) {
+                    try {
+                        const parsed = JSON.parse(cached);
+                        this.presets = parsed.presets || [];
+                        return;
+                    } catch (e) { /* corrupted, fall through */ }
+                }
+                try {
+                    const r = await fetch('/admin/static/omlx_preset.json');
+                    if (r.ok) {
+                        const data = await r.json();
+                        this.presets = data.presets || [];
+                    }
+                } catch (e) {
+                    console.error('Failed to load bundled presets:', e);
+                }
+            },
+
+            async refreshPresets() {
+                if (this.refreshingPresets) return;
+                this.refreshingPresets = true;
+                try {
+                    const r = await fetch('/admin/api/presets/refresh', { method: 'POST' });
+                    if (r.ok) {
+                        const data = await r.json();
+                        this.presets = data.presets || [];
+                        localStorage.setItem('omlx_preset_cache', JSON.stringify(data));
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Preset refresh failed:', e);
+                } finally {
+                    this.refreshingPresets = false;
+                }
+            },
+
+            // Floating tooltip shared by preset/profile pills (position:fixed escapes
+            // the scroll container's overflow clipping, unlike absolute+group-hover).
+            tip: { visible: false, text: '', x: 0, y: 0 },
+
+            showTip(el, text) {
+                if (!text) return;
+                const rect = el.getBoundingClientRect();
+                this.tip = {
+                    visible: true,
+                    text: text,
+                    x: rect.left + rect.width / 2,
+                    y: rect.bottom + 6,
+                };
+            },
+            hideTip() {
+                this.tip.visible = false;
+            },
+
+            _resetPresetApplicableFields() {
+                // Reset all fields a preset can touch so switching presets does not leave
+                // stale values. Intentionally does NOT touch model_alias / model_type_override
+                // / is_pinned / is_default / turboquant_* / dflash_* / specprefill_* / index_cache_*.
+                const ms = this.modelSettings;
+                ms.temperature = null;
+                ms.top_p = null;
+                ms.top_k = null;
+                ms.min_p = null;
+                ms.repetition_penalty = null;
+                ms.presence_penalty = null;
+                ms.force_sampling = false;
+                ms.max_context_window = null;
+                ms.max_tokens = null;
+                ms.reasoning_parser = null;
+                ms.ttl_seconds = null;
+                ms.enable_thinking = null;
+                ms.enableThinkingBudget = false;
+                ms.thinking_budget_tokens = null;
+                ms.enableToolResultLimit = false;
+                ms.max_tool_result_tokens = null;
+                ms.ctKwargEntries = [];
+            },
+
+            applyPresetToForm(preset) {
+                // Reset first so previous preset's fields (e.g. presence_penalty) do not stick.
+                this._resetPresetApplicableFields();
+                const s = preset.settings || {};
+                const ms = this.modelSettings;
+                for (const k of Object.keys(s)) {
+                    if (k === 'thinking_budget_enabled') {
+                        ms.enableThinkingBudget = !!s[k];
+                    } else if (k === 'max_tool_result_tokens') {
+                        ms.enableToolResultLimit = s[k] != null;
+                        ms.max_tool_result_tokens = s[k] ?? null;
+                    } else if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') {
+                        const ctk = s.chat_template_kwargs || {};
+                        const forced = new Set(s.forced_ct_kwargs || []);
+                        const entries = [];
+                        for (const [key, value] of Object.entries(ctk)) {
+                            if (key === 'enable_thinking') {
+                                entries.push({type:'enable_thinking', value:String(value), force:forced.has('enable_thinking')});
+                            } else if (key === 'reasoning_effort') {
+                                entries.push({type:'reasoning_effort', value:String(value), force:forced.has('reasoning_effort')});
+                            } else {
+                                entries.push({type:'custom', key, value:String(value), force:forced.has(key)});
+                            }
+                        }
+                        ms.ctKwargEntries = entries;
+                    } else {
+                        ms[k] = s[k];
+                    }
+                }
+                this.activeProfileName = null;
+                this.profilesDrift = false;
+            },
+
+            setScope(scope) {
+                this.profileScope = scope;
+                try { localStorage.setItem('omlx_profile_scope', scope); } catch (e) {}
+            },
+
             async createProfile() {
                 if (!this.selectedModel) return;
                 this.profileError = '';
+                const displayName = this.newProfile.display_name.trim();
+                if (!displayName) {
+                    this.profileError = 'Name required';
+                    return;
+                }
+                // Auto-generate short unique slug (matches backend ^[a-z0-9][a-z0-9_-]{0,31}$)
+                const autoId = 'p-' + Date.now().toString(36) + '-' +
+                               Math.random().toString(36).slice(2, 6);
                 const body = {
-                    name: this.newProfile.name.trim(),
-                    display_name: this.newProfile.display_name.trim() || this.newProfile.name.trim(),
+                    name: autoId,
+                    display_name: displayName,
                     description: this.newProfile.description.trim() || null,
                     settings: this.formValuesForProfile(),
-                    also_save_as_template: !!this.newProfile.also_as_template,
+                    also_save_as_template: false,
                 };
                 try {
                     const r = await fetch(
@@ -1230,9 +1402,16 @@
             },
             async createTemplate() {
                 this.profileError = '';
+                const displayName = this.newTemplate.display_name.trim();
+                if (!displayName) {
+                    this.profileError = 'Name required';
+                    return;
+                }
+                const autoId = 't-' + Date.now().toString(36) + '-' +
+                               Math.random().toString(36).slice(2, 6);
                 const body = {
-                    name: this.newTemplate.name.trim(),
-                    display_name: this.newTemplate.display_name.trim() || this.newTemplate.name.trim(),
+                    name: autoId,
+                    display_name: displayName,
                     description: this.newTemplate.description.trim() || null,
                     // Only universal fields — server will filter again defensively.
                     settings: this.formValuesForTemplate(),
@@ -1305,6 +1484,12 @@
                 this.profileDeleteConfirm = null;
                 this.templateDeleteConfirm = null;
                 this.activeProfileName = (model.settings && model.settings.active_profile_name) || null;
+                try {
+                    const saved = localStorage.getItem('omlx_profile_scope');
+                    if (saved === 'preset' || saved === 'global' || saved === 'model') {
+                        this.profileScope = saved;
+                    }
+                } catch (e) {}
                 await Promise.all([
                     this.loadProfilesForModel(model.id),
                     this.loadTemplates(),
@@ -1366,6 +1551,7 @@
                     dflash_draft_model: settings.dflash_draft_model || '',
                     dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
                     ctKwargEntries,
+                    trust_remote_code: settings.trust_remote_code || false,
                 };
                 this.showModelSettingsModal = true;
             },
@@ -1445,6 +1631,7 @@
                                 dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
                                     ? parseInt(this.modelSettings.dflash_draft_quant_bits)
                                     : null,
+                                trust_remote_code: this.modelSettings.trust_remote_code,
                             };
                         })()),
                     });
@@ -1507,6 +1694,7 @@
                         this.modelSettings.dflash_enabled = false;
                         this.modelSettings.dflash_draft_model = null;
                         this.modelSettings.dflash_draft_quant_bits = null;
+                        this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
                     } else if (response.status === 401) {
@@ -1549,6 +1737,15 @@
             get displayHost() {
                 const host = this.selectedAlias || this.stats.host || '127.0.0.1';
                 return this.formatDisplayHost(host);
+            },
+
+            get ttlPlaceholder() {
+                if (this.selectedModel?.pinned) return window.t('modal.model_settings.ttl_pinned');
+                const globalTtl = this.globalSettings.idle_timeout?.idle_timeout_seconds;
+                if (globalTtl) {
+                    return window.t('modal.model_settings.ttl_global_fallback').replace('{seconds}', globalTtl);
+                }
+                return window.t('modal.model_settings.ttl_no_ttl');
             },
 
             async loadServerInfo() {

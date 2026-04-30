@@ -11,11 +11,13 @@ The scheduler follows vLLM's design with:
 - Continuous batching via BatchGenerator
 """
 
+import concurrent.futures
 import copy
 import gc
 import logging
 import time
-from collections import deque
+from collections import defaultdict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -29,7 +31,9 @@ from mlx_lm.generate import (
     generation_stream,
 )
 from mlx_lm.models.cache import make_prompt_cache
-from mlx_lm.sample_utils import make_sampler, make_logits_processors
+from mlx_lm.sample_utils import make_logits_processors
+
+from .utils.sampling import make_sampler as omlx_make_sampler
 
 from pathlib import Path
 
@@ -48,9 +52,16 @@ def _sync_and_clear_cache():
     'completeMemory() prepare count underflow' kernel panic on M4 hardware
     (and SIGSEGV/SIGABRT on M3).
 
-    See: https://github.com/jundot/omlx/issues/300
+    See: https://github.com/jundot/omlx/issues/300, #888
     """
-    mx.synchronize(generation_stream)
+    # Generation_stream may not have in-flight work on the current thread
+    # (e.g. external prefill submits to the default stream). On some MLX
+    # builds mx.synchronize raises "There is no Stream(gpu, 0) in current
+    # thread" in that case; swallow it since there is nothing to drain.
+    try:
+        mx.synchronize(generation_stream)
+    except RuntimeError:
+        pass
     mx.synchronize()  # default stream
     mx.clear_cache()
 
@@ -167,9 +178,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Monkey-patch PromptProcessingBatch.prompt to set mRoPE deltas before the
 # prompt processing loop.  Without this, batched VLM prompt processing
-# (e.g. the 1-token final prompt after external prefill) falls into the
-# _wrap_caches fallback which collapses per-request offsets to a scalar,
-# corrupting attention masks for concurrent VLM requests.
+# (e.g. the 1-token final prompt after external prefill) would use
+# per-request offsets without rope_deltas, corrupting attention masks
+# for concurrent VLM requests.
 # ---------------------------------------------------------------------------
 _original_ppb_prompt = PromptProcessingBatch.prompt
 
@@ -316,6 +327,7 @@ class SchedulerConfig:
     # When paged_ssd_cache_dir is set, oMLX stores KV cache on paged SSD for prefix reuse.
     # When None, no oMLX caching (mlx-lm BatchGenerator manages KV internally).
     paged_ssd_cache_dir: Optional[str] = None  # Path for paged SSD cache storage (None = disabled)
+    hot_cache_only: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
 
@@ -477,6 +489,24 @@ class Scheduler:
         # Track active specprefill request for RoPE cleanup
         self._specprefill_active_request_id: Optional[str] = None
 
+        # Phase timing instrumentation for cache-on overhead diagnostics.
+        # Accumulated wall-time per phase + invocation count, dumped at request
+        # end or via get_phase_stats(). Adds ~100ns per measurement.
+        self._phase_total_ms: Dict[str, float] = defaultdict(float)
+        self._phase_count: Dict[str, int] = defaultdict(int)
+
+        # Async store_cache executor (G2-async). Offloads the post-finish
+        # bulk memcpy (28GB+ per 32k request) off the inference thread so
+        # response streaming isn't blocked by it.
+        self._store_cache_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        # Pending (uid, request_id, future) entries waiting for async store
+        # to finish before batch_generator.remove() can safely run. Drained
+        # at the start of every step.
+        self._pending_async_removes: deque = deque()
+        # Track in-flight store futures per request_id for lookup wait /
+        # shutdown wait.
+        self._inflight_store_futures: Dict[str, concurrent.futures.Future] = {}
+
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: Dict[str, int] = {}
         self.uid_to_request_id: Dict[int, str] = {}
@@ -533,6 +563,14 @@ class Scheduler:
                     f"block_size={self.config.paged_cache_block_size}, "
                     f"max_blocks={max_blocks}"
                 )
+
+            # Async store_cache executor: single worker so submissions are
+            # serialized (matches the original synchronous order) and we
+            # never have two stores racing on the same paged_ssd index.
+            self._store_cache_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="omlx-store-cache",
+            )
         else:
             logger.info("oMLX cache disabled (mlx-lm BatchGenerator manages KV internally)")
 
@@ -619,6 +657,178 @@ class Scheduler:
         # Must be after _is_harmony_model / _generation_config_eos init
         # since _get_xtc_special_tokens() delegates to _get_stop_tokens().
         self._xtc_special_tokens: list[int] = self._get_xtc_special_tokens()
+
+    @contextmanager
+    def _phase_timer(self, phase: str):
+        """Lightweight wall-time accumulator for cache-on overhead diagnostics.
+
+        Tracks total ms and invocation count per named phase. Intended for
+        boundary capture / store_cache / hot cache eviction hot paths.
+        """
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._phase_total_ms[phase] += (time.perf_counter() - t0) * 1000.0
+            self._phase_count[phase] += 1
+
+    def get_phase_stats(self) -> Dict[str, Dict[str, float]]:
+        """Return accumulated phase timings for diagnostics.
+
+        Returns dict of phase -> {total_ms, count, avg_ms}.
+        """
+        result = {}
+        for phase, total in self._phase_total_ms.items():
+            count = self._phase_count.get(phase, 0)
+            result[phase] = {
+                "total_ms": total,
+                "count": count,
+                "avg_ms": total / count if count else 0.0,
+            }
+        return result
+
+    @staticmethod
+    def _collect_arrays_from_extracted_cache(
+        extracted_cache: List[Any],
+    ) -> List[Any]:
+        """Collect lazy mx.array references from an _extracted_cache payload.
+
+        Used by G2-async to force a single batched mx.eval on the inference
+        thread before handing the cache off to the store_cache worker. The
+        worker can then call _extract_tensor_bytes safely (no further Metal
+        graph evaluation needed for non-bfloat16, no-op for already-evaluated).
+
+        Walks the per-layer dict format produced by _extract_cache_states:
+        each layer is {state, meta_state, class_name, cache_type}, where
+        state is a tuple of mx.arrays (or nested for CacheList / TurboQuant).
+        """
+        arrays: List[Any] = []
+        for layer in extracted_cache or []:
+            if not isinstance(layer, dict):
+                continue
+            state = layer.get('state', ())
+            if isinstance(state, mx.array):
+                arrays.append(state)
+                continue
+            if not isinstance(state, (list, tuple)):
+                continue
+            for item in state:
+                if isinstance(item, mx.array):
+                    arrays.append(item)
+                elif isinstance(item, (list, tuple)):
+                    for sub in item:
+                        if isinstance(sub, mx.array):
+                            arrays.append(sub)
+                        elif hasattr(sub, '_fields'):
+                            # NamedTuple state (TurboQuant). Walk fields.
+                            for fname in sub._fields:
+                                val = getattr(sub, fname, None)
+                                if isinstance(val, mx.array):
+                                    arrays.append(val)
+                elif hasattr(item, '_fields'):
+                    for fname in item._fields:
+                        val = getattr(item, fname, None)
+                        if isinstance(val, mx.array):
+                            arrays.append(val)
+        return arrays
+
+    def _async_store_cache_worker(
+        self,
+        request_id: str,
+        token_sequence_to_store: List[int],
+        cache_to_store: List[Any],
+        model_cache_config: Optional[Any],
+        intermediate_snapshots: Optional[Dict[int, List[Any]]],
+        extra_keys: Optional[Tuple[Any, ...]],
+        extra_key_token_start: Optional[int],
+        extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]],
+    ) -> None:
+        """Run store_cache + paged_cache cleanup off the inference thread.
+
+        Pre-conditions enforced by the caller (_cleanup_finished):
+        - All mx.array references in cache_to_store have already been
+          mx.eval()'d on the inference thread, so save_block's internal
+          mx.eval is a no-op.
+        - bfloat16 view+eval inside _extract_tensor_bytes runs on this
+          worker's default mx stream, isolated from generation_stream;
+          the underlying buffer is read-only at this point.
+        - batch_generator.remove(uid) is deferred until this worker
+          completes (handled by _drain_pending_async_removes).
+
+        paged_cache_manager and block_aware_cache rely on
+        threading.RLock so concurrent access from main and worker is safe.
+        """
+        try:
+            block_table = self.block_aware_cache.store_cache(
+                request_id,
+                token_sequence_to_store,
+                cache_to_store,
+                model_cache_config=model_cache_config,
+                boundary_snapshots=intermediate_snapshots,
+                extra_keys=extra_keys,
+                extra_key_token_start=extra_key_token_start,
+                extra_key_ranges=extra_key_ranges,
+            )
+            if block_table is None and self.paged_cache_manager is not None:
+                block_table = self.paged_cache_manager.get_block_table(request_id)
+            if block_table and self.paged_cache_manager is not None:
+                self.paged_cache_manager.release_for_eviction(block_table.block_ids)
+            if self.block_aware_cache is not None:
+                self.block_aware_cache.clear_request_entry(request_id)
+        except Exception as e:
+            logger.warning(
+                "Async store_cache failed for %s: %s", request_id, e
+            )
+
+    def _drain_pending_async_removes(self) -> None:
+        """Process deferred batch_generator.remove() calls from prior steps.
+
+        Called at the start of every step. For each pending entry, if the
+        async store_cache future has finished, perform the
+        batch_generator.remove() on the inference thread (Metal-safe) and
+        finalize cleanup state. Entries whose futures are still in flight
+        are left at the head of the deque for a later step.
+        """
+        if not self._pending_async_removes:
+            return
+        while self._pending_async_removes:
+            uid, request_id, future = self._pending_async_removes[0]
+            if future is not None and not future.done():
+                # Worker still busy. Stop draining; check again next step.
+                # Inflight entry stays at deque head to preserve order.
+                break
+            self._pending_async_removes.popleft()
+            # Surface worker exceptions for visibility (don't crash step loop).
+            if future is not None:
+                exc = future.exception()
+                if exc is not None:
+                    logger.warning(
+                        "Async store_cache for %s raised: %s", request_id, exc
+                    )
+            # Run batch_generator.remove on the inference thread.
+            try:
+                mx.synchronize(generation_stream)
+                self._remove_uid_from_active_batch(uid)
+                if hasattr(self.model, "unregister_rope_delta"):
+                    self.model.unregister_rope_delta(uid)
+            except Exception as e:
+                logger.warning(
+                    "Deferred batch_generator.remove(uid=%s) failed: %s",
+                    uid, e,
+                )
+            # Cleanup uid maps now that the slot is reclaimable.
+            if uid in self.uid_to_request_id:
+                del self.uid_to_request_id[uid]
+            if request_id in self.request_id_to_uid:
+                del self.request_id_to_uid[request_id]
+            self._inflight_store_futures.pop(request_id, None)
+            # Worker no longer holds extracted_cache — pop request from
+            # self.requests and drop the cache buffer references so MLX
+            # arrays can be freed.
+            req_to_remove = self.requests.pop(request_id, None)
+            if req_to_remove is not None:
+                req_to_remove._extracted_cache = None
+                req_to_remove.prompt_cache = None
 
     def _calculate_max_blocks(self) -> int:
         """
@@ -948,7 +1158,7 @@ class Scheduler:
 
     def _create_batch_generator(self, sampling_params: SamplingParams) -> BatchGenerator:
         """Create a BatchGenerator with the given sampling parameters."""
-        sampler = make_sampler(
+        sampler = omlx_make_sampler(
             temp=sampling_params.temperature,
             top_p=sampling_params.top_p,
             min_p=sampling_params.min_p,
@@ -1178,7 +1388,7 @@ class Scheduler:
         # derived from block_table.num_tokens and therefore trustworthy.
         if boundary_enabled and hasattr(request, "cached_tokens") and request.cached_tokens > 0:
             if base_size != request.cached_tokens:
-                logger.warning(
+                logger.debug(
                     "Cache base_size mismatch: computed %d, expected %d "
                     "(cached_tokens). Using cached_tokens for boundary "
                     "alignment.",
@@ -1201,10 +1411,14 @@ class Scheduler:
             # Setting _rope_deltas=None makes the language model use
             # _position_ids (set by get_input_embeddings) instead.
             # Saved and restored after prefill for decode rope_deltas capture.
+            # Only applies to mRoPE VLMs (Qwen2-VL, Qwen2.5-VL, GLM-4V, etc.);
+            # non-mRoPE VLMs like Gemma 4 have no _rope_deltas attribute.
             _saved_rope_deltas = None
-            if start_offset > 0 and hasattr(self.model, "_language_model"):
-                _saved_rope_deltas = self.model._language_model._rope_deltas
-                self.model._language_model._rope_deltas = None
+            if start_offset > 0:
+                lm = getattr(self.model, "_language_model", None)
+                if lm is not None and hasattr(lm, "_rope_deltas"):
+                    _saved_rope_deltas = lm._rope_deltas
+                    lm._rope_deltas = None
 
         # Prefill tokens[0:N-1] (leave last token for insert())
         prefill_tokens = tokens[:-1]
@@ -1375,7 +1589,13 @@ class Scheduler:
         self, sampling_params: SamplingParams, request: Any = None
     ) -> Tuple[Callable[[mx.array], mx.array], List[Callable]]:
         """Build per-request sampler and logits processors."""
-        sampler = make_sampler(
+        # Use omlx.utils.sampling.make_sampler instead of mlx_lm.sample_utils.
+        # The mlx-lm version decorates categorical_sampling and apply_* with
+        # @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state),
+        # which fails to advance the RNG state after the first call in this
+        # server environment. Identical prompts then produce identical output
+        # even at temperature > 1.
+        sampler = omlx_make_sampler(
             temp=sampling_params.temperature,
             top_p=sampling_params.top_p,
             min_p=sampling_params.min_p,
@@ -1777,19 +1997,21 @@ class Scheduler:
         try:
             # Synchronize pending generation_stream operations before
             # accessing batch cache tensors.
-            mx.synchronize(generation_stream)
-            with mx.stream(generation_stream):
-                result = self.batch_generator.extract_cache([uid])
-                if uid not in result:
-                    return None
-                cache_list, _tokens = result[uid]
-                # Only extract non-sliceable layers to avoid costly
-                # deep-copy accumulation (same rationale as prefill path).
-                return [
-                    c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES
-                    else None
-                    for c in cache_list
-                ]
+            with self._phase_timer("boundary_capture_sync"):
+                mx.synchronize(generation_stream)
+            with self._phase_timer("boundary_capture_extract"):
+                with mx.stream(generation_stream):
+                    result = self.batch_generator.extract_cache([uid])
+                    if uid not in result:
+                        return None
+                    cache_list, _tokens = result[uid]
+                    # Only extract non-sliceable layers to avoid costly
+                    # deep-copy accumulation (same rationale as prefill path).
+                    return [
+                        c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES
+                        else None
+                        for c in cache_list
+                    ]
         except Exception as e:
             logger.debug(f"Failed to extract boundary cache snapshot for uid={uid}: {e}")
             return None
@@ -1819,10 +2041,11 @@ class Scheduler:
 
         # Offload to SSD with in-memory fallback.
         if self._boundary_snapshot_store is not None:
-            saved = self._boundary_snapshot_store.save(
-                request.request_id, total_tokens, snapshot_cache,
-                self._extract_cache_states,
-            )
+            with self._phase_timer("boundary_snapshot_save"):
+                saved = self._boundary_snapshot_store.save(
+                    request.request_id, total_tokens, snapshot_cache,
+                    self._extract_cache_states,
+                )
             if saved:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = None
             else:
@@ -2067,13 +2290,13 @@ class Scheduler:
                 pass
 
         normalized_len = int(normalized_keys.shape[2]) if len(normalized_keys.shape) >= 3 else 0
-        effective_offset = max(0, offset)
-        if max_size > 0 and effective_offset >= max_size:
-            normalized_idx = min(normalized_len, max_size)
-        elif effective_offset > 0:
-            normalized_idx = min(normalized_len, effective_offset)
-        else:
-            normalized_idx = min(normalized_len, max(0, idx))
+        # Force case 1 of _temporal_order: _idx == keys.shape[2] means the
+        # buffer is already in temporal order (which is exactly what the
+        # oversized trim above produces — the contiguous tail of the most
+        # recent tokens). Anything else lets _temporal_order re-slice the
+        # buffer in the rotated branch (case 2), which is wasted work and
+        # obscures the merge contract. See cache.py:431-447 for the branches.
+        normalized_idx = normalized_len
 
         normalized_meta = (
             str(keep),
@@ -3193,12 +3416,24 @@ class Scheduler:
 
             # Insert into BatchGenerator with pre-filled cache + last token.
             # BatchGenerator only handles decode from here.
+            #
+            # IMPORTANT: ``logits_processors`` MUST be passed as a per-row
+            # list (possibly empty), never None.  mlx-lm's
+            # GenerationBatch._step does ``for p in self.logits_processors[e]``
+            # in any branch where ``any(self.logits_processors)`` is True
+            # (e.g., heterogeneous merge with another row that has a
+            # processor).  A None slot crashes that loop with
+            # ``TypeError: 'NoneType' object is not iterable``, which then
+            # bubbles into the engine retry loop and presents as a hang.
+            # See vllm-mlx-patched commit 8d4052b for the same root cause
+            # in a sibling project, and #934 for the user-visible symptom.
+            per_row_lps = list(logits_processors) if logits_processors else []
             uids = self.batch_generator.insert(
                 [tokens_to_process],
                 max_tokens=[request.sampling_params.max_tokens],
                 caches=[cache_to_use] if cache_to_use else None,
                 samplers=[sampler],
-                logits_processors=[logits_processors],
+                logits_processors=[per_row_lps],
                 state_machines=[sm],
             )
 
@@ -3417,7 +3652,8 @@ class Scheduler:
         # store_cache -> mx.save_safetensors triggers implicit mx.eval() which
         # can conflict with async Metal operations on the generation stream.
         if finished_ids:
-            mx.synchronize(generation_stream)
+            with self._phase_timer("cleanup_finished_sync"):
+                mx.synchronize(generation_stream)
 
         # SpecPrefill: restore original RoPE if active request finished
         for rid in finished_ids:
@@ -3433,12 +3669,16 @@ class Scheduler:
         for request_id in finished_ids:
             request = self.running.get(request_id)
 
-            # Store cache for future reuse
+            # Store cache for future reuse (G2-async): submit to background
+            # executor so the post-finish 28GB+ memcpy doesn't block response
+            # streaming. The inference thread does mx.synchronize +
+            # boundary merge + a single batched mx.eval here; the worker
+            # handles _extract_tensor_bytes (CPU memcpy) + index/queue
+            # registration. batch_generator.remove(uid) is deferred and
+            # picked up at the next step's _drain_pending_async_removes.
+            store_future = None
             if request is not None and request.prompt_token_ids:
                 if self.block_aware_cache is not None:
-                    # Store in paged cache
-                    # Key includes both prompt and output tokens for multi-turn chat caching
-                    block_table = None
                     if hasattr(request, '_extracted_cache') and request._extracted_cache is not None:
                         try:
                             full_token_sequence = list(request.prompt_token_ids) + list(request.output_token_ids)
@@ -3451,18 +3691,22 @@ class Scheduler:
                                 cacheable_sequence = full_token_sequence
                             token_sequence_to_store = cacheable_sequence
                             cache_to_store = request._extracted_cache
-                            # Get model cache config if available (for hybrid cache support)
                             model_cache_config = getattr(request, '_model_cache_config', None)
+                            intermediate_snapshots = None
 
-                            # Keep all tensor-touching cache store work on the
-                            # generation stream to avoid cross-stream conflicts
-                            # with arrays extracted from BatchGenerator caches.
-                            with mx.stream(generation_stream):
+                            # Boundary merge + a batched mx.eval all on the
+                            # inference thread. The eval forces every array
+                            # we hand to the worker into a materialized state
+                            # so the worker's _extract_tensor_bytes is a pure
+                            # memcpy (mx.eval inside save_block becomes a
+                            # no-op). bfloat16 view+eval inside the worker
+                            # then runs on its own default stream, isolated
+                            # from generation_stream.
+                            with self._phase_timer("store_cache_main_prep"), mx.stream(generation_stream):
                                 boundary_override = self._get_boundary_store_override(
                                     request_id,
                                     cacheable_sequence,
                                 )
-                                intermediate_snapshots = None
                                 if boundary_override is not None:
                                     (
                                         token_sequence_to_store,
@@ -3470,16 +3714,9 @@ class Scheduler:
                                         boundary_model_config,
                                         intermediate_snapshots,
                                     ) = boundary_override
-
-                                    # Merge boundary snapshot with full extracted cache:
-                                    # KVCache layers in the snapshot are placeholders
-                                    # (empty state) when snapshots skip sliceable layers.
-                                    # Fill them from the full extracted cache so that
-                                    # _extract_block_tensor_slice can slice KV data.
                                     cache_to_store = self._merge_boundary_with_full_cache(
                                         boundary_cache, request._extracted_cache
                                     )
-
                                     if boundary_model_config is not None:
                                         model_cache_config = boundary_model_config
                                     logger.info(
@@ -3490,72 +3727,87 @@ class Scheduler:
                                         f"{len(intermediate_snapshots) if intermediate_snapshots else 0} "
                                         f"intermediate snapshots)"
                                     )
+                                pre_eval_arrays = self._collect_arrays_from_extracted_cache(cache_to_store)
+                                if pre_eval_arrays:
+                                    with self._phase_timer("store_cache_main_eval"):
+                                        mx.eval(*pre_eval_arrays)
 
-                                block_table = self.block_aware_cache.store_cache(
+                            if self._store_cache_executor is not None:
+                                store_future = self._store_cache_executor.submit(
+                                    self._async_store_cache_worker,
                                     request_id,
                                     token_sequence_to_store,
                                     cache_to_store,
-                                    model_cache_config=model_cache_config,
-                                    boundary_snapshots=intermediate_snapshots,
-                                    extra_keys=request.vlm_extra_keys_for_cache,
-                                    extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
-                                    extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                                    model_cache_config,
+                                    intermediate_snapshots,
+                                    request.vlm_extra_keys_for_cache,
+                                    request.vlm_extra_key_token_start_for_cache,
+                                    request.vlm_extra_key_ranges_for_cache,
+                                )
+                                self._inflight_store_futures[request_id] = store_future
+                            else:
+                                # Executor unavailable — synchronous fallback.
+                                self._async_store_cache_worker(
+                                    request_id,
+                                    token_sequence_to_store,
+                                    cache_to_store,
+                                    model_cache_config,
+                                    intermediate_snapshots,
+                                    request.vlm_extra_keys_for_cache,
+                                    request.vlm_extra_key_token_start_for_cache,
+                                    request.vlm_extra_key_ranges_for_cache,
                                 )
                             logger.debug(
-                                f"Stored paged cache for request {request_id} "
-                                f"({len(token_sequence_to_store)} tokens stored, "
+                                f"Submitted async store_cache for {request_id} "
+                                f"({len(token_sequence_to_store)} tokens, "
                                 f"{len(full_token_sequence)} total: "
                                 f"{len(request.prompt_token_ids)} prompt + "
                                 f"{len(request.output_token_ids)} output)"
                             )
-                            # Immediately release _extracted_cache to free copy #1
-                            # (store_cache already cloned to PagedCache blocks)
-                            request._extracted_cache = None
                         except Exception as e:
-                            logger.debug(f"Failed to store paged cache for {request_id}: {e}")
-
-                    # ALWAYS release blocks for eviction, even if store_cache() failed
-                    # This prevents ref_count leak when _extracted_cache is None or exception occurs
-                    if block_table is None and self.paged_cache_manager:
-                        # Try to get existing block_table from paged cache or request
-                        block_table = self.paged_cache_manager.get_block_table(request_id)
-                        if block_table is None and hasattr(request, 'block_table'):
-                            block_table = request.block_table
-
-                    if block_table and self.paged_cache_manager:
-                        released = self.paged_cache_manager.release_for_eviction(
-                            block_table.block_ids
-                        )
-                        if released > 0:
-                            logger.debug(
-                                f"Released {released} blocks for eviction "
-                                f"(request {request_id})"
+                            logger.debug(f"Failed to submit async store for {request_id}: {e}")
+                    else:
+                        # No extracted_cache to store, but ensure block leak guard.
+                        block_table = None
+                        if self.paged_cache_manager:
+                            block_table = self.paged_cache_manager.get_block_table(request_id)
+                            if block_table is None and hasattr(request, 'block_table'):
+                                block_table = request.block_table
+                        if block_table and self.paged_cache_manager:
+                            self.paged_cache_manager.release_for_eviction(
+                                block_table.block_ids
                             )
-
-                    # ALWAYS clear request entry to prevent memory leak
-                    self.block_aware_cache.clear_request_entry(request_id)
+                        self.block_aware_cache.clear_request_entry(request_id)
 
             # Remove from running
             if request_id in self.running:
                 del self.running[request_id]
 
-            # Remove from BatchGenerator to free internal KV cache
+            # batch_generator.remove(uid): defer until the async store_cache
+            # worker finishes so the BatchKVCache slot isn't reused while the
+            # worker is still reading buffer references via cache_to_store.
+            # _drain_pending_async_removes (next step) handles the actual
+            # mx.synchronize + remove + uid_maps cleanup. If we have no async
+            # store (no extracted_cache, executor missing, fallback fail),
+            # fall back to immediate remove for back-compat behavior.
             if request_id in self.request_id_to_uid:
                 uid = self.request_id_to_uid[request_id]
-                # Synchronize in-flight GPU work before modifying batch state.
-                # batch_generator.remove() triggers lazy KV cache array slicing
-                # (BatchKVCache.filter) that replaces references to arrays still
-                # used by in-flight Metal command buffers from the previous
-                # batch_generator.next() call.  Without this barrier the Metal
-                # driver can hit 'completeMemory() prepare count underflow'.
-                # (Mirrors the fix in _do_abort_request, commit 634603f)
-                mx.synchronize(generation_stream)
-                self._remove_uid_from_active_batch(uid)
-                if hasattr(self.model, "unregister_rope_delta"):
-                    self.model.unregister_rope_delta(uid)
-                if uid in self.uid_to_request_id:
-                    del self.uid_to_request_id[uid]
-                del self.request_id_to_uid[request_id]
+                if store_future is not None:
+                    self._pending_async_removes.append((uid, request_id, store_future))
+                else:
+                    # Synchronize in-flight GPU work before modifying batch state.
+                    # batch_generator.remove() triggers lazy KV cache array slicing
+                    # (BatchKVCache.filter) that replaces references to arrays still
+                    # used by in-flight Metal command buffers from the previous
+                    # batch_generator.next() call.  Without this barrier the Metal
+                    # driver can hit 'completeMemory() prepare count underflow'.
+                    mx.synchronize(generation_stream)
+                    self._remove_uid_from_active_batch(uid)
+                    if hasattr(self.model, "unregister_rope_delta"):
+                        self.model.unregister_rope_delta(uid)
+                    if uid in self.uid_to_request_id:
+                        del self.uid_to_request_id[uid]
+                    del self.request_id_to_uid[request_id]
 
             # Clean up streaming detokenizer
             self._cleanup_detokenizer(request_id)
@@ -3577,12 +3829,39 @@ class Scheduler:
             # Track as finished
             self.finished_req_ids.add(request_id)
 
-            # Remove from requests dict to prevent memory leak
-            # Also clear cache references to release MLX arrays
-            req_to_remove = self.requests.pop(request_id, None)
-            if req_to_remove is not None:
-                req_to_remove._extracted_cache = None
-                req_to_remove.prompt_cache = None
+            # Remove from requests dict to prevent memory leak.
+            # When async store_cache is in flight, keep _extracted_cache alive
+            # until the worker finishes — the worker holds a reference via
+            # cache_to_store argument, but request._extracted_cache pointing
+            # to the same data is the canonical owner. We pop here only when
+            # no future is pending; the future's done callback (or
+            # _drain_pending_async_removes) clears the request later.
+            if store_future is None:
+                req_to_remove = self.requests.pop(request_id, None)
+                if req_to_remove is not None:
+                    req_to_remove._extracted_cache = None
+                    req_to_remove.prompt_cache = None
+            else:
+                # Drop request from running but keep in self.requests so the
+                # async worker keeps the cache buffers alive via reachability.
+                # Cleanup happens in _drain_pending_async_removes.
+                pass
+
+        # Emit phase timing diagnostics when accumulated counts are meaningful.
+        # Helps diagnose cache-on overhead (boundary capture / store_cache /
+        # hot cache eviction). Logged at info level so operators can see it
+        # without enabling debug.
+        if finished_ids and self._phase_total_ms:
+            stats_parts = []
+            for phase, total_ms in sorted(self._phase_total_ms.items()):
+                count = self._phase_count.get(phase, 0)
+                if count == 0:
+                    continue
+                stats_parts.append(
+                    f"{phase}={total_ms:.1f}ms/{count}"
+                )
+            if stats_parts:
+                logger.info("Cache phase timings: %s", ", ".join(stats_parts))
 
         # Schedule deferred Metal cache cleanup after request completion.
         if finished_ids:
@@ -3724,6 +4003,11 @@ class Scheduler:
 
         # Process pending aborts FIRST (thread-safe with hybrid executor)
         self._process_pending_aborts()
+
+        # Drain async store_cache completions from prior steps. Each completed
+        # entry triggers the deferred batch_generator.remove(uid) on the
+        # inference thread. Inflight entries are left for a later step.
+        self._drain_pending_async_removes()
 
         # Check memory pressure and evict if needed (tiered cache)
         if self.memory_monitor is not None:
@@ -3943,6 +4227,23 @@ class Scheduler:
         paged SSD cache files are NOT cleared to allow reuse on reload.
         """
         logger.info("Scheduler shutdown initiated...")
+        # Wait for any inflight async store_cache futures + drain pending
+        # batch_generator removes so the writer thread / underlying paged SSD
+        # cache see all blocks before close().
+        if self._store_cache_executor is not None:
+            try:
+                inflight = list(self._inflight_store_futures.values())
+                if inflight:
+                    logger.info(
+                        "Waiting for %d inflight async store_cache future(s)...",
+                        len(inflight),
+                    )
+                    concurrent.futures.wait(inflight, timeout=30.0)
+                self._drain_pending_async_removes()
+                self._store_cache_executor.shutdown(wait=True)
+            except Exception as e:
+                logger.warning(f"Async store_cache shutdown error: {e}")
+            self._store_cache_executor = None
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
@@ -4055,11 +4356,14 @@ class Scheduler:
             return
 
         try:
+            cache_dir = Path(self.config.paged_ssd_cache_dir) if self.config.paged_ssd_cache_dir else None
+
             # Initialize paged SSD cache manager for SSD storage
             self.paged_ssd_cache_manager = PagedSSDCacheManager(
-                cache_dir=Path(self.config.paged_ssd_cache_dir),
+                cache_dir=cache_dir,
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
+                hot_cache_only=self.config.hot_cache_only,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager
@@ -4072,7 +4376,8 @@ class Scheduler:
 
             # Initialize boundary snapshot SSD store for offloading
             # non-sliceable cache snapshots during prefill.
-            if BoundarySnapshotSSDStore is not None:
+            # Skip in hot_cache_only mode since snapshots would never be written.
+            if BoundarySnapshotSSDStore is not None and not self.config.hot_cache_only:
                 try:
                     self._boundary_snapshot_store = BoundarySnapshotSSDStore(
                         base_dir=Path(self.config.paged_ssd_cache_dir)

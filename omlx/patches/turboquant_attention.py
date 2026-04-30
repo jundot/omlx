@@ -42,7 +42,7 @@ def apply_turboquant_attention_patch() -> bool:
         from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
         from ..turboquant_kv import BatchTurboQuantKVCache
 
-        # Unwrap VLM _IntOffsetCacheProxy to detect underlying TQ cache
+        # Detect underlying TQ cache (may be wrapped by proxy objects)
         real_cache = cache
         if hasattr(cache, "_cache") and not isinstance(
             cache, (_TQCache, BatchTurboQuantKVCache)

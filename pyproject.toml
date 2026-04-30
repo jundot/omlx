@@ -28,16 +28,15 @@ classifiers = [
 ]
 
 dependencies = [
-    "mlx>=0.31.1",
-    # mlx-lm from commit (a401730) - MiniMax M2 parallel tool fix + BatchKVCache extend fix
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@a40173094136fbcbfb41966889a22530c83bd86e",
+    "mlx>=0.31.2",
+    # mlx-lm from commit (ed1fca4, v0.31.3) - thread-local generation stream + ArraysCache batch dim fixes + think token None safety
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
-    # transformers version aligned with mlx-lm requirement
-    # 5.4.0 broke VLM: Qwen2VLImageProcessor now hard-requires torch (#431)
-    "transformers>=5.0.0,<5.4.0",
+    # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
+    "transformers>=5.0.0",
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
     "numpy>=1.24.0",
@@ -61,8 +60,8 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (3472132) - TQ race fix, Gemma 4 offset/projection/audio fixes
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@3472132fe6ee7beeae2c2fc35923eaed2e734b3d",
+    # mlx-vlm from commit (e41cd25) - thread-local stream, DFlash GPU hang fix, hunyuan_vl/gemma3n cleanup
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e41cd25565861500e48c076ab31aaeafee0ed80f",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.3 (814c4a1) — block diffusion speculative decoding + temperature sampling
     "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@814c4a1",
@@ -132,7 +131,7 @@ include = ["omlx*"]
 # mlx-lm is pinned to a git commit; override transitive pins
 # (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
 override-dependencies = [
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@a40173094136fbcbfb41966889a22530c83bd86e",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
 ]
 
 [tool.black]

@@ -632,15 +632,28 @@ class EnginePool:
                             f"Falling back to default engine."
                         )
 
+            # Per-model trust_remote_code (security opt-in, issue #926).
+            # When unset, defaults to False — repos with custom modeling_*.py
+            # will fail to load until the user explicitly toggles this on
+            # in the admin UI's model settings modal.
+            trc = bool(getattr(model_settings, "trust_remote_code", False)) if model_settings else False
+
             # Create engine based on engine type (if DFlash not active)
             if engine is None:
                 if effective_type == "embedding":
-                    engine = EmbeddingEngine(model_name=entry.model_path)
+                    engine = EmbeddingEngine(
+                        model_name=entry.model_path,
+                        trust_remote_code=trc,
+                    )
                 elif effective_type == "reranker":
-                    engine = RerankerEngine(model_name=entry.model_path)
+                    engine = RerankerEngine(
+                        model_name=entry.model_path,
+                        trust_remote_code=trc,
+                    )
                 elif effective_type == "vlm":
                     engine = VLMBatchedEngine(
                         model_name=entry.model_path,
+                        trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
@@ -656,6 +669,7 @@ class EnginePool:
                 else:
                     engine = BatchedEngine(
                         model_name=entry.model_path,
+                        trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
@@ -686,12 +700,14 @@ class EnginePool:
                     if effective_type == "vlm":
                         engine = VLMBatchedEngine(
                             model_name=entry.model_path,
+                            trust_remote_code=trc,
                             scheduler_config=self._scheduler_config,
                             model_settings=model_settings,
                         )
                     else:
                         engine = BatchedEngine(
                             model_name=entry.model_path,
+                            trust_remote_code=trc,
                             scheduler_config=self._scheduler_config,
                             model_settings=model_settings,
                         )
@@ -722,6 +738,7 @@ class EnginePool:
 
                     engine = VLMBatchedEngine(
                         model_name=entry.model_path,
+                        trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
@@ -750,6 +767,7 @@ class EnginePool:
 
                     engine = BatchedEngine(
                         model_name=entry.model_path,
+                        trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
@@ -877,7 +895,9 @@ class EnginePool:
         }
 
     async def check_ttl_expirations(
-        self, settings_manager: ModelSettingsManager
+        self,
+        settings_manager: ModelSettingsManager,
+        global_idle_timeout_seconds: int | None = None,
     ) -> list[str]:
         """Check and unload models that have exceeded their TTL.
 
@@ -887,6 +907,7 @@ class EnginePool:
 
         Args:
             settings_manager: The settings manager to read TTL values from.
+            global_idle_timeout_seconds: Global idle timeout fallback (None = no global TTL).
 
         Returns:
             List of model IDs that were unloaded.
@@ -903,11 +924,14 @@ class EnginePool:
                     continue
 
                 settings = settings_manager.get_settings(model_id)
-                if settings.ttl_seconds is None:
+                effective_ttl = settings.ttl_seconds
+                if effective_ttl is None:
+                    effective_ttl = global_idle_timeout_seconds
+                if effective_ttl is None:
                     continue
 
                 idle_time = now - entry.last_access
-                if idle_time < settings.ttl_seconds:
+                if idle_time < effective_ttl:
                     continue
 
                 # Check if model has active requests
@@ -919,7 +943,7 @@ class EnginePool:
 
                 logger.info(
                     f"TTL expired for model '{model_id}' "
-                    f"(idle {idle_time:.0f}s > ttl {settings.ttl_seconds}s)"
+                    f"(idle {idle_time:.0f}s > ttl {effective_ttl}s)"
                 )
                 await self._unload_engine(model_id)
                 expired.append(model_id)

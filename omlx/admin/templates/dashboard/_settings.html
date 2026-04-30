@@ -55,6 +55,7 @@
                                         <option value="zh-TW">{{ t('settings.language.zh-TW') }}</option>
                                         <option value="ko">{{ t('settings.language.ko') }}</option>
                                         <option value="ja">{{ t('settings.language.ja') }}</option>
+                                        <option value="ru">{{ t('settings.language.ru') }}</option>
                                     </select>
                                 </div>
                             </div>
@@ -499,6 +500,24 @@
                                            min="1"
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
+                                <!-- Idle Timeout -->
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.model.idle_timeout') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.model.idle_timeout_desc') }}</p>
+                                    </div>
+                                    <select x-model="idleTimeoutValue"
+                                            @change="globalSettings.idle_timeout.idle_timeout_seconds = idleTimeoutValue === '' ? null : Number(idleTimeoutValue); saveGlobalSettings()"
+                                            class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="">{{ t('settings.model.idle_timeout_none') }}</option>
+                                        <option value="900">{{ t('settings.model.idle_timeout_15m') }}</option>
+                                        <option value="1800">{{ t('settings.model.idle_timeout_30m') }}</option>
+                                        <option value="3600">{{ t('settings.model.idle_timeout_1h') }}</option>
+                                        <option value="7200">{{ t('settings.model.idle_timeout_2h') }}</option>
+                                        <option value="28800">{{ t('settings.model.idle_timeout_8h') }}</option>
+                                        <option value="86400">{{ t('settings.model.idle_timeout_24h') }}</option>
+                                    </select>
+                                </div>
                             </div>
                         </div>
 
@@ -519,6 +538,23 @@
                                             :class="globalSettings.cache.enabled ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.cache.enabled ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <div class="flex items-center gap-2">
+                                            <label class="text-sm text-neutral-700">{{ t('settings.cache.hot_cache_only') }}</label>
+                                            <span class="px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+                                                {{ t('settings.global.restart_badge') }}
+                                            </span>
+                                        </div>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.cache.hot_cache_only_hint') }}</p>
+                                    </div>
+                                    <button type="button" @click="globalSettings.cache.hot_cache_only = !globalSettings.cache.hot_cache_only"
+                                            :class="globalSettings.cache.hot_cache_only ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.cache.hot_cache_only ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
@@ -943,21 +979,91 @@
                                         </div>
                                     </div>
 
-                                    <!-- Profile chip -->
-                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && model.settings && (model.settings.active_profile_name || model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser)"
+                                    <!-- Profile / preset / per-field chips -->
+                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && model.settings && (model.settings.active_profile_name || model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true)"
                                          class="px-6 pb-4 -mt-2">
                                         <div class="ml-11 flex flex-wrap gap-2">
+                                            <!-- 1. Profile pill (emerald) if active_profile_name -->
                                             <template x-if="model.settings?.active_profile_name">
                                                 <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
                                                     <i data-lucide="settings" class="w-3 h-3"></i>
                                                     <span x-text="model.settings.active_profile_name"></span>
                                                 </span>
                                             </template>
-                                            <template x-if="!model.settings?.active_profile_name">
-                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-neutral-100 text-neutral-600 border border-neutral-200">
+                                            <!-- 2. Preset pill (cyan) if settings match a preset exactly -->
+                                            <template x-if="!model.settings?.active_profile_name && matchedPreset(model.settings)">
+                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-cyan-50 text-cyan-700 border border-cyan-200">
                                                     <i data-lucide="settings" class="w-3 h-3"></i>
-                                                    <span>{{ t('modal.model_settings.profiles.custom_label') }}</span>
+                                                    <span x-text="matchedPreset(model.settings).display_name || matchedPreset(model.settings).name"></span>
                                                 </span>
+                                            </template>
+                                            <!-- 3. Per-field chips (original colors, rounded-full shape) -->
+                                            <template x-if="model.settings?.max_context_window">
+                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-amber-50 text-amber-700 border border-amber-200">
+                                                    ctx_window: <span class="ml-1" x-text="model.settings.max_context_window"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.max_tokens">
+                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                                                    max_tokens: <span class="ml-1" x-text="model.settings.max_tokens"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.temperature !== null && model.settings?.temperature !== undefined">
+                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-orange-50 text-orange-700 border border-orange-200">
+                                                    temp: <span class="ml-1" x-text="model.settings.temperature"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.top_p !== null && model.settings?.top_p !== undefined">
+                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-green-50 text-green-700 border border-green-200">
+                                                    top_p: <span class="ml-1" x-text="model.settings.top_p"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.top_k !== null && model.settings?.top_k !== undefined">
+                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-purple-50 text-purple-700 border border-purple-200">
+                                                    top_k: <span class="ml-1" x-text="model.settings.top_k"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.min_p !== null && model.settings?.min_p !== undefined">
+                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+                                                    min_p: <span class="ml-1" x-text="model.settings.min_p"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.repetition_penalty !== null && model.settings?.repetition_penalty !== undefined">
+                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-pink-50 text-pink-700 border border-pink-200">
+                                                    rep_penalty: <span class="ml-1" x-text="model.settings.repetition_penalty"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.presence_penalty !== null && model.settings?.presence_penalty !== undefined">
+                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-rose-50 text-rose-700 border border-rose-200">
+                                                    presence_penalty: <span class="ml-1" x-text="model.settings.presence_penalty"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.max_tool_result_tokens">
+                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-teal-50 text-teal-700 border border-teal-200">
+                                                    tool_result_tokens: <span class="ml-1" x-text="model.settings.max_tool_result_tokens"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.reasoning_parser">
+                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-violet-50 text-violet-700 border border-violet-200">
+                                                    reasoning_parser: <span class="ml-1" x-text="model.settings.reasoning_parser"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.enable_thinking === true">
+                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-sky-50 text-sky-700 border border-sky-200">
+                                                    thinking
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.force_sampling">
+                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-red-50 text-red-700 border border-red-200">
+                                                    force_sampling
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.chat_template_kwargs">
+                                                <template x-for="[k, v] in Object.entries(model.settings.chat_template_kwargs)" :key="k">
+                                                    <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+                                                        <span x-text="k"></span>: <span class="ml-1" x-text="v"></span>
+                                                    </span>
+                                                </template>
                                             </template>
                                         </div>
                                     </div>

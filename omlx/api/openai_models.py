@@ -10,6 +10,7 @@ These models define the request and response schemas for:
 - MCP (Model Context Protocol) integration
 """
 
+import json
 from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
@@ -72,15 +73,83 @@ class Message(BaseModel):
     # Continue from this message instead of starting a new turn (prefill / partial mode)
     partial: bool = False
 
+    @field_validator("tool_calls", mode="before")
+    @classmethod
+    def _validate_tool_call_arguments(cls, v: Any) -> Any:
+        """Validate arguments on each tool_call before the raw dict is stored.
+
+        tool_calls is typed as List[dict] for flexibility, which bypasses
+        FunctionCall's own validator. Re-run the same coercion here so
+        malformed arguments surface as 422 instead of crashing the chat
+        template on the next turn.
+        """
+        if not isinstance(v, list):
+            return v
+        for tc in v:
+            if not isinstance(tc, dict):
+                continue
+            func = tc.get("function")
+            if not isinstance(func, dict) or "arguments" not in func:
+                continue
+            func["arguments"] = _coerce_tool_call_arguments(func["arguments"])
+        return v
+
 
 # =============================================================================
 # Tool Calling
 # =============================================================================
 
+def _coerce_tool_call_arguments(v: Any) -> str:
+    """Normalize a tool_call.arguments value to a JSON-object string.
+
+    Native tool-calling chat templates (Qwen3.5/3.6, GLM-4.x, MiniMax)
+    iterate `arguments.items()`, which requires the echoed value to parse
+    back into a dict. Rejecting malformed inputs here turns the silent 500
+    in downstream template rendering into a clear 422 that tells the client
+    what to fix. Dict inputs (non-spec but common) are coerced to JSON
+    strings, empty/whitespace strings normalize to ``"{}"``, and any value
+    that can't round-trip into a JSON object raises ValueError.
+    """
+    if isinstance(v, dict):
+        return json.dumps(v, ensure_ascii=False)
+    if not isinstance(v, str):
+        raise ValueError(
+            f"arguments must be a JSON-encoded string, got {type(v).__name__}. "
+            "Per the OpenAI spec tool_call.arguments is a string containing JSON, "
+            "not a dict/list/number. Example: '{\"location\": \"Tokyo\"}'."
+        )
+    stripped = v.strip()
+    if not stripped:
+        return "{}"
+    try:
+        parsed = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError) as e:
+        snippet = stripped if len(stripped) <= 120 else stripped[:117] + "..."
+        raise ValueError(
+            f"arguments must be valid JSON, got parse error: {e}. "
+            "This usually means the client echoed a previous tool call "
+            "with a malformed arguments value. Send arguments as a "
+            "JSON-encoded object string like '{\"location\": \"Tokyo\"}'. "
+            f"Received: {snippet!r}"
+        ) from e
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"arguments must be a JSON object, got {type(parsed).__name__}. "
+            "Tool-call arguments cannot be a list, number, or bare string. "
+            "Example: '{\"location\": \"Tokyo\"}'."
+        )
+    return v
+
+
 class FunctionCall(BaseModel):
     """A function call with name and arguments."""
     name: str
     arguments: str  # JSON string
+
+    @field_validator("arguments", mode="before")
+    @classmethod
+    def _validate_arguments_json(cls, v: Any) -> str:
+        return _coerce_tool_call_arguments(v)
 
 
 class ToolCall(BaseModel):
@@ -212,6 +281,13 @@ class ChatCompletionChoice(BaseModel):
     finish_reason: Optional[str] = "stop"
 
 
+class PromptTokensDetails(BaseModel):
+    """Breakdown of prompt tokens used."""
+
+    cached_tokens: Optional[int] = None
+    audio_tokens: Optional[int] = None
+
+
 class Usage(BaseUsage):
     """Token usage statistics for OpenAI API.
 
@@ -219,7 +295,7 @@ class Usage(BaseUsage):
     When present, timing values are in seconds.
     """
 
-    cached_tokens: Optional[int] = None
+    prompt_tokens_details: Optional[PromptTokensDetails] = None
     # Timing metrics (oMLX extension, seconds)
     model_load_duration: Optional[float] = None
     time_to_first_token: Optional[float] = None

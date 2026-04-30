@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Literal
 
+import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -36,8 +37,12 @@ from .auth import (
     verify_api_key,
 )
 from ..settings import SubKeyEntry
+from ..model_profiles import EXCLUDED_FROM_PROFILES
+from ..utils.release_check import select_latest_stable_release
 
 logger = logging.getLogger(__name__)
+
+PRESET_REMOTE_URL = "https://omlx.ai/assets/omlx_preset.json"
 
 
 # =============================================================================
@@ -125,6 +130,8 @@ class ModelSettingsRequest(BaseModel):
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
+    # Security: per-model opt-in for trust_remote_code (issue #926)
+    trust_remote_code: Optional[bool] = None
 
 
 class CreateProfileRequest(BaseModel):
@@ -189,6 +196,7 @@ class GlobalSettingsRequest(BaseModel):
     cache_enabled: Optional[bool] = None
     ssd_cache_dir: Optional[str] = None
     ssd_cache_max_size: Optional[str] = None
+    hot_cache_only: Optional[bool] = None
     hot_cache_max_size: Optional[str] = None  # "0" = disabled, "8GB", etc.
     initial_cache_blocks: Optional[int] = None  # Starting blocks (requires restart)
 
@@ -232,6 +240,9 @@ class GlobalSettingsRequest(BaseModel):
 
     # UI settings
     ui_language: Optional[str] = None
+
+    # Idle timeout settings. null disables the global fallback.
+    idle_timeout_seconds: Optional[int] = Field(default=None, ge=60)
 
     # Auth settings
     api_key: Optional[str] = None
@@ -1422,6 +1433,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
+                "trust_remote_code": settings.trust_remote_code,
                 "display_name": settings.display_name,
                 "description": settings.description,
                 "active_profile_name": settings.active_profile_name,
@@ -1659,9 +1671,14 @@ async def update_model_settings(
         # Update server_state.default_model if setting as default
         if request.is_default and server_state:
             server_state.default_model = model_id
+    if "trust_remote_code" in sent:
+        current_settings.trust_remote_code = bool(request.trust_remote_code)
 
     # If an active profile was set, clear it when the user's save diverges
-    # from the profile's stored values.
+    # from the profile's stored values.  Only compare fields present in
+    # both the profile and the current settings — new fields in the model
+    # settings that the profile doesn't have are silently merged in, and
+    # removed fields (no longer in the profile) are skipped.
     if current_settings.active_profile_name:
         profile = settings_manager.get_profile(
             model_id, current_settings.active_profile_name
@@ -1671,10 +1688,34 @@ async def update_model_settings(
         else:
             profile_settings = profile.get("settings", {}) or {}
             candidate = current_settings.to_dict()
+            diverged = False
             for key, expected in profile_settings.items():
-                if candidate.get(key) != expected:
-                    current_settings.active_profile_name = None
+                # Profile None means "unconstrained" — candidate.to_dict()
+                # drops None, so treat profile None as no constraint to
+                # keep the comparison symmetric.
+                if expected is None:
+                    continue
+                if key not in candidate:
+                    diverged = True
                     break
+                if candidate[key] != expected:
+                    diverged = True
+                    break
+            if diverged:
+                current_settings.active_profile_name = None
+            else:
+                new_fields = {
+                    k: v for k, v in candidate.items()
+                    if k not in profile_settings and k not in EXCLUDED_FROM_PROFILES
+                }
+                if new_fields:
+                    profile_settings.update(new_fields)
+                    profile["settings"] = profile_settings
+                    settings_manager.update_profile(
+                        model_id,
+                        current_settings.active_profile_name,
+                        settings=profile_settings,
+                    )
 
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
@@ -1687,6 +1728,9 @@ async def update_model_settings(
             or "index_cache_freq" in sent
             or "dflash_enabled" in sent
             or "dflash_draft_model" in sent
+            # trust_remote_code is plumbed at model load time; toggling it on
+            # an already-loaded engine has no effect until reload.
+            or "trust_remote_code" in sent
         )
     )
     if requires_reload:
@@ -1920,6 +1964,38 @@ async def delete_template(
     return {"deleted": True, "name": name}
 
 
+# =============================================================================
+# Preset refresh (proxy to omlx.ai to avoid CORS)
+# =============================================================================
+
+
+@router.post("/api/presets/refresh")
+async def refresh_presets(is_admin: bool = Depends(require_admin)):
+    """Fetch the latest preset bundle from omlx.ai and return it.
+
+    The client uses this instead of fetching omlx.ai directly so we do not
+    depend on CORS headers on the remote host. Any failure is surfaced as 502
+    so the client can silently fall back to the bundled presets.
+    """
+    try:
+        resp = await asyncio.to_thread(
+            requests.get,
+            PRESET_REMOTE_URL,
+            timeout=10,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Fetch failed: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Remote returned {resp.status_code}",
+        )
+    try:
+        return resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Invalid JSON: {e}")
+
+
 @router.get("/api/models/{model_id}/generation_config")
 async def get_generation_config(
     model_id: str,
@@ -2114,6 +2190,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "ssd_cache_max_size": _format_cache_size(
                 global_settings.cache.get_ssd_cache_max_size_bytes(global_settings.base_path)
             ),
+            "hot_cache_only": global_settings.cache.hot_cache_only,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
         },
@@ -2170,6 +2247,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "ui": {
             "language": global_settings.ui.language,
+        },
+        "idle_timeout": {
+            "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
         },
     }
 
@@ -2335,6 +2415,8 @@ async def update_global_settings(
     if request.ssd_cache_max_size is not None:
         global_settings.cache.ssd_cache_max_size = request.ssd_cache_max_size
         cache_changed = True
+    if request.hot_cache_only is not None:
+        global_settings.cache.hot_cache_only = request.hot_cache_only
     if request.hot_cache_max_size is not None:
         global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
         cache_changed = True
@@ -2546,6 +2628,17 @@ async def update_global_settings(
         runtime_applied.append("ui_language")
         _refresh_i18n_globals()
         logger.info(f"UI language changed to: {request.ui_language}")
+
+    # Apply idle timeout settings (Live)
+    # Use model_fields_set to distinguish "explicitly sent as null" (disable)
+    # from "not sent" (don't touch).
+    if "idle_timeout_seconds" in request.model_fields_set:
+        global_settings.idle_timeout.idle_timeout_seconds = request.idle_timeout_seconds
+        runtime_applied.append("idle_timeout_seconds")
+        if request.idle_timeout_seconds:
+            logger.info(f"Idle timeout set to: {request.idle_timeout_seconds}s")
+        else:
+            logger.info("Idle timeout disabled")
 
     # Apply auth settings (API key change)
     if request.api_key is not None:
@@ -3029,10 +3122,12 @@ async def get_server_stats(
         model: Filter by model ID. Empty string returns global aggregate.
         scope: "session" for current session, "alltime" for persisted totals.
     """
+    from ..server import resolve_model_id
     from ..server_metrics import get_server_metrics
 
     metrics = get_server_metrics()
-    snapshot = metrics.get_snapshot(model_id=model, scope=scope)
+    resolved_model = resolve_model_id(model) or model if model else ""
+    snapshot = metrics.get_snapshot(model_id=resolved_model, scope=scope)
 
     global_settings = _get_global_settings()
     host = global_settings.server.host if global_settings else "127.0.0.1"
@@ -4308,11 +4403,14 @@ async def check_update(
     }
 
     try:
-        import requests
-
+        # Use the releases list (not /releases/latest) and pick the highest
+        # stable PEP 440 tag. Dev/rc tags here have historically been
+        # published with the GitHub prerelease flag unset, which makes
+        # /releases/latest return them as if they were stable.
         resp = await asyncio.to_thread(
             requests.get,
-            "https://api.github.com/repos/jundot/omlx/releases/latest",
+            "https://api.github.com/repos/jundot/omlx/releases",
+            params={"per_page": 20},
             timeout=5,
         )
         if resp.status_code != 200:
@@ -4320,17 +4418,18 @@ async def check_update(
             _update_cache_time = now
             return _update_cache
 
-        data = resp.json()
+        data = select_latest_stable_release(resp.json())
+        if data is None:
+            _update_cache = no_update
+            _update_cache_time = now
+            return _update_cache
+
         latest = data["tag_name"].lstrip("v")
 
         try:
             from packaging.version import Version
 
-            latest_ver = Version(latest)
-            update_available = (
-                latest_ver > Version(_omlx_version)
-                and not latest_ver.is_prerelease
-            )
+            update_available = Version(latest) > Version(_omlx_version)
         except Exception:
             update_available = False
 

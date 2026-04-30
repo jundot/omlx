@@ -1083,26 +1083,7 @@ def test_full_integration(model_path):
         print(f"{'='*60}")
         return
 
-    # Build weight-sharing decode model (zero-copy from VLM weights)
-    decode_model = None
-    try:
-        from pathlib import Path as _Path
-
-        from mlx.utils import tree_flatten
-        from mlx_lm.utils import load_model
-
-        with _track_peak_memory("VLM decode model (weight sharing)"):
-            lm_model, _ = load_model(_Path(model_path), lazy=True)
-            vlm_params = dict(tree_flatten(vlm_model.language_model.parameters()))
-            lm_params = [("language_model." + k, v) for k, v in vlm_params.items()]
-            lm_model.load_weights(lm_params, strict=False)
-            apply_gated_delta_advance_patch(lm_model)
-            decode_model = lm_model
-        print(f"  VLM decode model ready (weight sharing, zero-copy)")
-    except Exception as e:
-        print(f"  VLM decode model failed: {e}")
-
-    adapter = VLMModelAdapter(vlm_model, decode_model=decode_model)
+    adapter = VLMModelAdapter(vlm_model)
     vlm_tokenizer = getattr(processor, "tokenizer", processor)
 
     patch_applied = apply_gated_delta_advance_patch(adapter._language_model)
@@ -1118,7 +1099,7 @@ def test_full_integration(model_path):
         with _track_peak_memory("Test 7 - VLM image batch"):
             _test_vlm_image_batch(vlm_model, processor, adapter)
     finally:
-        del vlm_model, processor, adapter, vlm_tokenizer, decode_model
+        del vlm_model, processor, adapter, vlm_tokenizer
         gc.collect()
         mx.clear_cache()
 

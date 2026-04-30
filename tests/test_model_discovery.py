@@ -130,6 +130,42 @@ class TestDetectModelType:
         (llm_dir / "config.json").write_text(json.dumps(config))
         assert detect_model_type(llm_dir) == "llm"
 
+    def test_detect_qwen3_vl_reranker(self, tmp_path):
+        """Qwen3VLForConditionalGeneration + 'reranker' in dir name → reranker."""
+        reranker_dir = tmp_path / "Qwen3-VL-Reranker-2B-4bit"
+        reranker_dir.mkdir()
+        config = {
+            "model_type": "qwen3_vl",
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1024},
+        }
+        (reranker_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(reranker_dir) == "reranker"
+
+    def test_detect_qwen3_vl_embedding(self, tmp_path):
+        """Qwen3VLForConditionalGeneration + 'embedding' in dir name → embedding."""
+        embed_dir = tmp_path / "Qwen3-VL-Embedding-2B"
+        embed_dir.mkdir()
+        config = {
+            "model_type": "qwen3_vl",
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1024},
+        }
+        (embed_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(embed_dir) == "embedding"
+
+    def test_detect_qwen3_vl_without_rerank_or_embed_name_is_vlm(self, tmp_path):
+        """Plain Qwen3-VL without rerank/embed hints still classifies as VLM."""
+        vlm_dir = tmp_path / "Qwen3-VL-2B-Instruct"
+        vlm_dir.mkdir()
+        config = {
+            "model_type": "qwen3_vl",
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1024},
+        }
+        (vlm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(vlm_dir) == "vlm"
+
     def test_missing_config_defaults_to_llm(self, tmp_path):
         """Test that missing config.json defaults to LLM."""
         assert detect_model_type(tmp_path) == "llm"

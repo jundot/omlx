@@ -97,6 +97,7 @@ from .api.openai_models import (
     CompletionResponse,
     ModelInfo,
     ModelsResponse,
+    PromptTokensDetails,
     Usage,
 )
 from .api.embedding_models import (
@@ -339,6 +340,7 @@ async def lifespan(app: FastAPI):
                 max_bytes=max_bytes,
                 settings_manager=_server_state.settings_manager,
                 prefill_memory_guard=_server_state.global_settings.memory.prefill_memory_guard,
+                global_settings=_server_state.global_settings,
             )
             _server_state.process_memory_enforcer = enforcer
             _server_state.engine_pool._process_memory_enforcer = enforcer
@@ -353,7 +355,9 @@ async def lifespan(app: FastAPI):
                 try:
                     if _server_state.settings_manager is not None:
                         await _server_state.engine_pool.check_ttl_expirations(
-                            _server_state.settings_manager
+                            _server_state.settings_manager,
+                            global_idle_timeout_seconds=_server_state.global_settings.idle_timeout.idle_timeout_seconds
+                            if _server_state.global_settings else None,
                         )
                 except asyncio.CancelledError:
                     break
@@ -410,7 +414,7 @@ app = FastAPI(
 # Include MCP routes
 from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
 set_mcp_manager_getter(get_mcp_manager)
-app.include_router(mcp_router)
+app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])
 
 # Include audio routes only when mlx-audio is installed.
 # audio_routes.py itself only imports fastapi/stdlib at module level, so it
@@ -418,7 +422,7 @@ app.include_router(mcp_router)
 try:
     import mlx_audio as _  # noqa: F401
     from .api.audio_routes import router as audio_router
-    app.include_router(audio_router)
+    app.include_router(audio_router, dependencies=[Depends(verify_api_key)])
     del _
 except ImportError:
     pass
@@ -692,8 +696,52 @@ async def get_engine(
                 detail=f"Model '{model_id}' is not a reranker model. "
                 f"Use a SequenceClassification model for reranking."
             )
+    elif engine_type == EngineType.LLM:
+        # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
+        # fell through and crashed on `engine.model_type` with an unhandled
+        # 500. Reject with a clear 400 pointing the caller at the right
+        # endpoint.
+        if not isinstance(engine, BaseEngine):
+            _endpoint_hint = _suggest_endpoint_for_engine(engine)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{model_id}' is not an LLM / chat model. "
+                    f"{_endpoint_hint}"
+                ),
+            )
 
     return engine
+
+
+def _suggest_endpoint_for_engine(engine: object) -> str:
+    """Return a one-line hint pointing at the correct endpoint for a non-LLM engine."""
+    # Import audio engine classes lazily so that oMLX without the [audio]
+    # extra still imports this module.
+    try:
+        from omlx.engine.stt import STTEngine
+    except Exception:  # pragma: no cover - defensive
+        STTEngine = None  # type: ignore[assignment]
+    try:
+        from omlx.engine.tts import TTSEngine
+    except Exception:  # pragma: no cover - defensive
+        TTSEngine = None  # type: ignore[assignment]
+    try:
+        from omlx.engine.sts import STSEngine
+    except Exception:  # pragma: no cover - defensive
+        STSEngine = None  # type: ignore[assignment]
+
+    if STTEngine is not None and isinstance(engine, STTEngine):
+        return "Use /v1/audio/transcriptions for speech-to-text models."
+    if TTSEngine is not None and isinstance(engine, TTSEngine):
+        return "Use /v1/audio/speech for text-to-speech models."
+    if STSEngine is not None and isinstance(engine, STSEngine):
+        return "Use /v1/audio/process for speech-to-speech / audio processing models."
+    if isinstance(engine, EmbeddingEngine):
+        return "Use /v1/embeddings for embedding models."
+    if isinstance(engine, RerankerEngine):
+        return "Use /v1/rerank for reranker models."
+    return "Use the model's dedicated endpoint (see /v1/models)."
 
 
 async def get_engine_for_model(model: str | None = None) -> BaseEngine:
@@ -1730,10 +1778,13 @@ async def create_rerank(
 
     engine = await get_reranker_engine(request.model)
 
-    # Normalize documents to list of strings
-    documents = normalize_documents(request.documents)
+    # Preserve original structure for the engine (multimodal rerankers need
+    # dicts with 'image'), but keep a normalized text view for logging and
+    # emptiness checks.
+    documents_raw = request.documents
+    documents_text = normalize_documents(documents_raw)
 
-    if not documents:
+    if not documents_text:
         raise HTTPException(status_code=400, detail="Documents cannot be empty")
 
     if not request.query:
@@ -1744,23 +1795,30 @@ async def create_rerank(
 
     output = await engine.rerank(
         query=request.query,
-        documents=documents,
+        documents=documents_raw,
         top_n=request.top_n,
     )
 
     elapsed = time.perf_counter() - start_time
     logger.info(
-        f"Rerank: {len(documents)} docs, "
+        f"Rerank: {len(documents_raw)} docs, "
         f"{output.total_tokens} tokens in {elapsed:.3f}s"
     )
 
-    # Format response - results sorted by score (descending)
+    # Format response - results sorted by score (descending). Strings wrap
+    # into {"text": "..."}; dict inputs pass through as-is so multimodal
+    # callers get their original 'image' back.
     results = []
     for idx in output.indices:
+        if request.return_documents:
+            orig = documents_raw[idx]
+            display_doc = orig if isinstance(orig, dict) else {"text": orig}
+        else:
+            display_doc = None
         result = RerankResult(
             index=idx,
             relevance_score=output.scores[idx],
-            document={"text": documents[idx]} if request.return_documents else None,
+            document=display_doc,
         )
         results.append(result)
 
@@ -1862,7 +1920,7 @@ async def create_completion(
             completion_tokens=total_completion_tokens,
             cached_tokens=total_cached_tokens,
             generation_duration=elapsed,
-            model_id=request.model,
+            model_id=resolve_model_id(request.model) or request.model,
         )
 
         return CompletionResponse(
@@ -1872,6 +1930,9 @@ async def create_completion(
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
                 total_tokens=total_prompt_tokens + total_completion_tokens,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=total_cached_tokens,
+                ),
             ),
         ).model_dump_json()
 
@@ -1953,7 +2014,12 @@ async def create_chat_completion(
             if k not in forced_keys:
                 merged_ct_kwargs[k] = v
 
-    # Extract messages - different engines need different content handling
+    # Extract messages - different engines need different content handling.
+    # Templates that expose message.reasoning_content natively (Qwen 3.6+)
+    # get reasoning as a separate field; others fall back to <think> inlined
+    # in content.
+    _entry = get_engine_pool().get_entry(resolved_model)
+    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     is_vlm = isinstance(engine, VLMBatchedEngine)
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
@@ -1961,11 +2027,17 @@ async def create_chat_completion(
     elif is_vlm:
         # VLM: preserve image_url content parts for vision processing
         messages = extract_multimodal_content(
-            request.messages, max_tool_result_tokens, engine.tokenizer
+            request.messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            native_reasoning_content=native_reasoning,
         )
     else:
         messages = extract_text_content(
-            request.messages, max_tool_result_tokens, engine.tokenizer
+            request.messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            native_reasoning_content=native_reasoning,
         )
 
     # Compile grammar for structured output (logit-level enforcement).
@@ -2058,11 +2130,16 @@ async def create_chat_completion(
     if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
         merged_ct_kwargs["enable_thinking"] = True
 
-    # Auto-set preserve_thinking when thinking is active.  Qwen 3.6+
-    # templates strip <think> blocks from historical turns by default,
-    # which breaks KV prefix cache reuse.  Always preserve unless the
-    # user explicitly opted out.
-    if merged_ct_kwargs.get("enable_thinking") is not False and "preserve_thinking" not in merged_ct_kwargs:
+    # Auto-set preserve_thinking only when the template advertises support
+    # for it (Qwen 3.6+). Other templates silently ignore unknown kwargs
+    # today but strict templates could raise, so gate on the detected flag.
+    _entry = get_engine_pool().get_entry(resolved_model)
+    if (
+        _entry is not None
+        and _entry.preserve_thinking_default is True
+        and merged_ct_kwargs.get("enable_thinking") is not False
+        and "preserve_thinking" not in merged_ct_kwargs
+    ):
         merged_ct_kwargs["preserve_thinking"] = True
 
     # Add compiled grammar for logit-level structured output.
@@ -2124,7 +2201,7 @@ async def create_chat_completion(
             completion_tokens=output.completion_tokens,
             cached_tokens=output.cached_tokens,
             generation_duration=elapsed,
-            model_id=request.model,
+            model_id=resolved_model,
         )
 
         # Separate thinking from content
@@ -2197,6 +2274,9 @@ async def create_chat_completion(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 total_tokens=output.prompt_tokens + output.completion_tokens,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=output.cached_tokens,
+                ),
             ),
         ).model_dump_json()
 
@@ -2507,7 +2587,7 @@ async def stream_completion(
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
             generation_duration=gen_duration,
-            model_id=request.model,
+            model_id=resolve_model_id(request.model) or request.model,
         )
 
         # Emit usage chunk if requested
@@ -2525,7 +2605,9 @@ async def stream_completion(
                     prompt_tokens=pt,
                     completion_tokens=ct,
                     total_tokens=pt + ct,
-                    cached_tokens=last_output.cached_tokens or None,
+                    prompt_tokens_details=PromptTokensDetails(
+                        cached_tokens=last_output.cached_tokens,
+                    ),
                     model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
                     time_to_first_token=round(ttft, 2),
                     total_time=round(total_time, 2),
@@ -2815,7 +2897,7 @@ async def stream_chat_completion(
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
             generation_duration=gen_duration,
-            model_id=request.model,
+            model_id=resolved_model or request.model,
         )
 
         # Emit usage chunk if requested
@@ -2831,7 +2913,9 @@ async def stream_chat_completion(
                     prompt_tokens=pt,
                     completion_tokens=ct,
                     total_tokens=pt + ct,
-                    cached_tokens=last_output.cached_tokens or None,
+                    prompt_tokens_details=PromptTokensDetails(
+                        cached_tokens=last_output.cached_tokens,
+                    ),
                     model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
                     time_to_first_token=round(ttft, 2),
                     total_time=round(total_time, 2),
@@ -2942,13 +3026,21 @@ async def stream_anthropic_messages(
                 if thinking_delta:
                     if thinking_filter:
                         thinking_delta = thinking_filter.feed(thinking_delta)
-                    if not thinking_block_started:
-                        if thinking_delta:
+                    if thinking_delta:
+                        # Close any open text block before starting a new
+                        # thinking block at a fresh index. Anthropic SDKs
+                        # reject mixed-type content_block events at the same
+                        # index — this transition handles a model that emits
+                        # a second thinking section after some text.
+                        if text_block_started:
+                            yield create_content_block_stop_event(index=block_index)
+                            block_index += 1
+                            text_block_started = False
+                        if not thinking_block_started:
                             yield create_content_block_start_event(
                                 index=block_index, block_type="thinking"
                             )
                             thinking_block_started = True
-                    if thinking_delta:
                         yield create_thinking_delta_event(
                             index=block_index, thinking=thinking_delta
                         )
@@ -2985,6 +3077,10 @@ async def stream_anthropic_messages(
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
         if thinking_delta:
+            if text_block_started:
+                yield create_content_block_stop_event(index=block_index)
+                block_index += 1
+                text_block_started = False
             if not thinking_block_started:
                 yield create_content_block_start_event(
                     index=block_index, block_type="thinking"
@@ -2994,6 +3090,10 @@ async def stream_anthropic_messages(
     if thinking_filter:
         remaining_thinking = thinking_filter.finish()
         if remaining_thinking:
+            if text_block_started:
+                yield create_content_block_stop_event(index=block_index)
+                block_index += 1
+                text_block_started = False
             if not thinking_block_started:
                 yield create_content_block_start_event(
                     index=block_index, block_type="thinking"
@@ -3114,10 +3214,15 @@ async def stream_anthropic_messages(
     actual_output_tokens = scale_anthropic_tokens(
         last_output.completion_tokens if last_output else 0, request.model
     )
+    actual_cached_tokens = scale_anthropic_tokens(
+        last_output.cached_tokens if last_output else 0, request.model
+    )
     yield create_message_delta_event(
         stop_reason=stop_reason,
         output_tokens=actual_output_tokens,
         input_tokens=actual_input_tokens,
+        cached_tokens=actual_cached_tokens,
+        prefix_cache_enabled=engine.prefix_cache_enabled,
     )
 
     # Record metrics
@@ -3130,7 +3235,7 @@ async def stream_anthropic_messages(
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
             generation_duration=end_time - (first_token_time or start_time),
-            model_id=request.model,
+            model_id=resolved_model or request.model,
         )
 
     # 7. Send message_stop
@@ -3218,6 +3323,8 @@ async def create_anthropic_message(
     # Convert Anthropic format to internal format
     # Harmony models need special handling to preserve tool format
     is_vlm = isinstance(engine, VLMBatchedEngine)
+    _entry = get_engine_pool().get_entry(resolved_model)
+    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     if engine.model_type == "gpt_oss":
         messages = convert_anthropic_to_internal_harmony(
             request, max_tool_result_tokens, engine.tokenizer
@@ -3226,6 +3333,7 @@ async def create_anthropic_message(
         messages = convert_anthropic_to_internal(
             request, max_tool_result_tokens, engine.tokenizer,
             preserve_images=is_vlm,
+            native_reasoning_content=native_reasoning,
         )
 
     # Apply model-specific message extraction (e.g. Gemma 4 converts
@@ -3264,8 +3372,16 @@ async def create_anthropic_message(
     if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
         merged_ct_kwargs["enable_thinking"] = True
 
-    # Auto-set preserve_thinking when thinking is active (Qwen 3.6+).
-    if merged_ct_kwargs.get("enable_thinking") is not False and "preserve_thinking" not in merged_ct_kwargs:
+    # Auto-set preserve_thinking only when the template advertises support
+    # for it (Qwen 3.6+). Gated on detection so other templates don't
+    # receive an unknown kwarg.
+    _entry = get_engine_pool().get_entry(resolved_model)
+    if (
+        _entry is not None
+        and _entry.preserve_thinking_default is True
+        and merged_ct_kwargs.get("enable_thinking") is not False
+        and "preserve_thinking" not in merged_ct_kwargs
+    ):
         merged_ct_kwargs["preserve_thinking"] = True
 
     # Merge MCP tools with user-provided Anthropic tools
@@ -3346,7 +3462,7 @@ async def create_anthropic_message(
             completion_tokens=output.completion_tokens,
             cached_tokens=output.cached_tokens,
             generation_duration=elapsed,
-            model_id=request.model,
+            model_id=resolved_model,
         )
 
         # Separate thinking from content
@@ -3393,13 +3509,15 @@ async def create_anthropic_message(
                         pass
 
         response = convert_internal_to_anthropic_response(
-            text=cleaned_text.strip() if cleaned_text else regular_content,
+            text=cleaned_text.strip() if cleaned_text else "",
             model=request.model,
             prompt_tokens=scale_anthropic_tokens(output.prompt_tokens, request.model),
             completion_tokens=scale_anthropic_tokens(output.completion_tokens, request.model),
             finish_reason=output.finish_reason,
             tool_calls=tool_calls,
             thinking=cleaned_thinking if cleaned_thinking else None,
+            cached_tokens=scale_anthropic_tokens(output.cached_tokens, request.model),
+            prefix_cache_enabled=engine.prefix_cache_enabled,
         )
 
         return response.model_dump_json()
@@ -3687,8 +3805,16 @@ async def create_response(
     if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
         merged_ct_kwargs["enable_thinking"] = True
 
-    # Auto-set preserve_thinking when thinking is active (Qwen 3.6+).
-    if merged_ct_kwargs.get("enable_thinking") is not False and "preserve_thinking" not in merged_ct_kwargs:
+    # Auto-set preserve_thinking only when the template advertises support
+    # for it (Qwen 3.6+). Gated on detection so other templates don't
+    # receive an unknown kwarg.
+    _entry = get_engine_pool().get_entry(resolved_model)
+    if (
+        _entry is not None
+        and _entry.preserve_thinking_default is True
+        and merged_ct_kwargs.get("enable_thinking") is not False
+        and "preserve_thinking" not in merged_ct_kwargs
+    ):
         merged_ct_kwargs["preserve_thinking"] = True
 
     # Add compiled grammar for logit-level structured output.
@@ -3744,7 +3870,7 @@ async def create_response(
             completion_tokens=output.completion_tokens,
             cached_tokens=output.cached_tokens,
             generation_duration=elapsed,
-            model_id=request.model,
+            model_id=resolved_model,
         )
 
         # Process output text
@@ -4189,7 +4315,7 @@ async def stream_responses_api(
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
             generation_duration=gen_duration,
-            model_id=request.model,
+            model_id=resolved_model or request.model,
         )
         usage_data = {
             "input_tokens": last_output.prompt_tokens,

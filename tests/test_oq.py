@@ -25,7 +25,9 @@ from omlx.oq import (
     _format_size,
     _forward_layer,
     _get_predicate_bits,
+    _is_audio_tensor,
     _is_moe_router,
+    _is_vision_tensor,
     _LazyTensorIndex,
     _normalize_quant_path,
     _quantize_chunked,
@@ -124,6 +126,35 @@ class TestUniversalQuantPredicate:
 
     def test_time_decay_not_quantized(self, dense_config, module):
         assert universal_quant_predicate("model.layers.0.time_decay", module, dense_config) is False
+
+    # Qwen3_5 hybrid (GatedDeltaNet) — issue #913 regression guards.
+    # Real weight names use capital `A_log`, so the skip check must be case-insensitive.
+
+    def test_qwen35_A_log_not_quantized(self, dense_config, module):
+        path = "model.language_model.layers.0.linear_attn.A_log"
+        assert universal_quant_predicate(path, module, dense_config) is False
+
+    def test_qwen35_dt_bias_not_quantized(self, dense_config, module):
+        path = "model.language_model.layers.0.linear_attn.dt_bias"
+        assert universal_quant_predicate(path, module, dense_config) is False
+
+    def test_qwen35_linear_attn_conv1d_8bit(self, dense_config, module):
+        path = "model.language_model.layers.0.linear_attn.conv1d.weight"
+        result = universal_quant_predicate(path, module, dense_config)
+        assert isinstance(result, dict)
+        assert result["bits"] == 8
+
+    def test_qwen35_linear_attn_out_proj_5bit(self, dense_config, module):
+        path = "model.language_model.layers.0.linear_attn.out_proj.weight"
+        result = universal_quant_predicate(path, module, dense_config)
+        assert isinstance(result, dict)
+        assert result["bits"] == 5
+
+    def test_qwen35_linear_attn_in_proj_qkv_quantized(self, dense_config, module):
+        # Regression guard: existing behavior should still return a quant dict/True, not skip.
+        path = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+        result = universal_quant_predicate(path, module, dense_config)
+        assert result is not False
 
     # Stage 1: High-precision protection
 
@@ -343,6 +374,44 @@ class TestHelpers:
 
     def test_normalize_quant_path_scales(self):
         assert _normalize_quant_path("lm_head.scales") == "lm_head"
+
+    def test_is_audio_tensor_audio_tower(self):
+        assert _is_audio_tensor(
+            "audio_tower.layers.0.feed_forward1.ffw_layer_1.linear.weight"
+        ) is True
+
+    def test_is_audio_tensor_embed_audio_not_excluded(self):
+        # embed_audio.embedding_projection is the projection from audio output
+        # to text hidden — should be quantizable like embed_vision counterpart.
+        assert _is_audio_tensor(
+            "embed_audio.embedding_projection.weight"
+        ) is False
+
+    def test_is_audio_tensor_language_model(self):
+        assert _is_audio_tensor(
+            "language_model.model.layers.0.self_attn.q_proj.weight"
+        ) is False
+
+    def test_is_audio_tensor_vision_tower(self):
+        assert _is_audio_tensor(
+            "vision_tower.layers.0.self_attn.k_proj.weight"
+        ) is False
+
+    def test_universal_quant_predicate_skips_audio_tower(self):
+        # audio_tower tensors must be kept in fp16 (return False from predicate)
+        # — same treatment as vision_tower.
+        result = universal_quant_predicate(
+            "audio_tower.layers.0.self_attn.k_proj", None, {}, oq_level=4
+        )
+        assert result is False
+
+    def test_universal_quant_predicate_quantizes_embed_audio(self):
+        # embed_audio.embedding_projection should NOT be skipped — it's a
+        # quantizable Linear, mirroring how embed_vision is treated.
+        result = universal_quant_predicate(
+            "embed_audio.embedding_projection", None, {}, oq_level=4
+        )
+        assert result is not False
 
 
 # =============================================================================

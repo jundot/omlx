@@ -576,6 +576,74 @@ class TestStatsSecurity:
         # api_key is included for admin-only CLI snippet generation in the dashboard
         assert result["api_key"] == "super-secret-key"
 
+    def test_stats_resolves_alias_on_read(self):
+        """Per-model dropdown ID may be an alias; stats endpoint should resolve
+        before querying the metrics store so per-model counters aren't zeroed."""
+        mock_settings = MagicMock()
+        mock_settings.server.host = "127.0.0.1"
+        mock_settings.server.port = 8000
+        mock_settings.auth.api_key = ""
+        mock_settings.claude_code.context_scaling_enabled = False
+        mock_settings.claude_code.target_context_size = 200000
+
+        mock_metrics = MagicMock()
+        mock_metrics.get_snapshot.return_value = {
+            "total_prompt_tokens": 100,
+            "total_cached_tokens": 0,
+            "cache_efficiency": 0,
+            "avg_prefill_tps": 0,
+            "avg_generation_tps": 0,
+            "total_requests": 1,
+        }
+
+        with (
+            patch.object(admin_routes, "_get_global_settings", return_value=mock_settings),
+            patch("omlx.server_metrics.get_server_metrics", return_value=mock_metrics),
+            patch("omlx.server.resolve_model_id", return_value="real-id"),
+            patch.object(admin_routes, "_get_engine_info", return_value={}),
+            patch.object(admin_routes, "_build_active_models_data", return_value={"models": []}),
+            patch.object(admin_routes, "_build_runtime_cache_observability", return_value={"models": []}),
+        ):
+            asyncio.run(admin_routes.get_server_stats(model="my-alias", is_admin=True))
+
+        # Snapshot query must use the resolved real ID, not the raw alias sent by the client.
+        call_args = mock_metrics.get_snapshot.call_args
+        assert call_args.kwargs["model_id"] == "real-id"
+
+    def test_stats_empty_model_stays_empty(self):
+        """Global aggregate query (empty model) must not be resolved or mangled."""
+        mock_settings = MagicMock()
+        mock_settings.server.host = "127.0.0.1"
+        mock_settings.server.port = 8000
+        mock_settings.auth.api_key = ""
+        mock_settings.claude_code.context_scaling_enabled = False
+        mock_settings.claude_code.target_context_size = 200000
+
+        mock_metrics = MagicMock()
+        mock_metrics.get_snapshot.return_value = {
+            "total_prompt_tokens": 0,
+            "total_cached_tokens": 0,
+            "cache_efficiency": 0,
+            "avg_prefill_tps": 0,
+            "avg_generation_tps": 0,
+            "total_requests": 0,
+        }
+
+        with (
+            patch.object(admin_routes, "_get_global_settings", return_value=mock_settings),
+            patch("omlx.server_metrics.get_server_metrics", return_value=mock_metrics),
+            patch("omlx.server.resolve_model_id") as mock_resolve,
+            patch.object(admin_routes, "_get_engine_info", return_value={}),
+            patch.object(admin_routes, "_build_active_models_data", return_value={"models": []}),
+            patch.object(admin_routes, "_build_runtime_cache_observability", return_value={"models": []}),
+        ):
+            asyncio.run(admin_routes.get_server_stats(is_admin=True))
+
+        # No resolve call for the empty-model (global aggregate) path.
+        mock_resolve.assert_not_called()
+        call_args = mock_metrics.get_snapshot.call_args
+        assert call_args.kwargs["model_id"] == ""
+
 
 class TestRuntimeCacheObservability:
     """Tests for runtime cache observability robustness."""
@@ -822,3 +890,22 @@ class TestGlobalSettingsValidation:
             integrations_openclaw_tools_profile="coding"
         )
         assert req.integrations_openclaw_tools_profile == "coding"
+
+    def test_idle_timeout_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(idle_timeout_seconds=-1)
+
+    def test_idle_timeout_rejects_below_minimum(self):
+        # Minimum is 60s — anything smaller is not a meaningful idle window.
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(idle_timeout_seconds=30)
+
+    def test_idle_timeout_accepts_null_explicitly(self):
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=None)
+        assert req.idle_timeout_seconds is None
+        # model_fields_set should include it when explicitly passed.
+        assert "idle_timeout_seconds" in req.model_fields_set
+
+    def test_idle_timeout_accepts_valid_value(self):
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=1800)
+        assert req.idle_timeout_seconds == 1800

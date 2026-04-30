@@ -56,6 +56,7 @@ VLM_MODEL_TYPES = {
     "minicpmv",
     "phi4_siglip",
     "phi4mm",
+    "youtu_vl",
 }
 
 # Known VLM architectures
@@ -129,6 +130,20 @@ CAUSAL_LM_RERANKER_ARCHITECTURES = {
 # (no lm_head weights). Detected by architecture + directory name heuristic.
 CAUSAL_LM_EMBEDDING_ARCHITECTURES = {
     "Qwen3ForCausalLM",  # Qwen3-Embedding uses CausalLM arch without lm_head
+}
+
+# Multimodal (VLM-based) reranker architectures.
+# These share an architecture with VLM chat models but are fine-tuned for
+# reranking. Loaded via mlx-embeddings' model.process() API. Distinguished
+# from VLM chat by directory name heuristic.
+MULTIMODAL_RERANKER_ARCHITECTURES = {
+    "Qwen3VLForConditionalGeneration",  # Qwen3-VL-Reranker
+}
+
+# Multimodal (VLM-based) embedding architectures.
+# Same arch as the reranker variant; distinguished by directory name hint.
+MULTIMODAL_EMBEDDING_ARCHITECTURES = {
+    "Qwen3VLForConditionalGeneration",  # Qwen3-VL-Embedding
 }
 
 # Unsupported reranker architectures (future support)
@@ -403,6 +418,16 @@ def detect_model_type(model_path: Path) -> ModelType:
         if arch in CAUSAL_LM_EMBEDDING_ARCHITECTURES:
             if _is_causal_lm_embedding(model_path):
                 return "embedding"
+
+    # Check for multimodal (VLM-based) rerankers and embeddings.
+    # Same architecture string as VLM chat models; distinguished by the
+    # directory name heuristic. Must come before VLM detection below so
+    # the reranker/embedding hint wins over default VLM classification.
+    for arch in architectures:
+        if arch in MULTIMODAL_RERANKER_ARCHITECTURES and _is_causal_lm_reranker(model_path):
+            return "reranker"
+        if arch in MULTIMODAL_EMBEDDING_ARCHITECTURES and _is_causal_lm_embedding(model_path):
+            return "embedding"
 
     if _has_sentence_transformers_embedding_pipeline(model_path):
         return "embedding"

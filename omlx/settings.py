@@ -239,6 +239,7 @@ class CacheSettings:
     """Cache configuration settings."""
 
     enabled: bool = True
+    hot_cache_only: bool = False
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
@@ -281,6 +282,7 @@ class CacheSettings:
         """Convert to dictionary."""
         return {
             "enabled": self.enabled,
+            "hot_cache_only": self.hot_cache_only,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
@@ -292,6 +294,7 @@ class CacheSettings:
         """Create from dictionary."""
         return cls(
             enabled=data.get("enabled", True),
+            hot_cache_only=data.get("hot_cache_only", False),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=data.get("hot_cache_max_size", "0"),
@@ -350,6 +353,24 @@ class MemorySettings:
         return cls(
             max_process_memory=data.get("max_process_memory", "auto"),
             prefill_memory_guard=data.get("prefill_memory_guard", True),
+        )
+
+
+@dataclass
+class ModelIdleTimeoutSettings:
+    """Idle timeout settings for automatic model unloading."""
+
+    idle_timeout_seconds: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {"idle_timeout_seconds": self.idle_timeout_seconds}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ModelIdleTimeoutSettings":
+        """Create from dictionary."""
+        return cls(
+            idle_timeout_seconds=data.get("idle_timeout_seconds"),
         )
 
 
@@ -672,6 +693,7 @@ class GlobalSettings:
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
+    idle_timeout: ModelIdleTimeoutSettings = field(default_factory=ModelIdleTimeoutSettings)
 
     @classmethod
     def load(
@@ -765,6 +787,8 @@ class GlobalSettings:
                 )
             if "ui" in data:
                 self.ui = UISettings.from_dict(data["ui"])
+            if "idle_timeout" in data:
+                self.idle_timeout = ModelIdleTimeoutSettings.from_dict(data["idle_timeout"])
 
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse settings file {path}: {e}")
@@ -815,6 +839,8 @@ class GlobalSettings:
             self.cache.ssd_cache_dir = ssd_cache_dir
         if ssd_cache_max := os.getenv("OMLX_SSD_CACHE_MAX_SIZE"):
             self.cache.ssd_cache_max_size = ssd_cache_max
+        if hot_cache_only := os.getenv("OMLX_HOT_CACHE_ONLY"):
+            self.cache.hot_cache_only = hot_cache_only.lower() in ("true", "1", "yes")
         if initial_blocks := os.getenv("OMLX_INITIAL_CACHE_BLOCKS"):
             try:
                 self.cache.initial_cache_blocks = int(initial_blocks)
@@ -956,6 +982,7 @@ class GlobalSettings:
             "claude_code": self.claude_code.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
+            "idle_timeout": self.idle_timeout.to_dict(),
         }
 
         try:
@@ -1152,10 +1179,19 @@ class GlobalSettings:
         """
         from .scheduler import SchedulerConfig
 
+        # Always resolve ssd_dir so the scheduler can initialize PagedSSDCacheManager.
+        # When hot_cache_only=True, PagedSSDCacheManager skips directory init and
+        # the writer thread internally — the dir is not used for disk I/O.
+        ssd_dir = self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
+
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
             initial_cache_blocks=self.cache.initial_cache_blocks,
+            paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
+            hot_cache_only=self.cache.hot_cache_only,
+            paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(self.base_path),
+            hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1178,6 +1214,7 @@ class GlobalSettings:
             "claude_code": self.claude_code.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
+            "idle_timeout": self.idle_timeout.to_dict(),
         }
 
 

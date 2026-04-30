@@ -15,16 +15,32 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Dict, Tuple
 
 import mlx.core as mx
 
 from ..model_discovery import (
     CAUSAL_LM_RERANKER_ARCHITECTURES,
+    MULTIMODAL_RERANKER_ARCHITECTURES,
     SUPPORTED_RERANKER_ARCHITECTURES,
+    _is_causal_lm_reranker,
 )
+from ..utils.image import load_image
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_item_to_text(item: Any) -> str:
+    """Reduce a rerank input (str or dict with 'text') to plain text.
+
+    Used by text-only reranker paths so dict inputs stay compatible with
+    callers that previously passed bare strings.
+    """
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        return item.get("text", "") or ""
+    return str(item)
 
 
 @dataclass
@@ -72,14 +88,17 @@ class MLXRerankerModel:
         "Given a web search query, retrieve relevant passages that answer the query"
     )
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, trust_remote_code: bool = False):
         """
         Initialize the MLX reranker model.
 
         Args:
             model_name: HuggingFace model name or local path
+            trust_remote_code: Allow execution of custom Python shipped inside
+                the model repository. Off by default for security (issue #926).
         """
         self.model_name = model_name
+        self.trust_remote_code = trust_remote_code
 
         self.model = None
         self.processor = None
@@ -87,6 +106,7 @@ class MLXRerankerModel:
         self._num_labels: int | None = None
         self._is_causal_lm = False
         self._is_jina_reranker = False
+        self._is_vl_reranker = False
         self._token_true_id: int | None = None
         self._token_false_id: int | None = None
         self._doc_embed_token_id: int | None = None
@@ -150,16 +170,97 @@ class MLXRerankerModel:
         mx.eval(model.parameters())
 
         # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(model_path), trust_remote_code=self.trust_remote_code
+        )
 
         return model, tokenizer
+
+    def _load_vl_reranker(self) -> Tuple[Any, Any]:
+        """Load a multimodal reranker (e.g., Qwen3-VL-Reranker) via mlx-embeddings.
+
+        mlx-embeddings exposes a unified `load()` + `model.process()` API that
+        handles both embedding and reranking variants of Qwen3-VL. Reranker vs
+        embedder is decided by the input dict shape at inference time.
+        """
+        from mlx_embeddings import load as mlx_emb_load
+
+        return mlx_emb_load(
+            str(self.model_name),
+            tokenizer_config={"trust_remote_code": self.trust_remote_code},
+        )
+
+    def _build_vl_item(
+        self, item: "str | dict[str, Any]"
+    ) -> Dict[str, Any]:
+        """Normalize a rerank input into the mlx-embeddings VL item format.
+
+        Accepts either a bare string (text) or a dict with 'text' and/or
+        'image' keys. Image values are strings (URL / base64 data URI / local
+        path) and get loaded via omlx's shared image loader.
+        """
+        if isinstance(item, str):
+            return {"text": item}
+        if not isinstance(item, dict):
+            return {"text": str(item)}
+
+        result: Dict[str, Any] = {}
+        text = item.get("text")
+        if text:
+            result["text"] = text
+        image_ref = item.get("image")
+        if image_ref:
+            if isinstance(image_ref, str):
+                result["image"] = load_image(image_ref)
+            else:
+                # Already a PIL image or similar — pass through
+                result["image"] = image_ref
+        if not result:
+            raise ValueError(
+                "VL reranker item must have at least 'text' or 'image'."
+            )
+        return result
+
+    def _rerank_vl(
+        self,
+        query: "str | dict[str, Any]",
+        documents: "list[str] | list[dict[str, Any]]",
+        max_length: int,
+    ) -> RerankOutput:
+        """Rerank using mlx-embeddings' multimodal model.process() API."""
+        query_item = self._build_vl_item(query)
+        doc_items = [self._build_vl_item(d) for d in documents]
+
+        inputs = {
+            "instruction": self._CAUSAL_LM_DEFAULT_INSTRUCTION,
+            "query": query_item,
+            "documents": doc_items,
+        }
+
+        scores = self.model.process(inputs, processor=self.processor)
+        mx.eval(scores)
+        scores_list = [float(s) for s in scores.tolist()]
+        indices = sorted(
+            range(len(scores_list)),
+            key=lambda i: scores_list[i],
+            reverse=True,
+        )
+
+        return RerankOutput(
+            scores=scores_list,
+            indices=indices,
+            total_tokens=0,
+        )
 
     def _load_causal_lm(self) -> Tuple[Any, Any]:
         """Load a CausalLM-based reranker model using mlx-lm."""
         from mlx_lm import load as mlx_lm_load
 
         model_path = str(self.model_name)
-        loaded = mlx_lm_load(model_path)
+        loaded = mlx_lm_load(
+            model_path,
+            tokenizer_config={"trust_remote_code": self.trust_remote_code},
+        )
         model = loaded[0]
         tokenizer_wrapper = loaded[1]
 
@@ -220,7 +321,10 @@ class MLXRerankerModel:
         from mlx_lm import load as mlx_lm_load
 
         model_path = str(self.model_name)
-        loaded = mlx_lm_load(model_path)
+        loaded = mlx_lm_load(
+            model_path,
+            tokenizer_config={"trust_remote_code": self.trust_remote_code},
+        )
         model = loaded[0]
         tokenizer_wrapper = loaded[1]
 
@@ -486,7 +590,12 @@ class MLXRerankerModel:
         logger.info(f"Loading reranker model: {self.model_name} (arch={arch})")
 
         try:
-            if arch == "JinaForRanking":
+            if arch in MULTIMODAL_RERANKER_ARCHITECTURES:
+                # Multimodal reranker (e.g., Qwen3-VL-Reranker) via mlx-embeddings
+                self.model, self.processor = self._load_vl_reranker()
+                self._is_vl_reranker = True
+                self._num_labels = 1
+            elif arch == "JinaForRanking":
                 # Jina v3 reranker: listwise hidden-state scoring + projector
                 self.model, self.processor = self._load_jina_reranker()
                 self._is_jina_reranker = True
@@ -504,7 +613,10 @@ class MLXRerankerModel:
                 # Use mlx-embeddings for other architectures (ModernBert, etc.)
                 from mlx_embeddings import load
 
-                self.model, self.processor = load(self.model_name)
+                self.model, self.processor = load(
+                    self.model_name,
+                    tokenizer_config={"trust_remote_code": self.trust_remote_code},
+                )
 
                 # Get num_labels from model config
                 if hasattr(self.model, "config"):
@@ -518,7 +630,8 @@ class MLXRerankerModel:
             logger.info(
                 f"Reranker model loaded successfully: {self.model_name} "
                 f"(arch={arch}, num_labels={self._num_labels}, "
-                f"causal_lm={self._is_causal_lm}, compiled={self._is_compiled})"
+                f"causal_lm={self._is_causal_lm}, vl={self._is_vl_reranker}, "
+                f"compiled={self._is_compiled})"
             )
 
         except ImportError as e:
@@ -545,11 +658,12 @@ class MLXRerankerModel:
           in some MLX output containers.
         - Compile a narrow function that returns logits only.
         """
-        if self._is_causal_lm:
-            # CausalLM reranker path uses generation/logit selection logic;
-            # keep eager path until a dedicated compiled scorer is added.
+        if self._is_causal_lm or self._is_vl_reranker:
+            # CausalLM / VL reranker paths use custom scoring (yes/no logits or
+            # mlx-embeddings model.process). VL forward needs pixel_values and
+            # lacks pooler_output, so the compile wrapper here wouldn't apply.
             logger.info(
-                f"mx.compile skipped for causal-lm reranker {self.model_name}"
+                f"mx.compile skipped for {self.model_name}"
             )
             self._compiled_seq_logits = None
             return False
@@ -597,16 +711,18 @@ class MLXRerankerModel:
 
     def rerank(
         self,
-        query: str,
-        documents: list[str],
+        query: "str | dict",
+        documents: "list[str] | list[dict]",
         max_length: int | None = None,
     ) -> RerankOutput:
         """
         Rerank documents by relevance to the query.
 
         Args:
-            query: The search query
-            documents: List of documents to rerank
+            query: The search query. String for text-only rerankers. Dict with
+                'text' and/or 'image' for multimodal rerankers.
+            documents: List of documents to rerank. Each item can be a string
+                or a dict with 'text' and/or 'image' keys.
             max_length: Maximum token length for each query-document pair.
                 If None, uses model-appropriate default (512 for encoder,
                 8192 for CausalLM).
@@ -620,20 +736,33 @@ class MLXRerankerModel:
         if not documents:
             return RerankOutput(scores=[], indices=[], total_tokens=0)
 
+        if self._is_vl_reranker:
+            effective_max_length = (
+                max_length
+                if max_length is not None
+                else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
+            )
+            return self._rerank_vl(query, documents, effective_max_length)
+
+        # Text-only paths: coerce dict inputs down to text so existing
+        # _rerank_* methods keep their str-only contract.
+        query_str = _coerce_item_to_text(query)
+        docs_str = [_coerce_item_to_text(d) for d in documents]
+
         if self._is_jina_reranker:
             effective_max_length = (
                 max_length
                 if max_length is not None
                 else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
             )
-            return self._rerank_jina(query, documents, effective_max_length)
+            return self._rerank_jina(query_str, docs_str, effective_max_length)
         elif self._is_causal_lm:
             effective_max_length = (
                 max_length
                 if max_length is not None
                 else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
             )
-            return self._rerank_causal_lm(query, documents, effective_max_length)
+            return self._rerank_causal_lm(query_str, docs_str, effective_max_length)
         else:
             effective_max_length = (
                 max_length
@@ -641,7 +770,7 @@ class MLXRerankerModel:
                 else self._DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION
             )
             return self._rerank_seq_classification(
-                query, documents, effective_max_length
+                query_str, docs_str, effective_max_length
             )
 
     def _rerank_causal_lm(
@@ -1071,8 +1200,6 @@ class MLXRerankerModel:
         # CausalLM reranker architectures require the directory name heuristic
         # to distinguish from regular LLMs with the same architecture.
         if arch in CAUSAL_LM_RERANKER_ARCHITECTURES:
-            from ..model_discovery import _is_causal_lm_reranker
-
             if not _is_causal_lm_reranker(Path(self.model_name)):
                 raise ValueError(
                     f"Architecture {arch} is a CausalLM that can be used as a "
@@ -1083,9 +1210,26 @@ class MLXRerankerModel:
                 )
             return
 
+        # Multimodal reranker architectures share the arch string with VLM chat
+        # models; use the same dir-name heuristic to disambiguate.
+        if arch in MULTIMODAL_RERANKER_ARCHITECTURES:
+            if not _is_causal_lm_reranker(Path(self.model_name)):
+                raise ValueError(
+                    f"Architecture {arch} is a VLM that can be used as a "
+                    f"reranker, but the model directory name "
+                    f"'{Path(self.model_name).name}' does not contain "
+                    f"'reranker' or 'rerank'. Please rename the directory or "
+                    f"use the correct model."
+                )
+            return
+
         if arch not in SUPPORTED_RERANKER_ARCHITECTURES:
             supported_list = ", ".join(
-                sorted(SUPPORTED_RERANKER_ARCHITECTURES | CAUSAL_LM_RERANKER_ARCHITECTURES)
+                sorted(
+                    SUPPORTED_RERANKER_ARCHITECTURES
+                    | CAUSAL_LM_RERANKER_ARCHITECTURES
+                    | MULTIMODAL_RERANKER_ARCHITECTURES
+                )
             )
             raise ValueError(
                 f"Unsupported reranker architecture: {arch}. "

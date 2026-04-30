@@ -316,6 +316,8 @@ class TestVersionComparison:
     """Tests for version comparison logic used in macOS app update checking.
 
     Replicates _is_newer_version from omlx_app/app.py to avoid PyObjC dependency.
+    Prerelease filtering is the selector's job (see TestSelectLatestStableRelease),
+    so this only checks stable-vs-stable ordering.
     """
 
     @staticmethod
@@ -323,22 +325,12 @@ class TestVersionComparison:
         try:
             from packaging.version import Version
 
-            latest_ver = Version(latest)
-            return latest_ver > Version(current) and not latest_ver.is_prerelease
+            return Version(latest) > Version(current)
         except Exception:
             return False
 
     def test_stable_newer(self):
         assert self._is_newer_version("0.2.19", "0.2.18") is True
-
-    def test_dev_not_shown(self):
-        assert self._is_newer_version("0.2.19.dev1", "0.2.18") is False
-
-    def test_dev10_not_shown(self):
-        assert self._is_newer_version("0.2.19.dev10", "0.2.18") is False
-
-    def test_rc_not_shown(self):
-        assert self._is_newer_version("0.2.19rc1", "0.2.18") is False
 
     def test_stable_from_dev_current(self):
         assert self._is_newer_version("0.2.19", "0.2.19.dev1") is True
@@ -348,3 +340,71 @@ class TestVersionComparison:
 
     def test_older_version(self):
         assert self._is_newer_version("0.2.17", "0.2.18") is False
+
+
+class TestSelectLatestStableRelease:
+    """Tests for select_latest_stable_release used by both the menubar app
+    and the admin /api/update-check route.
+    """
+
+    @staticmethod
+    def _select(releases):
+        from omlx.utils.release_check import select_latest_stable_release
+
+        return select_latest_stable_release(releases)
+
+    @staticmethod
+    def _release(tag, prerelease=False, draft=False):
+        return {"tag_name": tag, "prerelease": prerelease, "draft": draft}
+
+    def test_picks_highest_stable_when_dev_is_first(self):
+        # Mirrors the actual issue #981 payload: dev tag returned first by
+        # GitHub but a real stable exists further down the list.
+        releases = [
+            self._release("v0.3.8.dev3"),
+            self._release("v0.3.8.dev1"),
+            self._release("v0.3.7"),
+            self._release("v0.3.6"),
+            self._release("v0.3.5"),
+        ]
+        assert self._select(releases)["tag_name"] == "v0.3.7"
+
+    def test_filters_pep440_prereleases(self):
+        releases = [
+            self._release("v1.0.0rc1"),
+            self._release("v1.0.0.dev1"),
+            self._release("v0.9.0"),
+        ]
+        assert self._select(releases)["tag_name"] == "v0.9.0"
+
+    def test_respects_github_prerelease_flag(self):
+        # Even if the tag parses as stable PEP 440, honor the flag if set.
+        releases = [
+            self._release("v2.0.0", prerelease=True),
+            self._release("v1.5.0"),
+        ]
+        assert self._select(releases)["tag_name"] == "v1.5.0"
+
+    def test_skips_drafts(self):
+        releases = [
+            self._release("v3.0.0", draft=True),
+            self._release("v2.0.0"),
+        ]
+        assert self._select(releases)["tag_name"] == "v2.0.0"
+
+    def test_skips_unparseable_tags(self):
+        releases = [
+            self._release("nightly"),
+            self._release("v1.2.3"),
+        ]
+        assert self._select(releases)["tag_name"] == "v1.2.3"
+
+    def test_all_prerelease_returns_none(self):
+        releases = [
+            self._release("v1.0.0.dev1"),
+            self._release("v1.0.0rc1"),
+        ]
+        assert self._select(releases) is None
+
+    def test_empty_returns_none(self):
+        assert self._select([]) is None

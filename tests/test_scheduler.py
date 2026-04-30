@@ -741,6 +741,61 @@ class TestSchedulerXtcSpecialTokens:
         assert 2 in tokens
 
 
+class TestSyncAndClearCache:
+    """Tests for module-level _sync_and_clear_cache() helper (#300, #888)."""
+
+    def test_swallows_generation_stream_thread_error(self):
+        """generation_stream sync failing must not break cache clear.
+
+        Reproduces #888: on some MLX builds mx.synchronize(generation_stream)
+        raises 'There is no Stream(gpu, 0) in current thread' when called
+        from an executor thread that has not submitted work to that stream
+        (e.g. during _do_external_prefill). The helper must swallow that
+        RuntimeError and still drain the default stream + clear the cache.
+        """
+        from omlx import scheduler as sched_mod
+
+        calls = []
+
+        def fake_gen_sync(stream):
+            calls.append(("gen_sync", stream))
+            raise RuntimeError("There is no Stream(gpu, 0) in current thread.")
+
+        def fake_default_sync():
+            calls.append(("default_sync",))
+
+        def fake_clear_cache():
+            calls.append(("clear_cache",))
+
+        def dispatch(*args, **kwargs):
+            if args:
+                fake_gen_sync(args[0])
+            else:
+                fake_default_sync()
+
+        with patch.object(sched_mod.mx, "synchronize", side_effect=dispatch), \
+             patch.object(sched_mod.mx, "clear_cache", side_effect=fake_clear_cache):
+            sched_mod._sync_and_clear_cache()
+
+        assert calls[0][0] == "gen_sync"
+        assert ("default_sync",) in calls
+        assert ("clear_cache",) in calls
+
+    def test_propagates_default_stream_error(self):
+        """Errors on the default stream sync are not swallowed."""
+        from omlx import scheduler as sched_mod
+
+        def dispatch(*args, **kwargs):
+            if not args:
+                raise RuntimeError("default stream failure")
+
+        with patch.object(sched_mod.mx, "synchronize", side_effect=dispatch), \
+             patch.object(sched_mod.mx, "clear_cache") as clear_cache:
+            with pytest.raises(RuntimeError, match="default stream failure"):
+                sched_mod._sync_and_clear_cache()
+            clear_cache.assert_not_called()
+
+
 class TestSchedulerFormatBytes:
     """Tests for Scheduler._format_bytes()."""
 

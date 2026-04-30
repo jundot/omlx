@@ -15,6 +15,7 @@ from omlx.api.tool_calling import (
     ToolCallStreamFilter,
     _gemma4_args_to_json_robust,
     _parse_gemma4_tool_call_fallback,
+    _serialize_tool_call_arguments,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
@@ -1085,6 +1086,123 @@ class TestParseToolCallsEmptyEndMarker:
         assert tool_calls is None or len(tool_calls) == 0
 
 
+class TestParseToolCallsSyntaxError:
+    """Regression tests for issue #882.
+
+    mlx-lm's qwen3_coder parser calls ast.literal_eval on parameter
+    values, which raises SyntaxError on non-Python-literal strings
+    (e.g. "python3 test.py" for an array-typed parameter). The
+    exception used to escape parse_tool_calls and turned into a
+    server_error SSE chunk, silently dropping the tool call.
+    """
+
+    def _qwen_tok(self, failing_parser):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = failing_parser
+        return tok
+
+    def test_syntax_error_does_not_escape(self):
+        """SyntaxError from native parser must not crash parse_tool_calls."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = self._qwen_tok(failing_parser)
+        text = (
+            "pre\n<tool_call>\n<function=shell>\n"
+            "<parameter=command>python3 test.py</parameter>\n"
+            "</function>\n</tool_call>\npost"
+        )
+        # Must not raise.
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        # XML fallback should have recovered the call.
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "shell"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"command": "python3 test.py"}
+
+    def test_qwen_xml_fallback_recovers_call(self):
+        """Qwen-style XML body recovers via _parse_xml_tool_calls on native failure."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = self._qwen_tok(failing_parser)
+        text = (
+            "<tool_call>\n<function=read>\n"
+            "<parameter=path>/etc/hosts</parameter>\n"
+            "<parameter=lines>10</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        _, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "read"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["path"] == "/etc/hosts"
+        assert args["lines"] == 10  # json.loads converts numeric string
+
+    def test_unparseable_body_logs_and_drops(self, caplog):
+        """Fully unparseable body drops gracefully and logs a warning."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = self._qwen_tok(failing_parser)
+        text = "<tool_call>not a function at all, just text</tool_call>"
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert tool_calls is None or len(tool_calls) == 0
+        # Warning emitted so failures are visible rather than silent.
+        assert any(
+            "Native tool parser failed" in r.message
+            and "SyntaxError" in r.message
+            for r in caplog.records
+        )
+
+    def test_type_error_also_caught(self):
+        """TypeError from native parser also must not escape."""
+
+        def failing_parser(text, tools):
+            raise TypeError("unexpected type during parse")
+
+        tok = self._qwen_tok(failing_parser)
+        text = (
+            "<tool_call>\n<function=patch>\n"
+            "<parameter=path>src/a.py</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        # Must not raise.
+        _, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "patch"
+
+    def test_gemma4_path_syntax_error_does_not_escape(self):
+        """Gemma 4 fallback branch also must not propagate SyntaxError."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<|tool_call>"
+        tok.tool_call_end = "<tool_call|>"
+        tok.tool_parser = failing_parser
+
+        text = "<|tool_call>garbage body<tool_call|>"
+        # Must not raise. Gemma 4 fallback will also fail on this body,
+        # but the outer code must still complete gracefully.
+        _, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is None or len(tool_calls) == 0
+
+
 class TestParseBracketToolCalls:
     """Tests for bracket-style tool call parsing (issue #159)."""
 
@@ -1758,3 +1876,54 @@ class TestParseToolCallsNativeParserListReturn:
             "second_a",
             "second_b",
         ]
+
+
+class TestSerializeToolCallArguments:
+    """Tests for `_serialize_tool_call_arguments`.
+
+    Guards the server-side exit: whatever the parser returns must leave
+    omlx as a valid JSON-object string so a subsequent turn's chat template
+    (which iterates `arguments.items()`) never crashes on the echo.
+    """
+
+    def test_dict_roundtrip(self):
+        result = _serialize_tool_call_arguments({"location": "Tokyo", "unit": "c"})
+        assert json.loads(result) == {"location": "Tokyo", "unit": "c"}
+
+    def test_empty_dict(self):
+        assert _serialize_tool_call_arguments({}) == "{}"
+
+    def test_non_ascii_preserved(self):
+        """ensure_ascii=False is applied so CJK/emoji stay readable."""
+        result = _serialize_tool_call_arguments({"city": "서울"})
+        assert "서울" in result
+
+    def test_non_dict_bare_string_coerced_to_empty(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments("Tokyo")
+        assert result == "{}"
+        assert any("non-dict" in r.message for r in caplog.records)
+
+    def test_non_dict_list_coerced_to_empty(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments([1, 2])
+        assert result == "{}"
+
+    def test_non_dict_none_coerced_to_empty(self):
+        assert _serialize_tool_call_arguments(None) == "{}"
+
+    def test_json_object_string_preserved(self, caplog):
+        """mlx-vlm/mlx-lm gemma4 parser hands back a JSON-object string per
+        the OpenAI spec; the validator must accept it instead of dropping it."""
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments('{"command": "ls /tmp\\n"}')
+        assert json.loads(result) == {"command": "ls /tmp\n"}
+        assert not any("non-dict" in r.message for r in caplog.records)
+
+    def test_json_array_string_coerced_to_empty(self, caplog):
+        """JSON arrays/scalars do not satisfy ``arguments.items()`` so they
+        must still be coerced."""
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments("[1, 2]")
+        assert result == "{}"
+        assert any("non-dict" in r.message for r in caplog.records)

@@ -30,6 +30,35 @@ from .openai_models import FunctionCall, ResponseFormat, ToolCall, ToolDefinitio
 logger = logging.getLogger(__name__)
 
 
+def _serialize_tool_call_arguments(arguments: Any) -> str:
+    """Serialize parser output to a JSON-object arguments string.
+
+    Chat templates for models with native tool calling (Qwen 3.5/3.6 XML,
+    GLM, MiniMax) iterate `arguments.items()` when the call is echoed back
+    in history. Anything that does not represent a JSON object must be
+    coerced to "{}" here so we never hand the client a non-JSON value that
+    the next turn's template would crash on.
+    """
+    if isinstance(arguments, dict):
+        return json.dumps(arguments, ensure_ascii=False)
+    # mlx-vlm / mlx-lm gemma4 parser returns a JSON-object string per the
+    # OpenAI spec. Accept it when it parses back to a dict.
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return json.dumps(parsed, ensure_ascii=False)
+    logger.warning(
+        "Tool parser returned non-dict arguments (type=%s, repr=%.200r); "
+        "coercing to empty object to keep downstream template safe.",
+        type(arguments).__name__,
+        arguments,
+    )
+    return "{}"
+
+
 @dataclass(frozen=True)
 class ToolCallExtraction:
     """Parsed tool-call result plus sanitized reasoning text."""
@@ -69,9 +98,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                     type="function",
                     function=FunctionCall(
                         name=name,
-                        arguments=json.dumps(arguments, ensure_ascii=False)
-                        if isinstance(arguments, dict)
-                        else str(arguments),
+                        arguments=_serialize_tool_call_arguments(arguments),
                     ),
                 )
             )
@@ -414,15 +441,21 @@ def parse_tool_calls(
                                 type="function",
                                 function=FunctionCall(
                                     name=name,
-                                    arguments=json.dumps(arguments, ensure_ascii=False)
-                                    if isinstance(arguments, dict)
-                                    else str(arguments),
+                                    arguments=_serialize_tool_call_arguments(arguments),
                                 ),
                             )
                         )
-                except (ValueError, json.JSONDecodeError, AttributeError, KeyError):
+                except (
+                    ValueError,
+                    json.JSONDecodeError,
+                    AttributeError,
+                    KeyError,
+                    SyntaxError,
+                    TypeError,
+                ) as primary_err:
                     # Gemma 4 only: try robust fallback that handles bare
                     # string values and colons in function names.
+                    gemma4_handled = False
                     if tool_call_start == "<|tool_call>":
                         try:
                             parsed = _parse_gemma4_tool_call_fallback(
@@ -440,20 +473,48 @@ def parse_tool_calls(
                                         type="function",
                                         function=FunctionCall(
                                             name=name,
-                                            arguments=json.dumps(
-                                                arguments, ensure_ascii=False
-                                            )
-                                            if isinstance(arguments, dict)
-                                            else str(arguments),
+                                            arguments=_serialize_tool_call_arguments(
+                                                arguments
+                                            ),
                                         ),
                                     )
                                 )
+                            gemma4_handled = True
                         except (
                             ValueError,
                             json.JSONDecodeError,
                             KeyError,
+                            SyntaxError,
+                            TypeError,
                         ):
                             pass
+
+                    if gemma4_handled:
+                        continue
+
+                    # Per-match XML fallback: regex-only, no ast.literal_eval,
+                    # recovers Qwen/GLM/Hermes-JSON formats. Prevents silent
+                    # drop when the native parser raises (e.g. ast.literal_eval
+                    # SyntaxError on non-Python-literal parameter values).
+                    fb_wrapped = f"<tool_call>{match}</tool_call>"
+                    _, fb_calls = _parse_xml_tool_calls(fb_wrapped)
+                    if fb_calls:
+                        tool_calls.extend(fb_calls)
+                        logger.warning(
+                            "Native tool parser failed (%s: %s), "
+                            "recovered via XML fallback. Match: %r",
+                            type(primary_err).__name__,
+                            primary_err,
+                            match[:200],
+                        )
+                    else:
+                        logger.warning(
+                            "Native tool parser failed (%s: %s) and XML "
+                            "fallback could not recover. Dropping match: %r",
+                            type(primary_err).__name__,
+                            primary_err,
+                            match[:200],
+                        )
                     continue
 
             if tool_calls:

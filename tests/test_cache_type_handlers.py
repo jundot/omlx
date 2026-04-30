@@ -337,7 +337,15 @@ class TestRotatingKVCacheHandlerWithMLX:
         return RotatingKVCacheHandler()
 
     def test_reconstruct_cache(self, handler, mx):
-        """Test reconstructing RotatingKVCache."""
+        """Reconstructed RotatingKVCache forces _idx to keys.shape[2].
+
+        Per mlx-lm 0.31.3 contract, the merge path expects the buffer to
+        be in temporal order (case 1 of _temporal_order), which requires
+        _idx == keys.shape[2]. The handler now enforces this invariant
+        regardless of the inbound meta_state's _idx field, since both
+        save sites (extract() and _normalize_rotating_state) emit
+        temporal-order buffers.
+        """
         state = {
             "keys": mx.zeros((1, 8, 256, 64)),
             "values": mx.zeros((1, 8, 256, 64)),
@@ -354,7 +362,70 @@ class TestRotatingKVCacheHandlerWithMLX:
         assert cache.max_size == 256
         assert cache.keep == 4
         assert cache.offset == 500
+        # _idx tracks the actual buffer length so _temporal_order returns
+        # the keys as-is (case 1). The legacy 100 hint is ignored.
+        assert cache._idx == 256
+
+    def test_reconstruct_cache_undersized_no_zero_padding(self, handler, mx):
+        """Restored cache with keys shorter than max_size keeps its length.
+
+        BatchRotatingKVCache.extract() can return a buffer with
+        keys.shape[2] < max_size when left_padding has been stripped.
+        The old handler zero-padded the front to max_size, which leaked
+        zero positions into attention during merge (issues #934 / #903).
+        The new handler keeps the buffer as-is, relying on
+        PrefillReadyRotatingKVCache.size() to clamp the merge slice.
+        """
+        from omlx.cache._rotating_subclass import PrefillReadyRotatingKVCache
+
+        # Simulate an undersized restored buffer: 100 real tokens with an
+        # original offset of 500 (rotation has wrapped at least once).
+        state = {
+            "keys": mx.zeros((1, 8, 100, 64)),
+            "values": mx.zeros((1, 8, 100, 64)),
+        }
+        meta_state = (0, 256, 500, 100)
+
+        cache = handler.reconstruct_cache(state, meta_state)
+
+        assert cache is not None
+        assert cache.max_size == 256
+        # Buffer is NOT padded back up to max_size.
+        assert cache.keys.shape[2] == 100
+        # _idx matches buffer length so _temporal_order is a no-op.
         assert cache._idx == 100
+        # offset is preserved from meta_state.
+        assert cache.offset == 500
+        # Subclass clamps size() so merge can't overshoot the buffer.
+        assert isinstance(cache, PrefillReadyRotatingKVCache)
+        assert cache.size() == 100
+
+    def test_reconstruct_cache_oversized_trims_to_max_size(self, handler, mx):
+        """Oversized prefill-internal snapshot is trimmed to max_size.
+
+        Boundary snapshots can hold seq_len = max_size + chunk_size - 1
+        as a mid-prefill artefact. The handler trims to the most recent
+        max_size tokens (with the head-keep portion preserved) and lands
+        the result in case 1 of _temporal_order.
+        """
+        from omlx.cache._rotating_subclass import PrefillReadyRotatingKVCache
+
+        max_size = 128
+        oversize = max_size + 32  # = 160
+        state = {
+            "keys": mx.zeros((1, 8, oversize, 64)),
+            "values": mx.zeros((1, 8, oversize, 64)),
+        }
+        meta_state = (0, max_size, oversize, oversize)
+
+        cache = handler.reconstruct_cache(state, meta_state)
+
+        assert cache is not None
+        assert cache.max_size == max_size
+        assert cache.keys.shape[2] == max_size
+        # _idx == buffer length keeps _temporal_order in case 1.
+        assert cache._idx == max_size
+        assert isinstance(cache, PrefillReadyRotatingKVCache)
 
 
 class TestArraysCacheHandler:

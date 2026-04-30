@@ -894,6 +894,57 @@ class TestEnginePoolTTL:
         assert expired == []
         assert pool._entries["model-a"].last_access == 200.0
 
+    @pytest.mark.asyncio
+    async def test_ttl_falls_back_to_global_idle_timeout(self, pool_with_loaded_model):
+        """Per-model TTL None falls back to global idle timeout."""
+        pool = pool_with_loaded_model
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = None
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=200.0):  # 100s idle > 60s global
+            expired = await pool.check_ttl_expirations(
+                settings_manager, global_idle_timeout_seconds=60
+            )
+
+        assert "model-a" in expired
+        assert pool._entries["model-a"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_ttl_global_disabled_when_none(self, pool_with_loaded_model):
+        """Per-model None + global None keeps model loaded."""
+        pool = pool_with_loaded_model
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = None
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=99999.0):
+            expired = await pool.check_ttl_expirations(
+                settings_manager, global_idle_timeout_seconds=None
+            )
+
+        assert expired == []
+        assert pool._entries["model-a"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_per_model_ttl_overrides_global(self, pool_with_loaded_model):
+        """Per-model TTL wins over global idle timeout."""
+        pool = pool_with_loaded_model
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = 300  # per-model wider than global
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=200.0):  # 100s idle < 300s per-model
+            expired = await pool.check_ttl_expirations(
+                settings_manager, global_idle_timeout_seconds=60
+            )
+
+        assert expired == []
+        assert pool._entries["model-a"].engine is not None
+
 
 class TestHasActiveRequests:
     """Tests for has_active_requests() on engine types."""

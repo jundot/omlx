@@ -24,9 +24,11 @@ Usage:
 """
 
 import asyncio
+import contextlib
 import copy
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -35,6 +37,8 @@ from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..models.vlm import VLMModelAdapter
+from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
+from ..patches.qwen3_5_attention import apply_qwen3_5_attention_patch
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -95,18 +99,37 @@ _video_processor_patched = False
 
 
 def _patch_video_processor_bug():
-    """Remove video_processor from transformers' auto-processor mapping.
+    """Prevent video_processor from crashing processor loading.
 
-    oMLX does not support video input. Without torchvision, transformers'
-    AutoVideoProcessor crashes when loading VLM processors that have a
-    video_preprocessor_config.json. By removing ``video_processor`` from
-    the mapping, ``ProcessorMixin.get_attributes()`` no longer recognises
-    it as a sub-processor and ``_get_arguments_from_pretrained`` never
-    attempts to load it.
+    Two interrelated issues without torchvision:
+
+    1. Gemma4's video_preprocessor_config.json triggers AutoVideoProcessor
+       which requires torchvision. Removing ``video_processor`` from the
+       MODALITY mapping prevents transformers from attempting to load it.
+
+    2. When mlx-vlm's custom processor patch fails (e.g. due to a stale
+       mistral_common dependency), it falls back to HF's ProcessorMixin
+       which passes ``video_processor`` as a kwarg. HF's own
+       ProcessorMixin.__init__ rejects unexpected kwargs. We patch it to
+       silently drop ``video_processor``.
     """
     global _video_processor_patched
     if _video_processor_patched:
         return
+
+    try:
+        from mistral_common.protocol.instruct.request import ReasoningEffort  # noqa: F401
+    except ImportError:
+        try:
+            import mistral_common.protocol.instruct.request as _mcpir
+
+            class _ReasoningEffort:
+                pass
+
+            _mcpir.ReasoningEffort = _ReasoningEffort
+            logger.debug("Stubbed missing mistral_common.ReasoningEffort")
+        except (ImportError, AttributeError):
+            pass
 
     try:
         from transformers.processing_utils import MODALITY_TO_AUTOPROCESSOR_MAPPING
@@ -115,10 +138,125 @@ def _patch_video_processor_bug():
         if "video_processor" in mapping:
             del mapping["video_processor"]
             logger.debug("Removed video_processor from MODALITY_TO_AUTOPROCESSOR_MAPPING")
-
-        _video_processor_patched = True
     except (ImportError, AttributeError):
         pass
+
+    try:
+        from transformers.processing_utils import ProcessorMixin
+
+        _orig_pm_init = ProcessorMixin.__init__
+
+        def _pm_init_drop_video(self, *args, **kwargs):
+            kwargs.pop("video_processor", None)
+            return _orig_pm_init(self, *args, **kwargs)
+
+        ProcessorMixin.__init__ = _pm_init_drop_video
+    except (ImportError, AttributeError):
+        pass
+
+    _video_processor_patched = True
+
+
+def _fix_processor_none_pixels(processor):
+    """Set sensible defaults when preprocessor_config.json has null pixels.
+
+    Some Qwen3-VL model configs ship ``"max_pixels": null`` which overrides
+    the constructor default and causes ``int > NoneType`` comparison errors
+    in ``_smart_resize_image``.
+    """
+    ip = getattr(processor, "image_processor", None)
+    if ip is None:
+        return
+    if getattr(ip, "max_pixels", None) is None and hasattr(ip, "max_pixels"):
+        ip.max_pixels = 14 * 14 * 4 * 1280
+        logger.debug("Fixed image_processor.max_pixels: None → %d", ip.max_pixels)
+    if getattr(ip, "min_pixels", None) is None and hasattr(ip, "min_pixels"):
+        ip.min_pixels = 56 * 56
+        logger.debug("Fixed image_processor.min_pixels: None → %d", ip.min_pixels)
+
+
+# Config keys to strip when audio_tower weights are missing but config still
+# advertises audio support. See `_strip_audio_config_if_orphaned`.
+_AUDIO_CONFIG_KEYS = (
+    "audio_config",
+    "audio_token_id",
+    "boa_token_id",
+    "eoa_token_id",
+    "eoa_token_index",
+)
+
+
+def _has_audio_weights(model_dir: Path) -> bool:
+    """Return True iff any safetensors shard contains audio_tower / embed_audio keys."""
+    import safetensors
+
+    for sf in model_dir.glob("*.safetensors"):
+        try:
+            with safetensors.safe_open(str(sf), framework="np") as f:
+                for k in f.keys():
+                    if k.startswith(("audio_tower.", "embed_audio.")):
+                        return True
+        except Exception:
+            # Corrupt or unreadable shard — treat as no audio info, let
+            # downstream loader produce its own error.
+            return False
+    return False
+
+
+@contextlib.contextmanager
+def _strip_audio_config_if_orphaned(model_dir: Path):
+    """Drop `audio_config` from `mlx_vlm.utils.load_config` results when the
+    safetensors shards lack audio_tower / embed_audio weights.
+
+    Some quantization tooling (notably oMLX's pre-fix oQ pipeline) writes
+    multimodal Gemma 4 checkpoints without audio weights but leaves
+    `audio_config` in `config.json`. mlx-vlm then instantiates `AudioEncoder`
+    and `model.load_weights(strict=True)` fails with "Missing 752 parameters".
+
+    This wrap is scoped to a single `mlx_vlm.utils.load(...)` call: it swaps
+    `load_config` on entry and restores it on exit. Other code paths that
+    read config (model_discovery, admin UI) bypass mlx-vlm entirely so they
+    are unaffected.
+    """
+    import mlx_vlm.utils as _vu
+
+    original = _vu.load_config
+    warned = set()
+
+    def _patched(path, **kwargs):
+        cfg = original(path, **kwargs)
+        if cfg.get("audio_config") is None:
+            return cfg
+        try:
+            p = Path(path) if not isinstance(path, Path) else path
+            if not p.is_dir():
+                return cfg
+            if _has_audio_weights(p):
+                return cfg
+        except Exception:
+            return cfg
+        cfg = dict(cfg)
+        # Explicit None instead of pop: mlx-vlm's load_model runs
+        # `config.setdefault("audio_config", {})` which would otherwise
+        # repopulate audio_config with `{}` and cause AudioEncoder to be
+        # instantiated with default values.
+        cfg["audio_config"] = None
+        for k in _AUDIO_CONFIG_KEYS:
+            if k != "audio_config":
+                cfg.pop(k, None)
+        if str(p) not in warned:
+            warned.add(str(p))
+            logger.warning(
+                "audio_tower weights missing for %s; loading without audio support",
+                p.name,
+            )
+        return cfg
+
+    _vu.load_config = _patched
+    try:
+        yield
+    finally:
+        _vu.load_config = original
 
 
 # Models that only support a single image per request
@@ -170,7 +308,7 @@ class VLMBatchedEngine(BaseEngine):
     def __init__(
         self,
         model_name: str,
-        trust_remote_code: bool = True,
+        trust_remote_code: bool = False,
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
@@ -259,6 +397,16 @@ class VLMBatchedEngine(BaseEngine):
                 )
         return self._grammar_compiler
 
+    @property
+    def prefix_cache_enabled(self) -> bool:
+        """True when the scheduler has a BlockAwarePrefixCache wired up."""
+        if self._engine is None:
+            return False
+        try:
+            return self._engine.engine.scheduler.block_aware_cache is not None
+        except AttributeError:
+            return False
+
     def _resolve_ocr_stop_token_ids(self) -> list[int]:
         """Convert OCR stop sequences to token IDs via the tokenizer.
 
@@ -300,25 +448,25 @@ class VLMBatchedEngine(BaseEngine):
         from ..engine_core import get_mlx_executor
 
         def _load_vlm_sync():
-            # Patch transformers bug: video_processor_class_from_name crashes
-            # when torchvision is not available (extractors is None, `in` fails).
-            # oMLX does not support video input, so we skip video processing.
             _patch_video_processor_bug()
-            return vlm_load(self._model_name)
+            with _strip_audio_config_if_orphaned(Path(self._model_name)):
+                return vlm_load(
+                    self._model_name, trust_remote_code=self._trust_remote_code
+                )
 
         loop = asyncio.get_running_loop()
         self._vlm_model, self._processor = await loop.run_in_executor(
             get_mlx_executor(), _load_vlm_sync
         )
 
+        _fix_processor_none_pixels(self._processor)
+
         # Initialize vision feature cache
         vision_ssd_dir = None
         if self._scheduler_config and getattr(
             self._scheduler_config, "paged_ssd_cache_dir", None
         ):
-            from pathlib import Path as _Path
-
-            vision_ssd_dir = _Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
+            vision_ssd_dir = Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
         self._vision_cache = VisionFeatureSSDCache(
             cache_dir=vision_ssd_dir,
             max_memory_entries=20,
@@ -337,47 +485,19 @@ class VLMBatchedEngine(BaseEngine):
         else:
             self._tokenizer = copy.deepcopy(self._processor)
 
-        # Build mlx-lm decode model for batched decode by sharing VLM weights.
-        # mlx-vlm language models may produce degenerated output in batched
-        # decode (e.g. gemma4 missing KV sharing between layers).
-        # The LM model is constructed without evaluating initial random weights
-        # (MLX lazy eval) then load_weights replaces them with VLM's arrays
-        # by reference — zero additional GPU memory.
-        self._lm_model = None
-        try:
-            from pathlib import Path as _Path
+        # Create VLM model adapter wrapping language_model.
+        # mlx-vlm models now handle per-sequence mx.array offsets natively
+        # and batched decode is fixed, so no separate mlx-lm decode model needed.
+        self._adapter = VLMModelAdapter(self._vlm_model)
 
-            from mlx.utils import tree_flatten
-            from mlx_lm.utils import load_model
-
-            def _build_decode_model():
-                # Create LM model with lazy=True: reads disk headers for correct
-                # quantized structure but does NOT evaluate weights → 0 GPU memory.
-                lm_model, _ = load_model(
-                    _Path(self._model_name), lazy=True
-                )
-                # Replace lazy weights with VLM's evaluated arrays by reference.
-                # VLM params "model.*" map to LM "language_model.model.*".
-                vlm_params = dict(tree_flatten(
-                    self._vlm_model.language_model.parameters()
-                ))
-                lm_params = [
-                    ("language_model." + k, v) for k, v in vlm_params.items()
-                ]
-                lm_model.load_weights(lm_params, strict=False)
-                return lm_model
-
-            self._lm_model = await loop.run_in_executor(
-                get_mlx_executor(), _build_decode_model
-            )
-            logger.info("VLM decode model ready (weight sharing, zero-copy)")
-        except Exception as e:
-            logger.warning("mlx-lm decode model failed, using vlm fallback: %s", e)
-
-        # Create VLM model adapter wrapping language_model
-        self._adapter = VLMModelAdapter(
-            self._vlm_model, decode_model=self._lm_model
-        )
+        # Patch mlx-vlm GatedDeltaNet to mirror mlx-lm fixes (cache.advance(S)
+        # + mx.contiguous on cache[0]) that mlx-vlm e41cd25 still lacks.
+        # Class-level monkey-patch — no-op when target classes are absent
+        # or already fixed upstream.
+        apply_gated_delta_advance_patch()
+        # Patch mlx-vlm Qwen3_5Attention to use plain RoPE on text-only
+        # inputs. Preserves mRoPE for genuine multimodal positions.
+        apply_qwen3_5_attention_patch()
 
         # Create scheduler config
         scheduler_config = (
@@ -595,13 +715,19 @@ class VLMBatchedEngine(BaseEngine):
             if msg_num_images > 0:
                 image_message_ranges.append((idx, msg_num_images))
 
-            # Preserve tool-related messages verbatim so the chat
-            # template receives tool_calls, tool_call_id, and
-            # tool_responses fields.  get_message_json() strips these,
-            # which makes tool results invisible to the model.
+            # Preserve tool-related messages and reasoning_content verbatim
+            # so the chat template receives tool_calls, tool_call_id,
+            # tool_responses, and reasoning_content fields. get_message_json()
+            # only handles (content, role) and strips every other top-level
+            # key, which would make tool results and Qwen 3.6+ reasoning
+            # blocks invisible to the model.
             if role == "tool" or (
                 role == "assistant"
-                and (msg.get("tool_calls") or msg.get("tool_responses"))
+                and (
+                    msg.get("tool_calls")
+                    or msg.get("tool_responses")
+                    or msg.get("reasoning_content")
+                )
             ):
                 formatted_messages.append(msg)
             else:
@@ -944,7 +1070,6 @@ class VLMBatchedEngine(BaseEngine):
                 logger.debug(
                     "Failed to compute segmented VLM cache boundaries, "
                     "falling back to whole-request keying",
-                    exc_info=True,
                 )
                 image_cache_key_start = 0
                 image_cache_key_ranges = []
@@ -1355,7 +1480,7 @@ class VLMBatchedEngine(BaseEngine):
                     non_system_prompt = self._tokenizer.apply_chat_template(
                         non_system, tokenize=False, add_generation_prompt=True,
                     )
-                    full_tokens = len(self._tokenizer.encode(prompt))
+                    full_tokens = len(prompt)
                     non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
                     system_end = full_tokens - non_system_tokens
                     if system_end > 0:
