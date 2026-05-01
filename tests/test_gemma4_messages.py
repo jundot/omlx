@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
-from omlx.adapter.gemma4 import extract_gemma4_messages
+from omlx.adapter.gemma4 import (
+    Gemma4OutputParserSession,
+    _strip_thinking,
+    extract_gemma4_messages,
+)
 from omlx.api.openai_models import Message
 
 
@@ -193,3 +197,214 @@ class TestExtractGemma4Messages:
         assert isinstance(content, list)
         types = [p["type"] for p in content]
         assert "image_url" in types
+
+    def test_multi_turn_rule_strips_prior_thought_block(self):
+        """Per Gemma 4 docs: only the final visible answer is kept in chat
+        history; prior thought blocks must not be fed back on the next turn.
+        """
+        messages = [
+            Message(role="user", content="What is 1+1?"),
+            Message(
+                role="assistant",
+                content="<think>\nLet me compute.\n</think>\n2",
+            ),
+            Message(role="user", content="What is 2+2?"),
+        ]
+        result = extract_gemma4_messages(messages)
+        assert result[1] == {"role": "assistant", "content": "2"}
+
+    def test_multi_turn_strips_raw_channel_form(self):
+        """Clients that preserve the protocol form (raw channel markers in
+        assistant content) also need their thought blocks stripped."""
+        messages = [
+            Message(
+                role="assistant",
+                content="<|channel>thought\nreasoning here\n<channel|>final",
+            ),
+        ]
+        result = extract_gemma4_messages(messages)
+        assert result[0]["content"] == "final"
+
+    def test_multi_turn_preserves_inline_think_mention(self):
+        """An assistant explaining the protocol must not have its examples
+        gutted on subsequent turns."""
+        explanation = "You write `<think>like this</think>` to enable reasoning."
+        messages = [Message(role="assistant", content=explanation)]
+        result = extract_gemma4_messages(messages)
+        assert result[0]["content"] == explanation
+
+    def test_strip_keeps_tool_calls(self):
+        """Stripping leading thought from assistant content must not drop
+        the structured ``tool_calls`` field."""
+        msg = Message(
+            role="assistant",
+            content="<think>\nplanning\n</think>\n",
+            tool_calls=[_tool_call_dict("c1", "search")],
+        )
+        result = extract_gemma4_messages([msg])
+        assert "tool_calls" in result[0]
+        assert result[0]["tool_calls"][0]["function"]["name"] == "search"
+
+
+class TestStripThinking:
+    """``_strip_thinking`` removes leading thought blocks only."""
+
+    def test_strips_canonical_channel_block(self):
+        """Per Gemma 4 spec: ``<|channel>thought\\n[reasoning]<channel|>[answer]``."""
+        text = "<|channel>thought\ninternal reasoning\n<channel|>the answer"
+        assert _strip_thinking(text) == "the answer"
+
+    def test_strips_empty_channel_block_per_spec(self):
+        """Per Gemma 4 spec: thinking-disabled larger models still emit an
+        empty thought block before the final answer."""
+        text = "<|channel>thought\n<channel|>the answer"
+        assert _strip_thinking(text) == "the answer"
+
+    def test_strips_rendered_think_block(self):
+        text = "<think>\nreasoning\n</think>\nthe answer"
+        assert _strip_thinking(text) == "the answer"
+
+    def test_strips_multiple_consecutive_blocks(self):
+        text = "<think>a</think>\n<think>b</think>\nanswer"
+        assert _strip_thinking(text) == "answer"
+
+    def test_strips_mixed_channel_and_think_blocks(self):
+        text = "<|channel>x<channel|><think>y</think>answer"
+        assert _strip_thinking(text) == "answer"
+
+    def test_preserves_inline_think_mention(self):
+        text = "You write `<think>like this</think>` to enable reasoning."
+        assert _strip_thinking(text) == text
+
+    def test_preserves_inline_channel_mention(self):
+        text = "The `<|channel>` token marks reasoning."
+        assert _strip_thinking(text) == text
+
+    def test_handles_leading_whitespace(self):
+        assert _strip_thinking("   <think>x</think>answer") == "answer"
+
+    def test_empty_string_unchanged(self):
+        assert _strip_thinking("") == ""
+
+    def test_non_string_passthrough(self):
+        assert _strip_thinking(None) is None
+        assert _strip_thinking(42) == 42
+
+
+class _FakeTokenizer:
+    """Tokenizer stub that bypasses the streaming detokenizer path."""
+
+    detokenizer = None
+
+    def decode(self, ids):
+        return ""
+
+
+class TestGemma4OutputParserSession:
+    """Output parser converts Gemma 4 channel markers to ``<think>`` tags."""
+
+    def _make_session(self):
+        return Gemma4OutputParserSession(_FakeTokenizer())
+
+    def test_canonical_thought_block_per_spec(self):
+        """``<|channel>thought\\n[reasoning]<channel|>[answer]`` per Gemma 4 spec."""
+        sess = self._make_session()
+        result = sess._consume_text(
+            "<|channel>thought\nreasoning\n<channel|>final answer",
+            final=True,
+        )
+        assert result.visible_text == "<think>\nreasoning\n</think>\nfinal answer"
+        assert sess._in_thought is False
+
+    def test_empty_thought_block_per_spec(self):
+        """Thinking-disabled larger models emit an empty thought block per spec."""
+        sess = self._make_session()
+        result = sess._consume_text(
+            "<|channel>thought\n<channel|>the answer", final=True
+        )
+        assert result.visible_text == "<think>\n</think>\nthe answer"
+
+    def test_no_newline_open_marker_defensive(self):
+        """``<|channel>thought<channel|>`` with no newline is recovered via
+        the bare-marker fallback, with the ``thought`` keyword absorbed."""
+        sess = self._make_session()
+        result = sess._consume_text(
+            "<|channel>thought<channel|>after", final=True
+        )
+        assert result.visible_text == "<think>\n</think>\nafter"
+
+    def test_bare_open_with_non_thought_channel(self):
+        """A bare ``<|channel>X<channel|>`` (unknown channel name) is wrapped
+        defensively as a thought block rather than leaking the markers."""
+        sess = self._make_session()
+        result = sess._consume_text(
+            "<|channel>X<channel|>after", final=True
+        )
+        assert result.visible_text == "<think>\nX</think>\nafter"
+
+    def test_streaming_canonical_split_at_marker_boundary(self):
+        """Open marker arriving across two chunks must still match canonical."""
+        sess = self._make_session()
+        r1 = sess._consume_text("<|channel>")
+        # Streaming defer: nothing emitted yet because the bare match could
+        # still extend to the canonical form.
+        assert r1.visible_text == ""
+        r2 = sess._consume_text(
+            "thought\nreasoning\n<channel|>answer", final=True
+        )
+        assert r1.visible_text + r2.visible_text == (
+            "<think>\nreasoning\n</think>\nanswer"
+        )
+
+    def test_streaming_defer_prefers_canonical_over_bare(self):
+        """When ``<|channel>thought`` arrives without a newline at the chunk
+        boundary, the parser must defer rather than commit the bare match."""
+        sess = self._make_session()
+        r1 = sess._consume_text("<|channel>thought")
+        assert r1.visible_text == ""
+        r2 = sess._consume_text("\nreasoning\n<channel|>answer", final=True)
+        assert r1.visible_text + r2.visible_text == (
+            "<think>\nreasoning\n</think>\nanswer"
+        )
+
+    def test_stray_close_marker_dropped(self):
+        """A ``<channel|>`` outside a thought block is absorbed silently."""
+        sess = self._make_session()
+        result = sess._consume_text("hello<channel|>world", final=True)
+        assert result.visible_text == "helloworld"
+
+    def test_turn_end_marker_dropped(self):
+        sess = self._make_session()
+        result = sess._consume_text("done<turn|>", final=True)
+        assert result.visible_text == "done"
+
+    def test_tool_response_markers_dropped(self):
+        sess = self._make_session()
+        result = sess._consume_text(
+            "<|tool_response>{\"x\":1}<tool_response|>after", final=True
+        )
+        assert result.visible_text == '{"x":1}after'
+
+    def test_finalize_closes_orphan_thought(self):
+        """A thought block left open at end-of-stream is closed in finalize."""
+        sess = self._make_session()
+        first = sess._consume_text("<|channel>thought\nincomplete reasoning")
+        final = sess.finalize()
+        combined = first.visible_text + final.visible_text
+        assert "<think>\n" in combined
+        assert combined.endswith("</think>\n")
+        assert sess._in_thought is False
+
+    def test_double_bare_open_does_not_re_emit_think(self):
+        """The user's reported double ``<|channel><|channel>`` artefact: the
+        second open while already inside a thought block must not re-emit a
+        nested ``<think>`` opener."""
+        sess = self._make_session()
+        result = sess._consume_text(
+            "<|channel>thought\nfirst<|channel>second\n<channel|>after",
+            final=True,
+        )
+        # Exactly one <think> opener despite two <|channel>... opens.
+        assert result.visible_text.count("<think>\n") == 1
+        assert result.visible_text.count("</think>\n") == 1
+        assert result.visible_text.endswith("after")
