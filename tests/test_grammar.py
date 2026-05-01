@@ -822,3 +822,18 @@ class TestListGrammarParsers:
             resp = client.get("/admin/api/grammar/parsers")
         assert resp.status_code == 200
         assert resp.json() == []
+
+    def test_returns_empty_when_xgrammar_native_binding_fails(self, client):
+        def raise_binding_error():
+            raise RuntimeError(
+                "Cannot find library: "
+                "libxgrammar_bindings.dylib, libxgrammar_bindings.so"
+            )
+
+        fake_xgrammar = SimpleNamespace(
+            get_builtin_structural_tag_supported_models=raise_binding_error
+        )
+        with patch.dict("sys.modules", {"xgrammar": fake_xgrammar}):
+            resp = client.get("/admin/api/grammar/parsers")
+        assert resp.status_code == 200
+        assert resp.json() == []
