@@ -41,7 +41,7 @@
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
-                integrations: { codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
+                integrations: { codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, crush_model: null, openclaw_tools_profile: 'full' },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
@@ -1873,6 +1873,16 @@
                 return parts.join(' ');
             },
 
+            get crushCommand() {
+                const cli = this.stats.cli_prefix || 'omlx';
+                const model = this.globalSettings.integrations.crush_model || 'select-a-model';
+                const parts = [`${this.shellQuote(cli)} launch crush --model ${this.shellQuote(model)}`];
+                if (this.stats.api_key) {
+                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
+                }
+                return parts.join(' ');
+            },
+
             async saveIntegrationSettings() {
                 try {
                     const response = await fetch('/admin/api/global-settings', {
@@ -1883,6 +1893,7 @@
                             integrations_opencode_model: this.globalSettings.integrations.opencode_model,
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
                             integrations_pi_model: this.globalSettings.integrations.pi_model,
+                            integrations_crush_model: this.globalSettings.integrations.crush_model,
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
                         }),
                     });

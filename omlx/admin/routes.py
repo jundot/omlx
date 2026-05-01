@@ -236,6 +236,7 @@ class GlobalSettingsRequest(BaseModel):
     integrations_opencode_model: Optional[str] = None
     integrations_openclaw_model: Optional[str] = None
     integrations_pi_model: Optional[str] = None
+    integrations_crush_model: Optional[str] = None
     integrations_openclaw_tools_profile: Optional[Literal["minimal", "coding", "messaging", "full"]] = None
 
     # UI settings
@@ -2236,6 +2237,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "opencode_model": global_settings.integrations.opencode_model,
             "openclaw_model": global_settings.integrations.openclaw_model,
             "pi_model": global_settings.integrations.pi_model,
+            "crush_model": global_settings.integrations.crush_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
         },
         "system": {
@@ -2606,6 +2608,9 @@ async def update_global_settings(
     if "integrations_pi_model" in request.model_fields_set:
         global_settings.integrations.pi_model = request.integrations_pi_model
         integrations_changed = True
+    if "integrations_crush_model" in request.model_fields_set:
+        global_settings.integrations.crush_model = request.integrations_crush_model
+        integrations_changed = True
     if "integrations_openclaw_tools_profile" in request.model_fields_set:
         global_settings.integrations.openclaw_tools_profile = (
             request.integrations_openclaw_tools_profile
@@ -2619,7 +2624,8 @@ async def update_global_settings(
             f"codex={global_settings.integrations.codex_model}, "
             f"opencode={global_settings.integrations.opencode_model}, "
             f"openclaw={global_settings.integrations.openclaw_model}, "
-            f"pi={global_settings.integrations.pi_model}"
+            f"pi={global_settings.integrations.pi_model}, "
+            f"crush={global_settings.integrations.crush_model}"
         )
 
     # Apply UI settings

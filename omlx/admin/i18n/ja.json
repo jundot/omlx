@@ -105,6 +105,7 @@
   "status.integrations.opencode_desc": "ターミナルAIコーディングアシスタント",
   "status.integrations.openclaw_desc": "メッセージング統合AIアシスタント",
   "status.integrations.pi_desc": "Terminal AI coding agent",
+  "status.integrations.crush_desc": "華やかなターミナル特化型コーディングエージェント",
   "status.integrations.openclaw_tools_profile": "ツール",
   "status.engines.section_label": "エンジンバージョン",
   "status.engines.unknown_version": "不明",
