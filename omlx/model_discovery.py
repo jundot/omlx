@@ -86,7 +86,6 @@ EMBEDDING_MODEL_TYPES = {
     "siglip",
     "colqwen2_5",
     "colqwen2-5",
-    "lfm2",
 }
 
 # Model types that have both embedding and LLM variants.
@@ -95,6 +94,7 @@ AMBIGUOUS_EMBEDDING_MODEL_TYPES = {
     "qwen3",
     "gemma3-text",
     "gemma3_text",
+    "lfm2",
 }
 
 # Known embedding architectures
@@ -512,8 +512,8 @@ def detect_model_type(model_path: Path) -> ModelType:
         return "audio_stt"
     if normalized_type in AUDIO_STS_MODEL_TYPES or model_type in AUDIO_STS_MODEL_TYPES:
         return "audio_sts"
-    # LFM2 audio: model_type starts with "lfm" and is not an embedding
-    if normalized_type.startswith("lfm") and normalized_type not in EMBEDDING_MODEL_TYPES:
+    # LFM2 audio: specific model_type for audio variants
+    if normalized_type == "lfm_audio":
         return "audio_sts"
 
     return "llm"
