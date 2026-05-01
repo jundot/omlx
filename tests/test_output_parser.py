@@ -142,6 +142,88 @@ class TestGemma4OutputParserSession:
         assert text == "<think>\nreasoning</think>\nanswer"
         assert "<turn|>" not in text
 
+    def test_stray_close_marker_outside_thought_dropped(self):
+        """A bare ``<channel|>`` after the thought block already closed must
+        not leak into visible content. Models occasionally emit one in long
+        multi-turn contexts and the SDK rejects it as raw markup."""
+        token_map = {
+            1: "<|channel>thought\n",
+            2: "reasoning",
+            3: "<channel|>",
+            4: "answer",
+            5: "<channel|>",
+            6: "more",
+        }
+        tokenizer = GemmaTokenizer(token_map)
+        session = Gemma4OutputParserSession(tokenizer)
+
+        parts = []
+        for token_id in [1, 2, 3, 4, 5, 6]:
+            parts.append(session.process_token(token_id).stream_text)
+        parts.append(session.finalize().stream_text)
+
+        text = "".join(parts)
+        assert text == "<think>\nreasoning</think>\nanswermore"
+        assert "<channel|>" not in text
+
+    def test_stray_open_marker_inside_thought_dropped(self):
+        """A nested ``<|channel>thought\\n`` while already inside a thought
+        block must not re-emit ``<think>``. The block stays open until the
+        first matching close marker."""
+        token_map = {
+            1: "<|channel>thought\n",
+            2: "step 1",
+            3: "<|channel>thought\n",
+            4: "step 2",
+            5: "<channel|>",
+            6: "answer",
+        }
+        tokenizer = GemmaTokenizer(token_map)
+        session = Gemma4OutputParserSession(tokenizer)
+
+        parts = []
+        for token_id in [1, 2, 3, 4, 5, 6]:
+            parts.append(session.process_token(token_id).stream_text)
+        parts.append(session.finalize().stream_text)
+
+        text = "".join(parts)
+        assert text == "<think>\nstep 1step 2</think>\nanswer"
+        assert text.count("<think>\n") == 1
+        assert text.count("</think>\n") == 1
+
+    def test_tool_call_markers_pass_through(self):
+        """Tool-call markup must reach the buffered output text untouched so
+        ``parse_tool_calls`` can extract the call. ``ToolCallStreamFilter``
+        downstream is responsible for removing it from stream deltas."""
+        token_map = {
+            1: "<|channel>thought\n",
+            2: "calling",
+            3: "<channel|>",
+            4: "<|tool_call>",
+            5: "call:bash{cmd:ls}",
+            6: "<tool_call|>",
+            7: "done",
+        }
+        tokenizer = GemmaTokenizer(token_map)
+        session = Gemma4OutputParserSession(tokenizer)
+
+        stream_parts = []
+        visible_parts = []
+        for token_id in [1, 2, 3, 4, 5, 6, 7]:
+            result = session.process_token(token_id)
+            stream_parts.append(result.stream_text)
+            visible_parts.append(result.visible_text)
+        final = session.finalize()
+        stream_parts.append(final.stream_text)
+        visible_parts.append(final.visible_text)
+
+        stream_text = "".join(stream_parts)
+        visible_text = "".join(visible_parts)
+        assert stream_text == visible_text
+        assert "<|tool_call>" in stream_text
+        assert "<tool_call|>" in stream_text
+        assert "call:bash{cmd:ls}" in stream_text
+
 
 class TestOutputParserFactory:
     def test_detects_gemma4(self):

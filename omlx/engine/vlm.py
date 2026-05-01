@@ -24,9 +24,11 @@ Usage:
 """
 
 import asyncio
+import contextlib
 import copy
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -35,6 +37,8 @@ from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..models.vlm import VLMModelAdapter
+from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
+from ..patches.qwen3_5_attention import apply_qwen3_5_attention_patch
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -171,6 +175,90 @@ def _fix_processor_none_pixels(processor):
         logger.debug("Fixed image_processor.min_pixels: None → %d", ip.min_pixels)
 
 
+# Config keys to strip when audio_tower weights are missing but config still
+# advertises audio support. See `_strip_audio_config_if_orphaned`.
+_AUDIO_CONFIG_KEYS = (
+    "audio_config",
+    "audio_token_id",
+    "boa_token_id",
+    "eoa_token_id",
+    "eoa_token_index",
+)
+
+
+def _has_audio_weights(model_dir: Path) -> bool:
+    """Return True iff any safetensors shard contains audio_tower / embed_audio keys."""
+    import safetensors
+
+    for sf in model_dir.glob("*.safetensors"):
+        try:
+            with safetensors.safe_open(str(sf), framework="np") as f:
+                for k in f.keys():
+                    if k.startswith(("audio_tower.", "embed_audio.")):
+                        return True
+        except Exception:
+            # Corrupt or unreadable shard — treat as no audio info, let
+            # downstream loader produce its own error.
+            return False
+    return False
+
+
+@contextlib.contextmanager
+def _strip_audio_config_if_orphaned(model_dir: Path):
+    """Drop `audio_config` from `mlx_vlm.utils.load_config` results when the
+    safetensors shards lack audio_tower / embed_audio weights.
+
+    Some quantization tooling (notably oMLX's pre-fix oQ pipeline) writes
+    multimodal Gemma 4 checkpoints without audio weights but leaves
+    `audio_config` in `config.json`. mlx-vlm then instantiates `AudioEncoder`
+    and `model.load_weights(strict=True)` fails with "Missing 752 parameters".
+
+    This wrap is scoped to a single `mlx_vlm.utils.load(...)` call: it swaps
+    `load_config` on entry and restores it on exit. Other code paths that
+    read config (model_discovery, admin UI) bypass mlx-vlm entirely so they
+    are unaffected.
+    """
+    import mlx_vlm.utils as _vu
+
+    original = _vu.load_config
+    warned = set()
+
+    def _patched(path, **kwargs):
+        cfg = original(path, **kwargs)
+        if cfg.get("audio_config") is None:
+            return cfg
+        try:
+            p = Path(path) if not isinstance(path, Path) else path
+            if not p.is_dir():
+                return cfg
+            if _has_audio_weights(p):
+                return cfg
+        except Exception:
+            return cfg
+        cfg = dict(cfg)
+        # Explicit None instead of pop: mlx-vlm's load_model runs
+        # `config.setdefault("audio_config", {})` which would otherwise
+        # repopulate audio_config with `{}` and cause AudioEncoder to be
+        # instantiated with default values.
+        cfg["audio_config"] = None
+        for k in _AUDIO_CONFIG_KEYS:
+            if k != "audio_config":
+                cfg.pop(k, None)
+        if str(p) not in warned:
+            warned.add(str(p))
+            logger.warning(
+                "audio_tower weights missing for %s; loading without audio support",
+                p.name,
+            )
+        return cfg
+
+    _vu.load_config = _patched
+    try:
+        yield
+    finally:
+        _vu.load_config = original
+
+
 # Models that only support a single image per request
 SINGLE_IMAGE_ONLY_MODELS = {
     "llava_next",
@@ -220,7 +308,7 @@ class VLMBatchedEngine(BaseEngine):
     def __init__(
         self,
         model_name: str,
-        trust_remote_code: bool = True,
+        trust_remote_code: bool = False,
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
@@ -361,7 +449,10 @@ class VLMBatchedEngine(BaseEngine):
 
         def _load_vlm_sync():
             _patch_video_processor_bug()
-            return vlm_load(self._model_name)
+            with _strip_audio_config_if_orphaned(Path(self._model_name)):
+                return vlm_load(
+                    self._model_name, trust_remote_code=self._trust_remote_code
+                )
 
         loop = asyncio.get_running_loop()
         self._vlm_model, self._processor = await loop.run_in_executor(
@@ -375,9 +466,7 @@ class VLMBatchedEngine(BaseEngine):
         if self._scheduler_config and getattr(
             self._scheduler_config, "paged_ssd_cache_dir", None
         ):
-            from pathlib import Path as _Path
-
-            vision_ssd_dir = _Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
+            vision_ssd_dir = Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
         self._vision_cache = VisionFeatureSSDCache(
             cache_dir=vision_ssd_dir,
             max_memory_entries=20,
@@ -400,6 +489,15 @@ class VLMBatchedEngine(BaseEngine):
         # mlx-vlm models now handle per-sequence mx.array offsets natively
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
         self._adapter = VLMModelAdapter(self._vlm_model)
+
+        # Patch mlx-vlm GatedDeltaNet to mirror mlx-lm fixes (cache.advance(S)
+        # + mx.contiguous on cache[0]) that mlx-vlm e41cd25 still lacks.
+        # Class-level monkey-patch — no-op when target classes are absent
+        # or already fixed upstream.
+        apply_gated_delta_advance_patch()
+        # Patch mlx-vlm Qwen3_5Attention to use plain RoPE on text-only
+        # inputs. Preserves mRoPE for genuine multimodal positions.
+        apply_qwen3_5_attention_patch()
 
         # Create scheduler config
         scheduler_config = (

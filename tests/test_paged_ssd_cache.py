@@ -726,6 +726,79 @@ class TestPagedSSDCacheManagerWithMLX:
         assert manager._stats["saves"] == initial_saves
         assert manager._stats["hits"] >= 1
 
+    def test_save_writes_format_version(self, tmp_path: Path, mock_mlx):
+        """Saved blocks tag the file with the current format version."""
+        import time as time_mod
+
+        from omlx.cache.paged_ssd_cache import _CACHE_FORMAT_VERSION
+
+        mx = mock_mlx
+
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+
+        block_hash = b"test_format_version_save"
+        cache_data = [(mx.zeros((1, 8, 32, 64)), mx.zeros((1, 8, 32, 64)))]
+        assert manager.save_block(block_hash, cache_data, 32) is True
+
+        # Wait for the background writer to flush the file to disk.
+        file_path = manager._get_file_path(block_hash)
+        for _ in range(50):
+            if file_path.exists():
+                break
+            time_mod.sleep(0.1)
+        assert file_path.exists(), "background writer never produced the file"
+
+        _, file_metadata = mx.load(str(file_path), return_metadata=True)
+        assert file_metadata.get("omlx_cache_format_version") == _CACHE_FORMAT_VERSION
+
+    def test_unversioned_block_is_rejected_at_index_scan(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Pre-fix blocks (no version marker) are skipped during scan.
+
+        Older builds saved RotatingKVCache layers zero-padded to max_size.
+        Loading those after the fix would leak zero positions into
+        attention via BatchRotatingKVCache.merge(). Treat them as a cache
+        miss by rejecting blocks without the format version.
+        """
+        mx = mock_mlx
+
+        cache_dir = tmp_path / "ssd_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Hand-write a cache file without the version tag, mirroring what
+        # an old-format save_block() would produce.
+        block_hash = b"\x01" * 32
+        block_hash_hex = block_hash.hex()
+        # Match the manager's per-prefix subdirectory layout.
+        sub_dir = cache_dir / block_hash_hex[:2]
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        legacy_file = sub_dir / f"{block_hash_hex}.safetensors"
+
+        mx.save_safetensors(
+            str(legacy_file),
+            {"layer_0_keys": mx.zeros((1, 8, 32, 64)), "layer_0_values": mx.zeros((1, 8, 32, 64))},
+            metadata={
+                # Intentionally missing omlx_cache_format_version.
+                "block_hash": block_hash_hex,
+                "token_count": "32",
+                "num_layers": "1",
+                "model_name": "legacy-model",
+                "created_at": "0",
+            },
+        )
+
+        manager_after_scan = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+        )
+
+        # Index scan ran in __init__. The legacy file should not appear.
+        assert not manager_after_scan.has_block(block_hash)
+
 
 class TestPagedSSDCacheManagerCacheList:
     """Tests for CacheList support in PagedSSDCacheManager."""

@@ -38,6 +38,7 @@ from .auth import (
 )
 from ..settings import SubKeyEntry
 from ..model_profiles import EXCLUDED_FROM_PROFILES
+from ..utils.release_check import select_latest_stable_release
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,8 @@ class ModelSettingsRequest(BaseModel):
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
+    # Security: per-model opt-in for trust_remote_code (issue #926)
+    trust_remote_code: Optional[bool] = None
 
 
 class CreateProfileRequest(BaseModel):
@@ -1430,6 +1433,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
+                "trust_remote_code": settings.trust_remote_code,
                 "display_name": settings.display_name,
                 "description": settings.description,
                 "active_profile_name": settings.active_profile_name,
@@ -1667,6 +1671,8 @@ async def update_model_settings(
         # Update server_state.default_model if setting as default
         if request.is_default and server_state:
             server_state.default_model = model_id
+    if "trust_remote_code" in sent:
+        current_settings.trust_remote_code = bool(request.trust_remote_code)
 
     # If an active profile was set, clear it when the user's save diverges
     # from the profile's stored values.  Only compare fields present in
@@ -1722,6 +1728,9 @@ async def update_model_settings(
             or "index_cache_freq" in sent
             or "dflash_enabled" in sent
             or "dflash_draft_model" in sent
+            # trust_remote_code is plumbed at model load time; toggling it on
+            # an already-loaded engine has no effect until reload.
+            or "trust_remote_code" in sent
         )
     )
     if requires_reload:
@@ -4394,9 +4403,14 @@ async def check_update(
     }
 
     try:
+        # Use the releases list (not /releases/latest) and pick the highest
+        # stable PEP 440 tag. Dev/rc tags here have historically been
+        # published with the GitHub prerelease flag unset, which makes
+        # /releases/latest return them as if they were stable.
         resp = await asyncio.to_thread(
             requests.get,
-            "https://api.github.com/repos/jundot/omlx/releases/latest",
+            "https://api.github.com/repos/jundot/omlx/releases",
+            params={"per_page": 20},
             timeout=5,
         )
         if resp.status_code != 200:
@@ -4404,17 +4418,18 @@ async def check_update(
             _update_cache_time = now
             return _update_cache
 
-        data = resp.json()
+        data = select_latest_stable_release(resp.json())
+        if data is None:
+            _update_cache = no_update
+            _update_cache_time = now
+            return _update_cache
+
         latest = data["tag_name"].lstrip("v")
 
         try:
             from packaging.version import Version
 
-            latest_ver = Version(latest)
-            update_available = (
-                latest_ver > Version(_omlx_version)
-                and not latest_ver.is_prerelease
-            )
+            update_available = Version(latest) > Version(_omlx_version)
         except Exception:
             update_available = False
 

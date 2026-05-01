@@ -52,14 +52,17 @@ class MLXEmbeddingModel:
         >>> print(len(output.embeddings))  # 2
     """
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, trust_remote_code: bool = False):
         """
         Initialize the MLX embedding model.
 
         Args:
             model_name: HuggingFace model name or local path
+            trust_remote_code: Allow execution of custom Python shipped inside
+                the model repository. Off by default for security (issue #926).
         """
         self.model_name = model_name
+        self.trust_remote_code = trust_remote_code
 
         self.model = None
         self.processor = None
@@ -132,9 +135,16 @@ class MLXEmbeddingModel:
             mx.eval(model_instance.parameters())
 
             try:
-                tokenizer = AutoTokenizer.from_pretrained(str(model_path), use_fast=False)
+                tokenizer = AutoTokenizer.from_pretrained(
+                    str(model_path),
+                    use_fast=False,
+                    trust_remote_code=self.trust_remote_code,
+                )
             except Exception:
-                tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+                tokenizer = AutoTokenizer.from_pretrained(
+                    str(model_path),
+                    trust_remote_code=self.trust_remote_code,
+                )
 
             self.model = model_instance
             self.processor = tokenizer
@@ -168,7 +178,10 @@ class MLXEmbeddingModel:
 
             logger.info(f"Loading embedding model via mlx-embeddings: {self.model_name}")
 
-            self.model, self.processor = load(self.model_name)
+            self.model, self.processor = load(
+                self.model_name,
+                tokenizer_config={"trust_remote_code": self.trust_remote_code},
+            )
 
             if hasattr(self.model, "config"):
                 config = self.model.config

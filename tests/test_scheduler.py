@@ -990,7 +990,7 @@ class TestSchedulerBoundarySnapshots:
     def test_cleanup_finished_defers_cache_store_while_batch_active(
         self, mock_model, mock_tokenizer
     ):
-        """Finished cache persistence should not block an active decode batch."""
+        """Finished cache persistence follows upstream async/sync store path."""
         config = SchedulerConfig(paged_cache_block_size=4)
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
         scheduler.block_aware_cache = MagicMock()
@@ -1019,23 +1019,19 @@ class TestSchedulerBoundarySnapshots:
 
         scheduler._cleanup_finished({"req-finished"})
 
-        scheduler.block_aware_cache.store_cache.assert_not_called()
-        assert len(scheduler._pending_cache_stores) == 1
-        assert scheduler._cache_store_deferred == 1
-
-        assert scheduler._process_pending_cache_stores() == 0
-        scheduler.running.clear()
-
-        assert scheduler._process_pending_cache_stores() == 1
         scheduler.block_aware_cache.store_cache.assert_called_once()
         args, kwargs = scheduler.block_aware_cache.store_cache.call_args
         assert args[0] == "req-finished"
         assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8]
+        assert len(scheduler._pending_cache_stores) == 0
+        assert scheduler._cache_store_deferred == 0
+        assert "req-active" in scheduler.running
+        assert scheduler._process_pending_cache_stores() == 0
 
     def test_cleanup_finished_drops_large_deferred_cache_store(
         self, mock_model, mock_tokenizer
     ):
-        """Large finished caches should not be held while decode continues."""
+        """Large finished caches follow upstream store path instead of local drop."""
         config = SchedulerConfig(paged_cache_block_size=4)
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
         scheduler.block_aware_cache = MagicMock()
@@ -1064,9 +1060,12 @@ class TestSchedulerBoundarySnapshots:
 
         scheduler._cleanup_finished({"req-large"})
 
-        scheduler.block_aware_cache.store_cache.assert_not_called()
+        scheduler.block_aware_cache.store_cache.assert_called_once()
+        args, kwargs = scheduler.block_aware_cache.store_cache.call_args
+        assert args[0] == "req-large"
+        assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
         assert len(scheduler._pending_cache_stores) == 0
-        assert scheduler._cache_store_dropped == 1
+        assert scheduler._cache_store_dropped == 0
 
     def test_cleanup_finished_uses_boundary_snapshot_for_partial_trailing_tokens(
         self, mock_model, mock_tokenizer

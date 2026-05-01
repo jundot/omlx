@@ -10,12 +10,12 @@ required. Integration tests (marked @pytest.mark.slow) need a real model.
 
 import base64
 import io
+import struct
 import wave
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -36,6 +36,7 @@ def _make_wav_bytes(duration_secs: float = 0.1, sample_rate: int = 22050) -> byt
 
 DUMMY_WAV = _make_wav_bytes()
 RIFF_MAGIC = b"RIFF"
+MAX_WAV_CHUNK_SIZE = 0xFFFFFFFF
 
 
 def _make_mock_tts_engine(wav_bytes: bytes = None) -> MagicMock:
@@ -43,6 +44,7 @@ def _make_mock_tts_engine(wav_bytes: bytes = None) -> MagicMock:
     from omlx.engine.tts import TTSEngine
     engine = MagicMock(spec=TTSEngine)
     engine.synthesize = AsyncMock(return_value=wav_bytes or DUMMY_WAV)
+    engine.supports_native_tts_streaming.return_value = False
     return engine
 
 
@@ -207,6 +209,16 @@ class TestTTSEndpointErrors:
         # Either rejected at validation or handled; must not be 5xx from server crash
         assert response.status_code != 500
 
+    def test_whitespace_input_returns_error(self, server_tts_client):
+        """Whitespace-only input is rejected before synthesis."""
+        client, mock_pool = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "   ", "stream": True},
+        )
+        assert response.status_code == 400
+        mock_pool.get_engine.assert_not_awaited()
+
     def test_unsupported_model_returns_error(self, server_tts_client):
         """Requesting an unknown model returns 4xx."""
         client, mock_pool = server_tts_client
@@ -241,6 +253,234 @@ class TestTTSEndpointErrors:
             json={"input": "No model specified"},
         )
         assert response.status_code >= 400
+
+
+# ---------------------------------------------------------------------------
+# TestTTSStreaming
+# ---------------------------------------------------------------------------
+
+
+class TestTTSStreaming:
+    """Streaming-specific TTS endpoint behaviour."""
+
+    def test_streaming_response_returns_wav(self, server_tts_client):
+        """stream=true returns streamed WAV bytes."""
+        client, _ = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hello world.", "stream": True},
+        )
+        assert response.status_code == 200
+        assert response.content[:4] == RIFF_MAGIC
+        assert "audio/wav" in response.headers.get("content-type", "")
+
+    def test_streaming_wav_header_advertises_unknown_length(self, server_tts_client):
+        """stream=true emits a WAV header that does not declare zero frames."""
+        client, _ = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hello world.", "stream": True},
+        )
+        assert response.status_code == 200
+        riff_size = struct.unpack_from("<I", response.content, 4)[0]
+        data_size = struct.unpack_from("<I", response.content, 40)[0]
+        assert riff_size == MAX_WAV_CHUNK_SIZE
+        assert data_size == MAX_WAV_CHUNK_SIZE
+
+        with wave.open(io.BytesIO(response.content), "rb") as wf:
+            assert wf.getnframes() > 0
+            assert wf.readframes(wf.getnframes())
+
+    def test_streaming_multi_sentence_calls_synthesize_per_segment(self, server_tts_client):
+        """stream=true splits long text into multiple synthesize calls."""
+        client, mock_pool = server_tts_client
+        engine = mock_pool.get_engine.return_value
+        engine.synthesize = AsyncMock(side_effect=[
+            _make_wav_bytes(0.05, sample_rate=24000),
+            _make_wav_bytes(0.05, sample_rate=24000),
+        ])
+
+        long_input = (
+            ("Hello world " * 18).strip() + ". " + ("Second sentence " * 18).strip() + "."
+        )
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": long_input,
+                "stream": True,
+            },
+        )
+        assert response.status_code == 200
+        assert engine.synthesize.await_count == 2
+        assert response.content[:4] == RIFF_MAGIC
+
+    def test_streaming_preserves_voice_across_segments(self, server_tts_client):
+        """voice is forwarded on every streaming synthesize call."""
+        client, mock_pool = server_tts_client
+        engine = mock_pool.get_engine.return_value
+        engine.synthesize = AsyncMock(side_effect=[
+            _make_wav_bytes(0.05, sample_rate=24000),
+            _make_wav_bytes(0.05, sample_rate=24000),
+        ])
+
+        long_input = (
+            ("Hello world " * 18).strip() + ". " + ("Second sentence " * 18).strip() + "."
+        )
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": long_input,
+                "voice": "Chelsie",
+                "temperature": 0.7,
+                "top_k": 20,
+                "top_p": 0.9,
+                "repetition_penalty": 1.05,
+                "max_tokens": 512,
+                "stream": True,
+            },
+        )
+        assert response.status_code == 200
+        assert engine.synthesize.await_count == 2
+        for call in engine.synthesize.await_args_list:
+            assert call.kwargs.get("voice") == "Chelsie"
+            assert call.kwargs.get("temperature") == 0.7
+            assert call.kwargs.get("top_k") == 20
+            assert call.kwargs.get("top_p") == 0.9
+            assert call.kwargs.get("repetition_penalty") == 1.05
+            assert call.kwargs.get("max_tokens") == 512
+
+    def test_streaming_rejects_non_wav_response_format(self, server_tts_client):
+        """stream=true only supports response_format=wav in phase 1."""
+        client, _ = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Hello world.",
+                "response_format": "mp3",
+                "stream": True,
+            },
+        )
+        assert response.status_code == 400
+        detail = response.json().get("detail") or response.json().get("error", {}).get("message", "")
+        assert "wav" in detail.lower()
+
+    def test_streaming_rejects_too_small_streaming_interval(self, server_tts_client):
+        """Native streaming intervals too small for mlx-audio are rejected."""
+        client, mock_pool = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Hello world.",
+                "stream": True,
+                "streaming_interval": 0.001,
+            },
+        )
+        assert response.status_code == 400
+        detail = response.json().get("detail") or response.json().get("error", {}).get("message", "")
+        assert "streaming_interval" in detail
+        mock_pool.get_engine.assert_not_awaited()
+
+    def test_streaming_uses_native_full_input_when_available(self, server_tts_client):
+        """stream=true uses model-native streaming without route-level text splitting."""
+        client, mock_pool = server_tts_client
+        engine = mock_pool.get_engine.return_value
+        engine.supports_native_tts_streaming.return_value = True
+        engine.synthesize = AsyncMock()
+        calls = []
+
+        async def stream_synthesize_pcm(text, **kwargs):
+            calls.append((text, kwargs))
+            yield 24000, 1, 2, b"\x00\x00" * 120
+            yield 24000, 1, 2, b"\x01\x00" * 120
+
+        engine.stream_synthesize_pcm = stream_synthesize_pcm
+        long_input = (
+            ("Hello world " * 18).strip() + ". " + ("Second sentence " * 18).strip() + "."
+        )
+
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": long_input,
+                "voice": "Vivian",
+                "stream": True,
+                "streaming_interval": 0.25,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.content[:4] == RIFF_MAGIC
+        assert engine.synthesize.await_count == 0
+        assert calls[0][0] == long_input
+        assert calls[0][1]["voice"] == "Vivian"
+        assert calls[0][1]["streaming_interval"] == 0.25
+
+    def test_native_streaming_uses_low_latency_default_interval(self, server_tts_client):
+        """Native streaming defaults to a low TTFT interval when none is provided."""
+        client, mock_pool = server_tts_client
+        engine = mock_pool.get_engine.return_value
+        engine.supports_native_tts_streaming.return_value = True
+        calls = []
+
+        async def stream_synthesize_pcm(text, **kwargs):
+            calls.append((text, kwargs))
+            yield 24000, 1, 2, b"\x00\x00" * 120
+
+        engine.stream_synthesize_pcm = stream_synthesize_pcm
+
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Count from one to thirty in a single continuous sentence.",
+                "stream": True,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.content[:4] == RIFF_MAGIC
+        assert calls[0][1]["streaming_interval"] == 0.2
+
+    def test_native_streaming_not_implemented_falls_back_before_header(self, server_tts_client):
+        """Compatibility stream kwargs that raise NotImplementedError use segmented fallback."""
+        client, mock_pool = server_tts_client
+        engine = mock_pool.get_engine.return_value
+        engine.supports_native_tts_streaming.return_value = True
+        engine.synthesize = AsyncMock(return_value=_make_wav_bytes(0.05, sample_rate=24000))
+
+        async def stream_synthesize_pcm(text, **kwargs):
+            raise NotImplementedError("streaming is not implemented for this model")
+            yield  # pragma: no cover
+
+        engine.stream_synthesize_pcm = stream_synthesize_pcm
+
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hello world.", "stream": True},
+        )
+
+        assert response.status_code == 200
+        assert response.content[:4] == RIFF_MAGIC
+        engine.synthesize.assert_awaited_once()
+
+    def test_streaming_engine_error_returns_500(self, server_tts_client):
+        """Synthesis failures before the first chunk return an HTTP error."""
+        client, mock_pool = server_tts_client
+        engine = mock_pool.get_engine.return_value
+        engine.synthesize = AsyncMock(side_effect=RuntimeError("synthesis failed"))
+
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hello world.", "stream": True},
+        )
+
+        assert response.status_code == 500
+        assert "audio/wav" not in response.headers.get("content-type", "")
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +560,49 @@ class TestTTSModelAliasResolution:
 
 
 # ---------------------------------------------------------------------------
+# TestTTSNativeStreamingCapability
+# ---------------------------------------------------------------------------
+
+
+class TestTTSNativeStreamingCapability:
+    """Verify native streaming detection is stricter than a stream kwarg."""
+
+    def _engine_with_generate_params(self, params):
+        import inspect
+
+        from omlx.engine.tts import TTSEngine
+
+        sig_params = {
+            "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        }
+        for p in params:
+            sig_params[p] = inspect.Parameter(
+                p,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=None,
+            )
+
+        generate_mock = MagicMock()
+        generate_mock.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
+
+        class FakeModel:
+            pass
+
+        engine = TTSEngine("test-model")
+        engine._model = FakeModel()
+        engine._model.generate = generate_mock
+        return engine
+
+    def test_stream_kwarg_alone_is_not_native_streaming(self):
+        engine = self._engine_with_generate_params(["stream"])
+        assert engine.supports_native_tts_streaming() is False
+
+    def test_streaming_interval_marks_native_streaming(self):
+        engine = self._engine_with_generate_params(["stream", "streaming_interval"])
+        assert engine.supports_native_tts_streaming() is True
+
+
+# ---------------------------------------------------------------------------
 # TestTTSVoiceRouting — unit tests for voice/instruct parameter dispatch
 # ---------------------------------------------------------------------------
 
@@ -335,6 +618,7 @@ class TestTTSVoiceRouting:
         generate_voice_design work correctly — MagicMock auto-creates attributes.
         """
         import asyncio
+
         from omlx.engine.tts import TTSEngine
 
         def _run(generate_sig_params, voice_value=None, instructions_value=None,
@@ -435,6 +719,7 @@ class TestTTSVoiceClonePassthrough:
     def _run_synthesize_clone(self):
         """Helper: run TTSEngine.synthesize with ref_audio/ref_text and return generate() kwargs."""
         import asyncio
+
         from omlx.engine.tts import TTSEngine
 
         def _run(ref_audio_path=None, ref_text=None):
@@ -695,6 +980,7 @@ class TestTTSGenerationParams:
     def _run_synthesize(self):
         """Reuse voice routing fixture pattern for gen param tests."""
         import asyncio
+
         from omlx.engine.tts import TTSEngine
 
         def _run(generate_sig_params, **synth_kwargs):

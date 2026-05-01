@@ -25,7 +25,9 @@ from omlx.oq import (
     _format_size,
     _forward_layer,
     _get_predicate_bits,
+    _is_audio_tensor,
     _is_moe_router,
+    _is_vision_tensor,
     _LazyTensorIndex,
     _normalize_quant_path,
     _quantize_chunked,
@@ -372,6 +374,44 @@ class TestHelpers:
 
     def test_normalize_quant_path_scales(self):
         assert _normalize_quant_path("lm_head.scales") == "lm_head"
+
+    def test_is_audio_tensor_audio_tower(self):
+        assert _is_audio_tensor(
+            "audio_tower.layers.0.feed_forward1.ffw_layer_1.linear.weight"
+        ) is True
+
+    def test_is_audio_tensor_embed_audio_not_excluded(self):
+        # embed_audio.embedding_projection is the projection from audio output
+        # to text hidden — should be quantizable like embed_vision counterpart.
+        assert _is_audio_tensor(
+            "embed_audio.embedding_projection.weight"
+        ) is False
+
+    def test_is_audio_tensor_language_model(self):
+        assert _is_audio_tensor(
+            "language_model.model.layers.0.self_attn.q_proj.weight"
+        ) is False
+
+    def test_is_audio_tensor_vision_tower(self):
+        assert _is_audio_tensor(
+            "vision_tower.layers.0.self_attn.k_proj.weight"
+        ) is False
+
+    def test_universal_quant_predicate_skips_audio_tower(self):
+        # audio_tower tensors must be kept in fp16 (return False from predicate)
+        # — same treatment as vision_tower.
+        result = universal_quant_predicate(
+            "audio_tower.layers.0.self_attn.k_proj", None, {}, oq_level=4
+        )
+        assert result is False
+
+    def test_universal_quant_predicate_quantizes_embed_audio(self):
+        # embed_audio.embedding_projection should NOT be skipped — it's a
+        # quantizable Linear, mirroring how embed_vision is treated.
+        result = universal_quant_predicate(
+            "embed_audio.embedding_projection", None, {}, oq_level=4
+        )
+        assert result is not False
 
 
 # =============================================================================

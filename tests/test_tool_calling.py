@@ -1911,3 +1911,19 @@ class TestSerializeToolCallArguments:
 
     def test_non_dict_none_coerced_to_empty(self):
         assert _serialize_tool_call_arguments(None) == "{}"
+
+    def test_json_object_string_preserved(self, caplog):
+        """mlx-vlm/mlx-lm gemma4 parser hands back a JSON-object string per
+        the OpenAI spec; the validator must accept it instead of dropping it."""
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments('{"command": "ls /tmp\\n"}')
+        assert json.loads(result) == {"command": "ls /tmp\n"}
+        assert not any("non-dict" in r.message for r in caplog.records)
+
+    def test_json_array_string_coerced_to_empty(self, caplog):
+        """JSON arrays/scalars do not satisfy ``arguments.items()`` so they
+        must still be coerced."""
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments("[1, 2]")
+        assert result == "{}"
+        assert any("non-dict" in r.message for r in caplog.records)

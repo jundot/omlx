@@ -10,13 +10,16 @@ This module provides OpenAI-compatible audio endpoints:
 
 import base64
 import logging
-import tempfile
+import math
 import os
-from typing import Optional
+import re
+import tempfile
+from typing import AsyncIterator, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
+from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
 from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
 
 logger = logging.getLogger(__name__)
@@ -28,6 +31,11 @@ MAX_AUDIO_UPLOAD_BYTES = 100 * 1024 * 1024
 
 # Maximum base64-encoded ref_audio size (~15 MB raw audio, enough for ~60s).
 MAX_REF_AUDIO_BASE64_BYTES = 20 * 1024 * 1024
+
+# Default native TTS chunk cadence. Keep this below the mlx-audio default to
+# improve TTFT while still letting the model process the full input at once.
+DEFAULT_NATIVE_TTS_STREAMING_INTERVAL_SECONDS = 0.2
+MIN_NATIVE_TTS_STREAMING_INTERVAL_SECONDS = 0.01
 
 # Video container extensions that should be routed through ffmpeg decoding.
 # mlx-audio only recognises audio-specific extensions (m4a, aac, ogg, opus),
@@ -86,6 +94,247 @@ async def _read_upload(file: UploadFile) -> bytes:
             )
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _decode_ref_audio_base64(request: AudioSpeechRequest) -> Optional[bytes]:
+    """Validate and decode optional base64 ref_audio from a TTS request."""
+    if request.ref_audio is None:
+        return None
+
+    if not request.ref_text:
+        raise HTTPException(
+            status_code=400,
+            detail="'ref_text' is required when 'ref_audio' is provided "
+            "(must be the transcript of the reference audio)",
+        )
+    if len(request.ref_audio) > MAX_REF_AUDIO_BASE64_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"ref_audio exceeds maximum allowed size "
+                f"({MAX_REF_AUDIO_BASE64_BYTES} bytes base64, "
+                f"~60 seconds of audio)"
+            ),
+        )
+    try:
+        return base64.b64decode(request.ref_audio, validate=True)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid base64 encoding in 'ref_audio' field",
+        )
+
+
+def _write_ref_audio_tempfile(audio_bytes: Optional[bytes]) -> Optional[str]:
+    """Persist decoded ref audio to a temp file if present."""
+    if audio_bytes is None:
+        return None
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    try:
+        tmp.write(audio_bytes)
+        return tmp.name
+    finally:
+        tmp.close()
+
+
+def _cleanup_tempfile(path: Optional[str]) -> None:
+    if path and os.path.exists(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _resolve_tts_streaming_interval(request: AudioSpeechRequest) -> float:
+    """Return a native TTS streaming interval that is safe for mlx-audio."""
+    if request.streaming_interval is None:
+        return DEFAULT_NATIVE_TTS_STREAMING_INTERVAL_SECONDS
+
+    interval = request.streaming_interval
+    if (
+        not math.isfinite(interval)
+        or interval < MIN_NATIVE_TTS_STREAMING_INTERVAL_SECONDS
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "'streaming_interval' must be at least "
+                f"{MIN_NATIVE_TTS_STREAMING_INTERVAL_SECONDS} seconds"
+            ),
+        )
+    return interval
+
+
+def _split_tts_text(text: str, max_chars: int = 300) -> list[str]:
+    """Split TTS input into conservative sentence-like chunks."""
+    text = text.strip()
+    if not text:
+        return []
+
+    sentences = re.split(r"(?<=[.!?。！？])\s+|\n+", text)
+    sentences = [s.strip() for s in sentences if s and s.strip()]
+    if not sentences:
+        sentences = [text]
+
+    chunks: list[str] = []
+    current = ""
+
+    def flush_current() -> None:
+        nonlocal current
+        if current:
+            chunks.append(current.strip())
+            current = ""
+
+    for sentence in sentences:
+        if len(sentence) > max_chars:
+            flush_current()
+            parts = re.split(r"(?<=[,;:，；：])\s*", sentence)
+            parts = [p.strip() for p in parts if p and p.strip()]
+            buffer = ""
+            for part in parts or [sentence]:
+                while len(part) > max_chars:
+                    if buffer:
+                        chunks.append(buffer.strip())
+                        buffer = ""
+                    chunks.append(part[:max_chars].strip())
+                    part = part[max_chars:].strip()
+                if not part:
+                    continue
+                candidate = f"{buffer} {part}".strip() if buffer else part
+                if len(candidate) <= max_chars:
+                    buffer = candidate
+                else:
+                    if buffer:
+                        chunks.append(buffer.strip())
+                    buffer = part
+            if buffer:
+                chunks.append(buffer.strip())
+            continue
+
+        candidate = f"{current} {sentence}".strip() if current else sentence
+        if current and len(candidate) > max_chars:
+            flush_current()
+            current = sentence
+        else:
+            current = candidate
+
+    flush_current()
+    return chunks or [text]
+
+
+async def _stream_speech_response(
+    engine,
+    request: AudioSpeechRequest,
+    ref_audio_path: Optional[str],
+    streaming_interval: float,
+) -> AsyncIterator[bytes]:
+    """Stream sentence-level TTS as a single WAV header plus PCM chunks."""
+    try:
+        if (
+            hasattr(engine, "supports_native_tts_streaming")
+            and engine.supports_native_tts_streaming()
+            and hasattr(engine, "stream_synthesize_pcm")
+        ):
+            logger.info(
+                "TTS native streaming start: model=%s, text_len=%d, voice=%s",
+                request.model, len(request.input), request.voice,
+            )
+            stream_format: Optional[tuple[int, int, int]] = None
+            try:
+                async for sample_rate, channels, sample_width, pcm_bytes in engine.stream_synthesize_pcm(
+                    request.input,
+                    voice=request.voice,
+                    speed=request.speed,
+                    instructions=request.instructions,
+                    ref_audio=ref_audio_path,
+                    ref_text=request.ref_text,
+                    temperature=request.temperature,
+                    top_k=request.top_k,
+                    top_p=request.top_p,
+                    repetition_penalty=request.repetition_penalty,
+                    max_tokens=request.max_tokens,
+                    streaming_interval=streaming_interval,
+                ):
+                    fmt = (sample_rate, channels, sample_width)
+                    if stream_format is None:
+                        stream_format = fmt
+                        yield wav_header(
+                            sample_rate=sample_rate,
+                            channels=channels,
+                            sample_width=sample_width,
+                        )
+                    elif fmt != stream_format:
+                        raise RuntimeError(
+                            "Inconsistent native streaming PCM format: "
+                            f"expected {stream_format}, got {fmt}"
+                        )
+                    if pcm_bytes:
+                        yield pcm_bytes
+            except NotImplementedError:
+                if stream_format is not None:
+                    raise
+                logger.info(
+                    "TTS native streaming unavailable at runtime; falling back "
+                    "to segmented synthesis: model=%s",
+                    request.model,
+                )
+            else:
+                return
+
+        segments = _split_tts_text(request.input)
+        logger.info(
+            "TTS streaming start: model=%s, text_len=%d, segments=%d, voice=%s",
+            request.model, len(request.input), len(segments), request.voice,
+        )
+
+        stream_format: Optional[tuple[int, int, int]] = None
+        for idx, segment in enumerate(segments, start=1):
+            wav_bytes = await engine.synthesize(
+                segment,
+                voice=request.voice,
+                speed=request.speed,
+                instructions=request.instructions,
+                ref_audio=ref_audio_path,
+                ref_text=request.ref_text,
+                temperature=request.temperature,
+                top_k=request.top_k,
+                top_p=request.top_p,
+                repetition_penalty=request.repetition_penalty,
+                max_tokens=request.max_tokens,
+            )
+            sample_rate, channels, sample_width, pcm_bytes = wav_bytes_to_pcm_frames(wav_bytes)
+            fmt = (sample_rate, channels, sample_width)
+            if stream_format is None:
+                stream_format = fmt
+                yield wav_header(sample_rate=sample_rate, channels=channels, sample_width=sample_width)
+            elif fmt != stream_format:
+                raise RuntimeError(
+                    "Inconsistent WAV format across TTS segments: "
+                    f"expected {stream_format}, got {fmt}"
+                )
+            logger.debug(
+                "TTS streaming segment %d/%d: text_len=%d, pcm_bytes=%d",
+                idx, len(segments), len(segment), len(pcm_bytes),
+            )
+            if pcm_bytes:
+                yield pcm_bytes
+    finally:
+        _cleanup_tempfile(ref_audio_path)
+
+
+async def _stream_with_prefetched_chunk(
+    first_chunk: bytes,
+    stream: AsyncIterator[bytes],
+) -> AsyncIterator[bytes]:
+    """Yield a chunk fetched before response headers, then the rest of the stream."""
+    try:
+        yield first_chunk
+        async for chunk in stream:
+            yield chunk
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
 
 
 # ---------------------------------------------------------------------------
@@ -172,40 +421,22 @@ async def create_speech(request: AudioSpeechRequest):
     from omlx.engine.tts import TTSEngine
     from omlx.exceptions import ModelNotFoundError
 
-    # Validate input is non-empty
-    if not request.input:
+    if not request.input or not request.input.strip():
         raise HTTPException(status_code=400, detail="'input' field must not be empty")
+    streaming_interval = DEFAULT_NATIVE_TTS_STREAMING_INTERVAL_SECONDS
+    if request.stream:
+        if request.response_format not in (None, "wav"):
+            raise HTTPException(
+                status_code=400,
+                detail="Streaming TTS currently only supports response_format='wav'",
+            )
+        streaming_interval = _resolve_tts_streaming_interval(request)
 
-    # --- Validate and decode ref_audio (voice clone) ---
-    audio_bytes = None
-    if request.ref_audio is not None:
-        if not request.ref_text:
-            raise HTTPException(
-                status_code=400,
-                detail="'ref_text' is required when 'ref_audio' is provided "
-                "(must be the transcript of the reference audio)",
-            )
-        if len(request.ref_audio) > MAX_REF_AUDIO_BASE64_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"ref_audio exceeds maximum allowed size "
-                    f"({MAX_REF_AUDIO_BASE64_BYTES} bytes base64, "
-                    f"~60 seconds of audio)"
-                ),
-            )
-        try:
-            audio_bytes = base64.b64decode(request.ref_audio, validate=True)
-        except Exception:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid base64 encoding in 'ref_audio' field",
-            )
+    audio_bytes = _decode_ref_audio_base64(request)
 
     pool = _get_engine_pool()
     resolved_model = _resolve_model(request.model)
 
-    # Load the engine via pool
     try:
         engine = await pool.get_engine(resolved_model)
     except ModelNotFoundError as exc:
@@ -223,15 +454,32 @@ async def create_speech(request: AudioSpeechRequest):
             detail=f"Model '{resolved_model}' is not a text-to-speech model",
         )
 
-    ref_audio_path = None
-    try:
-        # Write decoded audio to temp file if voice clone requested
-        if audio_bytes is not None:
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-            ref_audio_path = tmp.name
-            tmp.write(audio_bytes)
-            tmp.close()
+    ref_audio_path = _write_ref_audio_tempfile(audio_bytes)
 
+    if request.stream:
+        stream = _stream_speech_response(
+            engine,
+            request,
+            ref_audio_path,
+            streaming_interval,
+        )
+        try:
+            first_chunk = await stream.__anext__()
+        except StopAsyncIteration as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="TTS streaming produced no audio output",
+            ) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return StreamingResponse(
+            _stream_with_prefetched_chunk(first_chunk, stream),
+            media_type="audio/wav",
+        )
+
+    try:
         wav_bytes = await engine.synthesize(
             request.input,
             voice=request.voice,
@@ -250,11 +498,7 @@ async def create_speech(request: AudioSpeechRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
-        if ref_audio_path and os.path.exists(ref_audio_path):
-            try:
-                os.unlink(ref_audio_path)
-            except OSError:
-                pass
+        _cleanup_tempfile(ref_audio_path)
 
     return Response(content=wav_bytes, media_type="audio/wav")
 

@@ -107,6 +107,7 @@
                 enableToolResultLimit: false,
                 max_tool_result_tokens: null,
                 ctKwargEntries: [],
+                trust_remote_code: false,
             },
             savingModelSettings: false,
             loadingGenDefaults: false,
@@ -1550,6 +1551,7 @@
                     dflash_draft_model: settings.dflash_draft_model || '',
                     dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
                     ctKwargEntries,
+                    trust_remote_code: settings.trust_remote_code || false,
                 };
                 this.showModelSettingsModal = true;
             },
@@ -1629,6 +1631,7 @@
                                 dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
                                     ? parseInt(this.modelSettings.dflash_draft_quant_bits)
                                     : null,
+                                trust_remote_code: this.modelSettings.trust_remote_code,
                             };
                         })()),
                     });
@@ -1691,6 +1694,7 @@
                         this.modelSettings.dflash_enabled = false;
                         this.modelSettings.dflash_draft_model = null;
                         this.modelSettings.dflash_draft_quant_bits = null;
+                        this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
                     } else if (response.status === 401) {

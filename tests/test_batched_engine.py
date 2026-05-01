@@ -238,7 +238,8 @@ class TestBatchedEngineInitialization:
 
         engine = BatchedEngine(model_name="test-model")
 
-        assert engine._trust_remote_code is True
+        # Issue #926: default flipped to False so HF repos can't auto-execute custom Python.
+        assert engine._trust_remote_code is False
         assert engine._scheduler_config is None
         assert engine._stream_interval == 1
         assert engine._enable_thinking is None

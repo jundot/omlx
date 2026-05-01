@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..patches.qwen3_5_attention import force_text_only_rope
+
 logger = logging.getLogger(__name__)
 
 
@@ -253,9 +255,14 @@ class VLMModelAdapter(nn.Module):
                     position_ids = mx.broadcast_to(
                         positions[None, :, None], (3, B, L)
                     )
-                    result = self._language_model(
-                        input_ids, cache=cache, position_ids=position_ids, **kwargs
-                    )
+                    # Decode never adds new image tokens; the broadcast
+                    # collapses the 3 mRoPE sections to identical values,
+                    # so the patched Qwen3_5Attention can skip its per-layer
+                    # .item() probes and take the plain-RoPE branch directly.
+                    with force_text_only_rope():
+                        result = self._language_model(
+                            input_ids, cache=cache, position_ids=position_ids, **kwargs
+                        )
                 else:
                     result = self._language_model(
                         input_ids, cache=cache, **kwargs
@@ -271,9 +278,10 @@ class VLMModelAdapter(nn.Module):
                     position_ids = mx.broadcast_to(
                         offsets[None, :, None], (3, B, L)
                     )
-                    result = self._language_model(
-                        input_ids, cache=cache, position_ids=position_ids, **kwargs
-                    )
+                    with force_text_only_rope():
+                        result = self._language_model(
+                            input_ids, cache=cache, position_ids=position_ids, **kwargs
+                        )
                 else:
                     result = self._language_model(
                         input_ids, cache=cache, **kwargs

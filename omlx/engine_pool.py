@@ -632,15 +632,28 @@ class EnginePool:
                             f"Falling back to default engine."
                         )
 
+            # Per-model trust_remote_code (security opt-in, issue #926).
+            # When unset, defaults to False — repos with custom modeling_*.py
+            # will fail to load until the user explicitly toggles this on
+            # in the admin UI's model settings modal.
+            trc = bool(getattr(model_settings, "trust_remote_code", False)) if model_settings else False
+
             # Create engine based on engine type (if DFlash not active)
             if engine is None:
                 if effective_type == "embedding":
-                    engine = EmbeddingEngine(model_name=entry.model_path)
+                    engine = EmbeddingEngine(
+                        model_name=entry.model_path,
+                        trust_remote_code=trc,
+                    )
                 elif effective_type == "reranker":
-                    engine = RerankerEngine(model_name=entry.model_path)
+                    engine = RerankerEngine(
+                        model_name=entry.model_path,
+                        trust_remote_code=trc,
+                    )
                 elif effective_type == "vlm":
                     engine = VLMBatchedEngine(
                         model_name=entry.model_path,
+                        trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
@@ -656,6 +669,7 @@ class EnginePool:
                 else:
                     engine = BatchedEngine(
                         model_name=entry.model_path,
+                        trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
@@ -686,12 +700,14 @@ class EnginePool:
                     if effective_type == "vlm":
                         engine = VLMBatchedEngine(
                             model_name=entry.model_path,
+                            trust_remote_code=trc,
                             scheduler_config=self._scheduler_config,
                             model_settings=model_settings,
                         )
                     else:
                         engine = BatchedEngine(
                             model_name=entry.model_path,
+                            trust_remote_code=trc,
                             scheduler_config=self._scheduler_config,
                             model_settings=model_settings,
                         )
@@ -722,6 +738,7 @@ class EnginePool:
 
                     engine = VLMBatchedEngine(
                         model_name=entry.model_path,
+                        trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
@@ -750,6 +767,7 @@ class EnginePool:
 
                     engine = BatchedEngine(
                         model_name=entry.model_path,
+                        trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )

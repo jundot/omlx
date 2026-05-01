@@ -414,7 +414,7 @@ app = FastAPI(
 # Include MCP routes
 from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
 set_mcp_manager_getter(get_mcp_manager)
-app.include_router(mcp_router)
+app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])
 
 # Include audio routes only when mlx-audio is installed.
 # audio_routes.py itself only imports fastapi/stdlib at module level, so it
@@ -422,7 +422,7 @@ app.include_router(mcp_router)
 try:
     import mlx_audio as _  # noqa: F401
     from .api.audio_routes import router as audio_router
-    app.include_router(audio_router)
+    app.include_router(audio_router, dependencies=[Depends(verify_api_key)])
     del _
 except ImportError:
     pass
@@ -696,8 +696,52 @@ async def get_engine(
                 detail=f"Model '{model_id}' is not a reranker model. "
                 f"Use a SequenceClassification model for reranking."
             )
+    elif engine_type == EngineType.LLM:
+        # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
+        # fell through and crashed on `engine.model_type` with an unhandled
+        # 500. Reject with a clear 400 pointing the caller at the right
+        # endpoint.
+        if not isinstance(engine, BaseEngine):
+            _endpoint_hint = _suggest_endpoint_for_engine(engine)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{model_id}' is not an LLM / chat model. "
+                    f"{_endpoint_hint}"
+                ),
+            )
 
     return engine
+
+
+def _suggest_endpoint_for_engine(engine: object) -> str:
+    """Return a one-line hint pointing at the correct endpoint for a non-LLM engine."""
+    # Import audio engine classes lazily so that oMLX without the [audio]
+    # extra still imports this module.
+    try:
+        from omlx.engine.stt import STTEngine
+    except Exception:  # pragma: no cover - defensive
+        STTEngine = None  # type: ignore[assignment]
+    try:
+        from omlx.engine.tts import TTSEngine
+    except Exception:  # pragma: no cover - defensive
+        TTSEngine = None  # type: ignore[assignment]
+    try:
+        from omlx.engine.sts import STSEngine
+    except Exception:  # pragma: no cover - defensive
+        STSEngine = None  # type: ignore[assignment]
+
+    if STTEngine is not None and isinstance(engine, STTEngine):
+        return "Use /v1/audio/transcriptions for speech-to-text models."
+    if TTSEngine is not None and isinstance(engine, TTSEngine):
+        return "Use /v1/audio/speech for text-to-speech models."
+    if STSEngine is not None and isinstance(engine, STSEngine):
+        return "Use /v1/audio/process for speech-to-speech / audio processing models."
+    if isinstance(engine, EmbeddingEngine):
+        return "Use /v1/embeddings for embedding models."
+    if isinstance(engine, RerankerEngine):
+        return "Use /v1/rerank for reranker models."
+    return "Use the model's dedicated endpoint (see /v1/models)."
 
 
 async def get_engine_for_model(model: str | None = None) -> BaseEngine:
@@ -2989,13 +3033,21 @@ async def stream_anthropic_messages(
                 if thinking_delta:
                     if thinking_filter:
                         thinking_delta = thinking_filter.feed(thinking_delta)
-                    if not thinking_block_started:
-                        if thinking_delta:
+                    if thinking_delta:
+                        # Close any open text block before starting a new
+                        # thinking block at a fresh index. Anthropic SDKs
+                        # reject mixed-type content_block events at the same
+                        # index — this transition handles a model that emits
+                        # a second thinking section after some text.
+                        if text_block_started:
+                            yield create_content_block_stop_event(index=block_index)
+                            block_index += 1
+                            text_block_started = False
+                        if not thinking_block_started:
                             yield create_content_block_start_event(
                                 index=block_index, block_type="thinking"
                             )
                             thinking_block_started = True
-                    if thinking_delta:
                         yield create_thinking_delta_event(
                             index=block_index, thinking=thinking_delta
                         )
@@ -3032,6 +3084,10 @@ async def stream_anthropic_messages(
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
         if thinking_delta:
+            if text_block_started:
+                yield create_content_block_stop_event(index=block_index)
+                block_index += 1
+                text_block_started = False
             if not thinking_block_started:
                 yield create_content_block_start_event(
                     index=block_index, block_type="thinking"
@@ -3041,6 +3097,10 @@ async def stream_anthropic_messages(
     if thinking_filter:
         remaining_thinking = thinking_filter.finish()
         if remaining_thinking:
+            if text_block_started:
+                yield create_content_block_stop_event(index=block_index)
+                block_index += 1
+                text_block_started = False
             if not thinking_block_started:
                 yield create_content_block_start_event(
                     index=block_index, block_type="thinking"
@@ -3457,7 +3517,7 @@ async def create_anthropic_message(
                         pass
 
         response = convert_internal_to_anthropic_response(
-            text=cleaned_text.strip() if cleaned_text else regular_content,
+            text=cleaned_text.strip() if cleaned_text else "",
             model=request.model,
             prompt_tokens=scale_anthropic_tokens(output.prompt_tokens, request.model),
             completion_tokens=scale_anthropic_tokens(output.completion_tokens, request.model),

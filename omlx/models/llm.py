@@ -107,7 +107,7 @@ class MLXLanguageModel:
         top_p: float = 0.9,
     ):
         """Create a sampler for text generation."""
-        from mlx_lm.sample_utils import make_sampler
+        from ..utils.sampling import make_sampler
 
         return make_sampler(
             temp=temperature,

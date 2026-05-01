@@ -362,7 +362,7 @@ def _prefill_draft(model, tokens, cache, step_size=2048):
 
 def _lookahead_decode(model, first_logits, cache, n_steps, temp=0.6, top_p=0.95):
     """Run n_steps autoregressive decode, capturing queries via patched attention."""
-    from mlx_lm.sample_utils import make_sampler
+    from ..utils.sampling import make_sampler
 
     sampler = make_sampler(temp=temp, top_p=top_p)
     y = sampler(first_logits[:, -1, :])
