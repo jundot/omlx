@@ -56,7 +56,7 @@ class ModelSettings:
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
         turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
-        specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
+        specprefill_enabled: Enable SpecPrefill (experimental attention-based sparse prefill).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
         specprefill_threshold: Min tokens to trigger SpecPrefill.
@@ -98,7 +98,7 @@ class ModelSettings:
     turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
     turboquant_skip_last: bool = True  # Skip last KVCache layer (prevents corruption on sensitive models)
 
-    # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
+    # SpecPrefill (experimental: attention-based sparse prefill)
     specprefill_enabled: bool = False
     specprefill_draft_model: Optional[str] = None  # Path to draft model (must share tokenizer)
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
