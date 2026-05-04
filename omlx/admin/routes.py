@@ -9,9 +9,11 @@ This module provides HTTP routes for the admin panel including:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -1344,13 +1346,54 @@ async def delete_sub_key(
 # =============================================================================
 
 
+_SUPPORTED_MODELS_DOC_RE = re.compile(
+    r"Supported models:\s*\n((?:\s*-\s*\S.*\n?)+)",
+)
+
+
+def _models_from_docstring(fn) -> List[str]:
+    """Extract the ``Supported models:`` bullet list from an xgrammar 0.1.34+
+    structural-tag function's docstring. Returns ``[]`` if the section is
+    absent or unparseable."""
+    doc = inspect.getdoc(fn) or ""
+    match = _SUPPORTED_MODELS_DOC_RE.search(doc)
+    if not match:
+        return []
+    return [
+        line.strip().lstrip("-").strip()
+        for line in match.group(1).splitlines()
+        if line.strip().startswith("-")
+    ]
+
+
 @router.get("/api/grammar/parsers")
 async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     """Return available reasoning parser names from xgrammar.
 
-    Queries ``xgrammar.get_builtin_structural_tag_supported_models()`` at
-    runtime so the list stays in sync with the installed xgrammar version.
+    Supports both API generations:
+
+    - **xgrammar 0.1.34+** exposes a per-model registry at
+      ``xgrammar.builtin_structural_tag._structural_tag_registry``; supported
+      model names are pulled from each function's docstring.
+    - **xgrammar 0.1.32–0.1.33** exposes the now-removed helper
+      ``get_builtin_structural_tag_supported_models()``.
+
+    Returns ``[]`` if xgrammar is missing, fails to load (e.g. broken native
+    binding on macOS arm64), or has neither API available.
     """
+    # Prefer the 0.1.34+ registry so newer parsers (qwen3_6, gemma4,
+    # deepseek_v4, ...) are exposed.
+    try:
+        from xgrammar.builtin_structural_tag import _structural_tag_registry
+
+        return [
+            {"value": style, "label": style, "models": _models_from_docstring(fn)}
+            for style, fn in _structural_tag_registry.items()
+        ]
+    except Exception as e:
+        logger.debug("xgrammar 0.1.34+ registry unavailable: %s", e)
+
+    # Fall back to the pre-0.1.34 helper.
     try:
         from xgrammar import get_builtin_structural_tag_supported_models
 
@@ -1359,7 +1402,8 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
             {"value": style, "label": style, "models": models}
             for style, models in supported.items()
         ]
-    except ImportError:
+    except Exception as e:
+        logger.warning("xgrammar parser discovery unavailable: %s", e)
         return []
 
 

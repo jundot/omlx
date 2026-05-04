@@ -818,7 +818,115 @@ class TestListGrammarParsers:
             assert isinstance(item["models"], list)
 
     def test_returns_empty_when_xgrammar_unavailable(self, client):
-        with patch.dict("sys.modules", {"xgrammar": None}):
+        with patch.dict(
+            "sys.modules",
+            {"xgrammar": None, "xgrammar.builtin_structural_tag": None},
+        ):
             resp = client.get("/admin/api/grammar/parsers")
         assert resp.status_code == 200
         assert resp.json() == []
+
+    def test_returns_empty_when_xgrammar_native_binding_fails(self, client):
+        # Reproduces the symptom in jundot/omlx#1005: the macOS arm64 wheel's
+        # libxgrammar_bindings.dylib fails to load, so calling into xgrammar
+        # raises RuntimeError rather than ImportError. The route must still
+        # return [] cleanly rather than 500.
+        def boom():
+            raise RuntimeError(
+                "Cannot find library: "
+                "libxgrammar_bindings.dylib, libxgrammar_bindings.so"
+            )
+
+        fake_registry_module = SimpleNamespace(_structural_tag_registry=boom)
+        fake_xgrammar = SimpleNamespace(
+            get_builtin_structural_tag_supported_models=boom,
+            builtin_structural_tag=fake_registry_module,
+        )
+        # When tvm_ffi can't find the binding, even importing the registry
+        # submodule blows up; simulate that by removing it from sys.modules
+        # and forcing the helper call itself to fail.
+        with patch.dict(
+            "sys.modules",
+            {
+                "xgrammar": fake_xgrammar,
+                "xgrammar.builtin_structural_tag": None,
+            },
+        ):
+            resp = client.get("/admin/api/grammar/parsers")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_uses_registry_api_when_available(self, client):
+        # xgrammar 0.1.34+ dropped get_builtin_structural_tag_supported_models
+        # in favor of a per-model registry. The route must enumerate the
+        # registry and parse "Supported models:" from each function's
+        # docstring. Without this path, qwen3_6 / gemma4 / deepseek_v4 are
+        # invisible to the admin UI.
+        def fake_qwen3_6_fn():
+            """Get Qwen 3.6 style structural tag format.
+
+            Supported models:
+
+            - Qwen3.6
+            """
+
+        def fake_harmony_fn():
+            """Get Harmony format.
+
+            Supported models:
+
+            - gpt-oss
+            """
+
+        def fake_undocumented_fn():
+            """No supported-models block here."""
+
+        fake_registry = {
+            "qwen3_6": fake_qwen3_6_fn,
+            "harmony": fake_harmony_fn,
+            "mystery": fake_undocumented_fn,
+        }
+        fake_submodule = SimpleNamespace(_structural_tag_registry=fake_registry)
+        fake_xgrammar = SimpleNamespace(builtin_structural_tag=fake_submodule)
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "xgrammar": fake_xgrammar,
+                "xgrammar.builtin_structural_tag": fake_submodule,
+            },
+        ):
+            resp = client.get("/admin/api/grammar/parsers")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert {p["value"] for p in data} == {"qwen3_6", "harmony", "mystery"}
+        by_value = {p["value"]: p for p in data}
+        assert by_value["qwen3_6"]["models"] == ["Qwen3.6"]
+        assert by_value["harmony"]["models"] == ["gpt-oss"]
+        assert by_value["mystery"]["models"] == []
+
+    def test_falls_back_to_legacy_helper_when_registry_missing(self, client):
+        # xgrammar 0.1.32–0.1.33 path: registry submodule doesn't exist,
+        # but the old helper does.
+        def fake_supported():
+            return {
+                "qwen": ["Qwen3"],
+                "harmony": ["gpt-oss"],
+            }
+
+        fake_xgrammar = SimpleNamespace(
+            get_builtin_structural_tag_supported_models=fake_supported,
+        )
+        with patch.dict(
+            "sys.modules",
+            {
+                "xgrammar": fake_xgrammar,
+                "xgrammar.builtin_structural_tag": None,
+            },
+        ):
+            resp = client.get("/admin/api/grammar/parsers")
+        assert resp.status_code == 200
+        data = resp.json()
+        by_value = {p["value"]: p for p in data}
+        assert by_value["qwen"]["models"] == ["Qwen3"]
+        assert by_value["harmony"]["models"] == ["gpt-oss"]
