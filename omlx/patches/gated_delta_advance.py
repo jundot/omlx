@@ -63,7 +63,7 @@ def _build_replacement_call():
     ) -> "mx.array":
         _call_counter["n"] += 1
         if _call_counter["n"] in (1, 100, 1000):
-            logger.info(
+            logger.debug(
                 f"[gdn-body-replacement] call #{_call_counter['n']} "
                 f"B,S={inputs.shape[0]},{inputs.shape[1]} "
                 f"cache={'set' if cache is not None else 'None'} "

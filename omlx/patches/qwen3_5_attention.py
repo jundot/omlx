@@ -163,14 +163,14 @@ def _build_replacement_call():
         if forced:
             _call_counter["forced"] += 1
             if _call_counter["forced"] in (1, 100, 1000):
-                logger.info(
+                logger.debug(
                     f"[qwen3_5-attn-patch] forced-plain call #{_call_counter['forced']} "
                     f"B,L={B},{L}"
                 )
         elif use_plain:
             _call_counter["plain"] += 1
             if _call_counter["plain"] in (1, 100, 1000):
-                logger.info(
+                logger.debug(
                     f"[qwen3_5-attn-patch] plain-rope call #{_call_counter['plain']} "
                     f"B,L={B},{L} cache_offset="
                     f"{getattr(cache, 'offset', '-') if cache is not None else '-'}"
@@ -178,7 +178,7 @@ def _build_replacement_call():
         else:
             _call_counter["mrope"] += 1
             if _call_counter["mrope"] in (1, 100, 1000):
-                logger.info(
+                logger.debug(
                     f"[qwen3_5-attn-patch] mRoPE call #{_call_counter['mrope']} "
                     f"B,L={B},{L}"
                 )
