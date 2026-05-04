@@ -640,6 +640,8 @@
   "js.error.unload_model_failed": "卸載模型失敗",
   "js.error.save_model_settings_failed": "儲存模型設定失敗",
   "js.info.model_type_reload_required": "模型類型已變更。請卸載並重新載入模型以使變更生效。",
+  "js.info.model_settings_auto_unloaded": "Settings saved. The model was unloaded and will reload with the new settings on next use.",
+  "js.info.model_settings_auto_reloaded": "Settings saved. The pinned model was reloaded with the new settings.",
   "js.error.no_config_defaults": "未找到該模型的設定預設值",
   "js.error.load_generation_config_failed": "載入生成設定失敗",
   "js.error.select_prompt_length": "請至少選擇一個 Prompt 長度",

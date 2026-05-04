@@ -1664,7 +1664,13 @@
                         const data = await response.json();
                         this.showModelSettingsModal = false;
                         if (data.requires_reload) {
-                            alert(window.t('js.info.model_type_reload_required'));
+                            if (data.auto_reloaded) {
+                                alert(window.t('js.info.model_settings_auto_reloaded'));
+                            } else if (data.auto_unloaded) {
+                                alert(window.t('js.info.model_settings_auto_unloaded'));
+                            } else {
+                                alert(window.t('js.info.model_type_reload_required'));
+                            }
                         }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';

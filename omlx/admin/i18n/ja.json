@@ -640,6 +640,8 @@
   "js.error.unload_model_failed": "モデルのアンロードに失敗しました",
   "js.error.save_model_settings_failed": "モデル設定の保存に失敗しました",
   "js.info.model_type_reload_required": "モデルタイプが変更されました。変更を適用するにはモデルをアンロードして再ロードしてください。",
+  "js.info.model_settings_auto_unloaded": "Settings saved. The model was unloaded and will reload with the new settings on next use.",
+  "js.info.model_settings_auto_reloaded": "Settings saved. The pinned model was reloaded with the new settings.",
   "js.error.no_config_defaults": "このモデルのデフォルト設定が見つかりません",
   "js.error.load_generation_config_failed": "生成設定の読み込みに失敗しました",
   "js.error.select_prompt_length": "プロンプト長を1つ以上選択してください",

@@ -1802,7 +1802,8 @@ async def update_model_settings(
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
 
-    # Warn if engine type or index_cache_freq changed while model is loaded
+    # Auto-unload (and re-load if pinned) when a setting that only takes
+    # effect at engine construction time is changed on a loaded model.
     requires_reload = (
         entry.engine is not None
         and (
@@ -1820,11 +1821,25 @@ async def update_model_settings(
             or "trust_remote_code" in sent
         )
     )
+    auto_unloaded = False
+    auto_reloaded = False
     if requires_reload:
-        logger.info(
-            f"Settings changed for loaded model {model_id}. "
-            f"Reload required to take effect."
-        )
+        was_pinned = entry.is_pinned
+        try:
+            logger.info(
+                f"Settings changed for loaded model {model_id}, auto-unloading."
+            )
+            await engine_pool._unload_engine(model_id)
+            auto_unloaded = True
+        except Exception as e:
+            logger.warning(f"Auto-unload failed for {model_id}: {e}")
+        if auto_unloaded and was_pinned:
+            try:
+                await engine_pool._load_engine(model_id)
+                auto_reloaded = True
+                logger.info(f"Auto-reloaded pinned model {model_id} with new settings.")
+            except Exception as e:
+                logger.warning(f"Auto-reload failed for pinned model {model_id}: {e}")
 
     return {
         "success": True,
@@ -1833,6 +1848,8 @@ async def update_model_settings(
         "model_type": entry.model_type,
         "engine_type": entry.engine_type,
         "requires_reload": requires_reload,
+        "auto_unloaded": auto_unloaded,
+        "auto_reloaded": auto_reloaded,
     }
 
 

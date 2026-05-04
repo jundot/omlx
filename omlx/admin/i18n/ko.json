@@ -640,6 +640,8 @@
   "js.error.unload_model_failed": "모델 언로드에 실패했습니다",
   "js.error.save_model_settings_failed": "모델 설정 저장에 실패했습니다",
   "js.info.model_type_reload_required": "모델 타입이 변경되었습니다. 변경 사항을 적용하려면 모델을 언로드한 후 다시 로드해 주세요.",
+  "js.info.model_settings_auto_unloaded": "설정이 저장되었습니다. 모델을 언로드했으며, 다음 사용 시 새 설정으로 다시 로드됩니다.",
+  "js.info.model_settings_auto_reloaded": "설정이 저장되었습니다. 고정된 모델을 새 설정으로 다시 로드했습니다.",
   "js.error.no_config_defaults": "이 모델의 기본 설정을 찾을 수 없습니다",
   "js.error.load_generation_config_failed": "생성 설정 로드에 실패했습니다",
   "js.error.select_prompt_length": "프롬프트 길이를 하나 이상 선택하세요",
