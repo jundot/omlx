@@ -2583,6 +2583,138 @@ class TestStreamingHelperFunctions:
         assert tool_call_deltas == []
         assert "stop" in finish_reasons
 
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_honors_stop_at_server_layer(self):
+        """Server-layer stop-sequence enforcement halts streaming when the stop
+        string appears in accumulated text.
+
+        Defends against engines that accept ``stop=`` but do not consistently
+        honor it (notably some dflash + reasoning-parser combinations). The
+        check matches against accumulated_text (content + reasoning_content)
+        and breaks the streaming loop, preventing emission of subsequent chunks.
+        """
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(text="ok", new_text="ok", finished=False),
+            MockGenerationOutput(
+                text="ok STOP_HERE", new_text=" STOP_HERE", finished=False
+            ),
+            MockGenerationOutput(
+                text="ok STOP_HERE LEAK", new_text=" LEAK", finished=False
+            ),
+            MockGenerationOutput(
+                text="ok STOP_HERE LEAK done",
+                new_text=" done",
+                finished=True,
+                finish_reason="length",
+            ),
+        ])
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Test")],
+            stop=["STOP_HERE"],
+            stream=True,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Test"}]
+        async for event in stream_chat_completion(
+            engine, messages, request,
+            max_tokens=256, temperature=0.7, top_p=0.9, top_k=40,
+        ):
+            events.append(event)
+
+        streamed = "\n".join(events)
+        assert "LEAK" not in streamed, (
+            "Server-layer stop did not fire; later chunks leaked into stream"
+        )
+        # Sanity: pre-stop content emitted normally before the break.
+        assert "ok" in streamed
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_honors_string_form_stop(self):
+        """Single-string ``stop`` (not list) is also enforced at the server layer."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(text="alpha", new_text="alpha", finished=False),
+            MockGenerationOutput(text="alpha END", new_text=" END", finished=False),
+            MockGenerationOutput(
+                text="alpha END SHOULDNT_SEE",
+                new_text=" SHOULDNT_SEE",
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="alpha END SHOULDNT_SEE",
+                new_text="",
+                finished=True,
+                finish_reason="length",
+            ),
+        ])
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Test")],
+            stop="END",
+            stream=True,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Test"}]
+        async for event in stream_chat_completion(
+            engine, messages, request,
+            max_tokens=256, temperature=0.7, top_p=0.9, top_k=40,
+        ):
+            events.append(event)
+
+        streamed = "\n".join(events)
+        assert "SHOULDNT_SEE" not in streamed, (
+            "Server-layer stop did not fire on string-form stop parameter"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_no_stop_param_unchanged(self):
+        """Behavior unchanged when no stop parameter is supplied (regression guard)."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(text="line1", new_text="line1", finished=False),
+            MockGenerationOutput(
+                text="line1 line2",
+                new_text=" line2",
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Test")],
+            stream=True,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Test"}]
+        async for event in stream_chat_completion(
+            engine, messages, request,
+            max_tokens=256, temperature=0.7, top_p=0.9, top_k=40,
+        ):
+            events.append(event)
+
+        streamed = "\n".join(events)
+        # Both lines should be present; no early break since no stop was set.
+        assert "line1" in streamed
+        assert "line2" in streamed
+
+
 class TestStreamingEdgeCases:
     """Tests for edge cases in streaming responses."""
 

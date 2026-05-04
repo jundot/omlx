@@ -2743,6 +2743,25 @@ async def stream_chat_completion(
             last_output = output
             if output.new_text:
                 accumulated_text += output.new_text
+            # Server-layer stop-sequence enforcement
+            # (some engines do not honor user-provided stop strings, only EOS).
+            # Match against accumulated_text (content + reasoning_content).
+            _raw_stop = getattr(request, "stop", None)
+            _stop_seqs = []
+            if isinstance(_raw_stop, str):
+                _stop_seqs = [_raw_stop]
+            elif isinstance(_raw_stop, list):
+                _stop_seqs = [s for s in _raw_stop if isinstance(s, str)]
+            _matched_stop = next((s for s in _stop_seqs if s and s in accumulated_text), None)
+            if _matched_stop is not None and last_output is not None:
+                try:
+                    last_output.finished = True
+                    last_output.finish_reason = "stop"
+                except Exception:
+                    pass
+                logger.info("Stop-sequence matched at server layer: %r", _matched_stop)
+                break
+
 
             if stream_content and output.new_text:
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
