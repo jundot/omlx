@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 
 @dataclass
@@ -43,20 +40,19 @@ class Integration:
 
     def select_model(
         self, models_info: list[dict], tool_name: str | None = None
-    ) -> tuple[str, int | None]:
+    ) -> str:
         """Select a model interactively.
 
         Shows a textual TUI when running in a TTY; falls back to numbered
         terminal selection when textual is unavailable or stdout is not a TTY.
 
-        Returns (model_id, context_window).
+        Returns the selected model id (empty string when models_info is empty).
         """
         if not models_info:
-            return "", None
+            return ""
 
         if len(models_info) == 1:
-            m = models_info[0]
-            return m["id"], m.get("max_context_window")
+            return models_info[0]["id"]
 
         name = tool_name or "Tool"
 
@@ -67,7 +63,7 @@ class Integration:
                 pass
 
         # Fallback: numbered terminal selection
-        print(f"Available models:")
+        print("Available models:")
         for i, m in enumerate(models_info, 1):
             ctx = m.get("max_context_window")
             ctx_str = f"  [{ctx:,} ctx]" if ctx else ""
@@ -77,8 +73,7 @@ class Integration:
                 choice = input("Select model number: ").strip()
                 idx = int(choice) - 1
                 if 0 <= idx < len(models_info):
-                    m = models_info[idx]
-                    return m["id"], m.get("max_context_window")
+                    return models_info[idx]["id"]
                 print(f"Please enter 1-{len(models_info)}")
             except (ValueError, EOFError):
                 print(f"Please enter 1-{len(models_info)}")
@@ -122,27 +117,26 @@ class Integration:
         print(f"Config written: {config_path}")
 
 
-def _select_model_tui(
-    models_info: list[dict], tool_name: str
-) -> tuple[str, int | None]:
+def _select_model_tui(models_info: list[dict], tool_name: str) -> str:
     """Show a compact inline textual TUI for interactive model selection.
 
     Loaded models appear first with a filled bullet; unloaded (available on disk)
     appear after with an empty bullet and a warning on selection.
 
     Raises ImportError if textual is not installed.
-    Returns (model_id, context_window).
+    Returns the selected model id, or exits with 130 on cancel.
     """
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.widgets import Footer, Label, ListItem, ListView
+    from textual.widgets import Label, ListItem, ListView
 
-    # Sort: loaded first, then unloaded
-    loaded = [m for m in models_info if m.get("loaded", True)]
-    unloaded = [m for m in models_info if not m.get("loaded", True)]
+    # Sort: loaded first, then unloaded. Default to False so a missing
+    # "loaded" key (e.g. status fetch failed) renders as ○ rather than ●.
+    loaded = [m for m in models_info if m.get("loaded", False)]
+    unloaded = [m for m in models_info if not m.get("loaded", False)]
     ordered = loaded + unloaded
 
-    result: list[tuple[str, int | None]] = []
+    result: list[str] = []
 
     class ModelSelectorApp(App):
         ENABLE_COMMAND_PALETTE = False
@@ -186,7 +180,7 @@ def _select_model_tui(
             yield Label(f" oMLX › Launch {tool_name}", id="title")
             items = []
             for m in ordered:
-                is_loaded = m.get("loaded", True)
+                is_loaded = m.get("loaded", False)
                 bullet = "●" if is_loaded else "○"
                 ctx = m.get("max_context_window")
                 ctx_str = f"  {ctx // 1000}k" if ctx else ""
@@ -198,8 +192,7 @@ def _select_model_tui(
         def on_list_view_selected(self, event: ListView.Selected) -> None:
             idx = event.list_view.index
             if idx is not None and 0 <= idx < len(ordered):
-                m = ordered[idx]
-                result.append((m["id"], m.get("max_context_window")))
+                result.append(ordered[idx]["id"])
             self.exit()
 
         def action_quit_cancel(self) -> None:
@@ -210,6 +203,7 @@ def _select_model_tui(
 
     if not result:
         print("No model selected.")
-        sys.exit(0)
+        # 130 is the conventional shell exit code for SIGINT/cancel.
+        sys.exit(130)
 
     return result[0]

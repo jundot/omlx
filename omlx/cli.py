@@ -357,7 +357,7 @@ def launch_command(args):
                 {"id": m_id, **models_status_map.get(m_id, {})}
                 for m_id in models
             ]
-            model, _ = integration.select_model(
+            model = integration.select_model(
                 models_info_list, integration.display_name
             )
 

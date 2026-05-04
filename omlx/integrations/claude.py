@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import os
 import shutil
-import sys
 from pathlib import Path
 
 from omlx.integrations.base import Integration
+from omlx.utils.install import get_cli_prefix
 
 
 class ClaudeCodeIntegration(Integration):
@@ -25,7 +25,6 @@ class ClaudeCodeIntegration(Integration):
     def get_command(
         self, port: int, api_key: str, model: str, host: str = "127.0.0.1"
     ) -> str:
-        from omlx.utils.install import get_cli_prefix
         return f"{get_cli_prefix()} launch claude"
 
     def _find_claude_binary(self) -> str:

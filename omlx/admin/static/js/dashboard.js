@@ -1865,7 +1865,7 @@
 
             _launchCmd(tool) {
                 const cli = this.stats.cli_prefix || 'omlx';
-                return `${cli} launch ${tool}`;
+                return `${this.shellQuote(cli)} launch ${tool}`;
             },
 
             get claudeCommand() {

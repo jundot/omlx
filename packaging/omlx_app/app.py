@@ -255,8 +255,6 @@ class OMLXAppDelegate(NSObject):
         Tries /usr/local/bin first (like ollama), falls back to ~/.local/bin.
         Silently skips if neither directory is writable or the symlink already exists.
         """
-        from pathlib import Path
-
         bundle = NSBundle.mainBundle()
         exec_url = bundle.executableURL()
         if exec_url is None:
