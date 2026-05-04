@@ -1550,6 +1550,15 @@
                     dflash_enabled: settings.dflash_enabled || false,
                     dflash_draft_model: settings.dflash_draft_model || '',
                     dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
+                    dflash_max_ctx: settings.dflash_max_ctx ?? null,
+                    dflash_in_memory_cache: settings.dflash_in_memory_cache !== false,
+                    dflash_in_memory_cache_max_gib: settings.dflash_in_memory_cache_max_bytes
+                        ? Math.round(settings.dflash_in_memory_cache_max_bytes / (1024 ** 3))
+                        : 8,
+                    dflash_ssd_cache: settings.dflash_ssd_cache || false,
+                    dflash_compatible: model.dflash_compatible !== false,
+                    dflash_compatibility_reason: model.dflash_compatibility_reason || '',
+                    dflash_ssd_cache_available: !!model.dflash_ssd_cache_available,
                     ctKwargEntries,
                     trust_remote_code: settings.trust_remote_code || false,
                 };
@@ -1631,6 +1640,19 @@
                                 dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
                                     ? parseInt(this.modelSettings.dflash_draft_quant_bits)
                                     : null,
+                                dflash_max_ctx: this.modelSettings.dflash_enabled && this.modelSettings.dflash_max_ctx
+                                    ? parseInt(this.modelSettings.dflash_max_ctx)
+                                    : null,
+                                dflash_in_memory_cache: this.modelSettings.dflash_enabled
+                                    ? !!this.modelSettings.dflash_in_memory_cache
+                                    : true,
+                                dflash_in_memory_cache_max_bytes: this.modelSettings.dflash_enabled
+                                    ? Math.max(1, parseInt(this.modelSettings.dflash_in_memory_cache_max_gib) || 8) * (1024 ** 3)
+                                    : 8 * (1024 ** 3),
+                                dflash_ssd_cache: this.modelSettings.dflash_enabled
+                                    && !!this.modelSettings.dflash_in_memory_cache
+                                    && !!this.modelSettings.dflash_ssd_cache_available
+                                    && !!this.modelSettings.dflash_ssd_cache,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
                             };
                         })()),
@@ -1694,6 +1716,10 @@
                         this.modelSettings.dflash_enabled = false;
                         this.modelSettings.dflash_draft_model = null;
                         this.modelSettings.dflash_draft_quant_bits = null;
+                        this.modelSettings.dflash_max_ctx = null;
+                        this.modelSettings.dflash_in_memory_cache = true;
+                        this.modelSettings.dflash_in_memory_cache_max_gib = 8;
+                        this.modelSettings.dflash_ssd_cache = false;
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));

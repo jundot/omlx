@@ -619,6 +619,9 @@ class EnginePool:
                             model_settings=model_settings,
                             fallback_engine_type=effective_type,
                             scheduler_config=self._scheduler_config,
+                            omlx_ssd_cache_dir=getattr(
+                                self._scheduler_config, "paged_ssd_cache_dir", None
+                            ),
                         )
                         logger.info(f"DFlash enabled for {model_id}, draft={dflash_draft}")
                     except ImportError:
