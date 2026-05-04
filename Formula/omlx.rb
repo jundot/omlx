@@ -112,8 +112,7 @@ class Omlx < Formula
       ohai "  RECORD already lists the dylib"
     else
       ohai "  writing dylib entry to #{record}"
-      system "/bin/sh", "-c",
-             "echo 'xgrammar/libxgrammar_bindings.dylib,,' >> #{record}"
+      File.open(record, "a") { |f| f.puts "xgrammar/libxgrammar_bindings.dylib,," }
     end
 
     # Verify the patch took. Failing here is much less confusing than
