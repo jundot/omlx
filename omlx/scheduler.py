@@ -39,6 +39,7 @@ from pathlib import Path
 
 from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
+from .prefill_progress import get_prefill_tracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .exceptions import is_cache_corruption_error
 
@@ -2713,6 +2714,9 @@ class Scheduler:
         if n_to_score <= threshold:
             return
 
+        tracker = get_prefill_tracker()
+        model_id = os.path.basename(self.config.model_name.rstrip("/"))
+
         try:
             import time
             from .patches.specprefill import score_tokens, select_chunks
@@ -2732,6 +2736,11 @@ class Scheduler:
                             draft_cached_tokens = block_table.num_tokens
                 except Exception as e:
                     logger.debug(f"SpecPrefill: draft cache fetch failed: {e}")
+
+            # Register tracker entry so the dashboard shows the PP indicator
+            # during draft scoring. The bar sits at 0% (no per-chunk hooks)
+            # but the indicator beats showing "idle" for a multi-second pause.
+            tracker.update(request.request_id, 0, n_to_score, model_id)
 
             t0 = time.monotonic()
             importance, used_cache = score_tokens(
@@ -2788,9 +2797,13 @@ class Scheduler:
             del used_cache
             _sync_and_clear_cache()
 
+            # Mark scoring complete (auto-removes tracker entry).
+            tracker.update(request.request_id, n_to_score, n_to_score, model_id)
+
         except Exception as e:
             logger.error(f"SpecPrefill scoring failed, falling back to normal path: {e}")
             request.specprefill_indices = None
+            tracker.remove(request.request_id)
 
     def _cleanup_specprefill(self, request_id: str) -> None:
         """Clean up SpecPrefill RoPE patches when a request finishes."""
@@ -3259,6 +3272,9 @@ class Scheduler:
             #   BatchGenerator last token: pos = N' + (M - N' - 1) = M - 1
             #   First gen token: pos = (N'+1) + (M - N' - 1) = M
             if request.specprefill_indices is not None:
+                tracker = get_prefill_tracker()
+                model_id = os.path.basename(self.config.model_name.rstrip("/"))
+                total_pp = 0
                 try:
                     from .patches.specprefill import (
                         sparse_prefill, cleanup_rope,
@@ -3272,6 +3288,16 @@ class Scheduler:
                     sp_cache = make_prompt_cache(self.model)
                     all_tokens = tokens_to_process
                     sys_count = getattr(request, '_specprefill_system_tokens', 0)
+
+                    # Register tracker entry so the dashboard shows the PP
+                    # indicator throughout sys + sparse prefill. Denominator
+                    # mirrors the last-token removal applied below so the bar
+                    # ends cleanly at 100%.
+                    sel_list_pre = request.specprefill_indices.tolist()
+                    m_pre = len(all_tokens) - sys_count
+                    n_eff = len(sel_list_pre) - (1 if (m_pre - 1) in sel_list_pre else 0)
+                    total_pp = sys_count + n_eff
+                    tracker.update(request.request_id, 0, total_pp, model_id)
 
                     # Phase 1: system prompt full prefill (if not cached)
                     if sys_count > 0:
@@ -3342,10 +3368,14 @@ class Scheduler:
                     tokens_to_process = all_tokens[-1:]
                     self._specprefill_active_request_id = request.request_id
 
+                    # Mark spec-prefill complete (auto-removes tracker entry).
+                    tracker.update(request.request_id, total_pp, total_pp, model_id)
+
                 except Exception as e:
                     logger.error(f"SpecPrefill sparse prefill failed: {e}")
                     cleanup_rope(self.model)
                     request.specprefill_indices = None
+                    tracker.remove(request.request_id)
                     # Fall through to normal prefill
 
             # External prefill: process tokens[0:N-1] outside BatchGenerator.
