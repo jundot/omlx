@@ -260,6 +260,62 @@ class TestServerConfig:
         assert config.port == 8000
         assert config.model_dir == ""
 
+    def test_sync_port_to_server_settings_new_file(self, tmp_path: Path):
+        """Test syncing port creates settings.json if missing."""
+        config = ServerConfig(base_path=str(tmp_path), port=7999)
+        config.sync_port_to_server_settings()
+
+        settings_file = tmp_path / "settings.json"
+        assert settings_file.exists()
+        with open(settings_file) as f:
+            data = json.load(f)
+        assert data["server"]["port"] == 7999
+
+    def test_sync_port_to_server_settings_overwrites_stale(self, tmp_path: Path):
+        """Test syncing overwrites stale port and preserves other keys."""
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps({
+            "server": {"port": 8000},
+            "auth": {"api_key": "preserved"},
+            "model": {"model_dir": "/keep"},
+        }))
+
+        config = ServerConfig(base_path=str(tmp_path), port=7999)
+        config.sync_port_to_server_settings()
+
+        with open(settings_file) as f:
+            data = json.load(f)
+        assert data["server"]["port"] == 7999
+        assert data["auth"]["api_key"] == "preserved"
+        assert data["model"]["model_dir"] == "/keep"
+
+    def test_sync_port_to_server_settings_noop_when_match(self, tmp_path: Path):
+        """Test sync skips disk write when port already matches."""
+        settings_file = tmp_path / "settings.json"
+        original = json.dumps({"server": {"port": 7999}, "marker": "untouched"})
+        settings_file.write_text(original)
+        mtime_before = settings_file.stat().st_mtime_ns
+
+        config = ServerConfig(base_path=str(tmp_path), port=7999)
+        config.sync_port_to_server_settings()
+
+        mtime_after = settings_file.stat().st_mtime_ns
+        assert mtime_before == mtime_after
+
+    def test_sync_port_to_server_settings_recovers_from_corrupt_json(
+        self, tmp_path: Path
+    ):
+        """Test sync rewrites file when existing JSON is corrupt."""
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text("{ not valid json")
+
+        config = ServerConfig(base_path=str(tmp_path), port=7999)
+        config.sync_port_to_server_settings()
+
+        with open(settings_file) as f:
+            data = json.load(f)
+        assert data["server"]["port"] == 7999
+
     def test_set_server_api_key_new_file(self, tmp_path: Path):
         """Test setting API key creates settings.json if not exists."""
         config = ServerConfig(base_path=str(tmp_path))

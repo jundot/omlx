@@ -307,6 +307,9 @@ class ServerManager:
 
         self._adopted = False
         self._consecutive_health_failures = 0
+        # Mirror the app's port into the server's settings.json so `omlx launch`
+        # picks up the right port instead of falling back to a stale 8000.
+        self.config.sync_port_to_server_settings()
         args = self.config.build_serve_args()
 
         try:

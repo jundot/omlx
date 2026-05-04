@@ -215,6 +215,31 @@ class ServerConfig:
             with open(settings_file, "w") as f:
                 json.dump(data, f, indent=2)
 
+    def sync_port_to_server_settings(self):
+        """Write app's port to server's settings.json so `omlx launch` and other
+        CLI tools resolve the right port without needing --port.
+
+        The app starts the server with --port {self.port}, so the server is the
+        source of truth for the running port. Mirroring it into settings.json
+        keeps the CLI and admin in sync.
+        """
+        settings_file = Path(self.base_path).expanduser() / "settings.json"
+        data = {}
+        if settings_file.exists():
+            try:
+                with open(settings_file) as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        if "server" not in data:
+            data["server"] = {}
+        if data["server"].get("port") == self.port:
+            return
+        data["server"]["port"] = self.port
+        settings_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(settings_file, "w") as f:
+            json.dump(data, f, indent=2)
+
     def build_serve_args(self) -> list:
         """Build command line arguments for omlx serve.
 
