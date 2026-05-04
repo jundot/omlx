@@ -151,23 +151,46 @@ def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
         curses.curs_set(0)
         stdscr.keypad(True)
         idx = 0
+        scroll = 0
+        hint = "↑↓ navigate   PgUp/PgDn page   Enter launch   q cancel"
         while True:
+            max_y, max_x = stdscr.getmaxyx()
+            # Layout: row 0 title, row 1 blank, rows [items_top, items_bottom)
+            # for items, last row pinned for the hint.
+            items_top = 2
+            items_bottom = max(items_top + 1, max_y - 1)
+            visible_count = items_bottom - items_top
+
+            # Keep the cursor visible inside the viewport.
+            if idx < scroll:
+                scroll = idx
+            elif idx >= scroll + visible_count:
+                scroll = idx - visible_count + 1
+            max_scroll = max(0, len(ordered) - visible_count)
+            scroll = max(0, min(scroll, max_scroll))
+            visible_end = min(len(ordered), scroll + visible_count)
+
             stdscr.erase()
             try:
-                stdscr.addstr(0, 1, f"oMLX > Launch {tool_name}", curses.A_BOLD)
-                for i, m in enumerate(ordered):
+                stdscr.addstr(
+                    0, 1, f"oMLX > Launch {tool_name}"[: max_x - 2], curses.A_BOLD
+                )
+                for row_offset, i in enumerate(range(scroll, visible_end)):
+                    m = ordered[i]
                     bullet = "●" if m.get("loaded", False) else "○"
                     ctx = m.get("max_context_window")
                     ctx_str = f"  {ctx // 1000}k" if ctx else ""
                     line = f"  {bullet}  {m['id']}{ctx_str}"
+                    # Leave 2 cols on the right for scroll indicators.
+                    line = line[: max(0, max_x - 4)]
                     attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
-                    stdscr.addstr(i + 2, 1, line, attr)
-                stdscr.addstr(
-                    len(ordered) + 3,
-                    1,
-                    "↑↓ navigate   Enter launch   q cancel",
-                    curses.A_DIM,
-                )
+                    stdscr.addstr(items_top + row_offset, 1, line, attr)
+                # Scroll indicators on the right edge.
+                if scroll > 0:
+                    stdscr.addstr(items_top, max_x - 2, "▲", curses.A_DIM)
+                if visible_end < len(ordered):
+                    stdscr.addstr(items_bottom - 1, max_x - 2, "▼", curses.A_DIM)
+                stdscr.addstr(max_y - 1, 1, hint[: max_x - 2], curses.A_DIM)
             except curses.error:
                 # Window too small to render the full picker; keep going so
                 # the user can resize and the next loop redraws cleanly.
@@ -179,11 +202,22 @@ def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
                 idx = (idx - 1) % len(ordered)
             elif key in (curses.KEY_DOWN, ord("j")):
                 idx = (idx + 1) % len(ordered)
+            elif key == curses.KEY_PPAGE:
+                idx = max(0, idx - max(1, visible_count - 1))
+            elif key == curses.KEY_NPAGE:
+                idx = min(len(ordered) - 1, idx + max(1, visible_count - 1))
+            elif key == curses.KEY_HOME:
+                idx = 0
+            elif key == curses.KEY_END:
+                idx = len(ordered) - 1
             elif key in (curses.KEY_ENTER, 10, 13):
                 selected.append(ordered[idx]["id"])
                 return
             elif key in (ord("q"), 27):  # q or ESC
                 return
+            elif key == curses.KEY_RESIZE:
+                # Re-query getmaxyx on the next loop iteration.
+                continue
 
     curses.wrapper(_picker)
 
