@@ -7,8 +7,8 @@ text embeddings using Apple's MLX framework, with native fallback
 for XLMRoBERTa and BERT embedding models.
 """
 
-import json
 import inspect
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +16,10 @@ from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
+
+from .mlx_embeddings_compat import (
+    patch_qwen3_vl_processor_for_torch_free_image_loading,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +178,7 @@ class MLXEmbeddingModel:
 
         # 2. Fallback to mlx-embeddings
         try:
+            patch_qwen3_vl_processor_for_torch_free_image_loading()
             from mlx_embeddings import load
 
             logger.info(f"Loading embedding model via mlx-embeddings: {self.model_name}")
