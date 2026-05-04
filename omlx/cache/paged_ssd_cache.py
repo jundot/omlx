@@ -197,14 +197,18 @@ _ST_DTYPE_TO_NP = {
 def _extract_tensor_bytes(arr: "mx.array") -> Tuple[bytes, str, List[int]]:
     """Extract raw bytes from an evaluated mx.array.
 
-    Must be called from the inference thread after mx.eval() (Metal-safe).
-    The returned bytes can be written to disk from any thread without mx API.
+    Caller MUST ensure ``arr`` is already mx.eval'd before calling. This
+    function does NOT call mx.eval — it only reads the materialized buffer
+    via the Python buffer protocol. That keeps the call cross-thread safe
+    when the source array was evaluated on the inference thread.
 
-    For bfloat16 arrays, uses view(uint16) trick since Python's buffer
-    protocol doesn't support bfloat16 directly.
+    For bfloat16 arrays, uses view(uint16) since the buffer protocol does
+    not support bfloat16 directly. The view shares the source buffer; no
+    Metal command is issued by view() alone, and bytes(memoryview(view))
+    on an already-materialized source returns the raw bf16 bits unchanged.
 
     Args:
-        arr: Evaluated MLX array (must have been mx.eval'd).
+        arr: Evaluated MLX array (caller's responsibility).
 
     Returns:
         Tuple of (raw_bytes, safetensors_dtype_string, shape_list).
@@ -212,9 +216,7 @@ def _extract_tensor_bytes(arr: "mx.array") -> Tuple[bytes, str, List[int]]:
     dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
     shape = list(arr.shape)
     if arr.dtype == mx.bfloat16:
-        u16 = arr.view(mx.uint16)
-        mx.eval(u16)  # noqa: S307
-        raw = bytes(memoryview(u16))
+        raw = bytes(memoryview(arr.view(mx.uint16)))
     else:
         raw = bytes(memoryview(arr))
     return raw, dtype_str, shape
@@ -1195,16 +1197,15 @@ class PagedSSDCacheManager(CacheManager):
             # Merge CacheList sub_count metadata
             metadata.update(cache_list_meta)
 
-            # Materialize lazy arrays on the inference thread (Metal-safe).
-            if arrays:
-                mx.eval(*arrays.values())  # noqa: S307 — MLX tensor eval, not Python eval
-
-            # Extract raw bytes from evaluated tensors on the inference thread.
-            # This is Metal-safe because it uses memoryview() on evaluated arrays.
-            # For bfloat16, we use view(uint16) trick since Python's buffer
-            # protocol doesn't support bfloat16 directly.
-            # The background writer thread then writes the safetensors file
-            # using pure Python I/O — no mx/Metal API calls needed.
+            # Caller (scheduler._cleanup_finished, async store-cache path)
+            # already mx.eval's all real KV arrays on the inference thread
+            # before submitting to the omlx-store-cache executor. The tiny
+            # mx.zeros((1,)) placeholders allocated above are lazy nodes
+            # whose buffer materialization happens implicitly via the buffer
+            # protocol. Skipping the explicit mx.eval here keeps save_block
+            # off the Metal command-submission path when invoked from a
+            # non-inference thread, which is the source of the cross-thread
+            # race tracked in #978/#1040.
             tensors_raw = {}
             for name, arr in arrays.items():
                 tensors_raw[name] = _extract_tensor_bytes(arr)
