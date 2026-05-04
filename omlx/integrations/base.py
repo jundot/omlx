@@ -178,8 +178,8 @@ def _select_model_tui(
         """
 
         BINDINGS = [
-            Binding("q", "quit_cancel", "Cancelar", show=False),
-            Binding("escape", "quit_cancel", "Cancelar", show=False),
+            Binding("q", "quit_cancel", "Cancel", show=False),
+            Binding("escape", "quit_cancel", "Cancel", show=False),
         ]
 
         def compose(self) -> ComposeResult:
@@ -193,7 +193,7 @@ def _select_model_tui(
                 label = f" {bullet} {m['id']}{ctx_str}"
                 items.append(ListItem(Label(label)))
             yield ListView(*items)
-            yield Label(" ↑↓ navegar   Enter lanzar   q cancelar", id="hint")
+            yield Label(" ↑↓ navigate   Enter launch   q cancel", id="hint")
 
         def on_list_view_selected(self, event: ListView.Selected) -> None:
             idx = event.list_view.index
