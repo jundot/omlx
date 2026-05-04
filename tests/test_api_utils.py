@@ -6,6 +6,10 @@ Tests utility functions from api/utils.py and api/anthropic_utils.py for
 text processing, content extraction, and format conversion.
 """
 
+import logging
+
+import pytest
+
 from omlx.api.utils import (
     SPECIAL_TOKENS_PATTERN,
     _consolidate_system_messages,
@@ -1299,6 +1303,83 @@ class TestConvertAnthropicToolsToInternal:
         result = convert_anthropic_tools_to_internal(tools)
 
         assert result[0]["function"]["name"] == "search"
+
+    def test_drops_server_side_web_search(self):
+        """Anthropic web_search server-side tool is dropped (not executable)."""
+        tools = [AnthropicTool(type="web_search_20250305", name="web_search")]
+
+        result = convert_anthropic_tools_to_internal(tools)
+
+        assert result is None
+
+    def test_drops_server_side_code_execution(self):
+        """Anthropic code_execution server-side tool is dropped."""
+        tools = [
+            AnthropicTool(type="code_execution_20250825", name="code_execution"),
+        ]
+
+        result = convert_anthropic_tools_to_internal(tools)
+
+        assert result is None
+
+    @pytest.mark.parametrize(
+        "tool_type,name",
+        [
+            ("bash_20250124", "bash"),
+            ("text_editor_20250728", "str_replace_editor"),
+            ("computer_20250124", "computer"),
+        ],
+    )
+    def test_drops_bash_text_editor_computer(self, tool_type, name):
+        """Computer-use tool family (bash/text_editor/computer) is dropped."""
+        tools = [AnthropicTool(type=tool_type, name=name)]
+
+        result = convert_anthropic_tools_to_internal(tools)
+
+        assert result is None
+
+    def test_keeps_user_tools_drops_server_side(self):
+        """Mixed: user tool is forwarded, server-side tool is dropped."""
+        tools = [
+            AnthropicTool(name="get_weather", input_schema={"type": "object"}),
+            AnthropicTool(type="web_search_20250305", name="web_search"),
+        ]
+
+        result = convert_anthropic_tools_to_internal(tools)
+
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "get_weather"
+
+    def test_drop_logs_at_info(self, caplog):
+        """Dropping server-side tools emits an INFO log naming each one."""
+        tools = [
+            AnthropicTool(type="web_search_20250305", name="web_search"),
+            AnthropicTool(type="code_execution_20250825", name="code_execution"),
+        ]
+
+        with caplog.at_level(logging.INFO, logger="omlx.api.anthropic_utils"):
+            convert_anthropic_tools_to_internal(tools)
+
+        joined = "\n".join(caplog.messages)
+        assert "Dropped 2" in joined
+        assert "web_search_20250305:web_search" in joined
+        assert "code_execution_20250825:code_execution" in joined
+
+    def test_unknown_type_prefix_is_treated_as_user_tool(self):
+        """Unknown type with input_schema is forwarded as a user tool."""
+        tools = [
+            AnthropicTool(
+                name="custom",
+                type="unknown_kind_v1",
+                input_schema={"type": "object"},
+            ),
+        ]
+
+        result = convert_anthropic_tools_to_internal(tools)
+
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "custom"
+        assert result[0]["function"]["parameters"] == {"type": "object"}
 
 
 class TestConvertInternalToAnthropicResponse:

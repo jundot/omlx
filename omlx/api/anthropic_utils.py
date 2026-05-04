@@ -667,6 +667,26 @@ def _extract_tool_result_content(
 # Tool Conversion: Anthropic -> Internal
 # =============================================================================
 
+# Anthropic server-side tools (executed on Anthropic's infrastructure) carry a
+# versioned ``type`` like ``web_search_20250305`` and have no ``input_schema``.
+# oMLX cannot fulfill these locally, so we drop them before forwarding to the
+# model. See https://docs.anthropic.com for the canonical tool families.
+SERVER_SIDE_TOOL_TYPE_PREFIXES = (
+    "web_search_",
+    "code_execution_",
+    "bash_",
+    "text_editor_",
+    "computer_",
+)
+
+
+def _is_server_side_tool(tool_dict: dict[str, Any]) -> bool:
+    """Return True if the tool dict is an Anthropic server-side tool."""
+    tool_type = tool_dict.get("type")
+    if not isinstance(tool_type, str):
+        return False
+    return tool_type.startswith(SERVER_SIDE_TOOL_TYPE_PREFIXES)
+
 
 def convert_anthropic_tools_to_internal(
     tools: list[AnthropicTool] | None,
@@ -677,16 +697,21 @@ def convert_anthropic_tools_to_internal(
     Anthropic: {"name": "...", "description": "...", "input_schema": {...}}
     Internal:  {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
 
+    Anthropic server-side tools (web_search, code_execution, bash, text_editor,
+    computer) cannot be executed by oMLX and are dropped with an INFO log.
+
     Args:
         tools: List of Anthropic tool definitions
 
     Returns:
-        List of internal tool definitions, or None if no tools
+        List of internal tool definitions, or None if no executable tools
     """
     if not tools:
         return None
 
-    internal_tools = []
+    internal_tools: list[dict[str, Any]] = []
+    dropped: list[str] = []
+
     for tool in tools:
         # Handle both Pydantic models and dicts
         if hasattr(tool, "model_dump"):
@@ -696,15 +721,26 @@ def convert_anthropic_tools_to_internal(
         else:
             continue
 
+        if _is_server_side_tool(tool_dict):
+            dropped.append(f"{tool_dict.get('type')}:{tool_dict.get('name', '')}")
+            continue
+
         internal_tools.append(
             {
                 "type": "function",
                 "function": {
                     "name": tool_dict.get("name", ""),
                     "description": tool_dict.get("description", ""),
-                    "parameters": tool_dict.get("input_schema", {}),
+                    "parameters": tool_dict.get("input_schema") or {},
                 },
             }
+        )
+
+    if dropped:
+        logger.info(
+            "Dropped %d Anthropic server-side tool(s) not executable by oMLX: %s",
+            len(dropped),
+            ", ".join(dropped),
         )
 
     return internal_tools if internal_tools else None
