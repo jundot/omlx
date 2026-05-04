@@ -679,7 +679,7 @@
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">DFlash</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">Block diffusion speculative decoding for 3-4x faster generation. Requires a DFlash draft model checkpoint. (MLX impl by bstnxbt: <a href="https://github.com/bstnxbt/dflash-mlx" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">GitHub</a>) (<a href="https://arxiv.org/abs/2602.06036" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">Paper</a>)</p>
+                                            <p class="text-xs text-neutral-500 mt-0.5">Block diffusion speculative decoding for 3-4x faster generation. Requires a DFlash draft model checkpoint.<br><strong>Single-stream only: requests run one at a time.</strong><br>* MLX impl by bstnxbt(<a href="https://github.com/bstnxbt/dflash-mlx" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">GitHub</a>)</p>
                                             <p x-show="!modelSettings.dflash_compatible && modelSettings.dflash_compatibility_reason"
                                                class="text-xs text-amber-600 mt-1"
                                                x-text="modelSettings.dflash_compatibility_reason"></p>
