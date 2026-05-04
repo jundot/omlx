@@ -347,6 +347,7 @@
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
+            benchUploadSkipped: null,  // { features: [...] } when upload was skipped due to experimental features
 
             // Bench sub-tab & dropdown
             benchTab: 'throughput',
@@ -2108,6 +2109,7 @@
                 this.benchUploadResults = [];
                 this.benchUploadDone = null;
                 this.benchUploading = false;
+                this.benchUploadSkipped = null;
 
                 try {
                     const response = await fetch('/admin/api/bench/start', {
@@ -2187,6 +2189,14 @@
                             this.benchProgress = null;
                             es.close();
                             this.benchEventSource = null;
+                        } else if (data.type === 'upload_skipped') {
+                            this.benchUploadSkipped = { features: data.features || [] };
+                            this.benchUploading = false;
+                            this.benchRunning = false;
+                            this.benchProgress = null;
+                            es.close();
+                            this.benchEventSource = null;
+                            this.loadModels();
                         } else if (data.type === 'error') {
                             this.benchError = data.message;
                             this.benchRunning = false;

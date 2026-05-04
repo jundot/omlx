@@ -416,6 +416,7 @@ class TestUploadToOmlxAi:
         mock_entry.model_path = "/models/Qwen3-30B-4bit"
         mock_pool = MagicMock()
         mock_pool.get_entry.return_value = mock_entry
+        mock_pool._settings_manager = None
 
         mock_response = MagicMock()
         mock_response.status_code = 201
@@ -476,6 +477,7 @@ class TestUploadToOmlxAi:
         mock_entry.model_path = "/models/Qwen3-30B-4bit"
         mock_pool = MagicMock()
         mock_pool.get_entry.return_value = mock_entry
+        mock_pool._settings_manager = None
 
         mock_response = MagicMock()
         mock_response.status_code = 409
@@ -500,3 +502,53 @@ class TestUploadToOmlxAi:
 
         done_event = next(e for e in events if e["type"] == "upload_done")
         assert done_event["data"]["success"] == 1
+
+    @pytest.mark.asyncio
+    async def test_upload_skipped_when_experimental_features_enabled(self):
+        """Upload is skipped (no HTTP call) when experimental features were active."""
+        from omlx.admin.benchmark import _upload_to_omlx_ai
+
+        run = BenchmarkRun(
+            bench_id="test-bench",
+            request=BenchmarkRequest(
+                model_id="Qwen3-30B-4bit",
+                prompt_lengths=[1024],
+            ),
+            experimental_features=["dflash", "turboquant"],
+        )
+        run.results = [
+            {
+                "test_type": "single",
+                "pp": 1024,
+                "tg": 128,
+                "processing_tps": 500.0,
+                "gen_tps": 50.0,
+                "ttft_ms": 100.0,
+                "peak_memory_bytes": 0,
+            },
+        ]
+
+        mock_pool = MagicMock()
+        mock_pool._settings_manager = None
+        mock_to_thread = AsyncMock()
+
+        with patch("asyncio.to_thread", mock_to_thread):
+            await _upload_to_omlx_ai(run, mock_pool)
+
+        events = []
+        while not run.queue.empty():
+            events.append(run.queue.get_nowait())
+
+        # Only an upload_skipped event is emitted, no progress / upload / upload_done
+        event_types = [e["type"] for e in events]
+        assert "upload_skipped" in event_types
+        assert "upload" not in event_types
+        assert "upload_done" not in event_types
+        assert "progress" not in event_types
+
+        skipped = next(e for e in events if e["type"] == "upload_skipped")
+        assert skipped["reason"] == "experimental_features"
+        assert skipped["features"] == ["dflash", "turboquant"]
+
+        # No HTTP call was made
+        mock_to_thread.assert_not_called()
