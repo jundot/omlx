@@ -3940,7 +3940,9 @@ async def create_response(
                     )
                 )
 
-        usage = build_response_usage(output.prompt_tokens, output.completion_tokens)
+        usage = build_response_usage(
+            output.prompt_tokens, output.completion_tokens, output.cached_tokens
+        )
 
         response_obj = ResponseObject(
             model=request.model,
@@ -4321,7 +4323,7 @@ async def stream_responses_api(
             "input_tokens": last_output.prompt_tokens,
             "output_tokens": last_output.completion_tokens,
             "total_tokens": last_output.prompt_tokens + last_output.completion_tokens,
-            "input_tokens_details": {"cached_tokens": 0},
+            "input_tokens_details": {"cached_tokens": last_output.cached_tokens},
             "output_tokens_details": {"reasoning_tokens": 0},
         }
 

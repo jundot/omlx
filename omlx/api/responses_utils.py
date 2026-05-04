@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from .responses_models import (
     InputItem,
+    InputTokensDetails,
     OutputContent,
     OutputItem,
     ResponsesTool,
@@ -303,13 +304,14 @@ def build_function_call_output_item(
 
 
 def build_response_usage(
-    input_tokens: int, output_tokens: int
+    input_tokens: int, output_tokens: int, cached_tokens: int = 0
 ) -> ResponseUsage:
     """Build ResponseUsage from token counts."""
     return ResponseUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=input_tokens + output_tokens,
+        input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),
     )
 
 

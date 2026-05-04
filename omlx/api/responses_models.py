@@ -156,11 +156,13 @@ class OutputItem(BaseModel):
     call_id: Optional[str] = None
     name: Optional[str] = None
     arguments: Optional[str] = None
-    
+
+
 class InputTokensDetails(BaseModel):
-    """Details about output token usage."""
+    """Details about input token usage."""
 
     cached_tokens: int = 0
+
 
 class OutputTokensDetails(BaseModel):
     """Details about output token usage."""
