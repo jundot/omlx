@@ -26,6 +26,9 @@ from ..model_discovery import (
     _is_causal_lm_reranker,
 )
 from ..utils.image import load_image
+from .mlx_embeddings_compat import (
+    patch_qwen3_vl_processor_for_torch_free_image_loading,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +186,7 @@ class MLXRerankerModel:
         handles both embedding and reranking variants of Qwen3-VL. Reranker vs
         embedder is decided by the input dict shape at inference time.
         """
+        patch_qwen3_vl_processor_for_torch_free_image_loading()
         from mlx_embeddings import load as mlx_emb_load
 
         return mlx_emb_load(
@@ -611,6 +615,7 @@ class MLXRerankerModel:
                 self._num_labels = getattr(self.model.config, "num_labels", None)
             else:
                 # Use mlx-embeddings for other architectures (ModernBert, etc.)
+                patch_qwen3_vl_processor_for_torch_free_image_loading()
                 from mlx_embeddings import load
 
                 self.model, self.processor = load(

@@ -345,6 +345,7 @@
   "settings.language.ko": "한국어",
   "settings.language.ja": "日本語",
   "settings.language.ru": "Русский",
+  "settings.language.es": "西班牙文",
   "settings.save.button": "儲存設定",
   "settings.save.saving": "儲存中...",
   "settings.models.section_label": "模型設定",
@@ -632,6 +633,8 @@
   "js.error.unload_model_failed": "卸載模型失敗",
   "js.error.save_model_settings_failed": "儲存模型設定失敗",
   "js.info.model_type_reload_required": "模型類型已變更。請卸載並重新載入模型以使變更生效。",
+  "js.info.model_settings_auto_unloaded": "Settings saved. The model was unloaded and will reload with the new settings on next use.",
+  "js.info.model_settings_auto_reloaded": "Settings saved. The pinned model was reloaded with the new settings.",
   "js.error.no_config_defaults": "未找到該模型的設定預設值",
   "js.error.load_generation_config_failed": "載入生成設定失敗",
   "js.error.select_prompt_length": "請至少選擇一個 Prompt 長度",
@@ -644,6 +647,5 @@
   "js.error.delete_model_failed": "刪除模型失敗",
   "js.error.delete_model_connection": "刪除模型失敗，請檢查伺服器連線。",
   "js.success.download_started": "已開始下載：{repo_id}",
-  "js.success.settings_saved": "設定儲存成功",
-  "settings.language.es": "西班牙文"
+  "js.success.settings_saved": "設定儲存成功"
 }

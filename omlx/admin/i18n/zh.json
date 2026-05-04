@@ -345,6 +345,7 @@
   "settings.language.ko": "한국어",
   "settings.language.ja": "日本語",
   "settings.language.ru": "Русский",
+  "settings.language.es": "西班牙语",
   "settings.save.button": "保存设置",
   "settings.save.saving": "保存中...",
   "settings.models.section_label": "模型设置",
@@ -632,6 +633,8 @@
   "js.error.unload_model_failed": "卸载模型失败",
   "js.error.save_model_settings_failed": "保存模型设置失败",
   "js.info.model_type_reload_required": "模型类型已更改。请卸载并重新加载模型以使更改生效。",
+  "js.info.model_settings_auto_unloaded": "Settings saved. The model was unloaded and will reload with the new settings on next use.",
+  "js.info.model_settings_auto_reloaded": "Settings saved. The pinned model was reloaded with the new settings.",
   "js.error.no_config_defaults": "未找到该模型的配置默认值",
   "js.error.load_generation_config_failed": "加载生成配置失败",
   "js.error.select_prompt_length": "请至少选择一个提示词长度",
@@ -644,6 +647,5 @@
   "js.error.delete_model_failed": "删除模型失败",
   "js.error.delete_model_connection": "删除模型失败，请检查服务器连接。",
   "js.success.download_started": "已开始下载：{repo_id}",
-  "js.success.settings_saved": "设置已成功保存",
-  "settings.language.es": "西班牙语"
+  "js.success.settings_saved": "设置已成功保存"
 }

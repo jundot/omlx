@@ -9,9 +9,11 @@ This module provides HTTP routes for the admin panel including:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -128,6 +130,10 @@ class ModelSettingsRequest(BaseModel):
     dflash_enabled: Optional[bool] = None
     dflash_draft_model: Optional[str] = None
     dflash_draft_quant_bits: Optional[int] = None
+    dflash_max_ctx: Optional[int] = None
+    dflash_in_memory_cache: Optional[bool] = None
+    dflash_in_memory_cache_max_bytes: Optional[int] = None
+    dflash_ssd_cache: Optional[bool] = None
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
@@ -317,6 +323,22 @@ def _format_cache_size(size_bytes: int) -> str:
         return f"{gb:.0f}GB"
     mb = size_bytes / (1024 ** 2)
     return f"{mb:.0f}MB"
+
+
+def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
+    """Resolve dflash compatibility for an engine_pool model dict.
+
+    Returns ``(False, "")`` when dflash-mlx is not installed so the UI hides
+    the compat hint instead of pointing the user at an unrelated reason.
+    """
+    try:
+        from ..engine.dflash import is_dflash_compatible
+    except ImportError:
+        return False, ""
+    model_path = model_info.get("model_path") or ""
+    if not model_path:
+        return False, "model_path missing"
+    return is_dflash_compatible(model_path)
 
 
 def _apply_log_level_runtime(level: str) -> None:
@@ -1325,13 +1347,54 @@ async def delete_sub_key(
 # =============================================================================
 
 
+_SUPPORTED_MODELS_DOC_RE = re.compile(
+    r"Supported models:\s*\n((?:\s*-\s*\S.*\n?)+)",
+)
+
+
+def _models_from_docstring(fn) -> List[str]:
+    """Extract the ``Supported models:`` bullet list from an xgrammar 0.1.34+
+    structural-tag function's docstring. Returns ``[]`` if the section is
+    absent or unparseable."""
+    doc = inspect.getdoc(fn) or ""
+    match = _SUPPORTED_MODELS_DOC_RE.search(doc)
+    if not match:
+        return []
+    return [
+        line.strip().lstrip("-").strip()
+        for line in match.group(1).splitlines()
+        if line.strip().startswith("-")
+    ]
+
+
 @router.get("/api/grammar/parsers")
 async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     """Return available reasoning parser names from xgrammar.
 
-    Queries ``xgrammar.get_builtin_structural_tag_supported_models()`` at
-    runtime so the list stays in sync with the installed xgrammar version.
+    Supports both API generations:
+
+    - **xgrammar 0.1.34+** exposes a per-model registry at
+      ``xgrammar.builtin_structural_tag._structural_tag_registry``; supported
+      model names are pulled from each function's docstring.
+    - **xgrammar 0.1.32–0.1.33** exposes the now-removed helper
+      ``get_builtin_structural_tag_supported_models()``.
+
+    Returns ``[]`` if xgrammar is missing, fails to load (e.g. broken native
+    binding on macOS arm64), or has neither API available.
     """
+    # Prefer the 0.1.34+ registry so newer parsers (qwen3_6, gemma4,
+    # deepseek_v4, ...) are exposed.
+    try:
+        from xgrammar.builtin_structural_tag import _structural_tag_registry
+
+        return [
+            {"value": style, "label": style, "models": _models_from_docstring(fn)}
+            for style, fn in _structural_tag_registry.items()
+        ]
+    except Exception as e:
+        logger.debug("xgrammar 0.1.34+ registry unavailable: %s", e)
+
+    # Fall back to the pre-0.1.34 helper.
     try:
         from xgrammar import get_builtin_structural_tag_supported_models
 
@@ -1340,7 +1403,8 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
             {"value": style, "label": style, "models": models}
             for style, models in supported.items()
         ]
-    except ImportError:
+    except Exception as e:
+        logger.warning("xgrammar parser discovery unavailable: %s", e)
         return []
 
 
@@ -1377,11 +1441,22 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     # Get all model settings
     all_settings = settings_manager.get_all_settings() if settings_manager else {}
 
+    # SSD cache dir is set on the scheduler_config when the user enables paged
+    # SSD caching; admin UI consumes it to gate the dflash SSD toggle.
+    ssd_cache_dir = getattr(
+        getattr(engine_pool, "_scheduler_config", None),
+        "paged_ssd_cache_dir",
+        None,
+    )
+    dflash_ssd_cache_available = bool(ssd_cache_dir)
+
     # Combine model info with settings
     models = []
     for model_info in models_status:
         model_id = model_info["id"]
         settings = all_settings.get(model_id)
+
+        compat_ok, compat_reason = _dflash_compat_for_model(model_info)
 
         model_data = {
             "id": model_id,
@@ -1398,6 +1473,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "thinking_default": model_info.get("thinking_default"),
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
             "last_access": model_info.get("last_access"),
+            "dflash_compatible": compat_ok,
+            "dflash_compatibility_reason": compat_reason,
+            "dflash_ssd_cache_available": dflash_ssd_cache_available,
         }
 
         # Add settings if available
@@ -1432,6 +1510,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_enabled": settings.dflash_enabled,
                 "dflash_draft_model": settings.dflash_draft_model,
                 "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
+                "dflash_max_ctx": settings.dflash_max_ctx,
+                "dflash_in_memory_cache": settings.dflash_in_memory_cache,
+                "dflash_in_memory_cache_max_bytes": settings.dflash_in_memory_cache_max_bytes,
+                "dflash_ssd_cache": settings.dflash_ssd_cache,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "trust_remote_code": settings.trust_remote_code,
@@ -1686,11 +1768,55 @@ async def update_model_settings(
         current_settings.specprefill_threshold = request.specprefill_threshold or None
     # DFlash settings
     if "dflash_enabled" in sent:
-        current_settings.dflash_enabled = request.dflash_enabled or False
+        new_dflash_enabled = bool(request.dflash_enabled)
+        if new_dflash_enabled:
+            from ..engine.dflash import is_dflash_compatible
+
+            compat_ok, compat_reason = is_dflash_compatible(entry.model_path)
+            if not compat_ok:
+                raise HTTPException(status_code=400, detail=compat_reason)
+        current_settings.dflash_enabled = new_dflash_enabled
     if "dflash_draft_model" in sent:
         current_settings.dflash_draft_model = request.dflash_draft_model or None
     if "dflash_draft_quant_bits" in sent:
         current_settings.dflash_draft_quant_bits = request.dflash_draft_quant_bits or None
+    if "dflash_max_ctx" in sent:
+        # 0/None means "unlimited" — the engine treats None as no fallback threshold
+        value = request.dflash_max_ctx
+        current_settings.dflash_max_ctx = value if value and value > 0 else None
+    if "dflash_in_memory_cache" in sent:
+        current_settings.dflash_in_memory_cache = bool(request.dflash_in_memory_cache)
+    if "dflash_in_memory_cache_max_bytes" in sent and request.dflash_in_memory_cache_max_bytes:
+        current_settings.dflash_in_memory_cache_max_bytes = int(
+            request.dflash_in_memory_cache_max_bytes
+        )
+    if "dflash_ssd_cache" in sent:
+        ssd_requested = bool(request.dflash_ssd_cache)
+        if ssd_requested:
+            in_mem_after = (
+                bool(request.dflash_in_memory_cache)
+                if "dflash_in_memory_cache" in sent
+                else current_settings.dflash_in_memory_cache
+            )
+            if not in_mem_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail="DFlash SSD cache requires the in-memory cache to be enabled.",
+                )
+            ssd_dir = getattr(
+                getattr(_get_engine_pool(), "_scheduler_config", None),
+                "paged_ssd_cache_dir",
+                None,
+            )
+            if not ssd_dir:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "DFlash SSD cache requires oMLX paged SSD cache to be enabled "
+                        "(set --paged-ssd-cache-dir or configure it in settings)."
+                    ),
+                )
+        current_settings.dflash_ssd_cache = ssd_requested
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -1752,7 +1878,8 @@ async def update_model_settings(
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
 
-    # Warn if engine type or index_cache_freq changed while model is loaded
+    # Auto-unload (and re-load if pinned) when a setting that only takes
+    # effect at engine construction time is changed on a loaded model.
     requires_reload = (
         entry.engine is not None
         and (
@@ -1760,16 +1887,35 @@ async def update_model_settings(
             or "index_cache_freq" in sent
             or "dflash_enabled" in sent
             or "dflash_draft_model" in sent
+            or "dflash_draft_quant_bits" in sent
+            or "dflash_max_ctx" in sent
+            or "dflash_in_memory_cache" in sent
+            or "dflash_in_memory_cache_max_bytes" in sent
+            or "dflash_ssd_cache" in sent
             # trust_remote_code is plumbed at model load time; toggling it on
             # an already-loaded engine has no effect until reload.
             or "trust_remote_code" in sent
         )
     )
+    auto_unloaded = False
+    auto_reloaded = False
     if requires_reload:
-        logger.info(
-            f"Settings changed for loaded model {model_id}. "
-            f"Reload required to take effect."
-        )
+        was_pinned = entry.is_pinned
+        try:
+            logger.info(
+                f"Settings changed for loaded model {model_id}, auto-unloading."
+            )
+            await engine_pool._unload_engine(model_id)
+            auto_unloaded = True
+        except Exception as e:
+            logger.warning(f"Auto-unload failed for {model_id}: {e}")
+        if auto_unloaded and was_pinned:
+            try:
+                await engine_pool._load_engine(model_id)
+                auto_reloaded = True
+                logger.info(f"Auto-reloaded pinned model {model_id} with new settings.")
+            except Exception as e:
+                logger.warning(f"Auto-reload failed for pinned model {model_id}: {e}")
 
     return {
         "success": True,
@@ -1778,6 +1924,8 @@ async def update_model_settings(
         "model_type": entry.model_type,
         "engine_type": entry.engine_type,
         "requires_reload": requires_reload,
+        "auto_unloaded": auto_unloaded,
+        "auto_reloaded": auto_reloaded,
     }
 
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, List
 
 try:
@@ -15,12 +16,18 @@ from ..api.utils import _PRESERVE_BOUNDARY_KEY
 from .output_parser import OutputParserFinalizeResult, OutputParserTokenResult
 
 _OPEN_MARKER = "<|channel>thought\n"
+_OPEN_MARKER_BARE = "<|channel>"
 _CLOSE_MARKER = "<channel|>"
 _TURN_END_MARKER = "<turn|>"
 _TOOL_RESPONSE_OPEN = "<|tool_response>"
 _TOOL_RESPONSE_CLOSE = "<tool_response|>"
 _THINK_OPEN = "<think>\n"
 _THINK_CLOSE = "</think>\n"
+
+_LEADING_THOUGHT_RE = re.compile(
+    r"\A\s*(?:(?:<think>.*?</think>|<\|channel>.*?<channel\|>)\s*)+",
+    re.DOTALL,
+)
 
 
 def _try_parse_json(s: str) -> Any:
@@ -34,6 +41,26 @@ def _try_parse_json(s: str) -> Any:
         return json.loads(s)
     except (json.JSONDecodeError, ValueError):
         return s
+
+
+def _strip_thinking(text: Any) -> Any:
+    """Remove leading ``<think>...</think>`` or raw ``<|channel>...<channel|>`` spans.
+
+    Gemma 4's multi-turn rule requires that only the final visible answer
+    is kept in chat history. Clients such as Open WebUI replay the full
+    assistant content (including the rendered ``<think>`` block, or the
+    raw protocol form when a client preserves it). Feeding prior thought
+    blocks back primes the model to emit malformed channel markers on the
+    next turn, which then leak into user-facing output.
+
+    The match is anchored to the start of the message: the rendered thought
+    block always precedes the visible answer, so this catches every
+    legitimate occurrence while leaving inline mentions (e.g. an assistant
+    explaining how ``<think>`` tags work) untouched.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    return _LEADING_THOUGHT_RE.sub("", text, count=1)
 
 
 def extract_gemma4_messages(
@@ -146,6 +173,9 @@ def extract_gemma4_messages(
             content = msg.get("content", "")
             if isinstance(content, list):
                 content = _extract_text_from_content_list(content)
+            # Per Gemma 4's multi-turn rule, prior thought blocks must not
+            # be fed back into the next turn. Strip them before rendering.
+            content = _strip_thinking(content)
 
             out_msg: dict = {"role": "assistant", "content": content or ""}
 
@@ -286,12 +316,16 @@ class Gemma4OutputParserSession:
         # Channel open/close are tracked unconditionally so a stray
         # ``<channel|>`` outside a thought block (occasionally emitted in long
         # multi-turn contexts) is absorbed instead of leaking into visible
-        # text. Tool-call markup is intentionally not tracked here — the
+        # text. ``_OPEN_MARKER_BARE`` is a defensive fallback for malformed
+        # opens (e.g. ``<|channel>thought<channel|>`` with no newline, or a
+        # bare ``<|channel>`` emitted when the model is confused by polluted
+        # history). Tool-call markup is intentionally not tracked here — the
         # downstream ``ToolCallStreamFilter`` removes it from stream deltas
         # while ``parse_tool_calls`` still sees the raw markers in
         # ``output_text`` for extraction.
         return [
             _OPEN_MARKER,
+            _OPEN_MARKER_BARE,
             _CLOSE_MARKER,
             _TURN_END_MARKER,
             _TOOL_RESPONSE_OPEN,
@@ -345,7 +379,28 @@ class Gemma4OutputParserSession:
                 self._append_text(stream_parts, visible_parts, emit)
                 break
 
+            # Streaming defer: a bare ``<|channel>`` (or ``<|channel>thought``
+            # without trailing newline) at the end of the source could still
+            # extend to the canonical ``<|channel>thought\n`` once more
+            # tokens arrive. Buffer and wait so the canonical match wins.
+            if not final and marker == _OPEN_MARKER_BARE:
+                suffix = source[idx:]
+                if (
+                    len(suffix) < len(_OPEN_MARKER)
+                    and _OPEN_MARKER.startswith(suffix)
+                ):
+                    self._append_text(
+                        stream_parts, visible_parts, source[pos:idx]
+                    )
+                    self._buffer = suffix
+                    return OutputParserTokenResult(
+                        stream_text="".join(stream_parts),
+                        visible_text="".join(visible_parts),
+                    )
+
             self._append_text(stream_parts, visible_parts, source[pos:idx])
+
+            advance = len(marker)
 
             if marker == _OPEN_MARKER:
                 # Nested open while already in a thought block: drop the stray
@@ -355,6 +410,21 @@ class Gemma4OutputParserSession:
                     stream_parts.append(_THINK_OPEN)
                     visible_parts.append(_THINK_OPEN)
                     self._in_thought = True
+            elif marker == _OPEN_MARKER_BARE:
+                # Defensive fallback for malformed opens: ``<|channel>thought``
+                # without the trailing newline, or a bare ``<|channel>`` with
+                # an unrecognised channel name. Treat as a thought open and
+                # absorb the optional ``thought`` keyword and newline so they
+                # don't leak as visible text.
+                if not self._in_thought:
+                    stream_parts.append(_THINK_OPEN)
+                    visible_parts.append(_THINK_OPEN)
+                    self._in_thought = True
+                after = idx + advance
+                if source.startswith("thought\n", after):
+                    advance += len("thought\n")
+                elif source.startswith("thought", after):
+                    advance += len("thought")
             elif marker == _CLOSE_MARKER:
                 # Stray close outside a thought block: drop silently to keep
                 # the marker out of visible content.
@@ -364,7 +434,7 @@ class Gemma4OutputParserSession:
                     self._in_thought = False
             # _TURN_END_MARKER, _TOOL_RESPONSE_OPEN / _CLOSE: silent drop.
 
-            pos = idx + len(marker)
+            pos = idx + advance
 
         return OutputParserTokenResult(
             stream_text="".join(stream_parts),

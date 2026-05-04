@@ -158,6 +158,12 @@ class OutputItem(BaseModel):
     arguments: Optional[str] = None
 
 
+class InputTokensDetails(BaseModel):
+    """Details about input token usage."""
+
+    cached_tokens: int = 0
+
+
 class OutputTokensDetails(BaseModel):
     """Details about output token usage."""
 
@@ -170,6 +176,9 @@ class ResponseUsage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    input_tokens_details: InputTokensDetails = Field(
+        default_factory=InputTokensDetails
+    )
     output_tokens_details: OutputTokensDetails = Field(
         default_factory=OutputTokensDetails
     )

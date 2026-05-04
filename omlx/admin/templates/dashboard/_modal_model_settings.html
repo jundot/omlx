@@ -679,10 +679,19 @@
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">DFlash</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">Block diffusion speculative decoding for 3-4x faster generation. Requires a DFlash draft model checkpoint. (MLX impl by bstnxbt: <a href="https://github.com/bstnxbt/dflash-mlx" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">GitHub</a>) (<a href="https://arxiv.org/abs/2602.06036" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">Paper</a>)</p>
+                                            <p class="text-xs text-neutral-500 mt-0.5">Block diffusion speculative decoding for 3-4x faster generation. Requires a DFlash draft model checkpoint.<br><strong>Single-stream only: requests run one at a time.</strong><br>* MLX impl by bstnxbt(<a href="https://github.com/bstnxbt/dflash-mlx" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">GitHub</a>)</p>
+                                            <p x-show="!modelSettings.dflash_compatible && modelSettings.dflash_compatibility_reason"
+                                               class="text-xs text-amber-600 mt-1"
+                                               x-text="modelSettings.dflash_compatibility_reason"></p>
                                         </div>
-                                        <button type="button" @click="modelSettings.dflash_enabled = !modelSettings.dflash_enabled"
-                                                :class="modelSettings.dflash_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                        <button type="button"
+                                                @click="if (modelSettings.dflash_compatible) modelSettings.dflash_enabled = !modelSettings.dflash_enabled"
+                                                :disabled="!modelSettings.dflash_compatible"
+                                                :title="modelSettings.dflash_compatible ? '' : (modelSettings.dflash_compatibility_reason || 'Unsupported model')"
+                                                :class="[
+                                                    modelSettings.dflash_enabled ? 'bg-black' : 'bg-neutral-200',
+                                                    !modelSettings.dflash_compatible ? 'opacity-40 cursor-not-allowed' : ''
+                                                ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.dflash_enabled ? 'translate-x-5' : 'translate-x-0'"
                                                   class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -708,6 +717,49 @@
                                                 <option value="4">4-bit</option>
                                                 <option value="8">8-bit</option>
                                             </select>
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Max Context (fallback threshold)</label>
+                                            <input type="number" x-model.number="modelSettings.dflash_max_ctx" min="1" step="1024" placeholder="unlimited"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <p class="text-xs text-neutral-400 mt-1">Prompts at or above this token count switch to BatchedEngine. Leave empty for unlimited.</p>
+                                        </div>
+                                        <div class="flex items-start justify-between gap-3 pt-2 border-t border-neutral-200">
+                                            <div class="min-w-0">
+                                                <span class="text-sm font-medium text-neutral-700">In-memory cache</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">DFlash L1 prefix snapshot cache in RAM. Speeds up multi-turn chats with shared prefixes.</p>
+                                            </div>
+                                            <button type="button" @click="modelSettings.dflash_in_memory_cache = !modelSettings.dflash_in_memory_cache; if (!modelSettings.dflash_in_memory_cache) modelSettings.dflash_ssd_cache = false"
+                                                    :class="modelSettings.dflash_in_memory_cache ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="modelSettings.dflash_in_memory_cache ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                        <div x-show="modelSettings.dflash_in_memory_cache" x-transition>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">In-memory cache size (GiB)</label>
+                                            <input type="number" x-model.number="modelSettings.dflash_in_memory_cache_max_gib" min="1" max="256" step="1" placeholder="8"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <p class="text-xs text-neutral-400 mt-1">Byte budget for L1 snapshots; LRU evicts when exceeded.</p>
+                                        </div>
+                                        <div class="flex items-start justify-between gap-3">
+                                            <div class="min-w-0">
+                                                <span class="text-sm font-medium text-neutral-700">SSD cache</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">L2 spill of evicted L1 entries to disk. Uses the oMLX paged SSD cache directory (<code>dflash_l2/</code>).</p>
+                                                <p x-show="!modelSettings.dflash_ssd_cache_available" class="text-xs text-amber-600 mt-1">Enable oMLX paged SSD cache first (<code>--paged-ssd-cache-dir</code>).</p>
+                                                <p x-show="modelSettings.dflash_ssd_cache_available && !modelSettings.dflash_in_memory_cache" class="text-xs text-amber-600 mt-1">Requires in-memory cache to be enabled.</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="if (modelSettings.dflash_ssd_cache_available && modelSettings.dflash_in_memory_cache) modelSettings.dflash_ssd_cache = !modelSettings.dflash_ssd_cache"
+                                                    :disabled="!modelSettings.dflash_ssd_cache_available || !modelSettings.dflash_in_memory_cache"
+                                                    :class="[
+                                                        modelSettings.dflash_ssd_cache ? 'bg-black' : 'bg-neutral-200',
+                                                        (!modelSettings.dflash_ssd_cache_available || !modelSettings.dflash_in_memory_cache) ? 'opacity-40 cursor-not-allowed' : ''
+                                                    ]"
+                                                    class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="modelSettings.dflash_ssd_cache ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
                                         </div>
                                     </div>
                                 </div>
