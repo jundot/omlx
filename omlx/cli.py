@@ -547,6 +547,16 @@ Example directory structure:
         default=None,
         help="Log level (default: info). trace includes full message content",
     )
+    serve_parser.add_argument(
+        "--sse-keepalive-mode",
+        type=str,
+        choices=["chunk", "comment", "off"],
+        default=None,
+        help="SSE keepalive emission mode (default: chunk). 'chunk' emits "
+        "protocol-aware no-op events compatible with strict clients like "
+        "OpenClaw / WorkBuddy; 'comment' emits the legacy ': keep-alive' SSE "
+        "comment; 'off' disables keepalive entirely",
+    )
 
     # Scheduler options (for BatchedEngine)
     serve_parser.add_argument(

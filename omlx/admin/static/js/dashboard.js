@@ -30,7 +30,7 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk' },
                 model: { model_dirs: [''], max_model_memory: '' },
                 memory: { max_process_memory: 'auto', prefill_memory_guard: true },
                 scheduler: { max_concurrent_requests: 8 },
@@ -734,6 +734,7 @@
                             host: this.globalSettings.server.host,
                             port: this.globalSettings.server.port,
                             log_level: this.globalSettings.server.log_level,
+                            sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             max_model_memory: this.globalSettings.model.max_model_memory,
                             model_fallback: this.globalSettings.model.model_fallback,

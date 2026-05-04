@@ -92,3 +92,121 @@ class TestSSEKeepaliveExceptionHandling:
         # No error items
         error_items = [i for i in items if i.startswith("data: {")]
         assert len(error_items) == 0
+
+
+class TestKeepaliveChunkFormats:
+    """Tests for protocol-aware keepalive chunk emission."""
+
+    @pytest.mark.asyncio
+    async def test_chat_chunk_format_is_valid_chat_completion_chunk(self):
+        from omlx.server import _KEEPALIVE_CHAT_CHUNK
+
+        async def gen():
+            yield "data: real\n\n"
+
+        items = await _collect(
+            _with_sse_keepalive(gen(), keepalive_chunk=_KEEPALIVE_CHAT_CHUNK)
+        )
+        assert items[0] == _KEEPALIVE_CHAT_CHUNK
+        body = items[0].removeprefix("data: ").strip()
+        payload = json.loads(body)
+        assert payload["object"] == "chat.completion.chunk"
+        assert payload["choices"][0]["delta"]["content"] == ""
+        assert payload["choices"][0]["finish_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_completion_chunk_format_is_valid_text_completion(self):
+        from omlx.server import _KEEPALIVE_COMPLETION_CHUNK
+
+        async def gen():
+            yield "data: real\n\n"
+
+        items = await _collect(
+            _with_sse_keepalive(gen(), keepalive_chunk=_KEEPALIVE_COMPLETION_CHUNK)
+        )
+        body = items[0].removeprefix("data: ").strip()
+        payload = json.loads(body)
+        assert payload["object"] == "text_completion"
+        assert payload["choices"][0]["text"] == ""
+        assert payload["choices"][0]["finish_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_anthropic_ping_event_format(self):
+        from omlx.server import _KEEPALIVE_ANTHROPIC_PING
+
+        async def gen():
+            yield "event: message_start\ndata: {}\n\n"
+
+        items = await _collect(
+            _with_sse_keepalive(gen(), keepalive_chunk=_KEEPALIVE_ANTHROPIC_PING)
+        )
+        assert items[0].startswith("event: ping\n")
+        assert 'data: {"type":"ping"}' in items[0]
+
+    @pytest.mark.asyncio
+    async def test_keepalive_off_skips_emission(self):
+        async def gen():
+            yield "data: real\n\n"
+
+        items = await _collect(_with_sse_keepalive(gen(), keepalive_chunk=None))
+        # No keepalive frame, just the real chunk passed through
+        assert items == ["data: real\n\n"]
+
+
+class TestResolveKeepalive:
+    """Tests for _resolve_keepalive helper that maps settings to wire format."""
+
+    def _set_mode(self, mode: str):
+        from omlx.server import _server_state
+
+        if _server_state.global_settings is None:
+            pytest.skip("global_settings not initialized")
+        _server_state.global_settings.server.sse_keepalive_mode = mode
+
+    def test_chunk_mode_returns_protocol_specific_frames(self):
+        from omlx.server import (
+            _KEEPALIVE_ANTHROPIC_PING,
+            _KEEPALIVE_CHAT_CHUNK,
+            _KEEPALIVE_COMPLETION_CHUNK,
+            _resolve_keepalive,
+            _server_state,
+        )
+
+        if _server_state.global_settings is None:
+            pytest.skip("global_settings not initialized")
+        original = _server_state.global_settings.server.sse_keepalive_mode
+        try:
+            self._set_mode("chunk")
+            assert _resolve_keepalive("openai_chat") == _KEEPALIVE_CHAT_CHUNK
+            assert _resolve_keepalive("openai_completion") == _KEEPALIVE_COMPLETION_CHUNK
+            assert _resolve_keepalive("anthropic") == _KEEPALIVE_ANTHROPIC_PING
+            # Responses API has no official ping; chunk mode disables keepalive
+            assert _resolve_keepalive("openai_responses") is None
+        finally:
+            _server_state.global_settings.server.sse_keepalive_mode = original
+
+    def test_comment_mode_returns_legacy_comment(self):
+        from omlx.server import _KEEPALIVE_COMMENT, _resolve_keepalive, _server_state
+
+        if _server_state.global_settings is None:
+            pytest.skip("global_settings not initialized")
+        original = _server_state.global_settings.server.sse_keepalive_mode
+        try:
+            self._set_mode("comment")
+            for protocol in ("openai_chat", "openai_completion", "anthropic", "openai_responses"):
+                assert _resolve_keepalive(protocol) == _KEEPALIVE_COMMENT
+        finally:
+            _server_state.global_settings.server.sse_keepalive_mode = original
+
+    def test_off_mode_returns_none(self):
+        from omlx.server import _resolve_keepalive, _server_state
+
+        if _server_state.global_settings is None:
+            pytest.skip("global_settings not initialized")
+        original = _server_state.global_settings.server.sse_keepalive_mode
+        try:
+            self._set_mode("off")
+            for protocol in ("openai_chat", "openai_completion", "anthropic", "openai_responses"):
+                assert _resolve_keepalive(protocol) is None
+        finally:
+            _server_state.global_settings.server.sse_keepalive_mode = original

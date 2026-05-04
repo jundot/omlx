@@ -185,6 +185,7 @@ class GlobalSettingsRequest(BaseModel):
     port: Optional[int] = None
     log_level: Optional[str] = None
     server_aliases: Optional[List[str]] = None
+    sse_keepalive_mode: Optional[str] = None
 
     # Model settings
     model_dirs: Optional[List[str]] = None
@@ -2347,6 +2348,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "port": global_settings.server.port,
             "log_level": global_settings.server.log_level,
             "server_aliases": list(global_settings.server.server_aliases),
+            "sse_keepalive_mode": global_settings.server.sse_keepalive_mode,
         },
         "model": {
             "model_dirs": [
@@ -2476,6 +2478,16 @@ async def update_global_settings(
         # Apply log level at runtime
         _apply_log_level_runtime(request.log_level)
         runtime_applied.append("log_level")
+    if request.sse_keepalive_mode is not None:
+        valid_modes = {"chunk", "comment", "off"}
+        if request.sse_keepalive_mode not in valid_modes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid sse_keepalive_mode: {request.sse_keepalive_mode} "
+                f"(must be one of {sorted(valid_modes)})",
+            )
+        global_settings.server.sse_keepalive_mode = request.sse_keepalive_mode
+        runtime_applied.append("sse_keepalive_mode")
 
     if request.server_aliases is not None:
         from ..utils.network import is_valid_alias
