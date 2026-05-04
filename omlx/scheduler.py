@@ -15,6 +15,7 @@ import concurrent.futures
 import copy
 import gc
 import logging
+import os
 import time
 from collections import defaultdict, deque
 from contextlib import contextmanager
@@ -687,6 +688,32 @@ class Scheduler:
                 "avg_ms": total / count if count else 0.0,
             }
         return result
+
+    def _periodic_clear_threshold_bytes(self) -> int:
+        """Cache-bytes threshold above which the periodic clear runs.
+
+        Defaults to memory_limit/3 when a process memory limit is set,
+        otherwise an absolute 2 GiB floor. Each periodic clear releases
+        the entire MLX buffer pool in one batch; gating it on accumulated
+        bytes avoids producing IOGPUFamily refcount bursts when the pool
+        is already small.
+        """
+        if self._memory_limit_bytes > 0:
+            return max(self._memory_limit_bytes // 3, 2 * 1024**3)
+        return 2 * 1024**3
+
+    def _should_periodic_clear_cache(self) -> bool:
+        """Decide whether the per-step periodic clear should fire.
+
+        Returns False unless ``mlx_cache_cleanup_interval`` is configured,
+        the step counter just landed on the interval boundary, AND the
+        MLX buffer pool exceeds the threshold. See #978 / #1040 for the
+        kernel panic class this gating is meant to mitigate.
+        """
+        interval = self.config.mlx_cache_cleanup_interval
+        if interval <= 0 or self._step_counter % interval != 0:
+            return False
+        return mx.get_cache_memory() > self._periodic_clear_threshold_bytes()
 
     @staticmethod
     def _collect_arrays_from_extracted_cache(
@@ -4126,12 +4153,7 @@ class Scheduler:
 
         # Periodic Metal cache cleanup
         self._step_counter += 1
-        should_clear = False
-        if (
-            self.config.mlx_cache_cleanup_interval > 0
-            and self._step_counter % self.config.mlx_cache_cleanup_interval == 0
-        ):
-            should_clear = True
+        should_clear = self._should_periodic_clear_cache()
         # Deferred post-completion cleanup: fire once the step counter reaches
         # the target set by _cleanup_finished() (#435, #557).
         if self._deferred_clear_at is not None and self._step_counter >= self._deferred_clear_at:
