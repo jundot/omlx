@@ -1863,46 +1863,30 @@
                 }
             },
 
-            get codexCommand() {
+            _launchCmd(tool) {
                 const cli = this.stats.cli_prefix || 'omlx';
-                const model = this.globalSettings.integrations.codex_model || 'select-a-model';
-                const parts = [`${this.shellQuote(cli)} launch codex --model ${this.shellQuote(model)}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
-                }
-                return parts.join(' ');
+                return `${cli} launch ${tool}`;
+            },
+
+            get claudeCommand() {
+                return this._launchCmd('claude');
+            },
+
+            get codexCommand() {
+                return this._launchCmd('codex');
             },
 
             get opencodeCommand() {
-                const cli = this.stats.cli_prefix || 'omlx';
-                const model = this.globalSettings.integrations.opencode_model || 'select-a-model';
-                const parts = [`${this.shellQuote(cli)} launch opencode --model ${this.shellQuote(model)}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
-                }
-                return parts.join(' ');
+                return this._launchCmd('opencode');
             },
 
             get openclawCommand() {
-                const cli = this.stats.cli_prefix || 'omlx';
-                const model = this.globalSettings.integrations.openclaw_model || 'select-a-model';
-                const profile = this.globalSettings.integrations.openclaw_tools_profile || 'full';
-                const parts = [`${this.shellQuote(cli)} launch openclaw --model ${this.shellQuote(model)}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
-                }
-                parts.push(`--tools-profile ${this.shellQuote(profile)}`);
-                return parts.join(' ');
+                const profile = this.globalSettings.integrations.openclaw_tools_profile || 'coding';
+                return `${this._launchCmd('openclaw')} --tools-profile ${profile}`;
             },
 
             get piCommand() {
-                const cli = this.stats.cli_prefix || 'omlx';
-                const model = this.globalSettings.integrations.pi_model || 'select-a-model';
-                const parts = [`${this.shellQuote(cli)} launch pi --model ${this.shellQuote(model)}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
-                }
-                return parts.join(' ');
+                return this._launchCmd('pi');
             },
 
             async saveIntegrationSettings() {

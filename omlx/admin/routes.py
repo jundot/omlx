@@ -37,6 +37,7 @@ from .auth import (
     require_admin,
     validate_api_key,
     verify_api_key,
+    verify_session,
 )
 from ..settings import SubKeyEntry
 from ..model_profiles import EXCLUDED_FROM_PROFILES
@@ -1547,10 +1548,41 @@ async def unload_model(
     return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
 
 
+async def _require_admin_or_bearer(request: Request) -> bool:
+    """Allow admin session OR a valid Bearer API key (for CLI use)."""
+    gs = _get_global_settings() if _get_global_settings else None
+
+    # No-auth mode: always allow
+    if gs is not None and gs.auth.skip_api_key_verification:
+        return True
+
+    # Valid admin session cookie
+    if verify_session(request):
+        return True
+
+    # Bearer token matching the configured API key
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer ") and gs is not None:
+        token = auth_header[7:]
+        server_key = gs.auth.api_key or ""
+        sub_keys = gs.auth.sub_keys or []
+        if verify_api_key(token, server_key):
+            return True
+        for sk in sub_keys:
+            if verify_api_key(token, getattr(sk, "key", "")):
+                return True
+
+    raise HTTPException(
+        status_code=401,
+        detail="Admin authentication required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 @router.post("/api/models/{model_id}/load")
 async def load_model(
     model_id: str,
-    is_admin: bool = Depends(require_admin),
+    is_admin: bool = Depends(_require_admin_or_bearer),
 ):
     """Manually load a model into memory."""
     engine_pool = _get_engine_pool()

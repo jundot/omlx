@@ -65,6 +65,8 @@ dependencies = [
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.5.1 (110f261) — runtime_context, prefix cache (L1+L2), verify-specialized int4 qmm
     "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@110f261",
+    # TUI for interactive model selection in omlx launch
+    "textual>=0.80.0",
 ]
 
 [project.optional-dependencies]
