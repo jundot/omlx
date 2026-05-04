@@ -48,8 +48,6 @@ requirements = [
     "mcp>=1.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # TUI for interactive model selection in omlx launch
-    "textual>=0.80.0",
     # mlx-vlm from commit (e41cd25) - aligned with pyproject.toml
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e41cd25565861500e48c076ab31aaeafee0ed80f",
     # dflash-mlx v0.1.3 (814c4a1) — block diffusion speculative decoding + temperature sampling

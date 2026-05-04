@@ -43,8 +43,9 @@ class Integration:
     ) -> str:
         """Select a model interactively.
 
-        Shows a textual TUI when running in a TTY; falls back to numbered
-        terminal selection when textual is unavailable or stdout is not a TTY.
+        Shows a curses arrow-key picker when running in a TTY; falls back to
+        numbered terminal selection when curses is unavailable (e.g. native
+        Windows Python) or stdout is not a TTY.
 
         Returns the selected model id (empty string when models_info is empty).
         """
@@ -58,8 +59,13 @@ class Integration:
 
         if sys.stdout.isatty():
             try:
-                return _select_model_tui(models_info, name)
+                return _select_model_curses(models_info, name)
             except ImportError:
+                # Stdlib curses missing (e.g. native windows python).
+                pass
+            except Exception:
+                # Curses init/runtime failure (dumb terminal, no terminfo
+                # entry, broken pipe, etc.). Fall through to numbered.
                 pass
 
         # Fallback: numbered terminal selection
@@ -117,18 +123,21 @@ class Integration:
         print(f"Config written: {config_path}")
 
 
-def _select_model_tui(models_info: list[dict], tool_name: str) -> str:
-    """Show a compact inline textual TUI for interactive model selection.
+def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
+    """Show a fullscreen curses arrow-key picker for model selection.
 
-    Loaded models appear first with a filled bullet; unloaded (available on disk)
-    appear after with an empty bullet and a warning on selection.
+    Loaded models appear first with a filled bullet; unloaded (available on
+    disk) appear after with an empty bullet. Curses uses terminfo so this
+    works reliably across SSH/PuTTY/tmux/screen, unlike inline ANSI TUIs.
 
-    Raises ImportError if textual is not installed.
+    Raises ImportError if stdlib curses is not available.
     Returns the selected model id, or exits with 130 on cancel.
     """
-    from textual.app import App, ComposeResult
-    from textual.binding import Binding
-    from textual.widgets import Label, ListItem, ListView
+    import curses
+    import locale
+
+    # Required so curses renders unicode bullets (●○) correctly.
+    locale.setlocale(locale.LC_ALL, "")
 
     # Sort: loaded first, then unloaded. Default to False so a missing
     # "loaded" key (e.g. status fetch failed) renders as ○ rather than ●.
@@ -136,74 +145,51 @@ def _select_model_tui(models_info: list[dict], tool_name: str) -> str:
     unloaded = [m for m in models_info if not m.get("loaded", False)]
     ordered = loaded + unloaded
 
-    result: list[str] = []
+    selected: list[str] = []
 
-    class ModelSelectorApp(App):
-        ENABLE_COMMAND_PALETTE = False
-        CSS = """
-        Screen {
-            background: transparent;
-            height: auto;
-            max-height: 20;
-        }
-        #title {
-            padding: 0 2;
-            text-style: bold;
-            height: 1;
-        }
-        ListView {
-            border: none;
-            background: transparent;
-            height: auto;
-            max-height: 15;
-        }
-        ListItem {
-            padding: 0 1;
-            height: 1;
-            background: transparent;
-        }
-        ListItem:focus-within {
-            background: $accent 20%;
-        }
-        #hint {
-            padding: 0 2;
-            height: 1;
-        }
-        """
+    def _picker(stdscr) -> None:
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        idx = 0
+        while True:
+            stdscr.erase()
+            try:
+                stdscr.addstr(0, 1, f"oMLX > Launch {tool_name}", curses.A_BOLD)
+                for i, m in enumerate(ordered):
+                    bullet = "●" if m.get("loaded", False) else "○"
+                    ctx = m.get("max_context_window")
+                    ctx_str = f"  {ctx // 1000}k" if ctx else ""
+                    line = f"  {bullet}  {m['id']}{ctx_str}"
+                    attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
+                    stdscr.addstr(i + 2, 1, line, attr)
+                stdscr.addstr(
+                    len(ordered) + 3,
+                    1,
+                    "↑↓ navigate   Enter launch   q cancel",
+                    curses.A_DIM,
+                )
+            except curses.error:
+                # Window too small to render the full picker; keep going so
+                # the user can resize and the next loop redraws cleanly.
+                pass
+            stdscr.refresh()
 
-        BINDINGS = [
-            Binding("q", "quit_cancel", "Cancel", show=False),
-            Binding("escape", "quit_cancel", "Cancel", show=False),
-        ]
+            key = stdscr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                idx = (idx - 1) % len(ordered)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                idx = (idx + 1) % len(ordered)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                selected.append(ordered[idx]["id"])
+                return
+            elif key in (ord("q"), 27):  # q or ESC
+                return
 
-        def compose(self) -> ComposeResult:
-            yield Label(f" oMLX › Launch {tool_name}", id="title")
-            items = []
-            for m in ordered:
-                is_loaded = m.get("loaded", False)
-                bullet = "●" if is_loaded else "○"
-                ctx = m.get("max_context_window")
-                ctx_str = f"  {ctx // 1000}k" if ctx else ""
-                label = f" {bullet} {m['id']}{ctx_str}"
-                items.append(ListItem(Label(label)))
-            yield ListView(*items)
-            yield Label(" ↑↓ navigate   Enter launch   q cancel", id="hint")
+    curses.wrapper(_picker)
 
-        def on_list_view_selected(self, event: ListView.Selected) -> None:
-            idx = event.list_view.index
-            if idx is not None and 0 <= idx < len(ordered):
-                result.append(ordered[idx]["id"])
-            self.exit()
-
-        def action_quit_cancel(self) -> None:
-            self.exit()
-
-    app = ModelSelectorApp()
-    app.run(inline=True)
-
-    if not result:
+    if not selected:
         print("No model selected.")
         # 130 is the conventional shell exit code for SIGINT/cancel.
         sys.exit(130)
 
-    return result[0]
+    return selected[0]
