@@ -7,8 +7,10 @@ for better throughput when serving multiple concurrent requests.
 """
 
 import copy
+import json
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
@@ -27,6 +29,48 @@ try:
 except ImportError:
     HAS_HARMONY_ADAPTER = False
     preprocess_harmony_messages = None  # type: ignore
+
+
+# Known model types that mlx_lm cannot load. mlx_lm uses
+# ``importlib.import_module(f"mlx_lm.models.{model_type}")`` which fails for
+# unsupported architectures. Track upstream mlx-lm issues at:
+#   https://github.com/ml-explore/mlx-lm/issues
+_KNOWN_UNSUPPORTED_DRAFT_TYPES = {
+    "gemma4_assistant": (
+        "gemma4_assistant is not supported by mlx-lm. "
+        "This model type requires support in Apple's mlx-lm library. "
+        "Please file a feature request at https://github.com/ml-explore/mlx-lm"
+    ),
+}
+
+
+def _is_specprefill_compatible(model_path: str) -> tuple[bool, str]:
+    """Check if a model is likely loadable by mlx_lm.load() as a specprefill draft.
+
+    Returns (compatible: bool, hint: str).
+    If compatible=False, hint explains why and links to upstream.
+
+    This is a best-effort pre-check based on config.json model_type.
+    HF repos without a local config.json are assumed compatible
+    (mlx_lm will handle download and type detection).
+    """
+    cfg_path = Path(model_path) / "config.json"
+    if not cfg_path.exists():
+        # HF repo path — mlx_lm handles it
+        return True, ""
+
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        # Can't read config — defer to mlx_lm.load() which will surface the error
+        return True, ""
+
+    model_type = cfg.get("model_type", "")
+    hint = _KNOWN_UNSUPPORTED_DRAFT_TYPES.get(model_type, "")
+    if hint:
+        return False, hint
+    return True, ""
 
 
 class BatchedEngine(BaseEngine):
@@ -273,6 +317,12 @@ class BatchedEngine(BaseEngine):
             specprefill_draft = getattr(self._model_settings, "specprefill_draft_model", None)
             specprefill_enabled = getattr(self._model_settings, "specprefill_enabled", False)
             if specprefill_enabled and specprefill_draft:
+                # Pre-check: surface known incompatibilities before mlx_lm.load() fails
+                compatible, hint = _is_specprefill_compatible(specprefill_draft)
+                if not compatible:
+                    logger.warning(
+                        f"SpecPrefill: draft model may not be loadable — {hint}"
+                    )
                 try:
                     def _load_draft():
                         draft_model, _ = load(specprefill_draft)

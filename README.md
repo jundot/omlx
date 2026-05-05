@@ -325,6 +325,38 @@ FastAPI Server (OpenAI / Anthropic API)
 
 </details>
 
+## Troubleshooting
+
+### Speculative Decoding
+
+#### DFlash
+
+DFlash is a Rust-based block-diffusion drafter that works with Qwen models only. This is
+a hard limitation of the [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) Rust backend.
+DFlash is not available for Gemma, Llama, or other architectures.
+
+#### SpecPrefill
+
+SpecPrefill uses `mlx_lm.load()` to load the draft model. Any model type supported by
+[mlx-lm](https://github.com/ml-explore/mlx-lm) can be used as a draft. If your draft model
+fails to load with an error like "Model type X not supported", this means mlx-lm does not
+yet have a model loader for that architecture.
+
+Known unsupported draft model types:
+- `gemma4_assistant` — See [mlx-lm#XXXX](https://github.com/ml-explore/mlx-lm/issues)
+
+To request support for a new model type, please open an issue at
+https://github.com/ml-explore/mlx-lm with the model architecture details.
+
+### Structured Output
+
+Structured output requires the `--with-grammar` install flag which includes xgrammar. If
+you installed without this flag and need structured output, reinstall with:
+
+```bash
+brew reinstall jundot/omlx/omlx --with-grammar
+```
+
 ## Development
 
 ### CLI Server
