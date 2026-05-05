@@ -325,6 +325,123 @@ FastAPI Server (OpenAI / Anthropic API)
 
 </details>
 
+## Troubleshooting
+
+### Structured Output (xgrammar)
+
+Structured output requires the `--with-grammar` install flag which includes xgrammar. If
+you installed without this flag and need structured output, reinstall with:
+
+```bash
+brew reinstall jundot/omlx/omlx --with-grammar
+```
+
+The formula's `post_install` hook should fix xgrammar automatically. If structured output
+still fails after reinstalling with `--with-grammar`, apply the manual fix below.
+
+#### Detecting the Problem
+
+```bash
+# Run this with the OMLX libexec Python (not system Python)
+OMLX_CELLAR=$(ls -td /opt/homebrew/Cellar/omlx/HEAD-* 2>/dev/null | head -1 || \
+              ls -td /opt/homebrew/Cellar/omlx/*/ 2>/dev/null | tail -1)
+${OMLX_CELLAR}/libexec/bin/python3.11 -c "import xgrammar; print('xgrammar OK')"
+```
+
+Common failure modes:
+
+| Error | Cause |
+|-------|-------|
+| `ModuleNotFoundError: No module named 'xgrammar'` | xgrammar not installed — reinstall with `--with-grammar` |
+| `Cannot find library: libxgrammar_bindings.dylib` | Missing RECORD file in xgrammar dist-info |
+| `Library not loaded: @rpath/libtvm_ffi.dylib` | Missing rpath in libxgrammar_bindings.dylib |
+| `Killed: 9` on import | SIP killed an unsigned dylib |
+
+#### Manual Fix
+
+If `brew reinstall --with-grammar` does not resolve the issue, apply all four steps:
+
+**Step 1 — Find your OMLX libexec path** (the path differs per version):
+
+```bash
+OMLX_CELLAR=$(ls -td /opt/homebrew/Cellar/omlx/HEAD-* 2>/dev/null | head -1 || \
+              ls -td /opt/homebrew/Cellar/omlx/*/ 2>/dev/null | tail -1)
+SITE_PACKAGES="${OMLX_CELLAR}libexec/lib/python3.11/site-packages"
+echo "Site packages: $SITE_PACKAGES"
+```
+
+**Step 2 — Create the missing RECORD file:**
+
+```bash
+SITE="$SITE_PACKAGES"   # from step 1
+cd "$SITE"
+
+# Build RECORD entries for all files in xgrammar/ and xgrammar-*.dist-info/
+{
+  for f in $(find xgrammar -type f | grep -v "\\.dSYM" | sort); do
+    size=$(wc -c < "$f" | tr -d ' ')
+    echo "$f,$size,"
+  done
+  for f in $(find xgrammar-*.dist-info -type f | sort); do
+    size=$(wc -c < "$f" | tr -d ' ')
+    echo "$f,$size,"
+  done
+} > "xgrammar-*.dist-info/RECORD"
+```
+
+**Step 3 — Fix dylib load paths and re-sign:**
+
+```bash
+SITE="$SITE_PACKAGES"   # from step 1
+
+# Add @loader_path rpaths so both dylibs can find each other at runtime
+install_name_tool -add_rpath "@loader_path/" \
+  "$SITE/xgrammar/libxgrammar_bindings.dylib"
+install_name_tool -add_rpath "@loader_path/../tvm_ffi/lib/" \
+  "$SITE/xgrammar/libxgrammar_bindings.dylib"
+install_name_tool -add_rpath "@loader_path/" \
+  "$SITE/tvm_ffi/lib/libtvm_ffi.dylib"
+
+# Re-sign both dylibs — SIP kills unsigned dylibs with SIGKILL
+codesign -f -s - "$SITE/xgrammar/libxgrammar_bindings.dylib"
+codesign -f -s - "$SITE/tvm_ffi/lib/libtvm_ffi.dylib"
+```
+
+**Step 4 — Patch `load_binding.py` for DYLD_LIBRARY_PATH fallback** (required on some macOS versions):
+
+```bash
+SITE="$SITE_PACKAGES"   # from step 1
+cat >> "$SITE/xgrammar/load_binding.py" << 'PATCH'
+import os, pathlib as _pp
+_xg_root = _pp.Path(__file__).parent.parent
+_tvm_root = _xg_root / "tvm_ffi"
+_lib_dir = str(_tvm_root / "lib")
+_dylib_dir = str(_xg_root / "xgrammar")
+_existing = os.environ.get("DYLD_LIBRARY_PATH", "")
+_parts = [p for p in [_lib_dir, _dylib_dir, _existing] if p]
+os.environ["DYLD_LIBRARY_PATH"] = ":".join(_parts)
+PATCH
+```
+
+**Verify the fix:**
+
+```bash
+OMLX_CELLAR=$(ls -td /opt/homebrew/Cellar/omlx/HEAD-* 2>/dev/null | head -1 || \
+              ls -td /opt/homebrew/Cellar/omlx/*/ 2>/dev/null | tail -1)
+${OMLX_CELLAR}/libexec/bin/python3.11 -c "import xgrammar; print('xgrammar OK -- structured output ready')"
+```
+
+Alternatively, run the automated fix script:
+
+```bash
+python3 scripts/fix-xgrammar.py
+```
+
+> **Note:** The manual fix lives in Homebrew's Cellar directory. Running `brew upgrade omlx`
+> reinstalls OMLX and overwrites these changes. After every upgrade, re-run
+> `brew reinstall jundot/omlx/omlx --with-grammar` to apply the formula's official fix.
+> If that still fails, repeat the steps above.
+
 ## Development
 
 ### CLI Server
