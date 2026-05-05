@@ -322,3 +322,131 @@ class TestPagedSSDV3Format:
         assert "3" in _READABLE_CACHE_FORMAT_VERSIONS
 
         manager.close()
+
+
+class TestPrefixCacheNTupleSubState:
+    """prefix_cache._extract_block_tensor_slice preserves N-tuple sub-state.
+
+    V4's CacheList(RotatingKVCache, PoolingCache) hits the non-sliceable
+    branch (PoolingCache's buf_kv is 3D so all_sub_sliceable=False). Before
+    the fix, that branch cloned only ``sub_state[0], sub_state[1]`` from
+    each sub_state — silently dropping PoolingCache's ``pooled`` (index 2),
+    which corrupted the cross-session prefix cache hit.
+
+    The fix here: clone every element of every sub_state, wrap length>=3
+    sub_states in an ``__nstate__`` marker so downstream paged_ssd /
+    reconstruct paths see the full tuple.
+    """
+
+    def test_cache_list_non_sliceable_preserves_third_element(self):
+        """Most direct regression guard for V4 cross-session corruption.
+
+        Builds a cache_data with a CacheList layer whose second sub_state
+        is a 3-tuple (mimicking PoolingCache.state = (buf_kv, buf_gate,
+        pooled)) and verifies the third element survives the slice path.
+        """
+        import mlx.core as mx
+
+        from omlx.cache.prefix_cache import BlockAwarePrefixCache
+
+        # Stand-in cache that records type without needing a model.
+        class _FakeManager:
+            def get_block_size(self):
+                return 64
+
+            def cleanup(self):
+                pass
+
+        prefix_cache = BlockAwarePrefixCache.__new__(BlockAwarePrefixCache)
+        prefix_cache._block_size = 64
+
+        # Build a CacheList layer with two sub_states:
+        # - sub 0: 2-tuple (keys, values) — RotatingKVCache style, 4D but
+        #   axis-2 mismatch with sub 1 forces non-sliceable branch
+        # - sub 1: 3-tuple (buf_kv, buf_gate, pooled) — PoolingCache style
+        rot_keys = mx.zeros((1, 4, 16, 8))  # (B, H, seq, D)
+        rot_values = mx.zeros((1, 4, 16, 8))
+        buf_kv = mx.zeros((1, 4, 8))  # 3D — fails 4D sliceable check
+        buf_gate = mx.zeros((1, 4, 8))
+        pooled = mx.arange(1 * 32 * 8, dtype=mx.float32).reshape(1, 32, 8)
+        mx.eval(rot_keys, rot_values, buf_kv, buf_gate, pooled)
+
+        cache_data = [
+            {
+                "cache_type": "CacheList",
+                "class_name": "CacheList",
+                "state": [
+                    (rot_keys, rot_values),
+                    (buf_kv, buf_gate, pooled),
+                ],
+                "sub_class_names": ["RotatingKVCache", "PoolingCache"],
+            }
+        ]
+
+        block_slices = prefix_cache._extract_block_tensor_slice(
+            cache_data, start_idx=0, end_idx=16, is_last_block=True
+        )
+        assert block_slices is not None
+        assert len(block_slices) == 1
+        cache_list_marker = block_slices[0]
+        assert cache_list_marker[0] == "__cache_list__"
+        sub_tensors = cache_list_marker[1]
+        assert len(sub_tensors) == 2
+
+        # Sub 0 is length-2 → unwrapped to legacy (keys, values).
+        sub0 = sub_tensors[0]
+        assert isinstance(sub0, tuple) and len(sub0) == 2
+        assert mx.max(mx.abs(sub0[0] - rot_keys)).item() == 0.0
+
+        # Sub 1 is length-3 → preserved as __nstate__ marker. The third
+        # element (pooled) MUST survive — this is the V4 fix point.
+        sub1 = sub_tensors[1]
+        assert isinstance(sub1, tuple)
+        assert sub1[0] == "__nstate__"
+        assert sub1[1] == "PoolingCache"
+        elements = sub1[2]
+        assert len(elements) == 3
+        # Critical regression guard: pooled tensor preserved byte-equal.
+        assert mx.max(mx.abs(elements[2] - pooled)).item() == 0.0
+        # buf_kv / buf_gate also preserved.
+        assert mx.max(mx.abs(elements[0] - buf_kv)).item() == 0.0
+        assert mx.max(mx.abs(elements[1] - buf_gate)).item() == 0.0
+
+    def test_cache_list_legacy_two_tuple_unchanged(self):
+        """CacheList with all 2-tuple sub_states (legacy) round-trips
+        unchanged — keeps the V2 shape so existing callers see no
+        behavioral change."""
+        import mlx.core as mx
+
+        from omlx.cache.prefix_cache import BlockAwarePrefixCache
+
+        prefix_cache = BlockAwarePrefixCache.__new__(BlockAwarePrefixCache)
+        prefix_cache._block_size = 64
+
+        keys = mx.arange(1 * 4 * 16 * 8, dtype=mx.float32).reshape(1, 4, 16, 8)
+        values = mx.zeros((1, 4, 16, 8))
+        mx.eval(keys, values)
+
+        cache_data = [
+            {
+                "cache_type": "CacheList",
+                "class_name": "CacheList",
+                "state": [
+                    (keys, values),
+                    (keys, values),
+                ],
+                "sub_class_names": ["KVCache", "KVCache"],
+            }
+        ]
+
+        block_slices = prefix_cache._extract_block_tensor_slice(
+            cache_data, start_idx=0, end_idx=16, is_last_block=True
+        )
+        assert block_slices is not None
+        marker = block_slices[0]
+        assert marker[0] == "__cache_list__"
+        # Both sub_states are length 2 → legacy (keys, values) tuples.
+        for sub in marker[1]:
+            assert isinstance(sub, tuple)
+            assert len(sub) == 2
+            assert mx.max(mx.abs(sub[0] - keys)).item() == 0.0
