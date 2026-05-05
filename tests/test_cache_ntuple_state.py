@@ -323,7 +323,6 @@ class TestPagedSSDV3Format:
 
         manager.close()
 
-
 class TestPrefixCacheNTupleSubState:
     """prefix_cache._extract_block_tensor_slice preserves N-tuple sub-state.
 
