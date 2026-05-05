@@ -363,6 +363,66 @@ class DFlashEngine(BaseEngine):
             return False
         return len(prompt_tokens) >= self._max_dflash_ctx
 
+    def _get_think_token_id(self, attr: str) -> int | None:
+        """Safely read think_start_id / think_end_id from the tokenizer."""
+        try:
+            return getattr(self._tokenizer_obj, attr, None)
+        except (ValueError, TypeError):
+            return None
+
+    def _detect_needs_think_prefix(self, prompt_tokens: list[int]) -> bool:
+        """Detect if prompt ends with an open <think> tag (thinking enabled).
+
+        DFlash bypasses the scheduler, so the ``<think>\\n`` prefix that the
+        scheduler normally prepends to the first chunk for reasoning models
+        must be reproduced here. Mirrors ``Scheduler._detect_needs_think_prefix``.
+
+        Returns False for disabled-thinking patterns like <think></think>
+        where </think> immediately follows <think> in the prompt tail.
+        """
+        if not prompt_tokens:
+            return False
+
+        think_start_id = self._get_think_token_id('think_start_id')
+        if think_start_id is None and self._tokenizer_obj is not None:
+            try:
+                tid = self._tokenizer_obj.convert_tokens_to_ids("<think>")
+                if tid == getattr(self._tokenizer_obj, 'unk_token_id', None):
+                    return False
+                think_start_id = tid
+            except (AttributeError, KeyError, TypeError):
+                return False
+
+        if not think_start_id:
+            return False
+
+        last_tokens = list(prompt_tokens[-3:])
+        if think_start_id not in last_tokens:
+            return False
+
+        last_idx = len(last_tokens) - 1 - last_tokens[::-1].index(think_start_id)
+        after_start = last_tokens[last_idx + 1:]
+
+        if after_start:
+            think_end_id = self._get_think_token_id('think_end_id')
+            if think_end_id is not None and think_end_id in after_start:
+                return False
+            if self._tokenizer_obj is not None:
+                try:
+                    tid = self._tokenizer_obj.convert_tokens_to_ids("</think>")
+                    unk = getattr(self._tokenizer_obj, 'unk_token_id', None)
+                    if tid != unk and tid in after_start:
+                        return False
+                except (AttributeError, KeyError, TypeError):
+                    pass
+
+        return True
+
+    def _think_prefix_text(self) -> str:
+        """Return the opening think tag string to prepend (e.g. '<think>\\n')."""
+        tag = getattr(self._tokenizer_obj, 'think_start', '<think>')
+        return f"{tag}\n"
+
     def _stream_dflash_events(
         self,
         prompt_tokens: list[int],
@@ -616,6 +676,15 @@ class DFlashEngine(BaseEngine):
         text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
         text = clean_special_tokens(text)
 
+        # Reasoning models (Qwen3.x with enable_thinking, DeepSeek, MiniMax, ...)
+        # have <think>\n at the END of the prompt, so the model's first
+        # generated token is already INSIDE the thinking block. The opening
+        # tag never appears in the output, which would prevent extract_thinking
+        # / ThinkingParser from separating reasoning from content. Prepend
+        # the tag here so the API layer can split them correctly.
+        if self._detect_needs_think_prefix(prompt_tokens):
+            text = self._think_prefix_text() + text
+
         return GenerationOutput(
             text=text,
             tokens=generated,
@@ -675,6 +744,14 @@ class DFlashEngine(BaseEngine):
         queue: asyncio.Queue = asyncio.Queue()
         stop_event = threading.Event()
 
+        # Reasoning models put <think>\n at the end of the prompt, so dflash
+        # generates tokens already inside the thinking block. The streaming
+        # ThinkingParser starts in _in_thinking=False, so without prepending
+        # the opening tag on the first chunk the whole reasoning block leaks
+        # into content. Mirror Scheduler._detect_needs_think_prefix here.
+        needs_think_prefix = self._detect_needs_think_prefix(prompt_tokens)
+        think_prefix_pending = needs_think_prefix
+
         from ..engine_core import get_mlx_executor
         self._active_request = True
         future = loop.run_in_executor(
@@ -695,6 +772,10 @@ class DFlashEngine(BaseEngine):
         try:
             while True:
                 new_text, new_tokens, finished, metrics = await queue.get()
+
+                if think_prefix_pending and new_text:
+                    new_text = self._think_prefix_text() + new_text
+                    think_prefix_pending = False
 
                 total_text += new_text
                 total_completion += len(new_tokens)

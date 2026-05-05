@@ -320,3 +320,113 @@ class TestDFlashEnginePoolRouting:
         )
         assert settings.dflash_enabled is True
         assert settings.dflash_draft_model == "z-lab/Qwen3.5-4B-DFlash"
+
+
+class TestDFlashThinkPrefix:
+    """DFlash bypasses the scheduler, so it must replicate scheduler's
+    needs_think_prefix detection. Otherwise reasoning models leak the
+    whole thinking block into content (issue #1068)."""
+
+    def _make_engine(self, tokenizer):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        engine._tokenizer_obj = tokenizer
+        return engine
+
+    def _tokenizer(self, *, think_start_id=None, think_end_id=None,
+                   think_start_str="<think>"):
+        class _Tok:
+            pass
+
+        tok = _Tok()
+        tok.unk_token_id = 999
+        tok.think_start_id = think_start_id
+        tok.think_end_id = think_end_id
+        tok.think_start = think_start_str
+        return tok
+
+    def test_detect_returns_true_when_prompt_ends_with_think(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = self._make_engine(self._tokenizer(
+            think_start_id=151667, think_end_id=151668,
+        ))
+        # prompt ending: ..., <|im_start|>assistant\n, <think>\n
+        assert engine._detect_needs_think_prefix([100, 200, 151667]) is True
+
+    def test_detect_returns_false_when_close_follows_open(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = self._make_engine(self._tokenizer(
+            think_start_id=151667, think_end_id=151668,
+        ))
+        # disabled-thinking pattern: <think></think>
+        assert engine._detect_needs_think_prefix(
+            [100, 151667, 151668]
+        ) is False
+
+    def test_detect_returns_false_when_think_start_id_unavailable(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        # Tokenizer has neither think_start_id nor convert_tokens_to_ids
+        tok = self._tokenizer(think_start_id=None)
+        engine = self._make_engine(tok)
+        assert engine._detect_needs_think_prefix([100, 200, 300]) is False
+
+    def test_detect_returns_false_for_empty_prompt(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = self._make_engine(self._tokenizer(think_start_id=151667))
+        assert engine._detect_needs_think_prefix([]) is False
+
+    def test_detect_returns_false_when_think_not_in_tail(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = self._make_engine(self._tokenizer(think_start_id=151667))
+        # <think> appears earlier but not in last 3 — already inside an
+        # assistant turn, so a fresh prefix is not needed
+        assert engine._detect_needs_think_prefix(
+            [151667, 1, 2, 3, 4, 5]
+        ) is False
+
+    def test_think_prefix_text_uses_tokenizer_attr(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = self._make_engine(self._tokenizer(
+            think_start_str="<longcat_think>",
+        ))
+        assert engine._think_prefix_text() == "<longcat_think>\n"
+
+    def test_think_prefix_text_default(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        # Tokenizer with no think_start attr falls back to <think>
+        class _Tok:
+            pass
+        engine = self._make_engine(_Tok())
+        assert engine._think_prefix_text() == "<think>\n"
