@@ -36,6 +36,8 @@ class CacheType(Enum):
     ARRAYS_CACHE = "ArraysCache"
     QUANTIZED_KVCACHE = "QuantizedKVCache"
     CACHE_LIST = "CacheList"
+    POOLING_CACHE = "PoolingCache"
+    BATCH_POOLING_CACHE = "BatchPoolingCache"
 
 
 @dataclass
@@ -184,7 +186,9 @@ class KVCacheHandler(CacheTypeHandler):
         return {
             "keys": keys,
             "values": values,
-            "offset": getattr(cache_obj, "offset", keys.shape[2] if keys is not None else 0),
+            "offset": getattr(
+                cache_obj, "offset", keys.shape[2] if keys is not None else 0
+            ),
             "cache_type": self.cache_type.value,
         }
 
@@ -317,7 +321,9 @@ class RotatingKVCacheHandler(CacheTypeHandler):
             "keys": keys,
             "values": values,
             "offset": getattr(cache_obj, "offset", 0),
-            "max_size": getattr(cache_obj, "max_size", keys.shape[2] if keys is not None else 0),
+            "max_size": getattr(
+                cache_obj, "max_size", keys.shape[2] if keys is not None else 0
+            ),
             "keep": getattr(cache_obj, "keep", 0),
             "_idx": getattr(cache_obj, "_idx", 0),
             "meta_state": meta_state,
@@ -598,7 +604,9 @@ class ArraysCacheHandler(CacheTypeHandler):
     def extract_state(self, cache_obj: Any) -> Dict[str, Any]:
         """Extract state from ArraysCache object."""
         # Unwrap if wrapped in SizedArraysCache
-        inner = cache_obj._inner if isinstance(cache_obj, SizedArraysCache) else cache_obj
+        inner = (
+            cache_obj._inner if isinstance(cache_obj, SizedArraysCache) else cache_obj
+        )
         state_list = inner.state if hasattr(inner, "state") else inner.cache
 
         return {
@@ -802,14 +810,20 @@ class CacheListHandler(CacheTypeHandler):
             Reconstructed CacheList object, or None on failure.
         """
         sub_states = state.get("sub_states", [])
-        if not meta_state or not isinstance(meta_state, (list, tuple)) or len(meta_state) < 2:
+        if (
+            not meta_state
+            or not isinstance(meta_state, (list, tuple))
+            or len(meta_state) < 2
+        ):
             logger.error("CacheList reconstruct: missing or invalid meta_state")
             return None
 
         class_names, sub_meta_states = meta_state[0], meta_state[1]
 
         # Validate lengths match to prevent silent zip truncation
-        if len(sub_states) != len(class_names) or len(sub_states) != len(sub_meta_states):
+        if len(sub_states) != len(class_names) or len(sub_states) != len(
+            sub_meta_states
+        ):
             logger.error(
                 f"CacheList reconstruct: length mismatch — "
                 f"sub_states={len(sub_states)}, class_names={len(class_names)}, "
@@ -820,7 +834,9 @@ class CacheListHandler(CacheTypeHandler):
         # Sanitize sub_meta_states for sub-cache types that don't support
         # meta_state (inherit _BaseCache's strict setter which rejects
         # truthy values).  Use "" to match _BaseCache.meta_state getter.
-        _NO_META_STATE_TYPES = frozenset({"KVCache", "ConcatenateKVCache", "ArraysCache"})
+        _NO_META_STATE_TYPES = frozenset(
+            {"KVCache", "ConcatenateKVCache", "ArraysCache"}
+        )
         sanitized_sub_meta_states = [
             "" if cls_name in _NO_META_STATE_TYPES else sub_meta
             for cls_name, sub_meta in zip(class_names, sub_meta_states)
@@ -830,7 +846,9 @@ class CacheListHandler(CacheTypeHandler):
         try:
             from mlx_lm.models.cache import CacheList
 
-            return CacheList.from_state(sub_states, (class_names, sanitized_sub_meta_states))
+            return CacheList.from_state(
+                sub_states, (class_names, sanitized_sub_meta_states)
+            )
         except (ImportError, AttributeError, TypeError, KeyError, Exception) as e:
             logger.debug(f"CacheList.from_state() unavailable or failed: {e}")
 
@@ -846,7 +864,9 @@ class CacheListHandler(CacheTypeHandler):
         from .type_registry import CacheTypeRegistry as _Registry  # local import
 
         sub_caches = []
-        for sub_state, cls_name, sub_meta in zip(sub_states, class_names, sub_meta_states):
+        for sub_state, cls_name, sub_meta in zip(
+            sub_states, class_names, sub_meta_states
+        ):
             # Normalize class name for handler lookup
             normalized_name = self._CLASS_NAME_NORMALIZE.get(cls_name, cls_name)
             sub_handler = _Registry.get_handler_by_class_name(normalized_name)
@@ -869,7 +889,9 @@ class CacheListHandler(CacheTypeHandler):
                         )
                         return None
             except Exception as e:
-                logger.error(f"CacheList fallback: failed to reconstruct {cls_name}: {e}")
+                logger.error(
+                    f"CacheList fallback: failed to reconstruct {cls_name}: {e}"
+                )
                 return None
 
             if sub_cache is None:

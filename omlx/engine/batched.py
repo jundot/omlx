@@ -88,17 +88,17 @@ class BatchedEngine(BaseEngine):
             return None
         # Try different ways to access model_type
         try:
-            if hasattr(self._model, 'config'):
+            if hasattr(self._model, "config"):
                 config = self._model.config
-                if hasattr(config, 'model_type'):
+                if hasattr(config, "model_type"):
                     model_type = config.model_type
                     return model_type if isinstance(model_type, str) else None
                 elif isinstance(config, dict):
-                    model_type = config.get('model_type')
+                    model_type = config.get("model_type")
                     return model_type if isinstance(model_type, str) else None
-            if hasattr(self._model, 'args'):
+            if hasattr(self._model, "args"):
                 args = self._model.args
-                if hasattr(args, 'model_type'):
+                if hasattr(args, "model_type"):
                     model_type = args.model_type
                     return model_type if isinstance(model_type, str) else None
         except Exception as e:
@@ -114,6 +114,7 @@ class BatchedEngine(BaseEngine):
         """
         try:
             from ..adapter.output_parser import detect_message_extractor
+
             model_config = None
             if self._model is not None and hasattr(self._model, "config"):
                 cfg = self._model.config
@@ -139,7 +140,9 @@ class BatchedEngine(BaseEngine):
         try:
             from ..api.grammar import create_grammar_compiler
 
-            self._grammar_compiler = create_grammar_compiler(self._tokenizer, self._model)
+            self._grammar_compiler = create_grammar_compiler(
+                self._tokenizer, self._model
+            )
             logger.info("GrammarCompiler initialized for %s", self._model_name)
         except Exception:
             from ..utils.install import get_install_method
@@ -202,12 +205,18 @@ class BatchedEngine(BaseEngine):
 
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
+        from ..utils.model_loading import maybe_apply_pre_load_patches
 
         # Build tokenizer config with model-specific fixes
         tokenizer_config = get_tokenizer_config(
             self._model_name,
             trust_remote_code=self._trust_remote_code,
         )
+
+        # Apply pre-load patches that need to register modules into
+        # sys.modules before mlx_lm.load() runs (e.g. DeepSeek V4 PR 1192).
+        # Gated on model_type, so other models pay zero cost.
+        maybe_apply_pre_load_patches(self._model_name)
 
         # Load model on the global MLX executor to avoid blocking the event loop
         # while ensuring no concurrent Metal operations. See issue #85.
@@ -227,22 +236,29 @@ class BatchedEngine(BaseEngine):
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import apply_post_load_transforms
 
-        self._model = apply_post_load_transforms(
-            self._model, self._model_settings
-        )
+        self._model = apply_post_load_transforms(self._model, self._model_settings)
 
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled:
-                from ..patches.turboquant_attention import apply_turboquant_attention_patch
+                from ..patches.turboquant_attention import (
+                    apply_turboquant_attention_patch,
+                )
+
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 
         # Create engine config (copy to avoid mutating the shared instance)
-        scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()
-        scheduler_config.model_name = self._model_name  # Ensure cache isolation per model
+        scheduler_config = (
+            copy.copy(self._scheduler_config)
+            if self._scheduler_config
+            else SchedulerConfig()
+        )
+        scheduler_config.model_name = (
+            self._model_name
+        )  # Ensure cache isolation per model
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,
@@ -270,18 +286,28 @@ class BatchedEngine(BaseEngine):
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
-            specprefill_draft = getattr(self._model_settings, "specprefill_draft_model", None)
-            specprefill_enabled = getattr(self._model_settings, "specprefill_enabled", False)
+            specprefill_draft = getattr(
+                self._model_settings, "specprefill_draft_model", None
+            )
+            specprefill_enabled = getattr(
+                self._model_settings, "specprefill_enabled", False
+            )
             if specprefill_enabled and specprefill_draft:
                 try:
+
                     def _load_draft():
                         draft_model, _ = load(specprefill_draft)
                         return draft_model
-                    draft_model = await loop.run_in_executor(get_mlx_executor(), _load_draft)
+
+                    draft_model = await loop.run_in_executor(
+                        get_mlx_executor(), _load_draft
+                    )
                     self._engine.engine.scheduler.set_specprefill_draft_model(
                         draft_model, draft_model_name=specprefill_draft
                     )
-                    logger.info(f"SpecPrefill: draft model loaded ({specprefill_draft})")
+                    logger.info(
+                        f"SpecPrefill: draft model loaded ({specprefill_draft})"
+                    )
                 except Exception as e:
                     logger.error(f"SpecPrefill: draft model load failed: {e}")
 
@@ -292,7 +318,7 @@ class BatchedEngine(BaseEngine):
         """Stop the engine and cleanup resources."""
         if self._engine:
             await self._engine.stop()
-            if hasattr(self._engine, 'engine') and self._engine.engine is not None:
+            if hasattr(self._engine, "engine") and self._engine.engine is not None:
                 try:
                     self._engine.engine.close()
                 except Exception as e:
@@ -317,7 +343,7 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs: Optional kwargs passed to tokenizer.apply_chat_template
                 (e.g. enable_thinking, reasoning_effort). Overrides global _enable_thinking.
         """
-        if hasattr(self._tokenizer, 'apply_chat_template'):
+        if hasattr(self._tokenizer, "apply_chat_template"):
             is_partial = detect_and_strip_partial(messages)
             template_kwargs = {
                 "tokenize": False,
@@ -504,11 +530,17 @@ class BatchedEngine(BaseEngine):
         if kwargs.get("specprefill") is not None:
             specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
         if kwargs.get("specprefill_keep_pct") is not None:
-            specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop("specprefill_keep_pct")
+            specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop(
+                "specprefill_keep_pct"
+            )
         if kwargs.get("specprefill_threshold") is not None:
-            specprefill_kwargs["specprefill_threshold"] = kwargs.pop("specprefill_threshold")
+            specprefill_kwargs["specprefill_threshold"] = kwargs.pop(
+                "specprefill_threshold"
+            )
         if kwargs.get("specprefill_system_end") is not None:
-            specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
+            specprefill_kwargs["specprefill_system_end"] = kwargs.pop(
+                "specprefill_system_end"
+            )
 
         request_id = await self._engine.add_request(
             prompt=prompt,
@@ -540,14 +572,20 @@ class BatchedEngine(BaseEngine):
                 )
         except GeneratorExit:
             # Client disconnected
-            logger.info(f"[stream_generate] GeneratorExit caught for request {request_id}")
+            logger.info(
+                f"[stream_generate] GeneratorExit caught for request {request_id}"
+            )
         finally:
             # Abort the request if client disconnected before completion
             if not finished_normally:
-                logger.info(f"[stream_generate] Aborting request {request_id} (finished_normally={finished_normally})")
+                logger.info(
+                    f"[stream_generate] Aborting request {request_id} (finished_normally={finished_normally})"
+                )
                 await self._engine.abort_request(request_id)
             else:
-                logger.debug(f"[stream_generate] Request {request_id} finished normally")
+                logger.debug(
+                    f"[stream_generate] Request {request_id} finished normally"
+                )
 
     async def chat(
         self,
@@ -656,9 +694,15 @@ class BatchedEngine(BaseEngine):
         # SpecPrefill: compute system prompt token count for protection.
         # Can't template system-only messages (most templates require user),
         # so compute by subtracting non-system from full prompt tokens.
-        specprefill_model_enabled = getattr(self._model_settings, "specprefill_enabled", False) if self._model_settings else False
+        specprefill_model_enabled = (
+            getattr(self._model_settings, "specprefill_enabled", False)
+            if self._model_settings
+            else False
+        )
         if specprefill_model_enabled and kwargs.get("specprefill") is not False:
-            non_system = [m for m in messages if m.get("role") not in ("system", "developer")]
+            non_system = [
+                m for m in messages if m.get("role") not in ("system", "developer")
+            ]
             if len(non_system) < len(messages) and non_system:
                 try:
                     non_system_prompt = self._apply_chat_template(

@@ -3,10 +3,46 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def maybe_apply_pre_load_patches(model_name: str) -> None:
+    """Apply patches that need to run *before* mlx_lm.load() runs.
+
+    Currently dispatches the DeepSeek V4 patch (PR 1192) when
+    ``config.json`` declares ``model_type == "deepseek_v4"``. The patch
+    injects new modules into ``sys.modules`` and replaces a couple of
+    mlx-lm internals; gating on model type keeps other models at zero
+    cost.
+
+    Safe to call repeatedly; the patches are idempotent.
+    """
+    config_path = Path(model_name) / "config.json"
+    if not config_path.exists():
+        # HF repo IDs and other non-local paths fall through. mlx_lm.load
+        # downloads the config first and we'll rely on that path being
+        # taken before anyone calls a deepseek_v4 model anyway. Safe
+        # default: do nothing here.
+        return
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception as e:
+        logger.debug(
+            "Could not read %s for pre-load patch dispatch: %s", config_path, e
+        )
+        return
+
+    model_type = config.get("model_type")
+    if model_type == "deepseek_v4":
+        from ..patches.deepseek_v4 import apply_deepseek_v4_patch
+
+        if apply_deepseek_v4_patch():
+            logger.info("DeepSeek V4 pre-load patch applied for %s", model_name)
 
 
 def load_text_model(
@@ -14,6 +50,7 @@ def load_text_model(
     tokenizer_config: dict[str, Any] | None = None,
 ):
     """Load an LLM model/tokenizer pair via mlx-lm."""
+    maybe_apply_pre_load_patches(model_name)
     from mlx_lm import load
 
     return load(model_name, tokenizer_config=tokenizer_config)
