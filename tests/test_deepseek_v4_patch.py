@@ -229,8 +229,9 @@ class TestTokenizerPatch:
     def test_unrelated_error_reraises(self, applied_patch):
         """Errors outside the deepseek_v4 / max_position_embeddings signature
         must NOT be swallowed."""
-        import pytest as _pytest
         from unittest.mock import patch as mock_patch
+
+        import pytest as _pytest
 
         from omlx.patches.deepseek_v4 import tokenizer_patch
 
@@ -247,8 +248,9 @@ class TestTokenizerPatch:
     def test_explicit_config_skips_fallback(self, applied_patch):
         """If the caller already passed config=, we must not override it
         even when the inner call raises a matching error."""
-        import pytest as _pytest
         from unittest.mock import patch as mock_patch
+
+        import pytest as _pytest
 
         from omlx.patches.deepseek_v4 import tokenizer_patch
 
@@ -277,6 +279,139 @@ class TestTokenizerPatch:
 
         # register is an upstream classmethod — wrapped class must expose it.
         assert tu.AutoTokenizer.register is upstream_at.register
+
+
+class TestDSMLToolParser:
+    """tool_parser_v4 — DSML invoke / parameter grammar parsing."""
+
+    def test_single_invoke_typed_args(self, applied_patch):
+        from omlx.patches.deepseek_v4 import tool_parser_v4 as tp
+
+        text = (
+            '<｜DSML｜invoke name="get_weather">\n'
+            '<｜DSML｜parameter name="city" string="true">Seoul</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="days" string="false">7</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="imperial" string="false">false</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>"
+        )
+        result = tp.parse_tool_call(text)
+        assert result["name"] == "get_weather"
+        assert result["arguments"] == {
+            "city": "Seoul",
+            "days": 7,
+            "imperial": False,
+        }
+
+    def test_multiple_invokes_returns_list(self, applied_patch):
+        from omlx.patches.deepseek_v4 import tool_parser_v4 as tp
+
+        text = (
+            '<｜DSML｜invoke name="a">'
+            '<｜DSML｜parameter name="x" string="false">1</｜DSML｜parameter>'
+            "</｜DSML｜invoke>\n"
+            '<｜DSML｜invoke name="b">'
+            '<｜DSML｜parameter name="y" string="true">hello</｜DSML｜parameter>'
+            "</｜DSML｜invoke>"
+        )
+        result = tp.parse_tool_call(text)
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[0] == {"name": "a", "arguments": {"x": 1}}
+        assert result[1] == {"name": "b", "arguments": {"y": "hello"}}
+
+    def test_object_and_array_parameters(self, applied_patch):
+        from omlx.patches.deepseek_v4 import tool_parser_v4 as tp
+
+        text = (
+            '<｜DSML｜invoke name="search">\n'
+            '<｜DSML｜parameter name="filters" string="false">'
+            '{"category": "books", "min_price": 10}'
+            "</｜DSML｜parameter>\n"
+            '<｜DSML｜parameter name="ids" string="false">[1, 2, 3]</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>"
+        )
+        result = tp.parse_tool_call(text)
+        assert result["arguments"]["filters"] == {"category": "books", "min_price": 10}
+        assert result["arguments"]["ids"] == [1, 2, 3]
+
+    def test_no_invoke_raises(self, applied_patch):
+        import pytest as _pytest
+
+        from omlx.patches.deepseek_v4 import tool_parser_v4 as tp
+
+        with _pytest.raises(ValueError, match="No.*invoke.*block"):
+            tp.parse_tool_call("just some plain text without DSML markup")
+
+    def test_outer_markers_exposed(self, applied_patch):
+        from omlx.patches.deepseek_v4 import tool_parser_v4 as tp
+
+        # mlx-lm reads these as module attributes for stream detection.
+        assert tp.tool_call_start == "<｜DSML｜tool_calls>"
+        assert tp.tool_call_end == "</｜DSML｜tool_calls>"
+
+
+class TestChatTemplateV4:
+    """chat_template_v4 — DSML system prompt + tool_calls render."""
+
+    def test_outer_marker_uses_tool_calls_not_function_calls(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        # vllm's DeepSeekV4ToolParser overrides only the outer marker
+        # name (tool_calls vs V3.2's function_calls). Verify our copy
+        # made that one edit.
+        assert "function_calls" not in ct.tool_calls_template
+        assert "tool_calls" in ct.tool_calls_template
+        assert "function_calls" not in ct.TOOLS_SYSTEM_TEMPLATE
+
+    def test_inner_grammar_unchanged_from_v32(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        # Inner markers must still be invoke / parameter — V4 reuses V3.2's
+        # invoke/parameter grammar.
+        assert "invoke" in ct.tool_call_template
+        assert "parameter" in ct.encode_arguments_to_dsml(
+            {"name": "x", "arguments": '{"k": "v"}'}
+        )
+
+    def test_round_trip_encode_then_parse(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+        from omlx.patches.deepseek_v4 import tool_parser_v4 as tp
+
+        encoded_args = ct.encode_arguments_to_dsml(
+            {"name": "f", "arguments": '{"a": 1, "b": "hi", "c": [1, 2]}'}
+        )
+        invoke = ct.tool_call_template.format(
+            dsml_token=ct.dsml_token, name="f", arguments=encoded_args
+        )
+        block = ct.tool_calls_template.format(
+            dsml_token=ct.dsml_token, tool_calls=invoke
+        )
+        # Strip the outer markers as TokenizerWrapper would.
+        inner = (
+            block.replace(tp.tool_call_start, "").replace(tp.tool_call_end, "").strip()
+        )
+        parsed = tp.parse_tool_call(inner)
+        assert parsed == {"name": "f", "arguments": {"a": 1, "b": "hi", "c": [1, 2]}}
+
+
+class TestChatTemplateModuleRegistration:
+    """sys.modules registration so mlx-lm's importlib path picks up our types."""
+
+    def test_chat_template_module_registered(self, applied_patch):
+        import sys
+
+        assert "mlx_lm.chat_templates.deepseek_v4" in sys.modules
+        mod = sys.modules["mlx_lm.chat_templates.deepseek_v4"]
+        assert hasattr(mod, "apply_chat_template")
+
+    def test_tool_parser_module_registered(self, applied_patch):
+        import sys
+
+        assert "mlx_lm.tool_parsers.deepseek_v4" in sys.modules
+        mod = sys.modules["mlx_lm.tool_parsers.deepseek_v4"]
+        assert hasattr(mod, "parse_tool_call")
+        assert mod.tool_call_start == "<｜DSML｜tool_calls>"
+        assert mod.tool_call_end == "</｜DSML｜tool_calls>"
 
 
 class TestModelClassResolution:

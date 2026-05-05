@@ -153,11 +153,16 @@ def apply_deepseek_v4_patch() -> bool:
 
     # 6. Wrap tokenizer_utils.AutoTokenizer (deepseek_v4 fallback for
     #    transformers releases that pre-date PR 45643 / 2026-05-02).
-    from .tokenizer_patch import apply_tokenizer_patch
+    from .tokenizer_patch import apply_load_patch, apply_tokenizer_patch
 
     apply_tokenizer_patch()
 
-    # 7. Register omlx-side cache handlers.
+    # 7. Wrap tokenizer_utils.load to inject DSML chat_template +
+    #    tool_parser for deepseek_v4 models whose published jinja is
+    #    minimal and lacks tool grammar.
+    apply_load_patch()
+
+    # 8. Register omlx-side cache handlers.
     _register_cache_handlers()
 
     _APPLIED = True

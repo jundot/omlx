@@ -31,6 +31,7 @@ on the specific exception signature, retries with an empty
 attribute, so attribute-replacement is enough — we don't need to touch
 the ``load`` function body.
 """
+
 from __future__ import annotations
 
 import logging
@@ -77,12 +78,9 @@ def _build_wrapper():
                 # Only fall back on the specific deepseek_v4 / missing
                 # max_position_embeddings signature. Everything else
                 # re-raises unchanged.
-                if (
-                    "config" in kwargs
-                    or (
-                        "deepseek_v4" not in message
-                        and "max_position_embeddings" not in message
-                    )
+                if "config" in kwargs or (
+                    "deepseek_v4" not in message
+                    and "max_position_embeddings" not in message
                 ):
                     raise
                 warnings.warn(
@@ -135,5 +133,119 @@ def apply_tokenizer_patch() -> bool:
     logger.info(
         "mlx_lm.tokenizer_utils.AutoTokenizer wrapped "
         "(deepseek_v4 / max_position_embeddings fallback active)"
+    )
+    return True
+
+
+_LOAD_PATCHED = False
+
+
+def _register_chat_template_and_parser_modules() -> None:
+    """Register our chat_template_v4 / tool_parser_v4 as if they lived
+    inside mlx-lm. mlx-lm's tokenizer_config dispatcher does
+    ``importlib.import_module(f"mlx_lm.chat_templates.{type}")`` and
+    ``importlib.import_module(f"mlx_lm.tool_parsers.{type}")``, so
+    putting our modules under those qualified names keeps the upstream
+    code path intact.
+    """
+    import sys
+
+    # chat_templates.deepseek_v4
+    if "mlx_lm.chat_templates.deepseek_v4" not in sys.modules:
+        from . import chat_template_v4 as _ct
+
+        sys.modules["mlx_lm.chat_templates.deepseek_v4"] = _ct
+    # tool_parsers.deepseek_v4
+    if "mlx_lm.tool_parsers.deepseek_v4" not in sys.modules:
+        from . import tool_parser_v4 as _tp
+
+        sys.modules["mlx_lm.tool_parsers.deepseek_v4"] = _tp
+
+
+def _is_deepseek_v4_model(model_path) -> bool:
+    """Return True if ``model_path/config.json`` declares deepseek_v4."""
+    import json
+    from pathlib import Path
+
+    p = Path(model_path) / "config.json"
+    if not p.exists():
+        return False
+    try:
+        return json.loads(p.read_text()).get("model_type") == "deepseek_v4"
+    except Exception:
+        return False
+
+
+def apply_load_patch() -> bool:
+    """Wrap ``mlx_lm.tokenizer_utils.load`` so DeepSeek V4 models get the
+    DSML chat_template + tool_parser injected even when the published
+    ``tokenizer_config.json`` ships a minimal jinja with no tool grammar.
+
+    Approach: call upstream ``load``, then on the returned
+    ``TokenizerWrapper`` overwrite ``_chat_template``, ``_tool_parser``,
+    ``_tool_call_start``, ``_tool_call_end``, and the cached
+    ``_tool_call_*_tokens`` so they reflect our V4 modules. Touching
+    ``_attribute`` directly is hacky, but mlx-lm is pinned by commit so
+    the layout is stable, and going through the public init kwargs
+    would require either rewriting tokenizer_config.json on disk or
+    re-running ``load`` recursively — both worse trade-offs.
+    """
+    global _LOAD_PATCHED
+    if _LOAD_PATCHED:
+        return False
+
+    _register_chat_template_and_parser_modules()
+
+    orig_load = _tu.load
+
+    def patched_load(model_path, tokenizer_config_extra=None, eos_token_ids=None):
+        wrapper = orig_load(
+            model_path,
+            tokenizer_config_extra=tokenizer_config_extra,
+            eos_token_ids=eos_token_ids,
+        )
+
+        if not _is_deepseek_v4_model(model_path):
+            return wrapper
+
+        from . import chat_template_v4 as _ct
+        from . import tool_parser_v4 as _tp
+
+        # Skip if the published tokenizer_config already wired up V4 by
+        # itself — leave whatever the user / publisher chose alone.
+        if wrapper._chat_template is None:
+            wrapper._chat_template = _ct.apply_chat_template
+            wrapper.has_chat_template = True
+        if wrapper._tool_parser is None:
+            wrapper._tool_parser = _tp.parse_tool_call
+            wrapper._tool_call_start = _tp.tool_call_start
+            wrapper._tool_call_end = _tp.tool_call_end
+            try:
+                wrapper._tool_call_start_tokens = tuple(
+                    wrapper._tokenizer.encode(
+                        _tp.tool_call_start, add_special_tokens=False
+                    )
+                )
+                wrapper._tool_call_end_tokens = tuple(
+                    wrapper._tokenizer.encode(
+                        _tp.tool_call_end, add_special_tokens=False
+                    )
+                )
+            except Exception as e:
+                logger.warning(
+                    "Could not encode DSML tool-call markers as tokens: %s", e
+                )
+        logger.info(
+            "Injected DeepSeek V4 DSML chat_template + tool_parser into "
+            "TokenizerWrapper for %s",
+            model_path,
+        )
+        return wrapper
+
+    _tu.load = patched_load
+    _LOAD_PATCHED = True
+    logger.info(
+        "mlx_lm.tokenizer_utils.load wrapped "
+        "(injects DSML chat_template + tool_parser for deepseek_v4)"
     )
     return True
