@@ -340,6 +340,9 @@ class SchedulerConfig:
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
     mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
 
+    # Penalty window: context size for repetition/presence/frequency penalties
+    penalty_window: int = 20
+
 
 @dataclass
 class SchedulerOutput:
@@ -1201,12 +1204,15 @@ class Scheduler:
             repetition_penalty=sampling_params.repetition_penalty
             if sampling_params.repetition_penalty != 1.0
             else None,
+            repetition_context_size=self.config.penalty_window,
             presence_penalty=sampling_params.presence_penalty
             if sampling_params.presence_penalty != 0.0
             else None,
+            presence_context_size=self.config.penalty_window,
             frequency_penalty=sampling_params.frequency_penalty
             if sampling_params.frequency_penalty != 0.0
             else None,
+            frequency_context_size=self.config.penalty_window,
         )
 
         # Convert stop tokens from Set[int] to Sequence[Sequence[int]]
@@ -1636,12 +1642,15 @@ class Scheduler:
             repetition_penalty=sampling_params.repetition_penalty
             if sampling_params.repetition_penalty != 1.0
             else None,
+            repetition_context_size=self.config.penalty_window,
             presence_penalty=sampling_params.presence_penalty
             if sampling_params.presence_penalty != 0.0
             else None,
+            presence_context_size=self.config.penalty_window,
             frequency_penalty=sampling_params.frequency_penalty
             if sampling_params.frequency_penalty != 0.0
             else None,
+            frequency_context_size=self.config.penalty_window,
         )
 
         # Add thinking budget processor for reasoning models

@@ -520,6 +520,7 @@ class SamplingSettings:
     top_p: float = 0.95
     top_k: int = 0
     repetition_penalty: float = 1.0
+    penalty_window: int = 20
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -530,6 +531,7 @@ class SamplingSettings:
             "top_p": self.top_p,
             "top_k": self.top_k,
             "repetition_penalty": self.repetition_penalty,
+            "penalty_window": self.penalty_window,
         }
 
     @classmethod
@@ -542,6 +544,7 @@ class SamplingSettings:
             top_p=data.get("top_p", 0.95),
             top_k=data.get("top_k", 0),
             repetition_penalty=data.get("repetition_penalty", 1.0),
+            penalty_window=data.get("penalty_window", 20),
         )
 
 
@@ -1131,6 +1134,10 @@ class GlobalSettings:
             errors.append(
                 f"Invalid sampling top_k: {self.sampling.top_k} (must be >= 0)"
             )
+        if self.sampling.penalty_window < 1:
+            errors.append(
+                f"Invalid penalty_window: {self.sampling.penalty_window} (must be >= 1)"
+            )
 
         # Claude Code validation
         if self.claude_code.target_context_size <= 0:
@@ -1203,6 +1210,7 @@ class GlobalSettings:
             hot_cache_only=self.cache.hot_cache_only,
             paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(self.base_path),
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
+            penalty_window=self.sampling.penalty_window,
         )
 
     def to_dict(self) -> dict[str, Any]:

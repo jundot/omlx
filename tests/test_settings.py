@@ -1580,6 +1580,7 @@ class TestSamplingSettings:
         assert settings.top_p == 0.95
         assert settings.top_k == 0
         assert settings.repetition_penalty == 1.0
+        assert settings.penalty_window == 20
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
@@ -1588,6 +1589,8 @@ class TestSamplingSettings:
         assert d["max_context_window"] == 4096
         assert "max_tokens" in d
         assert "repetition_penalty" in d
+        assert "penalty_window" in d
+        assert d["penalty_window"] == 20
 
     def test_from_dict(self):
         """Test creation from dictionary."""
@@ -1602,6 +1605,13 @@ class TestSamplingSettings:
         settings = SamplingSettings.from_dict({})
         assert settings.max_context_window == 32768
         assert settings.repetition_penalty == 1.0
+        assert settings.penalty_window == 20
+
+    def test_from_dict_with_penalty_window(self):
+        """Test from_dict with penalty_window override."""
+        data = {"penalty_window": 64}
+        settings = SamplingSettings.from_dict(data)
+        assert settings.penalty_window == 64
 
 
 class TestClaudeCodeSettings:

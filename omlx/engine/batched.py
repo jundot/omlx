@@ -243,6 +243,12 @@ class BatchedEngine(BaseEngine):
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()
         scheduler_config.model_name = self._model_name  # Ensure cache isolation per model
+
+        # Propagate per-model settings overrides to scheduler config
+        if self._model_settings is not None:
+            if getattr(self._model_settings, 'penalty_window', None) is not None:
+                scheduler_config.penalty_window = self._model_settings.penalty_window
+
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,

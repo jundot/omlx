@@ -199,6 +199,7 @@ class SamplingDefaults:
     top_p: float = 0.95
     top_k: int = 0
     repetition_penalty: float = 1.0
+    penalty_window: int = 20
     force_sampling: bool = False
 
 
@@ -1155,6 +1156,7 @@ def init_server(
             top_p=global_settings.sampling.top_p,
             top_k=global_settings.sampling.top_k,
             repetition_penalty=getattr(global_settings.sampling, 'repetition_penalty', 1.0),
+            penalty_window=getattr(global_settings.sampling, 'penalty_window', 20),
         )
     else:
         _server_state.sampling = SamplingDefaults()

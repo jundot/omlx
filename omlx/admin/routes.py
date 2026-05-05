@@ -109,6 +109,7 @@ class ModelSettingsRequest(BaseModel):
     repetition_penalty: Optional[float] = None
     min_p: Optional[float] = None
     presence_penalty: Optional[float] = None
+    penalty_window: Optional[int] = None
     force_sampling: Optional[bool] = None
     max_tool_result_tokens: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
@@ -230,6 +231,7 @@ class GlobalSettingsRequest(BaseModel):
     sampling_top_p: Optional[float] = None
     sampling_top_k: Optional[int] = None
     sampling_repetition_penalty: Optional[float] = None
+    sampling_penalty_window: Optional[int] = None
 
     # Claude Code settings
     claude_code_context_scaling_enabled: Optional[bool] = None
@@ -694,6 +696,7 @@ def _apply_sampling_settings_runtime(
     top_p: Optional[float],
     top_k: Optional[int],
     repetition_penalty: Optional[float] = None,
+    penalty_window: Optional[int] = None,
 ) -> tuple[bool, str]:
     """
     Apply sampling default settings at runtime.
@@ -730,6 +733,10 @@ def _apply_sampling_settings_runtime(
     if repetition_penalty is not None:
         _server_state.sampling.repetition_penalty = repetition_penalty
         changes.append(f"repetition_penalty={repetition_penalty}")
+
+    if penalty_window is not None:
+        _server_state.sampling.penalty_window = penalty_window
+        changes.append(f"penalty_window={penalty_window}")
 
     if changes:
         return True, f"Sampling defaults updated: {', '.join(changes)}"
@@ -1492,6 +1499,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "repetition_penalty": settings.repetition_penalty,
                 "min_p": settings.min_p,
                 "presence_penalty": settings.presence_penalty,
+                "penalty_window": settings.penalty_window,
                 "force_sampling": settings.force_sampling,
                 "max_tool_result_tokens": settings.max_tool_result_tokens,
                 "enable_thinking": settings.enable_thinking,
@@ -1725,6 +1733,8 @@ async def update_model_settings(
         current_settings.min_p = request.min_p
     if "presence_penalty" in sent:
         current_settings.presence_penalty = request.presence_penalty
+    if "penalty_window" in sent:
+        current_settings.penalty_window = request.penalty_window
     if "force_sampling" in sent:
         current_settings.force_sampling = request.force_sampling
     if "max_tool_result_tokens" in sent:
@@ -2398,6 +2408,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "top_p": global_settings.sampling.top_p,
             "top_k": global_settings.sampling.top_k,
             "repetition_penalty": global_settings.sampling.repetition_penalty,
+            "penalty_window": global_settings.sampling.penalty_window,
         },
         "auth": {
             "api_key_set": bool(global_settings.auth.api_key),
@@ -2725,6 +2736,9 @@ async def update_global_settings(
     if request.sampling_repetition_penalty is not None:
         global_settings.sampling.repetition_penalty = request.sampling_repetition_penalty
         sampling_changed = True
+    if request.sampling_penalty_window is not None:
+        global_settings.sampling.penalty_window = request.sampling_penalty_window
+        sampling_changed = True
 
     if sampling_changed:
         success, msg = _apply_sampling_settings_runtime(
@@ -2734,6 +2748,7 @@ async def update_global_settings(
             request.sampling_top_p,
             request.sampling_top_k,
             request.sampling_repetition_penalty,
+            request.sampling_penalty_window,
         )
         if success:
             runtime_applied.append("sampling")

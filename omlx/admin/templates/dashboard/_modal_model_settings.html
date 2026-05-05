@@ -345,6 +345,15 @@
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                     </div>
+
+                                    <!-- Row 5: Penalty Window -->
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.penalty_window') }}</label>
+                                            <input type="number" x-model.number="modelSettings.penalty_window" step="1" min="1" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                    </div>
                                 </div>
                             </template>
 

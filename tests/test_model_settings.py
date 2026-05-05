@@ -99,6 +99,19 @@ class TestModelSettings:
         restored = ModelSettings.from_dict(d)
         assert restored.repetition_penalty == 1.5
 
+    def test_penalty_window_default(self):
+        """Test penalty_window defaults to None."""
+        settings = ModelSettings()
+        assert settings.penalty_window is None
+
+    def test_penalty_window_roundtrip(self):
+        """Test penalty_window survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(penalty_window=64)
+        d = original.to_dict()
+        assert d["penalty_window"] == 64
+        restored = ModelSettings.from_dict(d)
+        assert restored.penalty_window == 64
+
     def test_chat_template_kwargs_default(self):
         """Test chat_template_kwargs defaults to None."""
         settings = ModelSettings()

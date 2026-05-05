@@ -35,7 +35,7 @@
                 memory: { max_process_memory: 'auto', prefill_memory_guard: true },
                 scheduler: { max_concurrent_requests: 8 },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
-                sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
+                sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0, penalty_window: 20 },
                 mcp: { config_path: '' },
                 huggingface: { endpoint: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
@@ -103,6 +103,7 @@
                 repetition_penalty: null,
                 min_p: null,
                 presence_penalty: null,
+                penalty_window: null,
                 force_sampling: false,
                 enableToolResultLimit: false,
                 max_tool_result_tokens: null,
@@ -754,6 +755,7 @@
                             sampling_top_p: this.globalSettings.sampling.top_p,
                             sampling_top_k: this.globalSettings.sampling.top_k,
                             sampling_repetition_penalty: this.globalSettings.sampling.repetition_penalty,
+                            sampling_penalty_window: this.globalSettings.sampling.penalty_window,
                             mcp_config: this.globalSettings.mcp.config_path,
                             network_http_proxy: this.globalSettings.network.http_proxy,
                             network_https_proxy: this.globalSettings.network.https_proxy,
@@ -1532,6 +1534,7 @@
                     repetition_penalty: settings.repetition_penalty ?? null,
                     min_p: settings.min_p ?? null,
                     presence_penalty: settings.presence_penalty ?? null,
+                    penalty_window: settings.penalty_window ?? null,
                     force_sampling: settings.force_sampling || false,
                     enable_thinking: settings.enable_thinking ?? null,
                     thinking_default: model.thinking_default ?? null,
@@ -1607,6 +1610,7 @@
                                 repetition_penalty: Number.isFinite(this.modelSettings.repetition_penalty) ? this.modelSettings.repetition_penalty : null,
                                 min_p: Number.isFinite(this.modelSettings.min_p) ? this.modelSettings.min_p : null,
                                 presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
+                                penalty_window: Number.isFinite(this.modelSettings.penalty_window) ? this.modelSettings.penalty_window : null,
                                 force_sampling: this.modelSettings.force_sampling,
                                 reasoning_parser: this.modelSettings.reasoning_parser || null,
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,
@@ -1704,6 +1708,7 @@
                         this.modelSettings.max_tokens = null;
                         this.modelSettings.min_p = null;
                         this.modelSettings.presence_penalty = null;
+                        this.modelSettings.penalty_window = data.penalty_window ?? null;
                         this.modelSettings.force_sampling = false;
                         this.modelSettings.reasoning_parser = null;
                         this.modelSettings.ttl_seconds = null;

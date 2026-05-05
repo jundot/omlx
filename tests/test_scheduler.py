@@ -45,6 +45,7 @@ class TestSchedulerConfig:
         assert config.model_name == ""
         assert config.gc_cleanup_interval == 0
         assert config.mlx_cache_cleanup_interval == 512
+        assert config.penalty_window == 20
 
     def test_custom_values(self):
         """Test SchedulerConfig with custom values."""
@@ -62,6 +63,7 @@ class TestSchedulerConfig:
             model_name="test-model",
             gc_cleanup_interval=5,
             mlx_cache_cleanup_interval=20,
+            penalty_window=64,
         )
 
         assert config.max_num_seqs == 128
@@ -77,6 +79,7 @@ class TestSchedulerConfig:
         assert config.model_name == "test-model"
         assert config.gc_cleanup_interval == 5
         assert config.mlx_cache_cleanup_interval == 20
+        assert config.penalty_window == 64
 
 
 class TestSchedulingPolicy:
