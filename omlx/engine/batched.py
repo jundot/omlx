@@ -21,12 +21,13 @@ logger = logging.getLogger(__name__)
 
 # Optional Harmony adapter import
 try:
-    from ..adapter.harmony import preprocess_harmony_messages
+    from ..adapter.harmony import preprocess_harmony_messages, render_harmony_prompt
 
     HAS_HARMONY_ADAPTER = True
 except ImportError:
     HAS_HARMONY_ADAPTER = False
     preprocess_harmony_messages = None  # type: ignore
+    render_harmony_prompt = None  # type: ignore
 
 
 class BatchedEngine(BaseEngine):
@@ -317,6 +318,20 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs: Optional kwargs passed to tokenizer.apply_chat_template
                 (e.g. enable_thinking, reasoning_effort). Overrides global _enable_thinking.
         """
+        # Fallback for gpt-oss models whose tokenizer has no chat_template:
+        # render the Harmony prompt directly via openai-harmony.  Models that
+        # do ship a chat_template continue to use it (preserves any
+        # model-specific tuning the template author intended).
+        if (
+            self.model_type == "gpt_oss"
+            and HAS_HARMONY_ADAPTER
+            and render_harmony_prompt is not None
+            and not getattr(self._tokenizer, "chat_template", None)
+        ):
+            return render_harmony_prompt(
+                messages, tools=tools, chat_template_kwargs=chat_template_kwargs
+            )
+
         if hasattr(self._tokenizer, 'apply_chat_template'):
             is_partial = detect_and_strip_partial(messages)
             template_kwargs = {
