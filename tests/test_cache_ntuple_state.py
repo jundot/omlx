@@ -575,6 +575,39 @@ class TestPrefixCacheNTupleSubState:
         assert [i.name for i in info] == ["buf_kv", "buf_gate", "pooled"]
         assert all(i.sliceable is False for i in info)
 
+    def test_extract_cache_states_preserves_pooling_cache_3tuple(self):
+        """scheduler._extract_cache_states preserves PoolingCache's 3-tuple
+        state without dropping the third element. This is the topmost entry
+        point on the prefill → store_cache path; if state[2] survives here
+        and the downstream serializers (paged_ssd, boundary_snapshot,
+        prefix_cache) preserve it, V4 multi-session corruption is fully
+        prevented."""
+        import mlx.core as mx
+
+        from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+        from omlx.scheduler import Scheduler
+
+        apply_deepseek_v4_patch()
+        from mlx_lm.models.cache import PoolingCache
+
+        # Build a PoolingCache with a populated pooled tensor.
+        cache = PoolingCache(ratio=4)
+        pooled = mx.arange(1 * 8 * 16, dtype=mx.float32).reshape(1, 8, 16)
+        mx.eval(pooled)
+        cache.state = (None, None, pooled)
+
+        # Drive _extract_cache_states with a single-layer raw cache list.
+        # We use Scheduler.__new__ to avoid full init (no engine needed).
+        scheduler = Scheduler.__new__(Scheduler)
+        extracted, _ = scheduler._extract_cache_states([cache])
+        assert extracted is not None
+        assert len(extracted) == 1
+        layer_state = extracted[0]
+        # State must be a 3-tuple — third element preserved.
+        assert isinstance(layer_state["state"], tuple)
+        assert len(layer_state["state"]) == 3
+        assert mx.max(mx.abs(layer_state["state"][2] - pooled)).item() == 0.0
+
     def test_cache_list_legacy_two_tuple_unchanged(self):
         """CacheList with all 2-tuple sub_states (legacy) round-trips
         unchanged — keeps the V2 shape so existing callers see no
