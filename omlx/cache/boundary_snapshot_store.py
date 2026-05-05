@@ -20,17 +20,15 @@ import os
 import queue
 import shutil
 import threading
-import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
-
-import numpy as np
+from typing import Any
 
 from .paged_ssd_cache import (
     HAS_MLX,
+    _encode_shape,
     _extract_tensor_bytes,
     _has_zero_dim,
-    _encode_shape,
     _restore_tensor_from_bytes,
     _write_safetensors_no_mx,
 )
@@ -65,18 +63,16 @@ class BoundarySnapshotSSDStore:
             try:
                 shutil.rmtree(self._snapshot_dir)
             except Exception as e:
-                logger.warning(
-                    "Failed to clean up orphaned boundary snapshots: %s", e
-                )
+                logger.warning("Failed to clean up orphaned boundary snapshots: %s", e)
         self._snapshot_dir.mkdir(parents=True, exist_ok=True)
 
         # request_id -> {token_count -> file_path}
-        self._file_registry: Dict[str, Dict[int, Path]] = {}
+        self._file_registry: dict[str, dict[int, Path]] = {}
         self._registry_lock = threading.Lock()
 
         # Pending writes buffer — raw bytes for instant read-back.
         # key: (request_id, token_count)
-        self._pending_writes: Dict[Tuple[str, int], Dict] = {}
+        self._pending_writes: dict[tuple[str, int], dict] = {}
         self._pending_lock = threading.Lock()
 
         # Cancelled requests with remaining queue item counts.  Writer
@@ -102,7 +98,7 @@ class BoundarySnapshotSSDStore:
         self,
         request_id: str,
         token_count: int,
-        snapshot_cache: List[Any],
+        snapshot_cache: list[Any],
         extract_cache_states_fn: Callable,
     ) -> bool:
         """Serialize snapshot to SSD (non-blocking).
@@ -156,9 +152,7 @@ class BoundarySnapshotSSDStore:
 
             # 5. Enqueue for background write.
             try:
-                self._write_queue.put_nowait(
-                    (pw_key, tensors_raw, metadata, file_path)
-                )
+                self._write_queue.put_nowait((pw_key, tensors_raw, metadata, file_path))
             except queue.Full:
                 logger.warning(
                     "Boundary snapshot write queue full, snapshot %s/%d "
@@ -178,7 +172,7 @@ class BoundarySnapshotSSDStore:
         self,
         request_id: str,
         token_count: int,
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> list[dict[str, Any]] | None:
         """Load a snapshot, returning extracted cache state dicts.
 
         Checks the in-memory pending-writes buffer first (zero I/O), then
@@ -221,7 +215,9 @@ class BoundarySnapshotSSDStore:
         except Exception as e:
             logger.debug(
                 "Failed to load boundary snapshot %s/%d: %s",
-                request_id, token_count, e,
+                request_id,
+                token_count,
+                e,
             )
             return None
 
@@ -340,9 +336,7 @@ class BoundarySnapshotSSDStore:
             temp_path = None
             try:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
-                temp_path = file_path.with_name(
-                    file_path.stem + "_tmp.safetensors"
-                )
+                temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
                 _write_safetensors_no_mx(str(temp_path), tensors_raw, metadata)
 
                 # Request may have been cleaned up while serializing.
@@ -393,19 +387,18 @@ class BoundarySnapshotSSDStore:
                     if file_path.exists():
                         self._pending_writes.pop(pw_key, None)
 
-
     def _serialize_extracted(
         self,
-        extracted: List[Dict[str, Any]],
+        extracted: list[dict[str, Any]],
         request_id: str,
         token_count: int,
-    ) -> Tuple[Dict[str, Tuple[bytes, str, List[int]]], Dict[str, str]]:
+    ) -> tuple[dict[str, tuple[bytes, str, list[int]]], dict[str, str]]:
         """Convert extracted cache states to tensors_raw + metadata.
 
         Must be called on the inference thread (for mx.eval / _extract_tensor_bytes).
         """
-        arrays: Dict[str, Any] = {}  # name -> mx.array
-        layer_info: List[Dict[str, str]] = []
+        arrays: dict[str, Any] = {}  # name -> mx.array
+        layer_info: list[dict[str, str]] = []
 
         for i, layer_state in enumerate(extracted):
             class_name = layer_state.get("class_name", "KVCache")
@@ -413,31 +406,32 @@ class BoundarySnapshotSSDStore:
             meta_state = layer_state.get("meta_state", ())
             state = layer_state.get("state", ())
 
-            info: Dict[str, str] = {
+            info: dict[str, str] = {
                 "class_name": class_name,
                 "cache_type": cache_type,
-                "meta_state": json.dumps(
-                    list(meta_state) if meta_state else []
-                ),
+                "meta_state": json.dumps(list(meta_state) if meta_state else []),
             }
 
-            if isinstance(state, (list, tuple)) and len(state) >= 2:
-                first, second = state[0], state[1]
-                has_tensors = hasattr(first, "shape") or hasattr(second, "shape")
+            if isinstance(state, (list, tuple)) and len(state) >= 1:
+                # N-tuple safe: store every element under
+                # ``layer_{i}_state_{k}`` regardless of tuple length.
+                # PoolingCache (3-tuple) and BatchKVCache (4-tuple) both
+                # round-trip without dropping elements past index 1.
+                has_tensors = any(hasattr(elem, "shape") for elem in state)
                 if has_tensors:
                     info["has_state"] = "true"
-                    if hasattr(first, "shape"):
-                        if _has_zero_dim(first):
-                            arrays[f"layer_{i}_0"] = mx.zeros((1,))
-                            info["zero_dim_0"] = _encode_shape(first.shape)
+                    info["state_count"] = str(len(state))
+                    for k, elem in enumerate(state):
+                        if not hasattr(elem, "shape"):
+                            # Non-tensor element (None, scalar). Mark it so
+                            # _deserialize can restore the gap.
+                            info[f"missing_{k}"] = "1"
+                            continue
+                        if _has_zero_dim(elem):
+                            arrays[f"layer_{i}_state_{k}"] = mx.zeros((1,))
+                            info[f"zero_dim_{k}"] = _encode_shape(elem.shape)
                         else:
-                            arrays[f"layer_{i}_0"] = first
-                    if hasattr(second, "shape"):
-                        if _has_zero_dim(second):
-                            arrays[f"layer_{i}_1"] = mx.zeros((1,))
-                            info["zero_dim_1"] = _encode_shape(second.shape)
-                        else:
-                            arrays[f"layer_{i}_1"] = second
+                            arrays[f"layer_{i}_state_{k}"] = elem
                 else:
                     info["has_state"] = "false"
             else:
@@ -465,9 +459,9 @@ class BoundarySnapshotSSDStore:
 
     def _deserialize(
         self,
-        tensors_raw: Dict[str, Tuple[bytes, str, List[int]]],
-        metadata: Dict[str, str],
-    ) -> Optional[List[Dict[str, Any]]]:
+        tensors_raw: dict[str, tuple[bytes, str, list[int]]],
+        metadata: dict[str, str],
+    ) -> list[dict[str, Any]] | None:
         """Reconstruct extracted cache states from raw bytes + metadata."""
         try:
             num_layers = int(metadata["num_layers"])
@@ -475,7 +469,7 @@ class BoundarySnapshotSSDStore:
         except (KeyError, ValueError, json.JSONDecodeError):
             return None
 
-        result: List[Dict[str, Any]] = []
+        result: list[dict[str, Any]] = []
         for i in range(num_layers):
             info = layer_info[i] if i < len(layer_info) else {}
             class_name = info.get("class_name", "KVCache")
@@ -487,56 +481,95 @@ class BoundarySnapshotSSDStore:
                 meta_state = ()
 
             if info.get("has_state") == "true":
-                first = None
-                second = None
-                key_0 = f"layer_{i}_0"
-                key_1 = f"layer_{i}_1"
-
-                if key_0 in tensors_raw:
-                    raw, dtype_str, shape = tensors_raw[key_0]
-                    if f"zero_dim_0" in info:
-                        # Restore zero-dim tensor shape.
-                        zd_shape = tuple(
-                            int(d) for d in info["zero_dim_0"].split(",")
-                        )
-                        first = _restore_tensor_from_bytes(raw, dtype_str, [1])
-                        first = mx.zeros(zd_shape, dtype=first.dtype)
-                    else:
-                        first = _restore_tensor_from_bytes(raw, dtype_str, shape)
-                if key_1 in tensors_raw:
-                    raw, dtype_str, shape = tensors_raw[key_1]
-                    if f"zero_dim_1" in info:
-                        zd_shape = tuple(
-                            int(d) for d in info["zero_dim_1"].split(",")
-                        )
-                        second = _restore_tensor_from_bytes(raw, dtype_str, [1])
-                        second = mx.zeros(zd_shape, dtype=second.dtype)
-                    else:
-                        second = _restore_tensor_from_bytes(raw, dtype_str, shape)
-
-                state = (first, second) if first is not None else ()
-                result.append({
-                    "state": state,
-                    "meta_state": meta_state,
-                    "class_name": class_name,
-                    "cache_type": cache_type,
-                })
+                # V3 path: state_count meta + layer_{i}_state_{k} keys.
+                # V2 fallback: legacy layer_{i}_0/1 + zero_dim_0/1 keys
+                # for snapshots written before the N-tuple migration.
+                state = self._read_state_tuple_raw(tensors_raw, info, i)
+                result.append(
+                    {
+                        "state": state,
+                        "meta_state": meta_state,
+                        "class_name": class_name,
+                        "cache_type": cache_type,
+                    }
+                )
             else:
                 # Placeholder for skipped sliceable layers.
-                result.append({
-                    "state": (),
-                    "meta_state": meta_state,
-                    "class_name": class_name,
-                    "cache_type": cache_type,
-                })
+                result.append(
+                    {
+                        "state": (),
+                        "meta_state": meta_state,
+                        "class_name": class_name,
+                        "cache_type": cache_type,
+                    }
+                )
 
         return result
 
+    def _read_state_tuple_raw(
+        self,
+        tensors_raw: dict[str, tuple[bytes, str, list[int]]],
+        info: dict[str, str],
+        layer_idx: int,
+    ) -> tuple[Any, ...]:
+        """Read N elements from raw tensor bytes for one layer.
+
+        Recognizes both V3 (``layer_{i}_state_{k}`` + ``state_count``) and
+        the legacy V2 (``layer_{i}_0`` / ``layer_{i}_1``) snapshot layouts.
+        Missing elements come back as ``None``.
+        """
+        if "state_count" in info:
+            try:
+                count = int(info["state_count"])
+            except (ValueError, TypeError):
+                return ()
+            elements: list[Any] = []
+            for k in range(count):
+                if info.get(f"missing_{k}") == "1":
+                    elements.append(None)
+                    continue
+                key = f"layer_{layer_idx}_state_{k}"
+                if key not in tensors_raw:
+                    elements.append(None)
+                    continue
+                raw, dtype_str, shape = tensors_raw[key]
+                zd_marker = f"zero_dim_{k}"
+                if zd_marker in info:
+                    zd_shape = tuple(int(d) for d in info[zd_marker].split(","))
+                    restored = _restore_tensor_from_bytes(raw, dtype_str, [1])
+                    elements.append(mx.zeros(zd_shape, dtype=restored.dtype))
+                else:
+                    elements.append(_restore_tensor_from_bytes(raw, dtype_str, shape))
+            return tuple(elements)
+
+        # V2 polyfill — legacy 2-tuple snapshot.
+        first = None
+        second = None
+        key_0 = f"layer_{layer_idx}_0"
+        key_1 = f"layer_{layer_idx}_1"
+        if key_0 in tensors_raw:
+            raw, dtype_str, shape = tensors_raw[key_0]
+            if "zero_dim_0" in info:
+                zd_shape = tuple(int(d) for d in info["zero_dim_0"].split(","))
+                first = _restore_tensor_from_bytes(raw, dtype_str, [1])
+                first = mx.zeros(zd_shape, dtype=first.dtype)
+            else:
+                first = _restore_tensor_from_bytes(raw, dtype_str, shape)
+        if key_1 in tensors_raw:
+            raw, dtype_str, shape = tensors_raw[key_1]
+            if "zero_dim_1" in info:
+                zd_shape = tuple(int(d) for d in info["zero_dim_1"].split(","))
+                second = _restore_tensor_from_bytes(raw, dtype_str, [1])
+                second = mx.zeros(zd_shape, dtype=second.dtype)
+            else:
+                second = _restore_tensor_from_bytes(raw, dtype_str, shape)
+        return (first, second) if first is not None else ()
+
     def _reconstruct_from_safetensors(
         self,
-        arrays: Dict[str, Any],
-        metadata: Dict[str, str],
-    ) -> Optional[List[Dict[str, Any]]]:
+        arrays: dict[str, Any],
+        metadata: dict[str, str],
+    ) -> list[dict[str, Any]] | None:
         """Reconstruct from mx.load() result (arrays dict + metadata)."""
         try:
             num_layers = int(metadata["num_layers"])
@@ -544,7 +577,7 @@ class BoundarySnapshotSSDStore:
         except (KeyError, ValueError, json.JSONDecodeError):
             return None
 
-        result: List[Dict[str, Any]] = []
+        result: list[dict[str, Any]] = []
         for i in range(num_layers):
             info = layer_info[i] if i < len(layer_info) else {}
             class_name = info.get("class_name", "KVCache")
@@ -556,34 +589,67 @@ class BoundarySnapshotSSDStore:
                 meta_state = ()
 
             if info.get("has_state") == "true":
-                first = arrays.get(f"layer_{i}_0")
-                second = arrays.get(f"layer_{i}_1")
-
-                # Restore zero-dim tensors.
-                if "zero_dim_0" in info and first is not None:
-                    zd_shape = tuple(
-                        int(d) for d in info["zero_dim_0"].split(",")
-                    )
-                    first = mx.zeros(zd_shape, dtype=first.dtype)
-                if "zero_dim_1" in info and second is not None:
-                    zd_shape = tuple(
-                        int(d) for d in info["zero_dim_1"].split(",")
-                    )
-                    second = mx.zeros(zd_shape, dtype=second.dtype)
-
-                state = (first, second) if first is not None else ()
-                result.append({
-                    "state": state,
-                    "meta_state": meta_state,
-                    "class_name": class_name,
-                    "cache_type": cache_type,
-                })
+                state = self._read_state_tuple_arrays(arrays, info, i)
+                result.append(
+                    {
+                        "state": state,
+                        "meta_state": meta_state,
+                        "class_name": class_name,
+                        "cache_type": cache_type,
+                    }
+                )
             else:
-                result.append({
-                    "state": (),
-                    "meta_state": meta_state,
-                    "class_name": class_name,
-                    "cache_type": cache_type,
-                })
+                result.append(
+                    {
+                        "state": (),
+                        "meta_state": meta_state,
+                        "class_name": class_name,
+                        "cache_type": cache_type,
+                    }
+                )
 
         return result
+
+    def _read_state_tuple_arrays(
+        self,
+        arrays: dict[str, Any],
+        info: dict[str, str],
+        layer_idx: int,
+    ) -> tuple[Any, ...]:
+        """N-tuple aware safetensors-loaded variant of
+        ``_read_state_tuple_raw`` — sources tensors from a pre-decoded
+        ``mx.array`` dict instead of raw bytes.
+        """
+        if "state_count" in info:
+            try:
+                count = int(info["state_count"])
+            except (ValueError, TypeError):
+                return ()
+            elements: list[Any] = []
+            for k in range(count):
+                if info.get(f"missing_{k}") == "1":
+                    elements.append(None)
+                    continue
+                key = f"layer_{layer_idx}_state_{k}"
+                tensor = arrays.get(key)
+                if tensor is None:
+                    elements.append(None)
+                    continue
+                zd_marker = f"zero_dim_{k}"
+                if zd_marker in info:
+                    zd_shape = tuple(int(d) for d in info[zd_marker].split(","))
+                    elements.append(mx.zeros(zd_shape, dtype=tensor.dtype))
+                else:
+                    elements.append(tensor)
+            return tuple(elements)
+
+        # V2 polyfill.
+        first = arrays.get(f"layer_{layer_idx}_0")
+        second = arrays.get(f"layer_{layer_idx}_1")
+        if "zero_dim_0" in info and first is not None:
+            zd_shape = tuple(int(d) for d in info["zero_dim_0"].split(","))
+            first = mx.zeros(zd_shape, dtype=first.dtype)
+        if "zero_dim_1" in info and second is not None:
+            zd_shape = tuple(int(d) for d in info["zero_dim_1"].split(","))
+            second = mx.zeros(zd_shape, dtype=second.dtype)
+        return (first, second) if first is not None else ()

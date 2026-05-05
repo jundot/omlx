@@ -412,6 +412,101 @@ class TestPrefixCacheNTupleSubState:
         assert mx.max(mx.abs(elements[0] - buf_kv)).item() == 0.0
         assert mx.max(mx.abs(elements[1] - buf_gate)).item() == 0.0
 
+    def test_boundary_snapshot_three_tuple_round_trip(self, tmp_path):
+        """BoundarySnapshotSSDStore preserves all elements of a 3-tuple
+        state through serialize → deserialize. PoolingCache regression
+        guard at the boundary-snapshot layer.
+        """
+        import mlx.core as mx
+
+        from omlx.cache.boundary_snapshot_store import BoundarySnapshotSSDStore
+
+        store = BoundarySnapshotSSDStore(base_dir=tmp_path)
+
+        buf_kv = mx.arange(1 * 4 * 8, dtype=mx.float32).reshape(1, 4, 8)
+        buf_gate = mx.arange(1 * 4 * 8, dtype=mx.float32).reshape(1, 4, 8) * 2
+        pooled = mx.arange(1 * 16 * 8, dtype=mx.float32).reshape(1, 16, 8)
+        mx.eval(buf_kv, buf_gate, pooled)
+
+        extracted = [
+            {
+                "state": (buf_kv, buf_gate, pooled),
+                "meta_state": (4,),
+                "class_name": "PoolingCache",
+                "cache_type": "PoolingCache",
+            }
+        ]
+
+        tensors_raw, metadata = store._serialize_extracted(
+            extracted, request_id="req_test", token_count=16
+        )
+        # V3 layout: state_count + state_{k} keys.
+        import json as _json
+
+        info = _json.loads(metadata["layer_info"])[0]
+        assert info["state_count"] == "3"
+        assert "layer_0_state_0" in tensors_raw
+        assert "layer_0_state_2" in tensors_raw
+
+        result = store._deserialize(tensors_raw, metadata)
+        assert result is not None
+        assert len(result) == 1
+        state = result[0]["state"]
+        assert isinstance(state, tuple)
+        assert len(state) == 3
+        # Critical: third element (pooled) survives the round-trip.
+        assert mx.max(mx.abs(state[2] - pooled)).item() == 0.0
+        assert mx.max(mx.abs(state[0] - buf_kv)).item() == 0.0
+        assert mx.max(mx.abs(state[1] - buf_gate)).item() == 0.0
+
+        store.shutdown()
+
+    def test_boundary_snapshot_v2_layer_keys_polyfill(self, tmp_path):
+        """V2 boundary snapshots stored with legacy ``layer_{i}_0/1`` keys
+        are still readable by the V3 reader, returned as a 2-tuple.
+        """
+        import json as _json
+
+        import mlx.core as mx
+
+        from omlx.cache.boundary_snapshot_store import BoundarySnapshotSSDStore
+
+        store = BoundarySnapshotSSDStore(base_dir=tmp_path)
+
+        # Hand-craft a V2-layout snapshot (no state_count, only layer_0_0/1).
+        keys = mx.zeros((1, 4, 8, 16))
+        values = mx.ones((1, 4, 8, 16))
+        mx.eval(keys, values)
+        from omlx.cache.paged_ssd_cache import _extract_tensor_bytes
+
+        tensors_raw = {
+            "layer_0_0": _extract_tensor_bytes(keys),
+            "layer_0_1": _extract_tensor_bytes(values),
+        }
+        layer_info = [
+            {
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+                "meta_state": "[]",
+                "has_state": "true",
+            }
+        ]
+        metadata = {
+            "request_id": "v2_polyfill",
+            "token_count": "8",
+            "num_layers": "1",
+            "layer_info": _json.dumps(layer_info),
+        }
+
+        result = store._deserialize(tensors_raw, metadata)
+        assert result is not None
+        state = result[0]["state"]
+        assert len(state) == 2
+        assert mx.max(mx.abs(state[0] - keys)).item() == 0.0
+        assert mx.max(mx.abs(state[1] - values)).item() == 0.0
+
+        store.shutdown()
+
     def test_cache_list_legacy_two_tuple_unchanged(self):
         """CacheList with all 2-tuple sub_states (legacy) round-trips
         unchanged — keeps the V2 shape so existing callers see no
