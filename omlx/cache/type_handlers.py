@@ -6,11 +6,11 @@ This module provides abstract and concrete handlers for various cache types
 from mlx-lm, enabling type-aware cache operations like slicing and reconstruction.
 """
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
-import logging
+from typing import Any
 
 from ._rotating_subclass import PrefillReadyRotatingKVCache
 
@@ -45,10 +45,30 @@ class CacheStateInfo:
     """Information about a cache state for serialization."""
 
     cache_type: str
-    state_keys: Tuple[str, ...]
-    meta_state_keys: Tuple[str, ...]
+    state_keys: tuple[str, ...]
+    meta_state_keys: tuple[str, ...]
     supports_block_slicing: bool
     is_full_state: bool = False
+
+
+@dataclass
+class CacheStateAxisInfo:
+    """Per-element metadata of a cache's ``state`` tuple.
+
+    Each entry describes one element of ``cache_obj.state``:
+    - ``name``: logical name (e.g. ``keys``, ``values``, ``buf_kv``, ``pooled``)
+    - ``sequence_axis``: axis index of the sequence dimension, or ``None``
+      when the element is per-batch metadata (e.g. ``offset``, ``left_padding``
+      arrays in ``BatchKVCache.state``)
+    - ``sliceable``: whether this element can be sliced along ``sequence_axis``
+      for block-level prefix cache storage. Elements without a sequence_axis
+      are also non-sliceable; non-sliceable elements get last-block-only or
+      boundary-snapshot storage instead.
+    """
+
+    name: str
+    sequence_axis: int | None
+    sliceable: bool
 
 
 class CacheTypeHandler(ABC):
@@ -71,7 +91,7 @@ class CacheTypeHandler(ABC):
         pass
 
     @abstractmethod
-    def extract_state(self, cache_obj: Any) -> Dict[str, Any]:
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
         """Extract serializable state from cache object.
 
         Args:
@@ -83,7 +103,7 @@ class CacheTypeHandler(ABC):
         pass
 
     @abstractmethod
-    def get_seq_len(self, state: Dict[str, Any]) -> int:
+    def get_seq_len(self, state: dict[str, Any]) -> int:
         """Get sequence length from state.
 
         Args:
@@ -97,10 +117,10 @@ class CacheTypeHandler(ABC):
     @abstractmethod
     def slice_state(
         self,
-        state: Dict[str, Any],
+        state: dict[str, Any],
         start_idx: int,
         end_idx: int,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Slice state for block-level storage.
 
         Args:
@@ -116,8 +136,8 @@ class CacheTypeHandler(ABC):
     @abstractmethod
     def concatenate_states(
         self,
-        states: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        states: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         """Concatenate multiple block states into one.
 
         Args:
@@ -131,8 +151,8 @@ class CacheTypeHandler(ABC):
     @abstractmethod
     def reconstruct_cache(
         self,
-        state: Dict[str, Any],
-        meta_state: Optional[Tuple] = None,
+        state: dict[str, Any],
+        meta_state: tuple | None = None,
     ) -> Any:
         """Reconstruct cache object from stored state.
 
@@ -154,13 +174,113 @@ class CacheTypeHandler(ABC):
             supports_block_slicing=self.supports_block_slicing,
         )
 
-    def _get_state_keys(self) -> Tuple[str, ...]:
+    def _get_state_keys(self) -> tuple[str, ...]:
         """Return keys used in state dictionary."""
         return ("keys", "values")
 
-    def _get_meta_state_keys(self) -> Tuple[str, ...]:
+    def _get_meta_state_keys(self) -> tuple[str, ...]:
         """Return keys used in meta_state."""
         return ("offset",)
+
+    # ------------------------------------------------------------------
+    # N-tuple state interface
+    #
+    # The legacy interface (extract_state/reconstruct_cache with a dict
+    # of "keys"/"values") only models 2-tuple state. mlx-lm caches like
+    # BatchKVCache (4-tuple) and DeepSeek V4's PoolingCache (3-tuple)
+    # carry more elements that omlx core needs to preserve through the
+    # prefix-cache, boundary-snapshot, and SSD round-trip without
+    # silently dropping elements past index 1.
+    #
+    # The methods below give handlers a way to describe their state
+    # tuple element-by-element so omlx core can dispatch generically
+    # without hard-coded ``state[0], state[1]`` unpacking. Default
+    # implementations match the legacy 2-tuple ``(keys, values)``
+    # contract so existing handlers keep working with no change.
+    # ------------------------------------------------------------------
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        """Per-element metadata of ``cache_obj.state``.
+
+        Length and order match the tuple returned by ``cache_obj.state``.
+        Default = legacy 2-tuple ``(keys, values)`` with sequence_axis=2
+        and sliceable=True (matches KVCache and friends).
+        """
+        return (
+            CacheStateAxisInfo(name="keys", sequence_axis=2, sliceable=True),
+            CacheStateAxisInfo(name="values", sequence_axis=2, sliceable=True),
+        )
+
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        """Return the raw state tuple from ``cache_obj.state``.
+
+        omlx core uses this to serialize state element-by-element instead
+        of going through the legacy ``extract_state`` dict (which is still
+        supported via the default ``deserialize_state`` below).
+
+        Default = pass-through ``cache_obj.state`` cast to tuple.
+        """
+        state = getattr(cache_obj, "state", None)
+        if isinstance(state, (list, tuple)):
+            return tuple(state)
+        return ()
+
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        """Reconstruct a cache object from ordered state ``elements``.
+
+        Default behavior maps elements to the legacy ``keys``/``values``
+        dict by zipping with ``get_state_axis_info()`` names, then calls
+        ``reconstruct_cache``. Handlers whose state cannot be expressed
+        as ``(keys, values)`` (e.g. PoolingCacheHandler with 3 elements)
+        should override this method.
+        """
+        axis_info = self.get_state_axis_info()
+        state_dict: dict[str, Any] = {}
+        for info, elem in zip(axis_info, elements):
+            state_dict[info.name] = elem
+        state_dict["cache_type"] = self.cache_type.value
+        return self.reconstruct_cache(state_dict, meta_state)
+
+    def get_state_seq_len_from_tuple(self, state_tuple: tuple[Any, ...]) -> int:
+        """Return sequence length from the first sliceable element.
+
+        Walks ``get_state_axis_info()`` for the first entry with
+        ``sliceable=True`` and a defined ``sequence_axis``, then reads the
+        corresponding tensor's shape on that axis. Returns 0 if no
+        sliceable element with seq dim is present.
+        """
+        if not isinstance(state_tuple, (list, tuple)):
+            return 0
+        axis_info = self.get_state_axis_info()
+        for info, elem in zip(axis_info, state_tuple):
+            if not info.sliceable or info.sequence_axis is None:
+                continue
+            if elem is None or not hasattr(elem, "shape"):
+                continue
+            shape = elem.shape
+            if info.sequence_axis < len(shape):
+                return int(shape[info.sequence_axis])
+        return 0
+
+    def is_variable_length_state(self) -> bool:
+        """Whether the state tuple length is variable (e.g. ArraysCache).
+
+        Variable-length caches need different on-disk storage (a count
+        prefix). Most caches are fixed-length and return False.
+        """
+        return False
+
+    def is_composite_cache(self) -> bool:
+        """Whether this is a composite cache wrapping sub-caches.
+
+        Composite caches (CacheList) need recursive sub-handler dispatch
+        rather than direct state element serialization. Default False.
+        """
+        return False
 
 
 class KVCacheHandler(CacheTypeHandler):
@@ -180,7 +300,7 @@ class KVCacheHandler(CacheTypeHandler):
     def supports_block_slicing(self) -> bool:
         return True
 
-    def extract_state(self, cache_obj: Any) -> Dict[str, Any]:
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
         """Extract state from KVCache object."""
         keys, values = cache_obj.state
         return {
@@ -192,7 +312,7 @@ class KVCacheHandler(CacheTypeHandler):
             "cache_type": self.cache_type.value,
         }
 
-    def get_seq_len(self, state: Dict[str, Any]) -> int:
+    def get_seq_len(self, state: dict[str, Any]) -> int:
         """Get sequence length from keys tensor."""
         keys = state.get("keys")
         if keys is not None and hasattr(keys, "shape") and len(keys.shape) >= 3:
@@ -201,10 +321,10 @@ class KVCacheHandler(CacheTypeHandler):
 
     def slice_state(
         self,
-        state: Dict[str, Any],
+        state: dict[str, Any],
         start_idx: int,
         end_idx: int,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Slice keys and values along sequence dimension (axis 2)."""
         if not HAS_MLX:
             return None
@@ -232,8 +352,8 @@ class KVCacheHandler(CacheTypeHandler):
 
     def concatenate_states(
         self,
-        states: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        states: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         """Concatenate multiple KVCache states along sequence dimension."""
         if not HAS_MLX or not states:
             return {}
@@ -256,8 +376,8 @@ class KVCacheHandler(CacheTypeHandler):
 
     def reconstruct_cache(
         self,
-        state: Dict[str, Any],
-        meta_state: Optional[Tuple] = None,
+        state: dict[str, Any],
+        meta_state: tuple | None = None,
     ) -> Any:
         """Reconstruct KVCache from state."""
         try:
@@ -310,7 +430,16 @@ class RotatingKVCacheHandler(CacheTypeHandler):
     def supports_block_slicing(self) -> bool:
         return False  # Cannot safely slice rotating cache
 
-    def extract_state(self, cache_obj: Any) -> Dict[str, Any]:
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        # State is (keys, values) with sequence_axis=2 but the rotation
+        # index makes per-block slicing unsafe. Mark non-sliceable so
+        # omlx core uses the last-block-only / boundary-snapshot path.
+        return (
+            CacheStateAxisInfo(name="keys", sequence_axis=2, sliceable=False),
+            CacheStateAxisInfo(name="values", sequence_axis=2, sliceable=False),
+        )
+
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
         """Extract state from RotatingKVCache object."""
         keys, values = cache_obj.state
 
@@ -330,16 +459,16 @@ class RotatingKVCacheHandler(CacheTypeHandler):
             "cache_type": self.cache_type.value,
         }
 
-    def get_seq_len(self, state: Dict[str, Any]) -> int:
+    def get_seq_len(self, state: dict[str, Any]) -> int:
         """Get effective sequence length (offset, not buffer size)."""
         return state.get("offset", 0)
 
     def slice_state(
         self,
-        state: Dict[str, Any],
+        state: dict[str, Any],
         start_idx: int,
         end_idx: int,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """RotatingKVCache cannot be sliced by sequence position.
 
         Returns the full state instead, similar to ArraysCache.
@@ -359,8 +488,8 @@ class RotatingKVCacheHandler(CacheTypeHandler):
 
     def concatenate_states(
         self,
-        states: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        states: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         """For RotatingKVCache, use the most recent state.
 
         Rotating cache states cannot be concatenated like KV caches
@@ -385,8 +514,8 @@ class RotatingKVCacheHandler(CacheTypeHandler):
 
     def reconstruct_cache(
         self,
-        state: Dict[str, Any],
-        meta_state: Optional[Tuple] = None,
+        state: dict[str, Any],
+        meta_state: tuple | None = None,
     ) -> Any:
         """Reconstruct RotatingKVCache from state.
 
@@ -463,7 +592,7 @@ class RotatingKVCacheHandler(CacheTypeHandler):
 
         return cache
 
-    def _get_meta_state_keys(self) -> Tuple[str, ...]:
+    def _get_meta_state_keys(self) -> tuple[str, ...]:
         return ("keep", "max_size", "offset", "_idx")
 
 
@@ -577,7 +706,7 @@ class SizedArraysCache:
         return SizedArraysCache(extracted, self._token_count)
 
     @classmethod
-    def merge(cls, caches: List["SizedArraysCache"]) -> "SizedArraysCache":
+    def merge(cls, caches: list["SizedArraysCache"]) -> "SizedArraysCache":
         """Merge multiple caches, preserving size information."""
         inner_caches = [c._inner if isinstance(c, cls) else c for c in caches]
         # Use first inner cache's merge method
@@ -601,7 +730,16 @@ class ArraysCacheHandler(CacheTypeHandler):
     def supports_block_slicing(self) -> bool:
         return False  # Generic arrays may not be sequence-indexed
 
-    def extract_state(self, cache_obj: Any) -> Dict[str, Any]:
+    def is_variable_length_state(self) -> bool:
+        return True  # state is a list of arrays of variable count
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        # ArraysCache state length is dynamic. omlx core treats this as
+        # variable-length (count prefix); axis info is not consulted but
+        # we return an empty tuple to signal "no fixed schema".
+        return ()
+
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
         """Extract state from ArraysCache object."""
         # Unwrap if wrapped in SizedArraysCache
         inner = (
@@ -615,15 +753,15 @@ class ArraysCacheHandler(CacheTypeHandler):
             "cache_type": self.cache_type.value,
         }
 
-    def get_seq_len(self, state: Dict[str, Any]) -> int:
+    def get_seq_len(self, state: dict[str, Any]) -> int:
         return state.get("token_count", 0)
 
     def slice_state(
         self,
-        state: Dict[str, Any],
+        state: dict[str, Any],
         start_idx: int,
         end_idx: int,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         # Return full state
         return {
             "states": state.get("states", []),
@@ -633,8 +771,8 @@ class ArraysCacheHandler(CacheTypeHandler):
 
     def concatenate_states(
         self,
-        states: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        states: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         if not states:
             return {}
         # Use latest state
@@ -642,8 +780,8 @@ class ArraysCacheHandler(CacheTypeHandler):
 
     def reconstruct_cache(
         self,
-        state: Dict[str, Any],
-        meta_state: Optional[Tuple] = None,
+        state: dict[str, Any],
+        meta_state: tuple | None = None,
         token_count: int = 0,
     ) -> Any:
         """Reconstruct ArraysCache from state.
@@ -671,10 +809,10 @@ class ArraysCacheHandler(CacheTypeHandler):
         # Wrap with SizedArraysCache to provide correct size()
         return SizedArraysCache(cache, token_count)
 
-    def _get_state_keys(self) -> Tuple[str, ...]:
+    def _get_state_keys(self) -> tuple[str, ...]:
         return ("states",)
 
-    def _get_meta_state_keys(self) -> Tuple[str, ...]:
+    def _get_meta_state_keys(self) -> tuple[str, ...]:
         return ()
 
 
@@ -698,11 +836,19 @@ class CacheListHandler(CacheTypeHandler):
     def cache_type(self) -> CacheType:
         return CacheType.CACHE_LIST
 
+    def is_composite_cache(self) -> bool:
+        return True  # delegate to sub-handlers per sub-cache
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        # CacheList wraps sub-caches; per-element axis info is not
+        # meaningful at this level. omlx core dispatches per sub-cache.
+        return ()
+
     @property
     def supports_block_slicing(self) -> bool:
         return False  # Mixed sub-cache types prevent slicing
 
-    def extract_state(self, cache_obj: Any) -> Dict[str, Any]:
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
         """Extract state from CacheList object.
 
         Iterates over sub-caches and extracts each one's state, meta_state,
@@ -752,7 +898,7 @@ class CacheListHandler(CacheTypeHandler):
             "is_full_state": True,
         }
 
-    def get_seq_len(self, state: Dict[str, Any]) -> int:
+    def get_seq_len(self, state: dict[str, Any]) -> int:
         """Get sequence length from sub-caches.
 
         Returns the maximum seq_len found among sub-caches that have
@@ -769,10 +915,10 @@ class CacheListHandler(CacheTypeHandler):
 
     def slice_state(
         self,
-        state: Dict[str, Any],
+        state: dict[str, Any],
         start_idx: int,
         end_idx: int,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """CacheList cannot be sliced — return full state."""
         return {
             "sub_states": state.get("sub_states", []),
@@ -784,8 +930,8 @@ class CacheListHandler(CacheTypeHandler):
 
     def concatenate_states(
         self,
-        states: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        states: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         """Use the most recent (last) state."""
         if not states:
             return {}
@@ -793,8 +939,8 @@ class CacheListHandler(CacheTypeHandler):
 
     def reconstruct_cache(
         self,
-        state: Dict[str, Any],
-        meta_state: Optional[Tuple] = None,
+        state: dict[str, Any],
+        meta_state: tuple | None = None,
     ) -> Any:
         """Reconstruct CacheList from stored state.
 
@@ -876,18 +1022,23 @@ class CacheListHandler(CacheTypeHandler):
                     sub_cache = sub_handler.reconstruct_cache(
                         {"states": list(sub_state)}, sub_meta
                     )
+                elif isinstance(sub_state, (list, tuple)):
+                    # Generic N-tuple dispatch via the new deserialize_state
+                    # interface. Handlers that have a 3-tuple state (e.g.
+                    # PoolingCache: buf_kv, buf_gate, pooled) override
+                    # deserialize_state to consume all elements; default
+                    # implementation maps the first two to (keys, values)
+                    # which matches the legacy contract for KVCache /
+                    # RotatingKVCache.
+                    sub_cache = sub_handler.deserialize_state(
+                        tuple(sub_state), sub_meta
+                    )
                 else:
-                    # KVCache / RotatingKVCache: state is (keys, values)
-                    if isinstance(sub_state, (list, tuple)) and len(sub_state) >= 2:
-                        sub_cache = sub_handler.reconstruct_cache(
-                            {"keys": sub_state[0], "values": sub_state[1]}, sub_meta
-                        )
-                    else:
-                        logger.error(
-                            f"CacheList fallback: unexpected sub_state format "
-                            f"for {cls_name}"
-                        )
-                        return None
+                    logger.error(
+                        f"CacheList fallback: unexpected sub_state format "
+                        f"for {cls_name}"
+                    )
+                    return None
             except Exception as e:
                 logger.error(
                     f"CacheList fallback: failed to reconstruct {cls_name}: {e}"
@@ -906,10 +1057,10 @@ class CacheListHandler(CacheTypeHandler):
 
         return CacheList(*sub_caches)
 
-    def _get_state_keys(self) -> Tuple[str, ...]:
+    def _get_state_keys(self) -> tuple[str, ...]:
         return ("sub_states", "sub_class_names", "sub_meta_states")
 
-    def _get_meta_state_keys(self) -> Tuple[str, ...]:
+    def _get_meta_state_keys(self) -> tuple[str, ...]:
         return ("class_names", "sub_meta_states")
 
 
@@ -924,7 +1075,7 @@ class DefaultCacheHandler(KVCacheHandler):
     def cache_type(self) -> CacheType:
         return CacheType.KVCACHE
 
-    def extract_state(self, cache_obj: Any) -> Dict[str, Any]:
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
         """Try to extract state assuming KVCache-like structure."""
         try:
             if hasattr(cache_obj, "state"):
