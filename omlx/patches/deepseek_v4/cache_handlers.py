@@ -14,7 +14,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from omlx.cache.type_handlers import CacheType, CacheTypeHandler
+from omlx.cache.type_handlers import (
+    CacheStateAxisInfo,
+    CacheType,
+    CacheTypeHandler,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +87,54 @@ class PoolingCacheHandler(CacheTypeHandler):
             state.get("pooled"),
         )
         return cache
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        # PoolingCache.state = (buf_kv, buf_gate, pooled).
+        # buf_kv / buf_gate are remainder windows of shape (B, ratio, D);
+        # pooled is the accumulated compressed sequence (B, P, D). The
+        # quantization at ``ratio`` makes per-token slicing unsafe — keep
+        # all three elements non-sliceable so omlx core takes the
+        # last-block-only / boundary-snapshot path.
+        return (
+            CacheStateAxisInfo(name="buf_kv", sequence_axis=1, sliceable=False),
+            CacheStateAxisInfo(name="buf_gate", sequence_axis=1, sliceable=False),
+            CacheStateAxisInfo(name="pooled", sequence_axis=1, sliceable=False),
+        )
+
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        """Reconstruct PoolingCache from a 3-tuple state directly.
+
+        omlx core dispatches handlers via ``deserialize_state`` instead of
+        the legacy keys/values dict so 3-tuple state survives without
+        getting truncated by the default 2-tuple mapping.
+        """
+        if not isinstance(elements, (list, tuple)):
+            logger.error(
+                "PoolingCache deserialize: expected tuple, got %s",
+                type(elements).__name__,
+            )
+            return None
+        # Tolerate length-2 input (legacy V2-truncated state); fill the
+        # missing pooled with None so reconstruct doesn't crash.
+        if len(elements) == 2:
+            buf_kv, buf_gate = elements
+            pooled = None
+        elif len(elements) == 3:
+            buf_kv, buf_gate, pooled = elements
+        else:
+            logger.error(
+                "PoolingCache deserialize: expected 2 or 3 elements, got %d",
+                len(elements),
+            )
+            return None
+        return self.reconstruct_cache(
+            {"buf_kv": buf_kv, "buf_gate": buf_gate, "pooled": pooled},
+            meta_state,
+        )
 
     def _get_state_keys(self) -> tuple[str, ...]:
         return ("buf_kv", "buf_gate", "pooled")
@@ -168,6 +220,40 @@ class BatchPoolingCacheHandler(CacheTypeHandler):
         )
         cache.meta_state = (ratio, list(remainder), list(pool_lengths), list(processed))
         return cache
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        return (
+            CacheStateAxisInfo(name="buf_kv", sequence_axis=1, sliceable=False),
+            CacheStateAxisInfo(name="buf_gate", sequence_axis=1, sliceable=False),
+            CacheStateAxisInfo(name="pooled", sequence_axis=1, sliceable=False),
+        )
+
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        if not isinstance(elements, (list, tuple)):
+            logger.error(
+                "BatchPoolingCache deserialize: expected tuple, got %s",
+                type(elements).__name__,
+            )
+            return None
+        if len(elements) == 2:
+            buf_kv, buf_gate = elements
+            pooled = None
+        elif len(elements) == 3:
+            buf_kv, buf_gate, pooled = elements
+        else:
+            logger.error(
+                "BatchPoolingCache deserialize: expected 2 or 3 elements, got %d",
+                len(elements),
+            )
+            return None
+        return self.reconstruct_cache(
+            {"buf_kv": buf_kv, "buf_gate": buf_gate, "pooled": pooled},
+            meta_state,
+        )
 
     def _get_state_keys(self) -> tuple[str, ...]:
         return ("buf_kv", "buf_gate", "pooled")

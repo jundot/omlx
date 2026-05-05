@@ -507,6 +507,74 @@ class TestPrefixCacheNTupleSubState:
 
         store.shutdown()
 
+    def test_pooling_cache_handler_axis_info(self):
+        """PoolingCacheHandler exposes 3-element axis_info, all non-sliceable."""
+        from omlx.patches.deepseek_v4.cache_handlers import PoolingCacheHandler
+
+        info = PoolingCacheHandler().get_state_axis_info()
+        assert len(info) == 3
+        assert [i.name for i in info] == ["buf_kv", "buf_gate", "pooled"]
+        assert all(i.sequence_axis == 1 for i in info)
+        assert all(i.sliceable is False for i in info)
+
+    def test_pooling_cache_deserialize_3tuple_round_trip(self):
+        """PoolingCacheHandler.deserialize_state preserves all 3 elements."""
+        import mlx.core as mx
+
+        from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+
+        # PoolingCache lives in mlx_lm.models.cache only after the
+        # deepseek_v4 patch is applied (it injects the class).
+        apply_deepseek_v4_patch()
+        from mlx_lm.models.cache import PoolingCache
+
+        from omlx.patches.deepseek_v4.cache_handlers import PoolingCacheHandler
+
+        ratio = 4
+        original = PoolingCache(ratio=ratio)
+        # Populate via state setter to exercise the same path the handler
+        # uses on reconstruct.
+        buf_kv = mx.zeros((1, ratio, 8))
+        buf_gate = mx.zeros((1, ratio, 8))
+        pooled = mx.arange(1 * 12 * 8, dtype=mx.float32).reshape(1, 12, 8)
+        mx.eval(buf_kv, buf_gate, pooled)
+        original.state = (None, None, pooled)  # remainder buffers empty
+
+        h = PoolingCacheHandler()
+        elements = h.serialize_state(original)
+        assert len(elements) == 3
+        restored = h.deserialize_state(elements, meta_state=ratio)
+        assert restored is not None
+        assert restored.ratio == ratio
+        # The pooled tensor must round-trip byte-equal — V4 fix verification.
+        rest_kv, rest_gate, rest_pool = restored.state
+        assert mx.max(mx.abs(rest_pool - pooled)).item() == 0.0
+
+    def test_pooling_cache_deserialize_legacy_2tuple_input(self):
+        """Tolerates length-2 input (e.g. coming from a legacy V2 polyfill)
+        — pooled fills with None."""
+        import mlx.core as mx
+
+        from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+        from omlx.patches.deepseek_v4.cache_handlers import PoolingCacheHandler
+
+        apply_deepseek_v4_patch()
+
+        buf_kv = mx.zeros((1, 4, 8))
+        buf_gate = mx.zeros((1, 4, 8))
+        h = PoolingCacheHandler()
+        restored = h.deserialize_state((buf_kv, buf_gate), meta_state=4)
+        assert restored is not None
+        assert restored.ratio == 4
+
+    def test_batch_pooling_cache_handler_axis_info(self):
+        from omlx.patches.deepseek_v4.cache_handlers import BatchPoolingCacheHandler
+
+        info = BatchPoolingCacheHandler().get_state_axis_info()
+        assert len(info) == 3
+        assert [i.name for i in info] == ["buf_kv", "buf_gate", "pooled"]
+        assert all(i.sliceable is False for i in info)
+
     def test_cache_list_legacy_two_tuple_unchanged(self):
         """CacheList with all 2-tuple sub_states (legacy) round-trips
         unchanged — keeps the V2 shape so existing callers see no
