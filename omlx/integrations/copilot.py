@@ -43,7 +43,7 @@ class CopilotIntegration(Integration):
 
         env["COPILOT_PROVIDER_BASE_URL"] = f"http://{host}:{port}/v1"
         env["COPILOT_PROVIDER_TYPE"] = "openai"
-        env["COPILOT_PROVIDER_WIRE_API"] = "completions"
+        env["COPILOT_PROVIDER_WIRE_API"] = "responses"
         env["COPILOT_PROVIDER_BEARER_TOKEN"] = api_key or "omlx"
 
         if model:
