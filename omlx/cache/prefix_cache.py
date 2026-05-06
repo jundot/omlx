@@ -541,14 +541,20 @@ class BlockAwarePrefixCache(CacheManager):
                     snapshot_cache_data = boundary_snapshots[block_boundary_tc]
 
                 # Continuity check applies only when we will slice live
-                # cache_data for this block. With a boundary snapshot,
-                # _extract_block_tensor_slice pulls non-sliceable layers
-                # (RotatingKVCache, PoolingCache, ArraysCache) from the
-                # snapshot, so for all-non-sliceable models (e.g., V4)
-                # the snapshot fully covers the block and live cache
-                # length is irrelevant.
+                # cache_data for this block. Skipped when:
+                #   1. A boundary snapshot exists for this block — snapshots
+                #      are self-contained, so the live-cache seq_len gate
+                #      does not apply.
+                #   2. is_last_block is True — _extract_block_tensor_slice's
+                #      last-block branch uses cache_data's full state for
+                #      non-sliceable types (RotatingKVCache last window,
+                #      CacheList has_valid_state path) and needs no
+                #      sliceable seq_len. For sliceable hybrid models the
+                #      step-1 path already returns the full prefill length,
+                #      so the gate would not fire here anyway.
                 if (
                     snapshot_cache_data is None
+                    and not is_last_block
                     and cache_seq_len > 0
                     and cache_start >= cache_seq_len
                 ):
@@ -1634,15 +1640,55 @@ class BlockAwarePrefixCache(CacheManager):
                     # Determine sub-cache count from first valid block
                     num_sub_caches = len(cl_block_data[0])
 
+                    # Per-sub-cache class dispatch: sliceable sub-caches
+                    # (KVCache) concatenate per-block slices into the full
+                    # sequence; non-sliceable sub-caches (RotatingKVCache,
+                    # PoolingCache, ArraysCache, BatchPoolingCache) keep
+                    # the last block's full state, since each saved block
+                    # already snapshots the cache up to its boundary.
+                    sub_class_names_for_layer: list[str] = []
+                    if (
+                        last_block_meta_states
+                        and layer_idx < len(last_block_meta_states)
+                        and isinstance(
+                            last_block_meta_states[layer_idx], (list, tuple)
+                        )
+                        and len(last_block_meta_states[layer_idx]) >= 1
+                        and isinstance(
+                            last_block_meta_states[layer_idx][0], (list, tuple)
+                        )
+                    ):
+                        sub_class_names_for_layer = list(
+                            last_block_meta_states[layer_idx][0]
+                        )
+
+                    NON_SLICEABLE_SUB_CLASSES = {
+                        "RotatingKVCache",
+                        "PoolingCache",
+                        "ArraysCache",
+                        "BatchPoolingCache",
+                        "BatchRotatingKVCache",
+                    }
+
                     if len(cl_block_data) > 1:
-                        # Per-block sliced CacheList: concatenate sub-caches
-                        # element-wise. Generic over N-tuple state — for
-                        # legacy 2-tuple this is identical to the previous
-                        # (keys, values) concat; for caches with metadata
-                        # elements past index 1 those elements take the
-                        # last block's value (per-block snapshot semantics).
+                        # Per-block storage: concatenate sliceable sub-caches
+                        # element-wise; pick last block for non-sliceable.
                         concatenated_sub_states = []
                         for j in range(num_sub_caches):
+                            sub_class = (
+                                sub_class_names_for_layer[j]
+                                if j < len(sub_class_names_for_layer)
+                                else ""
+                            )
+                            if sub_class in NON_SLICEABLE_SUB_CLASSES:
+                                # Each saved block already snapshots the
+                                # full state at its boundary — pick the
+                                # last block, which corresponds to the
+                                # latest boundary of the matched prefix.
+                                concatenated_sub_states.append(
+                                    tuple(_sub_state_elements(cl_block_data[-1][j]))
+                                )
+                                continue
                             per_block_elements = [
                                 _sub_state_elements(bd[j]) for bd in cl_block_data
                             ]
@@ -1695,30 +1741,52 @@ class BlockAwarePrefixCache(CacheManager):
                         and isinstance(meta_state, (list, tuple))
                         and len(meta_state) >= 2
                     ):
-                        # Adjust sub-cache offsets to actual concatenated seq_len
+                        # Adjust sub-cache offsets to actual concatenated seq_len.
+                        # Sliceable sub-caches (KVCache) need offset replaced
+                        # with the post-concat seq_len. Non-sliceable
+                        # sub-caches (RotatingKVCache, PoolingCache, ...)
+                        # keep their last-block meta intact — the sliding
+                        # window offset / pool length already encode the
+                        # boundary state from the original snapshot.
                         class_names = meta_state[0]
                         adjusted_sub_metas = []
                         for j in range(num_sub_caches):
-                            actual_seq_len = concatenated_sub_states[j][0].shape[2]
-                            if j < len(meta_state[1]):
-                                orig_sub_meta = meta_state[1][j]
-                                if (
-                                    isinstance(orig_sub_meta, (list, tuple))
-                                    and len(orig_sub_meta) > 0
-                                ):
-                                    # Replace offset (first element) with actual seq_len
-                                    adjusted_sub_metas.append(
-                                        (actual_seq_len,) + tuple(orig_sub_meta[1:])
-                                    )
-                                else:
-                                    # Sub-cache has no real meta_state (e.g.,
-                                    # KVCache returns "").  Preserve empty value
-                                    # — offset inferred from tensor shape.
-                                    adjusted_sub_metas.append(
-                                        orig_sub_meta if orig_sub_meta else ""
-                                    )
+                            orig_sub_meta = (
+                                meta_state[1][j]
+                                if j < len(meta_state[1])
+                                else ""
+                            )
+                            sub_class = (
+                                sub_class_names_for_layer[j]
+                                if j < len(sub_class_names_for_layer)
+                                else ""
+                            )
+                            if sub_class in NON_SLICEABLE_SUB_CLASSES:
+                                adjusted_sub_metas.append(
+                                    orig_sub_meta if orig_sub_meta else ""
+                                )
+                                continue
+                            sub_elements = concatenated_sub_states[j]
+                            actual_seq_len = None
+                            if (
+                                sub_elements
+                                and len(sub_elements) > 0
+                                and hasattr(sub_elements[0], "shape")
+                                and len(sub_elements[0].shape) >= 3
+                            ):
+                                actual_seq_len = sub_elements[0].shape[2]
+                            if (
+                                actual_seq_len is not None
+                                and isinstance(orig_sub_meta, (list, tuple))
+                                and len(orig_sub_meta) > 0
+                            ):
+                                adjusted_sub_metas.append(
+                                    (actual_seq_len,) + tuple(orig_sub_meta[1:])
+                                )
                             else:
-                                adjusted_sub_metas.append("")
+                                adjusted_sub_metas.append(
+                                    orig_sub_meta if orig_sub_meta else ""
+                                )
                         meta_state = (class_names, adjusted_sub_metas)
 
                     cache = handler.reconstruct_cache(
