@@ -205,7 +205,7 @@ def maybe_load_custom_quantization(
         return None
 
     quant_config = config.get("quantization_config")
-    quant_method = quant_config.get("method") if quant_config else None
+    quant_method = quant_config.get("quant_method") if quant_config else None
 
     if not quant_method:
         return None
