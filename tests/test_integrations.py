@@ -675,7 +675,7 @@ class TestCopilotIntegration:
     def test_type(self):
         copilot = CopilotIntegration()
         assert copilot.type == "env_var"
-        assert copilot.display_name == "GitHub Copilot"
+        assert copilot.display_name == "Copilot CLI"
         assert copilot.install_check == "copilot"
 
     def test_launch_sets_provider_env(self):
@@ -710,7 +710,7 @@ class TestCopilotIntegration:
         assert captured["argv"] == ["copilot"]
         assert env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8000/v1"
         assert env["COPILOT_PROVIDER_TYPE"] == "openai"
-        assert env["COPILOT_PROVIDER_WIRE_API"] == "completions"
+        assert env["COPILOT_PROVIDER_WIRE_API"] == "responses"
         assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "secret"
         assert env["COPILOT_MODEL"] == "qwen3.5"
         assert env["COPILOT_PROVIDER_MODEL_ID"] == "qwen3.5"

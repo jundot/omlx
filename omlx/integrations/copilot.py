@@ -14,7 +14,7 @@ class CopilotIntegration(Integration):
     def __init__(self):
         super().__init__(
             name="copilot",
-            display_name="GitHub Copilot",
+            display_name="Copilot CLI",
             type="env_var",
             install_check="copilot",
             install_hint="npm install -g @github/copilot",
@@ -43,6 +43,8 @@ class CopilotIntegration(Integration):
 
         env["COPILOT_PROVIDER_BASE_URL"] = f"http://{host}:{port}/v1"
         env["COPILOT_PROVIDER_TYPE"] = "openai"
+
+        # Copilot CLI appears to have issues with the completions endpoint, responses appears to work as expected.
         env["COPILOT_PROVIDER_WIRE_API"] = "responses"
         env["COPILOT_PROVIDER_BEARER_TOKEN"] = api_key or "omlx"
 
@@ -56,7 +58,7 @@ class CopilotIntegration(Integration):
         if max_tokens:
             env["COPILOT_PROVIDER_MAX_OUTPUT_TOKENS"] = str(max_tokens)
 
-        print(f"Launching GitHub Copilot with model {model}...")
+        print(f"Launching Copilot CLI with model {model}...")
         if context_window:
             print(f"Max prompt tokens: {context_window:,}")
         if max_tokens:
