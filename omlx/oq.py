@@ -839,6 +839,26 @@ class _TrackedTensor:
             r *= d
         return r
 
+    # fix falling back to eager sanitize
+    #omlx.oq - WARNING - Streaming discovery failed ('_TrackedTensor' object has no attribute 'moveaxis'), falling back to eager sanitize
+    #omlx.oq - WARNING - Streaming discovery failed ('_TrackedTensor' object has no attribute 'transpose'), falling back to eager sanitize
+    
+    def moveaxis(self, source, destination):
+        dims = list(range(self.ndim))
+        dims.insert(destination, dims.pop(source))
+        new_shape = tuple(self.shape[d] for d in dims)
+        return self._clone(shape=new_shape, transform="moveaxis")
+
+    def transpose(self, *axes):
+        if not axes:
+            new_shape = tuple(reversed(self.shape))
+        else:
+            if len(axes) == 1 and isinstance(axes[0], (tuple, list)):
+                axes = axes[0]
+            new_shape = tuple(self.shape[a] for a in axes)
+        return self._clone(shape=new_shape, transform="transpose")
+
+
 
 
 def _streaming_fp8_dequant(lazy_index, scratch_dir=None, shard_bytes=4_000_000_000):
@@ -1562,14 +1582,45 @@ def _build_model_sanitizer(config: dict):
                     audio_tower = _AUDIO_SENTINEL
                 proxy = _Proxy()
                 proxy.config = model_config
+                
+                # 1. Evacuate the mtp related tensor first from the original (prevent deletion)
+                mtp_stash = {k: v for k, v in weights.items() if "mtp" in k}
+                
                 w = model_module.Model.sanitize(proxy, weights)
+                w = sanitize_weights(model_module.VisionModel, w, vision_config)
+                w = sanitize_weights(model_module.LanguageModel, w, text_config)
+                
+                import mlx.core as mx
+                final_mtp = {}
+                
+                for k, v in mtp_stash.items():
+                    # Convert the name to language_model.mtp... (mlx only )
+                    # It seems that mlx only recognizes the language_model.mtp form
+                    new_key = "language_model." + k if k.startswith("mtp.") else k
+                    
+                    # If an expert layer (experts) is found, it forces the conversion to the MLX 
+                    if ".mlp.experts." in new_key:
+                        # 1. Renaming the expert path to switch_mlp
+                        new_key = new_key.replace(".mlp.experts.", ".mlp.switch_mlp.")
+                        
+                        # 2. If gate_up_proj, split it in half and save it as gate_proj and up_proj respectively
+                        if "gate_up_proj" in new_key:
+                            split_axis = -1 if v.ndim == 1 else -2
+                            gate_v, up_v = mx.split(v, 2, axis=split_axis)
+                            
+                            final_mtp[new_key.replace("gate_up_proj", "gate_proj")] = gate_v
+                            final_mtp[new_key.replace("gate_up_proj", "up_proj")] = up_v
+                            continue # 원본 gate_up_proj는 저장하지 않음
+                    
+                    # Typical tensor and numerical calibration (+1.0) treatment
+                    if any(sfx in new_key for sfx in [".pre_fc_norm", "mtp.norm.weight"]):
+                        if v.ndim == 1:
+                            v = v + 1.0
+                    
+                    final_mtp[new_key] = v
 
-                w = sanitize_weights(
-                    model_module.VisionModel, w, vision_config
-                )
-                w = sanitize_weights(
-                    model_module.LanguageModel, w, text_config
-                )
+                # 4. Final injection of converted MTP layers
+                w.update(final_mtp)
                 return w
 
             logger.info(
