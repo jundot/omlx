@@ -48,6 +48,15 @@ class TestExtractThinking:
         assert "Step 1" in thinking
         assert content == "Final answer"
 
+    def test_open_tag_no_close_recovers_as_content(self):
+        """Model opened ``<think>`` but never closed it — non-streaming
+        path treats the body as content (matching the streaming
+        recovery in ThinkingParser.finish())."""
+        from omlx.api.thinking import extract_thinking
+        thinking, content = extract_thinking("<think>\nthe whole answer body")
+        assert thinking == ""
+        assert content == "the whole answer body"
+
     def test_partial_no_open_tag(self):
         """Content before </think> without <think> tag (scheduler prefix case)."""
         thinking, content = extract_thinking("reasoning content</think>Answer")
@@ -204,6 +213,76 @@ class TestThinkingParser:
         t1, c1 = parser.feed("<think>if x > 0 then y < 10")
         # The > and < characters should pass through since they don't form valid tags
         assert "x > 0" in t1 or "x > 0" in (t1 + parser._buffer)
+
+    def test_recovery_when_no_close_tag_streams_as_content(self):
+        """Model opened ``<think>`` but never emitted ``</think>``.
+
+        For V4-Flash and similar models, the thinking close tag is
+        sometimes skipped — the entire response streams as thinking
+        and the visible answer body ends up empty. ``finish()`` recovers
+        by re-emitting the accumulated thinking text as content so the
+        client can render the body. The thinking deltas already streamed
+        cannot be retracted, so the same text shows in both panels —
+        documented UX trade-off.
+        """
+        parser = ThinkingParser()
+
+        # Streamed chunks: open tag + free-form text, no close tag.
+        chunks = [
+            "<think>",
+            "Hello world ",
+            "this is the body of the response",
+            ".",
+        ]
+        thinking_emitted = []
+        content_emitted = []
+        for chunk in chunks:
+            t, c = parser.feed(chunk)
+            thinking_emitted.append(t)
+            content_emitted.append(c)
+        t, c = parser.finish()
+        thinking_emitted.append(t)
+        content_emitted.append(c)
+
+        thinking = "".join(thinking_emitted)
+        content = "".join(content_emitted)
+
+        # Live thinking deltas streamed normally during the response.
+        assert "Hello world" in thinking
+        assert "body of the response" in thinking
+        # Recovery: same text re-emitted as content at finish().
+        assert "Hello world" in content
+        assert "body of the response" in content
+        # No tag literals leaked into either panel.
+        assert "<think>" not in thinking and "<think>" not in content
+        assert "</think>" not in thinking and "</think>" not in content
+
+    def test_no_recovery_when_close_tag_seen(self):
+        """Normal path: ``</think>`` arrives, content streams live, no recovery."""
+        parser = ThinkingParser()
+
+        for chunk in ("<think>r1", "</think>", "answer"):
+            parser.feed(chunk)
+        t, c = parser.finish()
+
+        # Recovery branch must not fire — content was already emitted.
+        assert t == ""
+        assert c == ""
+
+    def test_no_recovery_when_content_emitted_alongside_thinking(self):
+        """Mixed: model emitted some content before ever opening think.
+
+        Recovery should only kick in when the model opens think and
+        never closes AND no real content was streamed. If real content
+        was already streamed (no thinking ever opened, or open then
+        close then more content) the recovery branch must stay off.
+        """
+        parser = ThinkingParser()
+        parser.feed("answer text")
+        t, c = parser.finish()
+        # Plain answer with no <think> tag — content streams live, finish
+        # returns nothing.
+        assert (t, c) == ("", "")
 
     def test_real_world_qwen3_output(self):
         """Simulate real Qwen3.5 output pattern."""

@@ -35,6 +35,11 @@ def extract_thinking(text: str) -> Tuple[str, str]:
     - Partial (no open tag): ``reasoning</think>answer`` → ``("reasoning", "answer")``
     - Empty think: ``<think></think>answer`` → ``("", "answer")``
     - Think only: ``<think>reasoning</think>`` → ``("reasoning", "")``
+    - Malformed (open with no close): ``<think>everything…`` →
+      ``("", "everything…")`` — recovery for V4-style models that
+      occasionally skip the ``</think>`` boundary token. Without this
+      fallback the entire body would be classified as thinking and the
+      visible answer would be empty.
 
     Args:
         text: Complete model output text.
@@ -68,6 +73,14 @@ def extract_thinking(text: str) -> Tuple[str, str]:
             remaining = text[match.end():].strip()
             return (thinking, remaining)
 
+    # Malformed: <think> opened but never closed. Drop the open tag and
+    # treat the remainder as content so the answer body is not empty.
+    if '<think>' in text and '</think>' not in text:
+        idx = text.index('<think>')
+        before = text[:idx]
+        after = text[idx + _OPEN_LEN:]
+        return ("", (before + after).strip())
+
     return ("", text)
 
 
@@ -96,6 +109,15 @@ class ThinkingParser:
     def __init__(self):
         self._in_thinking: bool = False
         self._buffer: str = ""  # Buffer for potential partial tags
+        # Recovery state for malformed thinking: when the prompt prepends
+        # ``<think>`` and the model never emits ``</think>`` before EOS,
+        # everything we streamed went out as thinking. The streamed events
+        # cannot be retracted, so finish() emits the accumulated thinking
+        # text once more as content — the client will show both panels but
+        # the answer body is no longer empty.
+        self._close_seen: bool = False
+        self._thinking_accumulated: List[str] = []
+        self._content_emitted: bool = False
 
     def feed(self, text: str) -> Tuple[str, str]:
         """Feed a text chunk, return (thinking_delta, content_delta).
@@ -131,6 +153,7 @@ class ThinkingParser:
                 # Try to match </think>
                 if remaining.startswith(_CLOSE_TAG):
                     self._in_thinking = False
+                    self._close_seen = True
                     i += _CLOSE_LEN
                     continue
 
@@ -153,29 +176,58 @@ class ThinkingParser:
                     content_out.append(text[i])
                 i += 1
 
-        return ("".join(thinking_out), "".join(content_out))
+        thinking_delta = "".join(thinking_out)
+        content_delta = "".join(content_out)
+        if thinking_delta:
+            self._thinking_accumulated.append(thinking_delta)
+        if content_delta:
+            self._content_emitted = True
+        return (thinking_delta, content_delta)
 
     def finish(self) -> Tuple[str, str]:
         """Flush any remaining buffered content.
 
         Should be called when the stream is complete to emit any
         buffered characters that were waiting for potential tag completion.
+        Also recovers from malformed thinking — when the model never
+        emitted ``</think>`` and no content was ever produced, returns
+        the accumulated thinking text as content so the client surfaces
+        a non-empty answer body.
 
         Returns:
-            Tuple of (thinking_text, content_text) from remaining buffer.
+            Tuple of (thinking_text, content_text) from remaining buffer
+            (plus recovered content if applicable).
         """
-        if not self._buffer:
-            return ("", "")
-
-        # The buffer contains a partial tag that never completed.
-        # Emit it as-is in the current mode.
-        buf = self._buffer
+        partial = self._buffer
         self._buffer = ""
 
+        # Recovery: prompt opened a thinking block (or model echoed
+        # ``<think>`` itself), the close tag never arrived, and nothing
+        # ever streamed as content. Re-emit the accumulated thinking text
+        # as content so the answer body is not empty. The thinking events
+        # already streamed live cannot be retracted, so the client sees
+        # the same text twice — once in the thinking panel, once as the
+        # answer. UX trade-off documented in the chat template plan.
+        if (
+            self._in_thinking
+            and not self._close_seen
+            and not self._content_emitted
+            and self._thinking_accumulated
+        ):
+            recovered = "".join(self._thinking_accumulated) + partial
+            self._content_emitted = True
+            return ("", recovered)
+
+        if not partial:
+            return ("", "")
+
+        # Partial tag never completed — emit it as-is in the current mode.
         if self._in_thinking:
-            return (buf, "")
+            self._thinking_accumulated.append(partial)
+            return (partial, "")
         else:
-            return ("", buf)
+            self._content_emitted = True
+            return ("", partial)
 
     @staticmethod
     def _could_be_tag(text: str) -> bool:
