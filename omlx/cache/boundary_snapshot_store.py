@@ -419,11 +419,33 @@ class BoundarySnapshotSSDStore:
                 "meta_state": json.dumps(list(meta_state) if meta_state else []),
             }
 
-            if isinstance(state, (list, tuple)) and len(state) >= 1:
-                # N-tuple safe: store every element under
+            if (
+                isinstance(state, list)
+                and len(state) >= 1
+                and all(isinstance(s, (list, tuple)) for s in state)
+            ):
+                # CacheList layer: ``state`` is a list of nested sub-state
+                # tuples (one per sub-cache, e.g. RotatingKVCache +
+                # PoolingCache for DeepSeek V4). Flatten as
+                # ``layer_{i}_sub_{j}_state_{k}`` keys so reconstruction
+                # can rebuild the nested shape.
+                info["has_state"] = "true"
+                info["sub_count"] = str(len(state))
+                for j, sub_state in enumerate(state):
+                    info[f"sub_{j}_count"] = str(len(sub_state))
+                    for k, elem in enumerate(sub_state):
+                        if not hasattr(elem, "shape"):
+                            info[f"sub_{j}_missing_{k}"] = "1"
+                            continue
+                        if _has_zero_dim(elem):
+                            arrays[f"layer_{i}_sub_{j}_state_{k}"] = mx.zeros((1,))
+                            info[f"sub_{j}_zero_dim_{k}"] = _encode_shape(elem.shape)
+                        else:
+                            arrays[f"layer_{i}_sub_{j}_state_{k}"] = elem
+            elif isinstance(state, (list, tuple)) and len(state) >= 1:
+                # Flat N-tuple state (KVCache, RotatingKVCache, PoolingCache,
+                # BatchKVCache). Store every element under
                 # ``layer_{i}_state_{k}`` regardless of tuple length.
-                # PoolingCache (3-tuple) and BatchKVCache (4-tuple) both
-                # round-trip without dropping elements past index 1.
                 has_tensors = any(hasattr(elem, "shape") for elem in state)
                 if has_tensors:
                     info["has_state"] = "true"
@@ -518,13 +540,52 @@ class BoundarySnapshotSSDStore:
         tensors_raw: dict[str, tuple[bytes, str, list[int]]],
         info: dict[str, str],
         layer_idx: int,
-    ) -> tuple[Any, ...]:
-        """Read N elements from raw tensor bytes for one layer.
+    ) -> Any:
+        """Read state for one layer from raw tensor bytes.
 
-        Recognizes both V3 (``layer_{i}_state_{k}`` + ``state_count``) and
-        the legacy V2 (``layer_{i}_0`` / ``layer_{i}_1``) snapshot layouts.
+        Returns:
+            - ``list`` of nested sub-state tuples for CacheList layers
+              (``sub_count`` in info), or
+            - ``tuple`` of N elements for flat layers (``state_count`` in
+              info, V3 layout), or
+            - 2-tuple from V2 polyfill (``layer_{i}_0`` / ``layer_{i}_1``).
+
         Missing elements come back as ``None``.
         """
+        if "sub_count" in info:
+            try:
+                sub_count = int(info["sub_count"])
+            except (ValueError, TypeError):
+                return []
+            sub_states: list[tuple[Any, ...]] = []
+            for j in range(sub_count):
+                count_key = f"sub_{j}_count"
+                try:
+                    count = int(info.get(count_key, "0"))
+                except (ValueError, TypeError):
+                    count = 0
+                sub_elements: list[Any] = []
+                for k in range(count):
+                    if info.get(f"sub_{j}_missing_{k}") == "1":
+                        sub_elements.append(None)
+                        continue
+                    key = f"layer_{layer_idx}_sub_{j}_state_{k}"
+                    if key not in tensors_raw:
+                        sub_elements.append(None)
+                        continue
+                    raw, dtype_str, shape = tensors_raw[key]
+                    zd_marker = f"sub_{j}_zero_dim_{k}"
+                    if zd_marker in info:
+                        zd_shape = tuple(int(d) for d in info[zd_marker].split(","))
+                        restored = _restore_tensor_from_bytes(raw, dtype_str, [1])
+                        sub_elements.append(mx.zeros(zd_shape, dtype=restored.dtype))
+                    else:
+                        sub_elements.append(
+                            _restore_tensor_from_bytes(raw, dtype_str, shape)
+                        )
+                sub_states.append(tuple(sub_elements))
+            return sub_states
+
         if "state_count" in info:
             try:
                 count = int(info["state_count"])
@@ -622,11 +683,44 @@ class BoundarySnapshotSSDStore:
         arrays: dict[str, Any],
         info: dict[str, str],
         layer_idx: int,
-    ) -> tuple[Any, ...]:
+    ) -> Any:
         """N-tuple aware safetensors-loaded variant of
         ``_read_state_tuple_raw`` — sources tensors from a pre-decoded
-        ``mx.array`` dict instead of raw bytes.
+        ``mx.array`` dict instead of raw bytes. Returns a list of nested
+        tuples for CacheList layers (``sub_count`` in info) or a flat
+        tuple otherwise.
         """
+        if "sub_count" in info:
+            try:
+                sub_count = int(info["sub_count"])
+            except (ValueError, TypeError):
+                return []
+            sub_states: list[tuple[Any, ...]] = []
+            for j in range(sub_count):
+                count_key = f"sub_{j}_count"
+                try:
+                    count = int(info.get(count_key, "0"))
+                except (ValueError, TypeError):
+                    count = 0
+                sub_elements: list[Any] = []
+                for k in range(count):
+                    if info.get(f"sub_{j}_missing_{k}") == "1":
+                        sub_elements.append(None)
+                        continue
+                    key = f"layer_{layer_idx}_sub_{j}_state_{k}"
+                    tensor = arrays.get(key)
+                    if tensor is None:
+                        sub_elements.append(None)
+                        continue
+                    zd_marker = f"sub_{j}_zero_dim_{k}"
+                    if zd_marker in info:
+                        zd_shape = tuple(int(d) for d in info[zd_marker].split(","))
+                        sub_elements.append(mx.zeros(zd_shape, dtype=tensor.dtype))
+                    else:
+                        sub_elements.append(tensor)
+                sub_states.append(tuple(sub_elements))
+            return sub_states
+
         if "state_count" in info:
             try:
                 count = int(info["state_count"])
