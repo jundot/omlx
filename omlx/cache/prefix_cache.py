@@ -758,7 +758,16 @@ class BlockAwarePrefixCache(CacheManager):
                 continue
 
         if max_seq_len > 0:
-            logger.debug(f"Using fallback max seq_len={max_seq_len}")
+            # Normal result for all-non-sliceable-KVCache models
+            # (e.g. DeepSeek V4 with RotatingKVCache + PoolingCache).
+            # Returns the sliding-window length, not a sequence length —
+            # callers that depend on full prefill length (continuity
+            # check, reconstruction concat) bypass this layer's
+            # contribution via the snapshot / is_last_block paths.
+            logger.debug(
+                f"Cache seq_len resolved from non-sliceable layer "
+                f"(window={max_seq_len})"
+            )
             return max_seq_len
 
         # Step 3: CacheList fallback — check sub-states for seq_len
