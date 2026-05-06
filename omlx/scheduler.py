@@ -2331,6 +2331,7 @@ class Scheduler:
         layer_cache: Any,
         state: tuple[Any, Any],
         meta_state: Any,
+        layer_idx: int | None = None,
     ) -> tuple[tuple[Any, Any], tuple[str, str, str, str]]:
         """
         Normalize RotatingKVCache state into merge-safe canonical form.
@@ -2440,9 +2441,11 @@ class Scheduler:
         )
 
         if original_len != normalized_len or idx != normalized_idx:
+            layer_tag = f"layer {layer_idx}: " if layer_idx is not None else ""
             logger.debug(
-                "Normalized RotatingKVCache snapshot: len %s->%s, idx %s->%s, "
+                "%sNormalized RotatingKVCache snapshot: len %s->%s, idx %s->%s, "
                 "offset=%s, max_size=%s",
+                layer_tag,
                 original_len,
                 normalized_len,
                 idx,
@@ -2583,6 +2586,7 @@ class Scheduler:
                             layer_cache,
                             state,
                             meta,
+                            layer_idx=layer_idx,
                         )
 
                     # Preserve the full state tuple regardless of length.
@@ -4312,6 +4316,32 @@ class Scheduler:
                     output.outputs = outputs
                     output.finished_request_ids = finished_ids
                     self._cleanup_finished(finished_ids)
+
+                    # Periodic Metal allocator cleanup during long decodes.
+                    # mx.random.categorical inside the sampler allocates a
+                    # tiny scalar via gumbel → uniform on every call.
+                    # omlx ships its own non-compiled sampler
+                    # (omlx/utils/sampling.py) so that RNG state actually
+                    # advances in the server, but the trade-off is that
+                    # those scalars accumulate in the IOGPU residency set
+                    # — macOS aborts at ~4096 entries. Long contexts
+                    # (50k+) decoding thousands of tokens hit that limit
+                    # mid-stream. Synchronise the generation stream first
+                    # so any in-flight Metal command buffer that still
+                    # references buffers we're about to drop has
+                    # completed; the allocator only releases pool entries
+                    # whose ref count is zero, but the sync guarantees
+                    # there is no race window. Decode-only path —
+                    # next_generated() returns nothing during prefill, so
+                    # we never disrupt prefill activation buffers.
+                    self._tokens_since_clear_cache = (
+                        getattr(self, "_tokens_since_clear_cache", 0)
+                        + len(responses)
+                    )
+                    if self._tokens_since_clear_cache >= 1024:
+                        mx.synchronize(generation_stream)
+                        mx.clear_cache()
+                        self._tokens_since_clear_cache = 0
 
         except _PrefillAbortedError:
             # Prefill was interrupted by a pending abort.
