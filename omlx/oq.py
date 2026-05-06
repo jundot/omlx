@@ -697,20 +697,26 @@ def _build_quant_plan(
 
 
 def resolve_output_name(
-    model_name: str, oq_level: int, dtype: str = "bfloat16"
+    model_name: str,
+    oq_level: int,
+    dtype: str = "bfloat16",
+    preserve_mtp: bool = False,
 ) -> str:
     """Generate output model name: strip existing quant suffixes, append oQ tag.
 
     Appends `-fp16` suffix when dtype is float16. bfloat16 is the default and
-    produces no dtype suffix (backwards compatible).
+    produces no dtype suffix (backwards compatible). When preserve_mtp is True,
+    appends `-mtp` so the resulting name reflects that mtp.* tensors and
+    config fields were preserved through quantization.
 
     Examples:
         "Qwen3.5-122B-A10B" + 4 + bfloat16 -> "Qwen3.5-122B-A10B-oQ4"
         "Qwen3.5-122B-A10B" + 4 + float16  -> "Qwen3.5-122B-A10B-oQ4-fp16"
         "Qwen3.5-122B-A10B-oQ6-fp16" + 2 + bfloat16 -> "Qwen3.5-122B-A10B-oQ2"
+        "Qwen3.5-27B" + 4 + bfloat16 + preserve_mtp -> "Qwen3.5-27B-oQ4-mtp"
     """
     pattern = re.compile(
-        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+)$",
+        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|mtp)$",
         flags=re.IGNORECASE,
     )
     base = model_name
@@ -723,6 +729,8 @@ def resolve_output_name(
     suffix = f"-oQ{level_str}"
     if dtype == "float16":
         suffix += "-fp16"
+    if preserve_mtp:
+        suffix += "-mtp"
     return f"{base}{suffix}"
 
 
@@ -1269,7 +1277,12 @@ def make_predicate(config: dict, oq_level: int = 4) -> Callable:
     return predicate
 
 
-def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) -> dict:
+def estimate_bpw_and_size(
+    model_path: str,
+    oq_level: int,
+    group_size: int = 64,
+    preserve_mtp: bool = False,
+) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
 
     Applies the universal predicate to each tensor to determine its bit width,
@@ -1277,6 +1290,9 @@ def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) 
 
     Args:
         model_path: Path to source model directory.
+        preserve_mtp: When True, mtp.* tensors are kept (counted toward
+            output size) instead of being skipped. Mirrors the matching
+            argument in ``quantize_oq_streaming``.
         oq_level: Target oQ level (base bits).
         group_size: Quantization group size.
 
@@ -1345,7 +1361,7 @@ def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) 
                 total_output_bytes += n_elements * 2
                 continue
 
-            if _should_skip_tensor(name):
+            if _should_skip_tensor(name, preserve_mtp=preserve_mtp):
                 continue
 
             bits, gs, _mode = _get_predicate_bits(name, config, oq_level, group_size)
@@ -1440,14 +1456,41 @@ _SKIP_QUANT_PATTERNS = (
 )
 
 
-def _should_skip_tensor(name: str) -> bool:
+def _should_skip_tensor(name: str, preserve_mtp: bool = False) -> bool:
     """Check if a tensor should be completely excluded from output.
 
-    These tensors are removed by mlx-lm sanitize() and should not be saved.
+    By default mtp.* tensors are stripped because mlx-lm's stock sanitize()
+    removes them when the model has no MTP head. When ``preserve_mtp`` is
+    True the caller has stashed mtp.* tensors around the sanitize call and
+    re-merged them, so we must keep them in the output shards.
     """
     if ".mtp." in name or name.startswith("mtp."):
-        return True
+        return not preserve_mtp
     return False
+
+
+def _is_mtp_tensor(name: str) -> bool:
+    """Return True iff the tensor key belongs to an MTP head."""
+    return name.startswith("mtp.") or ".mtp." in name
+
+
+def _normalize_mtp_in_config(config: dict) -> None:
+    """Zero out MTP layer counts in the output config (in place).
+
+    Used when preserve_mtp is False so the resulting quantized model
+    presents itself as MTP-free. Without this, the source config's
+    mtp_num_hidden_layers / num_nextn_predict_layers values would survive
+    while the actual mtp.* tensors are stripped, producing the
+    "Missing N parameters" load error we hit on Qwen3.5-27B.
+    """
+    for key in ("mtp_num_hidden_layers", "num_nextn_predict_layers"):
+        if key in config and config[key]:
+            config[key] = 0
+    text_cfg = config.get("text_config")
+    if isinstance(text_cfg, dict):
+        for key in ("mtp_num_hidden_layers", "num_nextn_predict_layers"):
+            if key in text_cfg and text_cfg[key]:
+                text_cfg[key] = 0
 
 
 def _should_quantize_tensor(name: str, shape: tuple) -> bool:
@@ -1478,6 +1521,19 @@ def _build_model_sanitizer(config: dict):
     if is_vlm:
         try:
             from mlx_vlm.utils import get_model_and_args, sanitize_weights
+
+            # Apply mlx-vlm MTP sanitize patch so qwen3_5/qwen3_5_moe Model
+            # classes keep ``mtp.*`` weights and shift the MTP-specific
+            # RMSNorm tensors by +1 (matching mlx_lm_mtp/qwen35_model.py).
+            # Without this, oQ output ships raw MTP norm weights, the
+            # mlx-lm patched sanitize on load doesn't re-shift (it guards on
+            # the unsanitized conv1d marker, which is False after oQ), and
+            # the MTP head produces garbage logits — 0% accept rate.
+            try:
+                from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_patch
+                apply_mlx_vlm_mtp_patch()
+            except Exception as patch_err:
+                logger.debug(f"mlx-vlm MTP patch not applied: {patch_err}")
 
             model_module, _ = get_model_and_args(config)
             model_config_cls = model_module.ModelConfig
@@ -1528,9 +1584,39 @@ def _build_model_sanitizer(config: dict):
     try:
         from mlx_lm.utils import _get_classes
 
+        # Apply mlx-lm MTP patch so the patched __init__/sanitize handle
+        # mtp.* tensors correctly. Idempotent — apply() is a no-op once
+        # patched.
+        try:
+            from omlx.patches.mlx_lm_mtp import (
+                apply_mlx_lm_mtp_patch,
+                is_mtp_active,
+                set_mtp_active,
+            )
+            apply_mlx_lm_mtp_patch()
+            _have_mtp_patch = True
+        except Exception as patch_err:
+            logger.debug(f"mlx-lm MTP patch not applied: {patch_err}")
+            _have_mtp_patch = False
+
         model_class, model_args_class = _get_classes(config)
         args = model_args_class.from_dict(config)
-        model = model_class(args)
+
+        # Force MTP active during model instantiation so the patched
+        # ``__init__`` attaches ``self.mtp``. With ``self.mtp`` attached,
+        # the patched ``Model.sanitize`` keeps ``mtp.*`` weights and applies
+        # the +1 RMSNorm shift to MTP norms (matching backbone). Without
+        # this, mtp.* would be stripped and MTP norms would never receive
+        # the shift, producing 0% accept rate after quantization.
+        if _have_mtp_patch:
+            prev_active = is_mtp_active()
+            try:
+                set_mtp_active(True)
+                model = model_class(args)
+            finally:
+                set_mtp_active(prev_active)
+        else:
+            model = model_class(args)
 
         if hasattr(model, "sanitize"):
             logger.info(
@@ -1578,6 +1664,36 @@ def _build_non_quantizable_set(config: dict) -> set:
         return set()
 
 
+def _is_mtp_protected_tensor(name: str) -> bool:
+    """Tensors inside the MTP head that must stay in full precision.
+
+    Aggressive quantization of the MTP head's fusion projection or final
+    hyper-head collapses draft acceptance to ~0% (oQ4 of an MTP-preserved
+    Qwen3.5-27B accepted 0/157 cycles). PR 990 protects ``mtp.fc`` for
+    Qwen3.5/3.6; PR 15's DeepSeek-V4 ``MTPBlock`` exposes the same
+    semantics under different names (``e_proj`` + ``h_proj`` for the
+    embedding/hidden fusion; ``hc_head.*`` for the final projection).
+    All of these stay in full precision; the MTP block's internal
+    DeepseekV4Block (attn/ffn) gets the same quantization as the
+    backbone's other layers.
+    """
+    if not (name.startswith("mtp.") or ".mtp." in name):
+        return False
+    # Qwen3.5/3.6 fusion projection
+    if name.endswith("mtp.fc.weight") or ".mtp.fc.weight" in name:
+        return True
+    # DeepSeek-V4 MTPBlock fusion projections
+    if name.endswith(".e_proj.weight") or name.endswith(".h_proj.weight"):
+        return True
+    # DeepSeek-V4 HyperHead final projection (sanitized form has the dot;
+    # the raw-HF form arrives as ``hc_head_<param>`` and we cover both).
+    if ".hc_head." in name:
+        return True
+    if name.endswith(".hc_head_fn") or name.endswith(".hc_head_base") or name.endswith(".hc_head_scale"):
+        return True
+    return False
+
+
 def _get_predicate_bits(tensor_name: str, config: dict, oq_level: int,
                         group_size: int) -> tuple:
     """Get quantization bits, group_size, and mode for a tensor.
@@ -1585,6 +1701,10 @@ def _get_predicate_bits(tensor_name: str, config: dict, oq_level: int,
     Returns:
         (bits, group_size, mode) or (None, None, None) if not quantized.
     """
+    # See _is_mtp_protected_tensor for why these tensors stay full precision.
+    if _is_mtp_protected_tensor(tensor_name):
+        return None, None, None
+
     base_bits = _base_bits_for_level(oq_level)
 
     result = universal_quant_predicate(tensor_name, None, config, oq_level)
@@ -1868,6 +1988,7 @@ def quantize_oq_streaming(
     hard_cap_bpw: float | None = None,
     sensitivity_model_path: str = "",
     dtype: str = "bfloat16",
+    preserve_mtp: bool = False,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -1884,6 +2005,13 @@ def quantize_oq_streaming(
         dtype: Target fp dtype for non-quantized weights and quant scales/biases.
             Must be "bfloat16" (default) or "float16". float16 yields ~20%
             faster prefill on M1/M2 Apple Silicon (native fp16 support).
+        preserve_mtp: Keep mtp.* tensors and config fields in the output so
+            the Native MTP toggle works after quantization. Stashes mtp.*
+            keys around the model.sanitize() call (which would otherwise
+            strip them) and re-merges. When False (default), mtp.* tensors
+            are stripped *and* the output config's mtp_num_hidden_layers /
+            num_nextn_predict_layers are normalized to 0 to keep the
+            quantized model self-consistent.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -1926,6 +2054,10 @@ def quantize_oq_streaming(
     cb("loading", 12.0)
 
     sanitize_fn = _build_model_sanitizer(config)
+    # When preserve_mtp is True, the patched sanitize functions
+    # (mlx_lm_mtp/qwen35_model.py and mlx_vlm_mtp/qwen35_vlm_model.py)
+    # keep mtp.* in the output and apply the +1 RMSNorm shift to MTP
+    # norms. No stash/merge wrapper needed — the patch covers both paths.
     if sanitize_fn is not None:
         # Try discovery-based streaming sanitize first (works for any model,
         # bounds peak memory by materializing one tensor at a time)
@@ -2175,6 +2307,15 @@ def quantize_oq_streaming(
                      "audio_config", "audio_token_id",
                      "boa_token_id", "eoa_token_id", "eoa_token_index"):
             output_config.pop(key, None)
+    if not preserve_mtp:
+        # Default path: zero out MTP layer counts so the quantized model
+        # doesn't claim to have an MTP head while its weights have been
+        # stripped. This keeps the output self-consistent — mtp_enabled
+        # toggle's compatibility check (_has_mtp_heads) reads these
+        # fields and will correctly report "no MTP heads" instead of
+        # crashing during model.load_weights() with the cryptic
+        # "Missing N parameters" error.
+        _normalize_mtp_in_config(output_config)
     # Ensure eos_token_id is present (mlx-lm adds it from tokenizer)
     if "eos_token_id" not in output_config:
         try:

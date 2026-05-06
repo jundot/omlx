@@ -458,6 +458,164 @@ class TestResolveOutputName:
     def test_float16_with_bitwidth_suffix(self):
         assert resolve_output_name("Model-8bit", 3, "float16") == "Model-oQ3-fp16"
 
+    def test_preserve_mtp_appends_mtp_suffix(self):
+        assert (
+            resolve_output_name("Qwen3.5-27B", 4, "bfloat16", preserve_mtp=True)
+            == "Qwen3.5-27B-oQ4-mtp"
+        )
+
+    def test_preserve_mtp_with_fp16(self):
+        assert (
+            resolve_output_name("Llama-3-8B", 4, "float16", preserve_mtp=True)
+            == "Llama-3-8B-oQ4-fp16-mtp"
+        )
+
+    def test_preserve_mtp_strips_existing_mtp_suffix(self):
+        # Re-quantizing an already-mtp output keeps the suffix only when the
+        # caller asks for it; without preserve_mtp the suffix is dropped.
+        assert (
+            resolve_output_name("Model-oQ6-mtp", 4, "bfloat16", preserve_mtp=False)
+            == "Model-oQ4"
+        )
+        assert (
+            resolve_output_name("Model-oQ6-mtp", 4, "bfloat16", preserve_mtp=True)
+            == "Model-oQ4-mtp"
+        )
+
+
+class TestShouldSkipTensor:
+    def test_default_skips_mtp(self):
+        from omlx.oq import _should_skip_tensor
+
+        assert _should_skip_tensor("mtp.fc.weight") is True
+        assert _should_skip_tensor("language_model.mtp.layers.0.foo") is True
+
+    def test_preserve_mtp_keeps_mtp(self):
+        from omlx.oq import _should_skip_tensor
+
+        assert _should_skip_tensor("mtp.fc.weight", preserve_mtp=True) is False
+        assert (
+            _should_skip_tensor("language_model.mtp.layers.0.foo", preserve_mtp=True)
+            is False
+        )
+
+    def test_non_mtp_tensors_never_skipped(self):
+        from omlx.oq import _should_skip_tensor
+
+        assert _should_skip_tensor("model.layers.0.attn.q_proj.weight") is False
+        assert (
+            _should_skip_tensor("model.layers.0.attn.q_proj.weight", preserve_mtp=True)
+            is False
+        )
+
+
+class TestMtpFcFullPrecision:
+    """Critical MTP projections (Qwen3.5 mtp.fc + DeepSeek-V4 e_proj/h_proj
+    + hc_head.*) must stay in full precision. Mirrors PR 990's quant_predicate
+    extended to PR 15's DeepSeek-V4 MTPBlock layout."""
+
+    def test_qwen_mtp_fc_top_level_returns_none(self):
+        from omlx.oq import _get_predicate_bits
+
+        bits, gs, mode = _get_predicate_bits("mtp.fc.weight", {}, 4, 64)
+        assert bits is None and gs is None and mode is None
+
+    def test_qwen_mtp_fc_nested_returns_none(self):
+        from omlx.oq import _get_predicate_bits
+
+        bits, gs, mode = _get_predicate_bits(
+            "language_model.mtp.fc.weight", {}, 4, 64
+        )
+        assert bits is None and gs is None and mode is None
+
+    def test_deepseek_e_proj_protected(self):
+        from omlx.oq import _get_predicate_bits
+
+        bits, _, _ = _get_predicate_bits("mtp.0.e_proj.weight", {}, 4, 64)
+        assert bits is None
+
+    def test_deepseek_h_proj_protected(self):
+        from omlx.oq import _get_predicate_bits
+
+        bits, _, _ = _get_predicate_bits("mtp.0.h_proj.weight", {}, 4, 64)
+        assert bits is None
+
+    def test_deepseek_hc_head_sanitized_protected(self):
+        from omlx.oq import _get_predicate_bits
+
+        for k in ("mtp.0.hc_head.fn", "mtp.0.hc_head.base", "mtp.0.hc_head.scale"):
+            bits, _, _ = _get_predicate_bits(k, {}, 4, 64)
+            assert bits is None, f"{k} should be full precision"
+
+    def test_deepseek_hc_head_raw_hf_protected(self):
+        from omlx.oq import _get_predicate_bits
+
+        # Raw HF form (before sanitize) — covered too.
+        for k in ("mtp.0.hc_head_fn", "mtp.0.hc_head_base", "mtp.0.hc_head_scale"):
+            bits, _, _ = _get_predicate_bits(k, {}, 4, 64)
+            assert bits is None, f"{k} should be full precision"
+
+    def test_other_mtp_tensors_still_quantized(self):
+        from omlx.oq import _get_predicate_bits
+
+        bits, _, _ = _get_predicate_bits(
+            "mtp.layers.0.self_attn.q_proj.weight", {}, 4, 64
+        )
+        assert bits is not None and bits >= 4
+
+    def test_deepseek_block_attn_still_quantized(self):
+        from omlx.oq import _get_predicate_bits
+
+        # MTPBlock 의 내부 attention/ffn 은 backbone 과 같은 양자화 정책
+        bits, _, _ = _get_predicate_bits(
+            "mtp.0.block.attn.wq_a.weight", {}, 4, 64
+        )
+        assert bits is not None
+
+    def test_normal_weights_unaffected(self):
+        from omlx.oq import _get_predicate_bits
+
+        bits, _, _ = _get_predicate_bits(
+            "model.layers.0.attn.q_proj.weight", {}, 4, 64
+        )
+        assert bits is not None
+
+    def test_non_mtp_e_proj_not_protected(self):
+        from omlx.oq import _get_predicate_bits
+
+        # e_proj 가 mtp 밖 (가상 케이스) 이면 보호 안 함
+        bits, _, _ = _get_predicate_bits("model.layers.0.e_proj.weight", {}, 4, 64)
+        assert bits is not None
+
+
+class TestNormalizeMtpInConfig:
+    def test_zeros_top_level_mtp_fields(self):
+        from omlx.oq import _normalize_mtp_in_config
+
+        cfg = {"mtp_num_hidden_layers": 1, "num_nextn_predict_layers": 2}
+        _normalize_mtp_in_config(cfg)
+        assert cfg["mtp_num_hidden_layers"] == 0
+        assert cfg["num_nextn_predict_layers"] == 0
+
+    def test_zeros_nested_text_config_fields(self):
+        from omlx.oq import _normalize_mtp_in_config
+
+        cfg = {
+            "model_type": "qwen3_5",
+            "text_config": {"mtp_num_hidden_layers": 1, "num_hidden_layers": 64},
+        }
+        _normalize_mtp_in_config(cfg)
+        assert cfg["text_config"]["mtp_num_hidden_layers"] == 0
+        # Non-mtp fields untouched.
+        assert cfg["text_config"]["num_hidden_layers"] == 64
+
+    def test_no_mtp_fields_is_noop(self):
+        from omlx.oq import _normalize_mtp_in_config
+
+        cfg = {"model_type": "llama"}
+        _normalize_mtp_in_config(cfg)
+        assert cfg == {"model_type": "llama"}
+
 
 # =============================================================================
 # Test validate_quantizable

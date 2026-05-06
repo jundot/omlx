@@ -763,6 +763,39 @@
                                         </div>
                                     </div>
                                 </div>
+
+                                <!-- Native MTP (mlx-lm PR 990 + PR 15 monkey-patch) -->
+                                <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mt-3">
+                                    <div class="flex items-start justify-between gap-3">
+                                        <div class="min-w-0">
+                                            <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.mtp') }}</span>
+                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.mtp_hint') | safe }}</p>
+                                            <p x-show="!modelSettings.mtp_compatible && modelSettings.mtp_compatibility_reason"
+                                               class="text-xs text-amber-600 mt-1"
+                                               x-text="modelSettings.mtp_compatibility_reason"></p>
+                                            <p x-show="modelSettings.mtp_compatible && (modelSettings.dflash_enabled || modelSettings.turboquant_kv_enabled)"
+                                               class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.mtp_conflict') }}</p>
+                                        </div>
+                                        <button type="button"
+                                                @click="if ((modelSettings.mtp_compatible || modelSettings.mtp_enabled) && !modelSettings.dflash_enabled && !modelSettings.turboquant_kv_enabled) modelSettings.mtp_enabled = !modelSettings.mtp_enabled"
+                                                :disabled="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.turboquant_kv_enabled"
+                                                :title="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled)
+                                                            ? (modelSettings.mtp_compatibility_reason || 'Unsupported model')
+                                                            : (modelSettings.dflash_enabled
+                                                                ? '{{ t('modal.model_settings.mtp_conflict_dflash') }}'
+                                                                : (modelSettings.turboquant_kv_enabled
+                                                                    ? '{{ t('modal.model_settings.mtp_conflict_turboquant') }}'
+                                                                    : ''))"
+                                                :class="[
+                                                    modelSettings.mtp_enabled ? 'bg-black' : 'bg-neutral-200',
+                                                    ((!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.turboquant_kv_enabled) ? 'opacity-40 cursor-not-allowed' : ''
+                                                ]"
+                                                class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            <span :class="modelSettings.mtp_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
+                                    </div>
+                                </div>
                         </div>
                     </div>
                 </div>

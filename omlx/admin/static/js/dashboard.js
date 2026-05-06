@@ -303,6 +303,7 @@
             oqTextOnly: false,
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
+            oqPreserveMtp: false,
 
             // oQ Uploader state
             uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
@@ -1561,6 +1562,9 @@
                     dflash_compatible: model.dflash_compatible !== false,
                     dflash_compatibility_reason: model.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model.dflash_ssd_cache_available,
+                    mtp_enabled: settings.mtp_enabled || false,
+                    mtp_compatible: model.mtp_compatible === true,
+                    mtp_compatibility_reason: model.mtp_compatibility_reason || '',
                     ctKwargEntries,
                     trust_remote_code: settings.trust_remote_code || false,
                 };
@@ -1655,6 +1659,7 @@
                                     && !!this.modelSettings.dflash_in_memory_cache
                                     && !!this.modelSettings.dflash_ssd_cache_available
                                     && !!this.modelSettings.dflash_ssd_cache,
+                                mtp_enabled: !!this.modelSettings.mtp_enabled,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
                             };
                         })()),
@@ -1728,6 +1733,7 @@
                         this.modelSettings.dflash_in_memory_cache = true;
                         this.modelSettings.dflash_in_memory_cache_max_gib = 8;
                         this.modelSettings.dflash_ssd_cache = false;
+                        this.modelSettings.mtp_enabled = false;
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
@@ -3458,6 +3464,7 @@
                             sensitivity_model_path: this.oqSensitivityModelPath,
                             text_only: this.oqTextOnly,
                             dtype: this.oqDtype,
+                            preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));
@@ -3562,6 +3569,11 @@
                 return model?.is_vlm || false;
             },
 
+            oqSelectedModelHasMtp() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                return model?.has_mtp_heads || false;
+            },
+
             oqEstimatedMemory() {
                 // Use precise estimate from API if available
                 if (this.oqEstimate) {
@@ -3605,6 +3617,7 @@
                         const params = new URLSearchParams({
                             model_path: this.oqSelectedModelPath,
                             oq_level: this.oqLevel,
+                            preserve_mtp: this.oqSelectedModelHasMtp() && this.oqPreserveMtp ? 'true' : 'false',
                         });
                         const resp = await fetch(`/admin/api/oq/estimate?${params}`);
                         if (resp.ok) {

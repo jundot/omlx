@@ -134,6 +134,8 @@ class ModelSettingsRequest(BaseModel):
     dflash_in_memory_cache: Optional[bool] = None
     dflash_in_memory_cache_max_bytes: Optional[int] = None
     dflash_ssd_cache: Optional[bool] = None
+    # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
+    mtp_enabled: Optional[bool] = None
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
@@ -292,6 +294,7 @@ class OQStartRequest(BaseModel):
     sensitivity_model_path: str = ""
     text_only: bool = False
     dtype: str = "bfloat16"
+    preserve_mtp: bool = False
 
 
 class HFUploadRequest(BaseModel):
@@ -340,6 +343,93 @@ def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     if not model_path:
         return False, "model_path missing"
     return is_dflash_compatible(model_path)
+
+
+def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
+    """Mirror of ``_dflash_compat_for_model`` for the native MTP toggle.
+
+    Returns ``(compatible, reason)``. Reason is empty on success and
+    suitable for surfacing to users (admin UI shows it under the toggle).
+
+    The check is conservative: even when the config declares MTP layers
+    we also peek at the safetensors weight index to verify that the
+    converter actually preserved the ``mtp.*`` tensors. Default mlx-lm
+    converters strip them; PR 990 ships a separate path that keeps them.
+    """
+    import json
+    from pathlib import Path
+
+    from ..utils.model_loading import _has_mtp_heads, _is_mtp_compatible
+
+    model_path = model_info.get("model_path") or ""
+    if not model_path:
+        return False, "model_path missing"
+    cfg_path = Path(model_path) / "config.json"
+    if not cfg_path.exists():
+        return False, "config.json not found"
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except Exception as e:
+        return False, f"failed to read config: {e}"
+    model_type = cfg.get("model_type")
+    if not _has_mtp_heads(cfg):
+        return False, "model has no MTP heads in config"
+    if not _is_mtp_compatible(cfg, model_type):
+        return False, (
+            f"model_type={model_type!r} is not on the MTP whitelist "
+            "(supported: qwen3_5*, qwen3_6*, deepseek_v4*)"
+        )
+    if not _model_has_mtp_weight_tensors(Path(model_path)):
+        return False, (
+            "Config declares MTP layers but the converted weights are missing "
+            "mtp.* tensors. Re-convert from HF with a converter that preserves "
+            "MTP weights."
+        )
+    return True, ""
+
+
+def _model_has_mtp_weight_tensors(model_dir) -> bool:
+    """Return True iff the model directory's weight files contain ``mtp.*`` keys.
+
+    Uses ``model.safetensors.index.json`` when present (cheap — only reads
+    the weight_map). Falls back to opening each ``*.safetensors`` and
+    checking its keys when no index is present (single-shard models).
+    Returns False on any error (we treat the model as incompatible rather
+    than risking a confusing load failure mid-inference).
+    """
+    import json
+    from pathlib import Path
+
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        # Library should be installed via mlx-lm deps; if it's not we can't
+        # peek the weights. Stay conservative and assume incompatible.
+        return False
+
+    model_dir = Path(model_dir)
+
+    # Preferred path: read the index file's weight_map (no tensor data loaded).
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            index = json.loads(index_path.read_text())
+            weight_map = index.get("weight_map", {})
+            return any("mtp." in key for key in weight_map.keys())
+        except Exception:
+            return False
+
+    # Single-shard fallback: enumerate keys via safe_open metadata. We
+    # short-circuit on the first ``mtp.*`` key.
+    for path in model_dir.glob("*.safetensors"):
+        try:
+            with safe_open(str(path), framework="numpy") as f:  # type: ignore[arg-type]
+                for key in f.keys():
+                    if "mtp." in key:
+                        return True
+        except Exception:
+            continue
+    return False
 
 
 def _apply_log_level_runtime(level: str) -> None:
@@ -1458,6 +1548,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         settings = all_settings.get(model_id)
 
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
+        mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
 
         model_data = {
             "id": model_id,
@@ -1477,6 +1568,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "dflash_compatible": compat_ok,
             "dflash_compatibility_reason": compat_reason,
             "dflash_ssd_cache_available": dflash_ssd_cache_available,
+            "mtp_compatible": mtp_compat_ok,
+            "mtp_compatibility_reason": mtp_compat_reason,
         }
 
         # Add settings if available
@@ -1515,6 +1608,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_in_memory_cache": settings.dflash_in_memory_cache,
                 "dflash_in_memory_cache_max_bytes": settings.dflash_in_memory_cache_max_bytes,
                 "dflash_ssd_cache": settings.dflash_ssd_cache,
+                "mtp_enabled": settings.mtp_enabled,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "trust_remote_code": settings.trust_remote_code,
@@ -1818,6 +1912,79 @@ async def update_model_settings(
                     ),
                 )
         current_settings.dflash_ssd_cache = ssd_requested
+
+    # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
+    if "mtp_enabled" in sent:
+        new_mtp_enabled = bool(request.mtp_enabled)
+        if new_mtp_enabled:
+            # Compatibility check: the model needs MTP heads in config.json AND
+            # the model_type must be one PR 990 / PR 15 covers AND the weight
+            # files must actually contain mtp.* tensors. The last check is
+            # the one that catches mlx-community converted weights where the
+            # default sanitize path stripped the MTP heads.
+            from ..utils.model_loading import _is_mtp_compatible
+            import json
+            from pathlib import Path
+
+            cfg_path = Path(entry.model_path) / "config.json"
+            if not cfg_path.exists():
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"MTP enabled but config.json missing at {cfg_path}; "
+                        "cannot verify MTP compatibility."
+                    ),
+                )
+            try:
+                cfg = json.loads(cfg_path.read_text())
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"MTP enabled but failed to read model config: {e}",
+                )
+            model_type = cfg.get("model_type")
+            if not _is_mtp_compatible(cfg, model_type):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Model is not MTP-compatible (model_type={model_type!r}, "
+                        f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
+                        "Native MTP requires Qwen3.5/3.6 or DeepSeek-V4 with MTP heads."
+                    ),
+                )
+            if not _model_has_mtp_weight_tensors(Path(entry.model_path)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Config declares MTP layers but the converted weights are "
+                        "missing mtp.* tensors. Re-convert from HF with a converter "
+                        "that preserves MTP weights. The default "
+                        "mlx-lm sanitize() path strips them."
+                    ),
+                )
+            # Mutual exclusion with DFlash / TurboQuant — ModelSettings.__post_init__
+            # also enforces this, but we surface a clearer error here.
+            dflash_after = (
+                bool(request.dflash_enabled)
+                if "dflash_enabled" in sent
+                else current_settings.dflash_enabled
+            )
+            if dflash_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
+                )
+            tq_after = (
+                bool(request.turboquant_kv_enabled)
+                if "turboquant_kv_enabled" in sent
+                else current_settings.turboquant_kv_enabled
+            )
+            if tq_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail="MTP and TurboQuant KV cannot both be enabled; TurboQuant patches the attention path MTP relies on.",
+                )
+        current_settings.mtp_enabled = new_mtp_enabled
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -4662,6 +4829,7 @@ async def list_oq_models(is_admin: bool = Depends(require_admin)):
 async def estimate_oq(
     model_path: str,
     oq_level: float,
+    preserve_mtp: bool = False,
     is_admin: bool = Depends(require_admin),
 ):
     """Estimate effective bpw and output size for a model at given oQ level."""
@@ -4669,7 +4837,11 @@ async def estimate_oq(
 
     try:
         result = await asyncio.to_thread(
-            estimate_bpw_and_size, model_path, oq_level
+            estimate_bpw_and_size,
+            model_path,
+            oq_level,
+            64,  # group_size (default)
+            preserve_mtp,
         )
         return result
     except Exception as e:
@@ -4704,6 +4876,7 @@ async def start_oq_quantization(
             sensitivity_model_path=request.sensitivity_model_path,
             text_only=request.text_only,
             dtype=request.dtype,
+            preserve_mtp=request.preserve_mtp,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
