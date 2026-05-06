@@ -529,8 +529,29 @@ class BlockAwarePrefixCache(CacheManager):
                     cache_start = start_idx
                     cache_end = end_idx
 
-                # Check cache continuity for the selected slice mode.
-                if cache_seq_len > 0 and cache_start >= cache_seq_len:
+                is_last_block = i == num_new_blocks - 1
+
+                # Look up boundary snapshot BEFORE the continuity check.
+                # Snapshots are self-contained — they carry the full cache
+                # state at this boundary, so the live-cache seq_len gate
+                # below does not apply when a snapshot covers this block.
+                block_boundary_tc = existing_tokens + end_idx
+                snapshot_cache_data = None
+                if boundary_snapshots and block_boundary_tc in boundary_snapshots:
+                    snapshot_cache_data = boundary_snapshots[block_boundary_tc]
+
+                # Continuity check applies only when we will slice live
+                # cache_data for this block. With a boundary snapshot,
+                # _extract_block_tensor_slice pulls non-sliceable layers
+                # (RotatingKVCache, PoolingCache, ArraysCache) from the
+                # snapshot, so for all-non-sliceable models (e.g., V4)
+                # the snapshot fully covers the block and live cache
+                # length is irrelevant.
+                if (
+                    snapshot_cache_data is None
+                    and cache_seq_len > 0
+                    and cache_start >= cache_seq_len
+                ):
                     logger.debug(
                         f"Cache continuity broken: cache only has {cache_seq_len} tokens, "
                         f"cannot store block at cache indices [{cache_start}:{cache_end}] "
@@ -541,16 +562,6 @@ class BlockAwarePrefixCache(CacheManager):
                     block_table.block_ids.pop()
                     block_table.num_tokens -= len(block_tokens)
                     break
-
-                is_last_block = i == num_new_blocks - 1
-
-                # Look up intermediate snapshot for this block's boundary.
-                # The snapshot provides per-block ArraysCache state captured
-                # at exactly this boundary during prefill.
-                block_boundary_tc = existing_tokens + end_idx
-                snapshot_cache_data = None
-                if boundary_snapshots and block_boundary_tc in boundary_snapshots:
-                    snapshot_cache_data = boundary_snapshots[block_boundary_tc]
 
                 block_kv_data = self._extract_block_tensor_slice(
                     cache_data,
