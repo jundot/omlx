@@ -234,7 +234,14 @@ class BoundarySnapshotSSDStore:
         return False
 
     def cleanup_request(self, request_id: str) -> None:
-        """Delete all snapshot files and pending writes for a request."""
+        """Delete all snapshot files and pending writes for a request.
+
+        Caller must guarantee no async store_cache worker is still reading
+        snapshots for this request — concurrent ``rmtree`` here would race
+        the worker's :meth:`load` calls and silently strip block storage.
+        :class:`omlx.scheduler.Scheduler` defers this call until the
+        ``store_future`` for ``request_id`` is done.
+        """
         # Count remaining queue items and mark as cancelled.  The writer
         # thread decrements the count on each skip and removes the entry
         # when it reaches zero.

@@ -869,6 +869,12 @@ class Scheduler:
             if request_id in self.request_id_to_uid:
                 del self.request_id_to_uid[request_id]
             self._inflight_store_futures.pop(request_id, None)
+            # Boundary snapshots were kept on disk for the worker; safe to
+            # delete now that the future has completed. Cleanup was
+            # deferred from _cleanup_finished to avoid racing the worker's
+            # boundary_snapshot_store.load() calls with rmtree.
+            if self._boundary_snapshot_store is not None:
+                self._boundary_snapshot_store.cleanup_request(request_id)
             # Worker no longer holds extracted_cache — pop request from
             # self.requests and drop the cache buffer references so MLX
             # arrays can be freed.
@@ -4089,9 +4095,15 @@ class Scheduler:
             if hasattr(self.model, "clear_pending_embeddings"):
                 self.model.clear_pending_embeddings()
 
-            # Drop any boundary snapshot for this request.
+            # Drop any boundary snapshot for this request. The in-memory
+            # dict pop is safe — the async store worker holds its own
+            # reference to the snapshot dict via _BoundarySnapshotProvider.
             self._boundary_cache_snapshots.pop(request_id, None)
-            if self._boundary_snapshot_store is not None:
+            # cleanup_request rmtree's the on-disk snapshot directory and
+            # races the worker's boundary_snapshot_store.load() calls. If
+            # an async store_future is in flight, defer cleanup until the
+            # worker finishes (handled in _drain_pending_async_removes).
+            if self._boundary_snapshot_store is not None and store_future is None:
                 self._boundary_snapshot_store.cleanup_request(request_id)
 
             # Track as finished
