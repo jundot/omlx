@@ -111,7 +111,21 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     p_dsml_template = """<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>"""
     P_dsml_strs = []
 
-    arguments = json.loads(tool_call["arguments"])
+    # OpenAI tool_calls store arguments as a JSON string; the omlx
+    # Anthropic adapter (api/anthropic_utils.py:198) decodes ``input``
+    # into a dict before storing it on assistant messages. Accept both
+    # so multi-turn conversations whose history was authored from
+    # either side render without raising.
+    raw_args = tool_call["arguments"]
+    if isinstance(raw_args, str):
+        arguments = json.loads(raw_args)
+    elif isinstance(raw_args, dict):
+        arguments = raw_args
+    else:
+        raise TypeError(
+            f"tool_call['arguments'] must be str or dict, got "
+            f"{type(raw_args).__name__}"
+        )
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(

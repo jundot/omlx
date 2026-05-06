@@ -474,6 +474,73 @@ class TestChatTemplateV4:
         assert "<functions>" not in prompt
         assert "## Tools" not in prompt
 
+    def test_encode_arguments_accepts_dict(self, applied_patch):
+        """Anthropic /v1/messages history stores tool_call arguments as
+        a dict (anthropic_utils.py decodes the input before saving).
+        encode_arguments_to_dsml must accept that shape — not just the
+        OpenAI JSON-string convention — so multi-turn renders don't
+        raise TypeError when the assistant history is from Claude Code.
+        """
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        encoded = ct.encode_arguments_to_dsml(
+            {"name": "f", "arguments": {"location": "Seoul", "n": 3}}
+        )
+        assert 'name="location"' in encoded and "Seoul" in encoded
+        assert 'name="n"' in encoded and ">3<" in encoded
+        # string="true" for string params, "false" for non-string.
+        assert 'string="true"' in encoded
+        assert 'string="false"' in encoded
+
+    def test_assistant_tool_call_dict_arguments_round_trip(self, applied_patch):
+        """End-to-end multi-turn: assistant message history contains a
+        tool_use whose arguments came in as dict (Anthropic shape). The
+        rendered prompt must include the assistant's prior tool_call
+        block in DSML form so the model can continue the conversation
+        coherently.
+        """
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        messages = [
+            {"role": "user", "content": "Weather in Seoul?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": {"location": "Seoul"},
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "content": "sunny, 22C"},
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+        prompt = ct.apply_chat_template(
+            messages, tools=tools, add_generation_prompt=True
+        )
+        assert "<｜DSML｜tool_calls>" in prompt
+        assert 'invoke name="get_weather"' in prompt
+        assert "Seoul" in prompt
+        assert "sunny, 22C" in prompt
+
 
 class TestChatTemplateModuleRegistration:
     """sys.modules registration so mlx-lm's importlib path picks up our types."""
