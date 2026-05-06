@@ -243,6 +243,23 @@ def apply_load_patch() -> bool:
         return wrapper
 
     _tu.load = patched_load
+    # mlx_lm.utils does ``from .tokenizer_utils import load as
+    # _load_tokenizer`` at module import, so patching only the module
+    # attribute on tokenizer_utils misses the already-bound reference
+    # on mlx_lm.utils. Replace both bindings so any call site
+    # (mlx_lm.utils.load, direct mlx_lm.tokenizer_utils.load) hits the
+    # patched function.
+    try:
+        import mlx_lm.utils as _mu
+
+        if hasattr(_mu, "_load_tokenizer"):
+            _mu._load_tokenizer = patched_load
+    except Exception as e:
+        logger.warning(
+            "Could not patch mlx_lm.utils._load_tokenizer (V4 chat_template "
+            "injection may not fire): %s",
+            e,
+        )
     _LOAD_PATCHED = True
     logger.info(
         "mlx_lm.tokenizer_utils.load wrapped "

@@ -393,6 +393,87 @@ class TestChatTemplateV4:
         parsed = tp.parse_tool_call(inner)
         assert parsed == {"name": "f", "arguments": {"a": 1, "b": "hi", "c": [1, 2]}}
 
+    def test_user_only_request_with_tools_injects_dsml(self, applied_patch):
+        """User-only message + tools must still emit the DSML tools block.
+
+        Regression guard for the case where a Claude Code or OpenAI client
+        passes ``tools`` without a system message. ``render_message`` only
+        injects tools on system / developer roles, so ``encode_messages``
+        synthesises an empty system message up front when the first
+        message is a plain user. Without this fix the rendered prompt
+        omits the ``<functions>`` schema entirely and the model never
+        emits a tool_calls block.
+        """
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+        prompt = ct.apply_chat_template(
+            [{"role": "user", "content": "Weather in Seoul?"}],
+            tools=tools,
+            add_generation_prompt=True,
+        )
+        assert "<functions>" in prompt
+        assert "get_weather" in prompt
+        assert ct.dsml_token in prompt
+
+    def test_system_user_request_with_tools_unchanged(self, applied_patch):
+        """When a system message is already present, the synthetic prepend
+        path must not fire — the rendered prompt keeps the original system
+        content verbatim and only injects the tools schema once.
+        """
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+        prompt = ct.apply_chat_template(
+            [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Weather in Seoul?"},
+            ],
+            tools=tools,
+            add_generation_prompt=True,
+        )
+        assert "You are a helpful assistant." in prompt
+        # Only one tools block — no double-injection from synthetic prepend.
+        assert prompt.count("<functions>") == 1
+
+    def test_user_only_no_tools_no_prepend(self, applied_patch):
+        """No tools → no synthetic system. Plain user-only request renders
+        with just the BOS + user wrapper, matching V3.2 baseline."""
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        prompt = ct.apply_chat_template(
+            [{"role": "user", "content": "Hi"}],
+            add_generation_prompt=True,
+        )
+        assert "<functions>" not in prompt
+        assert "## Tools" not in prompt
+
 
 class TestChatTemplateModuleRegistration:
     """sys.modules registration so mlx-lm's importlib path picks up our types."""

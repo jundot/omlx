@@ -329,6 +329,22 @@ def encode_messages(
     tools: Any = None,
 ) -> str:
     context = context if context else []
+
+    # render_message only injects the DSML tools block on system / developer
+    # roles (chat_template_v4.py:194-207). When the first message is a
+    # plain user (e.g. OpenAI request without a system message, or an
+    # Anthropic request whose system field was empty) the tools schema
+    # never reaches the model and it cannot emit a tool_calls block.
+    # Prepend an empty synthetic system message so render_tools fires
+    # without otherwise altering the conversation.
+    if (
+        tools
+        and messages
+        and messages[0].get("role") not in ("system", "developer")
+        and not (context and context[0].get("role") in ("system", "developer"))
+    ):
+        messages = [{"role": "system", "content": ""}, *messages]
+
     full_messages = context + messages
     prompt = bos_token if add_default_bos_token and len(context) == 0 else ""
 
@@ -349,6 +365,30 @@ def encode_messages(
 def apply_chat_template(
     messages, continue_final_message=False, add_generation_prompt=False, **kwargs
 ):
+    # mlx-lm and the omlx server forward an ``enable_thinking`` boolean
+    # kwarg through ``tokenizer.apply_chat_template``. The V3.2-derived
+    # ``encode_messages`` signature only knows ``thinking_mode`` ("chat"
+    # | "thinking"). Translate here so the caller's kwarg shape is
+    # preserved without leaking the rename downstream.
+    if "enable_thinking" in kwargs and "thinking_mode" not in kwargs:
+        kwargs["thinking_mode"] = (
+            "thinking" if kwargs.pop("enable_thinking") else "chat"
+        )
+    else:
+        kwargs.pop("enable_thinking", None)
+
+    # Drop unknown kwargs that some API frontends inject but
+    # encode_messages does not consume — keeps the wrapper resilient
+    # against future template_kwargs additions.
+    _accepted = {
+        "thinking_mode",
+        "context",
+        "drop_thinking",
+        "add_default_bos_token",
+        "tools",
+    }
+    kwargs = {k: v for k, v in kwargs.items() if k in _accepted}
+
     out = encode_messages(messages, **kwargs)
     if continue_final_message and add_generation_prompt:
         raise ValueError(
