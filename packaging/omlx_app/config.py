@@ -2,7 +2,7 @@
 
 import json
 import logging
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -169,11 +169,14 @@ class ServerConfig:
         try:
             with open(settings_file) as f:
                 data = json.load(f)
+            model_settings = data.get("model", {})
+            model_dirs = model_settings.get("model_dirs") or []
+            model_dir = model_dirs[0] if model_dirs else model_settings.get("model_dir")
             return {
-                "model_dir": data.get("model", {}).get("model_dir"),
+                "model_dir": model_dir,
                 "port": data.get("server", {}).get("port", 8000),
             }
-        except (json.JSONDecodeError, OSError) as e:
+        except (json.JSONDecodeError, OSError):
             return {}
 
     def sync_from_server_settings(self):
@@ -189,14 +192,14 @@ class ServerConfig:
         if "model_dir" in server_settings and server_settings["model_dir"]:
             self.model_dir = server_settings["model_dir"]
 
-    def sync_model_dir_to_server_settings(self):
-        """Write app's model_dir to server's settings.json if model_dirs not already set.
+    def sync_model_dir_to_server_settings(self, overwrite: bool = False):
+        """Write app's model directory to server settings.json.
 
-        Called after the welcome screen sets a model directory, so the server
-        picks it up from settings.json instead of a CLI flag.
+        The welcome screen uses the default conservative behavior so existing
+        multi-directory settings from the web admin are preserved. Preferences
+        saves pass overwrite=True because the user explicitly selected the app's
+        single model directory setting there.
         """
-        if not self.model_dir:
-            return
         settings_file = Path(self.base_path).expanduser() / "settings.json"
         data = {}
         if settings_file.exists():
@@ -207,13 +210,52 @@ class ServerConfig:
                 pass
         if "model" not in data:
             data["model"] = {}
-        existing_dirs = data["model"].get("model_dirs", [])
-        if not existing_dirs:
-            data["model"]["model_dirs"] = [self.model_dir]
-            data["model"]["model_dir"] = self.model_dir
-            settings_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(settings_file, "w") as f:
-                json.dump(data, f, indent=2)
+
+        existing_dirs = data["model"].get("model_dirs") or []
+        existing_dir = data["model"].get("model_dir")
+        if not overwrite and (existing_dirs or existing_dir):
+            return
+
+        model_dir = self.get_effective_model_dir()
+        data["model"]["model_dirs"] = [model_dir]
+        data["model"]["model_dir"] = model_dir
+        settings_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(settings_file, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def update_model_dir_runtime(self, model_dir: str) -> bool:
+        """Update model directory on a running server via admin API.
+
+        The admin API updates the in-memory server state and persists the same
+        value to settings.json. Returns False if the server is unreachable or
+        authentication fails.
+        """
+        base_url = f"http://127.0.0.1:{self.port}"
+        current_key = self.get_server_api_key()
+
+        try:
+            session = requests.Session()
+            session.trust_env = False
+
+            if current_key:
+                login_resp = session.post(
+                    f"{base_url}/admin/api/login",
+                    json={"api_key": current_key},
+                    timeout=2,
+                )
+                if login_resp.status_code != 200:
+                    return False
+
+            resp = session.post(
+                f"{base_url}/admin/api/global-settings",
+                json={"model_dirs": [model_dir]},
+                timeout=2,
+            )
+            return resp.status_code == 200
+
+        except requests.RequestException as e:
+            logger.debug(f"Failed to update model directory on running server: {e}")
+            return False
 
     def sync_port_to_server_settings(self):
         """Write app's port to server's settings.json so `omlx launch` and other
