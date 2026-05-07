@@ -1505,18 +1505,22 @@ def _should_quantize_tensor(name: str, shape: tuple) -> bool:
     return True
 
 
-def _build_model_sanitizer(config: dict):
+def _build_model_sanitizer(config: dict, text_only: bool = False):
     """Build a sanitize function from the model class.
 
     For VLM models, uses mlx-vlm's model class (preserves vision weights).
     For LLM models, uses mlx-lm's model class.
+    When text_only is True, always uses the LLM path even for VLM
+    architectures so that mlx_lm_mtp patches (which handle MTP sanitize
+    for both dense and MoE) are used instead of the VLM path whose
+    _Proxy-based sanitize drops the MTP head.
 
     Returns:
         A function that takes a dict of weights and returns sanitized weights,
         or None if the model class can't be loaded.
     """
     architectures = config.get("architectures", [])
-    is_vlm = any("ForConditionalGeneration" in a for a in architectures)
+    is_vlm = any("ForConditionalGeneration" in a for a in architectures) and not text_only
 
     if is_vlm:
         try:
@@ -2064,7 +2068,7 @@ def quantize_oq_streaming(
 
     cb("loading", 12.0)
 
-    sanitize_fn = _build_model_sanitizer(config)
+    sanitize_fn = _build_model_sanitizer(config, text_only=text_only)
     # When preserve_mtp is True, the patched sanitize functions
     # (mlx_lm_mtp/qwen35_model.py and mlx_vlm_mtp/qwen35_vlm_model.py)
     # keep mtp.* in the output and apply the +1 RMSNorm shift to MTP
