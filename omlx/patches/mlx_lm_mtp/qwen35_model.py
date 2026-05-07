@@ -222,7 +222,7 @@ def _patch_gated_delta_net(q35: Any) -> None:
     between for rollback on draft rejection.
     """
     cls = q35.GatedDeltaNet
-    if hasattr(cls, "_omlx_mtp_patched"):
+    if "_omlx_mtp_patched" in cls.__dict__:
         return
 
     import mlx.core as mx
@@ -358,7 +358,7 @@ def _patch_gated_delta_net(q35: Any) -> None:
 
 def _patch_decoder_layer(q35: Any) -> None:
     cls = q35.DecoderLayer
-    if hasattr(cls, "_omlx_mtp_patched"):
+    if "_omlx_mtp_patched" in cls.__dict__:
         return
 
     def __call__(self, x, mask=None, cache=None, n_confirmed: int = 0):
@@ -382,7 +382,7 @@ def _patch_decoder_layer(q35: Any) -> None:
 
 def _patch_qwen3_5_text_model(q35: Any) -> None:
     cls = q35.Qwen3_5TextModel
-    if hasattr(cls, "_omlx_mtp_patched"):
+    if "_omlx_mtp_patched" in cls.__dict__:
         return
 
     create_attention_mask = q35.create_attention_mask
@@ -428,7 +428,7 @@ def _patch_qwen3_5_text_model(q35: Any) -> None:
 
 def _patch_text_model(q35: Any) -> None:
     cls = q35.TextModel
-    if hasattr(cls, "_omlx_mtp_patched"):
+    if "_omlx_mtp_patched" in cls.__dict__:
         return
 
     from mlx_lm.models.cache import KVCache
@@ -575,7 +575,7 @@ def _patch_text_model(q35: Any) -> None:
 
 def _patch_outer_model(q35: Any) -> None:
     cls = q35.Model
-    if hasattr(cls, "_omlx_mtp_patched"):
+    if "_omlx_mtp_patched" in cls.__dict__:
         return
 
     def __call__(
@@ -630,7 +630,7 @@ def _patch_qwen3_5_moe() -> None:
         return
 
     cls = moe.Model
-    if hasattr(cls, "_omlx_mtp_patched"):
+    if "_omlx_mtp_patched" in cls.__dict__:
         return
 
     import mlx.core as mx
@@ -683,6 +683,11 @@ def _patch_qwen3_5_moe() -> None:
             )
             for layer_idx in range(mtp_num):
                 prefix = f"language_model.mtp.layers.{layer_idx}.mlp"
+                # Idempotent: oQ outputs already store experts in switch_mlp
+                # form (mlx-vlm sanitize patch unfuses MTP experts before
+                # quantization). Skip the load-time unfuse/stack in that case.
+                if f"{prefix}.switch_mlp.gate_proj.weight" in new_weights:
+                    continue
                 if mtp_is_fused:
                     _unfuse_experts(new_weights, prefix)
                 else:

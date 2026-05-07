@@ -1584,6 +1584,17 @@ def _build_model_sanitizer(config: dict):
     try:
         from mlx_lm.utils import _get_classes
 
+        # DeepSeek-V4 isn't in stock mlx-lm — its model class is injected
+        # into ``sys.modules`` by oMLX's base patch. Trigger that here so
+        # ``_get_classes(config)`` for model_type=="deepseek_v4" succeeds.
+        # No-op for other model types.
+        if config.get("model_type") == "deepseek_v4":
+            try:
+                from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+                apply_deepseek_v4_patch()
+            except Exception as patch_err:
+                logger.debug(f"deepseek_v4 base patch not applied: {patch_err}")
+
         # Apply mlx-lm MTP patch so the patched __init__/sanitize handle
         # mtp.* tensors correctly. Idempotent — apply() is a no-op once
         # patched.

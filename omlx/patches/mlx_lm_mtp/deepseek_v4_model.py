@@ -49,7 +49,7 @@ def apply() -> bool:
         return False
 
     # Idempotency check.
-    if hasattr(dsv4.Model, "_omlx_mtp_patched"):
+    if "_omlx_mtp_patched" in dsv4.Model.__dict__:
         _PATCHED = True
         return True
 
@@ -78,27 +78,25 @@ def _patch_model_args(dsv4: Any) -> None:
     by wrapping ``from_dict``.
     """
     args_cls = dsv4.ModelArgs
-    if hasattr(args_cls, "_omlx_mtp_args_patched"):
+    if "_omlx_mtp_args_patched" in args_cls.__dict__:
         return
 
     original_from_dict = args_cls.from_dict.__func__
 
     def patched_from_dict(cls, params):
-        # Pre-extend compress_ratios in the params dict so __post_init__
-        # accepts the wider list. We're conservative: only act when MTP
-        # layers are declared and the existing list is short by exactly
-        # num_nextn_predict_layers.
-        params = dict(params)
-        n_main = int(params.get("num_hidden_layers", 0) or 0)
-        n_mtp = int(params.get("num_nextn_predict_layers", 0) or 0)
-        ratios = params.get("compress_ratios")
-        if n_mtp > 0 and ratios is not None:
-            ratios = list(ratios)
-            target = n_main + n_mtp
-            if len(ratios) == n_main:
-                ratios = ratios + [0] * n_mtp
-            params["compress_ratios"] = ratios[:target]
-        return original_from_dict(cls, params)
+        # Build args via the base ``from_dict`` (which runs ``__post_init__``
+        # and may truncate ``compress_ratios`` back to ``num_hidden_layers``).
+        # Then re-extend the ratio list to cover MTP layers so MTPBlock's
+        # ``DeepseekV4Block(..., layer_idx=n_main+i)`` lookup succeeds.
+        args = original_from_dict(cls, params)
+        n_main = int(getattr(args, "num_hidden_layers", 0) or 0)
+        n_mtp = int(getattr(args, "num_nextn_predict_layers", 0) or 0)
+        if n_mtp > 0 and hasattr(args, "compress_ratios"):
+            ratios = list(args.compress_ratios)
+            if len(ratios) < n_main + n_mtp:
+                ratios = ratios + [0] * (n_main + n_mtp - len(ratios))
+            args.compress_ratios = ratios
+        return args
 
     args_cls.from_dict = classmethod(patched_from_dict)
     args_cls._omlx_mtp_args_patched = True
@@ -167,7 +165,7 @@ def _register_mtp_block(dsv4: Any) -> None:
 def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
     """Replace ``DeepseekV4Model.__call__`` to optionally return the raw 4D hidden."""
     cls = dsv4.DeepseekV4Model
-    if hasattr(cls, "_omlx_mtp_patched"):
+    if "_omlx_mtp_patched" in cls.__dict__:
         return
 
     import mlx.core as mx
@@ -238,7 +236,7 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
 
 def _patch_model(dsv4: Any) -> None:
     cls = dsv4.Model
-    if hasattr(cls, "_omlx_mtp_patched"):
+    if "_omlx_mtp_patched" in cls.__dict__:
         return
 
     import mlx.core as mx

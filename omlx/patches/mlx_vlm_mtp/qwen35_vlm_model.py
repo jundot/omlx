@@ -40,7 +40,7 @@ def apply() -> bool:
         return False
 
     cls = q35vlm.Model
-    if getattr(cls, "_omlx_mtp_vlm_patched", False):
+    if cls.__dict__.get("_omlx_mtp_vlm_patched", False):
         _APPLIED = True
         return True
 

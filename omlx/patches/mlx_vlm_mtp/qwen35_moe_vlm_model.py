@@ -30,7 +30,7 @@ def apply() -> bool:
         return False
 
     cls = q35moevlm.Model
-    if getattr(cls, "_omlx_mtp_vlm_patched", False):
+    if cls.__dict__.get("_omlx_mtp_vlm_patched", False):
         _APPLIED = True
         return True
 
@@ -45,11 +45,10 @@ def apply() -> bool:
             weights.pop("lm_head.weight", None)
 
         # Expert repack: gate_up_proj → gate_proj + up_proj per layer.
-        for layer_idx in range(self.config.text_config.num_hidden_layers):
-            prefix = f"model.language_model.layers.{layer_idx}.mlp"
+        def _unfuse_layer_experts(prefix):
             gate_up_key = f"{prefix}.experts.gate_up_proj"
             if gate_up_key not in weights:
-                continue
+                return
             gate_up_weight = weights.pop(gate_up_key)
             gate_weight, up_weights = mx.split(gate_up_weight, 2, axis=-2)
             weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
@@ -59,6 +58,31 @@ def apply() -> bool:
                 weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
                     down_key
                 )
+
+        for layer_idx in range(self.config.text_config.num_hidden_layers):
+            _unfuse_layer_experts(f"model.language_model.layers.{layer_idx}.mlp")
+
+        # MTP expert layers also ship in fused form (Qwen3.6) and must be
+        # unfused here so the oQ quantization sees the same per-projection
+        # shapes as the model class expects (switch_mlp.{gate,up,down}_proj).
+        # Without this, oQ stores fused experts.gate_up_proj on disk and
+        # mlx-lm's load-time unfuse can't recover the per-tensor quantization
+        # bits — class_predicate misses the lookup → wrong-bit init → shape
+        # mismatch.
+        # Note: mlx-vlm's TextConfig dataclass doesn't expose
+        # ``mtp_num_hidden_layers``, so we discover MTP layer indices from
+        # the weight keys themselves.
+        mtp_layer_idxs = sorted(
+            {
+                int(k.split(".")[2])
+                for k in weights
+                if k.startswith("mtp.layers.")
+                and len(k.split(".")) > 2
+                and k.split(".")[2].isdigit()
+            }
+        )
+        for layer_idx in mtp_layer_idxs:
+            _unfuse_layer_experts(f"mtp.layers.{layer_idx}.mlp")
 
         norm_keys = (
             ".input_layernorm.weight",
