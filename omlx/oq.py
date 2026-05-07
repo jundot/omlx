@@ -1505,6 +1505,104 @@ def _should_quantize_tensor(name: str, shape: tuple) -> bool:
     return True
 
 
+_PER_EXPERT_WEIGHT_RE = re.compile(
+    r"^(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+)
+
+
+def _prefuse_moe_experts_for_vlm(weights, config: dict) -> int:
+    """Fuse per-expert MoE weights into the stacked layout mlx_vlm expects.
+
+    FP8 MoE VLM checkpoints (e.g. Qwen3.5-MoE variants) store experts as
+    ``...mlp.experts.{n}.(gate|up|down)_proj.weight`` after FP8 dequant, but
+    mlx_vlm's ``Model.sanitize`` pops a single fused ``experts.gate_up_proj``
+    and crashes with ``KeyError`` when it is not present. This shim rebuilds
+    the fused tensors in chunks so peak memory stays bounded for models with
+    hundreds of experts. No-op when no per-expert keys are found (so dense
+    models and already-fused checkpoints pay nothing).
+
+    Returns the number of layers whose experts were fused.
+    """
+    tc = config.get("text_config", {}) or {}
+    num_experts = (
+        config.get("num_local_experts")
+        or tc.get("num_local_experts")
+        or config.get("num_experts")
+        or tc.get("num_experts")
+        or 0
+    )
+    if not num_experts:
+        return 0
+
+    groups: dict[tuple[str, str], dict[int, str]] = {}
+    for key in list(weights.keys()):
+        m = _PER_EXPERT_WEIGHT_RE.match(key)
+        if not m:
+            continue
+        prefix, idx, proj = m.group(1), int(m.group(2)), m.group(3)
+        groups.setdefault((prefix, proj), {})[idx] = key
+
+    if not groups:
+        return 0
+
+    _STACK_CHUNK = 16
+
+    def _stack_chunked(src_keys: list[str]):
+        partials = []
+        for base in range(0, len(src_keys), _STACK_CHUNK):
+            piece = [weights.pop(k) for k in src_keys[base:base + _STACK_CHUNK]]
+            stk = mx.stack(piece, axis=0)
+            mx.eval(stk)
+            del piece
+            mx.clear_cache()
+            partials.append(stk)
+        if len(partials) == 1:
+            return partials[0]
+        out = mx.concatenate(partials, axis=0)
+        mx.eval(out)
+        del partials
+        mx.clear_cache()
+        return out
+
+    prefixes = {p for p, _ in groups}
+    fused_layers = 0
+    for prefix in prefixes:
+        fused_gu = f"{prefix}.experts.gate_up_proj"
+        fused_dn = f"{prefix}.experts.down_proj"
+        if fused_gu in weights and fused_dn in weights:
+            continue
+
+        gate_map = groups.get((prefix, "gate_proj"), {})
+        up_map = groups.get((prefix, "up_proj"), {})
+        down_map = groups.get((prefix, "down_proj"), {})
+        if not (len(gate_map) == len(up_map) == len(down_map) == num_experts):
+            # Partial or mismatched layout — let the downstream sanitize raise
+            # a clear error instead of silently stacking a broken tensor.
+            continue
+
+        gate_keys = [gate_map[e] for e in range(num_experts)]
+        up_keys = [up_map[e] for e in range(num_experts)]
+        down_keys = [down_map[e] for e in range(num_experts)]
+
+        gate_stacked = _stack_chunked(gate_keys)
+        up_stacked = _stack_chunked(up_keys)
+        fused_gate_up = mx.concatenate([gate_stacked, up_stacked], axis=-2)
+        mx.eval(fused_gate_up)
+        del gate_stacked, up_stacked
+        mx.clear_cache()
+
+        weights[fused_gu] = fused_gate_up
+        weights[fused_dn] = _stack_chunked(down_keys)
+        fused_layers += 1
+
+    if fused_layers:
+        logger.info(
+            f"oQ: pre-fused per-expert MoE weights for {fused_layers} layer(s) "
+            f"(E={num_experts}) before mlx_vlm sanitize"
+        )
+    return fused_layers
+
+
 def _build_model_sanitizer(config: dict):
     """Build a sanitize function from the model class.
 
@@ -1558,6 +1656,7 @@ def _build_model_sanitizer(config: dict):
             _AUDIO_SENTINEL = object() if has_audio else None
 
             def _vlm_sanitize(weights):
+                _prefuse_moe_experts_for_vlm(weights, config)
                 class _Proxy:
                     audio_tower = _AUDIO_SENTINEL
                 proxy = _Proxy()
