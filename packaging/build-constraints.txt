@@ -1,0 +1,12 @@
+# Pip constraint file applied (via PIP_CONSTRAINT) to every wheel build the
+# packaging script triggers — including isolated build envs spawned by
+# `pip wheel git+url` for sdist/git deps. Without this, pip's build isolation
+# resolves `setuptools>=61.0` against PyPI freshly per package, and an older
+# setuptools rejects PEP 639 SPDX license strings (mlx-audio uses
+# `license = "MIT"`).
+#
+# Drop this constraint file once mlx-audio's pyproject.toml bumps its
+# `[build-system].requires` to `setuptools>=77` (PEP 639 support landed in
+# setuptools 77.0.0). Filed upstream as <TBD>.
+setuptools>=80
+wheel

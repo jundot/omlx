@@ -1282,8 +1282,6 @@ class Scheduler:
         """
         import os
 
-        from .prefill_progress import get_prefill_tracker
-
         tracker = get_prefill_tracker()
         # model_name is a full path; use basename to match engine_pool model_id.
         model_id = os.path.basename(self.config.model_name.rstrip("/"))
@@ -3172,8 +3170,6 @@ class Scheduler:
             self._boundary_snapshot_store.cleanup_request(request_id)
 
         # Remove from prefill progress tracker.
-        from .prefill_progress import get_prefill_tracker
-
         get_prefill_tracker().remove(request_id)
 
         # Mark as aborted
@@ -3630,8 +3626,6 @@ class Scheduler:
 
                 # Prefill complete: remove from progress tracker so dashboard
                 # shows "generating" instead of "PP" during decode.
-                from .prefill_progress import get_prefill_tracker
-
                 get_prefill_tracker().remove(request.request_id)
 
                 cache_to_use = prefilled_cache
@@ -3918,8 +3912,6 @@ class Scheduler:
             self._cleanup_specprefill(rid)
 
         # Remove finished requests from prefill progress tracker.
-        from .prefill_progress import get_prefill_tracker
-
         tracker = get_prefill_tracker()
         for rid in finished_ids:
             tracker.remove(rid)

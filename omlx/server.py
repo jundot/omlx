@@ -2086,7 +2086,7 @@ async def create_chat_completion(
     # in content.
     _entry = get_engine_pool().get_entry(resolved_model)
     native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
-    is_vlm = isinstance(engine, VLMBatchedEngine)
+    is_vlm = engine.supports_vision
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
         messages = extractor(request.messages, max_tool_result_tokens, engine.tokenizer)
@@ -3389,7 +3389,7 @@ async def create_anthropic_message(
 
     # Convert Anthropic format to internal format
     # Harmony models need special handling to preserve tool format
-    is_vlm = isinstance(engine, VLMBatchedEngine)
+    is_vlm = engine.supports_vision
     _entry = get_engine_pool().get_entry(resolved_model)
     native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     if engine.model_type == "gpt_oss":

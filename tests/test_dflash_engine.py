@@ -2,6 +2,8 @@
 """Tests for DFlash engine integration."""
 
 import json
+import sys
+import types
 
 import pytest
 
@@ -322,6 +324,86 @@ class TestDFlashEnginePoolRouting:
         assert settings.dflash_draft_model == "z-lab/Qwen3.5-4B-DFlash"
 
 
+class TestImageContentDetection:
+    """Helpers that decide whether a chat request carries vision content.
+
+    These gate DFlash's vision-fallback path: when any message contains an
+    image content part, DFlash must delegate to its VLM fallback rather than
+    flatten the messages through ``_apply_chat_template`` (which silently
+    drops the image).
+    """
+
+    def _import_helpers(self):
+        try:
+            from omlx.engine.dflash import (
+                _content_has_image_part,
+                _messages_have_images,
+            )
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        return _content_has_image_part, _messages_have_images
+
+    def test_text_only_string_content(self):
+        _content_has_image_part, _ = self._import_helpers()
+        assert _content_has_image_part("hello") is False
+
+    def test_text_only_list_content(self):
+        _content_has_image_part, _ = self._import_helpers()
+        content = [{"type": "text", "text": "hi"}]
+        assert _content_has_image_part(content) is False
+
+    def test_image_url_part(self):
+        _content_has_image_part, _ = self._import_helpers()
+        content = [
+            {"type": "text", "text": "describe this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+        ]
+        assert _content_has_image_part(content) is True
+
+    def test_image_part_alias(self):
+        _content_has_image_part, _ = self._import_helpers()
+        assert _content_has_image_part([{"type": "image", "image": "..."}]) is True
+
+    def test_input_image_part_alias(self):
+        _content_has_image_part, _ = self._import_helpers()
+        assert _content_has_image_part([{"type": "input_image", "image": "..."}]) is True
+
+    def test_messages_have_images_false_for_text_only(self):
+        _, _messages_have_images = self._import_helpers()
+        messages = [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": "hi"},
+        ]
+        assert _messages_have_images(messages) is False
+
+    def test_messages_have_images_true_when_any_message_has_image(self):
+        _, _messages_have_images = self._import_helpers()
+        messages = [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "what's here?"},
+                {"type": "image_url", "image_url": {"url": "https://..."}},
+            ]},
+        ]
+        assert _messages_have_images(messages) is True
+
+    def test_messages_have_images_handles_non_dict_messages(self):
+        _, _messages_have_images = self._import_helpers()
+        # Defensive: callers occasionally pass strings or odd shapes
+        assert _messages_have_images(["plain string", None]) is False  # type: ignore[list-item]
+
+    def test_object_with_type_attr_treated_as_image(self):
+        """Pydantic-style content parts use attribute access, not dict get."""
+        _content_has_image_part, _ = self._import_helpers()
+
+        class _Part:
+            def __init__(self, t):
+                self.type = t
+
+        assert _content_has_image_part([_Part("image_url")]) is True
+        assert _content_has_image_part([_Part("text")]) is False
+
+
 class TestDFlashThinkPrefix:
     """DFlash bypasses the scheduler, so it must replicate scheduler's
     needs_think_prefix detection. Otherwise reasoning models leak the
@@ -430,3 +512,283 @@ class TestDFlashThinkPrefix:
             pass
         engine = self._make_engine(_Tok())
         assert engine._think_prefix_text() == "<think>\n"
+
+
+class TestDFlashFallbackCoexistence:
+    """DFlash + sidecar fallback coexistence (vision routing).
+
+    Vision-bearing chat requests must lazy-init a sidecar fallback engine and
+    delegate to it WITHOUT releasing the DFlash models. Subsequent text-only
+    requests can then continue to use DFlash speculation. This is distinct
+    from the long-context overflow path, which deliberately evicts DFlash
+    to free memory for a larger context window.
+    """
+
+    @staticmethod
+    def _patch_dflash_mlx(monkeypatch):
+        """Stub the dflash_mlx prefix-cache import the eviction path uses,
+        so any accidental call into eviction during a coexistence test is
+        observable via state changes rather than ImportError."""
+        fake_mod = types.ModuleType("dflash_mlx.server.prefix_cache_flow")
+        fake_mod.shutdown_dflash_prefix_cache = lambda: None
+        monkeypatch.setitem(
+            sys.modules, "dflash_mlx", types.ModuleType("dflash_mlx")
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "dflash_mlx.server",
+            types.ModuleType("dflash_mlx.server"),
+        )
+        monkeypatch.setitem(
+            sys.modules, "dflash_mlx.server.prefix_cache_flow", fake_mod
+        )
+
+    @staticmethod
+    def _patch_vlm(monkeypatch, recorder):
+        from omlx.engine import vlm as vlm_module
+        from omlx.engine.base import GenerationOutput
+
+        class _FakeVLM:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.started = False
+                self.stopped = False
+                self.chat_calls = []
+                self.stream_chat_calls = []
+                recorder.append(self)
+
+            async def start(self):
+                self.started = True
+
+            async def stop(self):
+                self.stopped = True
+
+            async def chat(self, **kwargs):
+                self.chat_calls.append(kwargs)
+                return GenerationOutput(
+                    text="ok", prompt_tokens=10, completion_tokens=1,
+                    cached_tokens=0, finish_reason="stop",
+                )
+
+            async def stream_chat(self, **kwargs):
+                self.stream_chat_calls.append(kwargs)
+                yield GenerationOutput(
+                    text="ok", prompt_tokens=10, completion_tokens=1,
+                    cached_tokens=0, finish_reason="stop",
+                )
+
+            def has_active_requests(self):
+                return False
+
+        monkeypatch.setattr(vlm_module, "VLMBatchedEngine", _FakeVLM)
+
+    @staticmethod
+    def _make_engine():
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            fallback_engine_type="vlm",
+        )
+        engine._loaded = True
+        # Sentinel objects so we can verify the refs survive coexistence.
+        engine._target_model = object()
+        engine._draft_model = object()
+        engine._dflash_prefix_cache = object()
+        engine._runtime_context = object()
+        engine._executor_tokenizer = object()
+        return engine
+
+    async def test_ensure_fallback_engine_started_lazy_inits_vlm(self, monkeypatch):
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        recorder = []
+        self._patch_vlm(monkeypatch, recorder)
+
+        engine = self._make_engine()
+        await engine._ensure_fallback_engine_started()
+
+        assert len(recorder) == 1
+        assert recorder[0].started is True
+        assert engine._fallback_engine is recorder[0]
+
+    async def test_ensure_fallback_engine_started_is_idempotent(self, monkeypatch):
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        recorder = []
+        self._patch_vlm(monkeypatch, recorder)
+
+        engine = self._make_engine()
+        await engine._ensure_fallback_engine_started()
+        await engine._ensure_fallback_engine_started()
+        await engine._ensure_fallback_engine_started()
+
+        assert len(recorder) == 1
+
+    async def test_ensure_fallback_engine_started_keeps_dflash_loaded(self, monkeypatch):
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        recorder = []
+        self._patch_vlm(monkeypatch, recorder)
+
+        engine = self._make_engine()
+        target_ref = engine._target_model
+        draft_ref = engine._draft_model
+
+        await engine._ensure_fallback_engine_started()
+
+        assert engine._target_model is target_ref
+        assert engine._draft_model is draft_ref
+        assert engine._in_fallback_mode is False
+
+    async def test_chat_with_image_keeps_dflash_loaded(self, monkeypatch):
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        recorder = []
+        self._patch_vlm(monkeypatch, recorder)
+        self._patch_dflash_mlx(monkeypatch)
+
+        engine = self._make_engine()
+        target_ref = engine._target_model
+        draft_ref = engine._draft_model
+
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "what's here?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+        ]}]
+        result = await engine.chat(messages=messages)
+
+        assert len(recorder) == 1
+        assert len(recorder[0].chat_calls) == 1
+        assert recorder[0].chat_calls[0]["messages"] == messages
+        # Coexistence: DFlash refs must NOT have been released.
+        assert engine._target_model is target_ref
+        assert engine._draft_model is draft_ref
+        assert engine._in_fallback_mode is False
+        assert result.text == "ok"
+
+    async def test_stream_chat_with_image_keeps_dflash_loaded(self, monkeypatch):
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        recorder = []
+        self._patch_vlm(monkeypatch, recorder)
+        self._patch_dflash_mlx(monkeypatch)
+
+        engine = self._make_engine()
+        target_ref = engine._target_model
+        draft_ref = engine._draft_model
+
+        messages = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "..."}},
+        ]}]
+        outputs = []
+        async for output in engine.stream_chat(messages=messages):
+            outputs.append(output)
+
+        assert len(outputs) == 1
+        assert len(recorder[0].stream_chat_calls) == 1
+        assert engine._target_model is target_ref
+        assert engine._draft_model is draft_ref
+        assert engine._in_fallback_mode is False
+
+    async def test_two_image_requests_share_one_fallback_engine(self, monkeypatch):
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        recorder = []
+        self._patch_vlm(monkeypatch, recorder)
+        self._patch_dflash_mlx(monkeypatch)
+
+        engine = self._make_engine()
+        messages = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "..."}},
+        ]}]
+        await engine.chat(messages=messages)
+        await engine.chat(messages=messages)
+
+        assert len(recorder) == 1
+        assert len(recorder[0].chat_calls) == 2
+
+    def test_supports_vision_true_when_fallback_is_vlm(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        engine = DFlashEngine(
+            model_name="m", draft_model_path="d", fallback_engine_type="vlm",
+        )
+        assert engine.supports_vision is True
+
+    def test_supports_vision_false_when_fallback_is_batched(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        engine = DFlashEngine(
+            model_name="m", draft_model_path="d", fallback_engine_type="batched",
+        )
+        assert engine.supports_vision is False
+
+    async def test_get_stats_reports_sidecar_loaded(self, monkeypatch):
+        """get_stats() must distinguish 'sidecar started for vision' from
+        'in fallback mode' (long-context eviction)."""
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        recorder = []
+        self._patch_vlm(monkeypatch, recorder)
+
+        engine = self._make_engine()
+        assert engine.get_stats()["sidecar_loaded"] is False
+        assert engine.get_stats()["in_fallback_mode"] is False
+
+        await engine._ensure_fallback_engine_started()
+        assert engine.get_stats()["sidecar_loaded"] is True
+        assert engine.get_stats()["in_fallback_mode"] is False
+
+    async def test_evict_still_releases_dflash_when_called(self, monkeypatch):
+        """Long-context eviction path must still release DFlash refs and flip
+        the flag, even if the fallback engine was already started by a prior
+        vision request (coexistence path)."""
+        try:
+            from omlx.engine.dflash import DFlashEngine  # noqa: F401
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        recorder = []
+        self._patch_vlm(monkeypatch, recorder)
+        self._patch_dflash_mlx(monkeypatch)
+
+        engine = self._make_engine()
+        # Prime: vision request lazy-inits the sidecar.
+        await engine._ensure_fallback_engine_started()
+        assert engine._target_model is not None
+
+        # Long-context overflow now arrives → eviction.
+        await engine._evict_dflash_and_start_fallback()
+
+        # DFlash refs released, flag flipped, fallback NOT recreated.
+        assert engine._target_model is None
+        assert engine._draft_model is None
+        assert engine._in_fallback_mode is True
+        assert len(recorder) == 1

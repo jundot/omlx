@@ -50,6 +50,17 @@ class BaseEngine(ABC):
         """Get the tokenizer."""
         pass
 
+    @property
+    def supports_vision(self) -> bool:
+        """Whether this engine accepts image content parts in chat messages.
+
+        Used by the API layer to decide between ``extract_multimodal_content``
+        (preserves ``image_url`` parts) and ``extract_text_content`` (flattens
+        to text). Default False; engines that wrap or delegate to a VLM
+        override to True.
+        """
+        return False
+
     @abstractmethod
     async def start(self) -> None:
         """Start the engine (load model if not loaded)."""

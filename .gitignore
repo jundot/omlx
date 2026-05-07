@@ -62,6 +62,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# uv
+uv.lock
+
 # IDE
 .idea/
 .vscode/

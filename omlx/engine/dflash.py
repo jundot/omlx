@@ -28,6 +28,35 @@ from .base import BaseEngine, GenerationOutput
 logger = logging.getLogger(__name__)
 
 
+_IMAGE_PART_TYPES: frozenset[str] = frozenset({"image", "image_url", "input_image"})
+
+
+def _content_has_image_part(content: Any) -> bool:
+    """Return True if a chat message's content contains a vision part.
+
+    Mirrors the part-type set used by ``VLMBatchedEngine._count_content_parts``
+    so that DFlash's image detection stays in lockstep with the VLM engine.
+    """
+    if not isinstance(content, list):
+        return False
+    for item in content:
+        if isinstance(item, dict):
+            item_type = item.get("type", "")
+        else:
+            item_type = getattr(item, "type", "")
+        if item_type in _IMAGE_PART_TYPES:
+            return True
+    return False
+
+
+def _messages_have_images(messages: list[dict[str, Any]]) -> bool:
+    """Return True if any message in ``messages`` contains image content."""
+    return any(
+        isinstance(msg, dict) and _content_has_image_part(msg.get("content"))
+        for msg in messages
+    )
+
+
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
@@ -96,6 +125,7 @@ class DFlashEngine(BaseEngine):
         self._active_request = False
         self._model_type_str = None
         self._fallback_engine: BaseEngine | None = None
+        self._fallback_init_lock = asyncio.Lock()
         self._in_fallback_mode = False
         self._runtime_context: Any | None = None
         self._dflash_prefix_cache: Any | None = None
@@ -130,6 +160,16 @@ class DFlashEngine(BaseEngine):
     @property
     def model_type(self) -> str | None:
         return self._model_type_str
+
+    @property
+    def supports_vision(self) -> bool:
+        """DFlash is text-only, but its sidecar handles vision when the
+        underlying model is multimodal (``fallback_engine_type=='vlm'``).
+        Tells the API layer to preserve image content parts so vision
+        routing in ``chat`` / ``stream_chat`` can deliver them to the
+        sidecar instead of being stripped upstream.
+        """
+        return self._fallback_engine_type == "vlm"
 
     @staticmethod
     def _bits_to_quant_spec(bits: int | None) -> str | None:
@@ -227,8 +267,47 @@ class DFlashEngine(BaseEngine):
             f"l2_cache={self._resolve_dflash_l2_dir() is not None}"
         )
 
-    async def _evict_dflash_and_start_fallback(self) -> None:
-        """Evict dflash models from memory, verify release, then start fallback engine."""
+    async def _ensure_fallback_engine_started(self) -> None:
+        """Idempotently lazy-init and start the sidecar fallback engine.
+
+        Used by:
+          - vision routing in ``chat`` / ``stream_chat`` (DFlash stays loaded)
+          - long-context overflow in ``generate`` / ``stream_generate``,
+            invoked indirectly via ``_evict_dflash_and_start_fallback``
+
+        Concurrent callers are serialized through ``_fallback_init_lock``.
+        """
+        if self._fallback_engine is not None:
+            return
+        async with self._fallback_init_lock:
+            if self._fallback_engine is not None:
+                return
+            if self._fallback_engine_type == "vlm":
+                from .vlm import VLMBatchedEngine
+                engine: BaseEngine = VLMBatchedEngine(
+                    model_name=self._model_name,
+                    scheduler_config=self._scheduler_config,
+                    model_settings=self._model_settings,
+                )
+            else:
+                from .batched import BatchedEngine
+                engine = BatchedEngine(
+                    model_name=self._model_name,
+                    scheduler_config=self._scheduler_config,
+                    model_settings=self._model_settings,
+                )
+            await engine.start()
+            self._fallback_engine = engine
+            logger.info(
+                f"DFlash sidecar engine started: {self._fallback_engine_type}"
+            )
+
+    async def _release_dflash_models(self) -> None:
+        """Release DFlash draft/target/cache refs and settle MLX memory.
+
+        Does NOT start the fallback engine — callers compose this with
+        ``_ensure_fallback_engine_started`` when they need both.
+        """
         from dflash_mlx.server.prefix_cache_flow import shutdown_dflash_prefix_cache
 
         from ..engine_core import get_mlx_executor
@@ -236,7 +315,6 @@ class DFlashEngine(BaseEngine):
         loop = asyncio.get_running_loop()
         pre_active = mx.get_active_memory()
 
-        # Release dflash model and cache references
         shutdown_dflash_prefix_cache()
         self._dflash_prefix_cache = None
         self._runtime_context = None
@@ -244,14 +322,12 @@ class DFlashEngine(BaseEngine):
         self._draft_model = None
         self._executor_tokenizer = None
 
-        # Force memory reclaim with settle barrier
         gc.collect()
         await loop.run_in_executor(
             get_mlx_executor(),
             lambda: (mx.synchronize(), mx.clear_cache()),
         )
 
-        # Poll for actual memory release (same pattern as engine_pool._unload_engine)
         for settle_round in range(10):
             active_now = mx.get_active_memory()
             freed = pre_active - active_now
@@ -270,26 +346,16 @@ class DFlashEngine(BaseEngine):
         else:
             logger.warning("DFlash model eviction: memory settle timed out")
 
-        # Start fallback engine
-        if self._fallback_engine_type == "vlm":
-            from .vlm import VLMBatchedEngine
-            self._fallback_engine = VLMBatchedEngine(
-                model_name=self._model_name,
-                scheduler_config=self._scheduler_config,
-                model_settings=self._model_settings,
-            )
-        else:
-            from .batched import BatchedEngine
-            self._fallback_engine = BatchedEngine(
-                model_name=self._model_name,
-                scheduler_config=self._scheduler_config,
-                model_settings=self._model_settings,
-            )
-        await self._fallback_engine.start()
+    async def _evict_dflash_and_start_fallback(self) -> None:
+        """Long-context eviction: release DFlash refs and switch to the
+        fallback engine for the rest of the engine's lifetime.
+
+        Distinct from vision routing, which uses
+        ``_ensure_fallback_engine_started`` alone and keeps DFlash hot.
+        """
+        await self._release_dflash_models()
+        await self._ensure_fallback_engine_started()
         self._in_fallback_mode = True
-        logger.info(
-            f"DFlash fallback engine started: {self._fallback_engine_type}"
-        )
 
     async def stop(self) -> None:
         from dflash_mlx.server.prefix_cache_flow import shutdown_dflash_prefix_cache
@@ -480,6 +546,9 @@ class DFlashEngine(BaseEngine):
         next request.
         """
         event_iter = None
+        # Capture once so stop()/eviction can null self._executor_tokenizer
+        # without crashing an in-flight worker on the executor thread.
+        executor_tokenizer = self._executor_tokenizer
         try:
             event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                 prompt_tokens=prompt_tokens,
@@ -490,7 +559,7 @@ class DFlashEngine(BaseEngine):
             detokenizer = None
             try:
                 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
-                detokenizer = NaiveStreamingDetokenizer(self._executor_tokenizer)
+                detokenizer = NaiveStreamingDetokenizer(executor_tokenizer)
             except ImportError:
                 pass
 
@@ -517,7 +586,7 @@ class DFlashEngine(BaseEngine):
                         detokenizer.add_token(token_id)
                         text = detokenizer.last_segment
                     else:
-                        text = self._executor_tokenizer.decode([token_id])
+                        text = executor_tokenizer.decode([token_id])
                     asyncio.run_coroutine_threadsafe(
                         queue.put((text, [token_id], False, None)), loop
                     )
@@ -587,7 +656,10 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        prompt_tokens = self._tokenizer_obj.encode(prompt)
+        # Capture tokenizer locally so stop()/eviction can null self._tokenizer_obj
+        # mid-generation without crashing the post-decode finalization below.
+        tokenizer = self._tokenizer_obj
+        prompt_tokens = tokenizer.encode(prompt)
 
         # Fallback: evict dflash models, start LLM/VLM engine
         if self._should_fallback(prompt_tokens):
@@ -673,7 +745,7 @@ class DFlashEngine(BaseEngine):
             raise
         summary = summary or {}
 
-        text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
+        text = tokenizer.decode(generated, skip_special_tokens=True)
         text = clean_special_tokens(text)
 
         # Reasoning models (Qwen3.x with enable_thinking, DeepSeek, MiniMax, ...)
@@ -833,6 +905,34 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # Vision requests cannot be served through DFlash speculation: the
+        # chat-template flattening below renders image content blocks to text
+        # placeholders before the target model's vision encoder ever sees the
+        # image bytes. Lazy-init the VLM sidecar and route this request to
+        # it; DFlash itself stays loaded so subsequent text turns continue
+        # using speculation.
+        if _messages_have_images(messages):
+            if self._fallback_engine_type != "vlm":
+                raise RuntimeError(
+                    "DFlash received an image-bearing request but its configured "
+                    "fallback engine type is not 'vlm' — the underlying model is "
+                    "not multimodal. Disable DFlash for this model or send a "
+                    "text-only request."
+                )
+            await self._ensure_fallback_engine_started()
+            return await self._fallback_engine.chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                tools=tools,
+                **kwargs,
+            )
+
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         prompt = self._apply_chat_template(
@@ -862,6 +962,34 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # See chat() for rationale: image content cannot survive DFlash's
+        # chat-template flattening, so route image-bearing requests to the
+        # VLM sidecar (lazy-initialized on demand). DFlash stays loaded
+        # for subsequent text turns.
+        if _messages_have_images(messages):
+            if self._fallback_engine_type != "vlm":
+                raise RuntimeError(
+                    "DFlash received an image-bearing request but its configured "
+                    "fallback engine type is not 'vlm' — the underlying model is "
+                    "not multimodal. Disable DFlash for this model or send a "
+                    "text-only request."
+                )
+            await self._ensure_fallback_engine_started()
+            async for output in self._fallback_engine.stream_chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                tools=tools,
+                **kwargs,
+            ):
+                yield output
+            return
+
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         prompt = self._apply_chat_template(
@@ -889,6 +1017,7 @@ class DFlashEngine(BaseEngine):
             "max_dflash_ctx": self._max_dflash_ctx,
             "fallback_engine_type": self._fallback_engine_type,
             "in_fallback_mode": self._in_fallback_mode,
+            "sidecar_loaded": self._fallback_engine is not None,
             "loaded": self._loaded,
             "in_memory_cache": self._in_memory_cache_enabled,
             "ssd_cache": self._resolve_dflash_l2_dir() is not None,

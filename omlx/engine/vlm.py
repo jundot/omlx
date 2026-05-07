@@ -349,6 +349,10 @@ class VLMBatchedEngine(BaseEngine):
         return None
 
     @property
+    def supports_vision(self) -> bool:
+        return True
+
+    @property
     def message_extractor(self):
         """Return the model-specific message extractor function, or ``None``."""
         try:
