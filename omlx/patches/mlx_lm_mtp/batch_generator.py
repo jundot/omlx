@@ -291,6 +291,11 @@ class _MtpState:
     # Draft logprobs (vocab,) needed by stochastic acceptance / residual sampling.
     draft_tok: Optional[Any] = None  # (1,) uint32
     draft_lp: Optional[Any] = None  # (vocab,) float
+    # Filtered (sampler-applied) draft logprobs reused by the next cycle's
+    # acceptance ratio + residual sampling. Mirrors PR 990's accept_lp,
+    # adapted to oMLX's callable-sampler contract via metadata-introspection.
+    # None when the sampler exposes no metadata (raw-lp fallback path).
+    draft_accept_lp: Optional[Any] = None  # (vocab,) float
     # Host-side int copy of draft_tok. Cached at draft creation time so the
     # verify cycle can compare draft vs verify ids without a separate
     # GPU→CPU sync (`int(draft_tok.tolist()[0])` would force a stall).
@@ -354,6 +359,43 @@ def _logprobs(logits_2d):
     import mlx.core as mx
 
     return logits_2d - mx.logsumexp(logits_2d, axis=-1, keepdims=True)
+
+
+def _accept_lp_for(sampler, lp):
+    """Reproduce the sampler's filter+temperature pipeline on `lp` so the
+    acceptance ratio (and residual distribution) match the distribution the
+    sampler actually drew from.
+
+    Reads sampling params off the callable as function attributes (set by
+    ``omlx.utils.sampling.make_sampler``). For samplers without metadata —
+    e.g. mlx-lm stock callables, fallback samplers — returns `lp` unchanged
+    so behavior matches the pre-PR-990 raw-lp acceptance.
+    """
+    import mlx.core as mx
+
+    from omlx.utils.sampling import apply_min_p, apply_top_k, apply_top_p
+
+    temp = float(getattr(sampler, "temp", 0.0) or 0.0)
+    if temp == 0.0:
+        # Greedy / unknown sampler — raw lp is the acceptance distribution.
+        return lp
+
+    out = lp
+    top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
+    if 0.0 < top_p < 1.0:
+        out = apply_top_p(out, top_p)
+    min_p = float(getattr(sampler, "min_p", 0.0) or 0.0)
+    if min_p != 0.0:
+        min_keep = int(getattr(sampler, "min_tokens_to_keep", 1) or 1)
+        out = apply_min_p(out, min_p, min_keep)
+    top_k = int(getattr(sampler, "top_k", 0) or 0)
+    if top_k > 0:
+        out = apply_top_k(out, top_k)
+
+    # Temperature scale + renormalize so the output is a proper logprob
+    # distribution that can be indexed by token id for the acceptance check.
+    scaled = out * (1.0 / temp)
+    return scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
 
 
 def _trim_token_buffer(gen_batch: Any, n: int) -> None:
@@ -477,6 +519,10 @@ def _post_init_mtp(gen_batch: Any) -> None:
         )
     draft_lp_2d = _logprobs(mtp_logits_2d)
     draft_tok = sampler(draft_lp_2d)
+    # Filtered draft lp — what the sampler actually drew from. The next
+    # cycle's acceptance ratio uses this so the math matches the
+    # sampling distribution rather than the raw softmax.
+    draft_accept_lp_2d = _accept_lp_for(sampler, draft_lp_2d)
 
     mx.eval(main_tok, next_main_tok, draft_tok)
 
@@ -488,6 +534,7 @@ def _post_init_mtp(gen_batch: Any) -> None:
     state.next_main = _ensure_uint32(next_main_tok)
     state.draft_tok = _ensure_uint32(draft_tok)
     state.draft_lp = draft_lp_2d.squeeze(0)
+    state.draft_accept_lp = draft_accept_lp_2d.squeeze(0)
     state.draft_id = int(draft_tok.tolist()[0])
     state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
     state.queue.append(
@@ -641,11 +688,22 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     verify_id = int(verify_tok.tolist()[0])
     bonus_id = int(bonus_tok.tolist()[0])
 
+    # Filtered logprobs — distribution the sampler actually drew from.
+    # Used for acceptance ratio + residual sampling so they match the
+    # sampling distribution rather than raw softmax (PR 990 alignment).
+    verify_accept_lp = _accept_lp_for(sampler, verify_lp_2d)
+    draft_accept_lp = (
+        state.draft_accept_lp
+        if state.draft_accept_lp is not None
+        else _accept_lp_for(sampler, state.draft_lp)
+    )
+
     if is_greedy:
         accept = verify_id == draft_id
     else:
         log_accept = (
-            verify_lp_2d[0, draft_id].item() - state.draft_lp[draft_id].item()
+            verify_accept_lp[0, draft_id].item()
+            - draft_accept_lp[draft_id].item()
         )
         accept = log_accept >= 0 or random.random() < math.exp(log_accept)
     state.stats.sample_ms += (time.perf_counter() - t0) * 1000
@@ -691,14 +749,17 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
 
     # Pick the verify-position emit token: residual sample for stochastic.
+    # Residual is computed on the *filtered* distributions so the sample
+    # comes from `max(p_target_filt - p_draft_filt, 0)` — matching what the
+    # sampler would have produced if it had drawn directly from the verify
+    # position. emit_lp returned to the caller stays as the raw verify lp
+    # so downstream logprobs reporting is consistent with non-MTP paths.
     if is_greedy:
         emit_id = verify_id
         emit_lp = verify_lp_2d.squeeze(0)
     else:
-        emit_id, emit_lp = _residual_sample(verify_lp_2d, state.draft_lp)
-        if emit_id is None:
-            emit_id = verify_id
-            emit_lp = verify_lp_2d.squeeze(0)
+        emit_id, _ = _residual_sample(verify_accept_lp, draft_accept_lp)
+        emit_lp = verify_lp_2d.squeeze(0)
 
     emit_tok = mx.array([emit_id], dtype=mx.uint32)
     new_draft, new_draft_lp = _step_mtp(
@@ -754,35 +815,41 @@ def _step_mtp(
         mtp_logits_2d = _apply_processors(procs, prev_with_next, mtp_logits_2d)
     new_lp = _logprobs(mtp_logits_2d)
     new_tok = sampler(new_lp)
+    # Filtered draft lp — what the sampler actually drew from. The next
+    # verify cycle's acceptance ratio uses this so the math matches the
+    # sampling distribution rather than raw softmax (PR 990 alignment).
+    new_accept_lp = _accept_lp_for(sampler, new_lp)
     # ``.tolist()`` forces evaluation; replaces the explicit ``mx.eval`` and
     # piggybacks the host-side int caching on the same sync.
     draft_id_int = int(new_tok.tolist()[0])
     state.draft_id = draft_id_int
+    state.draft_accept_lp = new_accept_lp.squeeze(0)
     if stats is not None:
         stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
     return _ensure_uint32(new_tok), new_lp.squeeze(0)
 
 
-def _residual_sample(verify_lp_2d: Any, draft_lp_1d: Any) -> Tuple[Optional[int], Any]:
-    """Sample from ``max(p_target - p_draft, 0) / Z`` (Leviathan et al.).
+def _residual_sample(verify_lp_2d: Any, draft_lp_1d: Any) -> Tuple[int, Any]:
+    """Sample from ``max(p_target - p_draft, 0)`` (Leviathan et al. 2022).
 
-    Returns ``(token_id_or_None, verify_lp_1d)``; the caller falls back to
-    the verify token when ``Z`` is too small to define a residual distribution.
+    On degenerate input (residual all zero) falls back to the target
+    distribution rather than the verify-position argmax — keeps the sample
+    drawn from a proper distribution and stays in-graph (no host sync).
+    Mirrors mlx-lm PR 990 commit 6594348.
+
+    Returns ``(token_id_int, verify_lp_1d)``.
     """
     import mlx.core as mx
 
     p_target = mx.exp(verify_lp_2d.squeeze(0))
     p_draft = mx.exp(draft_lp_1d)
     residual = mx.maximum(p_target - p_draft, 0.0)
-    z_arr = residual.sum()
-    mx.eval(z_arr)
-    z = float(z_arr.item())
-    if z <= 1e-8:
-        return None, verify_lp_2d.squeeze(0)
-    sample = mx.random.categorical(
-        mx.log(residual / z + 1e-10).reshape(1, -1)
-    )
-    mx.eval(sample)
+    # Keep z in graph; mx.where switches to the target distribution when
+    # the residual mass is zero. ``categorical`` treats log(0) = -inf as
+    # p=0 so no safety epsilon is needed.
+    z = residual.sum(keepdims=True)
+    dist = mx.where(z > 0, residual, p_target)
+    sample = mx.random.categorical(mx.log(dist).reshape(1, -1))
     return int(sample.item()), verify_lp_2d.squeeze(0)
 
 
