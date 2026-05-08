@@ -1588,7 +1588,6 @@ class VLMBatchedEngine(BaseEngine):
         text_messages, images = extract_images_from_messages(messages)
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
-        partial = kwargs.pop("is_partial", None)
 
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
