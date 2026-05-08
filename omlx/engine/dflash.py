@@ -108,6 +108,11 @@ class DFlashEngine(BaseEngine):
             if model_settings
             else True
         )
+        self._in_memory_cache_max_entries = int(
+            getattr(model_settings, "dflash_in_memory_cache_max_entries", 4)
+            if model_settings
+            else 4
+        )
         self._in_memory_cache_max_bytes = int(
             getattr(model_settings, "dflash_in_memory_cache_max_bytes", 8 * 1024**3)
             if model_settings
@@ -170,6 +175,7 @@ class DFlashEngine(BaseEngine):
         cfg = runtime_config_from_profile(
             profile="balanced",
             prefix_cache=self._in_memory_cache_enabled,
+            prefix_cache_max_entries=self._in_memory_cache_max_entries,
             prefix_cache_max_bytes=self._in_memory_cache_max_bytes,
             prefix_cache_l2=l2_enabled,
             prefix_cache_l2_dir=str(l2_dir) if l2_dir else "",

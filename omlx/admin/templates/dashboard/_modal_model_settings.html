@@ -737,6 +737,12 @@
                                             </button>
                                         </div>
                                         <div x-show="modelSettings.dflash_in_memory_cache" x-transition>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">In-memory cache max entries</label>
+                                            <input type="number" x-model.number="modelSettings.dflash_in_memory_cache_max_entries" min="1" max="128" step="1" placeholder="4"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <p class="text-xs text-neutral-400 mt-1">Maximum number of prefix snapshots kept in L1 cache. Each entry stores KV + draft GDN state for one conversation prefix.</p>
+                                        </div>
+                                        <div x-show="modelSettings.dflash_in_memory_cache" x-transition>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">In-memory cache size (GiB)</label>
                                             <input type="number" x-model.number="modelSettings.dflash_in_memory_cache_max_gib" min="1" max="256" step="1" placeholder="8"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">

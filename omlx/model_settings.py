@@ -65,6 +65,7 @@ class ModelSettings:
         dflash_draft_quant_bits: Draft model quantization bits.
         dflash_max_ctx: Token threshold to fall back to BatchedEngine (None = unlimited).
         dflash_in_memory_cache: Enable DFlash L1 (RAM) prefix cache.
+        dflash_in_memory_cache_max_entries: L1 cache max entries (None = use dflash profile default, e.g. 4).
         dflash_in_memory_cache_max_bytes: L1 cache byte budget.
         dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
@@ -121,6 +122,7 @@ class ModelSettings:
     # DFlash prefix cache (private to dflash; separate from omlx tiered cache because
     # snapshots include draft model GDN state and target hidden chunks omlx never tracks)
     dflash_in_memory_cache: bool = True
+    dflash_in_memory_cache_max_entries: int = 4  # Default 4 entries (dflash profile default is 4)
     dflash_in_memory_cache_max_bytes: int = 8 * 1024 * 1024 * 1024  # 8 GiB (balanced profile default)
     dflash_ssd_cache: bool = False  # Requires in-memory cache and an omlx paged SSD cache dir
 

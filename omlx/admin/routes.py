@@ -132,6 +132,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_draft_quant_bits: Optional[int] = None
     dflash_max_ctx: Optional[int] = None
     dflash_in_memory_cache: Optional[bool] = None
+    dflash_in_memory_cache_max_entries: Optional[int] = None
     dflash_in_memory_cache_max_bytes: Optional[int] = None
     dflash_ssd_cache: Optional[bool] = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
@@ -1606,6 +1607,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
                 "dflash_max_ctx": settings.dflash_max_ctx,
                 "dflash_in_memory_cache": settings.dflash_in_memory_cache,
+                "dflash_in_memory_cache_max_entries": settings.dflash_in_memory_cache_max_entries,
                 "dflash_in_memory_cache_max_bytes": settings.dflash_in_memory_cache_max_bytes,
                 "dflash_ssd_cache": settings.dflash_ssd_cache,
                 "mtp_enabled": settings.mtp_enabled,
@@ -1881,6 +1883,11 @@ async def update_model_settings(
         current_settings.dflash_max_ctx = value if value and value > 0 else None
     if "dflash_in_memory_cache" in sent:
         current_settings.dflash_in_memory_cache = bool(request.dflash_in_memory_cache)
+    if "dflash_in_memory_cache_max_entries" in sent:
+        value = request.dflash_in_memory_cache_max_entries
+        current_settings.dflash_in_memory_cache_max_entries = (
+            int(value) if value and value > 0 else 4
+        )
     if "dflash_in_memory_cache_max_bytes" in sent and request.dflash_in_memory_cache_max_bytes:
         current_settings.dflash_in_memory_cache_max_bytes = int(
             request.dflash_in_memory_cache_max_bytes
@@ -2058,6 +2065,7 @@ async def update_model_settings(
             or "dflash_draft_quant_bits" in sent
             or "dflash_max_ctx" in sent
             or "dflash_in_memory_cache" in sent
+            or "dflash_in_memory_cache_max_entries" in sent
             or "dflash_in_memory_cache_max_bytes" in sent
             or "dflash_ssd_cache" in sent
             # trust_remote_code is plumbed at model load time; toggling it on
