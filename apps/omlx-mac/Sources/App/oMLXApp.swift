@@ -1,5 +1,7 @@
-// PR 1 — minimal SwiftUI shell. Replaced by AppView (PR 6) and full
-// scene wiring (PR 6+) over subsequent phases. See plan.md.
+// PR 1 (PR 6 update) — SwiftUI shell. The `Settings` scene now hosts the real
+// `AppView` instead of a placeholder. macOS routes both `Cmd-,` and the
+// menubar's `Admin Panel` item (via `showSettingsWindow:`) to this scene, so
+// we get one place to drive every screen and one window for the user to find.
 
 import SwiftUI
 
@@ -8,17 +10,12 @@ struct OMLXApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        // Placeholder Settings scene; replaced by AppView in PR 6.
         Settings {
-            VStack(spacing: 8) {
-                Text("oMLX-next")
-                    .font(.system(size: 17, weight: .semibold))
-                Text("Configuration arrives in PR 6.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-            }
-            .padding(40)
-            .frame(minWidth: 360, minHeight: 200)
+            AppView()
+                .frame(
+                    minWidth: 880, idealWidth: 1140, maxWidth: .infinity,
+                    minHeight: 600, idealHeight: 760, maxHeight: .infinity
+                )
         }
     }
 }

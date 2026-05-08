@@ -7,9 +7,9 @@
 //   • Stop Server     (RUNNING / STARTING / STOPPING / UNRESPONSIVE)
 //   • Start Server    (STOPPED / IDLE / FAILED)
 //   • Serving Stats   (Session + All-Time submenu)
-//   • Admin Panel     (enabled when running — opens AppView in PR 6, browser fallback now)
+//   • Admin Panel     (enabled when running — brings up the SwiftUI AppView)
 //   • Chat with oMLX  (enabled when running — opens /admin/chat in browser)
-//   • Settings…       (Cmd-, → SwiftUI Settings scene; AppView replaces in PR 6)
+//   • Settings…       (Cmd-, → SwiftUI Settings scene = AppView)
 //   • About oMLX
 //   • Quit oMLX       (Cmd-Q)
 //
@@ -388,10 +388,10 @@ final class MenubarController: NSObject {
     }
 
     @objc private func openAdminPanel() {
-        // PR 6 wires this to the SwiftUI AppView. Until then, route to the
-        // browser admin so the menu item isn't a dead end.
-        guard let url = URL(string: "http://\(config.host):\(config.port)/admin/dashboard") else { return }
-        NSWorkspace.shared.open(url)
+        // Routes to the SwiftUI AppView (the same `Settings` scene Cmd-, opens).
+        // We're an .accessory app — without `activate` the window opens behind
+        // the foreground app. Browser fallback is gone as of PR 6.
+        openAppViewWindow()
     }
 
     @objc private func openChat() {
@@ -400,9 +400,14 @@ final class MenubarController: NSObject {
     }
 
     @objc private func openSettings() {
-        // Opens the SwiftUI Settings scene declared in oMLXApp. macOS 14+
-        // exposes showSettingsWindow:; the older showPreferencesWindow:
-        // is still routed by AppKit, so we try both.
+        openAppViewWindow()
+    }
+
+    /// Brings the SwiftUI Settings scene (i.e., the AppView shell) to the
+    /// front. macOS 14+ exposes `showSettingsWindow:`; older selectors still
+    /// route through AppKit, so we try both.
+    private func openAppViewWindow() {
+        NSApp.activate(ignoringOtherApps: true)
         if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: self) {
             _ = NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: self)
         }
