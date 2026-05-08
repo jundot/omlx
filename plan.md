@@ -23,7 +23,7 @@ ships.
 | 6  | AppView shell — NavigationSplitView + sidebar | ✅ Merged | bf90a74 |
 | 7  | Configuration core: Server / Status / Logs (incl. Updates UI shell) | ✅ Merged | 63dbd71 |
 | 8  | Models + Downloads + per-model Settings | ✅ Merged | 2597210 |
-| 9  | Integrations + Security + About | ⬜ Not started | About loses inline updater; lives on Status |
+| 9  | Integrations + Security + About | ✅ Merged | a436b6c · About has no inline updater (lives on Status) |
 | 10 | Welcome wizard | ⬜ Not started | |
 | 11 | Sparkle auto-updater + i18n | ⬜ Not started | wires real updater into PR 7 UI |
 | 12 | Cutover & deprecation | ⬜ Not started | rename `-next.app` → `oMLX.app`, drop `packaging/omlx_app/` |
