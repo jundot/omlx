@@ -32,6 +32,12 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// Localized title key resolved against `Localizable.xcstrings`. Falls
+    /// back to the source-language `title` when a translation is missing.
+    var localizedTitle: LocalizedStringResource {
+        LocalizedStringResource(stringLiteral: "sidebar.\(rawValue)")
+    }
+
     var symbol: String {
         switch self {
         case .server:       return "server.rack"
@@ -75,6 +81,10 @@ enum SidebarGroup: String, CaseIterable, Hashable, Sendable {
     var sections: [AppSection] {
         AppSection.allCases.filter { $0.group == self }
     }
+
+    var localizedTitle: LocalizedStringResource {
+        LocalizedStringResource(stringLiteral: "sidebar.group.\(rawValue.lowercased())")
+    }
 }
 
 // MARK: - Sidebar
@@ -93,7 +103,7 @@ struct Sidebar: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(SidebarGroup.allCases, id: \.self) { group in
-                        SidebarGroupLabel(title: group.rawValue)
+                        SidebarGroupLabel(title: group.localizedTitle)
                         ForEach(group.sections) { section in
                             SidebarItem(
                                 section: section,
@@ -147,7 +157,7 @@ private struct SidebarSearchField: View {
 // MARK: - Group label
 
 private struct SidebarGroupLabel: View {
-    let title: String
+    let title: LocalizedStringResource
 
     @Environment(\.omlxTheme) private var theme
 
@@ -175,7 +185,7 @@ private struct SidebarItem: View {
         Button(action: onTap) {
             HStack(spacing: 9) {
                 Squircle(systemSymbol: section.symbol, size: 20, gradient: section.gradient)
-                Text(section.title)
+                Text(section.localizedTitle)
                     .font(.omlxText(13, weight: isSelected ? .medium : .regular))
                     .foregroundStyle(theme.text)
                 Spacer(minLength: 0)

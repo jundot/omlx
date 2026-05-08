@@ -1,13 +1,17 @@
-// PR 7 — stub for the Updates section on the Status screen (design v2).
+// PR 7 (PR 11 update) — Updates section view-model.
 //
-// Drives three observable bits: a check state (idle / checking / available),
-// the channel (Stable / Beta / Nightly), and two background prefs (autoCheck
-// + autoDownload). Channel/prefs persist to AppConfig so they survive a
-// relaunch; the actual feed wiring (Sparkle + GitHub releases) lands in PR 11
-// behind the same surface — no UI changes needed at that point.
+// Drives three observable bits the AppView's Status screen renders: the
+// check state (idle / checking / available), the channel (Stable / Beta /
+// Nightly), and two background prefs (autoCheck + autoDownload). Channel +
+// prefs persist to ~/Library/Application Support/oMLX-next/update-prefs.json
+// so they survive a relaunch.
 //
-// `checkForUpdates()` is a 1.4s simulator: it just bounces idle → checking →
-// idle(lastChecked = now). PR 11 swaps that body for `SUUpdater.checkForUpdates`.
+// PR 11 swaps the body of `checkForUpdates()` and `installAndRestart()` for
+// SparkleUpdater calls. Channel + auto-* prefs are forwarded to Sparkle on
+// every change so the user's selection takes effect on the next check.
+// When the Sparkle SwiftPM dep isn't resolved (`#if !canImport(Sparkle)`),
+// `SparkleUpdater` is a no-op stub and we keep the 1.4 s simulator from
+// PR 7 so the screen still demos correctly.
 
 import Foundation
 
@@ -39,18 +43,29 @@ final class UpdateController: ObservableObject {
 
     @Published private(set) var state: CheckState = .idle(lastChecked: nil)
     @Published var channel: UpdateChannel {
-        didSet { if !suspendPersist { persist() } }
+        didSet { if !suspendPersist { onPrefsChanged() } }
     }
     @Published var autoCheck: Bool {
-        didSet { if !suspendPersist { persist() } }
+        didSet { if !suspendPersist { onPrefsChanged() } }
     }
     @Published var autoDownload: Bool {
-        didSet { if !suspendPersist { persist() } }
+        didSet { if !suspendPersist { onPrefsChanged() } }
     }
 
     private let storeURL: URL
     private var simulationTask: Task<Void, Never>?
     private var suspendPersist = true
+
+    /// Lazily constructed so the SPM dep is only required when something
+    /// actually drives an update check. The shim variant of `SparkleUpdater`
+    /// is also lazy — same hook, no behavior.
+    private lazy var sparkle: SparkleUpdater = {
+        let s = SparkleUpdater()
+        s.channel = channel
+        s.automaticallyChecksForUpdates = autoCheck
+        s.automaticallyDownloadsUpdates = autoDownload
+        return s
+    }()
 
     init(storeURL: URL = AppConfig.appSupportURL().appendingPathComponent("update-prefs.json")) {
         self.storeURL = storeURL
@@ -63,22 +78,71 @@ final class UpdateController: ObservableObject {
         self.suspendPersist = false
     }
 
+    /// Idempotent. Call once after AppDelegate stands up so Sparkle's
+    /// background checker is wired and gets the user's stored prefs.
+    func bootstrap() {
+        _ = sparkle  // forces lazy init + applies prefs
+        if autoCheck {
+            sparkle.backgroundCheckForUpdates()
+        }
+    }
+
     func checkForUpdates() {
-        // Cancel an in-flight simulation so the user isn't stuck in `checking`
-        // if they tap twice.
+        #if canImport(Sparkle)
+        sparkle.checkForUpdates()
+        // The Sparkle UI takes over from here. We still flip our local
+        // state to `checking` so the AppView's button shows the spinner
+        // while Sparkle's panel is fetching the appcast.
+        state = .checking
+        // Sparkle's `userDriverDelegate` callbacks will eventually flip
+        // us back to idle/available, but we don't bind those yet — the
+        // feed is a TODO endpoint. Provide a 5 s safety so the spinner
+        // doesn't hang forever in dev.
+        scheduleCheckTimeout(seconds: 5)
+        #else
+        runSimulator()
+        #endif
+    }
+
+    func installAndRestart() {
+        #if canImport(Sparkle)
+        sparkle.installAndRestart()
+        #else
+        // No-op in stub builds.
+        #endif
+    }
+
+    // MARK: - Internals
+
+    private func onPrefsChanged() {
+        persist()
+        sparkle.channel = channel
+        sparkle.automaticallyChecksForUpdates = autoCheck
+        sparkle.automaticallyDownloadsUpdates = autoDownload
+    }
+
+    private func runSimulator() {
         simulationTask?.cancel()
         state = .checking
         simulationTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(1400))
             guard !Task.isCancelled, let self else { return }
-            // Stub always returns "up to date". PR 11 posts a real check.
             self.state = .idle(lastChecked: Date())
         }
     }
 
-    func installAndRestart() {
-        // Real implementation lands in PR 11. This stub is a no-op so the
-        // button can be wired today without lying to the user.
+    private func scheduleCheckTimeout(seconds: Double) {
+        simulationTask?.cancel()
+        simulationTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled, let self else { return }
+            // If Sparkle hasn't reported back, flip to idle so the UI
+            // doesn't sit in `checking` forever. Sparkle's own panel
+            // remains on screen if a real check is in flight.
+            if case .checking = self.state {
+                self.state = .idle(lastChecked: Date())
+            }
+        }
     }
 
     // MARK: - Persistence

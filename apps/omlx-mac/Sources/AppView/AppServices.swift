@@ -30,6 +30,11 @@ final class AppServices: NSObject, ObservableObject {
         self.updates = UpdateController()
         super.init()
         self.bind(server: server)
+        // Wire Sparkle (or its stub) on the next runloop so any user prefs
+        // saved on disk are applied before the first background check.
+        DispatchQueue.main.async { [weak self] in
+            self?.updates.bootstrap()
+        }
     }
 
     func bind(server: ServerProcess?) {
