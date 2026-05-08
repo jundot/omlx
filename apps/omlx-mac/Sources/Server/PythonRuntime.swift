@@ -1,16 +1,24 @@
-// PR 2 — locate the Python interpreter the parent will spawn.
+// PR 2 (PR 11 follow-up) — locate the Python interpreter the parent will
+// spawn.
 //
 // Resolution order (first match wins):
 //   1. OMLX_PYTHON_OVERRIDE env var — dev escape hatch.
 //   2. Bundle.main/Contents/Frameworks/cpython-3.11/bin/python3 — production.
 //      Layout matches the venvstacks export tree, which packaging/build.py
-//      copies verbatim into the Swift .app at the --swift-next step. The
-//      bundled interpreter resolves the framework layer via venvstacks's
-//      metadata in Contents/Frameworks/__venvstacks__/, so we don't set
-//      PYTHONPATH ourselves in the bundled case.
+//      copies verbatim into the Swift .app at the --swift-next step.
 //
-// PR 5 grows this with port/PATH plumbing; PR 12 collapses the two paths once
-// the venvstacks runtime is the only supported deployment.
+// In the bundled case the spawn environment also sets:
+//   PYTHONHOME = Contents/Frameworks/cpython-3.11
+//     so the relocated interpreter finds its stdlib without grepping the
+//     host system's /usr/lib.
+//   PYTHONPATH = Contents/Resources : framework-mlx-framework/site-packages
+//     : __venvstacks__/site-customize
+//     so `python -m omlx.cli` resolves both the omlx package (shipped as a
+//     pure source tree in Resources/omlx/, matching today's Python build)
+//     and the framework layer's wheels (mlx, transformers, fastapi, …).
+//   PYTHONDONTWRITEBYTECODE = 1
+//     so the read-only app bundle doesn't try to scribble .pyc files into
+//     itself at first import.
 
 import Foundation
 
@@ -21,6 +29,8 @@ struct PythonRuntime {
     let homebrewPaths: [String]
     /// PYTHONPATH entries to prepend. Empty when the override path is used.
     let pythonPath: [URL]
+    /// PYTHONHOME — the cpython layer root. nil when using a system Python.
+    let pythonHome: URL?
     /// True when the bundled runtime was found; false if we fell back.
     let isBundled: Bool
 
@@ -47,20 +57,26 @@ struct PythonRuntime {
                     executable: url,
                     homebrewPaths: defaultHomebrewPaths,
                     pythonPath: [],
+                    pythonHome: nil,
                     isBundled: false
                 )
             }
         }
 
         let bundleRoot = Bundle.main.bundleURL
-        let bundled = bundleRoot
-            .appendingPathComponent("Contents/Frameworks/cpython-3.11/bin/python3")
+        let frameworks = bundleRoot.appendingPathComponent("Contents/Frameworks")
+        let cpython = frameworks.appendingPathComponent("cpython-3.11")
+        let bundled = cpython.appendingPathComponent("bin/python3")
         tried.append(bundled.path)
         if FileManager.default.isExecutableFile(atPath: bundled.path) {
+            let resources = bundleRoot.appendingPathComponent("Contents/Resources")
+            let mlxFramework = frameworks
+                .appendingPathComponent("framework-mlx-framework/lib/python3.11/site-packages")
             return PythonRuntime(
                 executable: bundled,
                 homebrewPaths: defaultHomebrewPaths,
-                pythonPath: [],   // venvstacks metadata handles site-packages
+                pythonPath: [resources, mlxFramework],
+                pythonHome: cpython,
                 isBundled: true
             )
         }
@@ -68,7 +84,10 @@ struct PythonRuntime {
         throw ResolutionError.notFound(triedPaths: tried)
     }
 
-    /// Build the spawn environment: parent env + Homebrew PATH + PYTHONPATH.
+    /// Build the spawn environment: parent env + Homebrew PATH + PYTHONPATH +
+    /// PYTHONHOME. `PYTHONDONTWRITEBYTECODE=1` is set in bundled mode so the
+    /// read-only app bundle doesn't try to scribble `__pycache__/` into
+    /// itself.
     func makeEnvironment() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
 
@@ -85,6 +104,11 @@ struct PythonRuntime {
             } else {
                 env["PYTHONPATH"] = joined
             }
+        }
+
+        if let home = pythonHome {
+            env["PYTHONHOME"] = home.path
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
         }
 
         return env
