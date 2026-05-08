@@ -22,8 +22,13 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
-	<key>LSUIElement</key>
-	<true/>
+	<!--
+	  LSUIElement intentionally omitted. We start as Regular activation
+	  policy and switch to Accessory at runtime once the NSStatusItem is
+	  registered with WindowServer. Combining LSUIElement=true with that
+	  runtime switch causes Tahoe ControlCenter to silently block the
+	  status item (see app.py:189-200 + issue #725 from the Python menubar).
+	-->
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 oMLX. All rights reserved.</string>
 	<key>NSSupportsAutomaticTermination</key>

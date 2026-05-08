@@ -1,33 +1,88 @@
-// PR 2 — menubar still a stub, but now wired to ServerProcess so we can
-// Start / Stop the spawned child. Full menubar parity (icon templates,
-// dynamic menu, stats poll @1Hz, Bartender visibility watcher) lands in PR 4.
+// PR 4 — full menubar parity port. Mirrors the Python menu construction
+// (app.py:1450-1700) and refresh strategy (menuWillOpen + per-second poll).
+//
+// Items, top-down:
+//   • Status header                     (colored, non-clickable)
+//   • Force Restart   (UNRESPONSIVE/ERROR only)
+//   • Stop Server     (RUNNING / STARTING / STOPPING / UNRESPONSIVE)
+//   • Start Server    (STOPPED / IDLE / FAILED)
+//   • Serving Stats   (Session + All-Time submenu)
+//   • Admin Panel     (enabled when running — opens AppView in PR 6, browser fallback now)
+//   • Chat with oMLX  (enabled when running — opens /admin/chat in browser)
+//   • Settings…       (Cmd-, → SwiftUI Settings scene; AppView replaces in PR 6)
+//   • About oMLX
+//   • Quit oMLX       (Cmd-Q)
+//
+// Icon templates: MenubarOutline (stopped) / MenubarFilled (running). Stats
+// poll runs at 1Hz against /admin/api/stats; visibility watcher probes once
+// at +3 s post-launch with a single recreate-and-retry before alerting.
 
 import AppKit
 
 @MainActor
 final class MenubarController: NSObject {
-    private let statusItem: NSStatusItem
-    private weak var server: ServerProcess?
-    private let bootstrapError: Error?
-    private var startItem: NSMenuItem?
-    private var stopItem: NSMenuItem?
-    private var statusHeader: NSMenuItem?
 
-    init(server: ServerProcess?, lastError: Error? = nil) {
-        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    // MARK: - Inputs / state
+
+    private let server: ServerProcess?
+    private let config: AppConfig
+    private let bootstrapError: Error?
+
+    private var statusItem: NSStatusItem
+    private let menu = NSMenu()
+
+    private var statsPoller: MenubarStatsPoller?
+    private var visibilityWatcher: MenubarVisibilityWatcher?
+
+    // Strong refs to dynamic menu items so refreshMenuState() can edit
+    // without rebuilding the live NSMenu (matches Python's
+    // _refresh_menu_in_place — safe while menu is open).
+    private var statusHeader: NSMenuItem!
+    private var startItem: NSMenuItem!
+    private var stopItem: NSMenuItem!
+    private var restartItem: NSMenuItem!
+    private var statsParentItem: NSMenuItem!
+    private var statsSubmenu: NSMenu!
+    private var adminPanelItem: NSMenuItem!
+    private var chatItem: NSMenuItem!
+
+    private let iconOutline: NSImage?
+    private let iconFilled: NSImage?
+
+    // MARK: - Init
+
+    init(server: ServerProcess?, config: AppConfig, lastError: Error? = nil) {
         self.server = server
+        self.config = config
         self.bootstrapError = lastError
+
+        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+
+        let outline = NSImage(named: "MenubarOutline")
+        outline?.isTemplate = true
+        self.iconOutline = outline
+        let filled = NSImage(named: "MenubarFilled")
+        filled?.isTemplate = true
+        self.iconFilled = filled
+
         super.init()
 
-        if let button = statusItem.button {
-            button.image = NSImage(
+        statusItem.button?.image = outline
+        // SF Symbol fallback for asset-catalog miss in Debug builds.
+        if statusItem.button?.image == nil {
+            statusItem.button?.image = NSImage(
                 systemSymbolName: "cube.transparent",
                 accessibilityDescription: "oMLX"
             )
-            button.image?.isTemplate = true
+            statusItem.button?.image?.isTemplate = true
         }
+        statusItem.behavior = []
+        statusItem.menu = menu
+        menu.delegate = self
 
-        statusItem.menu = makeMenu()
+        buildMenu()
+        refreshMenuState()
+
         if let server {
             NotificationCenter.default.addObserver(
                 self,
@@ -36,81 +91,324 @@ final class MenubarController: NSObject {
                 object: server
             )
         }
-        refreshMenuState()
+
+        startStatsPoller()
+        startVisibilityWatcher()
     }
 
-    @objc private func serverStateChanged(_ note: Notification) {
-        refreshMenuState()
-    }
+    // MARK: - Menu construction
 
-    private func makeMenu() -> NSMenu {
-        let menu = NSMenu()
+    private func buildMenu() {
+        menu.removeAllItems()
 
-        let header = NSMenuItem(title: "Server: …", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-        statusHeader = header
+        statusHeader = NSMenuItem(title: "Server: …", action: nil, keyEquivalent: "")
+        statusHeader.isEnabled = false
+        menu.addItem(statusHeader)
 
         menu.addItem(.separator())
 
-        let start = NSMenuItem(
-            title: "Start Server", action: #selector(startServer), keyEquivalent: ""
-        )
-        start.target = self
-        menu.addItem(start)
-        startItem = start
+        restartItem = item("Force Restart",
+                           action: #selector(forceRestartServer),
+                           symbol: "arrow.clockwise.circle")
+        menu.addItem(restartItem)
 
-        let stop = NSMenuItem(
-            title: "Stop Server", action: #selector(stopServer), keyEquivalent: ""
-        )
-        stop.target = self
-        menu.addItem(stop)
-        stopItem = stop
+        stopItem = item("Stop Server",
+                        action: #selector(stopServer),
+                        symbol: "stop.circle")
+        menu.addItem(stopItem)
+
+        startItem = item("Start Server",
+                         action: #selector(startServer),
+                         symbol: "play.circle")
+        menu.addItem(startItem)
 
         menu.addItem(.separator())
 
-        let quit = NSMenuItem(
-            title: "Quit oMLX-next", action: #selector(quitApp), keyEquivalent: "q"
-        )
-        quit.target = self
+        statsParentItem = item("Serving Stats", action: nil, symbol: "chart.bar")
+        statsSubmenu = NSMenu()
+        statsParentItem.submenu = statsSubmenu
+        menu.addItem(statsParentItem)
+        rebuildStatsSubmenu()
+
+        menu.addItem(.separator())
+
+        adminPanelItem = item("Admin Panel",
+                              action: #selector(openAdminPanel),
+                              symbol: "globe")
+        menu.addItem(adminPanelItem)
+
+        chatItem = item("Chat with oMLX",
+                        action: #selector(openChat),
+                        symbol: "message")
+        menu.addItem(chatItem)
+
+        menu.addItem(.separator())
+
+        let prefs = item("Settings…",
+                         action: #selector(openSettings),
+                         symbol: "gearshape",
+                         keyEquivalent: ",")
+        menu.addItem(prefs)
+
+        let about = item("About oMLX-next",
+                         action: #selector(showAbout),
+                         symbol: "info.circle")
+        menu.addItem(about)
+
+        menu.addItem(.separator())
+
+        let quit = item("Quit oMLX-next",
+                        action: #selector(quitApp),
+                        symbol: "power",
+                        keyEquivalent: "q")
         menu.addItem(quit)
-
-        return menu
     }
+
+    private func item(
+        _ title: String,
+        action: Selector?,
+        symbol: String?,
+        keyEquivalent: String = ""
+    ) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+        item.target = (action != nil) ? self : nil
+        if let symbol,
+           let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        {
+            img.isTemplate = true
+            item.image = img
+        }
+        return item
+    }
+
+    // MARK: - Refresh
 
     private func refreshMenuState() {
         let state = server?.state ?? .idle
-        let header: String
+        let isRunning: Bool
+        if case .running = state { isRunning = true } else { isRunning = false }
+        let isStarting: Bool
+        if case .starting = state { isStarting = true } else { isStarting = false }
+        let isFailed: Bool
+        if case .failed = state { isFailed = true } else { isFailed = false }
+
+        // Status header
+        let (text, color) = headerDisplay(state)
+        statusHeader.attributedTitle = NSAttributedString(
+            string: text,
+            attributes: [.foregroundColor: color]
+        )
+
+        // Server-control item visibility — mirrors Python:
+        //   STOPPED → Start
+        //   RUNNING/STARTING/STOPPING/UNRESPONSIVE → Stop
+        //   UNRESPONSIVE/ERROR → Force Restart
+        startItem.isHidden = isRunning || isStarting
+        stopItem.isHidden = !(isRunning || isStarting)
+        restartItem.isHidden = !isFailed
+
+        // Disabled when no server bootstrap (ServerProcess is nil)
+        startItem.isEnabled = (server != nil) && !isRunning && !isStarting
+
+        // Admin Panel + Chat enabled only when actually running
+        adminPanelItem.isEnabled = isRunning
+        chatItem.isEnabled = isRunning
+
+        // Icon swap
+        statusItem.button?.image = isRunning ? iconFilled : iconOutline
+        statusItem.button?.image?.isTemplate = true
+    }
+
+    private func headerDisplay(_ state: ServerProcess.State) -> (String, NSColor) {
         switch state {
         case .idle:
-            header = bootstrapError.map { "Server: bootstrap failed (\($0))" }
-                ?? "Server: idle"
-        case .starting:                  header = "Server: starting…"
-        case .running(let pid):          header = "Server: running (pid \(pid))"
-        case .stopped:                   header = "Server: stopped"
-        case .failed(let message):       header = "Server: failed — \(message)"
+            if let err = bootstrapError {
+                return ("Server: bootstrap failed (\(err))", .systemRed)
+            }
+            return ("Server: idle", .secondaryLabelColor)
+        case .starting:
+            return ("Server: starting…", .systemBlue)
+        case .running(let pid):
+            return ("Server: running · pid \(pid) · :\(config.port)", .systemGreen)
+        case .stopped:
+            return ("Server: stopped", .secondaryLabelColor)
+        case .failed(let msg):
+            return ("Server: failed — \(msg)", .systemRed)
         }
-        statusHeader?.title = header
-
-        let running: Bool
-        if case .running = state { running = true } else { running = false }
-        startItem?.isHidden = running
-        stopItem?.isHidden = !running
-        startItem?.isEnabled = (server != nil) && !running
-        stopItem?.isEnabled = running
     }
+
+    private func rebuildStatsSubmenu() {
+        statsSubmenu.removeAllItems()
+
+        let isRunning: Bool
+        if case .running = server?.state { isRunning = true } else { isRunning = false }
+
+        if !isRunning {
+            statsSubmenu.addItem(disabled("Server is off"))
+            return
+        }
+        let session = statsPoller?.sessionStats
+        let alltime = statsPoller?.alltimeStats
+        if session == nil && alltime == nil {
+            statsSubmenu.addItem(disabled(statsPoller == nil
+                                          ? "Set OMLX_API_KEY to enable stats"
+                                          : "Loading stats…"))
+            return
+        }
+
+        statsSubmenu.addItem(disabled("Session"))
+        appendStat("Total Tokens Processed", compact(session?.totalPromptTokens))
+        appendStat("Cached Tokens", compact(session?.totalCachedTokens))
+        appendStat("Cache Efficiency", percent(session?.cacheEfficiency))
+        appendStat("Avg PP Speed", tps(session?.avgPrefillTps))
+        appendStat("Avg TG Speed", tps(session?.avgGenerationTps))
+
+        statsSubmenu.addItem(.separator())
+
+        statsSubmenu.addItem(disabled("All-Time"))
+        appendStat("Total Tokens Processed", compact(alltime?.totalPromptTokens))
+        appendStat("Cached Tokens", compact(alltime?.totalCachedTokens))
+        appendStat("Cache Efficiency", percent(alltime?.cacheEfficiency))
+        appendStat("Total Requests", compact(alltime?.totalRequests))
+    }
+
+    // MARK: - Pollers
+
+    private func startStatsPoller() {
+        guard let baseURL = config.baseURL,
+              let key = config.apiKey, !key.isEmpty else { return }
+        let p = MenubarStatsPoller(baseURL: baseURL, apiKey: key)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(statsDidUpdate(_:)),
+            name: MenubarStatsPoller.didUpdateNotification,
+            object: p
+        )
+        p.start()
+        self.statsPoller = p
+    }
+
+    private func startVisibilityWatcher() {
+        let watcher = MenubarVisibilityWatcher(initial: statusItem) { [weak self] in
+            self?.recreateStatusItem() ?? NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        }
+        watcher.scheduleInitialCheck(after: 3.0)
+        self.visibilityWatcher = watcher
+    }
+
+    private func recreateStatusItem() -> NSStatusItem {
+        NSStatusBar.system.removeStatusItem(statusItem)
+        let new = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        new.button?.image = iconOutline
+        new.button?.image?.isTemplate = true
+        new.menu = menu
+        statusItem = new
+        return new
+    }
+
+    // MARK: - Notification handlers
+
+    @objc private func serverStateChanged(_ note: Notification) {
+        refreshMenuState()
+        rebuildStatsSubmenu()
+    }
+
+    @objc private func statsDidUpdate(_ note: Notification) {
+        // Stats only need to redraw if the submenu is open or about to open;
+        // menuWillOpen (NSMenuDelegate) handles the latter, so for now we
+        // rebuild eagerly — the next render will pick up fresh values.
+        rebuildStatsSubmenu()
+    }
+
+    // MARK: - Actions
 
     @objc private func startServer() {
         guard let server else { return }
-        do { try server.start() }
-        catch { NSLog("oMLX-next: start failed: \(error)") }
+        do { try server.start() } catch {
+            NSLog("oMLX-next: start failed — \(error)")
+        }
     }
 
     @objc private func stopServer() {
         server?.terminate()
     }
 
+    @objc private func forceRestartServer() {
+        server?.terminate()
+        Task { @MainActor [server] in
+            try? await Task.sleep(for: .seconds(0.6))
+            try? server?.start()
+        }
+    }
+
+    @objc private func openAdminPanel() {
+        // PR 6 wires this to the SwiftUI AppView. Until then, route to the
+        // browser admin so the menu item isn't a dead end.
+        guard let url = URL(string: "http://\(config.host):\(config.port)/admin/dashboard") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func openChat() {
+        guard let url = URL(string: "http://\(config.host):\(config.port)/admin/chat") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func openSettings() {
+        // Opens the SwiftUI Settings scene declared in oMLXApp. macOS 14+
+        // exposes showSettingsWindow:; the older showPreferencesWindow:
+        // is still routed by AppKit, so we try both.
+        if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: self) {
+            _ = NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: self)
+        }
+    }
+
+    @objc private func showAbout() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(nil)
+    }
+
     @objc private func quitApp() {
         NSApp.terminate(nil)
+    }
+
+    // MARK: - Helpers
+
+    private func disabled(_ title: String) -> NSMenuItem {
+        let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        it.isEnabled = false
+        return it
+    }
+
+    private func appendStat(_ label: String, _ value: String) {
+        let it = NSMenuItem(title: "\(label):  \(value)", action: nil, keyEquivalent: "")
+        it.isEnabled = false
+        statsSubmenu.addItem(it)
+    }
+
+    private func compact(_ value: Int?) -> String {
+        guard let n = value else { return "—" }
+        if n >= 1_000_000_000 { return String(format: "%.1fB", Double(n) / 1e9) }
+        if n >= 1_000_000     { return String(format: "%.1fM", Double(n) / 1e6) }
+        if n >= 1_000         { return String(format: "%.1fK", Double(n) / 1e3) }
+        return "\(n)"
+    }
+
+    private func percent(_ value: Double?) -> String {
+        guard let v = value else { return "—" }
+        return String(format: "%.1f%%", v)
+    }
+
+    private func tps(_ value: Double?) -> String {
+        guard let v = value else { return "—" }
+        return String(format: "%.1f tok/s", v)
+    }
+}
+
+// MARK: - NSMenuDelegate
+
+extension MenubarController: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshMenuState()
+        rebuildStatsSubmenu()
     }
 }

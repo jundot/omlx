@@ -25,6 +25,9 @@
 		2BB00000000000000000000A /* SectionHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000A /* SectionHeader.swift */; };
 		2BB00000000000000000000B /* StatusPill.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000B /* StatusPill.swift */; };
 		2BB00000000000000000000C /* CodeChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000C /* CodeChip.swift */; };
+		3BB000000000000000000001 /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000001 /* AppConfig.swift */; };
+		3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000002 /* MenubarStatsPoller.swift */; };
+		3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -49,6 +52,9 @@
 		2CC00000000000000000000A /* SectionHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SectionHeader.swift; sourceTree = "<group>"; };
 		2CC00000000000000000000B /* StatusPill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusPill.swift; sourceTree = "<group>"; };
 		2CC00000000000000000000C /* CodeChip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeChip.swift; sourceTree = "<group>"; };
+		3CC000000000000000000001 /* AppConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfig.swift; sourceTree = "<group>"; };
+		3CC000000000000000000002 /* MenubarStatsPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarStatsPoller.swift; sourceTree = "<group>"; };
+		3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarVisibilityWatcher.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -77,9 +83,18 @@
 				1BBBBBBBBBBBBBBBBBBBBBB3 /* App */,
 				1BBBBBBBBBBBBBBBBBBBBBB4 /* Menubar */,
 				1BBBBBBBBBBBBBBBBBBBBBB7 /* Server */,
+				3EE000000000000000000001 /* Config */,
 				2EE000000000000000000001 /* Theme */,
 			);
 			path = Sources;
+			sourceTree = "<group>";
+		};
+		3EE000000000000000000001 /* Config */ = {
+			isa = PBXGroup;
+			children = (
+				3CC000000000000000000001 /* AppConfig.swift */,
+			);
+			path = Config;
 			sourceTree = "<group>";
 		};
 		2EE000000000000000000001 /* Theme */ = {
@@ -131,6 +146,8 @@
 			isa = PBXGroup;
 			children = (
 				1CCCCCCCCCCCCCCCCCCCCCC3 /* MenubarController.swift */,
+				3CC000000000000000000002 /* MenubarStatsPoller.swift */,
+				3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */,
 			);
 			path = Menubar;
 			sourceTree = "<group>";
@@ -239,6 +256,9 @@
 				2BB00000000000000000000A /* SectionHeader.swift in Sources */,
 				2BB00000000000000000000B /* StatusPill.swift in Sources */,
 				2BB00000000000000000000C /* CodeChip.swift in Sources */,
+				3BB000000000000000000001 /* AppConfig.swift in Sources */,
+				3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */,
+				3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -367,7 +387,6 @@
 		1AAAAAAAAAAAAAAAAAAAAAA7 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = "Resources/oMLX-next.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
@@ -393,7 +412,6 @@
 		1AAAAAAAAAAAAAAAAAAAAAA8 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = "Resources/oMLX-next.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
