@@ -31,7 +31,7 @@ from .paged_cache import (
 )
 from .paged_ssd_cache import PagedSSDCacheManager
 from .stats import PrefixCacheStats
-from .type_registry import CacheTypeRegistry
+from .type_registry import KNOWN_SLICEABLE_CACHE_TYPES, CacheTypeRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -727,19 +727,32 @@ class BlockAwarePrefixCache(CacheManager):
     def _all_layers_sliceable(
         self, layer_cache_types: list[str] | None
     ) -> bool:
-        """True iff every layer's cache type supports block slicing.
+        """True iff every layer's cache type is in the known-sliceable
+        whitelist.
+
+        Why a whitelist and not ``CacheTypeRegistry.supports_block_slicing``:
+        the registry uses ``DefaultCacheHandler`` (a ``KVCacheHandler``
+        subclass that reports ``supports_block_slicing=True``) as the
+        fallback for class names with no registered handler.  Several real
+        non-sliceable types — ``BatchRotatingKVCache``, ``BatchPoolingCache``,
+        ``PoolingCache`` (without the deepseek_v4 patch applied) — are
+        mapped in ``_class_name_map`` but have no registered handler, so
+        the registry would silently classify them as sliceable.  The
+        whitelist is the same one the rest of the scheduler trusts for
+        snapshot-skip and partial-extraction decisions, so MRU now agrees
+        with the surrounding code rather than getting its own answer.
 
         Hybrid models (e.g. Gemma 3, Mistral) mix sliceable layers with
-        non-sliceable ones (RotatingKVCache, ArraysCache). Splicing the
-        partial only into the sliceable layers would create per-layer
-        offset skew at decode — undefined behavior at the model level.
+        non-sliceable ones (``RotatingKVCache``, ``ArraysCache``).  Splicing
+        the partial only into the sliceable layers would create per-layer
+        offset skew at decode — undefined behaviour at the model level —
+        so we refuse the stash entirely whenever any layer is non-sliceable.
         """
         if not layer_cache_types:
             # Default fallback path assumes all layers are KVCache; safe to stash.
             return True
         for class_name in layer_cache_types:
-            handler = CacheTypeRegistry.get_handler_by_class_name(class_name)
-            if not handler.supports_block_slicing:
+            if class_name not in KNOWN_SLICEABLE_CACHE_TYPES:
                 return False
         return True
 
@@ -759,14 +772,15 @@ class BlockAwarePrefixCache(CacheManager):
         """Refresh the MRU partial slot from a just-completed store_cache.
 
         Clears the slot in every "no eligible tail" branch (no trailing
-        tokens, non-tensor data, MLX missing, hybrid model, extraction
-        failure) so a stale partial cannot survive into a future
-        ``apply_mru_partial`` call.
+        tokens, non-tensor data, MLX missing, hybrid model, no SSD
+        configured, extraction failure, or ambiguous cache layout) so a
+        stale partial cannot survive into a future ``apply_mru_partial``.
         """
         if (
             trailing_partial_tokens == 0
             or not is_tensor_data
             or not HAS_MLX
+            or self.paged_ssd_cache is None
             or not self._all_layers_sliceable(layer_cache_types)
         ):
             self._mru_partial = None
@@ -776,16 +790,36 @@ class BlockAwarePrefixCache(CacheManager):
         partial_global_start = existing_tokens + partial_start
         partial_global_end = partial_global_start + trailing_partial_tokens
 
+        # Decide which axis-2 index range covers the trailing partial:
+        # - Global: cache_data spans the full sequence (prefix + new tail);
+        #   slice at [partial_global_start:partial_global_end].
+        # - Local: cache_data spans only the newly-processed suffix;
+        #   slice at [partial_start:partial_start + trailing_partial_tokens].
+        #
+        # We classify by exact cache length, not the previous
+        # ``cache_seq_len >= existing_tokens + 1`` heuristic — that one
+        # silently picked "local" when ``cache_seq_len == existing_tokens``,
+        # which can happen on multi-turn requests where the cache was
+        # extracted at a boundary that happens to equal the prior turn's
+        # length.  Slicing local indices on a global cache there sampled
+        # tokens from the prefix, parent_hash still matched, and a future
+        # apply spliced wrong KV — silent generation corruption.  Now: if
+        # the layout cannot be unambiguously classified, refuse to stash.
         cache_seq_len = self._get_cache_seq_len(cache_data)
-        cache_uses_global_indices = (
-            existing_tokens > 0 and cache_seq_len >= existing_tokens + 1
-        )
-        if cache_uses_global_indices:
+        local_len = len(new_tokens)
+        if cache_seq_len >= partial_global_end:
+            # Cache is long enough to contain the global partial range.
             p_cache_start = partial_global_start
             p_cache_end = partial_global_end
-        else:
+        elif existing_tokens == 0 or cache_seq_len == local_len:
+            # Cache covers only the new suffix (or there is no prefix).
             p_cache_start = partial_start
             p_cache_end = partial_start + trailing_partial_tokens
+        else:
+            # Ambiguous: cache_seq_len is short of global_end but does
+            # not equal local_len either.  Refuse rather than guess.
+            self._mru_partial = None
+            return
 
         # is_last_block=False is the correct intent for partial extraction:
         # we want a token slice, not the full state of any non-sliceable
@@ -2683,6 +2717,13 @@ class BlockAwarePrefixCache(CacheManager):
         self._request_tables.clear()
         self._prefix_index.clear()
         self.paged_cache.clear()
+        # The MRU partial chains from a paged-block hash; once the paged
+        # cache is wiped, the partial cannot be safely applied even if a
+        # future request happens to reproduce the same parent_hash.
+        # Cache-corruption recovery (Scheduler._recover_from_cache_error)
+        # routes through here, so a stale partial would otherwise survive
+        # exactly the recovery path that exists because something was wrong.
+        self._mru_partial = None
         self.reset_stats()
         return cleared_count
 

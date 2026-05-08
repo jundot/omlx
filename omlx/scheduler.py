@@ -412,19 +412,15 @@ PromptProcessingBatch.prompt = _patched_ppb_prompt
 
 
 # Cache class names known to be sliceable (no boundary snapshots needed).
-# ChunkedKVCache is included once the batch=1 patch above installs its
-# extract/filter/size pass-throughs; without it Llama-4 requests fall
-# back to the snapshot path unnecessarily.
-_KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
-    {
-        "KVCache",
-        "BatchKVCache",
-        "QuantizedKVCache",
-        "TurboQuantKVCache",
-        "BatchTurboQuantKVCache",
-        "ChunkedKVCache",
-    }
-)
+# Canonical home: omlx/cache/type_registry.py.  ChunkedKVCache is included
+# there once the batch=1 patch above installs its extract/filter/size
+# pass-throughs (PR #1152); without it Llama-4 requests fall back to the
+# snapshot path unnecessarily.
+from omlx.cache.type_registry import KNOWN_SLICEABLE_CACHE_TYPES
+
+# Module-local alias kept for backwards compatibility with existing
+# call sites in this file.
+_KNOWN_SLICEABLE_CACHE_TYPES = KNOWN_SLICEABLE_CACHE_TYPES
 
 
 def _prompt_cache_needs_snapshots(prompt_cache: list[Any]) -> bool:
@@ -3322,6 +3318,20 @@ class Scheduler:
                     # re-prefill of the sub-block tail on exact-repeat
                     # prompts.  The splice is a no-op when no partial is
                     # stashed or the trailing tokens differ.
+                    #
+                    # Accounting note: the partial advances cached_tokens
+                    # but is NOT a stored paged block, so shared_prefix_blocks
+                    # stays at the count of paged blocks reused.  After a
+                    # successful splice the invariant relaxes from
+                    #     cached_tokens == shared_prefix_blocks * block_size
+                    # to
+                    #     cached_tokens >= shared_prefix_blocks * block_size
+                    # with cached_tokens - shared_prefix_blocks * block_size
+                    # ∈ [0, block_size) representing the partial.  Current
+                    # readers (logging at 2828, 2835) tolerate the relaxed
+                    # form; future readers that index block_table.block_ids
+                    # by shared_prefix_blocks must NOT use cached_tokens to
+                    # bound the loop.
                     if request.remaining_tokens:
                         (
                             request.prompt_cache,
@@ -5324,10 +5334,18 @@ class Scheduler:
             # finished their completeMemory() callbacks (#557).
             target = self._step_counter + self._DEFERRED_CLEAR_DELAY
             if self._deferred_clear_at is None or target > self._deferred_clear_at:
+                # Arm the suppression budget only when STARTING a new
+                # deferral epoch (transition from None).  Subsequent
+                # completions in the same epoch may legitimately push the
+                # deadline out (for IOKit safety, #557) but must NOT
+                # refresh the budget — otherwise a hot-prompt workload
+                # whose completions arrive faster than _DEFERRED_CLEAR_DELAY
+                # could keep re-arming after the budget was spent and
+                # defer the clear forever, defeating the pool-bloat
+                # mitigation (#411).  One suppression per epoch, total.
+                if self._deferred_clear_at is None:
+                    self._mru_clear_suppression_available = True
                 self._deferred_clear_at = target
-                # Each completion can stash a fresh MRU partial; grant a
-                # one-shot budget to defer the clear once for it.
-                self._mru_clear_suppression_available = True
 
     def _is_cache_corruption_error(self, error: Exception) -> bool:
         """Check if an error indicates cache corruption."""

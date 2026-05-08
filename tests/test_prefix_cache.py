@@ -2460,11 +2460,29 @@ class TestMRUPartialBlockCache:
         )
 
     @pytest.fixture
-    def prefix_cache(self, paged_cache):
+    def mock_ssd(self):
+        """An SSD manager mock — present, not used.
+
+        The MRU stash gates on ``paged_ssd_cache is not None`` because in
+        the no-SSD configuration ``reconstruct_cache`` returns ``None`` and
+        ``apply_mru_partial`` is unreachable; stashing then would only
+        produce dead memory.  Tests that exercise stash/apply directly
+        need an SSD instance present even though the mocked save/load
+        paths are not exercised.
+        """
+        mock = MagicMock()
+        mock.save_block.return_value = True
+        mock.load_block.return_value = None
+        mock.load_block_with_metadata.return_value = (None, None)
+        mock.has_block.return_value = False
+        return mock
+
+    @pytest.fixture
+    def prefix_cache(self, paged_cache, mock_ssd):
         return BlockAwarePrefixCache(
             model=MockModel(num_layers=4),
             paged_cache_manager=paged_cache,
-            paged_ssd_cache_manager=None,
+            paged_ssd_cache_manager=mock_ssd,
         )
 
     def _kv_layer(self, mx, n_tokens, head_dim=4, n_kv_heads=1, fill=1.0):
@@ -2579,7 +2597,9 @@ class TestMRUPartialBlockCache:
 
     # --- threat model: hybrid refusal (B1, B2) ---
 
-    def test_refuse_stash_when_any_layer_non_sliceable_hybrid(self, paged_cache, mx):
+    def test_refuse_stash_when_any_layer_non_sliceable_hybrid(
+        self, paged_cache, mock_ssd, mx
+    ):
         """Hybrid model (KVCache + RotatingKVCache): no stash.
 
         Splicing into only the sliceable layers produces per-layer offset
@@ -2591,7 +2611,7 @@ class TestMRUPartialBlockCache:
         cache = BlockAwarePrefixCache(
             model=MockModel(num_layers=2),
             paged_cache_manager=paged_cache,
-            paged_ssd_cache_manager=None,
+            paged_ssd_cache_manager=mock_ssd,
         )
         tokens = [10, 20, 30, 40, 50, 60]
         cache_data = [
@@ -2622,6 +2642,143 @@ class TestMRUPartialBlockCache:
         )
 
         assert prefix_cache._mru_partial is None
+
+    def test_refuse_stash_when_layer_falls_through_to_default_handler(
+        self, prefix_cache, mx
+    ):
+        """Non-sliceable types whose handler is unregistered (fall through
+        to ``DefaultCacheHandler``, which inherits ``KVCacheHandler``'s
+        ``supports_block_slicing=True``) must still be refused.
+
+        Concrete case: ``BatchRotatingKVCache`` is mapped in
+        ``_class_name_map`` to ``BATCH_ROTATING_KVCACHE`` but no handler
+        is registered for that enum.  The original rewrite's
+        registry-based gate would have classified it as sliceable,
+        recreating exactly the silent-corruption hazard the rewrite was
+        supposed to close, just from a different angle.  The fix uses an
+        explicit class-name whitelist (``KNOWN_SLICEABLE_CACHE_TYPES``)
+        instead of the registry.
+        """
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+        from omlx.cache.type_registry import (
+            KNOWN_SLICEABLE_CACHE_TYPES,
+            CacheTypeRegistry,
+        )
+
+        # Sanity: the registry would lie about this class name.
+        handler = CacheTypeRegistry.get_handler_by_class_name("BatchRotatingKVCache")
+        assert handler.supports_block_slicing is True
+        # And the whitelist correctly excludes it.
+        assert "BatchRotatingKVCache" not in KNOWN_SLICEABLE_CACHE_TYPES
+
+        tokens = [10, 20, 30, 40, 50, 60]
+        # cache_data shape doesn't matter — store_cache must refuse before
+        # any extraction is attempted.
+        cache_data = [self._kv_layer(mx, 6) for _ in range(4)]
+        config = ModelCacheConfig.from_type_list(
+            ["BatchRotatingKVCache"] * 4, model_name="test"
+        )
+
+        prefix_cache.store_cache(
+            "req-batch-rotating", tokens, cache_data, model_cache_config=config
+        )
+
+        assert prefix_cache._mru_partial is None
+        assert prefix_cache.has_mru_partial() is False
+
+    # --- threat model: stale-slot eviction at clear() (C2) ---
+
+    def test_clear_wipes_mru_partial(self, prefix_cache, mx):
+        """``BlockAwarePrefixCache.clear()`` must drop the MRU slot.
+
+        The scheduler's cache-corruption recovery routes through
+        ``clear()``.  A surviving partial chains from a paged-block hash
+        whose backing block was just freed; if a future request happens
+        to reproduce the same prompt prefix, ``compute_block_hash`` could
+        coincidentally yield the same hash and the partial would splice
+        into a freshly-reconstructed cache.  The KV would happen to be
+        correct (the model is deterministic) but the chain-of-trust is
+        gone — and the survival happens via *exactly the recovery path
+        that exists because something was wrong*.
+        """
+        prefix_cache.store_cache(
+            "req-clear",
+            [10, 20, 30, 40, 50, 60],
+            [self._kv_layer(mx, 6) for _ in range(4)],
+        )
+        assert prefix_cache._mru_partial is not None
+
+        prefix_cache.clear()
+
+        assert prefix_cache._mru_partial is None
+        assert prefix_cache.has_mru_partial() is False
+
+    # --- threat model: H2 ambiguous cache layout ---
+
+    def test_refuse_stash_on_ambiguous_cache_layout(
+        self, prefix_cache, mx
+    ):
+        """Cache lengths that don't unambiguously map to global or local
+        indexing must refuse the stash.
+
+        Multi-turn requests can produce ``cache_seq_len ==
+        existing_tokens`` or shapes between local and global.  The
+        previous heuristic (``cache_seq_len >= existing_tokens + 1``)
+        silently picked "local" on the boundary, slicing local indices
+        out of a global-indexed cache and capturing tokens from the
+        prefix instead of the trailing tail.  parent_hash still matched,
+        and a future apply spliced wrong KV — silent generation
+        corruption.
+
+        Drive that boundary directly: cache_seq_len falls strictly
+        between global_end and local_len.
+        """
+        # First turn: cache 4 tokens.
+        prefix_cache.store_cache(
+            "req-turn-1",
+            [1, 2, 3, 4],
+            [self._kv_layer(mx, 4) for _ in range(4)],
+        )
+
+        # Second turn: 8 prefix-aligned tokens (1 full block + 1 partial-block).
+        # Hand a cache_data whose cache_seq_len is 6 — strictly between:
+        #   - local_len = len(new_tokens) = len(tokens) - existing_tokens = 4
+        #   - global_end = existing_tokens + new_count = 4 + 4 = 8
+        # global_end (8) > cache_seq_len (6) > local_len (4): ambiguous.
+        full_tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        cache_data = [self._kv_layer(mx, 6) for _ in range(4)]
+
+        prefix_cache.store_cache(
+            "req-turn-2-ambiguous", full_tokens, cache_data
+        )
+
+        # Refuse rather than guess.  Stash must be the previous turn's
+        # state cleared (block-aligned turn 1 has no stash anyway), not
+        # a guessed-wrong turn 2.
+        assert prefix_cache._mru_partial is None
+
+    # --- threat model: H3 no-SSD config ---
+
+    def test_no_stash_when_paged_ssd_cache_is_none(self, paged_cache, mx):
+        """Without an SSD manager, ``reconstruct_cache`` returns ``None``,
+        which means ``apply_mru_partial`` is unreachable from the scheduler.
+        Stashing in this configuration would only produce dead memory
+        (a multi-MB tensor reference held until the next ``store_cache``
+        with no possible consumer)."""
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=4),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=None,
+        )
+
+        cache.store_cache(
+            "req-no-ssd",
+            [10, 20, 30, 40, 50, 60],
+            [self._kv_layer(mx, 6) for _ in range(4)],
+        )
+
+        assert cache._mru_partial is None
+        assert cache.has_mru_partial() is False
 
     # --- apply: real round-trip ---
 

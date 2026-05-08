@@ -1513,28 +1513,98 @@ class TestMRUDeferredClearSuppression:
         # reset on the next completion either way.
         assert scheduler._deferred_clear_at is None
 
-    def test_fresh_completion_resets_budget(
+    def test_new_epoch_completion_arms_budget(
         self, mock_model, mock_tokenizer
     ):
-        """A new completion after suppression refreshes the budget."""
+        """A completion that STARTS a new deferral epoch (transition from
+        ``_deferred_clear_at is None``) arms the budget.  Together with
+        the next test, this pins the contract: budget is one-shot per
+        epoch."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         scheduler._mru_clear_suppression_available = False  # spent
+        assert scheduler._deferred_clear_at is None  # no epoch in flight
 
         request = Request(
-            request_id="req-refresh",
+            request_id="req-new-epoch",
             prompt="hello",
             sampling_params=SamplingParams(),
         )
         request.prompt_token_ids = [1, 2]
         request.num_prompt_tokens = 2
         request.output_token_ids = [3]
-        scheduler.running["req-refresh"] = request
-        scheduler.requests["req-refresh"] = request
+        scheduler.running["req-new-epoch"] = request
+        scheduler.requests["req-new-epoch"] = request
 
         with patch("omlx.scheduler.mx"):
-            scheduler._cleanup_finished({"req-refresh"})
+            scheduler._cleanup_finished({"req-new-epoch"})
 
         assert scheduler._mru_clear_suppression_available is True
+
+    def test_completion_within_open_epoch_does_not_refresh_budget(
+        self, mock_model, mock_tokenizer
+    ):
+        """**The hot-prompt invariant.** A completion that lands while a
+        deferral is already pending must NOT refresh the budget.
+
+        Pre-fix behaviour: every completion re-armed
+        ``_mru_clear_suppression_available = True``.  Under hot-prompt
+        repeats — the very workload this feature targets — completions
+        arrive faster than ``_DEFERRED_CLEAR_DELAY``, so the budget
+        kept refreshing after being spent and the deferred clear could
+        be pushed forever, defeating the pool-bloat mitigation (#411).
+
+        Post-fix: budget is armed only on the transition from ``None``,
+        spent at the deadline if MRU is still warm, and stays spent for
+        the rest of the epoch regardless of how many further completions
+        land.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        # First completion opens the epoch and arms the budget.
+        req1 = Request(
+            request_id="req-open",
+            prompt="a",
+            sampling_params=SamplingParams(),
+        )
+        req1.prompt_token_ids = [1, 2]
+        req1.num_prompt_tokens = 2
+        req1.output_token_ids = [3]
+        scheduler.running["req-open"] = req1
+        scheduler.requests["req-open"] = req1
+
+        with patch("omlx.scheduler.mx"):
+            scheduler._cleanup_finished({"req-open"})
+
+        assert scheduler._deferred_clear_at is not None
+        assert scheduler._mru_clear_suppression_available is True
+
+        # Simulate the budget already being spent (suppression fired
+        # at first attempted deadline).
+        scheduler._mru_clear_suppression_available = False
+
+        # A second completion arrives while the same epoch is still
+        # open.  It may legitimately push the deadline out — that's the
+        # #557 invariant — but it must NOT refresh the spent budget.
+        scheduler._step_counter += 3
+        req2 = Request(
+            request_id="req-mid-epoch",
+            prompt="b",
+            sampling_params=SamplingParams(),
+        )
+        req2.prompt_token_ids = [4, 5]
+        req2.num_prompt_tokens = 2
+        req2.output_token_ids = [6]
+        scheduler.running["req-mid-epoch"] = req2
+        scheduler.requests["req-mid-epoch"] = req2
+
+        with patch("omlx.scheduler.mx"):
+            scheduler._cleanup_finished({"req-mid-epoch"})
+
+        # Deadline pushed (per #557), budget unchanged (per the C3 fix).
+        assert scheduler._deferred_clear_at == (
+            scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
+        )
+        assert scheduler._mru_clear_suppression_available is False
 
 
 class TestPeriodicClearGating:
