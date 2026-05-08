@@ -54,6 +54,7 @@
 		8BB000000000000000000003 /* HFTaskDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000003 /* HFTaskDTO.swift */; };
 		8BB000000000000000000004 /* ModelSettingsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000004 /* ModelSettingsScreen.swift */; };
 		9BB000000000000000000001 /* SubKeyDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000001 /* SubKeyDTO.swift */; };
+		ABB000000000000000000001 /* WelcomeWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACC000000000000000000001 /* WelcomeWindow.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -107,6 +108,7 @@
 		8CC000000000000000000003 /* HFTaskDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HFTaskDTO.swift; sourceTree = "<group>"; };
 		8CC000000000000000000004 /* ModelSettingsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSettingsScreen.swift; sourceTree = "<group>"; };
 		9CC000000000000000000001 /* SubKeyDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubKeyDTO.swift; sourceTree = "<group>"; };
+		ACC000000000000000000001 /* WelcomeWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeWindow.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -140,8 +142,17 @@
 				7EE000000000000000000001 /* Net */,
 				7EE000000000000000000003 /* Updater */,
 				6EE000000000000000000001 /* AppView */,
+				AEE000000000000000000001 /* Welcome */,
 			);
 			path = Sources;
+			sourceTree = "<group>";
+		};
+		AEE000000000000000000001 /* Welcome */ = {
+			isa = PBXGroup;
+			children = (
+				ACC000000000000000000001 /* WelcomeWindow.swift */,
+			);
+			path = Welcome;
 			sourceTree = "<group>";
 		};
 		6EE000000000000000000001 /* AppView */ = {
@@ -403,6 +414,7 @@
 				8BB000000000000000000003 /* HFTaskDTO.swift in Sources */,
 				8BB000000000000000000004 /* ModelSettingsScreen.swift in Sources */,
 				9BB000000000000000000001 /* SubKeyDTO.swift in Sources */,
+				ABB000000000000000000001 /* WelcomeWindow.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

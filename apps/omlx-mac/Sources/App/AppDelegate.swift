@@ -1,14 +1,22 @@
-// PR 5 — application delegate now sequences activation policy + menubar +
-// server bootstrap and installs POSIX signal handlers.
+// PR 5 (PR 10 update) — application delegate sequences activation policy +
+// menubar + server bootstrap and installs POSIX signal handlers.
 //
 //   applicationWillFinishLaunching  → setActivationPolicy(.regular)
 //   applicationDidFinishLaunching   → load AppConfig
-//                                   → resolve PythonRuntime
-//                                   → spawn ServerProcess
-//                                   → create MenubarController
-//                                   → install SignalHandlers (SIGTERM/INT/HUP/QUIT
-//                                      synchronously reap the Python child)
-//                                   → next runloop tick: setActivationPolicy(.accessory)
+//                                   → if first run (no config.json):
+//                                       • create MenubarController without
+//                                         a ServerProcess
+//                                       • show Welcome window (the wizard
+//                                         persists config.json + spawns the
+//                                         server when the user clicks Start)
+//                                       • flip to .accessory only after the
+//                                         wizard window closes
+//                                     else (returning user):
+//                                       • resolve PythonRuntime
+//                                       • spawn ServerProcess
+//                                       • create MenubarController
+//                                       • install SignalHandlers
+//                                       • flip to .accessory next runloop tick
 //   applicationWillTerminate        → await server.stop(timeout: 10)
 //                                      (graceful SIGTERM → wait → SIGKILL inside)
 
@@ -19,6 +27,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var server: ServerProcess?
     private var menubar: MenubarController?
     let services = AppServices()
+
+    private var welcomeController: WelcomeWindowController?
+    private var welcomeCloseObserver: NSObjectProtocol?
 
     nonisolated func applicationWillFinishLaunching(_ notification: Notification) {
         // Regular policy until the status item registers; we flip to Accessory
@@ -32,6 +43,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let config = AppConfig.load()
         services.updateConfig(config)
 
+        if AppConfig.configFileExists {
+            bootstrapServer(config: config)
+            scheduleAccessoryPolicyFlip()
+        } else {
+            // First run: stand up the menubar without a server, then run the
+            // wizard. The wizard's "Start Server" creates a ServerProcess via
+            // `services.bind(server:)`; AppDelegate adopts it back on close.
+            self.menubar = MenubarController(server: nil, config: config)
+            // Stay in .regular until the wizard closes so the user sees the
+            // window in the Dock.
+            NSApp.activate(ignoringOtherApps: true)
+            presentWelcome()
+        }
+    }
+
+    private func bootstrapServer(config: AppConfig) {
         do {
             let runtime = try PythonRuntime.resolve()
             let server = ServerProcess(
@@ -64,7 +91,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.menubar = MenubarController(server: nil, config: config, lastError: error)
             NSLog("oMLX-next: server bootstrap failed — \(error)")
         }
+    }
 
+    private func scheduleAccessoryPolicyFlip() {
         // Defer the policy flip so the status item has time to register
         // with WindowServer before we hide the Dock icon (mirrors
         // switchToAccessoryPolicy_ in app.py:324-327).
@@ -72,6 +101,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.setActivationPolicy(.accessory)
             NSApp.activate(ignoringOtherApps: true)
         }
+    }
+
+    private func presentWelcome() {
+        let controller = WelcomeWindowController(
+            services: services,
+            server: server
+        ) { [weak self] _, finishedServer in
+            // The wizard returns the spawned ServerProcess. Adopt it so
+            // applicationWillTerminate can clean up correctly.
+            self?.server = finishedServer
+            if let proc = finishedServer {
+                SignalHandlers.shared.install { [weak proc] in
+                    proc?.reapSync()
+                }
+            }
+        }
+        self.welcomeController = controller
+
+        welcomeCloseObserver = NotificationCenter.default.addObserver(
+            forName: WelcomeWindowController.willCloseNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            // Hop back into MainActor isolation to mutate AppDelegate state
+            // safely under Swift Concurrency.
+            MainActor.assumeIsolated {
+                self?.welcomeDidClose()
+            }
+        }
+
+        controller.show()
+    }
+
+    private func welcomeDidClose() {
+        if let observer = welcomeCloseObserver {
+            NotificationCenter.default.removeObserver(observer)
+            welcomeCloseObserver = nil
+        }
+        welcomeController = nil
+
+        // The wizard either spawned the server itself (success path) or the
+        // user closed it without starting (skipped). Either way, drop the
+        // app icon from the Dock and rebuild the menubar with whatever
+        // state we ended up with.
+        if let server, menubar != nil {
+            self.menubar = MenubarController(
+                server: server,
+                config: services.config
+            )
+        }
+        scheduleAccessoryPolicyFlip()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
