@@ -58,10 +58,19 @@ final class MenubarController: NSObject {
 
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
+        // Cap icons at 18×18 pt (the standard macOS menubar icon size).
+        // Our SVGs are 497×497 natural; without this, the status item
+        // auto-sizes to that natural width and dominates the menubar.
+        // Mirrors Python's _load_menubar_icon (app.py:973).
+        let menubarIconSize = NSSize(width: 18, height: 18)
+
         let outline = NSImage(named: "MenubarOutline")
+        outline?.size = menubarIconSize
         outline?.isTemplate = true
         self.iconOutline = outline
+
         let filled = NSImage(named: "MenubarFilled")
+        filled?.size = menubarIconSize
         filled?.isTemplate = true
         self.iconFilled = filled
 
@@ -70,11 +79,12 @@ final class MenubarController: NSObject {
         statusItem.button?.image = outline
         // SF Symbol fallback for asset-catalog miss in Debug builds.
         if statusItem.button?.image == nil {
-            statusItem.button?.image = NSImage(
+            let fallback = NSImage(
                 systemSymbolName: "cube.transparent",
                 accessibilityDescription: "oMLX"
             )
-            statusItem.button?.image?.isTemplate = true
+            fallback?.isTemplate = true
+            statusItem.button?.image = fallback
         }
         statusItem.behavior = []
         statusItem.menu = menu
