@@ -2,6 +2,14 @@
 
 Packages oMLX as a macOS menubar app using venvstacks.
 
+> **Two-track build during the Swift rewrite.** The `oMLX.app` (Python /
+> PyObjC) described below is the current shipping target. A SwiftUI rewrite
+> is landing under [`apps/omlx-mac/`](../apps/omlx-mac/) and builds to a
+> separate `oMLX-next.app` until the Phase 12 cutover. See
+> [`plan.md`](../plan.md) and
+> [`docs/native_app_architecture.md`](../docs/native_app_architecture.md) for
+> the roadmap.
+
 ## Requirements
 
 - macOS 15.0+ (Sequoia) — required by MLX >= 0.29.2
