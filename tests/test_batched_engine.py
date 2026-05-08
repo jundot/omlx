@@ -673,3 +673,85 @@ class TestApplyChatTemplatePartialMode:
         # partial stripped from message dicts
         call_msgs = mock_tokenizer.apply_chat_template.call_args[0][0]
         assert "partial" not in call_msgs[-1]
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=TypeError,
+        reason=(
+            "Pre-fix: BatchedEngine.count_chat_tokens lacks the is_partial "
+            "parameter the API server forwards.  detect_and_strip_partial "
+            "(invoked internally by _apply_chat_template) mutates the "
+            "messages list in place by popping partial=True.  The chat "
+            "phase then sees stripped messages and re-detects False, "
+            "rendering with add_generation_prompt=True instead of "
+            "continue_final_message=True.  This produces a different "
+            "token sequence than the count phase produced, misaligning "
+            "with the cached prefix on subsequent turns and surfacing as "
+            "a TTFT regression on identical re-prompts.  The fix detects "
+            "partial once at the API boundary and forwards is_partial as "
+            "an explicit parameter, skipping re-detection in the engine. "
+            "When the fix lands, this xfail flips to XPASS and the strict "
+            "marker forces removal of the decorator -- converting this "
+            "into a positive regression guard."
+        ),
+    )
+    def test_count_then_apply_chat_template_idempotent_under_partial_mode(self):
+        """Server flow: count_chat_tokens then _apply_chat_template on the
+        same messages list must render with identical partial-mode flags.
+
+        Mimics the post-fix server contract: detect_and_strip_partial once
+        at the API boundary, forward the resolved value to engine methods
+        via an explicit is_partial parameter, and assert both phases pass
+        the same partial-mode flags to apply_chat_template.
+
+        See the xfail decorator's reason field for full bug context.
+        """
+        from omlx.api.utils import detect_and_strip_partial
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.return_value = "<formatted>"
+        mock_tokenizer.encode.return_value = [1, 2, 3]
+        engine._tokenizer = mock_tokenizer
+
+        messages = [
+            {"role": "user", "content": "Generate JSON"},
+            {"role": "assistant", "content": "{", "partial": True},
+        ]
+
+        # Server flow: detect_and_strip_partial once at the API boundary,
+        # forward the resolved value to all engine methods.
+        is_partial = detect_and_strip_partial(messages)
+        assert is_partial is True
+
+        # Phase 1: count.
+        engine.count_chat_tokens(messages, is_partial=is_partial)
+        count_kwargs = dict(mock_tokenizer.apply_chat_template.call_args.kwargs)
+
+        # Phase 2: chat.  Operates on the same (now-stripped) messages list.
+        engine._apply_chat_template(messages, is_partial=is_partial)
+        chat_kwargs = dict(mock_tokenizer.apply_chat_template.call_args.kwargs)
+
+        # Both phases must render with identical partial-mode flags.
+        assert count_kwargs.get("continue_final_message") == chat_kwargs.get(
+            "continue_final_message"
+        ), (
+            "continue_final_message diverged across phases: "
+            f"count={count_kwargs.get('continue_final_message')}, "
+            f"chat={chat_kwargs.get('continue_final_message')}"
+        )
+        assert (
+            count_kwargs["add_generation_prompt"]
+            == chat_kwargs["add_generation_prompt"]
+        ), (
+            "add_generation_prompt diverged across phases: "
+            f"count={count_kwargs['add_generation_prompt']}, "
+            f"chat={chat_kwargs['add_generation_prompt']}"
+        )
+
+        # Specific contract: with partial=True forwarded, both phases use
+        # continue_final_message=True (not add_generation_prompt=True).
+        assert count_kwargs["continue_final_message"] is True
+        assert count_kwargs["add_generation_prompt"] is False
