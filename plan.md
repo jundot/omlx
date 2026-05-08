@@ -16,7 +16,7 @@ ships.
 |----|-------|--------|-------|
 | 0  | Land structure + plan doc | ✅ Merged | a19437c |
 | 1  | Xcode project + minimal launchable shell | ✅ Merged | 65dabfe |
-| 2  | Bundled Python runtime + ServerProcess stub | ⬜ Not started | |
+| 2  | Bundled Python runtime + ServerProcess stub | ✅ Merged | 75a5f69 |
 | 3  | Theme + design system + previews | ⬜ Not started | |
 | 4  | Menubar parity (status item, menu, stats poll, visibility watcher) | ⬜ Not started | |
 | 5  | ServerProcess full lifecycle (port `server_manager.py`) | ⬜ Not started | |
