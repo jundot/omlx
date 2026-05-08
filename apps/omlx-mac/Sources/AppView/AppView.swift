@@ -14,15 +14,16 @@ struct AppView: View {
     @State private var search: String = ""
 
     @Environment(\.colorScheme) private var scheme
+    @EnvironmentObject private var services: AppServices
 
     var body: some View {
         let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
 
         NavigationSplitView {
-            Sidebar(selection: $selection, search: $search)
+            Sidebar(selection: bindingForSelection(), search: $search)
                 .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 260)
         } detail: {
-            ContentScaffold(section: selection) {
+            ContentScaffold(section: selection, detailTitle: detailTitle) {
                 screen(for: selection)
             }
             .navigationSplitViewColumnWidth(min: 640, ideal: 920)
@@ -33,13 +34,38 @@ struct AppView: View {
         .environment(\.omlxTheme, theme)
     }
 
+    /// Drilling out of ModelSettingsScreen via the sidebar (changing section)
+    /// must clear the per-model detail id so we don't accidentally re-enter
+    /// the detail when the user returns to Models.
+    private func bindingForSelection() -> Binding<AppSection> {
+        Binding(
+            get: { selection },
+            set: { newValue in
+                if newValue != .models { services.modelDetailID = nil }
+                selection = newValue
+            }
+        )
+    }
+
+    private var detailTitle: String? {
+        if selection == .models, let id = services.modelDetailID, !id.isEmpty {
+            return id
+        }
+        return nil
+    }
+
     @ViewBuilder
     private func screen(for section: AppSection) -> some View {
         switch section {
         case .server:       ServerScreen()
         case .status:       StatusScreen()
         case .logs:         LogsScreen()
-        case .models:       ModelsScreen()
+        case .models:
+            if let id = services.modelDetailID {
+                ModelSettingsScreen(modelID: id)
+            } else {
+                ModelsScreen()
+            }
         case .downloads:    DownloadsScreen()
         case .integrations: IntegrationsScreen()
         case .security:     SecurityScreen()
@@ -55,6 +81,7 @@ struct AppView: View {
 /// 42 pt toolbar, 720 pt max content width, 20/28/36 pt padding.
 private struct ContentScaffold<Content: View>: View {
     let section: AppSection
+    let detailTitle: String?
     @ViewBuilder var content: () -> Content
 
     @Environment(\.omlxTheme) private var theme
@@ -71,7 +98,7 @@ private struct ContentScaffold<Content: View>: View {
             .padding(.bottom, 36)
         }
         .background(theme.contentBg)
-        .navigationTitle(section.title)
+        .navigationTitle(detailTitle ?? section.title)
     }
 }
 

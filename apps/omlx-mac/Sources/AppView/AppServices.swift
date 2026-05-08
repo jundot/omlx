@@ -15,6 +15,9 @@ import SwiftUI
 final class AppServices: NSObject, ObservableObject {
     @Published var config: AppConfig
     @Published var serverState: ServerProcess.State = .stopped
+    /// PR 8 — when non-nil, the AppView swaps the Models screen for the
+    /// per-model ModelSettingsScreen drilled to this id.
+    @Published var modelDetailID: String?
 
     let client: OMLXClient
     let updates: UpdateController

@@ -88,7 +88,95 @@ final class OMLXClient: ObservableObject {
         if let file, !file.isEmpty {
             q.append(URLQueryItem(name: "file", value: file))
         }
-        return try await get("/admin/api/logs", query: q)
+        return try await get(AdminAPI.logs, query: q)
+    }
+
+    // PR 8 — Models / Profiles / HF
+
+    func listModels() async throws -> ListModelsResponse {
+        try await get(AdminAPI.models)
+    }
+
+    @discardableResult
+    func loadModel(id: String) async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.loadModel(id))
+    }
+
+    @discardableResult
+    func unloadModel(id: String) async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.unloadModel(id))
+    }
+
+    @discardableResult
+    func reloadModels() async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.reloadModels)
+    }
+
+    @discardableResult
+    func updateModelSettings(id: String, patch: ModelSettingsPatch) async throws -> SimpleStatusResponse {
+        try await put(AdminAPI.modelSettings(id), body: patch)
+    }
+
+    func listModelProfiles(id: String) async throws -> ProfileListResponse {
+        try await get(AdminAPI.modelProfiles(id))
+    }
+
+    func createModelProfile(id: String, body: CreateProfileRequest) async throws -> CreateProfileResponse {
+        try await post(AdminAPI.modelProfiles(id), body: body)
+    }
+
+    @discardableResult
+    func deleteModelProfile(id: String, name: String) async throws -> DeleteResponse {
+        try await delete(AdminAPI.modelProfile(id, name))
+    }
+
+    @discardableResult
+    func applyModelProfile(id: String, name: String) async throws -> ApplyProfileResponse {
+        try await postEmpty(AdminAPI.applyModelProfile(id, name))
+    }
+
+    func listProfileTemplates() async throws -> TemplateListResponse {
+        try await get(AdminAPI.profileTemplates)
+    }
+
+    func createProfileTemplate(body: CreateTemplateRequest) async throws -> CreateTemplateResponse {
+        try await post(AdminAPI.profileTemplates, body: body)
+    }
+
+    @discardableResult
+    func deleteProfileTemplate(name: String) async throws -> DeleteResponse {
+        try await delete("\(AdminAPI.profileTemplates)/\(name)")
+    }
+
+    func listHFTasks() async throws -> HFTaskListResponse {
+        try await get(AdminAPI.hfTasks)
+    }
+
+    func startHFDownload(repoId: String, hfToken: String = "") async throws -> StartHFDownloadResponse {
+        try await post(AdminAPI.hfDownload, body: StartHFDownloadRequest(
+            repoId: repoId, hfToken: hfToken
+        ))
+    }
+
+    @discardableResult
+    func cancelHFDownload(taskId: String) async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.hfCancel(taskId))
+    }
+
+    @discardableResult
+    func retryHFDownload(taskId: String) async throws -> StartHFDownloadResponse {
+        try await postEmpty(AdminAPI.hfRetry(taskId))
+    }
+
+    @discardableResult
+    func removeHFTask(taskId: String) async throws -> SimpleStatusResponse {
+        try await delete(AdminAPI.hfTask(taskId))
+    }
+
+    func getHFRecommended(mlxOnly: Bool = true) async throws -> HFRecommendedResponse {
+        try await get(AdminAPI.hfRecommended, query: [
+            URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+        ])
     }
 
     // MARK: - Core request
@@ -100,6 +188,19 @@ final class OMLXClient: ObservableObject {
     private func post<U: Encodable, T: Decodable>(_ path: String, body: U) async throws -> T {
         let data = try encoder.encode(body)
         return try await request("POST", path: path, body: data)
+    }
+
+    private func put<U: Encodable, T: Decodable>(_ path: String, body: U) async throws -> T {
+        let data = try encoder.encode(body)
+        return try await request("PUT", path: path, body: data)
+    }
+
+    private func postEmpty<T: Decodable>(_ path: String) async throws -> T {
+        try await request("POST", path: path, body: nil)
+    }
+
+    private func delete<T: Decodable>(_ path: String) async throws -> T {
+        try await request("DELETE", path: path, body: nil)
     }
 
     private func request<T: Decodable>(

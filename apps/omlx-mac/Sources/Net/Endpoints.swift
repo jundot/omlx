@@ -16,4 +16,26 @@ enum AdminAPI {
     static let serverInfo      = "\(prefix)/server-info"
     static let stats           = "\(prefix)/stats"
     static let logs            = "\(prefix)/logs"
+
+    static let models          = "\(prefix)/models"
+    static func loadModel(_ id: String) -> String   { "\(models)/\(id)/load" }
+    static func unloadModel(_ id: String) -> String { "\(models)/\(id)/unload" }
+    static func modelSettings(_ id: String) -> String { "\(models)/\(id)/settings" }
+    static let reloadModels    = "\(prefix)/reload"
+
+    static func modelProfiles(_ id: String) -> String { "\(models)/\(id)/profiles" }
+    static func modelProfile(_ id: String, _ name: String) -> String {
+        "\(models)/\(id)/profiles/\(name)"
+    }
+    static func applyModelProfile(_ id: String, _ name: String) -> String {
+        "\(models)/\(id)/profiles/\(name)/apply"
+    }
+    static let profileTemplates = "\(prefix)/profile-templates"
+
+    static let hfTasks         = "\(prefix)/hf/tasks"
+    static let hfDownload      = "\(prefix)/hf/download"
+    static func hfCancel(_ taskId: String) -> String { "\(prefix)/hf/cancel/\(taskId)" }
+    static func hfRetry(_ taskId: String) -> String  { "\(prefix)/hf/retry/\(taskId)" }
+    static func hfTask(_ taskId: String) -> String   { "\(prefix)/hf/task/\(taskId)" }
+    static let hfRecommended   = "\(prefix)/hf/recommended"
 }

@@ -49,6 +49,10 @@
 		7BB000000000000000000006 /* StatsDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC000000000000000000006 /* StatsDTO.swift */; };
 		7BB000000000000000000007 /* LogsDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC000000000000000000007 /* LogsDTO.swift */; };
 		7BB000000000000000000008 /* UpdateController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC000000000000000000008 /* UpdateController.swift */; };
+		8BB000000000000000000001 /* ModelsDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000001 /* ModelsDTO.swift */; };
+		8BB000000000000000000002 /* ProfileDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000002 /* ProfileDTO.swift */; };
+		8BB000000000000000000003 /* HFTaskDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000003 /* HFTaskDTO.swift */; };
+		8BB000000000000000000004 /* ModelSettingsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000004 /* ModelSettingsScreen.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -97,6 +101,10 @@
 		7CC000000000000000000006 /* StatsDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatsDTO.swift; sourceTree = "<group>"; };
 		7CC000000000000000000007 /* LogsDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogsDTO.swift; sourceTree = "<group>"; };
 		7CC000000000000000000008 /* UpdateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateController.swift; sourceTree = "<group>"; };
+		8CC000000000000000000001 /* ModelsDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsDTO.swift; sourceTree = "<group>"; };
+		8CC000000000000000000002 /* ProfileDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileDTO.swift; sourceTree = "<group>"; };
+		8CC000000000000000000003 /* HFTaskDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HFTaskDTO.swift; sourceTree = "<group>"; };
+		8CC000000000000000000004 /* ModelSettingsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSettingsScreen.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -162,6 +170,9 @@
 				7CC000000000000000000005 /* ServerInfoDTO.swift */,
 				7CC000000000000000000006 /* StatsDTO.swift */,
 				7CC000000000000000000007 /* LogsDTO.swift */,
+				8CC000000000000000000001 /* ModelsDTO.swift */,
+				8CC000000000000000000002 /* ProfileDTO.swift */,
+				8CC000000000000000000003 /* HFTaskDTO.swift */,
 			);
 			path = DTO;
 			sourceTree = "<group>";
@@ -183,6 +194,7 @@
 				6CC000000000000000000006 /* LogsScreen.swift */,
 				6CC000000000000000000007 /* ModelsScreen.swift */,
 				6CC000000000000000000008 /* DownloadsScreen.swift */,
+				8CC000000000000000000004 /* ModelSettingsScreen.swift */,
 				6CC000000000000000000009 /* IntegrationsScreen.swift */,
 				6CC00000000000000000000A /* SecurityScreen.swift */,
 				6CC00000000000000000000B /* AboutScreen.swift */,
@@ -383,6 +395,10 @@
 				7BB000000000000000000006 /* StatsDTO.swift in Sources */,
 				7BB000000000000000000007 /* LogsDTO.swift in Sources */,
 				7BB000000000000000000008 /* UpdateController.swift in Sources */,
+				8BB000000000000000000001 /* ModelsDTO.swift in Sources */,
+				8BB000000000000000000002 /* ProfileDTO.swift in Sources */,
+				8BB000000000000000000003 /* HFTaskDTO.swift in Sources */,
+				8BB000000000000000000004 /* ModelSettingsScreen.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
