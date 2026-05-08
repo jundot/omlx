@@ -14,7 +14,7 @@ ships.
 
 | PR | Title | Status | Notes |
 |----|-------|--------|-------|
-| 0  | Land structure + plan doc | ⬜ Not started | this PR |
+| 0  | Land structure + plan doc | ✅ Merged | a19437c |
 | 1  | Xcode project + minimal launchable shell | ⬜ Not started | |
 | 2  | Bundled Python runtime + ServerProcess stub | ⬜ Not started | |
 | 3  | Theme + design system + previews | ⬜ Not started | |
