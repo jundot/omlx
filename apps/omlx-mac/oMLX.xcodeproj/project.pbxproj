@@ -13,6 +13,18 @@
 		1DDDDDDDDDDDDDDDDDDDDDD4 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC6 /* Assets.xcassets */; };
 		1DDDDDDDDDDDDDDDDDDDDDD5 /* PythonRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */; };
 		1DDDDDDDDDDDDDDDDDDDDDD6 /* ServerProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */; };
+		2BB000000000000000000001 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000001 /* Theme.swift */; };
+		2BB000000000000000000002 /* Squircle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000002 /* Squircle.swift */; };
+		2BB000000000000000000003 /* Glass.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000003 /* Glass.swift */; };
+		2BB000000000000000000004 /* Button.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000004 /* Button.swift */; };
+		2BB000000000000000000005 /* Popup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000005 /* Popup.swift */; };
+		2BB000000000000000000006 /* TextInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000006 /* TextInput.swift */; };
+		2BB000000000000000000007 /* Segmented.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000007 /* Segmented.swift */; };
+		2BB000000000000000000008 /* ListGroup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000008 /* ListGroup.swift */; };
+		2BB000000000000000000009 /* Row.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000009 /* Row.swift */; };
+		2BB00000000000000000000A /* SectionHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000A /* SectionHeader.swift */; };
+		2BB00000000000000000000B /* StatusPill.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000B /* StatusPill.swift */; };
+		2BB00000000000000000000C /* CodeChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000C /* CodeChip.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -25,6 +37,18 @@
 		1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX-next.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "oMLX-next.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PythonRuntime.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProcess.swift; sourceTree = "<group>"; };
+		2CC000000000000000000001 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		2CC000000000000000000002 /* Squircle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Squircle.swift; sourceTree = "<group>"; };
+		2CC000000000000000000003 /* Glass.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Glass.swift; sourceTree = "<group>"; };
+		2CC000000000000000000004 /* Button.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Button.swift; sourceTree = "<group>"; };
+		2CC000000000000000000005 /* Popup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Popup.swift; sourceTree = "<group>"; };
+		2CC000000000000000000006 /* TextInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextInput.swift; sourceTree = "<group>"; };
+		2CC000000000000000000007 /* Segmented.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Segmented.swift; sourceTree = "<group>"; };
+		2CC000000000000000000008 /* ListGroup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ListGroup.swift; sourceTree = "<group>"; };
+		2CC000000000000000000009 /* Row.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Row.swift; sourceTree = "<group>"; };
+		2CC00000000000000000000A /* SectionHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SectionHeader.swift; sourceTree = "<group>"; };
+		2CC00000000000000000000B /* StatusPill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusPill.swift; sourceTree = "<group>"; };
+		2CC00000000000000000000C /* CodeChip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeChip.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -53,8 +77,36 @@
 				1BBBBBBBBBBBBBBBBBBBBBB3 /* App */,
 				1BBBBBBBBBBBBBBBBBBBBBB4 /* Menubar */,
 				1BBBBBBBBBBBBBBBBBBBBBB7 /* Server */,
+				2EE000000000000000000001 /* Theme */,
 			);
 			path = Sources;
+			sourceTree = "<group>";
+		};
+		2EE000000000000000000001 /* Theme */ = {
+			isa = PBXGroup;
+			children = (
+				2CC000000000000000000001 /* Theme.swift */,
+				2CC000000000000000000002 /* Squircle.swift */,
+				2CC000000000000000000003 /* Glass.swift */,
+				2EE000000000000000000002 /* Components */,
+			);
+			path = Theme;
+			sourceTree = "<group>";
+		};
+		2EE000000000000000000002 /* Components */ = {
+			isa = PBXGroup;
+			children = (
+				2CC000000000000000000004 /* Button.swift */,
+				2CC000000000000000000005 /* Popup.swift */,
+				2CC000000000000000000006 /* TextInput.swift */,
+				2CC000000000000000000007 /* Segmented.swift */,
+				2CC000000000000000000008 /* ListGroup.swift */,
+				2CC000000000000000000009 /* Row.swift */,
+				2CC00000000000000000000A /* SectionHeader.swift */,
+				2CC00000000000000000000B /* StatusPill.swift */,
+				2CC00000000000000000000C /* CodeChip.swift */,
+			);
+			path = Components;
 			sourceTree = "<group>";
 		};
 		1BBBBBBBBBBBBBBBBBBBBBB7 /* Server */ = {
@@ -175,6 +227,18 @@
 				1DDDDDDDDDDDDDDDDDDDDDD3 /* MenubarController.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD5 /* PythonRuntime.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD6 /* ServerProcess.swift in Sources */,
+				2BB000000000000000000001 /* Theme.swift in Sources */,
+				2BB000000000000000000002 /* Squircle.swift in Sources */,
+				2BB000000000000000000003 /* Glass.swift in Sources */,
+				2BB000000000000000000004 /* Button.swift in Sources */,
+				2BB000000000000000000005 /* Popup.swift in Sources */,
+				2BB000000000000000000006 /* TextInput.swift in Sources */,
+				2BB000000000000000000007 /* Segmented.swift in Sources */,
+				2BB000000000000000000008 /* ListGroup.swift in Sources */,
+				2BB000000000000000000009 /* Row.swift in Sources */,
+				2BB00000000000000000000A /* SectionHeader.swift in Sources */,
+				2BB00000000000000000000B /* StatusPill.swift in Sources */,
+				2BB00000000000000000000C /* CodeChip.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
