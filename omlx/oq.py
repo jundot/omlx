@@ -839,7 +839,21 @@ class _TrackedTensor:
             r *= d
         return r
 
+    def moveaxis(self, source, destination):
+        dims = list(range(self.ndim))
+        dims.insert(destination, dims.pop(source))
+        new_shape = tuple(self.shape[d] for d in dims)
+        return self._clone(shape=new_shape, transform="moveaxis")
 
+    def transpose(self, *axes):
+        if not axes:
+            new_shape = tuple(reversed(self.shape))
+        else:
+            if len(axes) == 1 and isinstance(axes[0], (tuple, list)):
+                axes = axes[0]
+            new_shape = tuple(self.shape[a] for a in axes)
+        return self._clone(shape=new_shape, transform="transpose")
+    
 
 def _streaming_fp8_dequant(lazy_index, scratch_dir=None, shard_bytes=4_000_000_000):
     """Streaming FP8 dequant with disk spill. For each (weight, weight_scale_inv)
@@ -2157,6 +2171,12 @@ def quantize_oq_streaming(
 
     cb("loading", 20.0)
 
+    # --- [추가된 부분 1: config에서 MTP 활성화 여부 확인] ---
+    mtp_enabled = config.get("num_mtp_layers", 0) > 0
+    if not mtp_enabled and "text_config" in config:
+        mtp_enabled = config["text_config"].get("num_mtp_layers", 0) > 0
+    # --------------------------------------------------------
+
     tensor_names = list(all_weights.keys())
     total_tensors = len(tensor_names)
     out_shard_data = {}
@@ -2173,6 +2193,11 @@ def quantize_oq_streaming(
     processed_bytes = 0
 
     for i, tensor_name in enumerate(tensor_names):
+
+        if not mtp_enabled and (".mtp." in tensor_name or tensor_name.startswith("mtp.")):
+            all_weights.pop(tensor_name, None)
+            continue
+        
         w_mx = all_weights.pop(tensor_name)
         if isinstance(w_mx, _LazyTensor):
             w_mx = w_mx[:]
@@ -2806,6 +2831,15 @@ def _measure_sensitivity(
     """Measure sensitivity by loading model temporarily. Used by streaming path."""
     is_vlm = "vision_config" in config
 
+    import mlx.nn as nn
+    original_load_weights = nn.Module.load_weights
+
+    def _patched_load_weights(self, *args, **kwargs):
+        kwargs["strict"] = False
+        return original_load_weights(self, *args, **kwargs)
+    
+    nn.Module.load_weights = _patched_load_weights
+
     try:
         if is_vlm:
             from mlx_vlm.utils import load_model as vlm_load_model
@@ -2824,6 +2858,9 @@ def _measure_sensitivity(
             "using position-based"
         )
         return {}
+    
+    finally:
+        nn.Module.load_weights = original_load_weights
 
     sensitivity = _measure_sensitivity_from_model(
         model, tokenizer, config, oq_level,
@@ -2883,9 +2920,12 @@ def _measure_sensitivity_from_quantized_model(
 
     for layer_idx, block in enumerate(layers):
         layer_mask = layer_masks[layer_idx] if layer_idx < len(layer_masks) else None
+        
         out_baseline = _forward_layer(block, inputs, layer_mask, position_ids)
         if out_baseline is None:
             continue
+            
+        mx.eval(out_baseline)
 
         saved = {}
         for p, m in tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module):
@@ -2893,26 +2933,34 @@ def _measure_sensitivity_from_quantized_model(
                 continue
             bits = getattr(m, "bits", 4)
             gs = getattr(m, "group_size", 64)
-            mode = getattr(m, "mode", "affine")
             perturb_bits = bits - 1
             if perturb_bits not in _REQUANT_VALID_BITS:
                 continue
+                
             w_float = mx.dequantize(
                 m.weight, m.scales, getattr(m, "biases", None),
-                group_size=gs, bits=bits, mode=mode,
+                group_size=gs, bits=bits
             )
+            
             saved[p] = (m.weight, m.scales, getattr(m, "biases", None), bits)
             qw, sc, *rest = mx.quantize(w_float, group_size=gs, bits=perturb_bits, mode="affine")
+            
             m.weight = qw
             m.scales = sc
             m.biases = rest[0] if rest else None
             m.bits = perturb_bits
+            
+            if m.biases is not None:
+                mx.eval(m.weight, m.scales, m.biases)
+            else:
+                mx.eval(m.weight, m.scales)
 
         out_perturbed = _forward_layer(block, inputs, layer_mask, position_ids)
 
         modules_by_path = dict(
             tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module)
         )
+        
         for p, (w, s, b, orig_bits) in saved.items():
             if p in modules_by_path:
                 mod = modules_by_path[p]
@@ -2920,12 +2968,19 @@ def _measure_sensitivity_from_quantized_model(
                 mod.scales = s
                 if b is not None:
                     mod.biases = b
+                else:
+                    if hasattr(mod, "biases"):
+                        del mod.biases
                 mod.bits = orig_bits
 
         if out_perturbed is not None:
-            raw_mse = ((out_baseline - out_perturbed) ** 2).mean()
-            out_mag = (out_baseline ** 2).mean()
+            ob32 = out_baseline.astype(mx.float32)
+            op32 = out_perturbed.astype(mx.float32)
+            
+            raw_mse = ((ob32 - op32) ** 2).mean()
+            out_mag = (ob32 ** 2).mean()
             mse_val = raw_mse / mx.maximum(out_mag, 1e-10)
+            
             mx.eval(mse_val)
             sensitivity[layer_idx] = mse_val.item()
 
