@@ -18,6 +18,7 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var server: ServerProcess?
     private var menubar: MenubarController?
+    let services = AppServices()
 
     nonisolated func applicationWillFinishLaunching(_ notification: Notification) {
         // Regular policy until the status item registers; we flip to Accessory
@@ -29,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let config = AppConfig.load()
+        services.updateConfig(config)
 
         do {
             let runtime = try PythonRuntime.resolve()
@@ -39,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             self.server = server
             self.menubar = MenubarController(server: server, config: config)
+            services.bind(server: server)
 
             // Install signal handlers BEFORE the spawn so a fast crash of
             // the parent during startup still reaps any child we managed
