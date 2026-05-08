@@ -1,20 +1,35 @@
-// PR 1 — minimal application delegate.
+// PR 2 — application delegate now owns the ServerProcess + MenubarController.
 //
-// Owns the menubar status item; full lifecycle (server spawn, welcome
-// trigger, Sparkle, terminationHandler) lands in PR 2 / PR 5 / PR 11.
+// Server starts at applicationDidFinishLaunching and terminates at
+// applicationWillTerminate. Full SIGTERM→wait→SIGKILL sequencing + auto-restart
+// land in PR 5.
 
 import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private(set) var server: ServerProcess?
     private var menubar: MenubarController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        menubar = MenubarController()
+        do {
+            let runtime = try PythonRuntime.resolve()
+            let server = ServerProcess(runtime: runtime)
+            self.server = server
+            self.menubar = MenubarController(server: server)
+            try server.start()
+        } catch {
+            // Surface the failure in the menubar; a real alert UX lands in PR 5.
+            self.menubar = MenubarController(server: nil, lastError: error)
+            NSLog("oMLX-next: server bootstrap failed: \(error)")
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        server?.terminate()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        // We're a menubar app (LSUIElement) — closing the last window
-        // must not terminate the process.
+        // Menubar app (LSUIElement) — never quit on window close.
         false
     }
 }

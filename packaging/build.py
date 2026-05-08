@@ -1306,6 +1306,70 @@ def create_dmg(app_dir: Path):
     return dmg_path
 
 
+def embed_python_runtime_into_swift_app(
+    swift_app: Path,
+    export_dir: Path = EXPORT_DIR,
+    drop_app_layer: bool = False,
+) -> None:
+    """Copy the venvstacks Python runtime layers into a Swift-built .app.
+
+    Used by the SwiftUI rewrite (apps/omlx-mac/) during the side-by-side
+    transition. The Swift app is built by `apps/omlx-mac/Scripts/build.sh`
+    and lands at apps/omlx-mac/build/.../oMLX-next.app with no Python yet.
+    This step embeds the runtime so PythonRuntime.swift can resolve
+    Contents/Frameworks/cpython-3.11/bin/python3.
+
+    Layers copied (matches create_app_bundle()):
+        cpython-3.11/                  — Python interpreter
+        framework-mlx-framework/       — MLX + omlx server deps
+        __venvstacks__/                — venvstacks site-package metadata
+
+    `app-omlx-app` (the Python menubar layer) is NOT copied — the Swift app
+    replaces it. `drop_app_layer=True` is reserved for the PR 12 cutover when
+    we stop building that layer at all.
+    """
+    if not swift_app.exists():
+        raise SystemExit(f"Swift app not found: {swift_app}")
+    if not export_dir.exists():
+        raise SystemExit(
+            f"Venvstacks export not found at {export_dir}. "
+            f"Run `python build.py` first to produce the runtime layers."
+        )
+
+    print(f"\n[swift-next] Embedding Python runtime into {swift_app.name}")
+
+    frameworks_dir = swift_app / "Contents" / "Frameworks"
+    frameworks_dir.mkdir(parents=True, exist_ok=True)
+
+    layers = ["cpython-3.11", "framework-mlx-framework"]
+    for layer in layers:
+        src = export_dir / layer
+        dst = frameworks_dir / layer
+        if not src.exists():
+            print(f"  ! Skipping {layer} (not in export dir)")
+            continue
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst, symlinks=True)
+        print(f"  ✓ Copied {layer}")
+
+    # venvstacks metadata — required for the bundled interpreter to find
+    # the framework layer's site-packages without an explicit PYTHONPATH.
+    venvstacks_meta = export_dir / "__venvstacks__"
+    if venvstacks_meta.exists():
+        dst_meta = frameworks_dir / "__venvstacks__"
+        if dst_meta.exists():
+            shutil.rmtree(dst_meta)
+        shutil.copytree(venvstacks_meta, dst_meta, symlinks=True)
+        print("  ✓ Copied __venvstacks__ metadata")
+
+    # Note: codesign --deep over the embedded layers is fragile; the
+    # canonical sign-after-embed incantation is established in PR 12 cutover.
+    # Local Debug builds can run unsigned (CODE_SIGNING_ALLOWED=NO in
+    # apps/omlx-mac/Scripts/build.sh).
+    print(f"[swift-next] Embed complete: {swift_app}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build oMLX macOS app")
     parser.add_argument("--skip-venv", action="store_true",
@@ -1316,7 +1380,25 @@ def main():
                         help="Target macOS version for mlx/mlx-metal wheels "
                         "(e.g. 26.0). Downloads platform-specific wheels "
                         "with M5 Neural Accelerator support.")
+    parser.add_argument("--swift-next", action="store_true",
+                        help="Embed Python runtime into the SwiftUI rewrite's "
+                        "oMLX-next.app (apps/omlx-mac/). Requires an existing "
+                        "venvstacks export at packaging/_export/. PR 12 will "
+                        "promote this to the canonical build path.")
+    parser.add_argument("--swift-app", type=Path,
+                        default=SCRIPT_DIR.parent / "apps" / "omlx-mac"
+                        / "build" / "Build" / "Products" / "Debug"
+                        / "oMLX-next.app",
+                        help="Path to the Swift-built .app to embed into. "
+                        "Default points at the Debug output of build.sh.")
     args = parser.parse_args()
+
+    if args.swift_next:
+        if not EXPORT_DIR.exists() and not args.skip_venv:
+            print("[swift-next] No existing venvstacks export — building...")
+            build_venvstacks()
+        embed_python_runtime_into_swift_app(args.swift_app)
+        return
 
     print(f"Building {APP_NAME} v{VERSION}")
     print("=" * 50)

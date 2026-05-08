@@ -11,6 +11,8 @@
 		1DDDDDDDDDDDDDDDDDDDDDD2 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC2 /* AppDelegate.swift */; };
 		1DDDDDDDDDDDDDDDDDDDDDD3 /* MenubarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC3 /* MenubarController.swift */; };
 		1DDDDDDDDDDDDDDDDDDDDDD4 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC6 /* Assets.xcassets */; };
+		1DDDDDDDDDDDDDDDDDDDDDD5 /* PythonRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */; };
+		1DDDDDDDDDDDDDDDDDDDDDD6 /* ServerProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -21,6 +23,8 @@
 		1CCCCCCCCCCCCCCCCCCCCCC5 /* oMLX-next.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "oMLX-next.entitlements"; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC6 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX-next.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "oMLX-next.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PythonRuntime.swift; sourceTree = "<group>"; };
+		1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProcess.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -48,8 +52,18 @@
 			children = (
 				1BBBBBBBBBBBBBBBBBBBBBB3 /* App */,
 				1BBBBBBBBBBBBBBBBBBBBBB4 /* Menubar */,
+				1BBBBBBBBBBBBBBBBBBBBBB7 /* Server */,
 			);
 			path = Sources;
+			sourceTree = "<group>";
+		};
+		1BBBBBBBBBBBBBBBBBBBBBB7 /* Server */ = {
+			isa = PBXGroup;
+			children = (
+				1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */,
+				1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */,
+			);
+			path = Server;
 			sourceTree = "<group>";
 		};
 		1BBBBBBBBBBBBBBBBBBBBBB3 /* App */ = {
@@ -159,6 +173,8 @@
 				1DDDDDDDDDDDDDDDDDDDDDD1 /* oMLXApp.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD2 /* AppDelegate.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD3 /* MenubarController.swift in Sources */,
+				1DDDDDDDDDDDDDDDDDDDDDD5 /* PythonRuntime.swift in Sources */,
+				1DDDDDDDDDDDDDDDDDDDDDD6 /* ServerProcess.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
