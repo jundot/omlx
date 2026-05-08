@@ -2171,10 +2171,6 @@ def quantize_oq_streaming(
 
     cb("loading", 20.0)
 
-    mtp_enabled = config.get("num_mtp_layers", 0) > 0
-    if not mtp_enabled and "text_config" in config:
-        mtp_enabled = config["text_config"].get("num_mtp_layers", 0) > 0
-
     tensor_names = list(all_weights.keys())
     total_tensors = len(tensor_names)
     out_shard_data = {}
@@ -2192,7 +2188,7 @@ def quantize_oq_streaming(
 
     for i, tensor_name in enumerate(tensor_names):
 
-        if not mtp_enabled and (".mtp." in tensor_name or tensor_name.startswith("mtp.")):
+        if not preserve_mtp and (".mtp." in tensor_name or tensor_name.startswith("mtp.")):
             all_weights.pop(tensor_name, None)
             continue
         
