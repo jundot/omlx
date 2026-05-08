@@ -18,7 +18,7 @@ ships.
 | 1  | Xcode project + minimal launchable shell | ✅ Merged | 65dabfe |
 | 2  | Bundled Python runtime + ServerProcess stub | ✅ Merged | 75a5f69 |
 | 3  | Theme + design system + previews | ✅ Merged | 8262581 |
-| 4  | Menubar parity (status item, menu, stats poll, visibility watcher) | ⬜ Not started | |
+| 4  | Menubar parity (status item, menu, stats poll, visibility watcher) | ✅ Merged | d6da035 |
 | 5  | ServerProcess full lifecycle (port `server_manager.py`) | ⬜ Not started | |
 | 6  | AppView shell — NavigationSplitView + sidebar | ⬜ Not started | |
 | 7  | Configuration core: Server / Status / Logs (incl. Updates UI shell) | ⬜ Not started | |
