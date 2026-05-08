@@ -53,6 +53,7 @@
 		8BB000000000000000000002 /* ProfileDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000002 /* ProfileDTO.swift */; };
 		8BB000000000000000000003 /* HFTaskDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000003 /* HFTaskDTO.swift */; };
 		8BB000000000000000000004 /* ModelSettingsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000004 /* ModelSettingsScreen.swift */; };
+		9BB000000000000000000001 /* SubKeyDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000001 /* SubKeyDTO.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -105,6 +106,7 @@
 		8CC000000000000000000002 /* ProfileDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileDTO.swift; sourceTree = "<group>"; };
 		8CC000000000000000000003 /* HFTaskDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HFTaskDTO.swift; sourceTree = "<group>"; };
 		8CC000000000000000000004 /* ModelSettingsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSettingsScreen.swift; sourceTree = "<group>"; };
+		9CC000000000000000000001 /* SubKeyDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubKeyDTO.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -173,6 +175,7 @@
 				8CC000000000000000000001 /* ModelsDTO.swift */,
 				8CC000000000000000000002 /* ProfileDTO.swift */,
 				8CC000000000000000000003 /* HFTaskDTO.swift */,
+				9CC000000000000000000001 /* SubKeyDTO.swift */,
 			);
 			path = DTO;
 			sourceTree = "<group>";
@@ -399,6 +402,7 @@
 				8BB000000000000000000002 /* ProfileDTO.swift in Sources */,
 				8BB000000000000000000003 /* HFTaskDTO.swift in Sources */,
 				8BB000000000000000000004 /* ModelSettingsScreen.swift in Sources */,
+				9BB000000000000000000001 /* SubKeyDTO.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

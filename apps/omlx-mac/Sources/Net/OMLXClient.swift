@@ -179,6 +179,25 @@ final class OMLXClient: ObservableObject {
         ])
     }
 
+    // PR 9 — Security
+
+    @discardableResult
+    func setupApiKey(_ key: String, confirm: String) async throws -> SimpleSuccessResponse {
+        try await post(AdminAPI.setupApiKey, body: SetupApiKeyRequest(
+            apiKey: key, apiKeyConfirm: confirm
+        ))
+    }
+
+    @discardableResult
+    func createSubKey(key: String, name: String) async throws -> CreateSubKeyResponse {
+        try await post(AdminAPI.subKeys, body: CreateSubKeyRequest(key: key, name: name))
+    }
+
+    @discardableResult
+    func deleteSubKey(key: String) async throws -> SimpleSuccessResponse {
+        try await deleteWithBody(AdminAPI.subKeys, body: DeleteSubKeyRequest(key: key))
+    }
+
     // MARK: - Core request
 
     private func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {
@@ -201,6 +220,14 @@ final class OMLXClient: ObservableObject {
 
     private func delete<T: Decodable>(_ path: String) async throws -> T {
         try await request("DELETE", path: path, body: nil)
+    }
+
+    /// DELETE with a JSON body. The /admin/api/sub-keys endpoint is the
+    /// only caller — the server reads `key` from the request body rather
+    /// than the URL.
+    private func deleteWithBody<U: Encodable, T: Decodable>(_ path: String, body: U) async throws -> T {
+        let data = try encoder.encode(body)
+        return try await request("DELETE", path: path, body: data)
     }
 
     private func request<T: Decodable>(

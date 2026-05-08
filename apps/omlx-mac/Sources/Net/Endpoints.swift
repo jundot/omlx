@@ -38,4 +38,8 @@ enum AdminAPI {
     static func hfRetry(_ taskId: String) -> String  { "\(prefix)/hf/retry/\(taskId)" }
     static func hfTask(_ taskId: String) -> String   { "\(prefix)/hf/task/\(taskId)" }
     static let hfRecommended   = "\(prefix)/hf/recommended"
+
+    // PR 9
+    static let setupApiKey     = "\(prefix)/setup-api-key"
+    static let subKeys         = "\(prefix)/sub-keys"
 }
