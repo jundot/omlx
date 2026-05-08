@@ -21,7 +21,7 @@ ships.
 | 4  | Menubar parity (status item, menu, stats poll, visibility watcher) | ✅ Merged | d6da035 |
 | 5  | ServerProcess full lifecycle (port `server_manager.py`) | ✅ Merged | 91cf0c2 |
 | 6  | AppView shell — NavigationSplitView + sidebar | ✅ Merged | bf90a74 |
-| 7  | Configuration core: Server / Status / Logs (incl. Updates UI shell) | ⬜ Not started | |
+| 7  | Configuration core: Server / Status / Logs (incl. Updates UI shell) | ✅ Merged | 63dbd71 |
 | 8  | Models + Downloads + per-model Settings | ⬜ Not started | |
 | 9  | Integrations + Security + About | ⬜ Not started | About loses inline updater; lives on Status |
 | 10 | Welcome wizard | ⬜ Not started | |
