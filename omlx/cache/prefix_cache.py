@@ -44,6 +44,32 @@ class BlockCacheEntry:
     last_access: float
 
 
+@dataclass
+class _MRUPartialBlock:
+    """Single-slot most-recent stash for a trailing sub-block partial.
+
+    The paged SSD cache only persists full ``block_size`` blocks; trailing
+    sub-block tokens (e.g. 139 out of 256) are otherwise discarded and
+    re-prefilled on every repeat request. ``_MRUPartialBlock`` keeps the
+    last partial in memory so an immediate repeat skips re-prefilling
+    those tail tokens.
+
+    Single slot, replaced on every ``store_cache`` that produces a new
+    trailing partial. Evicted on any mismatch — parent-hash chain, token
+    prefix, layer count, splice failure — so a stale or mistargeted
+    partial cannot accumulate.
+
+    Stash and apply are gated on **uniform layer sliceability**: if any
+    layer in the model is non-sliceable (RotatingKVCache, ArraysCache,
+    etc.) the slot is left empty. Splicing into only the sliceable
+    layers would create per-layer offset skew at decode time.
+    """
+
+    parent_hash: bytes | None
+    tokens: list[int]
+    kv_data: list[tuple[Any, Any]]
+
+
 class BlockAwarePrefixCache(CacheManager):
     """
     Prefix cache that uses PagedCacheManager for block-based storage.
@@ -110,6 +136,11 @@ class BlockAwarePrefixCache(CacheManager):
         # Callback for restoring cold blocks (deprecated in paged SSD-only mode)
         # Kept for API compatibility
         self._cold_restore_callback: Callable[[int, bytes], bool] | None = None
+
+        # Single-slot stash for the trailing sub-block tail (see
+        # _MRUPartialBlock). Populated by store_cache, consumed by
+        # apply_mru_partial. Always None for hybrid models.
+        self._mru_partial: _MRUPartialBlock | None = None
 
         # Statistics
         self._hits = 0
@@ -659,6 +690,23 @@ class BlockAwarePrefixCache(CacheManager):
             last_access=time.time(),
         )
 
+        # Stash the trailing sub-block tail in memory so an immediate
+        # repeat request can splice it back in without a re-prefill.
+        # The slot is replaced unconditionally — if there's no eligible
+        # tail (block-aligned, hybrid model, extraction failure) we clear
+        # it so a stale partial from a previous store cannot survive.
+        self._update_mru_partial(
+            new_tokens=new_tokens,
+            cache_data=cache_data,
+            block_table=block_table,
+            existing_tokens=existing_tokens,
+            num_new_blocks=num_new_blocks,
+            trailing_partial_tokens=trailing_partial_tokens,
+            is_tensor_data=bool(is_tensor_data),
+            layer_cache_types=layer_cache_types,
+            model_cache_config=model_cache_config,
+        )
+
         logger.debug(
             f"Stored cache for {request_id}: "
             f"{len(block_table.block_ids)} blocks ({blocks_saved_to_ssd} saved to tiered cache), "
@@ -666,6 +714,209 @@ class BlockAwarePrefixCache(CacheManager):
         )
 
         return block_table
+
+    def has_mru_partial(self) -> bool:
+        """Whether a trailing-tail partial is currently stashed.
+
+        Used by the scheduler to decide whether to suppress a deferred
+        Metal cache clear (a fresh stash is a strong signal that the
+        same prompt may return immediately).
+        """
+        return self._mru_partial is not None
+
+    def _all_layers_sliceable(
+        self, layer_cache_types: list[str] | None
+    ) -> bool:
+        """True iff every layer's cache type supports block slicing.
+
+        Hybrid models (e.g. Gemma 3, Mistral) mix sliceable layers with
+        non-sliceable ones (RotatingKVCache, ArraysCache). Splicing the
+        partial only into the sliceable layers would create per-layer
+        offset skew at decode — undefined behavior at the model level.
+        """
+        if not layer_cache_types:
+            # Default fallback path assumes all layers are KVCache; safe to stash.
+            return True
+        for class_name in layer_cache_types:
+            handler = CacheTypeRegistry.get_handler_by_class_name(class_name)
+            if not handler.supports_block_slicing:
+                return False
+        return True
+
+    def _update_mru_partial(
+        self,
+        *,
+        new_tokens: list[int],
+        cache_data: list[Any],
+        block_table: BlockTable,
+        existing_tokens: int,
+        num_new_blocks: int,
+        trailing_partial_tokens: int,
+        is_tensor_data: bool,
+        layer_cache_types: list[str] | None,
+        model_cache_config: ModelCacheConfig | None,
+    ) -> None:
+        """Refresh the MRU partial slot from a just-completed store_cache.
+
+        Clears the slot in every "no eligible tail" branch (no trailing
+        tokens, non-tensor data, MLX missing, hybrid model, extraction
+        failure) so a stale partial cannot survive into a future
+        ``apply_mru_partial`` call.
+        """
+        if (
+            trailing_partial_tokens == 0
+            or not is_tensor_data
+            or not HAS_MLX
+            or not self._all_layers_sliceable(layer_cache_types)
+        ):
+            self._mru_partial = None
+            return
+
+        partial_start = num_new_blocks * self.block_size
+        partial_global_start = existing_tokens + partial_start
+        partial_global_end = partial_global_start + trailing_partial_tokens
+
+        cache_seq_len = self._get_cache_seq_len(cache_data)
+        cache_uses_global_indices = (
+            existing_tokens > 0 and cache_seq_len >= existing_tokens + 1
+        )
+        if cache_uses_global_indices:
+            p_cache_start = partial_global_start
+            p_cache_end = partial_global_end
+        else:
+            p_cache_start = partial_start
+            p_cache_end = partial_start + trailing_partial_tokens
+
+        # is_last_block=False is the correct intent for partial extraction:
+        # we want a token slice, not the full state of any non-sliceable
+        # layer. The non-sliceable case is already excluded above.
+        partial_kv = self._extract_block_tensor_slice(
+            cache_data,
+            p_cache_start,
+            p_cache_end,
+            model_cache_config,
+            is_last_block=False,
+        )
+        if not partial_kv:
+            self._mru_partial = None
+            return
+
+        parent_hash: bytes | None = None
+        if block_table.block_ids:
+            last_bid = block_table.block_ids[-1]
+            last_block = self.paged_cache.allocated_blocks.get(last_bid)
+            if last_block is not None and last_block.block_hash:
+                parent_hash = last_block.block_hash
+
+        self._mru_partial = _MRUPartialBlock(
+            parent_hash=parent_hash,
+            tokens=new_tokens[partial_start:],
+            kv_data=partial_kv,
+        )
+        logger.debug(
+            "Stashed MRU partial: %d tokens, parent_hash=%s, layers=%d",
+            len(self._mru_partial.tokens),
+            parent_hash[:8].hex() + "..." if parent_hash else "None",
+            len(partial_kv),
+        )
+
+    def apply_mru_partial(
+        self,
+        cache: list[Any],
+        block_table: BlockTable,
+        remaining_tokens: list[int],
+    ) -> tuple[list[Any], list[int], int]:
+        """Splice the MRU partial into a reconstructed cache, atomically.
+
+        On a match (parent-hash chain ok, partial tokens are a prefix of
+        ``remaining_tokens``, layer count matches, every layer is sliceable
+        and accepts the concatenate), every layer's keys/values/offset are
+        advanced by ``len(partial.tokens)`` and the partial tokens are
+        consumed from the front of ``remaining_tokens``.
+
+        On any miss or splice failure, the slot is evicted and the cache
+        is returned unchanged.
+
+        The splice is **transactional**: replacement keys/values are
+        materialized for every layer before any layer is mutated. A
+        failure on layer N rolls everything back; the caller never sees
+        a half-mutated cache. (This is the fix for review B3.)
+
+        Args:
+            cache: Reconstructed per-layer cache objects from
+                ``reconstruct_cache``. Mutated in place on success.
+            block_table: Block table from the same fetch_cache call.
+                Used to verify the partial chains from the right prefix.
+            remaining_tokens: Tokens still needing prefill.
+
+        Returns:
+            ``(cache, remaining_tokens, tokens_applied)``. On miss,
+            ``tokens_applied == 0`` and the inputs are returned unchanged.
+        """
+        partial = self._mru_partial
+        if partial is None or not remaining_tokens:
+            return cache, remaining_tokens, 0
+
+        # Parent-hash chain check
+        last_hash: bytes | None = None
+        if block_table and block_table.block_ids:
+            last_bid = block_table.block_ids[-1]
+            last_block = self.paged_cache.allocated_blocks.get(last_bid)
+            if last_block is not None:
+                last_hash = last_block.block_hash
+        if partial.parent_hash != last_hash:
+            self._mru_partial = None
+            return cache, remaining_tokens, 0
+
+        n_partial = len(partial.tokens)
+        if len(remaining_tokens) < n_partial:
+            self._mru_partial = None
+            return cache, remaining_tokens, 0
+        if remaining_tokens[:n_partial] != partial.tokens:
+            self._mru_partial = None
+            return cache, remaining_tokens, 0
+
+        if len(partial.kv_data) != len(cache):
+            logger.debug(
+                "MRU partial layer count mismatch: %d vs %d, evicting",
+                len(partial.kv_data), len(cache),
+            )
+            self._mru_partial = None
+            return cache, remaining_tokens, 0
+
+        if not HAS_MLX:
+            self._mru_partial = None
+            return cache, remaining_tokens, 0
+
+        # Phase 1: build per-layer replacements without touching the cache.
+        # Any failure here is a clean rollback — no layer has been mutated.
+        try:
+            replacements: list[tuple[int, Any, Any]] = []
+            for layer_idx, (p_keys, p_values) in enumerate(partial.kv_data):
+                cache_obj = cache[layer_idx]
+                new_keys = mx.concatenate([cache_obj.keys, p_keys], axis=2)
+                new_values = mx.concatenate([cache_obj.values, p_values], axis=2)
+                replacements.append((layer_idx, new_keys, new_values))
+        except Exception as e:
+            logger.debug("MRU partial splice build failed: %s, evicting", e)
+            self._mru_partial = None
+            return cache, remaining_tokens, 0
+
+        # Phase 2: commit. All concatenates have already succeeded; the
+        # only operations remaining are attribute writes and an integer
+        # add, which cannot raise on a well-formed cache object.
+        for layer_idx, new_keys, new_values in replacements:
+            cache_obj = cache[layer_idx]
+            cache_obj.keys = new_keys
+            cache_obj.values = new_values
+            cache_obj.offset += n_partial
+
+        new_remaining = remaining_tokens[n_partial:]
+        logger.debug(
+            "Applied MRU partial: %d tokens, %d remaining",
+            n_partial, len(new_remaining),
+        )
+        return cache, new_remaining, n_partial
 
     def _get_cache_seq_len(self, cache_data: list[dict[str, Any]]) -> int:
         """

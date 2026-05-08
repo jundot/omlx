@@ -1360,6 +1360,183 @@ class TestSchedulerRotatingBlockAlignment:
         assert scheduler._deferred_clear_at > first_target
 
 
+class TestMRUDeferredClearSuppression:
+    """Tests for the MRU-aware deferred-clear suppression.
+
+    When the prefix cache holds a warm MRU partial (the previous request
+    just left a sub-block tail in memory), the next deferred clear is
+    deferred by one more ``_DEFERRED_CLEAR_DELAY`` window so the still-
+    resident lazy KV tensors aren't dropped before a likely repeat.
+
+    The suppression is **budgeted at one-shot per completion** so it
+    cannot indefinitely defer the clear under hot-prompt repeats — total
+    deferral is bounded at 2x ``_DEFERRED_CLEAR_DELAY`` even if the MRU
+    is replenished on every iteration.
+    """
+
+    def _drive_clear_gate(self, scheduler):
+        """Run the step()-tail gate that decides whether to clear.
+
+        Mirrors the structure of step()'s end-of-step block — the
+        smallest slice of step() needed to exercise the suppression
+        logic without standing up a full BatchGenerator.
+        """
+        from omlx import scheduler as sched_mod
+
+        with patch.object(sched_mod, "_sync_and_clear_cache") as mock_clear:
+            scheduler._step_counter += 1
+            should_clear = scheduler._should_periodic_clear_cache()
+            if (
+                scheduler._deferred_clear_at is not None
+                and scheduler._step_counter >= scheduler._deferred_clear_at
+            ):
+                if (
+                    scheduler._mru_clear_suppression_available
+                    and scheduler.block_aware_cache is not None
+                    and scheduler.block_aware_cache.has_mru_partial()
+                ):
+                    scheduler._deferred_clear_at = (
+                        scheduler._step_counter
+                        + scheduler._DEFERRED_CLEAR_DELAY
+                    )
+                    scheduler._mru_clear_suppression_available = False
+                else:
+                    should_clear = True
+                    scheduler._deferred_clear_at = None
+                    scheduler._mru_clear_suppression_available = False
+            if should_clear:
+                sched_mod._sync_and_clear_cache()
+            return mock_clear.called
+
+    def test_suppression_budget_armed_on_completion(
+        self, mock_model, mock_tokenizer
+    ):
+        """Each completion that arms _deferred_clear_at also arms the budget."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="req-arm",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2]
+        request.num_prompt_tokens = 2
+        request.output_token_ids = [3]
+        scheduler.running["req-arm"] = request
+        scheduler.requests["req-arm"] = request
+
+        with patch("omlx.scheduler.mx"):
+            scheduler._cleanup_finished({"req-arm"})
+
+        assert scheduler._deferred_clear_at is not None
+        assert scheduler._mru_clear_suppression_available is True
+
+    def test_clear_fires_at_deadline_when_no_mru(
+        self, mock_model, mock_tokenizer
+    ):
+        """Without a warm MRU, the deferred clear fires at its deadline."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.block_aware_cache.has_mru_partial.return_value = False
+
+        scheduler._deferred_clear_at = scheduler._step_counter + 1
+        scheduler._mru_clear_suppression_available = True
+
+        cleared = self._drive_clear_gate(scheduler)
+
+        assert cleared is True
+        assert scheduler._deferred_clear_at is None
+        assert scheduler._mru_clear_suppression_available is False
+
+    def test_clear_deferred_once_when_mru_warm(
+        self, mock_model, mock_tokenizer
+    ):
+        """A warm MRU at the deadline defers the clear by one more window."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.block_aware_cache.has_mru_partial.return_value = True
+
+        scheduler._deferred_clear_at = scheduler._step_counter + 1
+        scheduler._mru_clear_suppression_available = True
+
+        cleared = self._drive_clear_gate(scheduler)
+
+        assert cleared is False
+        # Deadline pushed out by one more DELAY window
+        assert scheduler._deferred_clear_at == (
+            scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
+        )
+        # Budget spent — next deadline cannot suppress again
+        assert scheduler._mru_clear_suppression_available is False
+
+    def test_clear_fires_at_second_deadline_even_if_mru_still_warm(
+        self, mock_model, mock_tokenizer
+    ):
+        """Budget is one-shot: the second deadline fires regardless of MRU.
+
+        This is the bound that protects against infinite deferral under
+        hot-prompt repeats (review B6).
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.block_aware_cache.has_mru_partial.return_value = True
+
+        # First deadline → suppressed
+        scheduler._deferred_clear_at = scheduler._step_counter + 1
+        scheduler._mru_clear_suppression_available = True
+        first_cleared = self._drive_clear_gate(scheduler)
+        assert first_cleared is False
+
+        # Advance to the second deadline. MRU still warm, but no budget.
+        scheduler._step_counter = scheduler._deferred_clear_at - 1
+        second_cleared = self._drive_clear_gate(scheduler)
+
+        assert second_cleared is True
+        assert scheduler._deferred_clear_at is None
+
+    def test_clear_fires_immediately_after_mru_evicted(
+        self, mock_model, mock_tokenizer
+    ):
+        """If the MRU evicts before the deadline, the clear fires normally."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        # MRU was warm at completion but evicted by the time we reach deadline
+        scheduler.block_aware_cache.has_mru_partial.return_value = False
+
+        scheduler._deferred_clear_at = scheduler._step_counter + 1
+        scheduler._mru_clear_suppression_available = True
+
+        cleared = self._drive_clear_gate(scheduler)
+
+        assert cleared is True
+        # Budget left untouched as a side effect doesn't matter — it's
+        # reset on the next completion either way.
+        assert scheduler._deferred_clear_at is None
+
+    def test_fresh_completion_resets_budget(
+        self, mock_model, mock_tokenizer
+    ):
+        """A new completion after suppression refreshes the budget."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._mru_clear_suppression_available = False  # spent
+
+        request = Request(
+            request_id="req-refresh",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2]
+        request.num_prompt_tokens = 2
+        request.output_token_ids = [3]
+        scheduler.running["req-refresh"] = request
+        scheduler.requests["req-refresh"] = request
+
+        with patch("omlx.scheduler.mx"):
+            scheduler._cleanup_finished({"req-refresh"})
+
+        assert scheduler._mru_clear_suppression_available is True
+
+
 class TestPeriodicClearGating:
     """Tests for the conditional periodic clear (#978/#1040 mitigation)."""
 

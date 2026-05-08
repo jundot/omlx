@@ -20,7 +20,11 @@ from omlx.cache.paged_cache import (
     PagedCacheManager,
     compute_block_hash,
 )
-from omlx.cache.prefix_cache import BlockAwarePrefixCache, BlockCacheEntry
+from omlx.cache.prefix_cache import (
+    BlockAwarePrefixCache,
+    BlockCacheEntry,
+    _MRUPartialBlock,
+)
 from omlx.cache.stats import PrefixCacheStats
 
 
@@ -2413,3 +2417,475 @@ class TestPerBlockMetaStates:
             f"Last block should use snapshot offset=8, not shared offset=11, "
             f"got {b2_meta[1]}"
         )
+
+
+class TestMRUPartialBlockCache:
+    """Tests for the MRU partial block cache.
+
+    The MRU is a single-slot in-memory cache holding the trailing sub-block
+    tail from the most recent ``store_cache`` call. It lets exact-repeat
+    requests skip re-prefilling those tail tokens.
+
+    Threat-model coverage these tests enforce:
+
+    - **Hybrid refusal:** when any layer is non-sliceable (RotatingKVCache,
+      ArraysCache, etc.), the stash is suppressed entirely. Splicing into
+      only the sliceable layers would create per-layer offset skew at
+      decode time.
+    - **Transactional splice:** if any layer's concatenate fails, no layer
+      sees a mutated keys/values/offset. Half-mutated caches are silent
+      generation corruption.
+    - **Real round-trip:** store_cache populates ``_mru_partial`` via the
+      production extraction path; apply_mru_partial then splices it. The
+      tests do not hand-build ``_MRUPartialBlock`` objects for the splice
+      cases — that hides the extraction-vs-apply boundary the original
+      branch's tests missed.
+    """
+
+    @pytest.fixture
+    def mx(self):
+        try:
+            import mlx.core as mx
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    @pytest.fixture
+    def paged_cache(self):
+        return PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+
+    @pytest.fixture
+    def prefix_cache(self, paged_cache):
+        return BlockAwarePrefixCache(
+            model=MockModel(num_layers=4),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=None,
+        )
+
+    def _kv_layer(self, mx, n_tokens, head_dim=4, n_kv_heads=1, fill=1.0):
+        return {
+            "state": (
+                mx.full((1, n_kv_heads, n_tokens, head_dim), fill),
+                mx.full((1, n_kv_heads, n_tokens, head_dim), fill),
+            ),
+            "cache_type": "KVCache",
+            "class_name": "KVCache",
+        }
+
+    def _rotating_layer(self, mx, n_tokens, head_dim=4, n_kv_heads=1):
+        return {
+            "state": (
+                mx.ones((1, n_kv_heads, n_tokens, head_dim)),
+                mx.ones((1, n_kv_heads, n_tokens, head_dim)),
+            ),
+            "cache_type": "RotatingKVCache",
+            "class_name": "RotatingKVCache",
+        }
+
+    def _make_reconstructed_cache(self, mx, n_layers, n_tokens, head_dim=4):
+        """Build a list of MockKVCache objects matching what reconstruct_cache
+        would produce: keys.shape[2] == offset, valid region only."""
+        class MockKVCache:
+            def __init__(self, k, v, offset):
+                self.keys = k
+                self.values = v
+                self.offset = offset
+
+        return [
+            MockKVCache(
+                mx.ones((1, 1, n_tokens, head_dim)),
+                mx.ones((1, 1, n_tokens, head_dim)),
+                n_tokens,
+            )
+            for _ in range(n_layers)
+        ]
+
+    # --- initial state ---
+
+    def test_init_state_empty(self, prefix_cache):
+        assert prefix_cache._mru_partial is None
+        assert prefix_cache.has_mru_partial() is False
+
+    # --- stash semantics on uniformly sliceable layers ---
+
+    def test_stash_after_store_with_trailing_tokens(self, prefix_cache, mx):
+        """6 tokens, block_size=4 → 1 full block + 2 trailing → stash captured."""
+        tokens = [10, 20, 30, 40, 50, 60]
+        cache_data = [self._kv_layer(mx, 6) for _ in range(4)]
+
+        prefix_cache.store_cache("req-stash", tokens, cache_data)
+
+        partial = prefix_cache._mru_partial
+        assert partial is not None
+        assert partial.tokens == [50, 60]
+        assert len(partial.kv_data) == 4
+        assert prefix_cache.has_mru_partial() is True
+
+    def test_no_stash_when_block_aligned(self, prefix_cache, mx):
+        """Block-aligned tokens leave no trailing partial → slot cleared."""
+        tokens = [10, 20, 30, 40]
+        cache_data = [self._kv_layer(mx, 4) for _ in range(4)]
+
+        prefix_cache.store_cache("req-aligned", tokens, cache_data)
+
+        assert prefix_cache._mru_partial is None
+        assert prefix_cache.has_mru_partial() is False
+
+    def test_stash_replaced_on_subsequent_store(self, prefix_cache, mx):
+        """Each store_cache replaces the previous slot — single-slot semantics."""
+        for tail in (50, 99):
+            tokens = [10, 20, 30, 40, tail]
+            cache_data = [self._kv_layer(mx, 5) for _ in range(4)]
+            prefix_cache.store_cache(f"req-{tail}", tokens, cache_data)
+
+        assert prefix_cache._mru_partial is not None
+        assert prefix_cache._mru_partial.tokens == [99]
+
+    def test_stash_clears_when_subsequent_store_is_block_aligned(
+        self, prefix_cache, mx
+    ):
+        """Stash from request A is cleared when request B has no trailing partial."""
+        # First: stash a partial
+        prefix_cache.store_cache(
+            "req-a", [10, 20, 30, 40, 50], [self._kv_layer(mx, 5) for _ in range(4)]
+        )
+        assert prefix_cache._mru_partial is not None
+
+        # Second: block-aligned, must clear the stash so an apply attempt
+        # against a stale partial cannot succeed.
+        prefix_cache.store_cache(
+            "req-b", [11, 22, 33, 44], [self._kv_layer(mx, 4) for _ in range(4)]
+        )
+        assert prefix_cache._mru_partial is None
+
+    def test_stash_records_parent_hash_from_last_block(self, prefix_cache, mx):
+        """Stashed partial chains from the hash of the last full block."""
+        tokens = [10, 20, 30, 40, 50, 60]
+        cache_data = [self._kv_layer(mx, 6) for _ in range(4)]
+
+        block_table = prefix_cache.store_cache("req-hash", tokens, cache_data)
+
+        # The last (and only) block's hash should be the partial's parent.
+        last_block = prefix_cache.paged_cache.allocated_blocks[
+            block_table.block_ids[-1]
+        ]
+        assert prefix_cache._mru_partial.parent_hash == last_block.block_hash
+        assert last_block.block_hash is not None
+
+    # --- threat model: hybrid refusal (B1, B2) ---
+
+    def test_refuse_stash_when_any_layer_non_sliceable_hybrid(self, paged_cache, mx):
+        """Hybrid model (KVCache + RotatingKVCache): no stash.
+
+        Splicing into only the sliceable layers produces per-layer offset
+        skew at decode time (review B2). The only correct behavior is to
+        refuse the partial entirely for hybrid models.
+        """
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=2),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=None,
+        )
+        tokens = [10, 20, 30, 40, 50, 60]
+        cache_data = [
+            self._kv_layer(mx, 6),
+            self._rotating_layer(mx, 6),
+        ]
+        config = ModelCacheConfig.from_type_list(
+            ["KVCache", "RotatingKVCache"], model_name="test"
+        )
+
+        cache.store_cache("req-hybrid", tokens, cache_data, model_cache_config=config)
+
+        assert cache._mru_partial is None
+        assert cache.has_mru_partial() is False
+
+    def test_refuse_stash_when_all_layers_non_sliceable(self, prefix_cache, mx):
+        """Pure RotatingKVCache model also refuses stash."""
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        tokens = [10, 20, 30, 40, 50]
+        cache_data = [self._rotating_layer(mx, 5) for _ in range(4)]
+        config = ModelCacheConfig.from_type_list(
+            ["RotatingKVCache"] * 4, model_name="test"
+        )
+
+        prefix_cache.store_cache(
+            "req-rotating", tokens, cache_data, model_cache_config=config
+        )
+
+        assert prefix_cache._mru_partial is None
+
+    # --- apply: real round-trip ---
+
+    def test_apply_round_trip_exact_match(self, prefix_cache, mx):
+        """Real store → apply round-trip: partial produced by extraction
+        is consumed by the splice path, no hand-built _MRUPartialBlock."""
+        tokens = [10, 20, 30, 40, 50, 60]
+        cache_data = [self._kv_layer(mx, 6) for _ in range(4)]
+        block_table = prefix_cache.store_cache("req-rt", tokens, cache_data)
+
+        # Reconstructed cache: 4 layers × 4 tokens (the prefix only).
+        reconstructed = self._make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+        remaining = [50, 60]
+
+        result, new_remaining, applied = prefix_cache.apply_mru_partial(
+            reconstructed, block_table, remaining,
+        )
+
+        assert applied == 2
+        assert new_remaining == []
+        assert all(layer.offset == 6 for layer in result)
+        assert all(layer.keys.shape[2] == 6 for layer in result)
+        assert all(layer.values.shape[2] == 6 for layer in result)
+
+    def test_apply_round_trip_prefix_match_leaves_extra_tokens(
+        self, prefix_cache, mx
+    ):
+        """When remaining is longer than the partial, the partial covers
+        its prefix and the rest is left for normal prefill."""
+        tokens = [10, 20, 30, 40, 50, 60]
+        cache_data = [self._kv_layer(mx, 6) for _ in range(4)]
+        block_table = prefix_cache.store_cache("req-rt-prefix", tokens, cache_data)
+
+        reconstructed = self._make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+        remaining = [50, 60, 70, 80]  # partial is [50, 60]; [70, 80] left over
+
+        _, new_remaining, applied = prefix_cache.apply_mru_partial(
+            reconstructed, block_table, remaining,
+        )
+
+        assert applied == 2
+        assert new_remaining == [70, 80]
+
+    # --- apply: eviction reasons ---
+
+    def test_apply_evicts_on_parent_hash_mismatch(self, prefix_cache, mx):
+        """If the matched prefix's last block hash differs from the
+        partial's parent_hash, the partial is from a different prefix
+        and must be evicted."""
+        tokens = [10, 20, 30, 40, 50, 60]
+        cache_data = [self._kv_layer(mx, 6) for _ in range(4)]
+        block_table = prefix_cache.store_cache("req-evict-h", tokens, cache_data)
+
+        # Tamper with the partial's parent_hash so it doesn't chain.
+        prefix_cache._mru_partial.parent_hash = b"different-prefix"
+
+        reconstructed = self._make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+        _, new_remaining, applied = prefix_cache.apply_mru_partial(
+            reconstructed, block_table, [50, 60],
+        )
+
+        assert applied == 0
+        assert new_remaining == [50, 60]
+        assert prefix_cache._mru_partial is None
+
+    def test_apply_evicts_on_token_mismatch(self, prefix_cache, mx):
+        """Different trailing tokens → partial cannot apply, evict."""
+        tokens = [10, 20, 30, 40, 50, 60]
+        cache_data = [self._kv_layer(mx, 6) for _ in range(4)]
+        block_table = prefix_cache.store_cache("req-evict-t", tokens, cache_data)
+
+        reconstructed = self._make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+        _, new_remaining, applied = prefix_cache.apply_mru_partial(
+            reconstructed, block_table, [99, 60],  # first token doesn't match
+        )
+
+        assert applied == 0
+        assert new_remaining == [99, 60]
+        assert prefix_cache._mru_partial is None
+
+    def test_apply_evicts_on_remaining_shorter_than_partial(
+        self, prefix_cache, mx
+    ):
+        """If remaining_tokens is shorter than the partial it cannot match."""
+        tokens = [10, 20, 30, 40, 50, 60, 70]
+        cache_data = [self._kv_layer(mx, 7) for _ in range(4)]
+        block_table = prefix_cache.store_cache("req-evict-s", tokens, cache_data)
+        # Partial is [50, 60, 70]; remaining is shorter → must evict.
+
+        reconstructed = self._make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+        _, new_remaining, applied = prefix_cache.apply_mru_partial(
+            reconstructed, block_table, [50, 60],
+        )
+
+        assert applied == 0
+        assert prefix_cache._mru_partial is None
+
+    def test_apply_evicts_on_layer_count_mismatch(self, prefix_cache, mx):
+        """If the reconstructed cache layer count differs from the
+        stashed partial, evict — likely a model swap or bug, not safe."""
+        tokens = [10, 20, 30, 40, 50, 60]
+        cache_data = [self._kv_layer(mx, 6) for _ in range(4)]
+        block_table = prefix_cache.store_cache("req-evict-lc", tokens, cache_data)
+
+        # Reconstructed has only 2 layers, partial has 4 → mismatch.
+        reconstructed = self._make_reconstructed_cache(mx, n_layers=2, n_tokens=4)
+        _, _, applied = prefix_cache.apply_mru_partial(
+            reconstructed, block_table, [50, 60],
+        )
+
+        assert applied == 0
+        assert prefix_cache._mru_partial is None
+
+    def test_apply_noop_when_no_stash(self, prefix_cache, paged_cache, mx):
+        """No partial → no-op, remaining unchanged."""
+        block_table = paged_cache.create_block_table("req-noop")
+        reconstructed = self._make_reconstructed_cache(mx, n_layers=4, n_tokens=0)
+
+        result, remaining, applied = prefix_cache.apply_mru_partial(
+            reconstructed, block_table, [10, 20],
+        )
+
+        assert applied == 0
+        assert remaining == [10, 20]
+        assert result is reconstructed
+
+    def test_apply_noop_when_remaining_empty(self, prefix_cache, mx):
+        """Empty remaining → exact prefix hit already; no MRU work."""
+        tokens = [10, 20, 30, 40, 50, 60]
+        cache_data = [self._kv_layer(mx, 6) for _ in range(4)]
+        block_table = prefix_cache.store_cache("req-noop-empty", tokens, cache_data)
+
+        reconstructed = self._make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+        _, _, applied = prefix_cache.apply_mru_partial(
+            reconstructed, block_table, [],
+        )
+
+        assert applied == 0
+        # Stash must NOT be evicted on empty-remaining no-op — it could
+        # still match a *future* request that does have tail tokens.
+        assert prefix_cache._mru_partial is not None
+
+    # --- threat model: transactional splice rollback (B3) ---
+
+    def test_splice_failure_does_not_mutate_any_layer(
+        self, prefix_cache, mx
+    ):
+        """If any layer's concatenate fails, NO layer is mutated.
+
+        Review B3: the original implementation's try/except wrapped the
+        whole loop, so failure on layer N>0 left layers 0..N-1 mutated
+        with cache.offset += n_partial while the caller was told nothing
+        was applied. The rewrite must build replacements first and commit
+        atomically.
+        """
+        tokens = [10, 20, 30, 40, 50, 60]
+        cache_data = [self._kv_layer(mx, 6) for _ in range(4)]
+        block_table = prefix_cache.store_cache("req-rollback", tokens, cache_data)
+
+        reconstructed = self._make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+        # Snapshot the pre-splice state of every layer for an after-comparison.
+        before_offsets = [layer.offset for layer in reconstructed]
+        before_key_shapes = [layer.keys.shape for layer in reconstructed]
+
+        # Make mx.concatenate explode on the third call (layer 1's keys).
+        # Calls go: layer0 keys, layer0 values, layer1 keys (boom).
+        from omlx.cache import prefix_cache as pc_mod
+        real_concatenate = pc_mod.mx.concatenate
+        call_count = {"n": 0}
+
+        def flaky_concatenate(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 3:
+                raise RuntimeError("synthetic concatenate failure")
+            return real_concatenate(*args, **kwargs)
+
+        with patch.object(pc_mod.mx, "concatenate", side_effect=flaky_concatenate):
+            _, new_remaining, applied = prefix_cache.apply_mru_partial(
+                reconstructed, block_table, [50, 60],
+            )
+
+        assert applied == 0
+        assert new_remaining == [50, 60]
+        # No layer's offset advanced.
+        assert [layer.offset for layer in reconstructed] == before_offsets
+        # No layer's keys shape changed.
+        assert [layer.keys.shape for layer in reconstructed] == before_key_shapes
+        # Slot is evicted on splice failure (don't retry a failing partial).
+        assert prefix_cache._mru_partial is None
+
+    # --- threat model: multi-turn (existing_tokens > 0) ---
+
+    def test_stash_correct_indices_when_existing_tokens_present(
+        self, prefix_cache, mx
+    ):
+        """When store_cache is called with existing_tokens > 0 (multi-turn),
+        the stash slices the partial from the correct cache region.
+
+        cache_data is full-sequence (system prompt + new turn), so the
+        partial extraction must use global indices, not relative ones.
+        """
+        # Pretend a previous turn already cached 4 tokens.
+        prev_tokens = [1, 2, 3, 4]
+        prev_cache = [self._kv_layer(mx, 4) for _ in range(4)]
+        prefix_cache.store_cache("req-turn-1", prev_tokens, prev_cache)
+
+        # Second turn: 4 prev + 4 new = 8 prefix block tokens, then 2 trailing.
+        # Distinct fill values let us verify the stash sliced the *right*
+        # tokens — the partial should contain the trailing region's data
+        # (fill=2.0), not the prefix region (fill=1.0).
+        full_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        full_cache = []
+        for _ in range(4):
+            # First 8 positions = old (1.0), last 2 positions = new (2.0)
+            keys = mx.concatenate(
+                [
+                    mx.full((1, 1, 8, 4), 1.0),
+                    mx.full((1, 1, 2, 4), 2.0),
+                ],
+                axis=2,
+            )
+            values = mx.concatenate(
+                [
+                    mx.full((1, 1, 8, 4), 1.0),
+                    mx.full((1, 1, 2, 4), 2.0),
+                ],
+                axis=2,
+            )
+            full_cache.append({
+                "state": (keys, values),
+                "cache_type": "KVCache",
+                "class_name": "KVCache",
+            })
+
+        prefix_cache.store_cache("req-turn-2", full_tokens, full_cache)
+
+        partial = prefix_cache._mru_partial
+        assert partial is not None
+        assert partial.tokens == [9, 10]
+        # Each layer's stashed slice must be the trailing region (fill=2.0).
+        for keys, values in partial.kv_data:
+            assert keys.shape[2] == 2
+            assert mx.allclose(keys, mx.full((1, 1, 2, 4), 2.0))
+            assert mx.allclose(values, mx.full((1, 1, 2, 4), 2.0))
+
+
+class TestHasMRUPartial:
+    """The has_mru_partial() accessor is the public API the scheduler
+    uses to decide whether to suppress the deferred Metal cache clear."""
+
+    def test_has_mru_partial_reflects_slot(self):
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=2),
+            paged_cache_manager=PagedCacheManager(
+                block_size=4, max_blocks=10, model_name="t", initial_blocks=10,
+            ),
+            paged_ssd_cache_manager=None,
+        )
+        assert cache.has_mru_partial() is False
+
+        cache._mru_partial = _MRUPartialBlock(
+            parent_hash=b"x", tokens=[1], kv_data=[],
+        )
+        assert cache.has_mru_partial() is True
+
+        cache._mru_partial = None
+        assert cache.has_mru_partial() is False

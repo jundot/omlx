@@ -912,6 +912,16 @@ class Scheduler:
         # None = no deferred clear pending; int = step at which to fire.
         self._deferred_clear_at: int | None = None
 
+        # Per-completion budget for suppressing the deferred Metal cache
+        # clear when the prefix cache has a warm MRU partial (a strong
+        # signal that the same prompt may return immediately and would
+        # benefit from the still-resident lazy KV tensors).
+        # The budget is reset to True on every _cleanup_finished() that
+        # arms _deferred_clear_at.  Once spent (suppression has happened
+        # once), the deferred clear fires at the next deadline regardless
+        # of MRU state, bounding total deferral at 2x _DEFERRED_CLEAR_DELAY.
+        self._mru_clear_suppression_available: bool = False
+
         # Cache XTC special tokens (newline + EOS) — stable per tokenizer.
         # Must be after _is_harmony_model / _generation_config_eos init
         # since _get_xtc_special_tokens() delegates to _get_stop_tokens().
@@ -3307,6 +3317,23 @@ class Scheduler:
                     request.remaining_tokens = request.prompt_token_ids[
                         block_table.num_tokens :
                     ]
+                    # Splice the in-memory MRU partial onto the reconstructed
+                    # cache when the trailing tokens match.  Saves the
+                    # re-prefill of the sub-block tail on exact-repeat
+                    # prompts.  The splice is a no-op when no partial is
+                    # stashed or the trailing tokens differ.
+                    if request.remaining_tokens:
+                        (
+                            request.prompt_cache,
+                            request.remaining_tokens,
+                            partial_applied,
+                        ) = self.block_aware_cache.apply_mru_partial(
+                            request.prompt_cache,
+                            block_table,
+                            request.remaining_tokens,
+                        )
+                        if partial_applied > 0:
+                            request.cached_tokens += partial_applied
                     # For exact prefix hits we need cache state at (N-1) and the
                     # last prompt token as input to produce the first decode logit.
                     # Reusing cache state at N and feeding the last token again
@@ -5298,6 +5325,9 @@ class Scheduler:
             target = self._step_counter + self._DEFERRED_CLEAR_DELAY
             if self._deferred_clear_at is None or target > self._deferred_clear_at:
                 self._deferred_clear_at = target
+                # Each completion can stash a fresh MRU partial; grant a
+                # one-shot budget to defer the clear once for it.
+                self._mru_clear_suppression_available = True
 
     def _is_cache_corruption_error(self, error: Exception) -> bool:
         """Check if an error indicates cache corruption."""
@@ -5332,6 +5362,7 @@ class Scheduler:
 
         # Cancel any pending deferred Metal cache clear
         self._deferred_clear_at = None
+        self._mru_clear_suppression_available = False
 
         # Clear detokenizer state to prevent contamination after recovery
         self._request_detokenizers.clear()
@@ -5563,8 +5594,26 @@ class Scheduler:
             self._deferred_clear_at is not None
             and self._step_counter >= self._deferred_clear_at
         ):
-            should_clear = True
-            self._deferred_clear_at = None
+            # If the prefix cache is holding a warm MRU partial and we
+            # haven't yet spent the per-completion suppression budget,
+            # defer the clear by one more _DEFERRED_CLEAR_DELAY window.
+            # The MRU partial is a strong predictor that the next
+            # request will reuse the still-resident lazy KV tensors.
+            # The budget is one-shot, so total deferral is bounded at
+            # 2x _DEFERRED_CLEAR_DELAY even under hot-prompt repeats.
+            if (
+                self._mru_clear_suppression_available
+                and self.block_aware_cache is not None
+                and self.block_aware_cache.has_mru_partial()
+            ):
+                self._deferred_clear_at = (
+                    self._step_counter + self._DEFERRED_CLEAR_DELAY
+                )
+                self._mru_clear_suppression_available = False
+            else:
+                should_clear = True
+                self._deferred_clear_at = None
+                self._mru_clear_suppression_available = False
         if should_clear:
             _sync_and_clear_cache()
         if (
@@ -5664,6 +5713,7 @@ class Scheduler:
 
         # Cancel any pending deferred Metal cache clear
         self._deferred_clear_at = None
+        self._mru_clear_suppression_available = False
 
     def deep_reset(self) -> None:
         """
