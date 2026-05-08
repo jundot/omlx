@@ -37,6 +37,15 @@ dependencies = [
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
     "transformers>=5.0.0",
+    # transformers 5.x's tokenization_mistral_common module imports
+    # ReasoningEffort from mistral_common (added in 1.10). The audio extras
+    # transitively pull mistral-common via mlx-audio[stt], which historically
+    # resolved to 1.9.x and broke WhisperProcessor.from_pretrained() with a
+    # silent "Processor not found" on every Whisper model. Pinning the
+    # minimum here ensures resolution lands on a compatible version even
+    # without the audio extra installed.
+    # See pmarreck/omlx#1 for full repro and root cause.
+    "mistral-common>=1.10",
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
     "numpy>=1.24.0",
