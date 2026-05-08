@@ -28,6 +28,8 @@
 		3BB000000000000000000001 /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000001 /* AppConfig.swift */; };
 		3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000002 /* MenubarStatsPoller.swift */; };
 		3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */; };
+		4BB000000000000000000001 /* PortConflictResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000001 /* PortConflictResolver.swift */; };
+		4BB000000000000000000002 /* SignalHandlers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000002 /* SignalHandlers.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -55,6 +57,8 @@
 		3CC000000000000000000001 /* AppConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfig.swift; sourceTree = "<group>"; };
 		3CC000000000000000000002 /* MenubarStatsPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarStatsPoller.swift; sourceTree = "<group>"; };
 		3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarVisibilityWatcher.swift; sourceTree = "<group>"; };
+		4CC000000000000000000001 /* PortConflictResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortConflictResolver.swift; sourceTree = "<group>"; };
+		4CC000000000000000000002 /* SignalHandlers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignalHandlers.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -129,6 +133,8 @@
 			children = (
 				1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */,
 				1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */,
+				4CC000000000000000000001 /* PortConflictResolver.swift */,
+				4CC000000000000000000002 /* SignalHandlers.swift */,
 			);
 			path = Server;
 			sourceTree = "<group>";
@@ -259,6 +265,8 @@
 				3BB000000000000000000001 /* AppConfig.swift in Sources */,
 				3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */,
 				3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */,
+				4BB000000000000000000001 /* PortConflictResolver.swift in Sources */,
+				4BB000000000000000000002 /* SignalHandlers.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

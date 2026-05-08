@@ -184,11 +184,15 @@ final class MenubarController: NSObject {
     // MARK: - Refresh
 
     private func refreshMenuState() {
-        let state = server?.state ?? .idle
+        let state = server?.state ?? .stopped
         let isRunning: Bool
         if case .running = state { isRunning = true } else { isRunning = false }
         let isStarting: Bool
         if case .starting = state { isStarting = true } else { isStarting = false }
+        let isStopping: Bool
+        if case .stopping = state { isStopping = true } else { isStopping = false }
+        let isUnresponsive: Bool
+        if case .unresponsive = state { isUnresponsive = true } else { isUnresponsive = false }
         let isFailed: Bool
         if case .failed = state { isFailed = true } else { isFailed = false }
 
@@ -199,39 +203,45 @@ final class MenubarController: NSObject {
             attributes: [.foregroundColor: color]
         )
 
-        // Server-control item visibility — mirrors Python:
-        //   STOPPED → Start
+        // Server-control item visibility — mirrors server_manager.py:
+        //   STOPPED/FAILED → Start
         //   RUNNING/STARTING/STOPPING/UNRESPONSIVE → Stop
-        //   UNRESPONSIVE/ERROR → Force Restart
-        startItem.isHidden = isRunning || isStarting
-        stopItem.isHidden = !(isRunning || isStarting)
-        restartItem.isHidden = !isFailed
+        //   UNRESPONSIVE/FAILED → Force Restart
+        let liveLike = isRunning || isStarting || isStopping || isUnresponsive
+        startItem.isHidden = liveLike
+        stopItem.isHidden = !liveLike
+        restartItem.isHidden = !(isFailed || isUnresponsive)
 
-        // Disabled when no server bootstrap (ServerProcess is nil)
-        startItem.isEnabled = (server != nil) && !isRunning && !isStarting
+        // Disabled when no server bootstrap (ServerProcess is nil) or in
+        // a transitional state we shouldn't double-trigger.
+        startItem.isEnabled = (server != nil) && !liveLike
+        stopItem.isEnabled = liveLike && !isStopping
 
-        // Admin Panel + Chat enabled only when actually running
+        // Admin Panel + Chat enabled when actually running (not unresponsive)
         adminPanelItem.isEnabled = isRunning
         chatItem.isEnabled = isRunning
 
-        // Icon swap
-        statusItem.button?.image = isRunning ? iconFilled : iconOutline
+        // Icon swap — outline when not actively serving, filled otherwise
+        let serving = isRunning || isUnresponsive
+        statusItem.button?.image = serving ? iconFilled : iconOutline
         statusItem.button?.image?.isTemplate = true
     }
 
     private func headerDisplay(_ state: ServerProcess.State) -> (String, NSColor) {
         switch state {
-        case .idle:
+        case .stopped:
             if let err = bootstrapError {
                 return ("Server: bootstrap failed (\(err))", .systemRed)
             }
-            return ("Server: idle", .secondaryLabelColor)
+            return ("Server: stopped", .secondaryLabelColor)
         case .starting:
             return ("Server: starting…", .systemBlue)
         case .running(let pid):
             return ("Server: running · pid \(pid) · :\(config.port)", .systemGreen)
-        case .stopped:
-            return ("Server: stopped", .secondaryLabelColor)
+        case .stopping:
+            return ("Server: stopping…", .systemOrange)
+        case .unresponsive(let pid):
+            return ("Server: unresponsive · pid \(pid) (auto-recover or Force Restart)", .systemOrange)
         case .failed(let msg):
             return ("Server: failed — \(msg)", .systemRed)
         }
@@ -324,21 +334,47 @@ final class MenubarController: NSObject {
 
     @objc private func startServer() {
         guard let server else { return }
-        do { try server.start() } catch {
+        do {
+            switch try server.start() {
+            case .started, .alreadyRunning:
+                break
+            case .portConflict(let conflict):
+                presentPortConflictAlert(conflict)
+            }
+        } catch {
             NSLog("oMLX-next: start failed — \(error)")
         }
     }
 
     @objc private func stopServer() {
-        server?.terminate()
+        guard let server else { return }
+        Task { @MainActor in
+            await server.stop()
+        }
     }
 
     @objc private func forceRestartServer() {
-        server?.terminate()
-        Task { @MainActor [server] in
-            try? await Task.sleep(for: .seconds(0.6))
-            try? server?.start()
+        guard let server else { return }
+        Task { @MainActor in
+            do {
+                _ = try await server.forceRestart()
+            } catch {
+                NSLog("oMLX-next: force-restart failed — \(error)")
+            }
         }
+    }
+
+    private func presentPortConflictAlert(_ conflict: PortConflict) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Port \(config.port) is in use."
+        let pidStr = conflict.pid.map { "PID \($0)" } ?? "unknown PID"
+        alert.informativeText = conflict.isOMLX
+            ? "Another oMLX server is already running on this port (\(pidStr)). Stop it before starting a new instance, or change the port in Settings."
+            : "Another process (\(pidStr)) is listening on port \(config.port). Choose a different port in Settings or terminate that process."
+        alert.addButton(withTitle: "OK")
+        alert.window.level = .floating
+        alert.runModal()
     }
 
     @objc private func openAdminPanel() {
