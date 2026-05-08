@@ -2171,11 +2171,9 @@ def quantize_oq_streaming(
 
     cb("loading", 20.0)
 
-    # --- [추가된 부분 1: config에서 MTP 활성화 여부 확인] ---
     mtp_enabled = config.get("num_mtp_layers", 0) > 0
     if not mtp_enabled and "text_config" in config:
         mtp_enabled = config["text_config"].get("num_mtp_layers", 0) > 0
-    # --------------------------------------------------------
 
     tensor_names = list(all_weights.keys())
     total_tensors = len(tensor_names)
