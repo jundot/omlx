@@ -195,6 +195,45 @@ class TestHFDownloader:
             await downloader.shutdown()
 
     @pytest.mark.asyncio
+    async def test_download_removes_stale_symlink_target(self, model_dir):
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        target_dir = model_dir / "model"
+        target_dir.symlink_to(model_dir / "missing-cache-entry")
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            local_dir = Path(kwargs["local_dir"])
+            local_dir.mkdir(parents=True, exist_ok=True)
+            (local_dir / "config.json").write_text("{}")
+            return str(local_dir)
+
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.siblings = []
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            task = await downloader.start_download("owner/model")
+
+            await asyncio.sleep(0.5)
+
+            assert task.status == DownloadStatus.COMPLETED
+            assert target_dir.is_dir()
+            assert not target_dir.is_symlink()
+            assert (target_dir / "config.json").exists()
+
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
     async def test_download_failure_sets_error(self, model_dir):
         model_dir.mkdir(parents=True, exist_ok=True)
         downloader = HFDownloader(model_dir=str(model_dir))
