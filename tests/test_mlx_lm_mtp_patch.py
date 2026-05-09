@@ -161,6 +161,91 @@ class TestQwen35Model:
         assert hasattr(Model, "_omlx_mtp_patched")
 
 
+class TestQwen35MoeSanitize:
+    """Regression tests for the MoE MTP sanitize patch (qwen3_5_moe.Model)."""
+
+    @pytest.fixture(autouse=True)
+    def _apply(self):
+        try:
+            from omlx.patches.mlx_lm_mtp import qwen35_model
+        except ImportError:
+            pytest.skip("omlx.patches.mlx_lm_mtp not importable")
+        if not qwen35_model.apply():
+            pytest.skip("qwen35_model patch refused to apply")
+        from omlx.patches.mlx_lm_mtp.qwen35_model import _patch_qwen3_5_moe
+        _patch_qwen3_5_moe()
+
+    @pytest.fixture()
+    def moe_model(self):
+        from types import SimpleNamespace
+        from mlx_lm.models import qwen3_5_moe as moe
+
+        args = SimpleNamespace(
+            num_hidden_layers=2,
+            mtp_num_hidden_layers=1,
+            num_experts=4,
+        )
+        inner = SimpleNamespace(args=args, sanitize=lambda w: w)
+        model = moe.Model.__new__(moe.Model)
+        model.language_model = inner
+        return model
+
+    def _backbone_weights(self):
+        import mlx.core as mx
+
+        weights = {}
+        for layer in range(2):
+            pfx = f"language_model.model.layers.{layer}.mlp"
+            weights[f"{pfx}.experts.gate_up_proj"] = mx.zeros((4, 128, 64))
+            weights[f"{pfx}.experts.down_proj"] = mx.zeros((4, 64, 128))
+        weights["language_model.model.embed_tokens.weight"] = mx.zeros((256, 64))
+        return weights
+
+    def test_sanitize_no_mtp_weights(self, moe_model, caplog):
+        """Config declares mtp_num_hidden_layers=1 but no MTP weights exist
+        (model quantized without preserve_mtp). Must not crash."""
+        import logging
+
+        with caplog.at_level(logging.DEBUG):
+            result = moe_model.sanitize(self._backbone_weights())
+        assert not any("mtp" in k for k in result)
+        assert any("no MTP weights found" in r.getMessage() for r in caplog.records)
+
+    def test_sanitize_switch_mlp_form(self, moe_model):
+        """oQ outputs store MTP experts in switch_mlp form — sanitize skips."""
+        import mlx.core as mx
+
+        weights = self._backbone_weights()
+        pfx = "language_model.mtp.layers.0.mlp"
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            weights[f"{pfx}.switch_mlp.{proj}.weight"] = mx.zeros((4, 64, 128))
+        result = moe_model.sanitize(weights)
+        assert f"{pfx}.switch_mlp.gate_proj.weight" in result
+
+    def test_sanitize_per_expert_form(self, moe_model):
+        """Raw HF Qwen3.5 per-expert tensors stacked into switch_mlp."""
+        import mlx.core as mx
+
+        weights = self._backbone_weights()
+        pfx = "language_model.mtp.layers.0.mlp"
+        for e in range(4):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                weights[f"{pfx}.experts.{e}.{proj}.weight"] = mx.zeros((64, 128))
+        result = moe_model.sanitize(weights)
+        assert f"{pfx}.switch_mlp.gate_proj.weight" in result
+
+    def test_sanitize_fused_form(self, moe_model):
+        """Qwen3.6 fused gate_up_proj unfused into switch_mlp."""
+        import mlx.core as mx
+
+        weights = self._backbone_weights()
+        pfx = "language_model.mtp.layers.0.mlp"
+        weights[f"{pfx}.experts.gate_up_proj"] = mx.zeros((4, 128, 64))
+        weights[f"{pfx}.experts.down_proj"] = mx.zeros((4, 64, 128))
+        result = moe_model.sanitize(weights)
+        assert f"{pfx}.switch_mlp.gate_proj.weight" in result
+
+
 class TestDeepseekV4Model:
     def test_skip_when_base_patch_not_applied(self, monkeypatch):
         """deepseek_v4 MTP patch must skip cleanly if the base
