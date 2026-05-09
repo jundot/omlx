@@ -18,6 +18,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_draft_quant_bits is None
         assert settings.dflash_max_ctx is None
         assert settings.dflash_in_memory_cache is True
+        assert settings.dflash_in_memory_cache_max_entries == 4
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is False
 
@@ -50,6 +51,7 @@ class TestDFlashModelSettings:
             "dflash_draft_quant_bits": 4,
             "dflash_max_ctx": 8192,
             "dflash_in_memory_cache": False,
+            "dflash_in_memory_cache_max_entries": 16,
             "dflash_in_memory_cache_max_bytes": 4 * 1024 * 1024 * 1024,
             "dflash_ssd_cache": True,
         }
@@ -59,6 +61,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_draft_quant_bits == 4
         assert settings.dflash_max_ctx == 8192
         assert settings.dflash_in_memory_cache is False
+        assert settings.dflash_in_memory_cache_max_entries == 16
         assert settings.dflash_in_memory_cache_max_bytes == 4 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is True
 
@@ -71,6 +74,7 @@ class TestDFlashModelSettings:
         settings = ModelSettings.from_dict(data)
         assert settings.dflash_max_ctx is None
         assert settings.dflash_in_memory_cache is True
+        assert settings.dflash_in_memory_cache_max_entries == 4
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is False
 
