@@ -33,8 +33,8 @@ dependencies = [
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
-    # mlx-embeddings from latest commit (32981fa)
-    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
+    # mlx-embeddings from latest commit (ea6d739c)
+    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@ea6d739c73efe991239bc8596ebdfb7060ad209d",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
     "transformers>=5.0.0",
     # transformers 5.x's tokenization_mistral_common module imports
@@ -63,8 +63,8 @@ dependencies = [
     # Resource monitoring
     "psutil>=5.9.0",
     # Server
-    "fastapi>=0.108.0",
-    "uvicorn>=0.23.0",
+    "fastapi>=0.136.0",
+    "uvicorn>=0.46.0",
     # JSON Schema validation for structured output
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
