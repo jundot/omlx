@@ -39,6 +39,7 @@ from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..models.vlm import VLMModelAdapter
 from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
 from ..patches.qwen3_5_attention import apply_qwen3_5_attention_patch
+from ..patches.qwen3_6_nested_visual import apply_qwen3_6_nested_visual_patch
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -483,6 +484,9 @@ class VLMBatchedEngine(BaseEngine):
         # Patch mlx-vlm Qwen3_5Attention to use plain RoPE on text-only
         # inputs. Preserves mRoPE for genuine multimodal positions.
         apply_qwen3_5_attention_patch()
+        # Remap language_model.model.visual.* → vision_tower.* for
+        # Qwen3.6-35B-A3B's nested ViT layout.
+        apply_qwen3_6_nested_visual_patch()
 
         # Create scheduler config
         scheduler_config = (

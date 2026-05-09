@@ -1558,6 +1558,15 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                 apply_mlx_vlm_mtp_patch()
             except Exception as patch_err:
                 logger.debug(f"mlx-vlm MTP patch not applied: {patch_err}")
+            try:
+                from omlx.patches.qwen3_6_nested_visual import (
+                    apply_qwen3_6_nested_visual_patch,
+                )
+                apply_qwen3_6_nested_visual_patch()
+            except Exception as patch_err:
+                logger.debug(
+                    f"Qwen3.6 nested-visual patch not applied: {patch_err}"
+                )
 
             model_module, _ = get_model_and_args(config)
             model_config_cls = model_module.ModelConfig
