@@ -1555,6 +1555,7 @@
                     dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
                     dflash_max_ctx: settings.dflash_max_ctx ?? null,
                     dflash_in_memory_cache: settings.dflash_in_memory_cache !== false,
+                    dflash_in_memory_cache_max_entries: settings.dflash_in_memory_cache_max_entries || 4,
                     dflash_in_memory_cache_max_gib: settings.dflash_in_memory_cache_max_bytes
                         ? Math.round(settings.dflash_in_memory_cache_max_bytes / (1024 ** 3))
                         : 8,
@@ -1652,6 +1653,9 @@
                                 dflash_in_memory_cache: this.modelSettings.dflash_enabled
                                     ? !!this.modelSettings.dflash_in_memory_cache
                                     : true,
+                                dflash_in_memory_cache_max_entries: this.modelSettings.dflash_enabled
+                                    ? (parseInt(this.modelSettings.dflash_in_memory_cache_max_entries) || 4)
+                                    : 4,
                                 dflash_in_memory_cache_max_bytes: this.modelSettings.dflash_enabled
                                     ? Math.max(1, parseInt(this.modelSettings.dflash_in_memory_cache_max_gib) || 8) * (1024 ** 3)
                                     : 8 * (1024 ** 3),
@@ -1731,6 +1735,7 @@
                         this.modelSettings.dflash_draft_quant_bits = null;
                         this.modelSettings.dflash_max_ctx = null;
                         this.modelSettings.dflash_in_memory_cache = true;
+                        this.modelSettings.dflash_in_memory_cache_max_entries = 4;
                         this.modelSettings.dflash_in_memory_cache_max_gib = 8;
                         this.modelSettings.dflash_ssd_cache = false;
                         this.modelSettings.mtp_enabled = false;
