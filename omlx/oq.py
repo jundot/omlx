@@ -2998,6 +2998,10 @@ def _measure_sensitivity_from_quantized_model(
         out_baseline = _forward_layer(block, inputs, layer_mask, position_ids)
         if out_baseline is None:
             continue
+        # Materialize the baseline before mutating module weights below.
+        # Without this, the lazy graph would resolve baseline against the
+        # already-perturbed weights and the MSE would always be ~0.
+        mx.eval(out_baseline)
 
         saved = {}
         for p, m in tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module):
@@ -3005,13 +3009,12 @@ def _measure_sensitivity_from_quantized_model(
                 continue
             bits = getattr(m, "bits", 4)
             gs = getattr(m, "group_size", 64)
-            mode = getattr(m, "mode", "affine")
             perturb_bits = bits - 1
             if perturb_bits not in _REQUANT_VALID_BITS:
                 continue
             w_float = mx.dequantize(
                 m.weight, m.scales, getattr(m, "biases", None),
-                group_size=gs, bits=bits, mode=mode,
+                group_size=gs, bits=bits,
             )
             saved[p] = (m.weight, m.scales, getattr(m, "biases", None), bits)
             qw, sc, *rest = mx.quantize(w_float, group_size=gs, bits=perturb_bits, mode="affine")
@@ -3019,6 +3022,12 @@ def _measure_sensitivity_from_quantized_model(
             m.scales = sc
             m.biases = rest[0] if rest else None
             m.bits = perturb_bits
+            # Force re-quant materialization so the next forward sees the
+            # perturbed weights instead of the lazy reference to the originals.
+            if m.biases is not None:
+                mx.eval(m.weight, m.scales, m.biases)
+            else:
+                mx.eval(m.weight, m.scales)
 
         out_perturbed = _forward_layer(block, inputs, layer_mask, position_ids)
 
@@ -3032,11 +3041,17 @@ def _measure_sensitivity_from_quantized_model(
                 mod.scales = s
                 if b is not None:
                     mod.biases = b
+                elif hasattr(mod, "biases"):
+                    del mod.biases
                 mod.bits = orig_bits
 
         if out_perturbed is not None:
-            raw_mse = ((out_baseline - out_perturbed) ** 2).mean()
-            out_mag = (out_baseline ** 2).mean()
+            # Cast to float32 first: float16 squared differences overflow
+            # easily on long sequences, producing NaN sensitivity scores.
+            ob32 = out_baseline.astype(mx.float32)
+            op32 = out_perturbed.astype(mx.float32)
+            raw_mse = ((ob32 - op32) ** 2).mean()
+            out_mag = (ob32 ** 2).mean()
             mse_val = raw_mse / mx.maximum(out_mag, 1e-10)
             mx.eval(mse_val)
             sensitivity[layer_idx] = mse_val.item()
