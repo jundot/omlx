@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from omlx.api.responses_utils import ResponseStore
+from omlx.engine.base import BaseEngine
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.engine.reranker import RerankerEngine
 
@@ -143,7 +144,7 @@ class MockTokenizer:
         return "\n".join(parts)
 
 
-class MockBaseEngine:
+class MockBaseEngine(BaseEngine):
     """Mock LLM engine for testing."""
 
     def __init__(self, model_name: str = "test-llm-model"):
@@ -170,6 +171,9 @@ class MockBaseEngine:
     async def start(self) -> None:
         pass
 
+    async def stop(self) -> None:
+        pass
+
     async def generate(self, prompt: str, **kwargs) -> MockGenerationOutput:
         return MockGenerationOutput(text="Generated response.")
 
@@ -186,7 +190,7 @@ class MockBaseEngine:
             finish_reason="stop",
         )
 
-    def count_chat_tokens(self, messages: List[Dict], tools=None, chat_template_kwargs=None) -> int:
+    def count_chat_tokens(self, messages: List[Dict], tools=None, chat_template_kwargs=None, **kwargs) -> int:
         prompt = self._tokenizer.apply_chat_template(messages, tokenize=False)
         return len(self._tokenizer.encode(prompt))
 
@@ -205,6 +209,12 @@ class MockBaseEngine:
             finished=True,
             finish_reason="stop",
         )
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {}
+
+    def get_cache_stats(self):
+        return None
 
 
 class RecordingResponsesEngine(MockBaseEngine):
