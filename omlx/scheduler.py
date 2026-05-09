@@ -3328,9 +3328,10 @@ class Scheduler:
                     #     cached_tokens >= shared_prefix_blocks * block_size
                     # with cached_tokens - shared_prefix_blocks * block_size
                     # ∈ [0, block_size) representing the partial.  Current
-                    # readers (logging at 2828, 2835) tolerate the relaxed
-                    # form; future readers that index block_table.block_ids
-                    # by shared_prefix_blocks must NOT use cached_tokens to
+                    # readers (the scheduler's prefill-completion log lines
+                    # downstream) tolerate the relaxed form; future readers
+                    # that index block_table.block_ids by
+                    # shared_prefix_blocks must NOT use cached_tokens to
                     # bound the loop.
                     if request.remaining_tokens:
                         (

@@ -70,27 +70,22 @@ class _MRUPartialBlock:
     ``_clone_tensor`` → ``mx.copy``), so the slot's memory cost is
     automatically counted by ``mx.get_active_memory()``.  Every runtime
     memory enforcement and telemetry path in this codebase reads from
-    there:
+    there: the process-level enforcer, the scheduler's prefill
+    mid-loop limit check, the prefill pre-flight peak check, the
+    generation admission guard, and the periodic-clear threshold.
 
-    - process-level enforcer (``process_memory_enforcer.py``)
-    - prefill mid-loop limit check (``scheduler.py:1567``)
-    - prefill pre-flight peak check (``scheduler.py:3328``)
-    - generation admission guard (``scheduler.py:3377``)
-    - periodic clear threshold (``scheduler.py:_periodic_clear_threshold_bytes``)
-
-    Upstream of those, the engine pool's pre-load admission gate
-    (``engine_pool.py``) reserves a fraction of each model's weight
-    size as KV headroom when deciding whether to evict other models
-    before loading.  The MRU partial is one tenant of that headroom
-    alongside in-flight prompt caches; it is not separately reserved
-    because at one ``block_size``-worth of KV per cache instance
-    (~17 MiB for Kimi K2.5 / DeepSeek MLA, ~41 MiB for full-attention
-    70B models) it is dominated by the concurrent in-flight caches the
-    headroom was sized for.
+    Upstream of those, ``EnginePool`` reserves a fraction of each
+    model's weight size as KV headroom when deciding whether to evict
+    other models before loading.  The MRU partial is one tenant of
+    that headroom alongside in-flight prompt caches; it is not
+    separately reserved because at one ``block_size``-worth of KV per
+    cache instance (~17 MiB for Kimi K2.5 / DeepSeek MLA, ~41 MiB for
+    full-attention 70B models) it is dominated by the concurrent
+    in-flight caches the headroom was sized for.
 
     There is no separate up-front KV memory budget that the slot could
     escape (``_calculate_max_blocks`` is paged-SSD-only and returns a
-    fixed 100k block-metadata count, not a memory budget).
+    fixed block-metadata count, not a memory budget).
 
     Future maintainers: do **not** add a separate accounting hook for
     this slot.  The invariant that ``kv_data`` holds ``mx.array``

@@ -2485,25 +2485,46 @@ class TestMRUPartialBlockCache:
             paged_ssd_cache_manager=mock_ssd,
         )
 
-    def _kv_layer(self, mx, n_tokens, head_dim=4, n_kv_heads=1, fill=1.0):
+    def _layer(
+        self,
+        mx,
+        n_tokens,
+        *,
+        class_name="KVCache",
+        head_dim=4,
+        n_kv_heads=1,
+        fill=1.0,
+    ):
+        """Build a layer-state dict for store_cache.
+
+        ``class_name`` selects the cache type (e.g. ``"KVCache"``,
+        ``"RotatingKVCache"``, ``"BatchRotatingKVCache"``).  Both
+        ``cache_type`` and ``class_name`` keys are populated with the
+        same string — ``store_cache`` consults whichever the layer
+        provides.
+        """
         return {
             "state": (
                 mx.full((1, n_kv_heads, n_tokens, head_dim), fill),
                 mx.full((1, n_kv_heads, n_tokens, head_dim), fill),
             ),
-            "cache_type": "KVCache",
-            "class_name": "KVCache",
+            "cache_type": class_name,
+            "class_name": class_name,
         }
 
+    def _kv_layer(self, mx, n_tokens, head_dim=4, n_kv_heads=1, fill=1.0):
+        return self._layer(
+            mx, n_tokens,
+            class_name="KVCache",
+            head_dim=head_dim, n_kv_heads=n_kv_heads, fill=fill,
+        )
+
     def _rotating_layer(self, mx, n_tokens, head_dim=4, n_kv_heads=1):
-        return {
-            "state": (
-                mx.ones((1, n_kv_heads, n_tokens, head_dim)),
-                mx.ones((1, n_kv_heads, n_tokens, head_dim)),
-            ),
-            "cache_type": "RotatingKVCache",
-            "class_name": "RotatingKVCache",
-        }
+        return self._layer(
+            mx, n_tokens,
+            class_name="RotatingKVCache",
+            head_dim=head_dim, n_kv_heads=n_kv_heads,
+        )
 
     def _make_reconstructed_cache(self, mx, n_layers, n_tokens, head_dim=4):
         """Build a list of MockKVCache objects matching what reconstruct_cache
