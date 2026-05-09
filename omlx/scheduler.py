@@ -1263,7 +1263,7 @@ class Scheduler:
 
                 try:
                     think_start_id = getattr(self.tokenizer, 'think_start_id', None)
-                except ValueError:
+                except (ValueError, TypeError):
                     think_start_id = None
                 leading_ids, trailing_ids = self._resolve_think_close_pattern()
                 processor = ThinkingBudgetProcessor(
@@ -1312,7 +1312,7 @@ class Scheduler:
         # Tier 1: mlx-lm tokenizer attribute (covers all known think variants)
         try:
             think_end_id = getattr(self.tokenizer, 'think_end_id', None)
-        except ValueError:
+        except (ValueError, TypeError):
             # Multi-token think end (e.g. Gemma 4) - fall through to Tier 2
             think_end_id = None
         if think_end_id is not None:
@@ -1425,7 +1425,7 @@ class Scheduler:
         """
         try:
             think_start_id = getattr(self.tokenizer, 'think_start_id', None)
-        except ValueError:
+        except (ValueError, TypeError):
             # Multi-token think start (e.g. Gemma 4 <|channel>thought) -
             # single-token detection not applicable, handled by output parser
             return False
