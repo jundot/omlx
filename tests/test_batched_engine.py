@@ -682,8 +682,6 @@ class TestApplyChatTemplatePartialMode:
         at the API boundary, forward the resolved value to engine methods
         via an explicit is_partial parameter, and assert both phases pass
         the same partial-mode flags to apply_chat_template.
-
-        See the xfail decorator's reason field for full bug context.
         """
         from omlx.api.utils import detect_and_strip_partial
         from omlx.engine.batched import BatchedEngine
