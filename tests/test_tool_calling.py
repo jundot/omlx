@@ -1927,3 +1927,105 @@ class TestSerializeToolCallArguments:
             result = _serialize_tool_call_arguments("[1, 2]")
         assert result == "{}"
         assert any("non-dict" in r.message for r in caplog.records)
+
+
+class TestParseToolCallsLlama3JsonContent:
+    """Tests for the Llama-3-style {"name", "parameters"} JSON content fallback.
+
+    Llama-4-Scout-Instruct's official chat template instructs the model to
+    respond with ``{"name": "<func>", "parameters": {...}}`` instead of using
+    a marker tag, so this format must be promoted to ``tool_calls`` when the
+    function name matches a provided tool.
+    """
+
+    _WEATHER_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+            },
+        }
+    ]
+
+    def test_llama3_json_content_extracts_tool_call(self):
+        """Plain-content {"name","parameters":{...}} is promoted to tool_calls."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+
+        text = '{"name": "get_weather", "parameters": {"location": "Paris"}}'
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools=self._WEATHER_TOOLS)
+
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_weather"
+        assert json.loads(tool_calls[0].function.arguments) == {"location": "Paris"}
+        assert cleaned == ""
+
+    def test_llama3_json_arguments_synonym(self):
+        """``arguments`` should be accepted as a synonym for ``parameters``."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+
+        text = '{"name": "get_weather", "arguments": {"location": "Tokyo"}}'
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools=self._WEATHER_TOOLS)
+
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "get_weather"
+        assert json.loads(tool_calls[0].function.arguments) == {"location": "Tokyo"}
+
+    def test_llama3_json_content_strips_match_from_cleaned_text(self):
+        """Surrounding prose should survive; only the JSON block is removed."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+
+        text = (
+            'Sure, calling now: '
+            '{"name": "get_weather", "parameters": {"location": "Paris"}}'
+            ' done.'
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools=self._WEATHER_TOOLS)
+
+        assert tool_calls is not None and len(tool_calls) == 1
+        assert "get_weather" not in cleaned
+        assert "Sure, calling now:" in cleaned
+        assert "done." in cleaned
+
+    def test_llama3_json_content_rejects_unknown_function(self):
+        """Function names outside the tools list must NOT be promoted."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+
+        text = '{"name": "rm_rf", "parameters": {"path": "/"}}'
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools=self._WEATHER_TOOLS)
+
+        assert tool_calls is None
+        assert cleaned == text
+
+    def test_llama3_json_content_no_tools_no_promotion(self):
+        """Without a tools list, JSON content must not be classified as a call."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+
+        text = '{"name": "get_weather", "parameters": {"location": "Paris"}}'
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools=None)
+
+        assert tool_calls is None
+        assert cleaned == text
+
+    def test_llama3_json_content_invalid_json_skipped(self):
+        """Malformed parameter JSON must not raise; falls through cleanly."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+
+        text = '{"name": "get_weather", "parameters": {malformed}}'
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools=self._WEATHER_TOOLS)
+
+        # Either no match (regex picky on inner braces) or failed json.loads -
+        # both must result in no tool_calls and no exception.
+        assert tool_calls is None

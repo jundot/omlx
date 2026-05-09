@@ -546,6 +546,38 @@ def parse_tool_calls(
     if "[Calling tool:" in cleaned_text or "[Tool call:" in cleaned_text:
         return _parse_bracket_tool_calls(cleaned_text)
 
+    # Fallback: Llama-3-style JSON tool calls emitted as plain content.
+    # Llama-4-Scout-Instruct's official chat template instructs the model to
+    # respond with `{"name": "<func>", "parameters": {...}}` instead of using
+    # a marker tag. Promote only when the function name matches a provided
+    # tool, to avoid mis-parsing arbitrary user-content JSON as a tool call.
+    if tools and "{" in cleaned_text and '"name"' in cleaned_text:
+        valid_names = _extract_tool_names(tools)
+        for m in re.finditer(
+            r"\{\s*\"name\"\s*:\s*\"([A-Za-z_][\w.-]*)\"\s*,"
+            r"\s*\"(?:parameters|arguments)\"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})\s*\}",
+            cleaned_text,
+            flags=re.DOTALL,
+        ):
+            name = m.group(1)
+            if name not in valid_names:
+                continue
+            args_str = m.group(2)
+            try:
+                args = json.loads(args_str)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            tc = ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                type="function",
+                function=FunctionCall(
+                    name=name,
+                    arguments=_serialize_tool_call_arguments(args),
+                ),
+            )
+            cleaned = (cleaned_text[:m.start()] + cleaned_text[m.end():]).strip()
+            return cleaned, [tc]
+
     # All parsing attempts exhausted. Strip known tool-call markers so raw
     # control markup never leaks into the API response.  Models whose markers
     # overlap with the generic ``<tool_call>`` tag already returned above via
