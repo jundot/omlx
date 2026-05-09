@@ -107,29 +107,14 @@ def _patch_video_processor_bug():
        which requires torchvision. Removing ``video_processor`` from the
        MODALITY mapping prevents transformers from attempting to load it.
 
-    2. When mlx-vlm's custom processor patch fails (e.g. due to a stale
-       mistral_common dependency), it falls back to HF's ProcessorMixin
-       which passes ``video_processor`` as a kwarg. HF's own
-       ProcessorMixin.__init__ rejects unexpected kwargs. We patch it to
-       silently drop ``video_processor``.
+    2. When mlx-vlm's custom processor patch fails, it falls back to HF's
+       ProcessorMixin which passes ``video_processor`` as a kwarg. HF's
+       own ProcessorMixin.__init__ rejects unexpected kwargs, so it is
+       patched to silently drop ``video_processor``.
     """
     global _video_processor_patched
     if _video_processor_patched:
         return
-
-    try:
-        from mistral_common.protocol.instruct.request import ReasoningEffort  # noqa: F401
-    except ImportError:
-        try:
-            import mistral_common.protocol.instruct.request as _mcpir
-
-            class _ReasoningEffort:
-                pass
-
-            _mcpir.ReasoningEffort = _ReasoningEffort
-            logger.debug("Stubbed missing mistral_common.ReasoningEffort")
-        except (ImportError, AttributeError):
-            pass
 
     try:
         from transformers.processing_utils import MODALITY_TO_AUTOPROCESSOR_MAPPING
