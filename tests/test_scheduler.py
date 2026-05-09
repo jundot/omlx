@@ -137,7 +137,9 @@ class TestSchedulerInitialization:
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
         assert scheduler.model is mock_model
-        assert scheduler.tokenizer is mock_tokenizer
+        # Scheduler deep-copies tokenizer for thread safety (Rust RefCell
+        # isolation between event loop and MLX executor threads).
+        assert scheduler.tokenizer is not mock_tokenizer
         assert isinstance(scheduler.config, SchedulerConfig)
         assert isinstance(scheduler.waiting, deque)
         assert len(scheduler.waiting) == 0
@@ -168,6 +170,34 @@ class TestSchedulerInitialization:
         assert scheduler.num_requests_processed == 0
         assert scheduler.total_prompt_tokens == 0
         assert scheduler.total_completion_tokens == 0
+
+    def test_snapshot_for_admin_is_isolated_from_live_state(
+        self, mock_model, mock_tokenizer
+    ):
+        """Published admin snapshot must not mutate when live state changes."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="req-snap",
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+        request.prompt_token_ids = [1, 2, 3]
+        request.num_prompt_tokens = 3
+
+        scheduler.waiting.append(request)
+        scheduler.running["req-snap"] = request
+        scheduler._publish_admin_snapshot()
+
+        snap = scheduler.snapshot_for_admin()
+        assert snap["running_by_id"] == {"req-snap": request}
+        assert snap["waiting"] == [request]
+
+        scheduler.running.clear()
+        scheduler.waiting.clear()
+        # Snapshot reflects the published moment, not the live state.
+        assert snap["running_by_id"] == {"req-snap": request}
+        assert snap["waiting"] == [request]
 
 
 class TestSchedulerAddRequest:
@@ -739,6 +769,61 @@ class TestSchedulerXtcSpecialTokens:
         assert 2 in tokens
 
 
+class TestSyncAndClearCache:
+    """Tests for module-level _sync_and_clear_cache() helper (#300, #888)."""
+
+    def test_swallows_generation_stream_thread_error(self):
+        """generation_stream sync failing must not break cache clear.
+
+        Reproduces #888: on some MLX builds mx.synchronize(generation_stream)
+        raises 'There is no Stream(gpu, 0) in current thread' when called
+        from an executor thread that has not submitted work to that stream
+        (e.g. during _do_external_prefill). The helper must swallow that
+        RuntimeError and still drain the default stream + clear the cache.
+        """
+        from omlx import scheduler as sched_mod
+
+        calls = []
+
+        def fake_gen_sync(stream):
+            calls.append(("gen_sync", stream))
+            raise RuntimeError("There is no Stream(gpu, 0) in current thread.")
+
+        def fake_default_sync():
+            calls.append(("default_sync",))
+
+        def fake_clear_cache():
+            calls.append(("clear_cache",))
+
+        def dispatch(*args, **kwargs):
+            if args:
+                fake_gen_sync(args[0])
+            else:
+                fake_default_sync()
+
+        with patch.object(sched_mod.mx, "synchronize", side_effect=dispatch), \
+             patch.object(sched_mod.mx, "clear_cache", side_effect=fake_clear_cache):
+            sched_mod._sync_and_clear_cache()
+
+        assert calls[0][0] == "gen_sync"
+        assert ("default_sync",) in calls
+        assert ("clear_cache",) in calls
+
+    def test_propagates_default_stream_error(self):
+        """Errors on the default stream sync are not swallowed."""
+        from omlx import scheduler as sched_mod
+
+        def dispatch(*args, **kwargs):
+            if not args:
+                raise RuntimeError("default stream failure")
+
+        with patch.object(sched_mod.mx, "synchronize", side_effect=dispatch), \
+             patch.object(sched_mod.mx, "clear_cache") as clear_cache:
+            with pytest.raises(RuntimeError, match="default stream failure"):
+                sched_mod._sync_and_clear_cache()
+            clear_cache.assert_not_called()
+
+
 class TestSchedulerFormatBytes:
     """Tests for Scheduler._format_bytes()."""
 
@@ -1003,7 +1088,9 @@ class TestSchedulerBoundarySnapshots:
             # generation steps to avoid IOKit completeMemory() race (#435).
             # It should NOT be called immediately in _cleanup_finished.
             mock_mx.clear_cache.assert_not_called()
-            assert scheduler._deferred_clear_steps == 0
+            assert scheduler._deferred_clear_at == (
+                scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
+            )
 
     def test_prefill_boundary_snapshot_records_rotating_cache(
         self, mock_model, mock_tokenizer
@@ -1182,7 +1269,7 @@ class TestSchedulerRotatingBlockAlignment:
 
         Immediate mx.clear_cache() after request completion races with
         IOKit's asynchronous completeMemory() callbacks. Instead,
-        _cleanup_finished sets _deferred_clear_steps so the clear happens
+        _cleanup_finished sets _deferred_clear_at so the clear happens
         after _DEFERRED_CLEAR_DELAY generation steps.
         """
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
@@ -1203,8 +1290,10 @@ class TestSchedulerRotatingBlockAlignment:
             scheduler._cleanup_finished({"req-clear-cache"})
             # Should NOT clear immediately — deferred to avoid IOKit race
             mock_mx.clear_cache.assert_not_called()
-            # Counter should be set for deferred clearing
-            assert scheduler._deferred_clear_steps == 0
+            # Target step should be set for deferred clearing
+            assert scheduler._deferred_clear_at == (
+                scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
+            )
 
     def test_cleanup_finished_skips_clear_cache_when_no_finished(
         self, mock_model, mock_tokenizer
@@ -1215,7 +1304,121 @@ class TestSchedulerRotatingBlockAlignment:
         with patch("omlx.scheduler.mx") as mock_mx:
             scheduler._cleanup_finished(set())
             mock_mx.clear_cache.assert_not_called()
-            assert scheduler._deferred_clear_steps is None
+            assert scheduler._deferred_clear_at is None
+
+    def test_cleanup_finished_extends_deferred_clear_for_concurrent_completions(
+        self, mock_model, mock_tokenizer
+    ):
+        """Concurrent completions must extend the deferred clear window (#557).
+
+        With max_num_seqs > 1, two requests can finish in the same batch
+        or in consecutive steps. Each completion must get a full
+        _DEFERRED_CLEAR_DELAY window from its own finish step, otherwise
+        the second request's KV cache blocks can be re-allocated before
+        IOKit finishes completeMemory() callbacks.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        # Simulate first completion at step 0
+        req1 = Request(
+            request_id="req-concurrent-1",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        req1.prompt_token_ids = [1, 2]
+        req1.num_prompt_tokens = 2
+        req1.output_token_ids = [3]
+        scheduler.running["req-concurrent-1"] = req1
+        scheduler.requests["req-concurrent-1"] = req1
+
+        with patch("omlx.scheduler.mx"):
+            scheduler._cleanup_finished({"req-concurrent-1"})
+        first_target = scheduler._deferred_clear_at
+        assert first_target == scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
+
+        # Advance step counter to simulate a later step
+        scheduler._step_counter += 3
+
+        # Simulate second completion at step 3
+        req2 = Request(
+            request_id="req-concurrent-2",
+            prompt="world",
+            sampling_params=SamplingParams(),
+        )
+        req2.prompt_token_ids = [4, 5]
+        req2.num_prompt_tokens = 2
+        req2.output_token_ids = [6]
+        scheduler.running["req-concurrent-2"] = req2
+        scheduler.requests["req-concurrent-2"] = req2
+
+        with patch("omlx.scheduler.mx"):
+            scheduler._cleanup_finished({"req-concurrent-2"})
+
+        # Target must be extended to cover the second completion's full window
+        second_target = scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
+        assert scheduler._deferred_clear_at == second_target
+        assert scheduler._deferred_clear_at > first_target
+
+
+class TestPeriodicClearGating:
+    """Tests for the conditional periodic clear (#978/#1040 mitigation)."""
+
+    def test_periodic_clear_skipped_when_cache_below_threshold(
+        self, mock_model, mock_tokenizer
+    ):
+        """Periodic clear should NOT fire when MLX buffer pool is small.
+
+        The pre-fix behavior fired every mlx_cache_cleanup_interval steps
+        unconditionally, producing IOGPUFamily refcount transitions even
+        when there was nothing meaningful to release. After the fix, the
+        clear only fires when accumulated cache memory exceeds the
+        threshold (memory_limit/3 or absolute 2 GiB floor).
+        """
+        from omlx import scheduler as sched_mod
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._step_counter = scheduler.config.mlx_cache_cleanup_interval
+        scheduler._memory_limit_bytes = 0  # → use absolute 2 GiB threshold
+
+        # 1 GiB cached, well under the 2 GiB threshold
+        with patch.object(
+            sched_mod.mx, "get_cache_memory", return_value=1 * 1024**3
+        ):
+            assert scheduler._should_periodic_clear_cache() is False
+
+    def test_periodic_clear_fires_when_cache_above_threshold(
+        self, mock_model, mock_tokenizer
+    ):
+        """Periodic clear must fire when MLX buffer pool exceeds threshold."""
+        from omlx import scheduler as sched_mod
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._step_counter = scheduler.config.mlx_cache_cleanup_interval
+        scheduler._memory_limit_bytes = 0  # → 2 GiB absolute floor
+
+        # 3 GiB cached, exceeds the 2 GiB threshold
+        with patch.object(
+            sched_mod.mx, "get_cache_memory", return_value=3 * 1024**3
+        ):
+            assert scheduler._should_periodic_clear_cache() is True
+
+    def test_periodic_clear_threshold_scales_with_memory_limit(
+        self, mock_model, mock_tokenizer
+    ):
+        """Threshold must be max(memory_limit/3, 2 GiB) when limit is set."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        # Limit 30 GiB → threshold 10 GiB (memory_limit / 3)
+        scheduler._memory_limit_bytes = 30 * 1024**3
+        assert scheduler._periodic_clear_threshold_bytes() == 10 * 1024**3
+
+        # Limit 3 GiB → threshold 2 GiB (floor wins)
+        scheduler._memory_limit_bytes = 3 * 1024**3
+        assert scheduler._periodic_clear_threshold_bytes() == 2 * 1024**3
+
+        # No limit → 2 GiB absolute floor
+        scheduler._memory_limit_bytes = 0
+        assert scheduler._periodic_clear_threshold_bytes() == 2 * 1024**3
 
 
 class TestExtractCacheStatesCacheList:
@@ -1544,6 +1747,23 @@ class TestDetectNeedsThinkPrefix:
         scheduler = self._make_scheduler(mock_model, think_start_id=100)
         request = self._make_request([1, 2, 100, 101])
         assert scheduler._detect_needs_think_prefix(request) is True
+
+    def test_think_start_id_raises_type_error(self, mock_model):
+        """Tokenizer whose think_start_id raises TypeError -> False.
+
+        Models like context-1 (harmony parser) have _think_start_tokens=None
+        in their mlx-lm tokenizer, causing think_start_id to raise TypeError.
+        """
+        from unittest.mock import PropertyMock
+        from conftest import MockTokenizer
+
+        tokenizer = MockTokenizer()
+        type(tokenizer).think_start_id = PropertyMock(
+            side_effect=TypeError("object of type 'NoneType' has no len()")
+        )
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        request = self._make_request([1, 2, 3])
+        assert scheduler._detect_needs_think_prefix(request) is False
 
 
 class TestOutputParserSmoke:

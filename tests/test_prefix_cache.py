@@ -1015,6 +1015,69 @@ class TestArraysCacheLastBlockOnly:
         assert len(result.block_ids) == 2
         assert result.num_tokens == 8
 
+    def test_fetch_cache_with_segmented_extra_key_ranges(self):
+        """Later image changes should preserve reuse before their boundary."""
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+        )
+
+        tokens = list(range(12))
+        original_ranges = [
+            (5, ("image-1",)),
+            (9, ("image-1", "image-2")),
+        ]
+
+        stored = cache.store_cache(
+            "req-store",
+            tokens,
+            [],
+            extra_key_ranges=original_ranges,
+        )
+        assert stored is not None
+        assert stored.num_tokens == 12
+
+        exact_table, exact_remaining = cache.fetch_cache(
+            "req-exact",
+            tokens,
+            extra_key_ranges=original_ranges,
+        )
+        assert exact_table is not None
+        assert exact_table.num_tokens == 12
+        assert exact_remaining == []
+
+        changed_later_image_table, changed_later_image_remaining = cache.fetch_cache(
+            "req-later-image",
+            tokens,
+            extra_key_ranges=[
+                (5, ("image-1",)),
+                (9, ("image-1", "image-3")),
+            ],
+        )
+        assert changed_later_image_table is not None
+        assert changed_later_image_table.num_tokens == 8
+        assert changed_later_image_remaining == tokens[8:]
+
+        changed_earlier_image_table, changed_earlier_image_remaining = cache.fetch_cache(
+            "req-earlier-image",
+            tokens,
+            extra_key_ranges=[
+                (5, ("image-x",)),
+                (9, ("image-x", "image-2")),
+            ],
+        )
+        assert changed_earlier_image_table is not None
+        assert changed_earlier_image_table.num_tokens == 4
+        assert changed_earlier_image_remaining == tokens[4:]
+
     def test_store_cache_with_existing_prefix_uses_global_cache_indices(self, mx):
         """Store new blocks from full-sequence cache slices after cache hit.
 
@@ -2033,3 +2096,320 @@ class TestWalkBackTruncation:
 
         # block2 ref_count should have been decremented
         assert block2.ref_count == 1
+
+
+class TestPerBlockMetaStates:
+    """Tests for per-block meta_states in store_cache with boundary snapshots.
+
+    Verifies that blocks stored with boundary snapshots use the snapshot's
+    meta_state (correct per-boundary offset) rather than the shared final
+    meta_state from _extract_cache_states.
+    """
+
+    @pytest.fixture
+    def mx(self):
+        """Import MLX or skip."""
+        try:
+            import mlx.core as mx
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    def test_store_cache_uses_snapshot_meta_for_rotating_cache(self, mx):
+        """Boundary snapshot meta_state should override shared meta for RotatingKVCache blocks."""
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = True
+
+        model = MockModel(num_layers=2)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        # 8 tokens = 2 full blocks of 4
+        tokens = list(range(8))
+
+        # Simulate a hybrid model: layer 0 = KVCache, layer 1 = RotatingKVCache
+        # Final cache state has offset=8 (end of request)
+        cache_data = [
+            {
+                "state": (mx.ones((1, 4, 8, 64)), mx.ones((1, 4, 8, 64))),
+                "cache_type": "KVCache",
+                "class_name": "KVCache",
+                "meta_state": ("8",),
+            },
+            {
+                "state": (mx.ones((1, 1, 4, 256)), mx.ones((1, 1, 4, 256))),
+                "cache_type": "RotatingKVCache",
+                "class_name": "RotatingKVCache",
+                "meta_state": ("0", "4", "8", "4"),  # keep, max_size, offset=8 (final), _idx
+            },
+        ]
+        model_cache_config = ModelCacheConfig.from_type_list(
+            ["KVCache", "RotatingKVCache"], model_name="test-model"
+        )
+
+        # Boundary snapshot at token 4 (end of block 1) with correct offset=4
+        boundary_snapshots = {
+            4: [
+                {
+                    "state": (),
+                    "meta_state": (),
+                    "class_name": "KVCache",
+                    "cache_type": "KVCache",
+                },
+                {
+                    "state": (mx.ones((1, 1, 4, 256)), mx.ones((1, 1, 4, 256))),
+                    "meta_state": ("0", "4", "4", "4"),  # offset=4 at boundary
+                    "class_name": "RotatingKVCache",
+                    "cache_type": "RotatingKVCache",
+                },
+            ],
+        }
+
+        result = cache.store_cache(
+            "req-001",
+            tokens,
+            cache_data,
+            model_cache_config=model_cache_config,
+            boundary_snapshots=boundary_snapshots,
+        )
+
+        assert result is not None
+        assert len(result.block_ids) == 2
+
+        # Verify save_block was called twice (one per block)
+        assert mock_ssd.save_block.call_count == 2
+
+        # Block 1 (has boundary snapshot): should use snapshot meta for
+        # RotatingKVCache layer (offset=4), not shared meta (offset=8)
+        block1_call = mock_ssd.save_block.call_args_list[0]
+        block1_meta = block1_call.kwargs["layer_meta_states"]
+        # RotatingKVCache meta (layer 1): offset should be 4 from snapshot
+        assert block1_meta[1] == ("0", "4", "4", "4"), (
+            f"Block 1 RotatingKVCache meta should use snapshot offset=4, "
+            f"got {block1_meta[1]}"
+        )
+
+        # Block 2 (last block, uses main state): should use shared meta
+        block2_call = mock_ssd.save_block.call_args_list[1]
+        block2_meta = block2_call.kwargs["layer_meta_states"]
+        # Last block has no separate boundary snapshot override (boundary at
+        # token 8 matches the request end), so it uses the shared meta
+        assert block2_meta[1] == ("0", "4", "8", "4"), (
+            f"Block 2 RotatingKVCache meta should use shared meta offset=8, "
+            f"got {block2_meta[1]}"
+        )
+
+    def test_store_cache_kvcache_meta_falls_back_to_shared(self, mx):
+        """KVCache layers in boundary snapshots have empty meta, should fall back to shared."""
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = True
+
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        tokens = list(range(8))
+        cache_data = [
+            {
+                "state": (mx.ones((1, 4, 8, 64)), mx.ones((1, 4, 8, 64))),
+                "cache_type": "KVCache",
+                "class_name": "KVCache",
+                "meta_state": ("8",),
+            },
+        ]
+        model_cache_config = ModelCacheConfig.from_type_list(
+            ["KVCache"], model_name="test-model"
+        )
+
+        # KVCache layers have empty meta in boundary snapshots
+        boundary_snapshots = {
+            4: [
+                {
+                    "state": (),
+                    "meta_state": (),
+                    "class_name": "KVCache",
+                    "cache_type": "KVCache",
+                },
+            ],
+        }
+
+        result = cache.store_cache(
+            "req-001",
+            tokens,
+            cache_data,
+            model_cache_config=model_cache_config,
+            boundary_snapshots=boundary_snapshots,
+        )
+
+        assert result is not None
+        assert mock_ssd.save_block.call_count == 2
+
+        # Block 1: KVCache meta should fall back to shared meta (empty snapshot meta)
+        block1_call = mock_ssd.save_block.call_args_list[0]
+        block1_meta = block1_call.kwargs["layer_meta_states"]
+        assert block1_meta[0] == ("8",), (
+            f"KVCache should fall back to shared meta, got {block1_meta[0]}"
+        )
+
+    def test_store_cache_no_snapshot_uses_shared_meta(self, mx):
+        """Blocks without boundary snapshots should use shared meta (existing behavior)."""
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = True
+
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        tokens = list(range(4))
+        cache_data = [
+            {
+                "state": (mx.ones((1, 4, 4, 64)), mx.ones((1, 4, 4, 64))),
+                "cache_type": "KVCache",
+                "class_name": "KVCache",
+                "meta_state": ("4",),
+            },
+        ]
+
+        # No boundary snapshots
+        result = cache.store_cache("req-001", tokens, cache_data)
+
+        assert result is not None
+        assert mock_ssd.save_block.call_count == 1
+
+        block_call = mock_ssd.save_block.call_args_list[0]
+        block_meta = block_call.kwargs["layer_meta_states"]
+        assert block_meta[0] == ("4",)
+
+    def test_store_cache_last_block_with_snapshot_uses_snapshot_meta(self, mx):
+        """Last block should also prefer snapshot meta when a boundary snapshot exists."""
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = True
+
+        # Hybrid model: KVCache + RotatingKVCache (need KVCache so
+        # _get_cache_seq_len can determine the full sequence length)
+        model = MockModel(num_layers=2)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        # 8 tokens = 2 blocks, but cache_data reflects processing of
+        # 11 total tokens (3 trailing partial not stored).
+        # Shared meta has offset=11 (final state) for RotatingKVCache.
+        tokens = list(range(8))
+        cache_data = [
+            {
+                "state": (mx.ones((1, 4, 11, 64)), mx.ones((1, 4, 11, 64))),
+                "cache_type": "KVCache",
+                "class_name": "KVCache",
+                "meta_state": ("11",),
+            },
+            {
+                "state": (mx.ones((1, 1, 4, 256)), mx.ones((1, 1, 4, 256))),
+                "cache_type": "RotatingKVCache",
+                "class_name": "RotatingKVCache",
+                "meta_state": ("0", "4", "11", "4"),  # offset=11 (final)
+            },
+        ]
+        model_cache_config = ModelCacheConfig.from_type_list(
+            ["KVCache", "RotatingKVCache"], model_name="test-model"
+        )
+
+        # Both blocks have boundary snapshots with correct per-boundary offsets
+        boundary_snapshots = {
+            4: [
+                {
+                    "state": (),
+                    "meta_state": (),
+                    "class_name": "KVCache",
+                    "cache_type": "KVCache",
+                },
+                {
+                    "state": (mx.ones((1, 1, 4, 256)), mx.ones((1, 1, 4, 256))),
+                    "meta_state": ("0", "4", "4", "4"),
+                    "class_name": "RotatingKVCache",
+                    "cache_type": "RotatingKVCache",
+                },
+            ],
+            8: [
+                {
+                    "state": (),
+                    "meta_state": (),
+                    "class_name": "KVCache",
+                    "cache_type": "KVCache",
+                },
+                {
+                    "state": (mx.ones((1, 1, 4, 256)), mx.ones((1, 1, 4, 256))),
+                    "meta_state": ("0", "4", "8", "4"),  # offset=8 at boundary
+                    "class_name": "RotatingKVCache",
+                    "cache_type": "RotatingKVCache",
+                },
+            ],
+        }
+
+        result = cache.store_cache(
+            "req-001",
+            tokens,
+            cache_data,
+            model_cache_config=model_cache_config,
+            boundary_snapshots=boundary_snapshots,
+        )
+
+        assert result is not None
+        assert mock_ssd.save_block.call_count == 2
+
+        # Block 1: RotatingKVCache offset=4 from snapshot
+        b1_meta = mock_ssd.save_block.call_args_list[0].kwargs["layer_meta_states"]
+        assert b1_meta[1] == ("0", "4", "4", "4")
+
+        # Block 2 (last): RotatingKVCache offset=8 from snapshot,
+        # NOT offset=11 from shared meta
+        b2_meta = mock_ssd.save_block.call_args_list[1].kwargs["layer_meta_states"]
+        assert b2_meta[1] == ("0", "4", "8", "4"), (
+            f"Last block should use snapshot offset=8, not shared offset=11, "
+            f"got {b2_meta[1]}"
+        )

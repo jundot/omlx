@@ -351,9 +351,9 @@ class HarmonyStreamingParser:
 def parse_tool_calls_from_tokens(
     token_ids: list[int],
     prepend_start: bool = True,
-) -> tuple[str, list[dict[str, str]]]:
+) -> tuple[str, str, list[dict[str, str]]]:
     """
-    Parse tool calls from complete token sequence (non-streaming).
+    Parse a complete Harmony token sequence (non-streaming).
 
     Args:
         token_ids: Model output token ID list
@@ -361,12 +361,13 @@ def parse_tool_calls_from_tokens(
             Set to False if token_ids already includes start tokens.
 
     Returns:
-        (output_text, tool_calls)
-        - output_text: Text from final channel
+        (output_text, analysis_text, tool_calls)
+        - output_text: Text from the final channel
+        - analysis_text: Chain-of-thought text from the analysis channel
         - tool_calls: [{"name": "...", "arguments": "..."}]
     """
     if not token_ids:
-        return "", []
+        return "", "", []
 
     try:
         encoding = load_harmony_encoding("HarmonyGptOss")
@@ -399,6 +400,7 @@ def parse_tool_calls_from_tokens(
             )
 
         output_text = ""
+        analysis_text = ""
         tool_calls = []
 
         for msg in messages:
@@ -414,6 +416,13 @@ def parse_tool_calls_from_tokens(
                     if isinstance(text, str):
                         output_text += text
 
+            elif msg.channel == "analysis":
+                # Extract chain-of-thought text from analysis channel
+                for content in msg_content:
+                    text = getattr(content, "text", None)
+                    if isinstance(text, str):
+                        analysis_text += text
+
             elif msg.recipient and msg.recipient.startswith("functions."):
                 # Extract tool calls from commentary channel
                 name = msg.recipient[10:]  # Remove "functions." prefix
@@ -424,8 +433,8 @@ def parse_tool_calls_from_tokens(
                         arguments += text
                 tool_calls.append({"name": name, "arguments": arguments})
 
-        return output_text, tool_calls
+        return output_text, analysis_text, tool_calls
 
     except Exception as e:
         logger.warning(f"Error parsing tool calls from tokens: {e}")
-        return "", []
+        return "", "", []

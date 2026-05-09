@@ -249,7 +249,14 @@ def _find_target_python() -> str:
         str(BUILD_DIR / f"cpython-{target_minor}" / "bin" / f"python{target_minor}"),
     ]
     for path in candidates:
-        if path and Path(path).exists():
+        if not path or not Path(path).exists():
+            continue
+        # Skip interpreters without pip (e.g. venvstacks runtimes strip it)
+        check = subprocess.run(
+            [path, "-m", "pip", "--version"],
+            capture_output=True,
+        )
+        if check.returncode == 0:
             return path
 
     print(f"  Warning: python{target_minor} not found, using {sys.executable}")
@@ -560,7 +567,7 @@ def build_venvstacks():
 
 
 # mlx-audio git commit — aligned with pyproject.toml [audio] extra
-_MLX_AUDIO_GIT = "git+https://github.com/Blaizzy/mlx-audio@6408d2a410eb8c57464e07725b92271860199250"
+_MLX_AUDIO_GIT = "git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981"
 
 
 def _install_mlx_audio(export_dir: Path):
@@ -957,7 +964,20 @@ def create_app_bundle():
     cli_launcher = macos_dir / "omlx-cli"
     cli_launcher.write_text(
         '#!/bin/bash\n'
-        'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+        '# Resolve symlinks so this script keeps working when invoked through\n'
+        '# /usr/local/bin/omlx or ~/.local/bin/omlx, where $0 would otherwise\n'
+        '# point at the symlink directory and break the bundle path lookup.\n'
+        '# (macOS ships readlink without -f, so use a portable bash loop.)\n'
+        'SOURCE="$0"\n'
+        'while [ -L "$SOURCE" ]; do\n'
+        '    LINK_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"\n'
+        '    SOURCE="$(readlink "$SOURCE")"\n'
+        '    case "$SOURCE" in\n'
+        '        /*) ;;\n'
+        '        *) SOURCE="$LINK_DIR/$SOURCE" ;;\n'
+        '    esac\n'
+        'done\n'
+        'DIR="$(cd "$(dirname "$SOURCE")" && pwd)"\n'
         'CONTENTS="$(dirname "$DIR")"\n'
         'LAYERS="$CONTENTS/Frameworks"\n'
         '[ ! -d "$LAYERS" ] && LAYERS="$CONTENTS/Python"\n'
@@ -969,6 +989,10 @@ def create_app_bundle():
     cli_launcher.chmod(0o755)
 
     # Create Info.plist
+    # NOTE: do NOT add LSUIElement here. Dock icon visibility is controlled
+    # at runtime via setActivationPolicy_ in app.py. Combining LSUIElement
+    # with runtime policy switching causes ControlCenter to block the
+    # NSStatusItem (menubar icon) on macOS Sonoma+. See issue #725.
     print("  Creating Info.plist...")
     info_plist = {
         "CFBundleName": APP_NAME,
@@ -981,10 +1005,17 @@ def create_app_bundle():
         "CFBundleSignature": "????",
         "CFBundleIconFile": "AppIcon",
         "LSMinimumSystemVersion": "15.0",
-        "LSUIElement": True,
+        # Xcode sets this automatically; our manual bundle was missing it.
+        # Aligns the launch metadata with native AppKit templates so tools
+        # that key off NSPrincipalClass (Accessibility enumerators among
+        # them) recognize the process as a standard NSApplication host.
+        "NSPrincipalClass": "NSApplication",
         "NSHighResolutionCapable": True,
         "LSArchitecturePriority": ["arm64"],
-        "NSHumanReadableCopyright": f"Copyright 2024 oMLX contributors. Version {VERSION}",
+        "NSHumanReadableCopyright": (
+            f"Copyright © {datetime.now().year} oMLX contributors.\n"
+            "Licensed under the Apache License 2.0."
+        ),
     }
 
     with open(contents_dir / "Info.plist", "wb") as f:

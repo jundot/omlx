@@ -7,8 +7,8 @@ text embeddings using Apple's MLX framework, with native fallback
 for XLMRoBERTa and BERT embedding models.
 """
 
-import json
 import inspect
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +16,10 @@ from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
+
+from .mlx_embeddings_compat import (
+    patch_qwen3_vl_processor_for_torch_free_image_loading,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,14 +56,17 @@ class MLXEmbeddingModel:
         >>> print(len(output.embeddings))  # 2
     """
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, trust_remote_code: bool = False):
         """
         Initialize the MLX embedding model.
 
         Args:
             model_name: HuggingFace model name or local path
+            trust_remote_code: Allow execution of custom Python shipped inside
+                the model repository. Off by default for security (issue #926).
         """
         self.model_name = model_name
+        self.trust_remote_code = trust_remote_code
 
         self.model = None
         self.processor = None
@@ -68,6 +75,7 @@ class MLXEmbeddingModel:
         self._using_native = False
         self._is_compiled = False
         self._compiled_embed = None
+        self._remap_input_ids_to_inputs = False
 
     def _load_native(self) -> bool:
         """
@@ -131,9 +139,16 @@ class MLXEmbeddingModel:
             mx.eval(model_instance.parameters())
 
             try:
-                tokenizer = AutoTokenizer.from_pretrained(str(model_path), use_fast=False)
+                tokenizer = AutoTokenizer.from_pretrained(
+                    str(model_path),
+                    use_fast=False,
+                    trust_remote_code=self.trust_remote_code,
+                )
             except Exception:
-                tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+                tokenizer = AutoTokenizer.from_pretrained(
+                    str(model_path),
+                    trust_remote_code=self.trust_remote_code,
+                )
 
             self.model = model_instance
             self.processor = tokenizer
@@ -163,11 +178,15 @@ class MLXEmbeddingModel:
 
         # 2. Fallback to mlx-embeddings
         try:
+            patch_qwen3_vl_processor_for_torch_free_image_loading()
             from mlx_embeddings import load
 
             logger.info(f"Loading embedding model via mlx-embeddings: {self.model_name}")
 
-            self.model, self.processor = load(self.model_name)
+            self.model, self.processor = load(
+                self.model_name,
+                tokenizer_config={"trust_remote_code": self.trust_remote_code},
+            )
 
             if hasattr(self.model, "config"):
                 config = self.model.config
@@ -176,6 +195,7 @@ class MLXEmbeddingModel:
                     self._hidden_size = getattr(config.text_config, "hidden_size", None)
 
             self._using_native = False
+            self._detect_input_key_remapping()
             self._is_compiled = self._try_compile()
             self._loaded = True
             logger.info(
@@ -200,17 +220,28 @@ class MLXEmbeddingModel:
             raise
 
     def _extract_embeddings_array(self, outputs):
-        """Extract embedding tensor from model outputs."""
+        """Extract embedding tensor from model outputs as a 2D (batch, hidden) array."""
         if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
-            return outputs.text_embeds
-        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-            return outputs.pooler_output
-        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
-            return mx.mean(outputs.last_hidden_state, axis=1)
-        raise ValueError(
-            "Model output does not contain expected embedding fields "
-            "(text_embeds, pooler_output, or last_hidden_state)"
-        )
+            embeddings = outputs.text_embeds
+        elif hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+            embeddings = outputs.pooler_output
+        elif (
+            hasattr(outputs, "last_hidden_state")
+            and outputs.last_hidden_state is not None
+        ):
+            embeddings = outputs.last_hidden_state
+        else:
+            raise ValueError(
+                "Model output does not contain expected embedding fields "
+                "(text_embeds, pooler_output, or last_hidden_state)"
+            )
+
+        # Some models (e.g. ModernBERT loaded as MaskedLM) skip pooling and return
+        # per-token features with shape (batch, seq_len, hidden). Mean pool so
+        # /v1/embeddings always emits one vector per input.
+        if embeddings.ndim == 3:
+            embeddings = mx.mean(embeddings, axis=1)
+        return embeddings
 
     def _validate_native_weights(
         self, model_instance, weights: Dict[str, Any]
@@ -323,6 +354,25 @@ class MLXEmbeddingModel:
             None,
         )
 
+    def _detect_input_key_remapping(self) -> None:
+        """Check if the model accepts `inputs` instead of `input_ids` and cache the result."""
+        try:
+            params = inspect.signature(self.model.__call__).parameters
+            self._remap_input_ids_to_inputs = (
+                "input_ids" not in params and "inputs" in params
+            )
+        except (TypeError, ValueError):
+            self._remap_input_ids_to_inputs = False
+
+    def _adapt_model_inputs_for_call(
+        self, model_inputs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Rename prepared inputs to match the embedding model call signature."""
+        adapted_inputs = dict(model_inputs)
+        if self._remap_input_ids_to_inputs and "input_ids" in adapted_inputs:
+            adapted_inputs["inputs"] = adapted_inputs.pop("input_ids")
+        return adapted_inputs
+
     def _try_compile(self) -> bool:
         """
         Compile a primitive-output embedding forward function.
@@ -336,7 +386,7 @@ class MLXEmbeddingModel:
 
         try:
             def _compiled_embed(inputs):
-                outputs = base_model(**inputs)
+                outputs = base_model(**self._adapt_model_inputs_for_call(inputs))
                 return self._extract_embeddings_array(outputs)
 
             self._compiled_embed = mx.compile(_compiled_embed)
@@ -459,7 +509,7 @@ class MLXEmbeddingModel:
                     )
                     if not isinstance(inputs, dict):
                         inputs = dict(inputs)
-                    outputs = self.model(**inputs)
+                    outputs = self.model(**self._adapt_model_inputs_for_call(inputs))
                     total_tokens = self._count_prepared_tokens(inputs)
                 else:
                     from mlx_embeddings import generate

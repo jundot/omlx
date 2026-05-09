@@ -56,9 +56,12 @@ class EngineEntry:
     engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
+    thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
+    preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
+    loading_started_at: float | None = None  # Timestamp when current load started
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
 
@@ -95,6 +98,8 @@ class EnginePool:
         self._process_memory_enforcer: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
+        self._load_seconds_per_gb_ema: float | None = None
+        self._load_time_observations: int = 0
 
     @property
     def max_model_memory(self) -> int | None:
@@ -156,6 +161,8 @@ class EnginePool:
                     engine_type=info.engine_type,
                     estimated_size=info.estimated_size,
                     config_model_type=getattr(info, "config_model_type", ""),
+                    thinking_default=getattr(info, "thinking_default", None),
+                    preserve_thinking_default=getattr(info, "preserve_thinking_default", None),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -439,14 +446,25 @@ class EnginePool:
         """
         Find the least recently used non-pinned loaded model.
 
+        Skips models with active inference requests to avoid interrupting
+        in-flight generation.
+
         Returns:
-            Model ID of the LRU victim, or None if all models are pinned
+            Model ID of the LRU victim, or None if no evictable model found
         """
-        candidates = [
-            (e.last_access, mid)
-            for mid, e in self._entries.items()
-            if e.engine is not None and not e.is_pinned
-        ]
+        candidates = []
+        for mid, e in self._entries.items():
+            if e.engine is None or e.is_pinned:
+                continue
+            try:
+                if e.engine.has_active_requests():
+                    logger.debug(
+                        f"Skipping victim '{mid}': has active requests"
+                    )
+                    continue
+            except AttributeError:
+                pass
+            candidates.append((e.last_access, mid))
         if not candidates:
             return None
         candidates.sort()  # Sort by last_access (oldest first)
@@ -454,9 +472,11 @@ class EnginePool:
 
     async def _unload_engine(self, model_id: str) -> None:
         """
-        Immediately stop and unload an engine.
+        Immediately stop and unload an engine with memory settle barrier.
 
-        This aborts any in-progress requests.
+        After stopping the engine, polls mx.get_active_memory() to verify
+        Metal buffers are actually reclaimed before updating the memory
+        tracking counter.
 
         Args:
             model_id: The model ID to unload
@@ -466,16 +486,14 @@ class EnginePool:
             return
 
         logger.info(f"Unloading model: {model_id} (immediate abort)")
+        pre_unload_active = mx.get_active_memory()
 
         try:
             await entry.engine.stop()
         except Exception as e:
             logger.warning(f"Error stopping engine for {model_id}: {e}")
 
-        # Release memory tracking
-        self._current_model_memory -= entry.estimated_size
-
-        # Clear engine reference
+        # Clear engine reference before settle barrier
         entry.engine = None
         entry.last_access = 0.0
 
@@ -490,10 +508,73 @@ class EnginePool:
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
 
-        logger.info(
-            f"Unloaded model: {model_id}, "
-            f"memory usage: {format_size(self._current_model_memory)}"
-        )
+        # Memory settle barrier: poll actual freed memory instead of
+        # trusting the cumulative _current_model_memory estimate.
+        # Scale tolerance with model size: estimated_size includes a 5%
+        # overhead factor (model_discovery.py) that may not be reflected in
+        # actual freed memory. Use 2 GB floor for small models. See #768.
+        settle_tolerance = max(2 * 1024**3, int(entry.estimated_size * 0.05))
+        min_expected_freed = max(0, entry.estimated_size - settle_tolerance)
+        settled = False
+        for _settle_round in range(10):
+            active_now = mx.get_active_memory()
+            actual_freed = pre_unload_active - active_now
+            if actual_freed >= min_expected_freed:
+                settled = True
+                logger.debug(
+                    f"Settle round {_settle_round + 1} for '{model_id}': "
+                    f"freed={format_size(actual_freed)} "
+                    f"(need>={format_size(min_expected_freed)}) - settled"
+                )
+                break
+            logger.debug(
+                f"Settle round {_settle_round + 1} for '{model_id}': "
+                f"freed={format_size(actual_freed)} "
+                f"(need>={format_size(min_expected_freed)}) - retry"
+            )
+            await asyncio.sleep(0.5)
+            gc.collect()
+            await loop.run_in_executor(
+                get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+            )
+
+        # Release memory tracking AFTER barrier
+        self._current_model_memory -= entry.estimated_size
+
+        if settled:
+            logger.info(
+                f"Unloaded model: {model_id}, "
+                f"freed={format_size(actual_freed)} "
+                f"(expected>={format_size(min_expected_freed)}), "
+                f"active_memory: {format_size(active_now)} (settled)"
+            )
+        else:
+            # Barrier timed out - try emergency reclaim
+            logger.warning(
+                f"Settle barrier timed out for '{model_id}': "
+                f"freed={format_size(actual_freed)} "
+                f"(need>={format_size(min_expected_freed)})"
+            )
+            for _ in range(3):
+                gc.collect()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
+                await asyncio.sleep(1.0)
+            active_after = mx.get_active_memory()
+            if active_after > self._current_model_memory + 5 * 1024**3:
+                logger.error(
+                    f"Emergency reclaim failed for '{model_id}': "
+                    f"active_memory={format_size(active_after)} "
+                    f"exceeds safe threshold "
+                    f"({format_size(self._current_model_memory + 5 * 1024**3)})"
+                )
+            else:
+                logger.info(
+                    f"Emergency reclaim succeeded: "
+                    f"active_memory={format_size(active_after)}"
+                )
 
     async def _load_engine(self, model_id: str, force_lm: bool = False) -> None:
         """
@@ -511,6 +592,9 @@ class EnginePool:
             raise ModelLoadingError(model_id)
 
         entry.is_loading = True
+        entry.loading_started_at = time.monotonic()
+        load_started_at = entry.loading_started_at
+        load_completed = False
         entry.abort_loading = False
         try:
             effective_type = entry.engine_type
@@ -525,41 +609,140 @@ class EnginePool:
             if self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
 
-            # Create engine based on engine type
-            if effective_type == "embedding":
-                # EmbeddingEngine for embedding models
-                engine = EmbeddingEngine(model_name=entry.model_path)
-            elif effective_type == "reranker":
-                # RerankerEngine for reranker models
-                engine = RerankerEngine(model_name=entry.model_path)
-            elif effective_type == "vlm":
-                # VLMBatchedEngine for vision-language models
-                engine = VLMBatchedEngine(
-                    model_name=entry.model_path,
-                    scheduler_config=self._scheduler_config,
-                    model_settings=model_settings,
+            # Native MTP forces LM-only dispatch even for VLM models. Vision
+            # encoder weights are ignored because the patched mtp_forward only
+            # exists on the language model path. mtp_enabled was already
+            # validated as mutually exclusive with dflash / turboquant in
+            # ModelSettings.__post_init__.
+            if (
+                model_settings is not None
+                and getattr(model_settings, "mtp_enabled", False)
+                and effective_type == "vlm"
+            ):
+                logger.info(
+                    f"MTP enabled for VLM model {model_id}; "
+                    f"forcing LM-only dispatch, vision components ignored"
                 )
-            elif entry.engine_type == "audio_stt":
-                engine = STTEngine(model_name=entry.model_path)
-            elif entry.engine_type == "audio_tts":
-                engine = TTSEngine(model_name=entry.model_path)
-            elif entry.engine_type == "audio_sts":
-                engine = STSEngine(
-                    model_name=entry.model_path,
-                    config_model_type=entry.config_model_type,
-                )
-            else:
-                # BatchedEngine with continuous batching (default)
-                engine = BatchedEngine(
-                    model_name=entry.model_path,
-                    scheduler_config=self._scheduler_config,
-                    model_settings=model_settings,
-                )
+                effective_type = "batched"
+
+            # Check if DFlash is enabled — takes priority over engine type
+            # since DFlash has its own model loading pipeline
+            engine = None
+            if model_settings is not None:
+                dflash_enabled = getattr(model_settings, "dflash_enabled", False)
+                dflash_draft = getattr(model_settings, "dflash_draft_model", None)
+                if dflash_enabled and dflash_draft:
+                    try:
+                        from .engine.dflash import DFlashEngine
+                        engine = DFlashEngine(
+                            model_name=entry.model_path,
+                            draft_model_path=dflash_draft,
+                            draft_quant_bits=getattr(model_settings, "dflash_draft_quant_bits", None),
+                            model_settings=model_settings,
+                            fallback_engine_type=effective_type,
+                            scheduler_config=self._scheduler_config,
+                            omlx_ssd_cache_dir=getattr(
+                                self._scheduler_config, "paged_ssd_cache_dir", None
+                            ),
+                        )
+                        logger.info(f"DFlash enabled for {model_id}, draft={dflash_draft}")
+                    except ImportError:
+                        logger.warning(
+                            f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
+                            f"Falling back to default engine."
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"DFlash init failed for {model_id}: {e}. "
+                            f"Falling back to default engine."
+                        )
+
+            # Per-model trust_remote_code (security opt-in, issue #926).
+            # When unset, defaults to False — repos with custom modeling_*.py
+            # will fail to load until the user explicitly toggles this on
+            # in the admin UI's model settings modal.
+            trc = bool(getattr(model_settings, "trust_remote_code", False)) if model_settings else False
+
+            # Create engine based on engine type (if DFlash not active)
+            if engine is None:
+                if effective_type == "embedding":
+                    engine = EmbeddingEngine(
+                        model_name=entry.model_path,
+                        trust_remote_code=trc,
+                    )
+                elif effective_type == "reranker":
+                    engine = RerankerEngine(
+                        model_name=entry.model_path,
+                        trust_remote_code=trc,
+                    )
+                elif effective_type == "vlm":
+                    engine = VLMBatchedEngine(
+                        model_name=entry.model_path,
+                        trust_remote_code=trc,
+                        scheduler_config=self._scheduler_config,
+                        model_settings=model_settings,
+                    )
+                elif entry.engine_type == "audio_stt":
+                    engine = STTEngine(model_name=entry.model_path)
+                elif entry.engine_type == "audio_tts":
+                    engine = TTSEngine(model_name=entry.model_path)
+                elif entry.engine_type == "audio_sts":
+                    engine = STSEngine(
+                        model_name=entry.model_path,
+                        config_model_type=entry.config_model_type,
+                    )
+                else:
+                    engine = BatchedEngine(
+                        model_name=entry.model_path,
+                        trust_remote_code=trc,
+                        scheduler_config=self._scheduler_config,
+                        model_settings=model_settings,
+                    )
+
+            _is_dflash_engine = engine is not None and type(engine).__name__ == "DFlashEngine"
 
             try:
                 await engine.start()
             except Exception as start_error:
-                if force_lm and entry.engine_type == "vlm":
+                if _is_dflash_engine:
+                    # DFlash engine failed to start — fall back to the
+                    # model's natural engine type (VLM or Batched)
+                    logger.warning(
+                        f"DFlash start failed for {model_id}: {start_error}. "
+                        f"Falling back to {effective_type} engine."
+                    )
+                    try:
+                        await engine.stop()
+                    except Exception:
+                        pass
+                    gc.collect()
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        get_mlx_executor(),
+                        lambda: (mx.synchronize(), mx.clear_cache()),
+                    )
+
+                    if effective_type == "vlm":
+                        engine = VLMBatchedEngine(
+                            model_name=entry.model_path,
+                            trust_remote_code=trc,
+                            scheduler_config=self._scheduler_config,
+                            model_settings=model_settings,
+                        )
+                    else:
+                        engine = BatchedEngine(
+                            model_name=entry.model_path,
+                            trust_remote_code=trc,
+                            scheduler_config=self._scheduler_config,
+                            model_settings=model_settings,
+                        )
+                    await engine.start()
+                    logger.info(
+                        f"Successfully loaded {model_id} as {effective_type} "
+                        f"(fallback from DFlash)"
+                    )
+
+                elif force_lm and entry.engine_type == "vlm":
                     # force_lm created a BatchedEngine but mlx-lm can't
                     # load this VLM model — fall back to VLMBatchedEngine.
                     logger.warning(
@@ -580,6 +763,7 @@ class EnginePool:
 
                     engine = VLMBatchedEngine(
                         model_name=entry.model_path,
+                        trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
@@ -608,6 +792,7 @@ class EnginePool:
 
                     engine = BatchedEngine(
                         model_name=entry.model_path,
+                        trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
@@ -647,6 +832,7 @@ class EnginePool:
             entry.engine = engine
             entry.last_access = time.time()
             self._current_model_memory += entry.estimated_size
+            load_completed = True
 
             # Propagate memory limit to new engine's scheduler
             if self._process_memory_enforcer is not None:
@@ -670,7 +856,25 @@ class EnginePool:
                 f"total: {format_size(self._current_model_memory)})"
             )
         finally:
+            if load_completed and load_started_at is not None and entry.estimated_size > 0:
+                elapsed = max(0.0, time.monotonic() - load_started_at)
+                size_gb = entry.estimated_size / (1024 ** 3)
+                if size_gb > 0 and elapsed > 0:
+                    sample = elapsed / size_gb
+                    if self._load_seconds_per_gb_ema is None:
+                        self._load_seconds_per_gb_ema = sample
+                    else:
+                        self._load_seconds_per_gb_ema = (
+                            self._load_seconds_per_gb_ema * 0.9 + sample * 0.1
+                        )
+                    self._load_time_observations += 1
+                    logger.debug(
+                        f"Observed model load speed: {sample:.2f}s/GB "
+                        f"for {model_id} ({elapsed:.1f}s, {format_size(entry.estimated_size)}); "
+                        f"EMA={self._load_seconds_per_gb_ema:.2f}s/GB"
+                    )
             entry.is_loading = False
+            entry.loading_started_at = None
             entry.abort_loading = False
 
     async def preload_pinned_models(self) -> None:
@@ -715,17 +919,22 @@ class EnginePool:
             "current_model_memory": self._current_model_memory,
             "model_count": len(self._entries),
             "loaded_count": sum(1 for e in self._entries.values() if e.engine is not None),
+            "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
+            "load_time_observations": self._load_time_observations,
             "models": [
                 {
                     "id": mid,
                     "model_path": e.model_path,
                     "loaded": e.engine is not None,
                     "is_loading": e.is_loading,
+                    "loading_started_at": e.loading_started_at,
                     "estimated_size": e.estimated_size,
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
                     "config_model_type": e.config_model_type,
+                    "thinking_default": e.thinking_default,
+                    "preserve_thinking_default": e.preserve_thinking_default,
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
                 for mid, e in sorted(self._entries.items())
@@ -733,7 +942,9 @@ class EnginePool:
         }
 
     async def check_ttl_expirations(
-        self, settings_manager: ModelSettingsManager
+        self,
+        settings_manager: ModelSettingsManager,
+        global_idle_timeout_seconds: int | None = None,
     ) -> list[str]:
         """Check and unload models that have exceeded their TTL.
 
@@ -743,6 +954,7 @@ class EnginePool:
 
         Args:
             settings_manager: The settings manager to read TTL values from.
+            global_idle_timeout_seconds: Global idle timeout fallback (None = no global TTL).
 
         Returns:
             List of model IDs that were unloaded.
@@ -759,11 +971,14 @@ class EnginePool:
                     continue
 
                 settings = settings_manager.get_settings(model_id)
-                if settings.ttl_seconds is None:
+                effective_ttl = settings.ttl_seconds
+                if effective_ttl is None:
+                    effective_ttl = global_idle_timeout_seconds
+                if effective_ttl is None:
                     continue
 
                 idle_time = now - entry.last_access
-                if idle_time < settings.ttl_seconds:
+                if idle_time < effective_ttl:
                     continue
 
                 # Check if model has active requests
@@ -775,7 +990,7 @@ class EnginePool:
 
                 logger.info(
                     f"TTL expired for model '{model_id}' "
-                    f"(idle {idle_time:.0f}s > ttl {settings.ttl_seconds}s)"
+                    f"(idle {idle_time:.0f}s > ttl {effective_ttl}s)"
                 )
                 await self._unload_engine(model_id)
                 expired.append(model_id)

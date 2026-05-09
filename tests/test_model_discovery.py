@@ -11,6 +11,7 @@ from omlx.model_discovery import (
     DiscoveredModel,
     _is_adapter_dir,
     _is_unsupported_model,
+    _resolve_hf_cache_entry,
     detect_model_type,
     discover_models,
     discover_models_from_dirs,
@@ -85,6 +86,17 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "reranker"
 
+    def test_detect_jina_reranker_without_name_heuristic(self, tmp_path):
+        """JinaForRanking should detect as reranker without requiring 'rerank' in directory name."""
+        model_dir = tmp_path / "jina-v3-mlx"
+        model_dir.mkdir()
+        config = {
+            "model_type": "qwen3",
+            "architectures": ["JinaForRanking"],
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(model_dir) == "reranker"
+
     def test_detect_causal_lm_reranker(self, tmp_path):
         """Test detection of CausalLM-based reranker (e.g., Qwen3-Reranker)."""
         reranker_dir = tmp_path / "Qwen3-Reranker-0.6B-mxfp8"
@@ -118,6 +130,42 @@ class TestDetectModelType:
         (llm_dir / "config.json").write_text(json.dumps(config))
         assert detect_model_type(llm_dir) == "llm"
 
+    def test_detect_qwen3_vl_reranker(self, tmp_path):
+        """Qwen3VLForConditionalGeneration + 'reranker' in dir name → reranker."""
+        reranker_dir = tmp_path / "Qwen3-VL-Reranker-2B-4bit"
+        reranker_dir.mkdir()
+        config = {
+            "model_type": "qwen3_vl",
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1024},
+        }
+        (reranker_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(reranker_dir) == "reranker"
+
+    def test_detect_qwen3_vl_embedding(self, tmp_path):
+        """Qwen3VLForConditionalGeneration + 'embedding' in dir name → embedding."""
+        embed_dir = tmp_path / "Qwen3-VL-Embedding-2B"
+        embed_dir.mkdir()
+        config = {
+            "model_type": "qwen3_vl",
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1024},
+        }
+        (embed_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(embed_dir) == "embedding"
+
+    def test_detect_qwen3_vl_without_rerank_or_embed_name_is_vlm(self, tmp_path):
+        """Plain Qwen3-VL without rerank/embed hints still classifies as VLM."""
+        vlm_dir = tmp_path / "Qwen3-VL-2B-Instruct"
+        vlm_dir.mkdir()
+        config = {
+            "model_type": "qwen3_vl",
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1024},
+        }
+        (vlm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(vlm_dir) == "vlm"
+
     def test_missing_config_defaults_to_llm(self, tmp_path):
         """Test that missing config.json defaults to LLM."""
         assert detect_model_type(tmp_path) == "llm"
@@ -137,6 +185,7 @@ class TestDetectModelType:
         config = {
             "model_type": "qwen2_5_vl",
             "architectures": ["Qwen2_5_VLForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1152},
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
@@ -165,6 +214,7 @@ class TestDetectModelType:
         config = {
             "model_type": "gemma3",
             "architectures": ["Gemma3ForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1152},
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
@@ -174,9 +224,28 @@ class TestDetectModelType:
         config = {
             "model_type": "gemma4",
             "architectures": ["Gemma4ForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1152},
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_text_only_gemma3_as_llm(self, tmp_path):
+        """Text-only quant of Gemma3 (no vision_config) should be LLM."""
+        config = {
+            "model_type": "gemma3",
+            "architectures": ["Gemma3ForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_text_only_gemma4_as_llm(self, tmp_path):
+        """Text-only quant of Gemma4 (no vision_config) should be LLM."""
+        config = {
+            "model_type": "gemma4",
+            "architectures": ["Gemma4ForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
 
     def test_detect_vlm_qwen3_5_moe(self, tmp_path):
         """Test detection of Qwen3.5 MoE as VLM."""
@@ -230,6 +299,63 @@ class TestDetectModelType:
             "architectures": ["Gemma3TextForCausalLM"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_gemma3_text_model_without_sentence_transformers_modules_is_llm(self, tmp_path):
+        """gemma3_text base transformer without sentence-transformers modules stays LLM."""
+        config = {
+            "model_type": "gemma3_text",
+            "architectures": ["Gemma3TextModel"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_sentence_transformers_gemma3_text_as_embedding(self, tmp_path):
+        """gemma3_text sentence-transformers exports should be detected as embeddings."""
+        config = {
+            "model_type": "gemma3_text",
+            "architectures": ["Gemma3TextModel"],
+        }
+        modules = [
+            {
+                "idx": 0,
+                "name": "0",
+                "path": "",
+                "type": "sentence_transformers.models.Transformer",
+            },
+            {
+                "idx": 1,
+                "name": "1",
+                "path": "1_Pooling",
+                "type": "sentence_transformers.models.Pooling",
+            },
+            {
+                "idx": 2,
+                "name": "2",
+                "path": "2_Normalize",
+                "type": "sentence_transformers.models.Normalize",
+            },
+        ]
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "modules.json").write_text(json.dumps(modules))
+        assert detect_model_type(tmp_path) == "embedding"
+
+    def test_transformer_only_modules_json_is_not_embedding(self, tmp_path):
+        """modules.json with only Transformer (no Pooling/Normalize) should not be embedding."""
+        config = {
+            "model_type": "gemma3_text",
+            "architectures": ["Gemma3TextModel"],
+        }
+        modules = [
+            {
+                "idx": 0,
+                "name": "0",
+                "path": "",
+                "type": "sentence_transformers.models.Transformer",
+            },
+        ]
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "modules.json").write_text(json.dumps(modules))
         assert detect_model_type(tmp_path) == "llm"
 
     def test_detect_vlm_model_type_requires_vision_config(self, tmp_path):
@@ -848,3 +974,139 @@ class TestUnsupportedModels:
         assert models["whisper-large-v3"].model_type == "audio_stt"
         assert "Qwen3-TTS" in models
         assert models["Qwen3-TTS"].model_type == "audio_tts"
+
+
+class TestHfCacheDiscovery:
+    """Tests for HF Hub cache entry resolution and discovery."""
+
+    FAKE_COMMIT = "abc123def456"
+
+    def _make_model(self, path: Path, model_type: str = "llama"):
+        """Helper to create a valid model directory."""
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "config.json").write_text(json.dumps({"model_type": model_type}))
+        (path / "model.safetensors").write_bytes(b"0" * 1000)
+
+    def _make_hf_cache_entry(self, parent: Path, org: str, name: str):
+        """Helper to create a bare HF Hub cache directory layout (no model files)."""
+        entry = parent / f"models--{org}--{name}"
+        refs = entry / "refs"
+        refs.mkdir(parents=True)
+        (refs / "main").write_text(self.FAKE_COMMIT)
+        snapshot = entry / "snapshots" / self.FAKE_COMMIT
+        snapshot.mkdir(parents=True)
+        return entry, snapshot
+
+    def _make_hf_cache_model(self, parent: Path, org: str, name: str, model_type: str = "llama"):
+        """Helper to create an HF cache entry with a valid model in the snapshot."""
+        _, snapshot = self._make_hf_cache_entry(parent, org, name)
+        (snapshot / "config.json").write_text(json.dumps({"model_type": model_type}))
+        (snapshot / "model.safetensors").write_bytes(b"0" * 1000)
+
+    def test_resolve_valid_entry(self, tmp_path):
+        """Valid HF cache entry resolves to snapshot path and model name."""
+        entry, snapshot = self._make_hf_cache_entry(tmp_path, "mlx-community", "Qwen3-8B-4bit")
+
+        result = _resolve_hf_cache_entry(entry)
+        assert result is not None
+        assert result[0] == snapshot
+        assert result[1] == "Qwen3-8B-4bit"
+
+    def test_resolve_regular_dir_returns_none(self, tmp_path):
+        """Regular directory without models-- prefix returns None."""
+        regular = tmp_path / "mlx-community"
+        regular.mkdir()
+        assert _resolve_hf_cache_entry(regular) is None
+
+    def test_resolve_single_separator_returns_none(self, tmp_path):
+        """models--Name (no org separator) returns None."""
+        entry = tmp_path / "models--NoOrg"
+        entry.mkdir()
+        assert _resolve_hf_cache_entry(entry) is None
+
+    def test_resolve_missing_refs_main_returns_none(self, tmp_path):
+        """Missing refs/main returns None."""
+        entry = tmp_path / "models--mlx-community--Qwen3-8B"
+        entry.mkdir(parents=True)
+        assert _resolve_hf_cache_entry(entry) is None
+
+    def test_resolve_missing_snapshot_returns_none(self, tmp_path):
+        """Valid refs/main but missing snapshot directory returns None."""
+        entry = tmp_path / "models--mlx-community--Qwen3-8B"
+        refs = entry / "refs"
+        refs.mkdir(parents=True)
+        (refs / "main").write_text("deadbeef")
+        assert _resolve_hf_cache_entry(entry) is None
+
+    def test_resolve_strips_whitespace_from_refs(self, tmp_path):
+        """Trailing newline in refs/main is stripped (matches real HF cache)."""
+        entry, snapshot = self._make_hf_cache_entry(tmp_path, "mlx-community", "Qwen3-8B")
+        # Overwrite with trailing newline (like real HF cache)
+        (entry / "refs" / "main").write_text(self.FAKE_COMMIT + "\n")
+
+        result = _resolve_hf_cache_entry(entry)
+        assert result is not None
+        assert result[0] == snapshot
+
+    def test_discover_hf_cache_model(self, tmp_path):
+        """HF cache entries are discovered as models."""
+        self._make_hf_cache_model(tmp_path, "mlx-community", "Qwen3-8B-4bit")
+
+        models = discover_models(tmp_path)
+        assert len(models) == 1
+        assert "Qwen3-8B-4bit" in models
+        assert models["Qwen3-8B-4bit"].model_type == "llm"
+
+    def test_discover_multiple_hf_cache_models(self, tmp_path):
+        """Multiple HF cache entries are all discovered."""
+        self._make_hf_cache_model(tmp_path, "mlx-community", "Qwen3-8B-4bit")
+        self._make_hf_cache_model(tmp_path, "mlx-community", "Mistral-7B-v0.3")
+
+        models = discover_models(tmp_path)
+        assert len(models) == 2
+        assert "Qwen3-8B-4bit" in models
+        assert "Mistral-7B-v0.3" in models
+
+    def test_hf_cache_model_path_points_to_snapshot(self, tmp_path):
+        """model_path points to the snapshot dir, not the cache entry."""
+        self._make_hf_cache_model(tmp_path, "mlx-community", "Qwen3-8B-4bit")
+
+        models = discover_models(tmp_path)
+        assert models["Qwen3-8B-4bit"].model_path == str(
+            tmp_path / "models--mlx-community--Qwen3-8B-4bit" / "snapshots" / self.FAKE_COMMIT
+        )
+
+    def test_hf_cache_without_config_json_skipped(self, tmp_path):
+        """HF cache entries without config.json in snapshot are skipped."""
+        self._make_hf_cache_entry(tmp_path, "mlx-community", "NoConfig")
+
+        models = discover_models(tmp_path)
+        assert len(models) == 0
+
+    def test_mixed_flat_and_hf_cache(self, tmp_path):
+        """Mix of flat models and HF cache entries."""
+        self._make_model(tmp_path / "mistral-7b")
+        self._make_hf_cache_model(tmp_path, "mlx-community", "Qwen3-8B-4bit")
+
+        models = discover_models(tmp_path)
+        assert len(models) == 2
+        assert "mistral-7b" in models
+        assert "Qwen3-8B-4bit" in models
+
+    def test_mixed_org_and_hf_cache(self, tmp_path):
+        """Mix of org folders and HF cache entries."""
+        self._make_model(tmp_path / "Qwen" / "Qwen3-8B", model_type="qwen2")
+        self._make_hf_cache_model(tmp_path, "mlx-community", "Mistral-7B")
+
+        models = discover_models(tmp_path)
+        assert len(models) == 2
+        assert "Qwen3-8B" in models
+        assert "Mistral-7B" in models
+
+    def test_hf_cache_does_not_fall_through_to_org_scan(self, tmp_path):
+        """HF cache entries don't get scanned as org folders."""
+        self._make_hf_cache_model(tmp_path, "mlx-community", "Qwen3-8B-4bit")
+
+        models = discover_models(tmp_path)
+        assert len(models) == 1
+        assert "Qwen3-8B-4bit" in models

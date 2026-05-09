@@ -114,6 +114,8 @@ class ServerSettings:
     port: int = 8000
     log_level: str = "info"
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
+    server_aliases: list[str] = field(default_factory=list)
+    sse_keepalive_mode: str = "chunk"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -127,6 +129,8 @@ class ServerSettings:
             port=data.get("port", 8000),
             log_level=data.get("log_level", "info"),
             cors_origins=data.get("cors_origins", ["*"]),
+            server_aliases=data.get("server_aliases", []),
+            sse_keepalive_mode=data.get("sse_keepalive_mode", "chunk"),
         )
 
 
@@ -237,6 +241,7 @@ class CacheSettings:
     """Cache configuration settings."""
 
     enabled: bool = True
+    hot_cache_only: bool = False
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
@@ -279,6 +284,7 @@ class CacheSettings:
         """Convert to dictionary."""
         return {
             "enabled": self.enabled,
+            "hot_cache_only": self.hot_cache_only,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
@@ -290,6 +296,7 @@ class CacheSettings:
         """Create from dictionary."""
         return cls(
             enabled=data.get("enabled", True),
+            hot_cache_only=data.get("hot_cache_only", False),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=data.get("hot_cache_max_size", "0"),
@@ -348,6 +355,24 @@ class MemorySettings:
         return cls(
             max_process_memory=data.get("max_process_memory", "auto"),
             prefill_memory_guard=data.get("prefill_memory_guard", True),
+        )
+
+
+@dataclass
+class ModelIdleTimeoutSettings:
+    """Idle timeout settings for automatic model unloading."""
+
+    idle_timeout_seconds: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {"idle_timeout_seconds": self.idle_timeout_seconds}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ModelIdleTimeoutSettings":
+        """Create from dictionary."""
+        return cls(
+            idle_timeout_seconds=data.get("idle_timeout_seconds"),
         )
 
 
@@ -454,6 +479,35 @@ class ModelScopeSettings:
     def from_dict(cls, data: dict[str, Any]) -> "ModelScopeSettings":
         """Create from dictionary."""
         return cls(endpoint=data.get("endpoint", ""))
+
+
+@dataclass
+class NetworkSettings:
+    """Network proxy and TLS trust settings."""
+
+    http_proxy: str = ""
+    https_proxy: str = ""
+    no_proxy: str = ""
+    ca_bundle: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "http_proxy": self.http_proxy,
+            "https_proxy": self.https_proxy,
+            "no_proxy": self.no_proxy,
+            "ca_bundle": self.ca_bundle,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "NetworkSettings":
+        """Create from dictionary."""
+        return cls(
+            http_proxy=data.get("http_proxy", ""),
+            https_proxy=data.get("https_proxy", ""),
+            no_proxy=data.get("no_proxy", ""),
+            ca_bundle=data.get("ca_bundle", ""),
+        )
 
 
 @dataclass
@@ -583,11 +637,12 @@ class ClaudeCodeSettings:
 
 @dataclass
 class IntegrationSettings:
-    """Other integrations settings (Codex, OpenCode, OpenClaw)."""
+    """Other integrations settings (Codex, OpenCode, OpenClaw, Pi)."""
 
     codex_model: str | None = None
     opencode_model: str | None = None
     openclaw_model: str | None = None
+    pi_model: str | None = None
     openclaw_tools_profile: str = "coding"
 
     def to_dict(self) -> dict[str, Any]:
@@ -596,6 +651,7 @@ class IntegrationSettings:
             "codex_model": self.codex_model,
             "opencode_model": self.opencode_model,
             "openclaw_model": self.openclaw_model,
+            "pi_model": self.pi_model,
             "openclaw_tools_profile": self.openclaw_tools_profile,
         }
 
@@ -606,6 +662,7 @@ class IntegrationSettings:
             codex_model=data.get("codex_model", None),
             opencode_model=data.get("opencode_model", None),
             openclaw_model=data.get("openclaw_model", None),
+            pi_model=data.get("pi_model", None),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
         )
 
@@ -632,11 +689,13 @@ class GlobalSettings:
     mcp: MCPSettings = field(default_factory=MCPSettings)
     huggingface: HuggingFaceSettings = field(default_factory=HuggingFaceSettings)
     modelscope: ModelScopeSettings = field(default_factory=ModelScopeSettings)
+    network: NetworkSettings = field(default_factory=NetworkSettings)
     sampling: SamplingSettings = field(default_factory=SamplingSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
+    idle_timeout: ModelIdleTimeoutSettings = field(default_factory=ModelIdleTimeoutSettings)
 
     @classmethod
     def load(
@@ -716,6 +775,8 @@ class GlobalSettings:
                 self.huggingface = HuggingFaceSettings.from_dict(data["huggingface"])
             if "modelscope" in data:
                 self.modelscope = ModelScopeSettings.from_dict(data["modelscope"])
+            if "network" in data:
+                self.network = NetworkSettings.from_dict(data["network"])
             if "sampling" in data:
                 self.sampling = SamplingSettings.from_dict(data["sampling"])
             if "logging" in data:
@@ -728,6 +789,8 @@ class GlobalSettings:
                 )
             if "ui" in data:
                 self.ui = UISettings.from_dict(data["ui"])
+            if "idle_timeout" in data:
+                self.idle_timeout = ModelIdleTimeoutSettings.from_dict(data["idle_timeout"])
 
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse settings file {path}: {e}")
@@ -778,6 +841,8 @@ class GlobalSettings:
             self.cache.ssd_cache_dir = ssd_cache_dir
         if ssd_cache_max := os.getenv("OMLX_SSD_CACHE_MAX_SIZE"):
             self.cache.ssd_cache_max_size = ssd_cache_max
+        if hot_cache_only := os.getenv("OMLX_HOT_CACHE_ONLY"):
+            self.cache.hot_cache_only = hot_cache_only.lower() in ("true", "1", "yes")
         if initial_blocks := os.getenv("OMLX_INITIAL_CACHE_BLOCKS"):
             try:
                 self.cache.initial_cache_blocks = int(initial_blocks)
@@ -802,6 +867,16 @@ class GlobalSettings:
         if ms_endpoint := os.getenv("OMLX_MS_ENDPOINT"):
             self.modelscope.endpoint = ms_endpoint
 
+        # Network settings
+        if http_proxy := os.getenv("OMLX_HTTP_PROXY"):
+            self.network.http_proxy = http_proxy
+        if https_proxy := os.getenv("OMLX_HTTPS_PROXY"):
+            self.network.https_proxy = https_proxy
+        if no_proxy := os.getenv("OMLX_NO_PROXY"):
+            self.network.no_proxy = no_proxy
+        if ca_bundle := os.getenv("OMLX_CA_BUNDLE"):
+            self.network.ca_bundle = ca_bundle
+
         # Logging settings
         if log_dir := os.getenv("OMLX_LOG_DIR"):
             self.logging.log_dir = log_dir
@@ -825,6 +900,8 @@ class GlobalSettings:
             self.server.port = args.port
         if hasattr(args, "log_level") and args.log_level is not None:
             self.server.log_level = args.log_level
+        if hasattr(args, "sse_keepalive_mode") and args.sse_keepalive_mode is not None:
+            self.server.sse_keepalive_mode = args.sse_keepalive_mode
 
         # Model settings
         if hasattr(args, "model_dir") and args.model_dir is not None:
@@ -877,6 +954,16 @@ class GlobalSettings:
         if hasattr(args, "ms_endpoint") and args.ms_endpoint is not None:
             self.modelscope.endpoint = args.ms_endpoint
 
+        # Network settings
+        if hasattr(args, "http_proxy") and args.http_proxy is not None:
+            self.network.http_proxy = args.http_proxy
+        if hasattr(args, "https_proxy") and args.https_proxy is not None:
+            self.network.https_proxy = args.https_proxy
+        if hasattr(args, "no_proxy") and args.no_proxy is not None:
+            self.network.no_proxy = args.no_proxy
+        if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
+            self.network.ca_bundle = args.ca_bundle
+
     def save(self) -> None:
         """Save current settings to the settings file."""
         self.ensure_directories()
@@ -893,11 +980,13 @@ class GlobalSettings:
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),
+            "network": self.network.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
+            "idle_timeout": self.idle_timeout.to_dict(),
         }
 
         try:
@@ -965,6 +1054,13 @@ class GlobalSettings:
             errors.append(
                 f"Invalid log_level: {self.server.log_level} "
                 f"(must be one of {valid_log_levels})"
+            )
+
+        valid_keepalive_modes = {"chunk", "comment", "off"}
+        if self.server.sse_keepalive_mode not in valid_keepalive_modes:
+            errors.append(
+                f"Invalid sse_keepalive_mode: {self.server.sse_keepalive_mode} "
+                f"(must be one of {valid_keepalive_modes})"
             )
 
         # Model validation
@@ -1067,6 +1163,22 @@ class GlobalSettings:
                     "(must start with http:// or https://)"
                 )
 
+        # Network proxy validation
+        if self.network.http_proxy:
+            proxy = self.network.http_proxy.strip()
+            if proxy and not proxy.startswith(("http://", "https://")):
+                errors.append(
+                    f"Invalid http_proxy: '{proxy}' "
+                    "(must start with http:// or https://)"
+                )
+        if self.network.https_proxy:
+            proxy = self.network.https_proxy.strip()
+            if proxy and not proxy.startswith(("http://", "https://")):
+                errors.append(
+                    f"Invalid https_proxy: '{proxy}' "
+                    "(must start with http:// or https://)"
+                )
+
         return errors
 
     def to_scheduler_config(self) -> SchedulerConfig:
@@ -1078,10 +1190,19 @@ class GlobalSettings:
         """
         from .scheduler import SchedulerConfig
 
+        # Always resolve ssd_dir so the scheduler can initialize PagedSSDCacheManager.
+        # When hot_cache_only=True, PagedSSDCacheManager skips directory init and
+        # the writer thread internally — the dir is not used for disk I/O.
+        ssd_dir = self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
+
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
             initial_cache_blocks=self.cache.initial_cache_blocks,
+            paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
+            hot_cache_only=self.cache.hot_cache_only,
+            paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(self.base_path),
+            hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1098,11 +1219,13 @@ class GlobalSettings:
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),
+            "network": self.network.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
+            "idle_timeout": self.idle_timeout.to_dict(),
         }
 
 

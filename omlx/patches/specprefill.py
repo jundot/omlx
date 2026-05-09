@@ -23,6 +23,7 @@ Design notes:
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -50,10 +51,15 @@ class _AttentionCapture:
         self._query_buffer = query_buffer
         self._query_extractor = query_extractor
 
-    def __call__(self, x, mask=None, cache=None):
-        queries = self._query_extractor(self._original, x, cache)
+    def __call__(self, x, mask=None, cache=None, **kwargs):
+        if kwargs and _accepts_extractor_kwargs(self._query_extractor, kwargs):
+            queries = self._query_extractor(self._original, x, cache, **kwargs)
+        else:
+            # Backward compatibility for custom extractors with the older
+            # (attn, x, cache) signature.
+            queries = self._query_extractor(self._original, x, cache)
         self._query_buffer[self._buf_idx].append(queries)
-        return self._original(x, mask=mask, cache=cache)
+        return self._original(x, mask=mask, cache=cache, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._original, name)
@@ -64,7 +70,30 @@ class _AttentionCapture:
 # ---------------------------------------------------------------------------
 
 
-def _qwen35_extract_queries(attn, x, cache=None):
+def _accepts_extractor_kwargs(extractor, kwargs) -> bool:
+    """Whether a query extractor accepts the supplied keyword arguments."""
+    try:
+        params = inspect.signature(extractor).parameters.values()
+    except (TypeError, ValueError):
+        return True
+
+    for param in params:
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+
+    accepted = {
+        param.name
+        for param in params
+        if param.kind
+        in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    }
+    return set(kwargs).issubset(accepted)
+
+
+def _qwen35_extract_queries(attn, x, cache=None, **kwargs):
     """Qwen3.5: gate split + q_norm + RoPE."""
     B, L, D = x.shape
     q_out = attn.q_proj(x)
@@ -79,8 +108,25 @@ def _qwen35_extract_queries(attn, x, cache=None):
     return queries
 
 
-def _llama_extract_queries(attn, x, cache=None):
-    """Standard transformer: q_proj + reshape + RoPE (Llama, Mistral, Gemma, GPT-OSS)."""
+def _qwen36_extract_queries(attn, x, cache=None, **kwargs):
+    """Qwen3.6 MoE / non-gated q_norm models: q_proj + q_norm + RoPE."""
+    B, L, _ = x.shape
+    n_heads = getattr(
+        attn,
+        "num_attention_heads",
+        getattr(attn, "n_heads", getattr(attn, "num_heads", None)),
+    )
+    queries = attn.q_proj(x).reshape(B, L, n_heads, -1)
+    queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
+    if cache is not None:
+        queries = attn.rope(queries, offset=cache.offset)
+    else:
+        queries = attn.rope(queries)
+    return queries
+
+
+def _llama_extract_queries(attn, x, cache=None, **kwargs):
+    """Standard transformer: q_proj + reshape + RoPE."""
     B, L, D = x.shape
     n_heads = getattr(
         attn,
@@ -96,7 +142,20 @@ def _llama_extract_queries(attn, x, cache=None):
     return queries
 
 
-def _nemotron_h_extract_queries(attn, x, cache=None):
+def _gemma4_extract_queries(attn, x, cache=None, offset=None, **kwargs):
+    """Gemma 4: q_proj + per-head q_norm + RoPE with shared-KV offset support."""
+    B, L, D = x.shape
+    n_heads = getattr(attn, "n_heads", getattr(attn, "num_attention_heads", None))
+    queries = attn.q_proj(x).reshape(B, L, n_heads, -1)
+    queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
+    rope_offset = (
+        offset if offset is not None else (cache.offset if cache is not None else 0)
+    )
+    queries = attn.rope(queries, offset=rope_offset)
+    return queries
+
+
+def _nemotron_h_extract_queries(attn, x, cache=None, **kwargs):
     """Nemotron-H: q_proj only, no RoPE (content-based attention)."""
     B, L, D = x.shape
     queries = attn.q_proj(x).reshape(B, L, attn.num_heads, -1).transpose(0, 2, 1, 3)
@@ -143,7 +202,19 @@ def _build_layer_to_cache_map(model) -> Dict[int, int]:
     """Build layer_idx → cache_idx mapping.
 
     Standard models: identity. Nemotron-H: compacted (only M/* layers).
+    Gemma 4: shared-KV layers reuse earlier caches via previous_kvs, which
+    lives on Gemma4TextModel — reachable at ``.model`` for the text
+    model or ``.language_model.model`` for the VLM wrapper.
     """
+    for root in (
+        getattr(getattr(model, "language_model", None), "model", None),
+        getattr(model, "model", None),
+        model,
+    ):
+        previous_kvs = getattr(root, "previous_kvs", None)
+        if previous_kvs is not None:
+            return dict(enumerate(previous_kvs))
+
     has_block_type = any(hasattr(layer, "block_type") for layer in model.layers)
     if not has_block_type:
         return {i: i for i in range(len(model.layers))}
@@ -158,12 +229,87 @@ def _build_layer_to_cache_map(model) -> Dict[int, int]:
     return layer_to_cache
 
 
+def _linear_output_dims(linear) -> Optional[int]:
+    """Best-effort output dimension lookup for Linear / QuantizedLinear layers."""
+    if linear is None:
+        return None
+    if hasattr(linear, "out_features"):
+        return getattr(linear, "out_features")
+    if hasattr(linear, "output_dims"):
+        return getattr(linear, "output_dims")
+    weight = getattr(linear, "weight", None)
+    if weight is not None and getattr(weight, "shape", None):
+        return weight.shape[0]
+    return None
+
+
+def _uses_gated_q_proj(attn_obj) -> bool:
+    """Detect Qwen-style gated q_proj layout from projection dimensions."""
+    n_heads = getattr(
+        attn_obj,
+        "num_attention_heads",
+        getattr(attn_obj, "n_heads", getattr(attn_obj, "num_heads", None)),
+    )
+    head_dim = getattr(attn_obj, "head_dim", None)
+    q_out = _linear_output_dims(getattr(attn_obj, "q_proj", None))
+    if None in (n_heads, head_dim, q_out):
+        return False
+    return q_out == 2 * n_heads * head_dim
+
+
+def _uses_non_gated_q_norm(attn_obj) -> bool:
+    """Detect Qwen3.6-style attention: per-head RMSNorm on q, no gate split.
+
+    Matches when q_norm has weight shape (head_dim,) and q_proj outputs
+    n_heads * head_dim. Filters out olmo-style flat q_norm and cohere-style
+    LayerNorm2D, whose q_norm.weight.shape[0] does not equal head_dim.
+    """
+    q_norm = getattr(attn_obj, "q_norm", None)
+    if q_norm is None:
+        return False
+    q_norm_weight = getattr(q_norm, "weight", None)
+    if q_norm_weight is None:
+        return False
+    shape = getattr(q_norm_weight, "shape", None)
+    if not shape:
+        return False
+    q_norm_dim = shape[0]
+
+    n_heads = getattr(
+        attn_obj,
+        "num_attention_heads",
+        getattr(attn_obj, "n_heads", getattr(attn_obj, "num_heads", None)),
+    )
+    q_out = _linear_output_dims(getattr(attn_obj, "q_proj", None))
+    if not n_heads or q_out is None:
+        return False
+    return q_out == n_heads * q_norm_dim
+
+
+def _is_gemma4_attention(attn_obj) -> bool:
+    """Detect Gemma 4 attention by its shared-KV / offset call contract."""
+    if not hasattr(attn_obj, "q_norm") or not hasattr(attn_obj, "rope"):
+        return False
+    call = getattr(attn_obj, "__call__", None)
+    if call is None:
+        return False
+    try:
+        params = inspect.signature(call).parameters
+    except (TypeError, ValueError):
+        return False
+    return "shared_kv" in params and "offset" in params
+
+
 def _detect_query_extractor(attn_obj) -> Callable:
     """Auto-detect the appropriate query extractor for the model architecture."""
-    if hasattr(attn_obj, "q_norm"):
+    if _uses_gated_q_proj(attn_obj):
         return _qwen35_extract_queries
+    elif _is_gemma4_attention(attn_obj):
+        return _gemma4_extract_queries
     elif not hasattr(attn_obj, "rope"):
         return _nemotron_h_extract_queries
+    elif _uses_non_gated_q_norm(attn_obj):
+        return _qwen36_extract_queries
     else:
         return _llama_extract_queries
 
@@ -198,25 +344,34 @@ def _unpatch_attention_capture(model, originals):
         _set_attn_module(model.layers[layer_idx], orig)
 
 
-def _prefill_draft(model, tokens, cache, step_size=2048):
+def _prefill_draft(model, tokens, cache, step_size=2048, progress_callback=None):
     """Prefill draft model with all prompt tokens. Returns last logits."""
     prompt = mx.array(tokens) if not isinstance(tokens, mx.array) else tokens
     n = len(tokens)
     processed = 0
     while n - processed > 1:
         chunk = min(step_size, n - processed - 1)
+        if progress_callback is not None:
+            # Mark the chunk as active before the MLX eval without advancing
+            # completed-token progress. Advancing here makes tok/s math lie
+            # because the expensive work has not finished yet.
+            progress_callback(processed, n)
         model(prompt[processed : processed + chunk][None], cache=cache)
         mx.eval([c.state for c in cache])
         processed += chunk
+        if progress_callback is not None:
+            progress_callback(processed, n)
         mx.clear_cache()
     logits = model(prompt[processed:][None], cache=cache)
     mx.eval(logits)
+    if progress_callback is not None:
+        progress_callback(n, n)
     return logits
 
 
 def _lookahead_decode(model, first_logits, cache, n_steps, temp=0.6, top_p=0.95):
     """Run n_steps autoregressive decode, capturing queries via patched attention."""
-    from mlx_lm.sample_utils import make_sampler
+    from ..utils.sampling import make_sampler
 
     sampler = make_sampler(temp=temp, top_p=top_p)
     y = sampler(first_logits[:, -1, :])
@@ -300,6 +455,7 @@ def score_tokens(
     prefill_step_size: int = 2048,
     query_extractor: Optional[Callable] = None,
     existing_cache: Optional[List[Any]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Tuple[mx.array, Any]:
     """Score token importance using attention patterns on a draft model.
 
@@ -352,14 +508,34 @@ def score_tokens(
         cached_len = cache[0].offset if hasattr(cache[0], "offset") else 0
         suffix = tokens[cached_len:]
         if suffix:
-            logits = _prefill_draft(model, suffix, cache, step_size=prefill_step_size)
+            logits = _prefill_draft(
+                model,
+                suffix,
+                cache,
+                step_size=prefill_step_size,
+                progress_callback=(
+                    (lambda processed, total: progress_callback(cached_len + processed, n_prompt, "scoring"))
+                    if progress_callback is not None
+                    else None
+                ),
+            )
         else:
             # Exact cache hit — run last token to get logits
             logits = model(mx.array([tokens[-1]])[None], cache=cache)
             mx.eval(logits)
     else:
         cache = make_prompt_cache(model)
-        logits = _prefill_draft(model, tokens, cache, step_size=prefill_step_size)
+        logits = _prefill_draft(
+            model,
+            tokens,
+            cache,
+            step_size=prefill_step_size,
+            progress_callback=(
+                (lambda processed, total: progress_callback(processed, total, "scoring"))
+                if progress_callback is not None
+                else None
+            ),
+        )
 
     # Record cache offset before lookahead so we can trim afterwards.
     # Lookahead decode appends n_lookahead+1 tokens to the cache which
@@ -372,6 +548,8 @@ def score_tokens(
         model, query_buffer, query_extractor
     )
     try:
+        if progress_callback is not None:
+            progress_callback(n_prompt, n_prompt, "lookahead")
         _lookahead_decode(model, logits, cache, n_lookahead, temp=temp, top_p=top_p)
         mx.eval(query_buffer)
     finally:
@@ -389,6 +567,8 @@ def score_tokens(
         pool_kernel=pool_kernel if pool_kernel > 0 else None,
     )
     mx.eval(importance)
+    if progress_callback is not None:
+        progress_callback(n_prompt, n_prompt, "importance")
 
     # Trim lookahead tokens from cache before returning.
     # KVCache stores keys/values as contiguous tensors; slicing back
@@ -407,7 +587,9 @@ def score_tokens(
     return importance, cache
 
 
-def select_chunks(importance: mx.array, keep_pct: float = 0.3, chunk_size: int = 32) -> mx.array:
+def select_chunks(
+    importance: mx.array, keep_pct: float = 0.3, chunk_size: int = 32
+) -> mx.array:
     """Select top-K% token chunks by average importance.
 
     Args:
@@ -499,6 +681,13 @@ def manual_rope_with_freqs(x, positions, dims, freqs, pre_scale=1.0):
 # ---------------------------------------------------------------------------
 
 
+def _scalar_offset(offset) -> int:
+    """Coerce scalar RoPE offset to int (Gemma4 wraps cache.offset in mx.array)."""
+    if isinstance(offset, mx.array):
+        return int(offset.item())
+    return int(offset)
+
+
 class _PositionMappedRoPE:
     """Applies RoPE at non-contiguous positions during sparse prefill.
 
@@ -509,7 +698,7 @@ class _PositionMappedRoPE:
     def __init__(self, original_rope, all_positions, cache_start=0):
         self._original = original_rope
         self._all_positions = all_positions
-        self._cache_start = cache_start
+        self._cache_start = _scalar_offset(cache_start)
         self._has_custom_freqs = hasattr(original_rope, "_freqs")
 
         if self._has_custom_freqs:
@@ -523,7 +712,7 @@ class _PositionMappedRoPE:
 
     def __call__(self, x, offset=0):
         L = x.shape[2]
-        idx = offset - self._cache_start
+        idx = _scalar_offset(offset) - self._cache_start
         positions = self._all_positions[idx : idx + L]
         if self._has_custom_freqs:
             return manual_rope_with_freqs(
@@ -577,6 +766,7 @@ def sparse_prefill(
     cache,
     step_size: int = 2048,
     position_offset: int = 0,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> mx.array:
     """Prefill model cache with selected tokens at their original positions.
 
@@ -657,14 +847,23 @@ def sparse_prefill(
 
         while n - processed > 1:
             chunk = min(step_size, n - processed - 1)
+            if progress_callback is not None:
+                # Surface that work is active before the potentially long
+                # target-model eval returns, but don't advance completed-token
+                # progress until the eval has actually finished.
+                progress_callback(processed, n)
             model(prompt[processed : processed + chunk][None], cache=cache)
             mx.eval([c.state for c in cache])
             processed += chunk
+            if progress_callback is not None:
+                progress_callback(processed, n)
             mx.clear_cache()
 
         # Last token -> logits
         logits = model(prompt[processed:][None], cache=cache)
         mx.eval(logits)
+        if progress_callback is not None:
+            progress_callback(n, n)
 
     finally:
         # Replace position-mapped RoPE with offset-adjusted RoPE for decode

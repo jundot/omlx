@@ -408,6 +408,37 @@ class TestExtractEmbeddingsArray:
         with pytest.raises(ValueError, match="expected embedding fields"):
             model._extract_embeddings_array(outputs)
 
+    def test_extract_text_embeds_3d_mean_pool(self):
+        """Per-token text_embeds (e.g. ModernBERT MaskedLM) should be mean pooled."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        outputs = MagicMock(spec=[])
+        # Shape (batch=1, seq_len=2, hidden=2). Mean over axis=1 → [[0.2, 0.3]].
+        outputs.text_embeds = mx.array([[[0.1, 0.2], [0.3, 0.4]]])
+        outputs.pooler_output = None
+        outputs.last_hidden_state = None
+
+        result = model._extract_embeddings_array(outputs)
+        mx.eval(result)
+        assert result.shape == (1, 2)
+        assert result.tolist()[0] == pytest.approx([0.2, 0.3])
+
+    def test_extract_pooler_output_3d_mean_pool(self):
+        """Per-token pooler_output should also be mean pooled to 2D."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        outputs = MagicMock(spec=[])
+        outputs.pooler_output = mx.ones((2, 4, 3))
+        outputs.last_hidden_state = None
+
+        result = model._extract_embeddings_array(outputs)
+        mx.eval(result)
+        assert result.shape == (2, 3)
+
 
 class TestEmbeddingCompileFallback:
     """Tests for embedding compile path fallback behavior."""
@@ -532,6 +563,44 @@ class TestEmbeddingCompileFallback:
         model.model.assert_called_once()
         assert result.embeddings[0] == pytest.approx([0.3, 0.4, 0.5], abs=1e-5)
 
+    def test_custom_processor_eager_path_remaps_input_ids_for_inputs_signature(self):
+        """Models that accept `inputs` instead of `input_ids` should still work."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        class InputsOnlyModel:
+            def __call__(self, inputs, attention_mask=None):
+                assert inputs.tolist() == [[4, 5, 6]]
+                assert attention_mask.tolist() == [[1, 1, 1]]
+
+                outputs = MagicMock(spec=[])
+                outputs.text_embeds = mx.array([[0.7, 0.8, 0.9]])
+                outputs.pooler_output = None
+                outputs.last_hidden_state = None
+                return outputs
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = InputsOnlyModel()
+        model._detect_input_key_remapping()
+
+        processor = MagicMock(spec=[])
+        processor.prepare_embedding_inputs = MagicMock(
+            return_value={
+                "input_ids": mx.array([[4, 5, 6]]),
+                "attention_mask": mx.array([[1, 1, 1]]),
+            }
+        )
+        model.processor = processor
+
+        with patch("mlx_embeddings.generate") as mock_generate:
+            result = model.embed(["hello world"])
+
+        mock_generate.assert_not_called()
+        assert result.embeddings[0] == pytest.approx([0.7, 0.8, 0.9], abs=1e-5)
+
     def test_custom_processor_receives_image_items_unchanged(self):
         """Custom processors should receive raw image strings unchanged."""
         import mlx.core as mx
@@ -634,7 +703,7 @@ class TestEmbeddingEngine:
 
             asyncio.run(engine.start())
 
-            MockModel.assert_called_once_with("test-model")
+            MockModel.assert_called_once_with("test-model", trust_remote_code=False)
             mock_model.load.assert_called_once()
 
             asyncio.run(engine.stop())
@@ -725,6 +794,30 @@ class TestEmbeddingEngine:
 
             assert engine.processor is mock_model.processor
             assert engine.hidden_size == 384
+
+    def test_engine_clears_metal_cache_after_embed(self):
+        """Metal cache should be cleared after the last active embed request (#684)."""
+        import asyncio
+        from omlx.engine.embedding import EmbeddingEngine
+        from omlx.models.embedding import EmbeddingOutput
+
+        engine = EmbeddingEngine("test-model")
+
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
+             patch("omlx.engine.embedding.mx") as mock_mx:
+            mock_model = MagicMock()
+            mock_model.embed.return_value = EmbeddingOutput(
+                embeddings=[[0.1, 0.2]],
+                total_tokens=5,
+                dimensions=2,
+            )
+            MockModel.return_value = mock_model
+
+            asyncio.run(engine.start())
+            asyncio.run(engine.embed(["Hello"]))
+
+            mock_mx.synchronize.assert_called()
+            mock_mx.clear_cache.assert_called()
 
 
 class TestEmbeddingModelsPydantic:

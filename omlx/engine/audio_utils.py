@@ -2,13 +2,49 @@
 """Shared utilities for audio engines (STT, TTS, STS)."""
 
 import io
+import struct
 import wave
 
 import numpy as np
 
-
 # Default sample rate used when the model does not report one.
 DEFAULT_SAMPLE_RATE = 24000
+_MAX_WAV_CHUNK_SIZE = 0xFFFFFFFF
+
+
+def wav_header(sample_rate: int, channels: int = 1, sample_width: int = 2) -> bytes:
+    """Create a PCM WAV header suitable for streamed/unknown-length audio."""
+    block_align = channels * sample_width
+    byte_rate = sample_rate * block_align
+    bits_per_sample = sample_width * 8
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        _MAX_WAV_CHUNK_SIZE,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,  # PCM
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        _MAX_WAV_CHUNK_SIZE,
+    )
+
+
+
+def wav_bytes_to_pcm_frames(wav_bytes: bytes) -> tuple[int, int, int, bytes]:
+    """Extract WAV metadata and raw PCM frames from WAV bytes."""
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        sample_rate = wf.getframerate()
+        channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        pcm_bytes = wf.readframes(wf.getnframes())
+    return sample_rate, channels, sample_width, pcm_bytes
+
 
 
 def audio_to_wav_bytes(audio_array, sample_rate: int) -> bytes:

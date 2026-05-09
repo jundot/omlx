@@ -9,9 +9,11 @@ This module provides HTTP routes for the admin panel including:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -22,10 +24,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Literal
 
+import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .auth import (
     REMEMBER_ME_MAX_AGE,
@@ -34,10 +37,15 @@ from .auth import (
     require_admin,
     validate_api_key,
     verify_api_key,
+    verify_session,
 )
 from ..settings import SubKeyEntry
+from ..model_profiles import EXCLUDED_FROM_PROFILES
+from ..utils.release_check import select_latest_stable_release
 
 logger = logging.getLogger(__name__)
+
+PRESET_REMOTE_URL = "https://omlx.ai/assets/omlx_preset.json"
 
 
 # =============================================================================
@@ -72,6 +80,22 @@ class DeleteSubKeyRequest(BaseModel):
     key: str
 
 
+class CacheProbeRequest(BaseModel):
+    """Request model for probing per-prompt cache state.
+
+    Tokenizes a chat message list with the target model's tokenizer, then
+    classifies each block's location in the cache hierarchy:
+    - Hot SSD (in-RAM copy of SSD cache, ready to mount without disk read)
+    - Disk SSD (persisted only, needs disk read to reuse)
+    - Cold (fully uncached — would require full prefill)
+    """
+
+    model_id: str
+    messages: List[Dict[str, Any]]
+    tools: Optional[List[Dict[str, Any]]] = None
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
+
+
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
@@ -91,6 +115,7 @@ class ModelSettingsRequest(BaseModel):
     forced_ct_kwargs: Optional[list[str]] = None
     ttl_seconds: Optional[int] = None
     index_cache_freq: Optional[int] = None
+    enable_thinking: Optional[bool] = None
     thinking_budget_enabled: Optional[bool] = None
     thinking_budget_tokens: Optional[int] = None
     # TurboQuant KV cache (mlx-vlm backend)
@@ -101,9 +126,58 @@ class ModelSettingsRequest(BaseModel):
     specprefill_draft_model: Optional[str] = None
     specprefill_keep_pct: Optional[float] = None
     specprefill_threshold: Optional[int] = None
+    # DFlash (block diffusion speculative decoding)
+    dflash_enabled: Optional[bool] = None
+    dflash_draft_model: Optional[str] = None
+    dflash_draft_quant_bits: Optional[int] = None
+    dflash_max_ctx: Optional[int] = None
+    dflash_in_memory_cache: Optional[bool] = None
+    dflash_in_memory_cache_max_entries: Optional[int] = None
+    dflash_in_memory_cache_max_bytes: Optional[int] = None
+    dflash_ssd_cache: Optional[bool] = None
+    # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
+    mtp_enabled: Optional[bool] = None
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
+    # Security: per-model opt-in for trust_remote_code (issue #926)
+    trust_remote_code: Optional[bool] = None
+
+
+class CreateProfileRequest(BaseModel):
+    """Request body for creating a per-model profile."""
+    name: str
+    display_name: str
+    description: Optional[str] = None
+    settings: Dict[str, Any] = Field(default_factory=dict)
+    also_save_as_template: bool = False
+    source_template: Optional[str] = None
+
+
+class UpdateProfileRequest(BaseModel):
+    """Request body for updating/renaming a per-model profile."""
+    new_name: Optional[str] = None
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    settings: Optional[Dict[str, Any]] = None
+    source_template: Optional[str] = None
+    also_save_as_template: bool = False
+
+
+class CreateTemplateRequest(BaseModel):
+    """Request body for creating a global template."""
+    name: str
+    display_name: str
+    description: Optional[str] = None
+    settings: Dict[str, Any] = Field(default_factory=dict)
+
+
+class UpdateTemplateRequest(BaseModel):
+    """Request body for updating/renaming a global template."""
+    new_name: Optional[str] = None
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    settings: Optional[Dict[str, Any]] = None
 
 
 class GlobalSettingsRequest(BaseModel):
@@ -113,6 +187,8 @@ class GlobalSettingsRequest(BaseModel):
     host: Optional[str] = None
     port: Optional[int] = None
     log_level: Optional[str] = None
+    server_aliases: Optional[List[str]] = None
+    sse_keepalive_mode: Optional[str] = None
 
     # Model settings
     model_dirs: Optional[List[str]] = None
@@ -131,6 +207,7 @@ class GlobalSettingsRequest(BaseModel):
     cache_enabled: Optional[bool] = None
     ssd_cache_dir: Optional[str] = None
     ssd_cache_max_size: Optional[str] = None
+    hot_cache_only: Optional[bool] = None
     hot_cache_max_size: Optional[str] = None  # "0" = disabled, "8GB", etc.
     initial_cache_blocks: Optional[int] = None  # Starting blocks (requires restart)
 
@@ -142,6 +219,12 @@ class GlobalSettingsRequest(BaseModel):
 
     # ModelScope settings
     ms_endpoint: Optional[str] = None
+
+    # Network settings
+    network_http_proxy: Optional[str] = None
+    network_https_proxy: Optional[str] = None
+    network_no_proxy: Optional[str] = None
+    network_ca_bundle: Optional[str] = None
 
     # Sampling defaults
     sampling_max_context_window: Optional[int] = None
@@ -163,10 +246,14 @@ class GlobalSettingsRequest(BaseModel):
     integrations_codex_model: Optional[str] = None
     integrations_opencode_model: Optional[str] = None
     integrations_openclaw_model: Optional[str] = None
+    integrations_pi_model: Optional[str] = None
     integrations_openclaw_tools_profile: Optional[Literal["minimal", "coding", "messaging", "full"]] = None
 
     # UI settings
     ui_language: Optional[str] = None
+
+    # Idle timeout settings. null disables the global fallback.
+    idle_timeout_seconds: Optional[int] = Field(default=None, ge=60)
 
     # Auth settings
     api_key: Optional[str] = None
@@ -207,6 +294,8 @@ class OQStartRequest(BaseModel):
     group_size: int = 64
     sensitivity_model_path: str = ""
     text_only: bool = False
+    dtype: str = "bfloat16"
+    preserve_mtp: bool = False
 
 
 class HFUploadRequest(BaseModel):
@@ -239,6 +328,109 @@ def _format_cache_size(size_bytes: int) -> str:
         return f"{gb:.0f}GB"
     mb = size_bytes / (1024 ** 2)
     return f"{mb:.0f}MB"
+
+
+def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
+    """Resolve dflash compatibility for an engine_pool model dict.
+
+    Returns ``(False, "")`` when dflash-mlx is not installed so the UI hides
+    the compat hint instead of pointing the user at an unrelated reason.
+    """
+    try:
+        from ..engine.dflash import is_dflash_compatible
+    except ImportError:
+        return False, ""
+    model_path = model_info.get("model_path") or ""
+    if not model_path:
+        return False, "model_path missing"
+    return is_dflash_compatible(model_path)
+
+
+def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
+    """Mirror of ``_dflash_compat_for_model`` for the native MTP toggle.
+
+    Returns ``(compatible, reason)``. Reason is empty on success and
+    suitable for surfacing to users (admin UI shows it under the toggle).
+
+    The check is conservative: even when the config declares MTP layers
+    we also peek at the safetensors weight index to verify that the
+    converter actually preserved the ``mtp.*`` tensors. Default mlx-lm
+    converters strip them; PR 990 ships a separate path that keeps them.
+    """
+    import json
+    from pathlib import Path
+
+    from ..utils.model_loading import _has_mtp_heads, _is_mtp_compatible
+
+    model_path = model_info.get("model_path") or ""
+    if not model_path:
+        return False, "model_path missing"
+    cfg_path = Path(model_path) / "config.json"
+    if not cfg_path.exists():
+        return False, "config.json not found"
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except Exception as e:
+        return False, f"failed to read config: {e}"
+    model_type = cfg.get("model_type")
+    if not _has_mtp_heads(cfg):
+        return False, "model has no MTP heads in config"
+    if not _is_mtp_compatible(cfg, model_type):
+        return False, (
+            f"model_type={model_type!r} is not on the MTP whitelist "
+            "(supported: qwen3_5*, qwen3_6*, deepseek_v4*)"
+        )
+    if not _model_has_mtp_weight_tensors(Path(model_path)):
+        return False, (
+            "Config declares MTP layers but the converted weights are missing "
+            "mtp.* tensors. Re-convert from HF with a converter that preserves "
+            "MTP weights."
+        )
+    return True, ""
+
+
+def _model_has_mtp_weight_tensors(model_dir) -> bool:
+    """Return True iff the model directory's weight files contain ``mtp.*`` keys.
+
+    Uses ``model.safetensors.index.json`` when present (cheap — only reads
+    the weight_map). Falls back to opening each ``*.safetensors`` and
+    checking its keys when no index is present (single-shard models).
+    Returns False on any error (we treat the model as incompatible rather
+    than risking a confusing load failure mid-inference).
+    """
+    import json
+    from pathlib import Path
+
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        # Library should be installed via mlx-lm deps; if it's not we can't
+        # peek the weights. Stay conservative and assume incompatible.
+        return False
+
+    model_dir = Path(model_dir)
+
+    # Preferred path: read the index file's weight_map (no tensor data loaded).
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            index = json.loads(index_path.read_text())
+            weight_map = index.get("weight_map", {})
+            return any("mtp." in key for key in weight_map.keys())
+        except Exception:
+            return False
+
+    # Single-shard fallback: enumerate keys via safe_open metadata. We
+    # short-circuit on the first ``mtp.*`` key.
+    for path in model_dir.glob("*.safetensors"):
+        try:
+            with safe_open(str(path), framework="numpy") as f:  # type: ignore[arg-type]
+                for key in f.keys():
+                    if "mtp." in key:
+                        return True
+        except Exception:
+            continue
+    return False
 
 
 def _apply_log_level_runtime(level: str) -> None:
@@ -898,11 +1090,10 @@ async def login_page(request: Request):
 
     global_settings = _get_global_settings()
 
-    # Skip login page when skip_api_key_verification is enabled on localhost
+    # Skip login page when skip_api_key_verification is enabled
     if (
         global_settings is not None
         and global_settings.auth.skip_api_key_verification
-        and global_settings.server.host == "127.0.0.1"
     ):
         return RedirectResponse(url="/admin/dashboard", status_code=302)
 
@@ -1244,6 +1435,72 @@ async def delete_sub_key(
 
 
 # =============================================================================
+# Grammar API Routes
+# =============================================================================
+
+
+_SUPPORTED_MODELS_DOC_RE = re.compile(
+    r"Supported models:\s*\n((?:\s*-\s*\S.*\n?)+)",
+)
+
+
+def _models_from_docstring(fn) -> List[str]:
+    """Extract the ``Supported models:`` bullet list from an xgrammar 0.1.34+
+    structural-tag function's docstring. Returns ``[]`` if the section is
+    absent or unparseable."""
+    doc = inspect.getdoc(fn) or ""
+    match = _SUPPORTED_MODELS_DOC_RE.search(doc)
+    if not match:
+        return []
+    return [
+        line.strip().lstrip("-").strip()
+        for line in match.group(1).splitlines()
+        if line.strip().startswith("-")
+    ]
+
+
+@router.get("/api/grammar/parsers")
+async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
+    """Return available reasoning parser names from xgrammar.
+
+    Supports both API generations:
+
+    - **xgrammar 0.1.34+** exposes a per-model registry at
+      ``xgrammar.builtin_structural_tag._structural_tag_registry``; supported
+      model names are pulled from each function's docstring.
+    - **xgrammar 0.1.32–0.1.33** exposes the now-removed helper
+      ``get_builtin_structural_tag_supported_models()``.
+
+    Returns ``[]`` if xgrammar is missing, fails to load (e.g. broken native
+    binding on macOS arm64), or has neither API available.
+    """
+    # Prefer the 0.1.34+ registry so newer parsers (qwen3_6, gemma4,
+    # deepseek_v4, ...) are exposed.
+    try:
+        from xgrammar.builtin_structural_tag import _structural_tag_registry
+
+        return [
+            {"value": style, "label": style, "models": _models_from_docstring(fn)}
+            for style, fn in _structural_tag_registry.items()
+        ]
+    except Exception as e:
+        logger.debug("xgrammar 0.1.34+ registry unavailable: %s", e)
+
+    # Fall back to the pre-0.1.34 helper.
+    try:
+        from xgrammar import get_builtin_structural_tag_supported_models
+
+        supported = get_builtin_structural_tag_supported_models()
+        return [
+            {"value": style, "label": style, "models": models}
+            for style, models in supported.items()
+        ]
+    except Exception as e:
+        logger.warning("xgrammar parser discovery unavailable: %s", e)
+        return []
+
+
+# =============================================================================
 # Models API Routes
 # =============================================================================
 
@@ -1276,11 +1533,23 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     # Get all model settings
     all_settings = settings_manager.get_all_settings() if settings_manager else {}
 
+    # SSD cache dir is set on the scheduler_config when the user enables paged
+    # SSD caching; admin UI consumes it to gate the dflash SSD toggle.
+    ssd_cache_dir = getattr(
+        getattr(engine_pool, "_scheduler_config", None),
+        "paged_ssd_cache_dir",
+        None,
+    )
+    dflash_ssd_cache_available = bool(ssd_cache_dir)
+
     # Combine model info with settings
     models = []
     for model_info in models_status:
         model_id = model_info["id"]
         settings = all_settings.get(model_id)
+
+        compat_ok, compat_reason = _dflash_compat_for_model(model_info)
+        mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
 
         model_data = {
             "id": model_id,
@@ -1294,7 +1563,14 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),
+            "thinking_default": model_info.get("thinking_default"),
+            "preserve_thinking_default": model_info.get("preserve_thinking_default"),
             "last_access": model_info.get("last_access"),
+            "dflash_compatible": compat_ok,
+            "dflash_compatibility_reason": compat_reason,
+            "dflash_ssd_cache_available": dflash_ssd_cache_available,
+            "mtp_compatible": mtp_compat_ok,
+            "mtp_compatibility_reason": mtp_compat_reason,
         }
 
         # Add settings if available
@@ -1312,6 +1588,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "presence_penalty": settings.presence_penalty,
                 "force_sampling": settings.force_sampling,
                 "max_tool_result_tokens": settings.max_tool_result_tokens,
+                "enable_thinking": settings.enable_thinking,
                 "thinking_budget_enabled": settings.thinking_budget_enabled,
                 "thinking_budget_tokens": settings.thinking_budget_tokens,
                 "reasoning_parser": settings.reasoning_parser,
@@ -1325,10 +1602,21 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "specprefill_draft_model": settings.specprefill_draft_model,
                 "specprefill_keep_pct": settings.specprefill_keep_pct,
                 "specprefill_threshold": settings.specprefill_threshold,
+                "dflash_enabled": settings.dflash_enabled,
+                "dflash_draft_model": settings.dflash_draft_model,
+                "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
+                "dflash_max_ctx": settings.dflash_max_ctx,
+                "dflash_in_memory_cache": settings.dflash_in_memory_cache,
+                "dflash_in_memory_cache_max_entries": settings.dflash_in_memory_cache_max_entries,
+                "dflash_in_memory_cache_max_bytes": settings.dflash_in_memory_cache_max_bytes,
+                "dflash_ssd_cache": settings.dflash_ssd_cache,
+                "mtp_enabled": settings.mtp_enabled,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
+                "trust_remote_code": settings.trust_remote_code,
                 "display_name": settings.display_name,
                 "description": settings.description,
+                "active_profile_name": settings.active_profile_name,
             }
 
         models.append(model_data)
@@ -1357,10 +1645,41 @@ async def unload_model(
     return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
 
 
+async def _require_admin_or_bearer(request: Request) -> bool:
+    """Allow admin session OR a valid Bearer API key (for CLI use)."""
+    gs = _get_global_settings() if _get_global_settings else None
+
+    # No-auth mode: always allow
+    if gs is not None and gs.auth.skip_api_key_verification:
+        return True
+
+    # Valid admin session cookie
+    if verify_session(request):
+        return True
+
+    # Bearer token matching the configured API key
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer ") and gs is not None:
+        token = auth_header[7:]
+        server_key = gs.auth.api_key or ""
+        sub_keys = gs.auth.sub_keys or []
+        if verify_api_key(token, server_key):
+            return True
+        for sk in sub_keys:
+            if verify_api_key(token, getattr(sk, "key", "")):
+                return True
+
+    raise HTTPException(
+        status_code=401,
+        detail="Admin authentication required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 @router.post("/api/models/{model_id}/load")
 async def load_model(
     model_id: str,
-    is_admin: bool = Depends(require_admin),
+    is_admin: bool = Depends(_require_admin_or_bearer),
 ):
     """Manually load a model into memory."""
     engine_pool = _get_engine_pool()
@@ -1509,6 +1828,8 @@ async def update_model_settings(
         current_settings.max_tool_result_tokens = (
             request.max_tool_result_tokens if request.max_tool_result_tokens and request.max_tool_result_tokens > 0 else None
         )
+    if "enable_thinking" in sent:
+        current_settings.enable_thinking = request.enable_thinking
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = request.thinking_budget_enabled or False
     if "thinking_budget_tokens" in sent:
@@ -1542,6 +1863,135 @@ async def update_model_settings(
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
         current_settings.specprefill_threshold = request.specprefill_threshold or None
+    # DFlash settings
+    if "dflash_enabled" in sent:
+        new_dflash_enabled = bool(request.dflash_enabled)
+        if new_dflash_enabled:
+            from ..engine.dflash import is_dflash_compatible
+
+            compat_ok, compat_reason = is_dflash_compatible(entry.model_path)
+            if not compat_ok:
+                raise HTTPException(status_code=400, detail=compat_reason)
+        current_settings.dflash_enabled = new_dflash_enabled
+    if "dflash_draft_model" in sent:
+        current_settings.dflash_draft_model = request.dflash_draft_model or None
+    if "dflash_draft_quant_bits" in sent:
+        current_settings.dflash_draft_quant_bits = request.dflash_draft_quant_bits or None
+    if "dflash_max_ctx" in sent:
+        # 0/None means "unlimited" — the engine treats None as no fallback threshold
+        value = request.dflash_max_ctx
+        current_settings.dflash_max_ctx = value if value and value > 0 else None
+    if "dflash_in_memory_cache" in sent:
+        current_settings.dflash_in_memory_cache = bool(request.dflash_in_memory_cache)
+    if "dflash_in_memory_cache_max_entries" in sent:
+        value = request.dflash_in_memory_cache_max_entries
+        current_settings.dflash_in_memory_cache_max_entries = (
+            int(value) if value and value > 0 else 4
+        )
+    if "dflash_in_memory_cache_max_bytes" in sent and request.dflash_in_memory_cache_max_bytes:
+        current_settings.dflash_in_memory_cache_max_bytes = int(
+            request.dflash_in_memory_cache_max_bytes
+        )
+    if "dflash_ssd_cache" in sent:
+        ssd_requested = bool(request.dflash_ssd_cache)
+        if ssd_requested:
+            in_mem_after = (
+                bool(request.dflash_in_memory_cache)
+                if "dflash_in_memory_cache" in sent
+                else current_settings.dflash_in_memory_cache
+            )
+            if not in_mem_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail="DFlash SSD cache requires the in-memory cache to be enabled.",
+                )
+            ssd_dir = getattr(
+                getattr(_get_engine_pool(), "_scheduler_config", None),
+                "paged_ssd_cache_dir",
+                None,
+            )
+            if not ssd_dir:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "DFlash SSD cache requires oMLX paged SSD cache to be enabled "
+                        "(set --paged-ssd-cache-dir or configure it in settings)."
+                    ),
+                )
+        current_settings.dflash_ssd_cache = ssd_requested
+
+    # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
+    if "mtp_enabled" in sent:
+        new_mtp_enabled = bool(request.mtp_enabled)
+        if new_mtp_enabled:
+            # Compatibility check: the model needs MTP heads in config.json AND
+            # the model_type must be one PR 990 / PR 15 covers AND the weight
+            # files must actually contain mtp.* tensors. The last check is
+            # the one that catches mlx-community converted weights where the
+            # default sanitize path stripped the MTP heads.
+            from ..utils.model_loading import _is_mtp_compatible
+            import json
+            from pathlib import Path
+
+            cfg_path = Path(entry.model_path) / "config.json"
+            if not cfg_path.exists():
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"MTP enabled but config.json missing at {cfg_path}; "
+                        "cannot verify MTP compatibility."
+                    ),
+                )
+            try:
+                cfg = json.loads(cfg_path.read_text())
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"MTP enabled but failed to read model config: {e}",
+                )
+            model_type = cfg.get("model_type")
+            if not _is_mtp_compatible(cfg, model_type):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Model is not MTP-compatible (model_type={model_type!r}, "
+                        f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
+                        "Native MTP requires Qwen3.5/3.6 or DeepSeek-V4 with MTP heads."
+                    ),
+                )
+            if not _model_has_mtp_weight_tensors(Path(entry.model_path)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Config declares MTP layers but the converted weights are "
+                        "missing mtp.* tensors. Re-convert from HF with a converter "
+                        "that preserves MTP weights. The default "
+                        "mlx-lm sanitize() path strips them."
+                    ),
+                )
+            # Mutual exclusion with DFlash / TurboQuant — ModelSettings.__post_init__
+            # also enforces this, but we surface a clearer error here.
+            dflash_after = (
+                bool(request.dflash_enabled)
+                if "dflash_enabled" in sent
+                else current_settings.dflash_enabled
+            )
+            if dflash_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
+                )
+            tq_after = (
+                bool(request.turboquant_kv_enabled)
+                if "turboquant_kv_enabled" in sent
+                else current_settings.turboquant_kv_enabled
+            )
+            if tq_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail="MTP and TurboQuant KV cannot both be enabled; TurboQuant patches the attention path MTP relies on.",
+                )
+        current_settings.mtp_enabled = new_mtp_enabled
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -1554,23 +2004,94 @@ async def update_model_settings(
         # Update server_state.default_model if setting as default
         if request.is_default and server_state:
             server_state.default_model = model_id
+    if "trust_remote_code" in sent:
+        current_settings.trust_remote_code = bool(request.trust_remote_code)
+
+    # If an active profile was set, clear it when the user's save diverges
+    # from the profile's stored values.  Only compare fields present in
+    # both the profile and the current settings — new fields in the model
+    # settings that the profile doesn't have are silently merged in, and
+    # removed fields (no longer in the profile) are skipped.
+    if current_settings.active_profile_name:
+        profile = settings_manager.get_profile(
+            model_id, current_settings.active_profile_name
+        )
+        if profile is None:
+            current_settings.active_profile_name = None
+        else:
+            profile_settings = profile.get("settings", {}) or {}
+            candidate = current_settings.to_dict()
+            diverged = False
+            for key, expected in profile_settings.items():
+                # Profile None means "unconstrained" — candidate.to_dict()
+                # drops None, so treat profile None as no constraint to
+                # keep the comparison symmetric.
+                if expected is None:
+                    continue
+                if key not in candidate:
+                    diverged = True
+                    break
+                if candidate[key] != expected:
+                    diverged = True
+                    break
+            if diverged:
+                current_settings.active_profile_name = None
+            else:
+                new_fields = {
+                    k: v for k, v in candidate.items()
+                    if k not in profile_settings and k not in EXCLUDED_FROM_PROFILES
+                }
+                if new_fields:
+                    profile_settings.update(new_fields)
+                    profile["settings"] = profile_settings
+                    settings_manager.update_profile(
+                        model_id,
+                        current_settings.active_profile_name,
+                        settings=profile_settings,
+                    )
 
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
 
-    # Warn if engine type or index_cache_freq changed while model is loaded
+    # Auto-unload (and re-load if pinned) when a setting that only takes
+    # effect at engine construction time is changed on a loaded model.
     requires_reload = (
         entry.engine is not None
         and (
             ("model_type_override" in sent and entry.engine_type != prev_engine_type)
             or "index_cache_freq" in sent
+            or "dflash_enabled" in sent
+            or "dflash_draft_model" in sent
+            or "dflash_draft_quant_bits" in sent
+            or "dflash_max_ctx" in sent
+            or "dflash_in_memory_cache" in sent
+            or "dflash_in_memory_cache_max_entries" in sent
+            or "dflash_in_memory_cache_max_bytes" in sent
+            or "dflash_ssd_cache" in sent
+            # trust_remote_code is plumbed at model load time; toggling it on
+            # an already-loaded engine has no effect until reload.
+            or "trust_remote_code" in sent
         )
     )
+    auto_unloaded = False
+    auto_reloaded = False
     if requires_reload:
-        logger.info(
-            f"Settings changed for loaded model {model_id}. "
-            f"Reload required to take effect."
-        )
+        was_pinned = entry.is_pinned
+        try:
+            logger.info(
+                f"Settings changed for loaded model {model_id}, auto-unloading."
+            )
+            await engine_pool._unload_engine(model_id)
+            auto_unloaded = True
+        except Exception as e:
+            logger.warning(f"Auto-unload failed for {model_id}: {e}")
+        if auto_unloaded and was_pinned:
+            try:
+                await engine_pool._load_engine(model_id)
+                auto_reloaded = True
+                logger.info(f"Auto-reloaded pinned model {model_id} with new settings.")
+            except Exception as e:
+                logger.warning(f"Auto-reload failed for pinned model {model_id}: {e}")
 
     return {
         "success": True,
@@ -1579,7 +2100,256 @@ async def update_model_settings(
         "model_type": entry.model_type,
         "engine_type": entry.engine_type,
         "requires_reload": requires_reload,
+        "auto_unloaded": auto_unloaded,
+        "auto_reloaded": auto_reloaded,
     }
+
+
+# =============================================================================
+# Profile & Template endpoints
+# =============================================================================
+
+
+def _require_settings_manager():
+    mgr = _get_settings_manager()
+    if mgr is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    return mgr
+
+
+def _require_model(model_id: str):
+    pool = _get_engine_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    entry = pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    return entry
+
+
+@router.get("/api/models/{model_id}/profiles")
+async def list_model_profiles(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    return {"profiles": mgr.list_profiles(model_id)}
+
+
+@router.post("/api/models/{model_id}/profiles")
+async def create_model_profile(
+    model_id: str,
+    request: CreateProfileRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    from ..model_profiles import InvalidProfileNameError, filter_universal_fields
+
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    try:
+        profile = mgr.save_profile(
+            model_id=model_id,
+            name=request.name,
+            display_name=request.display_name,
+            description=request.description,
+            settings=request.settings or {},
+            source_template=request.source_template,
+        )
+    except InvalidProfileNameError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    if request.also_save_as_template:
+        try:
+            mgr.upsert_template(
+                name=request.name,
+                display_name=request.display_name,
+                description=request.description,
+                settings=filter_universal_fields(request.settings or {}),
+            )
+        except InvalidProfileNameError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    return {"profile": profile}
+
+
+@router.put("/api/models/{model_id}/profiles/{name}")
+async def update_model_profile(
+    model_id: str,
+    name: str,
+    request: UpdateProfileRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    from ..model_profiles import InvalidProfileNameError, filter_universal_fields
+
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    try:
+        updated = mgr.update_profile(
+            model_id=model_id,
+            name=name,
+            new_name=request.new_name,
+            display_name=request.display_name,
+            description=request.description,
+            settings=request.settings,
+            source_template=request.source_template,
+        )
+    except InvalidProfileNameError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+
+    if request.also_save_as_template and request.settings is not None:
+        try:
+            mgr.upsert_template(
+                name=updated["name"],
+                display_name=updated["display_name"],
+                description=updated.get("description"),
+                settings=filter_universal_fields(request.settings),
+            )
+        except InvalidProfileNameError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    return {"profile": updated}
+
+
+@router.delete("/api/models/{model_id}/profiles/{name}")
+async def delete_model_profile(
+    model_id: str,
+    name: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    if not mgr.delete_profile(model_id, name):
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    return {"deleted": True, "name": name}
+
+
+@router.post("/api/models/{model_id}/profiles/{name}/apply")
+async def apply_model_profile(
+    model_id: str,
+    name: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    applied = mgr.apply_profile(model_id, name)
+    if applied is None:
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    return {"model_id": model_id, "settings": applied.to_dict()}
+
+
+@router.get("/api/profile-fields")
+async def get_profile_fields(is_admin: bool = Depends(require_admin)):
+    from ..model_profiles import (
+        UNIVERSAL_PROFILE_FIELDS,
+        MODEL_SPECIFIC_PROFILE_FIELDS,
+    )
+
+    return {
+        "universal": list(UNIVERSAL_PROFILE_FIELDS),
+        "model_specific": list(MODEL_SPECIFIC_PROFILE_FIELDS),
+    }
+
+
+@router.get("/api/profile-templates")
+async def list_templates(is_admin: bool = Depends(require_admin)):
+    mgr = _require_settings_manager()
+    return {"templates": mgr.list_templates()}
+
+
+@router.post("/api/profile-templates")
+async def create_template(
+    request: CreateTemplateRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    from ..model_profiles import InvalidProfileNameError
+
+    mgr = _require_settings_manager()
+    try:
+        tmpl = mgr.save_template(
+            name=request.name,
+            display_name=request.display_name,
+            description=request.description,
+            settings=request.settings or {},
+        )
+    except InvalidProfileNameError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"template": tmpl}
+
+
+@router.put("/api/profile-templates/{name}")
+async def update_template(
+    name: str,
+    request: UpdateTemplateRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    from ..model_profiles import InvalidProfileNameError
+
+    mgr = _require_settings_manager()
+    try:
+        updated = mgr.update_template(
+            name=name,
+            new_name=request.new_name,
+            display_name=request.display_name,
+            description=request.description,
+            settings=request.settings,
+        )
+    except InvalidProfileNameError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Template not found: {name}")
+    return {"template": updated}
+
+
+@router.delete("/api/profile-templates/{name}")
+async def delete_template(
+    name: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    if not mgr.delete_template(name):
+        raise HTTPException(status_code=404, detail=f"Template not found: {name}")
+    return {"deleted": True, "name": name}
+
+
+# =============================================================================
+# Preset refresh (proxy to omlx.ai to avoid CORS)
+# =============================================================================
+
+
+@router.post("/api/presets/refresh")
+async def refresh_presets(is_admin: bool = Depends(require_admin)):
+    """Fetch the latest preset bundle from omlx.ai and return it.
+
+    The client uses this instead of fetching omlx.ai directly so we do not
+    depend on CORS headers on the remote host. Any failure is surfaced as 502
+    so the client can silently fall back to the bundled presets.
+    """
+    try:
+        resp = await asyncio.to_thread(
+            requests.get,
+            PRESET_REMOTE_URL,
+            timeout=10,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Fetch failed: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Remote returned {resp.status_code}",
+        )
+    try:
+        return resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Invalid JSON: {e}")
 
 
 @router.get("/api/models/{model_id}/generation_config")
@@ -1684,6 +2454,40 @@ async def get_generation_config(
 # =============================================================================
 
 
+@router.get("/api/server-info")
+async def get_server_info(is_admin: bool = Depends(require_admin)):
+    """Return server connectivity metadata for the dashboard.
+
+    Provides the configured host, port, and the list of user-facing
+    aliases (hostnames/IPs) that the dashboard can use to render
+    selectable API URL hints.
+
+    Returns:
+        JSON object with ``host``, ``port``, and ``aliases``.
+
+    Raises:
+        HTTPException: 401 if not authenticated, 503 if server not initialized.
+    """
+    from ..utils.network import detect_server_aliases
+
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    configured = list(global_settings.server.server_aliases)
+    if configured:
+        aliases = configured
+    else:
+        # Fall back to live detection if persisted list is empty.
+        aliases = detect_server_aliases(host=global_settings.server.host)
+
+    return {
+        "host": global_settings.server.host,
+        "port": global_settings.server.port,
+        "aliases": aliases,
+    }
+
+
 @router.get("/api/global-settings")
 async def get_global_settings(is_admin: bool = Depends(require_admin)):
     """
@@ -1718,6 +2522,8 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "host": global_settings.server.host,
             "port": global_settings.server.port,
             "log_level": global_settings.server.log_level,
+            "server_aliases": list(global_settings.server.server_aliases),
+            "sse_keepalive_mode": global_settings.server.sse_keepalive_mode,
         },
         "model": {
             "model_dirs": [
@@ -1741,6 +2547,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "ssd_cache_max_size": _format_cache_size(
                 global_settings.cache.get_ssd_cache_max_size_bytes(global_settings.base_path)
             ),
+            "hot_cache_only": global_settings.cache.hot_cache_only,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
         },
@@ -1752,6 +2559,12 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "modelscope": {
             "endpoint": global_settings.modelscope.endpoint,
+        },
+        "network": {
+            "http_proxy": global_settings.network.http_proxy,
+            "https_proxy": global_settings.network.https_proxy,
+            "no_proxy": global_settings.network.no_proxy,
+            "ca_bundle": global_settings.network.ca_bundle,
         },
         "sampling": {
             "max_context_window": global_settings.sampling.max_context_window,
@@ -1779,6 +2592,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "codex_model": global_settings.integrations.codex_model,
             "opencode_model": global_settings.integrations.opencode_model,
             "openclaw_model": global_settings.integrations.openclaw_model,
+            "pi_model": global_settings.integrations.pi_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
         },
         "system": {
@@ -1790,6 +2604,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "ui": {
             "language": global_settings.ui.language,
+        },
+        "idle_timeout": {
+            "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
         },
     }
 
@@ -1829,9 +2646,6 @@ async def update_global_settings(
     # Apply server settings
     if request.host is not None:
         global_settings.server.host = request.host
-        # Reset skip_api_key_verification when host is not localhost
-        if request.host != "127.0.0.1":
-            global_settings.auth.skip_api_key_verification = False
     if request.port is not None:
         global_settings.server.port = request.port
     if request.log_level is not None:
@@ -1839,6 +2653,40 @@ async def update_global_settings(
         # Apply log level at runtime
         _apply_log_level_runtime(request.log_level)
         runtime_applied.append("log_level")
+    if request.sse_keepalive_mode is not None:
+        valid_modes = {"chunk", "comment", "off"}
+        if request.sse_keepalive_mode not in valid_modes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid sse_keepalive_mode: {request.sse_keepalive_mode} "
+                f"(must be one of {sorted(valid_modes)})",
+            )
+        global_settings.server.sse_keepalive_mode = request.sse_keepalive_mode
+        runtime_applied.append("sse_keepalive_mode")
+
+    if request.server_aliases is not None:
+        from ..utils.network import is_valid_alias
+
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for alias in request.server_aliases:
+            if not isinstance(alias, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid server alias: each alias must be a string",
+                )
+            value = alias.strip()
+            if not value or value in seen:
+                continue
+            if not is_valid_alias(value):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid server alias: {value!r} (must be a hostname or IP address)",
+                )
+            seen.add(value)
+            cleaned.append(value)
+        global_settings.server.server_aliases = cleaned
+        runtime_applied.append("server_aliases")
 
     # Apply model settings
     new_dirs = None
@@ -1934,6 +2782,8 @@ async def update_global_settings(
     if request.ssd_cache_max_size is not None:
         global_settings.cache.ssd_cache_max_size = request.ssd_cache_max_size
         cache_changed = True
+    if request.hot_cache_only is not None:
+        global_settings.cache.hot_cache_only = request.hot_cache_only
     if request.hot_cache_max_size is not None:
         global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
         cache_changed = True
@@ -1983,6 +2833,52 @@ async def update_global_settings(
             f"ModelScope endpoint updated to: "
             f"{request.ms_endpoint or '(default)'}"
         )
+
+    # Apply network settings (Live - immediately applied via env vars)
+    network_changed = False
+    if request.network_http_proxy is not None:
+        global_settings.network.http_proxy = request.network_http_proxy
+        if request.network_http_proxy:
+            os.environ["HTTP_PROXY"] = request.network_http_proxy
+            os.environ["http_proxy"] = request.network_http_proxy
+        else:
+            os.environ.pop("HTTP_PROXY", None)
+            os.environ.pop("http_proxy", None)
+        network_changed = True
+
+    if request.network_https_proxy is not None:
+        global_settings.network.https_proxy = request.network_https_proxy
+        if request.network_https_proxy:
+            os.environ["HTTPS_PROXY"] = request.network_https_proxy
+            os.environ["https_proxy"] = request.network_https_proxy
+        else:
+            os.environ.pop("HTTPS_PROXY", None)
+            os.environ.pop("https_proxy", None)
+        network_changed = True
+
+    if request.network_no_proxy is not None:
+        global_settings.network.no_proxy = request.network_no_proxy
+        if request.network_no_proxy:
+            os.environ["NO_PROXY"] = request.network_no_proxy
+            os.environ["no_proxy"] = request.network_no_proxy
+        else:
+            os.environ.pop("NO_PROXY", None)
+            os.environ.pop("no_proxy", None)
+        network_changed = True
+
+    if request.network_ca_bundle is not None:
+        global_settings.network.ca_bundle = request.network_ca_bundle
+        if request.network_ca_bundle:
+            os.environ["REQUESTS_CA_BUNDLE"] = request.network_ca_bundle
+            os.environ["SSL_CERT_FILE"] = request.network_ca_bundle
+        else:
+            os.environ.pop("REQUESTS_CA_BUNDLE", None)
+            os.environ.pop("SSL_CERT_FILE", None)
+        network_changed = True
+
+    if network_changed:
+        runtime_applied.append("network")
+        logger.info("Network settings updated")
 
     # Apply sampling settings (Live - immediately applied)
     sampling_changed = False
@@ -2074,6 +2970,9 @@ async def update_global_settings(
             request.integrations_openclaw_model
         )
         integrations_changed = True
+    if "integrations_pi_model" in request.model_fields_set:
+        global_settings.integrations.pi_model = request.integrations_pi_model
+        integrations_changed = True
     if "integrations_openclaw_tools_profile" in request.model_fields_set:
         global_settings.integrations.openclaw_tools_profile = (
             request.integrations_openclaw_tools_profile
@@ -2086,7 +2985,8 @@ async def update_global_settings(
             f"Integration settings updated: "
             f"codex={global_settings.integrations.codex_model}, "
             f"opencode={global_settings.integrations.opencode_model}, "
-            f"openclaw={global_settings.integrations.openclaw_model}"
+            f"openclaw={global_settings.integrations.openclaw_model}, "
+            f"pi={global_settings.integrations.pi_model}"
         )
 
     # Apply UI settings
@@ -2095,6 +2995,17 @@ async def update_global_settings(
         runtime_applied.append("ui_language")
         _refresh_i18n_globals()
         logger.info(f"UI language changed to: {request.ui_language}")
+
+    # Apply idle timeout settings (Live)
+    # Use model_fields_set to distinguish "explicitly sent as null" (disable)
+    # from "not sent" (don't touch).
+    if "idle_timeout_seconds" in request.model_fields_set:
+        global_settings.idle_timeout.idle_timeout_seconds = request.idle_timeout_seconds
+        runtime_applied.append("idle_timeout_seconds")
+        if request.idle_timeout_seconds:
+            logger.info(f"Idle timeout set to: {request.idle_timeout_seconds}s")
+        else:
+            logger.info("Idle timeout disabled")
 
     # Apply auth settings (API key change)
     if request.api_key is not None:
@@ -2110,11 +3021,7 @@ async def update_global_settings(
         logger.info("API key updated via admin settings")
 
     if request.skip_api_key_verification is not None:
-        # Only allow enabling when host is localhost
-        if request.skip_api_key_verification and global_settings.server.host != "127.0.0.1":
-            global_settings.auth.skip_api_key_verification = False
-        else:
-            global_settings.auth.skip_api_key_verification = request.skip_api_key_verification
+        global_settings.auth.skip_api_key_verification = request.skip_api_key_verification
         runtime_applied.append("skip_api_key_verification")
 
     # Validate settings
@@ -2475,6 +3382,24 @@ def _build_runtime_cache_observability(
         elif not isinstance(ssd_stats, dict):
             ssd_stats = {}
 
+        ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+        scheduler_model_name = getattr(getattr(scheduler, "config", None), "model_name", "")
+        if ssd_manager is not None and hasattr(ssd_manager, "get_stats_for_model"):
+            try:
+                scoped_ssd_stats = ssd_manager.get_stats_for_model(
+                    scheduler_model_name or model_id
+                )
+                if is_dataclass(scoped_ssd_stats):
+                    ssd_stats = asdict(scoped_ssd_stats)
+                elif isinstance(scoped_ssd_stats, dict):
+                    ssd_stats = scoped_ssd_stats
+            except Exception as exc:
+                logger.warning(
+                    "Failed to collect model-scoped SSD cache stats for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+
         prefix_stats = runtime_stats.get("prefix_cache")
         if is_dataclass(prefix_stats):
             prefix_stats = asdict(prefix_stats)
@@ -2564,10 +3489,12 @@ async def get_server_stats(
         model: Filter by model ID. Empty string returns global aggregate.
         scope: "session" for current session, "alltime" for persisted totals.
     """
+    from ..server import resolve_model_id
     from ..server_metrics import get_server_metrics
 
     metrics = get_server_metrics()
-    snapshot = metrics.get_snapshot(model_id=model, scope=scope)
+    resolved_model = resolve_model_id(model) or model if model else ""
+    snapshot = metrics.get_snapshot(model_id=resolved_model, scope=scope)
 
     global_settings = _get_global_settings()
     host = global_settings.server.host if global_settings else "127.0.0.1"
@@ -2622,6 +3549,7 @@ def _build_active_models_data() -> dict:
             "total_waiting_requests": 0,
         }
 
+    now = time.monotonic()
     tracker = get_prefill_tracker()
     status = engine_pool.get_status()
     models = []
@@ -2635,6 +3563,10 @@ def _build_active_models_data() -> dict:
         model_id = model_info["id"]
         active_requests = 0
         waiting_requests = 0
+        running_by_id = {}
+        waiting_ids = set()
+        waiting = []
+        activities = []
 
         # Get per-model active/waiting request counts.
         # Follow the same pattern as server.py /api/status endpoint.
@@ -2646,20 +3578,90 @@ def _build_active_models_data() -> dict:
                 core = getattr(async_core, "engine", None)
                 if core is not None:
                     collectors = getattr(core, "_output_collectors", {})
-                    active_request_ids = set(collectors.keys())
-                    active_requests = len(collectors)
+                    try:
+                        active_request_ids = set(collectors.keys())
+                        active_requests = len(collectors)
+                    except RuntimeError:
+                        # Scheduler state is mutated from the engine executor;
+                        # keep the dashboard endpoint best-effort rather than
+                        # failing on a concurrent dict resize.
+                        active_request_ids = set()
+                        active_requests = len(collectors)
+
                     sched = getattr(core, "scheduler", None)
-                    if sched is not None:
-                        waiting_requests = len(getattr(sched, "waiting", []))
+                    if sched is not None and hasattr(sched, "snapshot_for_admin"):
+                        snap = sched.snapshot_for_admin()
+                        running_by_id = snap["running_by_id"]
+                        waiting_queue = snap["waiting"]
+                        waiting_requests = len(waiting_queue)
+                        waiting_ids = {req.request_id for req in waiting_queue}
+                        waiting = [
+                            {
+                                "request_id": req.request_id,
+                                "queue_position": idx,
+                                "elapsed_seconds": max(0.0, now - req.arrival_time),
+                                "prompt_tokens": getattr(req, "num_prompt_tokens", 0),
+                            }
+                            for idx, req in enumerate(waiting_queue, start=1)
+                        ]
+            elif hasattr(entry.engine, "get_activity_snapshot"):
+                snapshot = entry.engine.get_activity_snapshot()
+                active_requests = snapshot.get("active_requests", 0)
+                activities = snapshot.get("activities", [])
 
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
 
-        # Generating = active requests that finished prefill
-        generating = [
-            {"request_id": rid}
-            for rid in sorted(active_request_ids - prefilling_ids)
-        ]
+        # Generating = active requests that finished prefill.
+        generating = []
+        for rid in sorted(active_request_ids - prefilling_ids - waiting_ids):
+            req = running_by_id.get(rid)
+            generated_tokens = getattr(req, "num_output_tokens", 0) if req else 0
+            started_at = getattr(req, "generation_started_at", None) if req else None
+            last_activity_at = getattr(req, "last_activity_at", None) if req else None
+            elapsed = max(0.0, now - started_at) if started_at else None
+            last_activity_age = (
+                max(0.0, now - last_activity_at) if last_activity_at else None
+            )
+            tokens_per_second = (
+                generated_tokens / elapsed if elapsed and elapsed > 0 else 0.0
+            )
+            generating.append(
+                {
+                    "request_id": rid,
+                    "elapsed_seconds": elapsed,
+                    "generated_tokens": generated_tokens,
+                    "tokens_per_second": tokens_per_second,
+                    "last_activity_age_seconds": last_activity_age,
+                    "prompt_tokens": getattr(req, "num_prompt_tokens", 0) if req else 0,
+                    "max_tokens": getattr(req, "max_tokens", None) if req else None,
+                }
+            )
+
+        loading_started_at = model_info.get("loading_started_at")
+        loading_elapsed_seconds = (
+            max(0.0, now - loading_started_at) if loading_started_at else None
+        )
+        loading_estimated_seconds = None
+        loading_remaining_seconds_estimate = None
+        if loading_elapsed_seconds is not None:
+            estimated_size_gb = model_info.get("estimated_size", 0) / (1024 ** 3)
+            # Model loaders do not expose byte-level progress, so use a
+            # deliberately conservative elapsed-time estimate and cap below
+            # complete until the model is actually loaded.
+            observed_seconds_per_gb = status.get("load_seconds_per_gb_estimate")
+            observations = status.get("load_time_observations", 0)
+            if observed_seconds_per_gb and observations >= 2:
+                # Adapt to this machine/session once we have more than a
+                # single potentially-misleading sample.
+                loading_estimated_seconds = max(
+                    3.0,
+                    1.0 + estimated_size_gb * float(observed_seconds_per_gb),
+                )
+                if loading_elapsed_seconds < loading_estimated_seconds:
+                    loading_remaining_seconds_estimate = max(
+                        0.0, loading_estimated_seconds - loading_elapsed_seconds
+                    )
 
         models.append({
             "id": model_id,
@@ -2669,8 +3671,13 @@ def _build_active_models_data() -> dict:
             ),
             "pinned": model_info.get("pinned", False),
             "is_loading": model_info.get("is_loading", False),
+            "loading_elapsed_seconds": loading_elapsed_seconds,
+            "loading_estimated_seconds": loading_estimated_seconds,
+            "loading_remaining_seconds_estimate": loading_remaining_seconds_estimate,
             "active_requests": active_requests,
             "waiting_requests": waiting_requests,
+            "waiting": waiting,
+            "activities": activities,
             "prefilling": prefilling,
             "generating": generating,
         })
@@ -2770,6 +3777,187 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 
     return {"status": "ok", "total_deleted": total_deleted}
+
+
+@router.post("/api/cache/probe")
+async def probe_cache(
+    request: CacheProbeRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Probe cache state for a chat message list.
+
+    Classifies each block of the rendered prompt into one of three buckets:
+    - ``blocks_ssd_hot``: in the SSD manager's hot cache (RAM copy of cold
+      blocks, ready to mount without disk read)
+    - ``blocks_ssd_disk``: only in the SSD index on disk
+    - ``blocks_cold``: not cached anywhere (requires full prefill)
+
+    The split is computed via a walk of the chain-hashed block sequence — the
+    same hashing the scheduler uses at prefill time. The model must be loaded
+    for the probe to run; unloaded models return ``model_loaded: false``.
+    """
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    entry = engine_pool._entries.get(request.model_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model not found: {request.model_id}"
+        )
+    if entry.engine is None:
+        return {
+            "model_id": request.model_id,
+            "model_loaded": False,
+            "reason": "Model is not loaded — load it to enable cache probing.",
+        }
+
+    engine = entry.engine
+    tokenizer = getattr(engine, "_tokenizer", None)
+    if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+        raise HTTPException(
+            status_code=400,
+            detail="Model tokenizer does not support chat templating.",
+        )
+
+    # Reach into the scheduler to access the prefix index and SSD manager.
+    async_core = getattr(engine, "_engine", None)
+    core = getattr(async_core, "engine", None) if async_core is not None else None
+    scheduler = getattr(core, "scheduler", None) if core is not None else None
+    if scheduler is None:
+        raise HTTPException(
+            status_code=500, detail="Scheduler unavailable for loaded model."
+        )
+
+    prefix_cache = getattr(scheduler, "block_aware_cache", None)
+    ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+    paged_cache = getattr(scheduler, "paged_cache_manager", None)
+    block_size = getattr(
+        getattr(scheduler, "config", None), "paged_cache_block_size", 0
+    )
+    if not block_size and prefix_cache is not None:
+        block_size = getattr(prefix_cache, "block_size", 0)
+    if not block_size:
+        raise HTTPException(
+            status_code=500,
+            detail="Cache block size unavailable — cache may not be enabled.",
+        )
+
+    # Render + tokenize the prompt using the same path as generation so the
+    # hashes line up with what the scheduler would produce at prefill.
+    try:
+        messages = request.messages
+        if hasattr(engine, "_preprocess_messages"):
+            messages = engine._preprocess_messages(messages)
+        try:
+            from ..api.tool_calling import convert_tools_for_template  # type: ignore
+            template_tools = (
+                convert_tools_for_template(request.tools) if request.tools else None
+            )
+        except Exception:
+            template_tools = request.tools or None
+        if hasattr(engine, "_apply_chat_template"):
+            prompt = engine._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=request.chat_template_kwargs,
+            )
+        else:
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        token_ids = list(tokenizer.encode(prompt))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Failed to tokenize messages: {exc}"
+        )
+
+    total_tokens = len(token_ids)
+    if total_tokens == 0:
+        return {
+            "model_id": request.model_id,
+            "model_loaded": True,
+            "total_tokens": 0,
+            "block_size": block_size,
+            "total_blocks": 0,
+            "blocks_ssd_hot": 0,
+            "blocks_ssd_disk": 0,
+            "blocks_cold": 0,
+            "ssd_hit_tokens": 0,
+            "cold_tokens": 0,
+        }
+
+    # Compute chain-hashed block sequence.
+    from ..cache.paged_cache import compute_block_hash
+
+    model_name = getattr(paged_cache, "model_name", None) if paged_cache else None
+    ssd_index = getattr(ssd_manager, "_index", None) if ssd_manager else None
+    ssd_hot = getattr(ssd_manager, "_hot_cache", None) if ssd_manager else None
+
+    # The cache is a contiguous prefix (each block chain-hashed from the
+    # previous), so we walk block-by-block until the first retrievability
+    # miss — after that, every subsequent block is necessarily cold.
+    #
+    # Ground truth for "cached" in paged-SSD mode is retrievability:
+    # hot_cache (RAM copy) OR ssd_index (on disk). BlockAwarePrefixCache's
+    # internal prefix index is deliberately NOT consulted — it tracks every
+    # hash the scheduler has seen and isn't cleared by clear_ssd_cache(),
+    # so relying on it would report false positives after a manual wipe.
+    blocks_ssd_hot = 0
+    blocks_ssd_disk = 0
+    ssd_hit_tokens = 0
+
+    parent_hash = b""
+    total_blocks = (total_tokens + block_size - 1) // block_size
+
+    for start in range(0, total_tokens, block_size):
+        end = min(start + block_size, total_tokens)
+        block_tokens = token_ids[start:end]
+        if not block_tokens:
+            break
+
+        block_hash = compute_block_hash(
+            parent_hash,
+            block_tokens,
+            extra_keys=None,
+            model_name=model_name,
+        )
+        parent_hash = block_hash
+
+        in_ssd_hot = ssd_hot is not None and block_hash in ssd_hot
+        in_ssd_disk = False
+        if ssd_index is not None:
+            try:
+                in_ssd_disk = ssd_index.contains(block_hash)
+            except Exception:
+                in_ssd_disk = False
+
+        if not (in_ssd_hot or in_ssd_disk):
+            break
+
+        if in_ssd_hot:
+            blocks_ssd_hot += 1
+        else:
+            blocks_ssd_disk += 1
+        ssd_hit_tokens += len(block_tokens)
+
+    cached_blocks = blocks_ssd_hot + blocks_ssd_disk
+    blocks_cold = max(total_blocks - cached_blocks, 0)
+
+    return {
+        "model_id": request.model_id,
+        "model_loaded": True,
+        "total_tokens": total_tokens,
+        "block_size": block_size,
+        "total_blocks": total_blocks,
+        "blocks_ssd_hot": blocks_ssd_hot,
+        "blocks_ssd_disk": blocks_ssd_disk,
+        "blocks_cold": blocks_cold,
+        "ssd_hit_tokens": ssd_hit_tokens,
+        "cold_tokens": max(total_tokens - ssd_hit_tokens, 0),
+    }
 
 
 # =============================================================================
@@ -2954,6 +4142,24 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
     model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
 
+    from ..model_discovery import _resolve_hf_cache_entry
+
+    def _add_model(model_path: Path, model_name: str) -> None:
+        if model_name in seen_names:
+            return
+        seen_names.add(model_name)
+        total_size = sum(
+            f.stat().st_size for f in model_path.rglob("*") if f.is_file()
+        )
+        models.append(
+            {
+                "name": model_name,
+                "path": str(model_path),
+                "size": total_size,
+                "size_formatted": format_size(total_size),
+            }
+        )
+
     models = []
     seen_names: set[str] = set()
     for model_dir in model_dirs:
@@ -2965,44 +4171,22 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
             if (subdir / "config.json").exists():
                 # Level 1: direct model folder
-                if subdir.name in seen_names:
-                    continue
-                seen_names.add(subdir.name)
-                total_size = sum(
-                    f.stat().st_size for f in subdir.rglob("*") if f.is_file()
-                )
-                models.append(
-                    {
-                        "name": subdir.name,
-                        "path": str(subdir),
-                        "size": total_size,
-                        "size_formatted": format_size(total_size),
-                    }
-                )
+                _add_model(subdir, subdir.name)
             else:
+                # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
+                hf_resolved = _resolve_hf_cache_entry(subdir)
+                if hf_resolved is not None:
+                    snapshot_path, model_name = hf_resolved
+                    if (snapshot_path / "config.json").exists():
+                        _add_model(snapshot_path, model_name)
+                    continue
+
                 # Level 2: organization folder — scan children
                 for child in sorted(subdir.iterdir()):
                     if not child.is_dir() or child.name.startswith("."):
                         continue
-                    if not (child / "config.json").exists():
-                        continue
-                    if child.name in seen_names:
-                        continue
-                    seen_names.add(child.name)
-
-                    total_size = sum(
-                        f.stat().st_size
-                        for f in child.rglob("*")
-                        if f.is_file()
-                    )
-                    models.append(
-                        {
-                            "name": child.name,
-                            "path": str(child),
-                            "size": total_size,
-                            "size_formatted": format_size(total_size),
-                        }
-                    )
+                    if (child / "config.json").exists():
+                        _add_model(child, child.name)
 
     return {"models": models}
 
@@ -3666,11 +4850,14 @@ async def check_update(
     }
 
     try:
-        import requests
-
+        # Use the releases list (not /releases/latest) and pick the highest
+        # stable PEP 440 tag. Dev/rc tags here have historically been
+        # published with the GitHub prerelease flag unset, which makes
+        # /releases/latest return them as if they were stable.
         resp = await asyncio.to_thread(
             requests.get,
-            "https://api.github.com/repos/jundot/omlx/releases/latest",
+            "https://api.github.com/repos/jundot/omlx/releases",
+            params={"per_page": 20},
             timeout=5,
         )
         if resp.status_code != 200:
@@ -3678,17 +4865,18 @@ async def check_update(
             _update_cache_time = now
             return _update_cache
 
-        data = resp.json()
+        data = select_latest_stable_release(resp.json())
+        if data is None:
+            _update_cache = no_update
+            _update_cache_time = now
+            return _update_cache
+
         latest = data["tag_name"].lstrip("v")
 
         try:
             from packaging.version import Version
 
-            latest_ver = Version(latest)
-            update_available = (
-                latest_ver > Version(_omlx_version)
-                and not latest_ver.is_prerelease
-            )
+            update_available = Version(latest) > Version(_omlx_version)
         except Exception:
             update_available = False
 
@@ -3729,6 +4917,7 @@ async def list_oq_models(is_admin: bool = Depends(require_admin)):
 async def estimate_oq(
     model_path: str,
     oq_level: float,
+    preserve_mtp: bool = False,
     is_admin: bool = Depends(require_admin),
 ):
     """Estimate effective bpw and output size for a model at given oQ level."""
@@ -3736,7 +4925,11 @@ async def estimate_oq(
 
     try:
         result = await asyncio.to_thread(
-            estimate_bpw_and_size, model_path, oq_level
+            estimate_bpw_and_size,
+            model_path,
+            oq_level,
+            64,  # group_size (default)
+            preserve_mtp,
         )
         return result
     except Exception as e:
@@ -3758,6 +4951,11 @@ async def start_oq_quantization(
             status_code=400,
             detail="Invalid oQ level. Must be 2, 3, 4, 5, 6, or 8",
         )
+    if request.dtype not in ("bfloat16", "float16"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid dtype. Must be 'bfloat16' or 'float16'",
+        )
     try:
         task = await _oq_manager.start_quantization(
             model_path=request.model_path,
@@ -3765,6 +4963,8 @@ async def start_oq_quantization(
             group_size=request.group_size,
             sensitivity_model_path=request.sensitivity_model_path,
             text_only=request.text_only,
+            dtype=request.dtype,
+            preserve_mtp=request.preserve_mtp,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

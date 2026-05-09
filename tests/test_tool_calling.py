@@ -6,20 +6,26 @@ Tests JSON schema validation, JSON extraction, and tool conversion functions.
 """
 
 import json
+import logging
 import pytest
 
 from unittest.mock import MagicMock
 
 from omlx.api.tool_calling import (
     ToolCallStreamFilter,
+    _gemma4_args_to_json_robust,
+    _parse_gemma4_tool_call_fallback,
+    _serialize_tool_call_arguments,
     build_json_system_prompt,
     convert_tools_for_template,
+    enrich_tool_params_for_gemma4,
     extract_json_from_text,
     extract_tool_calls_with_thinking,
     format_tool_call_for_message,
     parse_json_output,
     parse_tool_calls,
     parse_tool_calls_with_thinking_fallback,
+    restore_gemma4_param_names,
     validate_json_schema,
 )
 from omlx.api.openai_models import (
@@ -1080,6 +1086,123 @@ class TestParseToolCallsEmptyEndMarker:
         assert tool_calls is None or len(tool_calls) == 0
 
 
+class TestParseToolCallsSyntaxError:
+    """Regression tests for issue #882.
+
+    mlx-lm's qwen3_coder parser calls ast.literal_eval on parameter
+    values, which raises SyntaxError on non-Python-literal strings
+    (e.g. "python3 test.py" for an array-typed parameter). The
+    exception used to escape parse_tool_calls and turned into a
+    server_error SSE chunk, silently dropping the tool call.
+    """
+
+    def _qwen_tok(self, failing_parser):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = failing_parser
+        return tok
+
+    def test_syntax_error_does_not_escape(self):
+        """SyntaxError from native parser must not crash parse_tool_calls."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = self._qwen_tok(failing_parser)
+        text = (
+            "pre\n<tool_call>\n<function=shell>\n"
+            "<parameter=command>python3 test.py</parameter>\n"
+            "</function>\n</tool_call>\npost"
+        )
+        # Must not raise.
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        # XML fallback should have recovered the call.
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "shell"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"command": "python3 test.py"}
+
+    def test_qwen_xml_fallback_recovers_call(self):
+        """Qwen-style XML body recovers via _parse_xml_tool_calls on native failure."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = self._qwen_tok(failing_parser)
+        text = (
+            "<tool_call>\n<function=read>\n"
+            "<parameter=path>/etc/hosts</parameter>\n"
+            "<parameter=lines>10</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        _, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "read"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["path"] == "/etc/hosts"
+        assert args["lines"] == 10  # json.loads converts numeric string
+
+    def test_unparseable_body_logs_and_drops(self, caplog):
+        """Fully unparseable body drops gracefully and logs a warning."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = self._qwen_tok(failing_parser)
+        text = "<tool_call>not a function at all, just text</tool_call>"
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert tool_calls is None or len(tool_calls) == 0
+        # Warning emitted so failures are visible rather than silent.
+        assert any(
+            "Native tool parser failed" in r.message
+            and "SyntaxError" in r.message
+            for r in caplog.records
+        )
+
+    def test_type_error_also_caught(self):
+        """TypeError from native parser also must not escape."""
+
+        def failing_parser(text, tools):
+            raise TypeError("unexpected type during parse")
+
+        tok = self._qwen_tok(failing_parser)
+        text = (
+            "<tool_call>\n<function=patch>\n"
+            "<parameter=path>src/a.py</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        # Must not raise.
+        _, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "patch"
+
+    def test_gemma4_path_syntax_error_does_not_escape(self):
+        """Gemma 4 fallback branch also must not propagate SyntaxError."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<|tool_call>"
+        tok.tool_call_end = "<tool_call|>"
+        tok.tool_parser = failing_parser
+
+        text = "<|tool_call>garbage body<tool_call|>"
+        # Must not raise. Gemma 4 fallback will also fail on this body,
+        # but the outer code must still complete gracefully.
+        _, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is None or len(tool_calls) == 0
+
+
 class TestParseBracketToolCalls:
     """Tests for bracket-style tool call parsing (issue #159)."""
 
@@ -1356,3 +1479,451 @@ class TestParseToolCallsWithThinkingFallback:
         assert result.tool_calls is not None
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].function.name == "get_weather"
+
+
+# ---------------------------------------------------------------------------
+# Gemma 4 robust fallback parser tests
+# ---------------------------------------------------------------------------
+
+
+class TestGemma4ArgsToJsonRobust:
+    """Tests for _gemma4_args_to_json_robust()."""
+
+    def test_gemma4_delimiters(self):
+        result = _gemma4_args_to_json_robust('{query: <|"|>test search<|"|>}')
+        assert result == {"query": "test search"}
+
+    def test_bare_string_value(self):
+        result = _gemma4_args_to_json_robust("{location: Tokyo}")
+        assert result == {"location": "Tokyo"}
+
+    def test_bare_multiword_value(self):
+        result = _gemma4_args_to_json_robust("{city: New York}")
+        assert result == {"city": "New York"}
+
+    def test_numeric_value(self):
+        result = _gemma4_args_to_json_robust("{count: 5}")
+        assert result == {"count": 5}
+
+    def test_boolean_value(self):
+        result = _gemma4_args_to_json_robust("{verbose: true}")
+        assert result == {"verbose": True}
+
+    def test_null_value(self):
+        result = _gemma4_args_to_json_robust("{data: null}")
+        assert result == {"data": None}
+
+    def test_mixed_types(self):
+        result = _gemma4_args_to_json_robust(
+            '{query: <|"|>hello<|"|>, count: 5}'
+        )
+        assert result == {"query": "hello", "count": 5}
+
+    def test_standard_json_passthrough(self):
+        result = _gemma4_args_to_json_robust('{"query": "hello"}')
+        assert result == {"query": "hello"}
+
+    def test_empty_object(self):
+        result = _gemma4_args_to_json_robust("{}")
+        assert result == {}
+
+
+class TestParseGemma4ToolCallFallback:
+    """Tests for _parse_gemma4_tool_call_fallback()."""
+
+    def test_bare_string_args(self):
+        result = _parse_gemma4_tool_call_fallback(
+            "call:get_weather{location: Tokyo}"
+        )
+        assert result["name"] == "get_weather"
+        assert result["arguments"] == {"location": "Tokyo"}
+
+    def test_gemma4_delimiters(self):
+        result = _parse_gemma4_tool_call_fallback(
+            'call:search{query: <|"|>test<|"|>}'
+        )
+        assert result["name"] == "search"
+        assert result["arguments"] == {"query": "test"}
+
+    def test_colon_in_function_name(self):
+        result = _parse_gemma4_tool_call_fallback(
+            'call:tavily:search{query: <|"|>test<|"|>}'
+        )
+        assert result["name"] == "tavily:search"
+        assert result["arguments"] == {"query": "test"}
+
+    def test_standard_json_args(self):
+        result = _parse_gemma4_tool_call_fallback(
+            'call:search{"query": "hello world"}'
+        )
+        assert result["name"] == "search"
+        assert result["arguments"] == {"query": "hello world"}
+
+    def test_empty_args(self):
+        result = _parse_gemma4_tool_call_fallback("call:get_time{}")
+        assert result["name"] == "get_time"
+        assert result["arguments"] == {}
+
+    def test_multiple_calls(self):
+        result = _parse_gemma4_tool_call_fallback(
+            "call:a{x: 1}\ncall:b{y: 2}"
+        )
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[0]["name"] == "a"
+        assert result[1]["name"] == "b"
+
+    def test_no_match_raises(self):
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback("not a tool call")
+
+
+class TestParseToolCallsGemma4Integration:
+    """Integration tests for parse_tool_calls() with Gemma 4 tokenizer."""
+
+    @staticmethod
+    def _make_gemma4_tokenizer():
+        """Create a mock tokenizer that mimics Gemma 4 configuration."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<|tool_call>"
+        tok.tool_call_end = "<tool_call|>"
+        tok.tool_parser = MagicMock(
+            side_effect=ValueError("mlx-lm parser failed")
+        )
+        return tok
+
+    def test_fallback_parses_bare_strings(self):
+        """Gemma 4 fallback succeeds when mlx-lm parser fails on bare strings."""
+        tok = self._make_gemma4_tokenizer()
+        text = "<|tool_call>\ncall:get_weather{location: Tokyo}\n<tool_call|>"
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_weather"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["location"] == "Tokyo"
+        # Markers should be stripped from cleaned_text
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+
+    def test_markers_stripped_on_total_failure(self, caplog):
+        """Even when fallback fails, markers are stripped and warning is logged."""
+        tok = self._make_gemma4_tokenizer()
+        # Completely unparseable content between markers
+        text = "<|tool_call>garbage that matches no format<tool_call|>"
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is None
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+        assert any("parsing failed" in msg for msg in caplog.messages)
+
+    def test_function_gemma_fallback_not_triggered(self):
+        """Fallback is NOT triggered for function_gemma (different markers)."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<start_function_call>"
+        tok.tool_call_end = "<end_function_call>"
+        tok.tool_parser = MagicMock(
+            side_effect=ValueError("parser failed")
+        )
+        text = (
+            "<start_function_call>"
+            "call:func{key:<escape>value<escape>}"
+            "<end_function_call>"
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        # Should NOT have parsed via Gemma4 fallback (gate check fails)
+        assert tool_calls is None
+
+    def test_xml_fallback_still_works(self):
+        """Models with <tool_call> markers still fall through to XML parser."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = MagicMock(
+            side_effect=ValueError("parser failed")
+        )
+        text = '<tool_call>{"name": "search", "arguments": {"q": "hi"}}</tool_call>'
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        # Should be parsed by _parse_xml_tool_calls fallback (Branch 2)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "search"
+
+
+class TestEnrichToolParamsForGemma4:
+    """Tests for enrich_tool_params_for_gemma4()."""
+
+    def test_renames_description_param(self):
+        """Parameter named 'description' gets renamed to 'param_description'."""
+        tools = [{"function": {"name": "delegate", "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "prompt": {"type": "string"},
+            },
+            "required": ["description", "prompt"],
+        }}}]
+        result = enrich_tool_params_for_gemma4(tools)
+        props = result[0]["function"]["parameters"]["properties"]
+        assert "param_description" in props
+        assert "description" not in props
+        required = result[0]["function"]["parameters"]["required"]
+        assert "param_description" in required
+        assert "description" not in required
+
+    def test_does_not_rename_non_colliding_params(self):
+        """Parameters like 'name' and 'type' are NOT renamed (not in colliding set)."""
+        tools = [{"function": {"name": "create", "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "type": {"type": "string"},
+                "count": {"type": "integer"},
+            },
+            "required": ["name", "type", "count"],
+        }}}]
+        result = enrich_tool_params_for_gemma4(tools)
+        props = result[0]["function"]["parameters"]["properties"]
+        assert "name" in props
+        assert "type" in props
+        assert "count" in props
+
+    def test_adds_description_to_required_params(self):
+        """Required params without descriptions get auto-generated ones."""
+        tools = [{"function": {"name": "search", "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+            },
+            "required": ["query"],
+        }}}]
+        result = enrich_tool_params_for_gemma4(tools)
+        prop = result[0]["function"]["parameters"]["properties"]["query"]
+        assert "description" in prop
+        assert "REQUIRED" in prop["description"]
+        assert "'query'" in prop["description"]
+
+    def test_preserves_existing_descriptions(self):
+        """Params that already have descriptions are left unchanged."""
+        tools = [{"function": {"name": "search", "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query text"},
+            },
+            "required": ["query"],
+        }}}]
+        result = enrich_tool_params_for_gemma4(tools)
+        prop = result[0]["function"]["parameters"]["properties"]["query"]
+        assert prop["description"] == "Search query text"
+
+    def test_does_not_mutate_input(self):
+        """Original tool definitions are not modified."""
+        tools = [{"function": {"name": "delegate", "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+            },
+            "required": ["description"],
+        }}}]
+        original_props = list(tools[0]["function"]["parameters"]["properties"].keys())
+        enrich_tool_params_for_gemma4(tools)
+        assert list(tools[0]["function"]["parameters"]["properties"].keys()) == original_props
+
+    def test_empty_tools_list(self):
+        """Empty tools list returns empty list."""
+        assert enrich_tool_params_for_gemma4([]) == []
+
+    def test_tool_without_parameters(self):
+        """Tools without parameters are passed through unchanged."""
+        tools = [{"function": {"name": "get_time"}}]
+        result = enrich_tool_params_for_gemma4(tools)
+        assert result[0]["function"]["name"] == "get_time"
+
+
+class TestRestoreGemma4ParamNames:
+    """Tests for restore_gemma4_param_names()."""
+
+    def test_restores_renamed_description(self):
+        """param_description is restored to description."""
+        args = {"param_description": "audit the code", "prompt": "check for bugs"}
+        result = restore_gemma4_param_names(args)
+        assert result == {"description": "audit the code", "prompt": "check for bugs"}
+
+    def test_does_not_strip_non_colliding_prefix(self):
+        """param_count should NOT be renamed to count (not a colliding param)."""
+        args = {"param_count": 5, "query": "test"}
+        result = restore_gemma4_param_names(args)
+        assert result == {"param_count": 5, "query": "test"}
+
+    def test_leaves_regular_params_unchanged(self):
+        """Regular params pass through unchanged."""
+        args = {"prompt": "hello", "count": 3}
+        result = restore_gemma4_param_names(args)
+        assert result == {"prompt": "hello", "count": 3}
+
+    def test_empty_dict(self):
+        """Empty dict returns empty dict."""
+        assert restore_gemma4_param_names({}) == {}
+
+    def test_round_trip(self):
+        """Enrich then restore produces original param names."""
+        tools = [{"function": {"name": "delegate", "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "prompt": {"type": "string"},
+            },
+            "required": ["description", "prompt"],
+        }}}]
+        enriched = enrich_tool_params_for_gemma4(tools)
+        # Simulate model output using enriched param names
+        enriched_props = enriched[0]["function"]["parameters"]["properties"]
+        model_args = {k: "test" for k in enriched_props}
+        restored = restore_gemma4_param_names(model_args)
+        assert set(restored.keys()) == {"description", "prompt"}
+
+
+class TestParseToolCallsNativeParserListReturn:
+    """MiniMax M2 parser returns a list when a single <minimax:tool_call>
+    block contains multiple <invoke>s. parse_tool_calls() must flatten that
+    into one ToolCall per invoke, not drop the whole block.
+    """
+
+    def test_single_block_multiple_invokes(self):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<minimax:tool_call>"
+        tok.tool_call_end = "</minimax:tool_call>"
+        tok.tool_parser = lambda text, tools: [
+            {"name": "list_files", "arguments": {"path": "."}},
+            {"name": "read_file", "arguments": {"path": "README.md"}},
+        ]
+
+        text = (
+            "<minimax:tool_call>"
+            "<invoke name=\"list_files\"><parameter name=\"path\">.</parameter></invoke>"
+            "<invoke name=\"read_file\"><parameter name=\"path\">README.md</parameter></invoke>"
+            "</minimax:tool_call>"
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 2
+        assert tool_calls[0].function.name == "list_files"
+        assert tool_calls[1].function.name == "read_file"
+        assert json.loads(tool_calls[1].function.arguments) == {"path": "README.md"}
+
+    def test_single_block_single_invoke_returns_dict(self):
+        """Regression guard: single-invoke case still returns a dict."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<minimax:tool_call>"
+        tok.tool_call_end = "</minimax:tool_call>"
+        tok.tool_parser = lambda text, tools: {
+            "name": "list_files",
+            "arguments": {"path": "."},
+        }
+
+        text = (
+            "<minimax:tool_call>"
+            "<invoke name=\"list_files\"><parameter name=\"path\">.</parameter></invoke>"
+            "</minimax:tool_call>"
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "list_files"
+
+    def test_multiple_blocks_each_with_multiple_invokes(self):
+        """Two blocks, each returning a list — total 4 tool calls."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<minimax:tool_call>"
+        tok.tool_call_end = "</minimax:tool_call>"
+
+        def parser(text, tools):
+            if "first" in text:
+                return [
+                    {"name": "first_a", "arguments": {}},
+                    {"name": "first_b", "arguments": {}},
+                ]
+            return [
+                {"name": "second_a", "arguments": {}},
+                {"name": "second_b", "arguments": {}},
+            ]
+
+        tok.tool_parser = parser
+        text = (
+            "<minimax:tool_call>first</minimax:tool_call>"
+            "<minimax:tool_call>second</minimax:tool_call>"
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert [tc.function.name for tc in tool_calls] == [
+            "first_a",
+            "first_b",
+            "second_a",
+            "second_b",
+        ]
+
+
+class TestSerializeToolCallArguments:
+    """Tests for `_serialize_tool_call_arguments`.
+
+    Guards the server-side exit: whatever the parser returns must leave
+    omlx as a valid JSON-object string so a subsequent turn's chat template
+    (which iterates `arguments.items()`) never crashes on the echo.
+    """
+
+    def test_dict_roundtrip(self):
+        result = _serialize_tool_call_arguments({"location": "Tokyo", "unit": "c"})
+        assert json.loads(result) == {"location": "Tokyo", "unit": "c"}
+
+    def test_empty_dict(self):
+        assert _serialize_tool_call_arguments({}) == "{}"
+
+    def test_non_ascii_preserved(self):
+        """ensure_ascii=False is applied so CJK/emoji stay readable."""
+        result = _serialize_tool_call_arguments({"city": "서울"})
+        assert "서울" in result
+
+    def test_non_dict_bare_string_coerced_to_empty(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments("Tokyo")
+        assert result == "{}"
+        assert any("non-dict" in r.message for r in caplog.records)
+
+    def test_non_dict_list_coerced_to_empty(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments([1, 2])
+        assert result == "{}"
+
+    def test_non_dict_none_coerced_to_empty(self):
+        assert _serialize_tool_call_arguments(None) == "{}"
+
+    def test_json_object_string_preserved(self, caplog):
+        """mlx-vlm/mlx-lm gemma4 parser hands back a JSON-object string per
+        the OpenAI spec; the validator must accept it instead of dropping it."""
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments('{"command": "ls /tmp\\n"}')
+        assert json.loads(result) == {"command": "ls /tmp\n"}
+        assert not any("non-dict" in r.message for r in caplog.records)
+
+    def test_json_array_string_coerced_to_empty(self, caplog):
+        """JSON arrays/scalars do not satisfy ``arguments.items()`` so they
+        must still be coerced."""
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments("[1, 2]")
+        assert result == "{}"
+        assert any("non-dict" in r.message for r in caplog.records)

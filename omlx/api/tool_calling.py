@@ -17,6 +17,7 @@ Also includes structured output (JSON Schema) utilities:
 """
 
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -25,6 +26,37 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from jsonschema import validate, ValidationError
 
 from .openai_models import FunctionCall, ResponseFormat, ToolCall, ToolDefinition
+
+logger = logging.getLogger(__name__)
+
+
+def _serialize_tool_call_arguments(arguments: Any) -> str:
+    """Serialize parser output to a JSON-object arguments string.
+
+    Chat templates for models with native tool calling (Qwen 3.5/3.6 XML,
+    GLM, MiniMax) iterate `arguments.items()` when the call is echoed back
+    in history. Anything that does not represent a JSON object must be
+    coerced to "{}" here so we never hand the client a non-JSON value that
+    the next turn's template would crash on.
+    """
+    if isinstance(arguments, dict):
+        return json.dumps(arguments, ensure_ascii=False)
+    # mlx-vlm / mlx-lm gemma4 parser returns a JSON-object string per the
+    # OpenAI spec. Accept it when it parses back to a dict.
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return json.dumps(parsed, ensure_ascii=False)
+    logger.warning(
+        "Tool parser returned non-dict arguments (type=%s, repr=%.200r); "
+        "coercing to empty object to keep downstream template safe.",
+        type(arguments).__name__,
+        arguments,
+    )
+    return "{}"
 
 
 @dataclass(frozen=True)
@@ -66,9 +98,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                     type="function",
                     function=FunctionCall(
                         name=name,
-                        arguments=json.dumps(arguments, ensure_ascii=False)
-                        if isinstance(arguments, dict)
-                        else str(arguments),
+                        arguments=_serialize_tool_call_arguments(arguments),
                     ),
                 )
             )
@@ -259,6 +289,92 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
     return cleaned, tool_calls
 
 
+# ---------------------------------------------------------------------------
+# Gemma 4 robust fallback parser
+# ---------------------------------------------------------------------------
+
+def _gemma4_args_to_json_robust(args_str: str) -> dict:
+    """Convert Gemma 4 tool call args to a Python dict.
+
+    Handles the common failure cases that mlx-lm's parser cannot:
+    - Bare string values without ``<|"|>`` delimiters (e.g. ``{location: Tokyo}``)
+    - Spaces after commas in key-value pairs
+    """
+    import regex
+
+    # 1. Extract <|"|>-delimited strings and replace with placeholders
+    strings: list[str] = []
+
+    def _capture(m):
+        strings.append(m.group(1))
+        return f"\x00{len(strings) - 1}\x00"
+
+    text = regex.sub(r'<\|"\|>(.*?)<\|"\|>', _capture, args_str, flags=regex.DOTALL)
+
+    # 2. Quote bare keys (allow whitespace after { or ,)
+    text = regex.sub(r"(?<=[{,])\s*(\w+)\s*:", r' "\1":', text)
+
+    # 3. Restore captured strings as properly escaped JSON strings
+    for i, s in enumerate(strings):
+        text = text.replace(f"\x00{i}\x00", json.dumps(s))
+
+    # 4. Try json.loads — works when all values are already valid JSON primitives
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 5. Quote bare string values that are not numbers, booleans, or null
+    def _quote_bare(m):
+        value = m.group(2).strip()
+        suffix = m.group(3)
+        if value.lower() in ("true", "false", "null"):
+            return f": {value}{suffix}"
+        try:
+            json.loads(value)
+            return f": {value}{suffix}"
+        except (json.JSONDecodeError, ValueError):
+            return f": {json.dumps(value)}{suffix}"
+
+    text = regex.sub(
+        r"(:\s*)([^\",\[\]{}\s][^,}]*?)(\s*[,}])", _quote_bare, text
+    )
+    return json.loads(text)
+
+
+def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
+    """Robust fallback parser for Gemma 4 ``call:name{args}`` format.
+
+    Activated only for Gemma 4 models (guarded by ``tool_call_start`` check).
+    Extends mlx-lm's parser to handle:
+    - Bare string values without ``<|"|>`` delimiters
+    - Colons / dots / hyphens in function names
+    """
+    import regex
+
+    pattern = regex.compile(
+        r"call:([\w:.-]+)(\{(?:[^{}]|(?2))*\})", regex.DOTALL
+    )
+    matches = list(pattern.finditer(text))
+    if not matches:
+        raise ValueError("No function call found in Gemma 4 format")
+
+    results = []
+    for match in matches:
+        func_name = match.group(1)
+        args_str = match.group(2)
+
+        # Try standard JSON first (model may emit valid JSON args)
+        try:
+            arguments = json.loads(args_str)
+        except json.JSONDecodeError:
+            arguments = _gemma4_args_to_json_robust(args_str)
+
+        results.append({"name": func_name, "arguments": arguments})
+
+    return results[0] if len(results) == 1 else results
+
+
 def parse_tool_calls(
     text: str,
     tokenizer: Any,
@@ -313,21 +429,92 @@ def parse_tool_calls(
             for match in matches:
                 try:
                     parsed = tool_parser(match.strip(), tools)
-                    name = parsed.get("name", "")
-                    arguments = parsed.get("arguments", {})
-                    tool_calls.append(
-                        ToolCall(
-                            id=f"call_{uuid.uuid4().hex[:8]}",
-                            type="function",
-                            function=FunctionCall(
-                                name=name,
-                                arguments=json.dumps(arguments, ensure_ascii=False)
-                                if isinstance(arguments, dict)
-                                else str(arguments),
-                            ),
+                    # MiniMax M2 parser returns a list when a single
+                    # <minimax:tool_call> block contains multiple <invoke>s.
+                    items = parsed if isinstance(parsed, list) else [parsed]
+                    for p in items:
+                        name = p.get("name", "")
+                        arguments = p.get("arguments", {})
+                        tool_calls.append(
+                            ToolCall(
+                                id=f"call_{uuid.uuid4().hex[:8]}",
+                                type="function",
+                                function=FunctionCall(
+                                    name=name,
+                                    arguments=_serialize_tool_call_arguments(arguments),
+                                ),
+                            )
                         )
-                    )
-                except (ValueError, json.JSONDecodeError, AttributeError, KeyError):
+                except (
+                    ValueError,
+                    json.JSONDecodeError,
+                    AttributeError,
+                    KeyError,
+                    SyntaxError,
+                    TypeError,
+                ) as primary_err:
+                    # Gemma 4 only: try robust fallback that handles bare
+                    # string values and colons in function names.
+                    gemma4_handled = False
+                    if tool_call_start == "<|tool_call>":
+                        try:
+                            parsed = _parse_gemma4_tool_call_fallback(
+                                match.strip()
+                            )
+                            items = (
+                                parsed if isinstance(parsed, list) else [parsed]
+                            )
+                            for p in items:
+                                name = p.get("name", "")
+                                arguments = p.get("arguments", {})
+                                tool_calls.append(
+                                    ToolCall(
+                                        id=f"call_{uuid.uuid4().hex[:8]}",
+                                        type="function",
+                                        function=FunctionCall(
+                                            name=name,
+                                            arguments=_serialize_tool_call_arguments(
+                                                arguments
+                                            ),
+                                        ),
+                                    )
+                                )
+                            gemma4_handled = True
+                        except (
+                            ValueError,
+                            json.JSONDecodeError,
+                            KeyError,
+                            SyntaxError,
+                            TypeError,
+                        ):
+                            pass
+
+                    if gemma4_handled:
+                        continue
+
+                    # Per-match XML fallback: regex-only, no ast.literal_eval,
+                    # recovers Qwen/GLM/Hermes-JSON formats. Prevents silent
+                    # drop when the native parser raises (e.g. ast.literal_eval
+                    # SyntaxError on non-Python-literal parameter values).
+                    fb_wrapped = f"<tool_call>{match}</tool_call>"
+                    _, fb_calls = _parse_xml_tool_calls(fb_wrapped)
+                    if fb_calls:
+                        tool_calls.extend(fb_calls)
+                        logger.warning(
+                            "Native tool parser failed (%s: %s), "
+                            "recovered via XML fallback. Match: %r",
+                            type(primary_err).__name__,
+                            primary_err,
+                            match[:200],
+                        )
+                    else:
+                        logger.warning(
+                            "Native tool parser failed (%s: %s) and XML "
+                            "fallback could not recover. Dropping match: %r",
+                            type(primary_err).__name__,
+                            primary_err,
+                            match[:200],
+                        )
                     continue
 
             if tool_calls:
@@ -358,6 +545,39 @@ def parse_tool_calls(
     # Fallback: bracket tool call formats (from text-formatted history)
     if "[Calling tool:" in cleaned_text or "[Tool call:" in cleaned_text:
         return _parse_bracket_tool_calls(cleaned_text)
+
+    # All parsing attempts exhausted. Strip known tool-call markers so raw
+    # control markup never leaks into the API response.  Models whose markers
+    # overlap with the generic ``<tool_call>`` tag already returned above via
+    # Branch 2 (_parse_xml_tool_calls), so this only affects models with
+    # unique markers (Gemma 4, Mistral, Pythonic, Kimi K2, Longcat, etc.).
+    if getattr(tokenizer, "has_tool_calling", False):
+        _start = getattr(tokenizer, "tool_call_start", None)
+        _end = getattr(tokenizer, "tool_call_end", None)
+        if _start and _end:
+            s_esc = re.escape(_start)
+            e_esc = re.escape(_end)
+            stripped = re.findall(
+                rf"{s_esc}(.*?){e_esc}", cleaned_text, flags=re.DOTALL
+            )
+            if stripped:
+                logger.warning(
+                    "Tool call markers found but parsing failed, "
+                    "stripping markers. Raw content: %s",
+                    stripped,
+                )
+            cleaned_text = re.sub(
+                rf"{s_esc}.*?{e_esc}", "", cleaned_text, flags=re.DOTALL
+            ).strip()
+        elif _start:
+            idx = cleaned_text.find(_start)
+            if idx >= 0:
+                logger.warning(
+                    "Tool call start marker found but parsing failed, "
+                    "stripping marker. Raw content: %s",
+                    cleaned_text[idx:],
+                )
+                cleaned_text = cleaned_text[:idx].strip()
 
     return cleaned_text, None
 
@@ -823,6 +1043,71 @@ def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:
             )
 
     return converted if converted else None
+
+
+# Parameter names that collide with JSON Schema keywords.
+# Gemma 4 confuses these with schema-level fields and drops them from
+# tool call output.  We rename them before the chat template and restore
+# them after parsing the model's response.
+_GEMMA4_COLLIDING_PARAMS = {"description"}
+_GEMMA4_RENAME_PREFIX = "param_"
+
+
+def enrich_tool_params_for_gemma4(tools: list[dict]) -> list[dict]:
+    """Fix tool schemas for Gemma 4 models.
+
+    1. Renames parameters whose names collide with JSON Schema keywords
+       (e.g. ``description`` -> ``param_description``) so Gemma 4 doesn't
+       confuse them with schema-level fields.
+    2. Adds explicit descriptions to required parameters that lack them.
+
+    Use :func:`restore_gemma4_param_names` on tool call arguments to
+    reverse the renaming before returning them to the caller.
+    """
+    enriched = []
+    for tool in tools:
+        tool = dict(tool)
+        func = dict(tool.get("function", {}))
+        params = func.get("parameters", {})
+        if isinstance(params, dict) and "properties" in params:
+            params = dict(params)
+            old_props = params.get("properties", {})
+            required = list(params.get("required", []))
+            new_props = {}
+            new_required = []
+            for pname, pdef in old_props.items():
+                pdef = dict(pdef)
+                if pname in _GEMMA4_COLLIDING_PARAMS:
+                    new_name = _GEMMA4_RENAME_PREFIX + pname
+                else:
+                    new_name = pname
+                if not pdef.get("description"):
+                    label = "REQUIRED. " if pname in required else ""
+                    pdef["description"] = (
+                        f"{label}The '{pname}' value"
+                        f" (type: {pdef.get('type', 'string')})"
+                    )
+                new_props[new_name] = pdef
+                new_required.append(new_name if pname in required else None)
+            params["properties"] = new_props
+            params["required"] = [r for r in new_required if r]
+            func["parameters"] = params
+        tool["function"] = func
+        enriched.append(tool)
+    return enriched
+
+
+def restore_gemma4_param_names(arguments: dict) -> dict:
+    """Reverse the parameter renaming done by :func:`enrich_tool_params_for_gemma4`."""
+    restored = {}
+    for k, v in arguments.items():
+        if k.startswith(_GEMMA4_RENAME_PREFIX):
+            original = k[len(_GEMMA4_RENAME_PREFIX):]
+            if original in _GEMMA4_COLLIDING_PARAMS:
+                restored[original] = v
+                continue
+        restored[k] = v
+    return restored
 
 
 def format_tool_call_for_message(tool_call: ToolCall) -> dict:

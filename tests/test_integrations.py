@@ -8,22 +8,26 @@ from unittest.mock import patch
 import pytest
 
 from omlx.integrations import get_integration, list_integrations
+from omlx.integrations.claude import ClaudeCodeIntegration
 from omlx.integrations.codex import CodexIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
+from omlx.integrations.pi import PiIntegration
 
 
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 3
+        assert len(integrations) == 5
         names = {i.name for i in integrations}
-        assert names == {"codex", "opencode", "openclaw"}
+        assert names == {"claude", "codex", "opencode", "openclaw", "pi"}
 
     def test_get_integration(self):
+        assert get_integration("claude") is not None
         assert get_integration("codex") is not None
         assert get_integration("opencode") is not None
         assert get_integration("openclaw") is not None
+        assert get_integration("pi") is not None
         assert get_integration("nonexistent") is None
 
 
@@ -408,6 +412,252 @@ class TestOpenClawIntegration:
         assert ocl.display_name == "OpenClaw"
 
 
+class TestPiIntegration:
+    def test_get_command(self):
+        pi = PiIntegration()
+        cmd = pi.get_command(port=8000, api_key="key", model="qwen3.5")
+        assert "omlx launch pi" in cmd
+        assert "--model qwen3.5" in cmd
+
+    def test_get_command_no_model(self):
+        pi = PiIntegration()
+        cmd = pi.get_command(port=8000, api_key="", model="")
+        assert "select-a-model" in cmd
+
+    def test_configure_new_files(self, tmp_path):
+        models_path = tmp_path / "pi" / "agent" / "models.json"
+        settings_path = tmp_path / "pi" / "agent" / "settings.json"
+
+        pi = PiIntegration()
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+        ):
+            pi.configure(port=8000, api_key="test-key", model="qwen3.5")
+
+        models_config = json.loads(models_path.read_text())
+        provider = models_config["providers"]["omlx"]
+        assert provider["baseUrl"] == "http://127.0.0.1:8000/v1"
+        assert provider["api"] == "openai-completions"
+        assert provider["apiKey"] == "test-key"
+        assert provider["authHeader"] is True
+        assert provider["models"][0]["id"] == "qwen3.5"
+        assert provider["models"][0]["input"] == ["text"]
+
+        settings_config = json.loads(settings_path.read_text())
+        assert settings_config["defaultProvider"] == "omlx"
+        assert settings_config["defaultModel"] == "qwen3.5"
+
+    def test_configure_custom_host(self, tmp_path):
+        models_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+
+        pi = PiIntegration()
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+        ):
+            pi.configure(port=9000, api_key="key", model="test", host="192.168.1.100")
+
+        provider = json.loads(models_path.read_text())["providers"]["omlx"]
+        assert provider["baseUrl"] == "http://192.168.1.100:9000/v1"
+
+    def test_configure_creates_backup(self, tmp_path):
+        models_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+        models_path.write_text('{"providers": {"old": {}}}')
+        settings_path.write_text('{"defaultProvider": "old"}')
+
+        pi = PiIntegration()
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+        ):
+            pi.configure(port=8000, api_key="", model="test")
+
+        model_backups = list(tmp_path.glob("models.*.bak"))
+        settings_backups = list(tmp_path.glob("settings.*.bak"))
+        assert len(model_backups) == 1
+        assert len(settings_backups) == 1
+        assert json.loads(model_backups[0].read_text()) == {"providers": {"old": {}}}
+        assert json.loads(settings_backups[0].read_text()) == {"defaultProvider": "old"}
+
+    def test_configure_vlm_model(self, tmp_path):
+        models_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+
+        pi = PiIntegration()
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+        ):
+            pi.configure(
+                port=8000,
+                api_key="key",
+                model="qwen2.5-vl",
+                model_type="vlm",
+                context_window=32768,
+                max_tokens=8192,
+            )
+
+        provider = json.loads(models_path.read_text())["providers"]["omlx"]
+        model_config = provider["models"][0]
+        assert model_config["input"] == ["text", "image"]
+        assert model_config["contextWindow"] == 32768
+        assert model_config["maxTokens"] == 8192
+
+    def test_configure_preserves_existing(self, tmp_path):
+        models_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+        models_path.write_text(json.dumps({"providers": {"anthropic": {"baseUrl": "https://api.anthropic.com"}}}))
+        settings_path.write_text(json.dumps({"theme": "dark"}))
+
+        pi = PiIntegration()
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+        ):
+            pi.configure(port=9000, api_key="", model="llama")
+
+        models_config = json.loads(models_path.read_text())
+        assert "anthropic" in models_config["providers"]
+        assert models_config["providers"]["omlx"]["apiKey"] == "omlx"
+
+        settings_config = json.loads(settings_path.read_text())
+        assert settings_config["theme"] == "dark"
+        assert settings_config["defaultProvider"] == "omlx"
+        assert settings_config["defaultModel"] == "llama"
+
+    def test_type(self):
+        pi = PiIntegration()
+        assert pi.type == "config_file"
+        assert pi.display_name == "Pi"
+
+
+class TestClaudeCodeIntegration:
+    def test_get_command(self):
+        cc = ClaudeCodeIntegration()
+        cmd = cc.get_command(port=8000, api_key="key", model="qwen3.5")
+        assert "omlx launch claude" in cmd
+
+    def test_get_command_ignores_model(self):
+        # Claude integration uses TUI selection so the rendered command
+        # is the same regardless of model arg.
+        cc = ClaudeCodeIntegration()
+        assert cc.get_command(port=8000, api_key="", model="") == cc.get_command(
+            port=8000, api_key="key", model="qwen3.5"
+        )
+
+    def test_type(self):
+        cc = ClaudeCodeIntegration()
+        assert cc.type == "env_var"
+        assert cc.display_name == "Claude Code"
+        assert cc.install_check == "claude"
+
+    def test_find_claude_binary_in_path(self):
+        cc = ClaudeCodeIntegration()
+        with patch("omlx.integrations.claude.shutil.which", return_value="/usr/bin/claude"):
+            assert cc._find_claude_binary() == "claude"
+
+    def test_find_claude_binary_local_fallback(self, tmp_path):
+        cc = ClaudeCodeIntegration()
+        local_claude = tmp_path / ".claude" / "local" / "claude"
+        local_claude.parent.mkdir(parents=True)
+        local_claude.write_text("#!/bin/sh\n")
+        with (
+            patch("omlx.integrations.claude.shutil.which", return_value=None),
+            patch("omlx.integrations.claude.Path.home", return_value=tmp_path),
+        ):
+            assert cc._find_claude_binary() == str(local_claude)
+
+    def test_find_claude_binary_not_found(self, tmp_path):
+        cc = ClaudeCodeIntegration()
+        with (
+            patch("omlx.integrations.claude.shutil.which", return_value=None),
+            patch("omlx.integrations.claude.Path.home", return_value=tmp_path),
+        ):
+            # Falls back to the bare name so the os.execvpe error surfaces clearly.
+            assert cc._find_claude_binary() == "claude"
+
+    def test_launch_sets_anthropic_env(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["binary"] = binary
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch("omlx.integrations.claude.os.environ", base_env),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"),
+        ):
+            cc.launch(
+                port=8000,
+                api_key="secret",
+                model="qwen3.5",
+                context_window=131072,
+            )
+
+        env = captured["env"]
+        assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8000"
+        assert env["ANTHROPIC_AUTH_TOKEN"] == "secret"
+        assert env["ANTHROPIC_API_KEY"] == ""
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "qwen3.5"
+        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "qwen3.5"
+        assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "qwen3.5"
+        assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "qwen3.5"
+        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "131072"
+        # Bundled-python vars must be stripped so claude code subprocess hooks
+        # don't inherit our cpython-3.11 stack.
+        assert "PYTHONHOME" not in env
+        assert "PYTHONPATH" not in env
+        assert "PYTHONDONTWRITEBYTECODE" not in env
+
+    def test_launch_open_server_uses_omlx_token(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"),
+        ):
+            cc.launch(port=8000, api_key="", model="qwen3.5")
+
+        # Empty api_key means an open server, claude code still needs
+        # *some* token so we ship a placeholder.
+        assert captured["env"]["ANTHROPIC_AUTH_TOKEN"] == "omlx"
+
+    def test_launch_without_model(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"),
+        ):
+            cc.launch(port=8000, api_key="key", model="")
+
+        env = captured["env"]
+        assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in env
+        assert "CLAUDE_CODE_SUBAGENT_MODEL" not in env
+
+
 class TestIntegrationSettings:
     def test_settings_dataclass(self):
         from omlx.settings import IntegrationSettings
@@ -416,6 +666,7 @@ class TestIntegrationSettings:
         assert settings.codex_model is None
         assert settings.opencode_model is None
         assert settings.openclaw_model is None
+        assert settings.pi_model is None
         assert settings.openclaw_tools_profile == "coding"
 
     def test_to_dict(self):
@@ -425,6 +676,7 @@ class TestIntegrationSettings:
         d = settings.to_dict()
         assert d["codex_model"] == "qwen3.5"
         assert d["opencode_model"] is None
+        assert d["pi_model"] is None
         assert d["openclaw_tools_profile"] == "coding"
 
     def test_from_dict(self):
@@ -436,6 +688,7 @@ class TestIntegrationSettings:
         assert settings.codex_model == "llama"
         assert settings.opencode_model == "qwen"
         assert settings.openclaw_model is None
+        assert settings.pi_model is None
 
     def test_from_dict_empty(self):
         from omlx.settings import IntegrationSettings

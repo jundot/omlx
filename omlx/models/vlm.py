@@ -25,64 +25,9 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..patches.qwen3_5_attention import force_text_only_rope
+
 logger = logging.getLogger(__name__)
-
-
-class _IntOffsetCacheProxy:
-    """Proxy that converts mx.array cache.offset to Python int.
-
-    mlx-lm's BatchKVCache stores ``offset`` as ``mx.array`` for efficient
-    batched updates, but mlx-vlm models use ``cache.offset`` as a scalar
-    (e.g. for slice indices, mx.arange, int() casts).  This proxy
-    converts on read while leaving internal cache operations unaffected.
-
-    For batched decode with multiple requests of different prompt lengths,
-    max(offset) is used.  This is correct for the longest request but
-    gives slightly wrong RoPE positions for shorter requests.
-    Proper per-element offset support requires upstream mlx-vlm changes.
-    """
-
-    __slots__ = ("_cache",)
-
-    def __init__(self, cache: Any):
-        object.__setattr__(self, "_cache", cache)
-
-    @property
-    def offset(self):
-        raw = self._cache.offset
-        if isinstance(raw, mx.array):
-            if raw.ndim == 0:
-                return int(raw.item())
-            return int(raw.max().item())
-        return raw
-
-    def __getattr__(self, name: str):
-        return getattr(self._cache, name)
-
-    def __setattr__(self, name: str, value: Any):
-        if name == "_cache":
-            object.__setattr__(self, name, value)
-        else:
-            setattr(self._cache, name, value)
-
-    def __getitem__(self, key):
-        return self._cache[key]
-
-    def __setitem__(self, key, value):
-        self._cache[key] = value
-
-    def __bool__(self):
-        return True
-
-    def __iter__(self):
-        return iter(self._cache)
-
-
-def _wrap_caches(cache_list: Optional[List[Any]]) -> Optional[List[Any]]:
-    """Wrap batch cache objects with int-offset proxies for mlx-vlm compatibility."""
-    if cache_list is None:
-        return None
-    return [_IntOffsetCacheProxy(c) for c in cache_list]
 
 
 class VLMModelAdapter(nn.Module):
@@ -106,25 +51,23 @@ class VLMModelAdapter(nn.Module):
         _embed_offset: Current chunk offset during chunked prefill
     """
 
-    def __init__(self, vlm_model: nn.Module, decode_model: Optional[nn.Module] = None):
-        """
-        Initialize the adapter.
-
-        Args:
-            vlm_model: The full VLM model loaded by mlx_vlm.utils.load()
-            decode_model: Optional mlx-lm model for batched decode.
-                When provided, this model handles batched decode (batch > 1)
-                while vlm_model handles VLM prefill and single-request decode.
-        """
+    def __init__(self, vlm_model: nn.Module):
         super().__init__()
         self._vlm_model = vlm_model
         self._language_model = vlm_model.language_model
-        self._decode_model = decode_model
+        self._uses_mrope = self._detect_mrope(vlm_model)
 
         # Pending vision embeddings state (set before prefill, cleared after)
         self._pending_embeds: Optional[mx.array] = None
         self._pending_kwargs: Dict[str, Any] = {}
         self._embed_offset: int = 0
+
+        # Per-request mRoPE state: UID → rope_delta mapping.
+        # Populated by scheduler after VLM prefill, consumed during decode.
+        # The _patched_generation_batch_step builds _batch_rope_deltas
+        # from this dict + current batch UIDs before each step.
+        self._uid_rope_deltas: Dict[int, float] = {}
+        self._batch_rope_deltas: Optional[mx.array] = None
 
     @property
     def layers(self):
@@ -160,7 +103,6 @@ class VLMModelAdapter(nn.Module):
         """
         if hasattr(self._language_model, "make_cache"):
             return self._language_model.make_cache()
-        # Fallback: default KVCache for each layer (matches mlx-lm's make_prompt_cache)
         from mlx_lm.models.cache import KVCache
         return [KVCache() for _ in range(len(self.layers))]
 
@@ -193,6 +135,22 @@ class VLMModelAdapter(nn.Module):
         self._pending_kwargs = {}
         self._embed_offset = 0
 
+    @staticmethod
+    def _detect_mrope(vlm_model) -> bool:
+        """Check if VLM model uses multi-dimensional RoPE (mRoPE)."""
+        config = getattr(vlm_model, "config", None)
+        if config is None:
+            return False
+        text_config = getattr(config, "text_config", None)
+        if text_config is None:
+            return False
+        rope_cfg = getattr(text_config, "rope_scaling", None) or getattr(
+            text_config, "rope_parameters", None
+        )
+        if isinstance(rope_cfg, dict):
+            return "mrope_section" in rope_cfg
+        return False
+
     def clear_vlm_position_state(self) -> None:
         """Clear stale mRoPE position state from previous VLM requests.
 
@@ -208,6 +166,36 @@ class VLMModelAdapter(nn.Module):
         """
         self._language_model._position_ids = None
         self._language_model._rope_deltas = None
+        self._batch_rope_deltas = None
+
+    def register_rope_delta(self, uid: int, delta: float) -> None:
+        """Register rope_delta for a UID after VLM prefill."""
+        self._uid_rope_deltas[uid] = delta
+
+    def unregister_rope_delta(self, uid: int) -> None:
+        """Remove rope_delta for a finished/aborted UID."""
+        self._uid_rope_deltas.pop(uid, None)
+
+    def set_batch_rope_deltas(self, deltas: mx.array) -> None:
+        """Set per-request rope_deltas for the current decode batch.
+
+        Called by _patched_generation_batch_step before each step with
+        an array of rope_deltas aligned to the batch slot order.
+        """
+        self._batch_rope_deltas = deltas
+
+    def get_last_rope_deltas(self) -> float:
+        """Extract rope_deltas from language model after VLM prefill.
+
+        Should be called after get_input_embeddings() which sets
+        ``_rope_deltas`` on the language model.
+        """
+        rd = getattr(self._language_model, "_rope_deltas", None)
+        if rd is None:
+            return 0.0
+        if hasattr(rd, "item"):
+            return float(rd.item())
+        return float(rd)
 
     @property
     def has_pending_embeddings(self) -> bool:
@@ -238,35 +226,71 @@ class VLMModelAdapter(nn.Module):
         Returns:
             Model output (logits as mx.array)
         """
-        wrapped_cache = _wrap_caches(cache)
         inputs_embeds = kwargs.pop("inputs_embeds", None)
         vlm_extra = kwargs.pop("vlm_extra_kwargs", None) or {}
+        vlm_extra.pop("_captured_rope_deltas", None)
 
         if inputs_embeds is not None:
-            # Batched VLM path: embeddings from _process_prompts
             result = self._language_model(
                 input_ids,
                 inputs_embeds=inputs_embeds,
-                cache=wrapped_cache,
+                cache=cache,
                 **vlm_extra,
                 **kwargs,
             )
         elif self._pending_embeds is not None:
-            # Legacy single-request path
-            result = self._forward_with_embeddings(input_ids, wrapped_cache, **kwargs)
+            result = self._forward_with_embeddings(input_ids, cache, **kwargs)
         else:
-            # Standard decode/prefill path: token IDs only.
-            # Use mlx-lm decode model for batched decode (batch > 1)
-            # since mlx-vlm language models may not handle batching.
-            if self._decode_model is not None and input_ids.shape[0] > 1:
-                result = self._decode_model(input_ids, cache=cache, **kwargs)
+            if self._uses_mrope and self._batch_rope_deltas is not None and cache is not None:
+                offsets = None
+                for c in cache:
+                    if hasattr(c, "offset"):
+                        offsets = c.offset
+                        break
+                B, L = input_ids.shape
+                deltas = self._batch_rope_deltas
+                if (offsets is not None and isinstance(offsets, mx.array)
+                        and deltas.size == B):
+                    positions = offsets + deltas
+                    position_ids = mx.broadcast_to(
+                        positions[None, :, None], (3, B, L)
+                    )
+                    # Decode never adds new image tokens; the broadcast
+                    # collapses the 3 mRoPE sections to identical values,
+                    # so the patched Qwen3_5Attention can skip its per-layer
+                    # .item() probes and take the plain-RoPE branch directly.
+                    with force_text_only_rope():
+                        result = self._language_model(
+                            input_ids, cache=cache, position_ids=position_ids, **kwargs
+                        )
+                else:
+                    result = self._language_model(
+                        input_ids, cache=cache, **kwargs
+                    )
+            elif self._uses_mrope and cache is not None:
+                offsets = None
+                for c in cache:
+                    if hasattr(c, "offset") and isinstance(c.offset, mx.array) and c.offset.ndim > 0:
+                        offsets = c.offset
+                        break
+                if offsets is not None:
+                    B, L = input_ids.shape
+                    position_ids = mx.broadcast_to(
+                        offsets[None, :, None], (3, B, L)
+                    )
+                    with force_text_only_rope():
+                        result = self._language_model(
+                            input_ids, cache=cache, position_ids=position_ids, **kwargs
+                        )
+                else:
+                    result = self._language_model(
+                        input_ids, cache=cache, **kwargs
+                    )
             else:
                 if hasattr(self._vlm_model, "_set_position_state"):
                     self._vlm_model._set_position_state(input_ids)
-                result = self._language_model(input_ids, cache=wrapped_cache, **kwargs)
+                result = self._language_model(input_ids, cache=cache, **kwargs)
 
-        # mlx-vlm models return LanguageModelOutput(logits=...) but
-        # mlx-lm's BatchGenerator expects raw mx.array logits.
         if hasattr(result, "logits"):
             return result.logits
         return result
@@ -281,12 +305,9 @@ class VLMModelAdapter(nn.Module):
         chunk_len = input_ids.shape[1]
         total_len = self._pending_embeds.shape[1]
 
-        # Slice embeddings for this chunk
         end_offset = min(self._embed_offset + chunk_len, total_len)
         chunk_embeds = self._pending_embeds[:, self._embed_offset:end_offset, :]
 
-        # If chunk_embeds is shorter than input_ids (last chunk edge case),
-        # the language model handles the size mismatch via inputs_embeds taking priority
         result = self._language_model(
             input_ids,
             inputs_embeds=chunk_embeds,
@@ -297,8 +318,6 @@ class VLMModelAdapter(nn.Module):
 
         self._embed_offset = end_offset
 
-        # Check if prefill is complete (only 1 token remaining = the last token
-        # that gets processed in _step, not in _process_prompts)
         if self._embed_offset >= total_len - 1:
             self.clear_pending_embeddings()
 

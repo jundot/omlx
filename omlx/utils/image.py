@@ -170,3 +170,18 @@ def compute_image_hash(images: List[Image.Image]) -> Optional[str]:
         hasher.update(rgb_img.tobytes())
 
     return hasher.hexdigest()
+
+
+def compute_per_image_hashes(images: List[Image.Image]) -> List[str]:
+    """Compute individual SHA256 hashes for each image.
+
+    Returns a list of hex-encoded hash strings, one per image.
+    """
+    hashes = []
+    for img in images:
+        hasher = hashlib.sha256()
+        hasher.update(f"{img.size[0]}x{img.size[1]}".encode())
+        rgb_img = img.convert("RGB")
+        hasher.update(rgb_img.tobytes())
+        hashes.append(hasher.hexdigest())
+    return hashes

@@ -60,10 +60,10 @@ def _has_meaningful_readme(path: Path) -> bool:
 def _is_oq_model(name: str) -> bool:
     """Check if a model name indicates an oQ-quantized model.
 
-    oQ models have 'oQ' in the last 5 characters of their name,
-    e.g. 'Qwen3.5-122B-oQ4', 'Llama-3B-oQ4e'.
+    Any folder name containing 'oQ' (case-sensitive) is treated as an oQ model,
+    e.g. 'Qwen3.5-122B-oQ4', 'Llama-3B-oQ4e', 'Qwen3.6-27B-oQ3.5e'.
     """
-    return "oQ" in name[-5:]
+    return "oQ" in name
 
 
 def _generate_model_card(

@@ -43,6 +43,13 @@ class CacheTypeRegistry:
     _class_name_map: Dict[str, CacheType] = {
         "KVCache": CacheType.KVCACHE,
         "RotatingKVCache": CacheType.ROTATING_KVCACHE,
+        # omlx subclass that overrides size() to clamp by actual buffer
+        # length (defined in omlx/cache/_rotating_subclass.py). Cache
+        # restore serializes type(cache).__name__, so the registry must
+        # recognize this name to route through RotatingKVCacheHandler;
+        # otherwise the default handler reconstructs vanilla
+        # RotatingKVCache and the size() override is lost.
+        "PrefillReadyRotatingKVCache": CacheType.ROTATING_KVCACHE,
         "BatchKVCache": CacheType.BATCH_KVCACHE,
         "BatchRotatingKVCache": CacheType.BATCH_ROTATING_KVCACHE,
         "ArraysCache": CacheType.ARRAYS_CACHE,
@@ -53,6 +60,10 @@ class CacheTypeRegistry:
         # checks the class name first and routes to TQ-specific handling)
         "TurboQuantKVCache": CacheType.KVCACHE,
         "BatchTurboQuantKVCache": CacheType.KVCACHE,
+        # DeepSeek V4 compressed-attention pool. Handlers live in
+        # patches/deepseek_v4/cache_handlers.py and register on patch apply.
+        "PoolingCache": CacheType.POOLING_CACHE,
+        "BatchPoolingCache": CacheType.BATCH_POOLING_CACHE,
     }
 
     # Default handler instance
@@ -137,7 +148,9 @@ class CacheTypeRegistry:
             ):
                 return CacheType.ARRAYS_CACHE
 
-            logger.debug(f"Could not detect cache type for {class_name}, assuming KVCache")
+            logger.debug(
+                f"Could not detect cache type for {class_name}, assuming KVCache"
+            )
             return CacheType.KVCACHE
 
         return cache_type

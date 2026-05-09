@@ -294,9 +294,10 @@ class TestParseToolCallsFromTokens:
             allowed_special="all",
         )
         # prepend_start=True adds <|start|>assistant
-        output_text, tool_calls = parse_tool_calls_from_tokens(
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens(
             tokens, prepend_start=True
         )
+        assert analysis_text == ""
         assert isinstance(tool_calls, list)
 
     def test_extracts_final_text(self, encoding):
@@ -305,7 +306,8 @@ class TestParseToolCallsFromTokens:
             "<|channel|>final<|message|>Hello world<|end|>",
             allowed_special="all",
         )
-        output_text, tool_calls = parse_tool_calls_from_tokens(
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens(
             tokens, prepend_start=True
         )
+        assert analysis_text == ""
         assert "Hello world" in output_text

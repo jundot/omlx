@@ -988,18 +988,22 @@ class TestReconstructCachePartialRestore:
         assert rot_cache.keys is not None
         assert rot_cache.keys.shape == (1, 8, 1024, 64)
         assert rot_cache.values.shape == (1, 8, 1024, 64)
-        assert rot_cache._idx == 100
+        # mlx-lm 0.31.3 contract: _idx must equal keys.shape[2] so the
+        # buffer is read in temporal order (case 1 of _temporal_order).
+        # The legacy meta_state's _idx=100 hint is intentionally ignored.
+        assert rot_cache._idx == 1024
 
-    def test_undersized_rotating_cache_padded_on_reconstruct(
+    def test_undersized_rotating_cache_preserves_buffer_length(
         self, paged_cache, mock_ssd_cache
     ):
         """Undersized RotatingKVCache from BatchRotatingKVCache.extract()
-        should be zero-padded to max_size during reconstruction.
+        keeps its actual buffer length on reconstruct.
 
-        BatchRotatingKVCache.extract() strips left_padding, producing
-        keys.shape[2] < max_size while offset >= max_size. Without padding,
-        size() reports max_size but _temporal_order returns fewer entries,
-        causing broadcast_shapes errors in merge().
+        Pre-fix omlx zero-padded the buffer to max_size. That broke the
+        merge contract by leaking zero positions into attention (#934,
+        #903). Post-fix, the buffer length is preserved and
+        PrefillReadyRotatingKVCache.size() clamps the merge slice so
+        BatchRotatingKVCache.merge() never reads beyond the real data.
         """
         model = MockModel(num_layers=2)
         prefix_cache = BlockAwarePrefixCache(
@@ -1045,13 +1049,16 @@ class TestReconstructCachePartialRestore:
 
         rot_cache = result[1]
         assert rot_cache.max_size == 1024
-        # Buffer must be padded to max_size for merge safety
-        assert rot_cache.keys.shape[2] == 1024
-        assert rot_cache.values.shape[2] == 1024
-        # Offset preserved from meta_state
+        # Buffer length is preserved — no zero padding to max_size.
+        assert rot_cache.keys.shape[2] == 845
+        assert rot_cache.values.shape[2] == 845
+        # Offset preserved from meta_state.
         assert rot_cache.offset == 44225
-        # _idx should be max_size (data fills the buffer after padding)
-        assert rot_cache._idx == 1024
+        # _idx matches the buffer so _temporal_order returns as-is.
+        assert rot_cache._idx == 845
+        # PrefillReadyRotatingKVCache clamps size() to the buffer length,
+        # protecting BatchRotatingKVCache.merge() from over-reading.
+        assert rot_cache.size() == 845
 
 
 class TestModelCacheConfigCacheList:

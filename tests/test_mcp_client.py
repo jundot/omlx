@@ -607,6 +607,23 @@ class TestMCPClientCallTool:
 
         assert result.content == {"key": "value"}
 
+    @pytest.mark.asyncio
+    async def test_call_tool_structured_content(self, connected_client: MCPClient):
+        """Test tool call with structuredContent fallback."""
+        mock_result = MagicMock(spec=[])
+        mock_result.content = []
+        mock_result.structuredContent = {"results": ["Result 1", "Result 2"]}
+        mock_result.isError = False
+        connected_client._session.call_tool.return_value = mock_result
+
+        result = await connected_client.call_tool("web_search", {"query": "test"})
+
+        assert result.is_error is False
+        assert result.content == {"results": ["Result 1", "Result 2"]}
+        connected_client._session.call_tool.assert_called_with(
+            "web_search", {"query": "test"}
+        )
+
 
 class TestMCPClientRefreshTools:
     """Tests for MCPClient.refresh_tools()."""

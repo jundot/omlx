@@ -322,3 +322,96 @@ class TestModelFallback:
         with pytest.raises(HTTPException) as exc_info:
             await get_engine("unknown-model", EngineType.EMBEDDING)
         assert exc_info.value.status_code == 404
+
+
+class TestGetEngineLLMTypeValidation:
+    """LLM endpoints must reject non-LLM engines with a clean 400 (#507).
+
+    Issue #507: POST /v1/chat/completions against an STT/TTS/STS/Embedding
+    model was producing an unhandled 500 with `'STTEngine' object has no
+    attribute 'model_type'` because `get_engine(..., EngineType.LLM)` never
+    validated that the resolved engine was actually an LLM. The fix adds an
+    isinstance check mirroring the one already in place for EMBEDDING and
+    RERANKER.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_server_state(self):
+        state = ServerState()
+        with patch("omlx.server._server_state", state):
+            self._state = state
+            yield
+
+    def _pool_returning(self, engine):
+        pool = MagicMock()
+        pool.resolve_model_id.side_effect = lambda mid, _sm: mid
+        pool.get_engine = AsyncMock(return_value=engine)
+        self._state.engine_pool = pool
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_llm_rejects_stt_engine(self):
+        """Requesting an STT model on an LLM endpoint returns HTTP 400, not 500."""
+        from omlx.engine.stt import STTEngine
+        stt = MagicMock(spec=STTEngine)
+        self._pool_returning(stt)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_engine("whisper-large-v3-turbo", EngineType.LLM)
+        assert exc_info.value.status_code == 400
+        detail = str(exc_info.value.detail).lower()
+        assert "not an llm" in detail or "not a chat" in detail or "not a text" in detail
+
+    @pytest.mark.asyncio
+    async def test_llm_rejects_tts_engine(self):
+        """Requesting a TTS model on an LLM endpoint returns HTTP 400."""
+        from omlx.engine.tts import TTSEngine
+        tts = MagicMock(spec=TTSEngine)
+        self._pool_returning(tts)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_engine("qwen3-tts", EngineType.LLM)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_llm_rejects_sts_engine(self):
+        """Requesting an STS model on an LLM endpoint returns HTTP 400."""
+        from omlx.engine.sts import STSEngine
+        sts = MagicMock(spec=STSEngine)
+        self._pool_returning(sts)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_engine("deepfilternet", EngineType.LLM)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_llm_rejects_embedding_engine(self):
+        """Requesting an embedding model on an LLM endpoint returns HTTP 400."""
+        from omlx.engine.embedding import EmbeddingEngine
+        emb = MagicMock(spec=EmbeddingEngine)
+        self._pool_returning(emb)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_engine("bge-small", EngineType.LLM)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_llm_rejects_reranker_engine(self):
+        """Requesting a reranker model on an LLM endpoint returns HTTP 400."""
+        from omlx.engine.reranker import RerankerEngine
+        rr = MagicMock(spec=RerankerEngine)
+        self._pool_returning(rr)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_engine("jina-reranker", EngineType.LLM)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_llm_accepts_llm_engine(self):
+        """A genuine LLM engine passes validation and is returned as-is."""
+        from omlx.engine.base import BaseEngine
+        llm = MagicMock(spec=BaseEngine)
+        self._pool_returning(llm)
+
+        engine = await get_engine("llama-3", EngineType.LLM)
+        assert engine is llm

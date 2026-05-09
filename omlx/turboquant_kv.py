@@ -234,12 +234,31 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
 
     # ---- make_mask override (batch-aware) ----------------------------------
 
-    def make_mask(self, *args, **kwargs):
-        if isinstance(self.offset, int):
-            return create_attention_mask(*args, offset=self.offset, **kwargs)
-        return create_causal_mask(
-            args[0], offset=self.offset, left_padding=self.left_padding, **kwargs
-        )
+    def make_mask(
+        self,
+        N: int,
+        return_array: bool = False,
+        window_size: Optional[int] = None,
+    ):
+        offset = self.offset
+        if isinstance(offset, int):
+            return create_attention_mask(N, offset, return_array, window_size)
+        if isinstance(offset, mx.array) and offset.size == 1:
+            return create_attention_mask(N, offset.item(), return_array, window_size)
+        # B>1: batched causal mask
+        max_offset = offset.max().item()
+        total = max_offset + N
+        rinds = mx.arange(total)[None, None, :]
+        linds = mx.arange(N)[None, None, :, None]
+        off = offset[:, None, None, None]
+        linds = linds + off
+        mask = linds >= rinds
+        if window_size is not None:
+            mask = mask & (linds < rinds + window_size)
+        if self.left_padding is not None:
+            lp = self.left_padding[:, None, None, None]
+            mask = mask & (rinds >= lp)
+        return mask
 
     # prefill_attention and dequantize inherited from TurboQuantKVCache
 

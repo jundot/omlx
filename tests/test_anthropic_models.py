@@ -305,6 +305,75 @@ class TestAnthropicTool:
 
         assert tool.cache_control == {"type": "ephemeral"}
 
+    def test_server_side_web_search_tool(self):
+        """Server-side web_search tool: type-only, no input_schema."""
+        tool = AnthropicTool(type="web_search_20250305", name="web_search")
+
+        assert tool.type == "web_search_20250305"
+        assert tool.name == "web_search"
+        assert tool.input_schema is None
+
+    def test_server_side_code_execution_tool(self):
+        """Server-side code_execution tool validates without input_schema."""
+        tool = AnthropicTool(type="code_execution_20250825", name="code_execution")
+
+        assert tool.type == "code_execution_20250825"
+        assert tool.input_schema is None
+
+    def test_server_side_tool_with_extra_fields(self):
+        """Server-side tools may carry extra Anthropic-defined fields."""
+        tool = AnthropicTool(
+            type="web_search_20250305",
+            name="web_search",
+            max_uses=5,
+            allowed_domains=["docs.anthropic.com"],
+        )
+
+        assert tool.type == "web_search_20250305"
+        # extra="allow" preserves unknown fields on the model
+        dumped = tool.model_dump()
+        assert dumped["max_uses"] == 5
+        assert dumped["allowed_domains"] == ["docs.anthropic.com"]
+
+    def test_tool_rejects_missing_schema_and_type(self):
+        """Tool without input_schema or type is invalid."""
+        with pytest.raises(ValidationError):
+            AnthropicTool(name="broken")
+
+    def test_tool_with_only_input_schema_still_works(self):
+        """Regression: existing user-defined tool form still validates."""
+        tool = AnthropicTool(name="user_tool", input_schema={"type": "object"})
+
+        assert tool.input_schema == {"type": "object"}
+        assert tool.type is None
+
+    def test_messages_request_with_mixed_tools(self):
+        """MessagesRequest accepts mix of user tool and server-side tool."""
+        req = MessagesRequest(
+            model="claude-haiku-local",
+            max_tokens=128,
+            messages=[AnthropicMessage(role="user", content="hi")],
+            tools=[
+                AnthropicTool(name="get_weather", input_schema={"type": "object"}),
+                AnthropicTool(type="web_search_20250305", name="web_search"),
+            ],
+        )
+
+        assert len(req.tools) == 2
+        assert req.tools[0].input_schema == {"type": "object"}
+        assert req.tools[1].type == "web_search_20250305"
+
+    def test_token_count_request_with_server_side_tool(self):
+        """TokenCountRequest also accepts server-side tool definitions."""
+        req = TokenCountRequest(
+            model="claude-haiku-local",
+            messages=[AnthropicMessage(role="user", content="hi")],
+            tools=[AnthropicTool(type="web_search_20250305", name="web_search")],
+        )
+
+        assert len(req.tools) == 1
+        assert req.tools[0].type == "web_search_20250305"
+
 
 class TestToolChoice:
     """Tests for ToolChoice model."""

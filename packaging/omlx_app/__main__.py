@@ -5,9 +5,11 @@ Wraps the app launch in comprehensive error handling so that failures
 via a native dialog instead of being silently swallowed.
 """
 
+import logging
 import sys
 import traceback
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
@@ -16,6 +18,34 @@ def _get_crash_log_path() -> Path:
     app_support = Path.home() / "Library" / "Application Support" / "oMLX"
     app_support.mkdir(parents=True, exist_ok=True)
     return app_support / "crash.log"
+
+
+def _configure_file_logging() -> None:
+    """Route menubar app logs to ~/Library/Application Support/oMLX/logs/menubar.log.
+
+    The menubar process has no terminal to print to under LaunchServices, so
+    without a file handler every logger.info/warning call is discarded. The
+    file is what `omlx diagnose menubar` reads when troubleshooting hidden
+    icon reports.
+    """
+    log_dir = Path.home() / "Library" / "Application Support" / "oMLX" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        log_dir / "menubar.log", maxBytes=1_000_000, backupCount=3
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+    )
+    root = logging.getLogger()
+    # Only install once per process.
+    if not any(
+        isinstance(h, RotatingFileHandler)
+        and getattr(h, "baseFilename", "").endswith("menubar.log")
+        for h in root.handlers
+    ):
+        root.addHandler(handler)
+    if root.level == logging.NOTSET or root.level > logging.INFO:
+        root.setLevel(logging.INFO)
 
 
 def _write_crash_log(exc_text: str) -> Path:
@@ -80,6 +110,7 @@ def _check_os_version() -> None:
 
 
 _check_os_version()
+_configure_file_logging()
 
 try:
     from .app import main

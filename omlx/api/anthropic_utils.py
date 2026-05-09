@@ -126,6 +126,7 @@ def convert_anthropic_to_internal(
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
     preserve_images: bool = False,
+    native_reasoning_content: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Convert Anthropic Messages API format to internal format.
@@ -142,6 +143,10 @@ def convert_anthropic_to_internal(
         tokenizer: Tokenizer instance for token counting and truncation.
         preserve_images: If True, preserve image blocks as OpenAI image_url
             format for VLM processing.
+        native_reasoning_content: If True, attach Anthropic ``thinking`` blocks
+            as a ``reasoning_content`` field on assistant messages (Qwen 3.6+
+            templates).  If False, inline each block as ``<think>...</think>``
+            in the message content as a fallback.
 
     Returns:
         List of {"role": str, "content": str or list}
@@ -169,6 +174,7 @@ def convert_anthropic_to_internal(
                     text_parts: list[str] = []
                     image_parts: list[dict] = []
                     tool_calls: list[dict] = []
+                    thinking_parts: list[str] = []
                     for block in content:
                         block_dict = _content_block_to_dict(block)
                         if block_dict is None:
@@ -192,12 +198,25 @@ def convert_anthropic_to_internal(
                                     "arguments": tool_input,
                                 },
                             })
+                        elif block_type == "thinking":
+                            # Native mode: collect for reasoning_content field.
+                            # Fallback: inline as <think>...</think> in source
+                            # order (Anthropic emits thinking first, so appending
+                            # preserves the natural ordering).
+                            thinking_text = block_dict.get("thinking", "")
+                            if thinking_text:
+                                if native_reasoning_content:
+                                    thinking_parts.append(thinking_text)
+                                else:
+                                    text_parts.append(f"<think>\n{thinking_text}\n</think>")
                         elif block_type == "document":
                             text_parts.append(_decode_document_block(block_dict))
                     msg_dict = _build_message_from_parts(role, text_parts, image_parts) or {
                         "role": role,
                         "content": "",
                     }
+                    if thinking_parts:
+                        msg_dict["reasoning_content"] = "\n".join(thinking_parts)
                     if tool_calls:
                         msg_dict["tool_calls"] = tool_calls
                         msg_dict[_PRESERVE_ROLE_BOUNDARY] = True
@@ -238,7 +257,13 @@ def convert_anthropic_to_internal(
                                     block_dict.get("content", ""), image_parts
                                 )
                         elif block_type == "thinking":
-                            continue
+                            # User messages don't carry reasoning_content in the
+                            # Qwen 3.6 template, so native mode simply drops these
+                            # blocks.  Fallback keeps the legacy <think> inline
+                            # behaviour in source order.
+                            thinking_text = block_dict.get("thinking", "")
+                            if thinking_text and not native_reasoning_content:
+                                text_parts.append(f"<think>\n{thinking_text}\n</think>")
                         elif block_type == "document":
                             text_parts.append(_decode_document_block(block_dict))
                     msg_dict = _build_message_from_parts(role, text_parts, image_parts)
@@ -251,6 +276,7 @@ def convert_anthropic_to_internal(
             # Content blocks list
             text_parts: list[str] = []
             image_parts: list[dict] = []
+            thinking_parts: list[str] = []
             saw_tool_markup = False
             for block in content:
                 block_dict = _content_block_to_dict(block)
@@ -292,8 +318,14 @@ def convert_anthropic_to_internal(
                         )
 
                 elif block_type == "thinking":
-                    # Thinking blocks are ignored (reasoning content is not passed to model)
-                    continue
+                    # Native mode: collect for reasoning_content (assistant only).
+                    # Fallback: inline as <think>...</think> in source order.
+                    thinking_text = block_dict.get("thinking", "")
+                    if thinking_text:
+                        if native_reasoning_content and role == "assistant":
+                            thinking_parts.append(thinking_text)
+                        elif not native_reasoning_content:
+                            text_parts.append(f"<think>\n{thinking_text}\n</think>")
 
                 elif block_type == "document":
                     text_parts.append(_decode_document_block(block_dict))
@@ -302,6 +334,8 @@ def convert_anthropic_to_internal(
                 "role": role,
                 "content": "",
             }
+            if thinking_parts:
+                msg_dict["reasoning_content"] = "\n".join(thinking_parts)
             if saw_tool_markup:
                 msg_dict[_PRESERVE_ROLE_BOUNDARY] = True
             processed_messages.append(msg_dict)
@@ -633,6 +667,26 @@ def _extract_tool_result_content(
 # Tool Conversion: Anthropic -> Internal
 # =============================================================================
 
+# Anthropic server-side tools (executed on Anthropic's infrastructure) carry a
+# versioned ``type`` like ``web_search_20250305`` and have no ``input_schema``.
+# oMLX cannot fulfill these locally, so we drop them before forwarding to the
+# model. See https://docs.anthropic.com for the canonical tool families.
+SERVER_SIDE_TOOL_TYPE_PREFIXES = (
+    "web_search_",
+    "code_execution_",
+    "bash_",
+    "text_editor_",
+    "computer_",
+)
+
+
+def _is_server_side_tool(tool_dict: dict[str, Any]) -> bool:
+    """Return True if the tool dict is an Anthropic server-side tool."""
+    tool_type = tool_dict.get("type")
+    if not isinstance(tool_type, str):
+        return False
+    return tool_type.startswith(SERVER_SIDE_TOOL_TYPE_PREFIXES)
+
 
 def convert_anthropic_tools_to_internal(
     tools: list[AnthropicTool] | None,
@@ -643,16 +697,21 @@ def convert_anthropic_tools_to_internal(
     Anthropic: {"name": "...", "description": "...", "input_schema": {...}}
     Internal:  {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
 
+    Anthropic server-side tools (web_search, code_execution, bash, text_editor,
+    computer) cannot be executed by oMLX and are dropped with an INFO log.
+
     Args:
         tools: List of Anthropic tool definitions
 
     Returns:
-        List of internal tool definitions, or None if no tools
+        List of internal tool definitions, or None if no executable tools
     """
     if not tools:
         return None
 
-    internal_tools = []
+    internal_tools: list[dict[str, Any]] = []
+    dropped: list[str] = []
+
     for tool in tools:
         # Handle both Pydantic models and dicts
         if hasattr(tool, "model_dump"):
@@ -662,15 +721,26 @@ def convert_anthropic_tools_to_internal(
         else:
             continue
 
+        if _is_server_side_tool(tool_dict):
+            dropped.append(f"{tool_dict.get('type')}:{tool_dict.get('name', '')}")
+            continue
+
         internal_tools.append(
             {
                 "type": "function",
                 "function": {
                     "name": tool_dict.get("name", ""),
                     "description": tool_dict.get("description", ""),
-                    "parameters": tool_dict.get("input_schema", {}),
+                    "parameters": tool_dict.get("input_schema") or {},
                 },
             }
+        )
+
+    if dropped:
+        logger.info(
+            "Dropped %d Anthropic server-side tool(s) not executable by oMLX: %s",
+            len(dropped),
+            ", ".join(dropped),
         )
 
     return internal_tools if internal_tools else None
@@ -689,9 +759,17 @@ def convert_internal_to_anthropic_response(
     finish_reason: str | None,
     tool_calls: list[ToolCall] | None = None,
     thinking: str | None = None,
+    cached_tokens: int = 0,
+    prefix_cache_enabled: bool = False,
 ) -> MessagesResponse:
     """
     Convert internal output to Anthropic MessagesResponse.
+
+    When ``prefix_cache_enabled`` is True the prompt count is split into
+    Anthropic's disjoint usage fields so that
+    input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+    equals prompt_tokens. Otherwise the response keeps the legacy shape
+    (input_tokens = prompt_tokens, cache fields = 0).
 
     Args:
         text: Generated text content
@@ -701,18 +779,27 @@ def convert_internal_to_anthropic_response(
         finish_reason: Internal finish reason ("stop", "length", "tool_calls")
         tool_calls: List of internal ToolCall objects
         thinking: Reasoning/thinking content from <think> blocks
+        cached_tokens: Prompt tokens served from the prefix cache
+        prefix_cache_enabled: Whether the engine runs automatic prefix caching
 
     Returns:
         Anthropic MessagesResponse
     """
     content: list[ContentBlockText | ContentBlockToolUse | ContentBlockThinking] = []
 
-    # Add thinking content block before text if present
+    # Add thinking content block before text if present.
+    # Anthropic's spec requires a non-empty cryptographic signature on
+    # thinking blocks; an empty string makes some SDK versions fall
+    # back to a text-block parser path and emit "Content block is not
+    # a text block". omlx cannot mint a real Anthropic signature, so
+    # we use a stable placeholder string. Clients that strictly verify
+    # the signature will still reject, but the common Claude Code SDK
+    # only checks that the field is present and non-empty.
     if thinking and thinking.strip():
         content.append(ContentBlockThinking(
             type="thinking",
             thinking=thinking,
-            signature="",
+            signature="omlx-reasoning",
         ))
 
     # Add text content block if present and not empty
@@ -744,6 +831,17 @@ def convert_internal_to_anthropic_response(
     # Map finish reason to stop reason
     stop_reason = map_finish_reason_to_stop_reason(finish_reason, bool(tool_calls))
 
+    # When prefix caching is on, split prompt_tokens into the Anthropic
+    # disjoint triple (input + creation + read == prompt_tokens).
+    if prefix_cache_enabled:
+        cache_read = max(0, min(cached_tokens, prompt_tokens))
+        cache_creation = prompt_tokens - cache_read
+        input_display = 0
+    else:
+        cache_read = 0
+        cache_creation = 0
+        input_display = prompt_tokens
+
     return MessagesResponse(
         id=f"msg_{uuid.uuid4().hex[:24]}",
         type="message",
@@ -752,8 +850,10 @@ def convert_internal_to_anthropic_response(
         content=content,
         stop_reason=stop_reason,
         usage=AnthropicUsage(
-            input_tokens=prompt_tokens,
+            input_tokens=input_display,
             output_tokens=completion_tokens,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
         ),
     )
 
@@ -845,7 +945,14 @@ def create_content_block_start_event(index: int, block_type: str, **kwargs) -> s
             "input": {},
         }
     elif block_type == "thinking":
-        content_block = {"type": "thinking", "thinking": ""}
+        # Anthropic spec requires a signature field on thinking blocks
+        # (see convert_internal_to_anthropic_response for the rationale
+        # behind the placeholder string).
+        content_block = {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "omlx-reasoning",
+        }
     else:
         content_block = {"type": block_type}
 
@@ -911,11 +1018,25 @@ def create_message_delta_event(
     output_tokens: int,
     stop_sequence: str | None = None,
     input_tokens: int | None = None,
+    cached_tokens: int = 0,
+    prefix_cache_enabled: bool = False,
 ) -> str:
-    """Create message_delta SSE event."""
-    usage = {"output_tokens": output_tokens}
-    if input_tokens is not None:
+    """Create message_delta SSE event.
+
+    When ``prefix_cache_enabled`` is True and ``input_tokens`` is given, the
+    count is split into Anthropic's disjoint triple (input stays 0, creation
+    and read carry the remainder). Otherwise the legacy shape is preserved.
+    """
+    usage: dict[str, int] = {"output_tokens": output_tokens}
+
+    if prefix_cache_enabled and input_tokens is not None:
+        cache_read = max(0, min(cached_tokens, input_tokens))
+        usage["input_tokens"] = 0
+        usage["cache_creation_input_tokens"] = input_tokens - cache_read
+        usage["cache_read_input_tokens"] = cache_read
+    elif input_tokens is not None:
         usage["input_tokens"] = input_tokens
+
     return format_sse_event(
         "message_delta",
         {
