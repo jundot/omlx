@@ -1291,4 +1291,77 @@ class TestDiscoverSanitizePlan:
 
 
 # =============================================================================
+# Test _build_model_sanitizer text_only VLM bypass
+# =============================================================================
+
+
+class TestBuildModelSanitizerTextOnly:
+    """When text_only=True, _build_model_sanitizer must use the mlx-lm (LLM)
+    sanitize path — never the mlx-vlm (VLM) path — even when the model config
+    lists a ForConditionalGeneration architecture.
+
+    Without this, VLM sanitize uses a _Proxy that lacks self.mtp, silently
+    stripping all mtp.* tensors from the oQ output despite preserve_mtp=True.
+    """
+
+    VLM_CONFIG = {
+        "architectures": ["Qwen2_5_VLForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "num_hidden_layers": 28,
+        "hidden_size": 3584,
+    }
+
+    LLM_CONFIG = {
+        "architectures": ["Qwen2ForCausalLM"],
+        "model_type": "qwen3_5",
+        "num_hidden_layers": 28,
+        "hidden_size": 3584,
+    }
+
+    def test_vlm_config_without_text_only_attempts_vlm_path(self):
+        """Baseline: VLM config without text_only should try the VLM path."""
+        from unittest.mock import patch
+
+        from omlx.oq import _build_model_sanitizer
+
+        with patch("omlx.oq.logger") as mock_logger:
+            _build_model_sanitizer(self.VLM_CONFIG, text_only=False)
+
+        debug_messages = [str(c) for c in mock_logger.debug.call_args_list]
+        info_messages = [str(c) for c in mock_logger.info.call_args_list]
+        all_messages = " ".join(debug_messages + info_messages)
+        assert "mlx-vlm" in all_messages or "mlx-lm" in all_messages
+
+    def test_vlm_config_with_text_only_skips_vlm_path(self):
+        """With text_only=True, the VLM path must be skipped entirely."""
+        from unittest.mock import patch
+
+        from omlx.oq import _build_model_sanitizer
+
+        with patch("omlx.oq.logger") as mock_logger:
+            _build_model_sanitizer(self.VLM_CONFIG, text_only=True)
+
+        debug_messages = [str(c) for c in mock_logger.debug.call_args_list]
+        info_messages = [str(c) for c in mock_logger.info.call_args_list]
+        all_messages = " ".join(debug_messages + info_messages)
+        assert "mlx-vlm full sanitize" not in all_messages
+
+    def test_llm_config_unaffected_by_text_only(self):
+        """LLM configs (no ForConditionalGeneration) should always use the
+        mlx-lm path regardless of text_only."""
+        from unittest.mock import patch
+
+        from omlx.oq import _build_model_sanitizer
+
+        for text_only in (True, False):
+            with patch("omlx.oq.logger") as mock_logger:
+                _build_model_sanitizer(self.LLM_CONFIG, text_only=text_only)
+
+            debug_messages = [str(c) for c in mock_logger.debug.call_args_list]
+            info_messages = [str(c) for c in mock_logger.info.call_args_list]
+            all_messages = " ".join(debug_messages + info_messages)
+            assert "mlx-vlm full sanitize" not in all_messages
+
+
+# =============================================================================
 # Test GPTQ quantization
