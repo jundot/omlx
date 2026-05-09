@@ -379,8 +379,11 @@ class STSEngine(BaseNonStreamingEngine):
         def _process_sync():
             return processor_fn(model, str(audio_path), **kwargs)
 
-        with self._active_lock:
-            self._active_count += 1
+        activity_id = self._begin_activity(
+            "processing audio",
+            detail="Processing audio",
+            metadata={"file_size_bytes": file_size, "family": family},
+        )
         try:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(get_mlx_executor(), _process_sync)
@@ -392,7 +395,7 @@ class STSEngine(BaseNonStreamingEngine):
             )
             return result
         finally:
-            if self._decrement_active():
+            if self._end_activity(activity_id):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),

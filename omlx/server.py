@@ -1755,6 +1755,13 @@ async def create_embeddings(
             f"Embedding: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
             f"{output.total_tokens} tokens in {elapsed:.3f}s"
         )
+        get_server_metrics().record_request_complete(
+            prompt_tokens=output.total_tokens,
+            completion_tokens=0,
+            cached_tokens=0,
+            prefill_duration=elapsed,
+            model_id=resolve_model_id(request.model) or request.model,
+        )
 
         data = []
         for i, embedding in enumerate(output.embeddings):
@@ -1868,6 +1875,13 @@ async def create_rerank(
     logger.info(
         f"Rerank: {len(documents_raw)} docs, "
         f"{output.total_tokens} tokens in {elapsed:.3f}s"
+    )
+    get_server_metrics().record_request_complete(
+        prompt_tokens=output.total_tokens,
+        completion_tokens=0,
+        cached_tokens=0,
+        prefill_duration=elapsed,
+        model_id=resolve_model_id(request.model) or request.model,
     )
 
     # Format response - results sorted by score (descending). Strings wrap

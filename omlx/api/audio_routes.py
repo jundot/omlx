@@ -20,6 +20,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response, StreamingResponse
 
 from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
+from ..server_metrics import get_server_metrics
 from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,19 @@ def _resolve_model(model_id: str) -> str:
     from omlx.server import resolve_model_id
 
     return resolve_model_id(model_id) or model_id
+
+
+def _record_audio_request(model_id: str) -> None:
+    """Record audio request count without treating bytes/chars as tokens."""
+    try:
+        get_server_metrics().record_request_complete(
+            prompt_tokens=0,
+            completion_tokens=0,
+            cached_tokens=0,
+            model_id=model_id,
+        )
+    except Exception as exc:
+        logger.warning("Failed to record audio metrics for %s: %s", model_id, exc)
 
 
 async def _read_upload(file: UploadFile) -> bytes:
@@ -359,16 +373,16 @@ async def create_transcription(
     from omlx.exceptions import ModelNotFoundError
 
     pool = _get_engine_pool()
-    model = _resolve_model(model)
+    resolved_model = _resolve_model(model)
 
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
-        engine = await pool.get_engine(model)
+        engine = await pool.get_engine(resolved_model)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
             status_code=404,
-            detail=f"Model '{model}' not found. Available: {avail}",
+            detail=f"Model '{resolved_model}' not found. Available: {avail}",
         ) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -376,7 +390,7 @@ async def create_transcription(
     if not isinstance(engine, STTEngine):
         raise HTTPException(
             status_code=400,
-            detail=f"Model '{model}' is not a speech-to-text model",
+            detail=f"Model '{resolved_model}' is not a speech-to-text model",
         )
 
     # Save uploaded file to a temp path so the engine can open it by path.
@@ -403,6 +417,8 @@ async def create_transcription(
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+    _record_audio_request(resolved_model)
 
     # Build response directly from the dict returned by STTEngine
     segments = result.get("segments") or None
@@ -500,6 +516,8 @@ async def create_speech(request: AudioSpeechRequest):
     finally:
         _cleanup_tempfile(ref_audio_path)
 
+    _record_audio_request(resolved_model)
+
     return Response(content=wav_bytes, media_type="audio/wav")
 
 
@@ -518,16 +536,16 @@ async def process_audio(
     from omlx.exceptions import ModelNotFoundError
 
     pool = _get_engine_pool()
-    model = _resolve_model(model)
+    resolved_model = _resolve_model(model)
 
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
-        engine = await pool.get_engine(model)
+        engine = await pool.get_engine(resolved_model)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
             status_code=404,
-            detail=f"Model '{model}' not found. Available: {avail}",
+            detail=f"Model '{resolved_model}' not found. Available: {avail}",
         ) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -535,7 +553,7 @@ async def process_audio(
     if not isinstance(engine, STSEngine):
         raise HTTPException(
             status_code=400,
-            detail=f"Model '{model}' is not a speech-to-speech / audio processing model",
+            detail=f"Model '{resolved_model}' is not a speech-to-speech / audio processing model",
         )
 
     # Save uploaded file to a temp path so the engine can open it by path.
@@ -562,5 +580,7 @@ async def process_audio(
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+    _record_audio_request(resolved_model)
 
     return Response(content=wav_bytes, media_type="audio/wav")

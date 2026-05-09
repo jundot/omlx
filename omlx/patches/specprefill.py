@@ -344,19 +344,28 @@ def _unpatch_attention_capture(model, originals):
         _set_attn_module(model.layers[layer_idx], orig)
 
 
-def _prefill_draft(model, tokens, cache, step_size=2048):
+def _prefill_draft(model, tokens, cache, step_size=2048, progress_callback=None):
     """Prefill draft model with all prompt tokens. Returns last logits."""
     prompt = mx.array(tokens) if not isinstance(tokens, mx.array) else tokens
     n = len(tokens)
     processed = 0
     while n - processed > 1:
         chunk = min(step_size, n - processed - 1)
+        if progress_callback is not None:
+            # Mark the chunk as active before the MLX eval without advancing
+            # completed-token progress. Advancing here makes tok/s math lie
+            # because the expensive work has not finished yet.
+            progress_callback(processed, n)
         model(prompt[processed : processed + chunk][None], cache=cache)
         mx.eval([c.state for c in cache])
         processed += chunk
+        if progress_callback is not None:
+            progress_callback(processed, n)
         mx.clear_cache()
     logits = model(prompt[processed:][None], cache=cache)
     mx.eval(logits)
+    if progress_callback is not None:
+        progress_callback(n, n)
     return logits
 
 
@@ -446,6 +455,7 @@ def score_tokens(
     prefill_step_size: int = 2048,
     query_extractor: Optional[Callable] = None,
     existing_cache: Optional[List[Any]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Tuple[mx.array, Any]:
     """Score token importance using attention patterns on a draft model.
 
@@ -498,14 +508,34 @@ def score_tokens(
         cached_len = cache[0].offset if hasattr(cache[0], "offset") else 0
         suffix = tokens[cached_len:]
         if suffix:
-            logits = _prefill_draft(model, suffix, cache, step_size=prefill_step_size)
+            logits = _prefill_draft(
+                model,
+                suffix,
+                cache,
+                step_size=prefill_step_size,
+                progress_callback=(
+                    (lambda processed, total: progress_callback(cached_len + processed, n_prompt, "scoring"))
+                    if progress_callback is not None
+                    else None
+                ),
+            )
         else:
             # Exact cache hit — run last token to get logits
             logits = model(mx.array([tokens[-1]])[None], cache=cache)
             mx.eval(logits)
     else:
         cache = make_prompt_cache(model)
-        logits = _prefill_draft(model, tokens, cache, step_size=prefill_step_size)
+        logits = _prefill_draft(
+            model,
+            tokens,
+            cache,
+            step_size=prefill_step_size,
+            progress_callback=(
+                (lambda processed, total: progress_callback(processed, total, "scoring"))
+                if progress_callback is not None
+                else None
+            ),
+        )
 
     # Record cache offset before lookahead so we can trim afterwards.
     # Lookahead decode appends n_lookahead+1 tokens to the cache which
@@ -518,6 +548,8 @@ def score_tokens(
         model, query_buffer, query_extractor
     )
     try:
+        if progress_callback is not None:
+            progress_callback(n_prompt, n_prompt, "lookahead")
         _lookahead_decode(model, logits, cache, n_lookahead, temp=temp, top_p=top_p)
         mx.eval(query_buffer)
     finally:
@@ -535,6 +567,8 @@ def score_tokens(
         pool_kernel=pool_kernel if pool_kernel > 0 else None,
     )
     mx.eval(importance)
+    if progress_callback is not None:
+        progress_callback(n_prompt, n_prompt, "importance")
 
     # Trim lookahead tokens from cache before returning.
     # KVCache stores keys/values as contiguous tensors; slicing back
@@ -732,6 +766,7 @@ def sparse_prefill(
     cache,
     step_size: int = 2048,
     position_offset: int = 0,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> mx.array:
     """Prefill model cache with selected tokens at their original positions.
 
@@ -812,14 +847,23 @@ def sparse_prefill(
 
         while n - processed > 1:
             chunk = min(step_size, n - processed - 1)
+            if progress_callback is not None:
+                # Surface that work is active before the potentially long
+                # target-model eval returns, but don't advance completed-token
+                # progress until the eval has actually finished.
+                progress_callback(processed, n)
             model(prompt[processed : processed + chunk][None], cache=cache)
             mx.eval([c.state for c in cache])
             processed += chunk
+            if progress_callback is not None:
+                progress_callback(processed, n)
             mx.clear_cache()
 
         # Last token -> logits
         logits = model(prompt[processed:][None], cache=cache)
         mx.eval(logits)
+        if progress_callback is not None:
+            progress_callback(n, n)
 
     finally:
         # Replace position-mapped RoPE with offset-adjusted RoPE for decode

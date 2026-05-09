@@ -143,7 +143,7 @@
                                                 <template x-if="m.is_loading">
                                                     <div class="flex items-center gap-1.5">
                                                         <svg class="w-3 h-3 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
-                                                        <span class="text-xs text-blue-500 font-medium">loading</span>
+                                                        <span class="text-xs text-blue-500 font-medium" x-text="'Loading' + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + ' left' : '')"></span>
                                                     </div>
                                                 </template>
                                                 <!-- Prefilling -->
@@ -195,7 +195,10 @@
                                                              :style="'width: ' + (pp.total > 0 ? Math.min(100, pp.processed / pp.total * 100) : 0) + '%'"></div>
                                                     </div>
                                                     <span class="text-[10px] text-blue-500 font-medium w-8 text-right" x-text="(pp.total > 0 ? Math.round(pp.processed / pp.total * 100) : 0) + '%'"></span>
+                                                    <span class="text-[10px] text-blue-600 font-medium" x-show="pp.detail" x-text="pp.detail"></span>
                                                     <span class="text-[10px] text-neutral-400" x-text="formatTokenCount(pp.processed) + ' / ' + formatTokenCount(pp.total) + ' tok'"></span>
+                                                    <span x-show="pp.scored_tokens || pp.selected_tokens" class="text-[10px] text-neutral-400" x-text="'(' + (pp.scored_tokens ? 'draft scored ' + formatTokenCount(pp.scored_tokens) : '') + (pp.scored_tokens && pp.selected_tokens ? ' · ' : '') + (pp.selected_tokens ? 'selected ' + formatTokenCount(pp.selected_tokens) + (pp.keep_percent != null ? ' (' + pp.keep_percent + '%)' : '') : '') + ')'"></span>
+                                                    <span x-show="pp.elapsed != null" class="text-[10px] text-neutral-400" x-text="formatDurationShort(pp.elapsed)"></span>
                                                     <span x-show="pp.speed > 0" class="text-[10px] text-neutral-400"
                                                           x-text="'(' + pp.speed.toFixed(0) + ' tok/s' + (pp.eta != null ? ', ' + (pp.eta >= 60 ? Math.floor(pp.eta / 60) + 'm ' + Math.round(pp.eta % 60) + 's' : Math.round(pp.eta) + 's') + ' left' : '') + ')'"></span>
                                                 </div>
@@ -206,10 +209,48 @@
                                     <template x-if="m.generating && m.generating.length > 0">
                                         <div class="mt-1.5 ml-5 space-y-1.5">
                                             <template x-for="gen in m.generating" :key="gen.request_id">
-                                                <div class="flex items-center gap-2">
+                                                <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
                                                     <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="gen.request_id.substring(0, 8)"></span>
-                                                    <span class="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
-                                                    <span class="text-[10px] text-green-600 font-medium" x-text="window.t('status.active_models.generating')"></span>
+                                                    <span class="inline-flex items-center gap-2 min-w-[104px] whitespace-nowrap">
+                                                        <span class="w-2 h-2 rounded-full flex-shrink-0 bg-green-400 animate-pulse"></span>
+                                                        <span class="text-[10px] text-green-600 font-medium" x-text="window.t('status.active_models.generating')"></span>
+                                                    </span>
+                                                    <span class="text-[10px] text-neutral-400 w-16 whitespace-nowrap ml-2" x-text="formatTokenCount(gen.generated_tokens || 0) + ' tok'"></span>
+                                                    <span x-show="gen.tokens_per_second > 0" class="text-[10px] text-neutral-400 w-20 whitespace-nowrap"
+                                                          x-text="gen.tokens_per_second.toFixed(1) + ' tok/s'"></span>
+                                                    <span x-show="gen.last_activity_age_seconds >= 3" class="text-[10px] text-neutral-400 whitespace-nowrap" x-text="formatActivityAge(gen.last_activity_age_seconds)"></span>
+                                                    <span x-show="gen.elapsed_seconds != null" class="text-[10px] text-neutral-400 whitespace-nowrap"
+                                                          x-text="formatDurationShort(gen.elapsed_seconds)"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+                                    <!-- Non-streaming activity sub-rows -->
+                                    <template x-if="m.activities && m.activities.length > 0">
+                                        <div class="mt-1.5 ml-5 space-y-1.5">
+                                            <template x-for="activity in m.activities" :key="activity.request_id">
+                                                <div class="flex flex-wrap items-center gap-x-5 gap-y-1">
+                                                    <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="activity.request_id.substring(0, 8)"></span>
+                                                    <span class="inline-flex items-center gap-2 min-w-[120px] whitespace-nowrap">
+                                                        <span class="w-2 h-2 rounded-full flex-shrink-0" :class="activityDotClass(activity.last_activity_age_seconds)"></span>
+                                                        <span class="text-[10px] text-green-600 font-medium" x-text="activity.detail || activity.kind || window.t('status.active_models.active')"></span>
+                                                    </span>
+                                                    <span x-show="formatActivityMetadata(activity)" class="text-[10px] text-neutral-400 whitespace-nowrap ml-2" x-text="formatActivityMetadata(activity)"></span>
+                                                    <span x-show="activity.elapsed_seconds != null" class="text-[10px] text-neutral-400 whitespace-nowrap ml-1" x-text="formatDurationShort(activity.elapsed_seconds)"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+                                    <!-- Waiting sub-rows -->
+                                    <template x-if="m.waiting && m.waiting.length > 0">
+                                        <div class="mt-1.5 ml-5 space-y-1.5">
+                                            <template x-for="wait in m.waiting" :key="wait.request_id">
+                                                <div class="flex items-center gap-2">
+                                                    <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="wait.request_id.substring(0, 8)"></span>
+                                                    <span class="w-2 h-2 rounded-full bg-amber-300"></span>
+                                                    <span class="text-[10px] text-amber-600 font-medium" x-text="window.t('status.active_models.waiting') + ' #' + wait.queue_position"></span>
+                                                    <span class="text-[10px] text-neutral-400" x-text="formatDurationShort(wait.elapsed_seconds)"></span>
+                                                    <span x-show="wait.prompt_tokens > 0" class="text-[10px] text-neutral-400" x-text="'prompt: ' + formatTokenCount(wait.prompt_tokens) + ' tok'"></span>
                                                 </div>
                                             </template>
                                         </div>

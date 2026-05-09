@@ -29,11 +29,20 @@ class PrefillProgressTracker:
         self._progress: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
 
-    def update(self, request_id: str, processed: int, total: int, model_id: str) -> None:
-        """Update prefill progress for a request.
+    def update(
+        self,
+        request_id: str,
+        processed: int,
+        total: int,
+        model_id: str,
+        phase: str = "prefill",
+        detail: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Update prefill/spec-prefill progress for a request.
 
         Auto-removes the entry when processed >= total (prefill complete).
-        Tracks timing for speed/ETA calculation.
+        Tracks phase timing for speed/ETA calculation.
         """
         now = time.monotonic()
         with self._lock:
@@ -41,7 +50,10 @@ class PrefillProgressTracker:
                 self._progress.pop(request_id, None)
             else:
                 prev = self._progress.get(request_id)
-                if prev is not None:
+                phase_changed = prev is not None and prev.get("phase") != phase
+                start_time = now if prev is None or phase_changed else prev["start_time"]
+
+                if prev is not None and not phase_changed:
                     dt = now - prev["last_time"]
                     dtok = processed - prev["processed"]
                     if dt > 0 and dtok > 0:
@@ -51,14 +63,20 @@ class PrefillProgressTracker:
                 else:
                     speed = 0.0
 
-                self._progress[request_id] = {
-                    "processed": processed,
-                    "total": total,
-                    "model_id": model_id,
-                    "start_time": prev["start_time"] if prev else now,
-                    "last_time": now,
-                    "speed": speed,
-                }
+                entry = dict(extra or {})
+                entry.update(
+                    {
+                        "processed": processed,
+                        "total": total,
+                        "model_id": model_id,
+                        "start_time": start_time,
+                        "last_time": now,
+                        "speed": speed,
+                        "phase": phase,
+                        "detail": detail,
+                    }
+                )
+                self._progress[request_id] = entry
 
     def remove(self, request_id: str) -> None:
         """Explicitly remove a request (e.g. on abort or finish)."""
@@ -72,16 +90,32 @@ class PrefillProgressTracker:
             for rid, entry in self._progress.items():
                 if entry["model_id"] != model_id:
                     continue
-                remaining = entry["total"] - entry["processed"]
+                elapsed = time.monotonic() - entry["start_time"]
                 speed = entry.get("speed", 0.0)
+                remaining = entry["total"] - entry["processed"]
                 eta = remaining / speed if speed > 0 else None
-                results.append({
+                result = {
                     "request_id": rid,
                     "processed": entry["processed"],
                     "total": entry["total"],
                     "speed": round(speed, 1),
                     "eta": round(eta, 1) if eta is not None else None,
-                })
+                    "elapsed": round(elapsed, 1),
+                    "phase": entry.get("phase", "prefill"),
+                    "detail": entry.get("detail"),
+                }
+                for key in (
+                    "scored_tokens",
+                    "selected_tokens",
+                    "keep_percent",
+                    "prompt_tokens",
+                    "system_tokens",
+                    "conversation_tokens",
+                    "cached_tokens",
+                ):
+                    if key in entry:
+                        result[key] = entry[key]
+                results.append(result)
             return results
 
     def clear(self) -> None:

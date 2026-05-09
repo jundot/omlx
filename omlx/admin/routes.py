@@ -3549,6 +3549,7 @@ def _build_active_models_data() -> dict:
             "total_waiting_requests": 0,
         }
 
+    now = time.monotonic()
     tracker = get_prefill_tracker()
     status = engine_pool.get_status()
     models = []
@@ -3562,6 +3563,10 @@ def _build_active_models_data() -> dict:
         model_id = model_info["id"]
         active_requests = 0
         waiting_requests = 0
+        running_by_id = {}
+        waiting_ids = set()
+        waiting = []
+        activities = []
 
         # Get per-model active/waiting request counts.
         # Follow the same pattern as server.py /api/status endpoint.
@@ -3573,20 +3578,105 @@ def _build_active_models_data() -> dict:
                 core = getattr(async_core, "engine", None)
                 if core is not None:
                     collectors = getattr(core, "_output_collectors", {})
-                    active_request_ids = set(collectors.keys())
-                    active_requests = len(collectors)
+                    try:
+                        active_request_ids = set(collectors.keys())
+                        active_requests = len(collectors)
+                    except RuntimeError:
+                        # Scheduler state is mutated from the engine executor;
+                        # keep the dashboard endpoint best-effort rather than
+                        # failing on a concurrent dict resize.
+                        active_request_ids = set()
+                        active_requests = len(collectors)
+
                     sched = getattr(core, "scheduler", None)
                     if sched is not None:
-                        waiting_requests = len(getattr(sched, "waiting", []))
+                        for attempt in range(2):
+                            try:
+                                running_by_id = dict(getattr(sched, "running", {}))
+                                waiting_queue = list(getattr(sched, "waiting", []))
+                                waiting_requests = len(waiting_queue)
+                                waiting_ids = {req.request_id for req in waiting_queue}
+                                waiting = [
+                                    {
+                                        "request_id": req.request_id,
+                                        "queue_position": idx,
+                                        "elapsed_seconds": max(0.0, now - req.arrival_time),
+                                        "prompt_tokens": getattr(req, "num_prompt_tokens", 0),
+                                    }
+                                    for idx, req in enumerate(waiting_queue, start=1)
+                                ]
+                                break
+                            except (RuntimeError, KeyError):
+                                if attempt == 0:
+                                    continue
+                                logger.debug(
+                                    "Active model scheduler snapshot raced; "
+                                    "falling back to aggregate counts only",
+                                    exc_info=True,
+                                )
+                                waiting_queue_ref = getattr(sched, "waiting", [])
+                                waiting_requests = len(waiting_queue_ref)
+                                running_by_id = {}
+                                waiting_ids = set()
+                                waiting = []
+            elif hasattr(entry.engine, "get_activity_snapshot"):
+                snapshot = entry.engine.get_activity_snapshot()
+                active_requests = snapshot.get("active_requests", 0)
+                activities = snapshot.get("activities", [])
 
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
 
-        # Generating = active requests that finished prefill
-        generating = [
-            {"request_id": rid}
-            for rid in sorted(active_request_ids - prefilling_ids)
-        ]
+        # Generating = active requests that finished prefill.
+        generating = []
+        for rid in sorted(active_request_ids - prefilling_ids - waiting_ids):
+            req = running_by_id.get(rid)
+            generated_tokens = getattr(req, "num_output_tokens", 0) if req else 0
+            started_at = getattr(req, "generation_started_at", None) if req else None
+            last_activity_at = getattr(req, "last_activity_at", None) if req else None
+            elapsed = max(0.0, now - started_at) if started_at else None
+            last_activity_age = (
+                max(0.0, now - last_activity_at) if last_activity_at else None
+            )
+            tokens_per_second = (
+                generated_tokens / elapsed if elapsed and elapsed > 0 else 0.0
+            )
+            generating.append(
+                {
+                    "request_id": rid,
+                    "elapsed_seconds": elapsed,
+                    "generated_tokens": generated_tokens,
+                    "tokens_per_second": tokens_per_second,
+                    "last_activity_age_seconds": last_activity_age,
+                    "prompt_tokens": getattr(req, "num_prompt_tokens", 0) if req else 0,
+                    "max_tokens": getattr(req, "max_tokens", None) if req else None,
+                }
+            )
+
+        loading_started_at = model_info.get("loading_started_at")
+        loading_elapsed_seconds = (
+            max(0.0, now - loading_started_at) if loading_started_at else None
+        )
+        loading_estimated_seconds = None
+        loading_remaining_seconds_estimate = None
+        if loading_elapsed_seconds is not None:
+            estimated_size_gb = model_info.get("estimated_size", 0) / (1024 ** 3)
+            # Model loaders do not expose byte-level progress, so use a
+            # deliberately conservative elapsed-time estimate and cap below
+            # complete until the model is actually loaded.
+            observed_seconds_per_gb = status.get("load_seconds_per_gb_estimate")
+            observations = status.get("load_time_observations", 0)
+            if observed_seconds_per_gb and observations >= 2:
+                # Adapt to this machine/session once we have more than a
+                # single potentially-misleading sample.
+                loading_estimated_seconds = max(
+                    3.0,
+                    1.0 + estimated_size_gb * float(observed_seconds_per_gb),
+                )
+                if loading_elapsed_seconds < loading_estimated_seconds:
+                    loading_remaining_seconds_estimate = max(
+                        0.0, loading_estimated_seconds - loading_elapsed_seconds
+                    )
 
         models.append({
             "id": model_id,
@@ -3596,8 +3686,13 @@ def _build_active_models_data() -> dict:
             ),
             "pinned": model_info.get("pinned", False),
             "is_loading": model_info.get("is_loading", False),
+            "loading_elapsed_seconds": loading_elapsed_seconds,
+            "loading_estimated_seconds": loading_estimated_seconds,
+            "loading_remaining_seconds_estimate": loading_remaining_seconds_estimate,
             "active_requests": active_requests,
             "waiting_requests": waiting_requests,
+            "waiting": waiting,
+            "activities": activities,
             "prefilling": prefilling,
             "generating": generating,
         })

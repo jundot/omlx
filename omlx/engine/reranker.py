@@ -129,13 +129,18 @@ class RerankerEngine(BaseNonStreamingEngine):
                 max_length=max_length,
             )
 
-        with self._active_lock:
-            self._active_count += 1
+        activity_id = self._begin_activity(
+            "reranking",
+            detail="Reranking",
+            total_items=len(documents),
+            metadata={"document_count": len(documents)},
+        )
         try:
             loop = asyncio.get_running_loop()
             output = await loop.run_in_executor(
                 get_mlx_executor(), _rerank_sync
             )
+            self._update_activity(activity_id, token_count=output.total_tokens)
 
             # Apply top_n filtering if specified
             if top_n is not None and top_n < len(output.indices):
@@ -149,7 +154,7 @@ class RerankerEngine(BaseNonStreamingEngine):
 
             return output
         finally:
-            if self._decrement_active():
+            if self._end_activity(activity_id):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),
