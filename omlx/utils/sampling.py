@@ -145,23 +145,36 @@ def make_sampler(
     top-p / min-p / xtc / top-k filters and finishes with categorical sampling.
     """
     if temp == 0:
-        return lambda x: mx.argmax(x, axis=-1)
+        sampler = lambda x: mx.argmax(x, axis=-1)
+    else:
+        sampling_methods = []
+        if top_p > 0 and top_p < 1.0:
+            sampling_methods.append(lambda x: apply_top_p(x, top_p))
+        if min_p != 0.0:
+            sampling_methods.append(
+                lambda x: apply_min_p(x, min_p, min_tokens_to_keep)
+            )
+        if xtc_probability > 0.0:
+            sampling_methods.append(
+                lambda x: apply_xtc(
+                    x, xtc_probability, xtc_threshold, xtc_special_tokens
+                )
+            )
+        if top_k > 0:
+            sampling_methods.append(lambda x: apply_top_k(x, top_k))
 
-    sampling_methods = []
-    if top_p > 0 and top_p < 1.0:
-        sampling_methods.append(lambda x: apply_top_p(x, top_p))
-    if min_p != 0.0:
-        sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
-    if xtc_probability > 0.0:
-        sampling_methods.append(
-            lambda x: apply_xtc(x, xtc_probability, xtc_threshold, xtc_special_tokens)
-        )
-    if top_k > 0:
-        sampling_methods.append(lambda x: apply_top_k(x, top_k))
+        def sampler(logprobs: mx.array) -> mx.array:
+            for method in sampling_methods:
+                logprobs = method(logprobs)
+            return categorical_sampling(logprobs, temp)
 
-    def sampler(logprobs: mx.array) -> mx.array:
-        for method in sampling_methods:
-            logprobs = method(logprobs)
-        return categorical_sampling(logprobs, temp)
-
+    # Expose sampling params on the returned callable so downstream code
+    # (e.g. MTP acceptance check) can rebuild the filtered distribution
+    # without re-plumbing the params through the BatchGenerator contract.
+    # Lambda functions accept attribute assignment in CPython.
+    sampler.temp = temp
+    sampler.top_p = top_p
+    sampler.min_p = min_p
+    sampler.top_k = top_k
+    sampler.min_tokens_to_keep = min_tokens_to_keep
     return sampler

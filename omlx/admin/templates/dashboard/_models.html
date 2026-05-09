@@ -1124,6 +1124,27 @@
                                         <p x-show="oqTextOnly && oqSelectedModelIsVLM()" x-cloak class="text-xs text-amber-600 leading-relaxed">
                                             Excludes vision encoder weights. Output is a text-only model (~2-3% smaller).
                                         </p>
+                                        <!-- Preserve MTP weights -->
+                                        <div class="flex items-center justify-between">
+                                            <div class="flex-1 min-w-0 pr-3">
+                                                <span class="text-sm text-neutral-600">{{ t('models.oq.preserve_mtp') }}</span>
+                                                <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.preserve_mtp_help') }}</p>
+                                                <p x-show="!oqSelectedModelHasMtp()"
+                                                   x-cloak
+                                                   class="text-xs text-amber-600 mt-1 leading-relaxed">{{ t('models.oq.preserve_mtp_unavailable') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="if (oqSelectedModelHasMtp()) oqPreserveMtp = !oqPreserveMtp"
+                                                    :disabled="!oqSelectedModelHasMtp()"
+                                                    :class="[
+                                                        oqPreserveMtp ? 'bg-black' : 'bg-neutral-200',
+                                                        !oqSelectedModelHasMtp() ? 'opacity-40 cursor-not-allowed' : ''
+                                                    ]"
+                                                    class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="oqPreserveMtp ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
                                         <!-- Non-quant weight dtype -->
                                         <div class="flex items-center justify-between gap-4">
                                             <div class="flex-1 min-w-0">

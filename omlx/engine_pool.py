@@ -61,6 +61,7 @@ class EngineEntry:
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
+    loading_started_at: float | None = None  # Timestamp when current load started
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
 
@@ -97,6 +98,8 @@ class EnginePool:
         self._process_memory_enforcer: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
+        self._load_seconds_per_gb_ema: float | None = None
+        self._load_time_observations: int = 0
 
     @property
     def max_model_memory(self) -> int | None:
@@ -589,6 +592,9 @@ class EnginePool:
             raise ModelLoadingError(model_id)
 
         entry.is_loading = True
+        entry.loading_started_at = time.monotonic()
+        load_started_at = entry.loading_started_at
+        load_completed = False
         entry.abort_loading = False
         try:
             effective_type = entry.engine_type
@@ -602,6 +608,22 @@ class EnginePool:
             model_settings = None
             if self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
+
+            # Native MTP forces LM-only dispatch even for VLM models. Vision
+            # encoder weights are ignored because the patched mtp_forward only
+            # exists on the language model path. mtp_enabled was already
+            # validated as mutually exclusive with dflash / turboquant in
+            # ModelSettings.__post_init__.
+            if (
+                model_settings is not None
+                and getattr(model_settings, "mtp_enabled", False)
+                and effective_type == "vlm"
+            ):
+                logger.info(
+                    f"MTP enabled for VLM model {model_id}; "
+                    f"forcing LM-only dispatch, vision components ignored"
+                )
+                effective_type = "batched"
 
             # Check if DFlash is enabled — takes priority over engine type
             # since DFlash has its own model loading pipeline
@@ -619,6 +641,9 @@ class EnginePool:
                             model_settings=model_settings,
                             fallback_engine_type=effective_type,
                             scheduler_config=self._scheduler_config,
+                            omlx_ssd_cache_dir=getattr(
+                                self._scheduler_config, "paged_ssd_cache_dir", None
+                            ),
                         )
                         logger.info(f"DFlash enabled for {model_id}, draft={dflash_draft}")
                     except ImportError:
@@ -807,6 +832,7 @@ class EnginePool:
             entry.engine = engine
             entry.last_access = time.time()
             self._current_model_memory += entry.estimated_size
+            load_completed = True
 
             # Propagate memory limit to new engine's scheduler
             if self._process_memory_enforcer is not None:
@@ -830,7 +856,25 @@ class EnginePool:
                 f"total: {format_size(self._current_model_memory)})"
             )
         finally:
+            if load_completed and load_started_at is not None and entry.estimated_size > 0:
+                elapsed = max(0.0, time.monotonic() - load_started_at)
+                size_gb = entry.estimated_size / (1024 ** 3)
+                if size_gb > 0 and elapsed > 0:
+                    sample = elapsed / size_gb
+                    if self._load_seconds_per_gb_ema is None:
+                        self._load_seconds_per_gb_ema = sample
+                    else:
+                        self._load_seconds_per_gb_ema = (
+                            self._load_seconds_per_gb_ema * 0.9 + sample * 0.1
+                        )
+                    self._load_time_observations += 1
+                    logger.debug(
+                        f"Observed model load speed: {sample:.2f}s/GB "
+                        f"for {model_id} ({elapsed:.1f}s, {format_size(entry.estimated_size)}); "
+                        f"EMA={self._load_seconds_per_gb_ema:.2f}s/GB"
+                    )
             entry.is_loading = False
+            entry.loading_started_at = None
             entry.abort_loading = False
 
     async def preload_pinned_models(self) -> None:
@@ -875,12 +919,15 @@ class EnginePool:
             "current_model_memory": self._current_model_memory,
             "model_count": len(self._entries),
             "loaded_count": sum(1 for e in self._entries.values() if e.engine is not None),
+            "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
+            "load_time_observations": self._load_time_observations,
             "models": [
                 {
                     "id": mid,
                     "model_path": e.model_path,
                     "loaded": e.engine is not None,
                     "is_loading": e.is_loading,
+                    "loading_started_at": e.loading_started_at,
                     "estimated_size": e.estimated_size,
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,

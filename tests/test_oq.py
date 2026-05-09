@@ -16,7 +16,9 @@ except ImportError:
 from omlx.oq import (
     OQ_LEVELS,
     _LEVEL_BITS,
+    _MAX_MODEL_RAM_FRACTION,
     _OQ_BPW_TARGETS,
+    _DiscoveredPlan,
     _TrackedTensor,
     _bpw_targets_for_level,
     _build_quant_plan,
@@ -34,6 +36,7 @@ from omlx.oq import (
     _should_quantize_tensor,
     estimate_memory,
     make_predicate,
+    quantize_oq_streaming,
     resolve_output_name,
     universal_quant_predicate,
     validate_quantizable,
@@ -457,6 +460,164 @@ class TestResolveOutputName:
 
     def test_float16_with_bitwidth_suffix(self):
         assert resolve_output_name("Model-8bit", 3, "float16") == "Model-oQ3-fp16"
+
+    def test_preserve_mtp_appends_mtp_suffix(self):
+        assert (
+            resolve_output_name("Qwen3.5-27B", 4, "bfloat16", preserve_mtp=True)
+            == "Qwen3.5-27B-oQ4-mtp"
+        )
+
+    def test_preserve_mtp_with_fp16(self):
+        assert (
+            resolve_output_name("Llama-3-8B", 4, "float16", preserve_mtp=True)
+            == "Llama-3-8B-oQ4-fp16-mtp"
+        )
+
+    def test_preserve_mtp_strips_existing_mtp_suffix(self):
+        # Re-quantizing an already-mtp output keeps the suffix only when the
+        # caller asks for it; without preserve_mtp the suffix is dropped.
+        assert (
+            resolve_output_name("Model-oQ6-mtp", 4, "bfloat16", preserve_mtp=False)
+            == "Model-oQ4"
+        )
+        assert (
+            resolve_output_name("Model-oQ6-mtp", 4, "bfloat16", preserve_mtp=True)
+            == "Model-oQ4-mtp"
+        )
+
+
+class TestShouldSkipTensor:
+    def test_default_skips_mtp(self):
+        from omlx.oq import _should_skip_tensor
+
+        assert _should_skip_tensor("mtp.fc.weight") is True
+        assert _should_skip_tensor("language_model.mtp.layers.0.foo") is True
+
+    def test_preserve_mtp_keeps_mtp(self):
+        from omlx.oq import _should_skip_tensor
+
+        assert _should_skip_tensor("mtp.fc.weight", preserve_mtp=True) is False
+        assert (
+            _should_skip_tensor("language_model.mtp.layers.0.foo", preserve_mtp=True)
+            is False
+        )
+
+    def test_non_mtp_tensors_never_skipped(self):
+        from omlx.oq import _should_skip_tensor
+
+        assert _should_skip_tensor("model.layers.0.attn.q_proj.weight") is False
+        assert (
+            _should_skip_tensor("model.layers.0.attn.q_proj.weight", preserve_mtp=True)
+            is False
+        )
+
+
+class TestMtpFcFullPrecision:
+    """Critical MTP projections (Qwen3.5 mtp.fc + DeepSeek-V4 e_proj/h_proj
+    + hc_head.*) must stay in full precision. Mirrors PR 990's quant_predicate
+    extended to PR 15's DeepSeek-V4 MTPBlock layout."""
+
+    def test_qwen_mtp_fc_top_level_returns_none(self):
+        from omlx.oq import _get_predicate_bits
+
+        bits, gs, mode = _get_predicate_bits("mtp.fc.weight", {}, 4, 64)
+        assert bits is None and gs is None and mode is None
+
+    def test_qwen_mtp_fc_nested_returns_none(self):
+        from omlx.oq import _get_predicate_bits
+
+        bits, gs, mode = _get_predicate_bits(
+            "language_model.mtp.fc.weight", {}, 4, 64
+        )
+        assert bits is None and gs is None and mode is None
+
+    def test_deepseek_e_proj_protected(self):
+        from omlx.oq import _get_predicate_bits
+
+        bits, _, _ = _get_predicate_bits("mtp.0.e_proj.weight", {}, 4, 64)
+        assert bits is None
+
+    def test_deepseek_h_proj_protected(self):
+        from omlx.oq import _get_predicate_bits
+
+        bits, _, _ = _get_predicate_bits("mtp.0.h_proj.weight", {}, 4, 64)
+        assert bits is None
+
+    def test_deepseek_hc_head_sanitized_protected(self):
+        from omlx.oq import _get_predicate_bits
+
+        for k in ("mtp.0.hc_head.fn", "mtp.0.hc_head.base", "mtp.0.hc_head.scale"):
+            bits, _, _ = _get_predicate_bits(k, {}, 4, 64)
+            assert bits is None, f"{k} should be full precision"
+
+    def test_deepseek_hc_head_raw_hf_protected(self):
+        from omlx.oq import _get_predicate_bits
+
+        # Raw HF form (before sanitize) — covered too.
+        for k in ("mtp.0.hc_head_fn", "mtp.0.hc_head_base", "mtp.0.hc_head_scale"):
+            bits, _, _ = _get_predicate_bits(k, {}, 4, 64)
+            assert bits is None, f"{k} should be full precision"
+
+    def test_other_mtp_tensors_still_quantized(self):
+        from omlx.oq import _get_predicate_bits
+
+        bits, _, _ = _get_predicate_bits(
+            "mtp.layers.0.self_attn.q_proj.weight", {}, 4, 64
+        )
+        assert bits is not None and bits >= 4
+
+    def test_deepseek_block_attn_still_quantized(self):
+        from omlx.oq import _get_predicate_bits
+
+        # MTPBlock 의 내부 attention/ffn 은 backbone 과 같은 양자화 정책
+        bits, _, _ = _get_predicate_bits(
+            "mtp.0.block.attn.wq_a.weight", {}, 4, 64
+        )
+        assert bits is not None
+
+    def test_normal_weights_unaffected(self):
+        from omlx.oq import _get_predicate_bits
+
+        bits, _, _ = _get_predicate_bits(
+            "model.layers.0.attn.q_proj.weight", {}, 4, 64
+        )
+        assert bits is not None
+
+    def test_non_mtp_e_proj_not_protected(self):
+        from omlx.oq import _get_predicate_bits
+
+        # e_proj 가 mtp 밖 (가상 케이스) 이면 보호 안 함
+        bits, _, _ = _get_predicate_bits("model.layers.0.e_proj.weight", {}, 4, 64)
+        assert bits is not None
+
+
+class TestNormalizeMtpInConfig:
+    def test_zeros_top_level_mtp_fields(self):
+        from omlx.oq import _normalize_mtp_in_config
+
+        cfg = {"mtp_num_hidden_layers": 1, "num_nextn_predict_layers": 2}
+        _normalize_mtp_in_config(cfg)
+        assert cfg["mtp_num_hidden_layers"] == 0
+        assert cfg["num_nextn_predict_layers"] == 0
+
+    def test_zeros_nested_text_config_fields(self):
+        from omlx.oq import _normalize_mtp_in_config
+
+        cfg = {
+            "model_type": "qwen3_5",
+            "text_config": {"mtp_num_hidden_layers": 1, "num_hidden_layers": 64},
+        }
+        _normalize_mtp_in_config(cfg)
+        assert cfg["text_config"]["mtp_num_hidden_layers"] == 0
+        # Non-mtp fields untouched.
+        assert cfg["text_config"]["num_hidden_layers"] == 64
+
+    def test_no_mtp_fields_is_noop(self):
+        from omlx.oq import _normalize_mtp_in_config
+
+        cfg = {"model_type": "llama"}
+        _normalize_mtp_in_config(cfg)
+        assert cfg == {"model_type": "llama"}
 
 
 # =============================================================================
@@ -883,7 +1044,10 @@ class TestForwardLayer:
 
 
 def _write_safetensors(path, tensors):
-    """Write a minimal safetensors file from {name: np.ndarray} dict."""
+    """Write a minimal safetensors file from {name: np.ndarray} dict.
+
+    Values can be np.ndarray (auto-dtype) or (raw_bytes, shape, sf_dtype) tuples
+    for dtypes numpy doesn't support (F8_E4M3, F8_E8M0, I8)."""
     import json
     import struct
 
@@ -891,12 +1055,16 @@ def _write_safetensors(path, tensors):
     data_parts = []
     offset = 0
     dtype_map = {np.float16: "F16", np.float32: "F32", np.dtype("<f2"): "F16"}
-    for name, arr in tensors.items():
-        raw = arr.tobytes()
-        sf_dtype = dtype_map.get(arr.dtype, "F16")
+    for name, val in tensors.items():
+        if isinstance(val, tuple):
+            raw, shape, sf_dtype = val
+        else:
+            raw = val.tobytes()
+            shape = list(val.shape)
+            sf_dtype = dtype_map.get(val.dtype, "F16")
         header[name] = {
             "dtype": sf_dtype,
-            "shape": list(arr.shape),
+            "shape": list(shape),
             "data_offsets": [offset, offset + len(raw)],
         }
         data_parts.append(raw)
@@ -1045,7 +1213,24 @@ class TestTrackedTensor:
     def test_getitem_slice(self):
         t = _TrackedTensor((4, 8), "F16", sources=["a"])
         r = t[1:3]
+        assert r.shape == (2, 8)
         assert r.transform == "slice"
+
+    def test_getitem_half_split(self):
+        t = _TrackedTensor((256, 2048, 384), "F16", sources=["gate_up"])
+        first = t[:, :1024, :]
+        assert first.shape == (256, 1024, 384)
+        assert first.transform == "split_0_2"
+        assert first.axis == 1
+        second = t[:, 1024:, :]
+        assert second.transform == "split_1_2"
+        # bare-slice path (axis 0)
+        t2 = _TrackedTensor((8, 4), "F16", sources=["a"])
+        assert t2[:4].transform == "split_0_2"
+
+    def test_getitem_non_half_stays_slice(self):
+        t = _TrackedTensor((256, 2048, 384), "F16", sources=["a"])
+        assert t[:, :512, :].transform == "slice"
 
     def test_getitem_none_broadcast(self):
         t = _TrackedTensor((4, 8), "F16", sources=["a"])
@@ -1068,6 +1253,25 @@ class TestTrackedTensor:
         t = _TrackedTensor((4, 8), "F16", sources=["a"])
         r = t.T
         assert r.shape == (8, 4)
+
+    def test_moveaxis_method(self):
+        t = _TrackedTensor((2, 3, 4), "F16", sources=["a"])
+        assert t.moveaxis(0, 2).shape == (3, 4, 2)
+        assert t.moveaxis(0, 2).transform == "moveaxis_0_2"
+        # negative axes normalized
+        assert t.moveaxis(-1, 0).transform == "moveaxis_2_0"
+
+    def test_transpose_method(self):
+        t = _TrackedTensor((2, 3, 4), "F16", sources=["a"])
+        assert t.transpose(2, 0, 1).shape == (4, 2, 3)
+        assert t.transpose(2, 0, 1).transform == "transpose_2_0_1"
+        # no-args reverses all axes
+        assert t.transpose().transform == "transpose_2_1_0"
+
+    def test_getitem_ellipsis_raises(self):
+        t = _TrackedTensor((2, 3, 4), "F16", sources=["a"])
+        with pytest.raises(NotImplementedError):
+            t[..., :2]
 
     def test_size_property(self):
         t = _TrackedTensor((4, 8), "F16", sources=["a"])
@@ -1130,6 +1334,550 @@ class TestDiscoverSanitizePlan:
         assert plan is not None
         assert "model.embed_tokens.weight" not in plan
         assert len(plan) == len(tensors) - 1
+
+    def test_non_replayable_slice_fails_discovery(self, sf_file):
+        path, tensors = sf_file
+        idx = _LazyTensorIndex([path])
+
+        def slice_sanitize(weights):
+            return {k: v[:, :3] for k, v in weights.items()}
+
+        with pytest.raises(ValueError, match="non-replayable"):
+            _discover_sanitize_plan(slice_sanitize, idx)
+
+
+# =============================================================================
+# Test _model_exceeds_ram guard
+# =============================================================================
+
+
+class TestModelExceedsRamGuard:
+    """Tests for the OOM guard that skips memory-intensive paths when a model
+    is larger than system RAM."""
+
+    @pytest.fixture
+    def sf_file(self, tmp_path):
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        tensors = {
+            "weight_a": np.zeros((128, 256), dtype=np.float32),
+            "weight_b": np.zeros((64, 128), dtype=np.float32),
+        }
+        path = tmp_path / "test.safetensors"
+        np_save(tensors, str(path))
+        expected_bytes = (128 * 256 + 64 * 128) * 4
+        return path, expected_bytes
+
+    def test_lazy_index_nbytes_matches_tensor_sizes(self, sf_file):
+        path, expected_bytes = sf_file
+        idx = _LazyTensorIndex([path])
+        assert idx.nbytes() == expected_bytes
+
+    def test_guard_boundary(self, sf_file):
+        """Guard uses strict > with _MAX_MODEL_RAM_FRACTION of system RAM."""
+        path, expected_bytes = sf_file
+        idx = _LazyTensorIndex([path])
+        nbytes = idx.nbytes()
+        # Exceeds when "system RAM" is small enough
+        small_ram = int(nbytes / _MAX_MODEL_RAM_FRACTION) - 1
+        assert nbytes > int(small_ram * _MAX_MODEL_RAM_FRACTION)
+        # Does not exceed when system RAM is large
+        large_ram = int(nbytes / _MAX_MODEL_RAM_FRACTION) + 1
+        assert not (nbytes > int(large_ram * _MAX_MODEL_RAM_FRACTION))
+
+
+
+# =============================================================================
+# Test on-the-fly FP8 dequant in _LazyTensorIndex
+# =============================================================================
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestOnTheFlyFp8Dequant:
+    def test_vllm_scale_inv_convention(self, tmp_path):
+        """vLLM convention: weight (F8_E4M3) + weight_scale_inv (F32)."""
+        w = np.random.randint(0, 255, (128, 128), dtype=np.uint8)
+        s = np.ones((1, 1), dtype=np.float32)
+        path = str(tmp_path / "vllm.safetensors")
+        _write_safetensors(path, {
+            "layer.weight": (w.tobytes(), [128, 128], "F8_E4M3"),
+            "layer.weight_scale_inv": s,
+        })
+        idx = _LazyTensorIndex([path])
+        assert len(idx._fp8_pairs) == 1
+        assert "layer.weight" in idx
+        assert "layer.weight_scale_inv" not in idx
+        result = idx["layer.weight"]
+        assert result.dtype == mx.bfloat16
+
+    def test_mxfp_dot_scale_convention(self, tmp_path):
+        """MXFP convention: key.weight (F8_E4M3) + key.scale (F8_E8M0)."""
+        w = np.random.randint(0, 255, (128, 128), dtype=np.uint8)
+        s = np.full((1, 1), 127, dtype=np.uint8)  # E8M0 127 = 2^0 = 1.0
+        path = str(tmp_path / "mxfp.safetensors")
+        _write_safetensors(path, {
+            "layer.weight": (w.tobytes(), [128, 128], "F8_E4M3"),
+            "layer.scale": (s.tobytes(), [1, 1], "F8_E8M0"),
+        })
+        idx = _LazyTensorIndex([path])
+        assert "layer.weight" in idx
+        assert "layer.scale" not in idx
+        result = idx.pop("layer.weight")
+        assert result.dtype == mx.bfloat16
+        assert "layer.weight" not in idx._index
+
+    def test_i8_with_e8m0_scale(self, tmp_path):
+        """I8 expert weights with E8M0 microscaling (1x16 block)."""
+        w = np.random.randint(-128, 127, (32, 32), dtype=np.int8)
+        s = np.full((32, 2), 127, dtype=np.uint8)  # 1x16 blocking, scale=1.0
+        path = str(tmp_path / "i8.safetensors")
+        _write_safetensors(path, {
+            "expert.weight": (w.tobytes(), [32, 32], "I8"),
+            "expert.scale": (s.tobytes(), [32, 2], "F8_E8M0"),
+        })
+        idx = _LazyTensorIndex([path])
+        result = idx["expert.weight"]
+        expected = mx.array(w.astype(np.float32)).astype(mx.bfloat16)
+        assert mx.allclose(result, expected, atol=0.1).item()
+
+    def test_no_scale_keys_no_pairs(self, tmp_path):
+        path = str(tmp_path / "plain.safetensors")
+        _write_safetensors(path, {
+            "layer.weight": np.random.randn(4, 8).astype(np.float16),
+        })
+        idx = _LazyTensorIndex([path])
+        assert len(idx._fp8_pairs) == 0
+        assert len(idx) == 1
+
+
+# =============================================================================
+# End-to-end: quantize_oq_streaming with FP8 sources
+# =============================================================================
+
+
+def _make_fp8_model(model_dir, n_layers=2, hidden=128, n_experts=0,
+                    fp8_convention="mxfp"):
+    """Create a synthetic FP8 model directory for integration testing.
+
+    Returns the path and total raw bytes of FP8 weight data.
+    """
+    import json
+
+    config = {
+        "architectures": ["TestModelForCausalLM"],
+        "model_type": "test_fp8",
+        "num_hidden_layers": n_layers,
+        "hidden_size": hidden,
+        "vocab_size": 256,
+    }
+    if n_experts:
+        config["num_local_experts"] = n_experts
+
+    tensors = {}
+
+    # Embedding (plain F16 — not FP8)
+    tensors["model.embed_tokens.weight"] = np.random.randn(
+        256, hidden
+    ).astype(np.float16)
+
+    for i in range(n_layers):
+        pfx = f"model.layers.{i}"
+
+        # Attention weights (FP8 + scale)
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            w = np.random.randint(0, 255, (hidden, hidden), dtype=np.uint8)
+            if fp8_convention == "mxfp":
+                s = np.full((1, 1), 127, dtype=np.uint8)  # E8M0 scale=1.0
+                tensors[f"{pfx}.self_attn.{proj}.weight"] = (
+                    w.tobytes(), [hidden, hidden], "F8_E4M3"
+                )
+                tensors[f"{pfx}.self_attn.{proj}.scale"] = (
+                    s.tobytes(), [1, 1], "F8_E8M0"
+                )
+            else:  # vllm
+                s = np.ones((1, 1), dtype=np.float32)
+                tensors[f"{pfx}.self_attn.{proj}.weight"] = (
+                    w.tobytes(), [hidden, hidden], "F8_E4M3"
+                )
+                tensors[f"{pfx}.self_attn.{proj}.weight_scale_inv"] = s
+
+        # MLP weights (FP8 + scale)
+        for proj in ["gate_proj", "up_proj"]:
+            w = np.random.randint(0, 255, (hidden * 4, hidden), dtype=np.uint8)
+            if fp8_convention == "mxfp":
+                s = np.full((1, 1), 127, dtype=np.uint8)
+                tensors[f"{pfx}.mlp.{proj}.weight"] = (
+                    w.tobytes(), [hidden * 4, hidden], "F8_E4M3"
+                )
+                tensors[f"{pfx}.mlp.{proj}.scale"] = (
+                    s.tobytes(), [1, 1], "F8_E8M0"
+                )
+            else:
+                s = np.ones((1, 1), dtype=np.float32)
+                tensors[f"{pfx}.mlp.{proj}.weight"] = (
+                    w.tobytes(), [hidden * 4, hidden], "F8_E4M3"
+                )
+                tensors[f"{pfx}.mlp.{proj}.weight_scale_inv"] = s
+
+        # down_proj (FP8)
+        w = np.random.randint(0, 255, (hidden, hidden * 4), dtype=np.uint8)
+        if fp8_convention == "mxfp":
+            s = np.full((1, 1), 127, dtype=np.uint8)
+            tensors[f"{pfx}.mlp.down_proj.weight"] = (
+                w.tobytes(), [hidden, hidden * 4], "F8_E4M3"
+            )
+            tensors[f"{pfx}.mlp.down_proj.scale"] = (
+                s.tobytes(), [1, 1], "F8_E8M0"
+            )
+        else:
+            s = np.ones((1, 1), dtype=np.float32)
+            tensors[f"{pfx}.mlp.down_proj.weight"] = (
+                w.tobytes(), [hidden, hidden * 4], "F8_E4M3"
+            )
+            tensors[f"{pfx}.mlp.down_proj.weight_scale_inv"] = s
+
+        # Layer norms (plain F16)
+        tensors[f"{pfx}.input_layernorm.weight"] = np.ones(
+            hidden, dtype=np.float16
+        )
+        tensors[f"{pfx}.post_attention_layernorm.weight"] = np.ones(
+            hidden, dtype=np.float16
+        )
+
+    # LM head (plain F16)
+    tensors["lm_head.weight"] = np.random.randn(256, hidden).astype(np.float16)
+
+    sf_path = str(model_dir / "model.safetensors")
+    _write_safetensors(sf_path, tensors)
+
+    with open(model_dir / "config.json", "w") as f:
+        json.dump(config, f)
+
+    return model_dir
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestQuantizeOqStreamingFp8:
+    """End-to-end tests for quantize_oq_streaming with FP8 source models."""
+
+    def test_mxfp_source_produces_output(self, tmp_path):
+        """MXFP (.scale suffix) FP8 model quantizes without error."""
+        src = tmp_path / "src"
+        src.mkdir()
+        _make_fp8_model(src, fp8_convention="mxfp")
+        out = tmp_path / "out"
+
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        assert (out / "config.json").exists()
+        out_shards = list(out.glob("*.safetensors"))
+        assert len(out_shards) > 0
+
+    def test_vllm_source_produces_output(self, tmp_path):
+        """vLLM (_scale_inv suffix) FP8 model quantizes without error."""
+        src = tmp_path / "src"
+        src.mkdir()
+        _make_fp8_model(src, fp8_convention="vllm")
+        out = tmp_path / "out"
+
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        assert (out / "config.json").exists()
+        out_shards = list(out.glob("*.safetensors"))
+        assert len(out_shards) > 0
+
+    def test_no_scale_keys_in_output(self, tmp_path):
+        """Scale keys are consumed by dequant, never written to output."""
+        src = tmp_path / "src"
+        src.mkdir()
+        _make_fp8_model(src, fp8_convention="mxfp")
+        out = tmp_path / "out"
+
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        from safetensors import safe_open
+        for sf in out.glob("*.safetensors"):
+            with safe_open(str(sf), framework="numpy") as f:
+                for k in f.keys():
+                    assert not k.endswith(".scale"), f"scale key leaked: {k}"
+                    assert not k.endswith("_scale_inv"), \
+                        f"scale_inv key leaked: {k}"
+
+    def test_output_tensors_are_bf16_or_quantized(self, tmp_path):
+        """All output tensors are either quantized (uint32) or bf16."""
+        src = tmp_path / "src"
+        src.mkdir()
+        _make_fp8_model(src, fp8_convention="mxfp")
+        out = tmp_path / "out"
+
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        allowed = {mx.bfloat16, mx.float16, mx.float32, mx.uint32, mx.uint8}
+        for sf in out.glob("*.safetensors"):
+            tensors = mx.load(str(sf))
+            for k, t in tensors.items():
+                assert t.dtype in allowed, f"{k}: unexpected dtype {t.dtype}"
+
+    def test_exceeds_ram_skips_eager_sanitize(self, tmp_path):
+        """When model exceeds simulated RAM, eager sanitize is skipped."""
+        from unittest.mock import patch
+        src = tmp_path / "src"
+        src.mkdir()
+        _make_fp8_model(src, n_layers=2, hidden=128, fp8_convention="mxfp")
+        out = tmp_path / "out"
+
+        # Patch system RAM to 1 byte — any model exceeds it
+        with patch("omlx.settings.get_system_memory", return_value=1):
+            quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        assert (out / "config.json").exists()
+        out_shards = list(out.glob("*.safetensors"))
+        assert len(out_shards) > 0
+
+    def test_exceeds_ram_no_scratch_files(self, tmp_path):
+        """On-the-fly dequant produces zero scratch/temp shard files."""
+        from unittest.mock import patch
+        import tempfile
+        import os
+
+        src = tmp_path / "src"
+        src.mkdir()
+        _make_fp8_model(src, fp8_convention="mxfp")
+        out = tmp_path / "out"
+
+        # List temp files before
+        tmpdir = tempfile.gettempdir()
+        before = set(os.listdir(tmpdir))
+
+        with patch("omlx.settings.get_system_memory", return_value=1):
+            quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        # No new safetensors scratch files in tmp
+        after = set(os.listdir(tmpdir))
+        new_files = after - before
+        scratch = [f for f in new_files if "safetensors" in f or "dequant" in f]
+        assert scratch == [], f"scratch files created: {scratch}"
+
+    def test_fp8_dequant_with_sanitize_plan(self, tmp_path):
+        """When sanitize discovery succeeds, FP8 dequant works through
+        _DiscoveredPlan._materialize_source."""
+        src = tmp_path / "src"
+        src.mkdir()
+        _make_fp8_model(src, n_layers=1, hidden=128, fp8_convention="mxfp")
+
+        idx = _LazyTensorIndex([str(src / "model.safetensors")])
+        assert len(idx._fp8_pairs) > 0
+
+        def rename_sanitize(weights):
+            return {k.replace("model.", "m."): v for k, v in weights.items()}
+
+        plan = _discover_sanitize_plan(rename_sanitize, idx)
+        assert plan is not None
+
+        dp = _DiscoveredPlan(plan, idx)
+        # pop a renamed FP8 tensor — should dequant via _materialize_source
+        renamed_key = None
+        for k in dp.keys():
+            if "q_proj" in k:
+                renamed_key = k
+                break
+        assert renamed_key is not None
+        arr = dp.pop(renamed_key)
+        assert arr.dtype == mx.bfloat16
+        assert arr.shape == (128, 128)
+
+    def test_logical_metadata_hides_scales_reports_bf16(self, tmp_path):
+        """logical_metadata() hides scale keys and reports FP8 weights as BF16."""
+        src = tmp_path / "src"
+        src.mkdir()
+        _make_fp8_model(src, n_layers=1, hidden=64, fp8_convention="mxfp")
+        idx = _LazyTensorIndex([str(src / "model.safetensors")])
+
+        meta = idx.logical_metadata()
+        for k in meta:
+            assert not k.endswith(".scale"), f"scale key visible: {k}"
+        for k, (shape, dtype) in meta.items():
+            if "self_attn" in k or "mlp" in k:
+                if k.endswith(".weight"):
+                    assert dtype == "BF16", f"{k}: dtype={dtype}, expected BF16"
+
+    def test_mixed_fp8_and_plain_tensors(self, tmp_path):
+        """Model with both FP8 and plain (F16) tensors handles both correctly."""
+        src = tmp_path / "src"
+        src.mkdir()
+        _make_fp8_model(src, n_layers=1, hidden=128, fp8_convention="mxfp")
+        out = tmp_path / "out"
+
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        from safetensors import safe_open
+        out_keys = set()
+        for sf in out.glob("*.safetensors"):
+            with safe_open(str(sf), framework="numpy") as f:
+                out_keys.update(f.keys())
+
+        # Embedding and norms should be present (not quantized, just passed through)
+        assert any("embed" in k for k in out_keys)
+        assert any("layernorm" in k for k in out_keys)
+        # Attention weights should be quantized (have .scales)
+        assert any("self_attn" in k and k.endswith(".scales") for k in out_keys)
+
+    def test_i8_expert_weights_with_mxfp_scale(self, tmp_path):
+        """I8 expert weights with E8M0 microscaling (1x16 block) dequant
+        correctly through the full quantize pipeline."""
+        import json
+
+        src = tmp_path / "src"
+        src.mkdir()
+
+        hidden = 64
+        tensors = {
+            "model.embed_tokens.weight": np.random.randn(
+                256, hidden
+            ).astype(np.float16),
+            "lm_head.weight": np.random.randn(256, hidden).astype(np.float16),
+            "model.layers.0.input_layernorm.weight": np.ones(
+                hidden, dtype=np.float16
+            ),
+        }
+        # I8 weight with 1x16 blocking
+        w_i8 = np.random.randint(-128, 127, (hidden, hidden), dtype=np.int8)
+        bs_col = 16
+        sn = hidden // bs_col
+        s_e8m0 = np.full((hidden, sn), 127, dtype=np.uint8)
+        tensors["model.layers.0.self_attn.q_proj.weight"] = (
+            w_i8.tobytes(), [hidden, hidden], "I8"
+        )
+        tensors["model.layers.0.self_attn.q_proj.scale"] = (
+            s_e8m0.tobytes(), [hidden, sn], "F8_E8M0"
+        )
+
+        _write_safetensors(str(src / "model.safetensors"), tensors)
+        config = {
+            "architectures": ["TestModelForCausalLM"],
+            "model_type": "test_i8",
+            "num_hidden_layers": 1,
+            "hidden_size": hidden,
+            "vocab_size": 256,
+        }
+        with open(src / "config.json", "w") as f:
+            json.dump(config, f)
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        assert (out / "config.json").exists()
+        from safetensors import safe_open
+        out_keys = set()
+        for sf in out.glob("*.safetensors"):
+            with safe_open(str(sf), framework="numpy") as f:
+                out_keys.update(f.keys())
+        assert not any(k.endswith(".scale") for k in out_keys)
+
+    def test_bf16_weight_with_scale_key_not_paired(self, tmp_path):
+        """BF16 weight + .scale key must NOT be treated as FP8 pair."""
+        src = tmp_path / "src"
+        src.mkdir()
+        hidden = 64
+        tensors = {
+            "model.embed_tokens.weight": np.random.randn(256, hidden).astype(np.float16),
+            "lm_head.weight": np.random.randn(256, hidden).astype(np.float16),
+            "model.layers.0.input_layernorm.weight": np.ones(hidden, dtype=np.float16),
+            "model.layers.0.self_attn.q_proj.weight": np.random.randn(
+                hidden, hidden).astype(np.float16),
+            "model.layers.0.self_attn.q_proj.scale": np.ones(
+                (1, hidden), dtype=np.float32),
+        }
+        _write_safetensors(str(src / "model.safetensors"), tensors)
+        import json
+        config = {
+            "architectures": ["TestModelForCausalLM"],
+            "model_type": "test_bf16_scale",
+            "num_hidden_layers": 1,
+            "hidden_size": hidden,
+            "vocab_size": 256,
+        }
+        with open(src / "config.json", "w") as f:
+            json.dump(config, f)
+
+        idx = _LazyTensorIndex([str(src / "model.safetensors")])
+        assert len(idx._fp8_pairs) == 0, "BF16 weight should not pair with .scale"
+        assert "model.layers.0.self_attn.q_proj.scale" in idx, "scale key must remain visible"
+
+
+# =============================================================================
+# Test _build_model_sanitizer text_only VLM bypass
+# =============================================================================
+
+
+class TestBuildModelSanitizerTextOnly:
+    """When text_only=True, _build_model_sanitizer must use the mlx-lm (LLM)
+    sanitize path — never the mlx-vlm (VLM) path — even when the model config
+    lists a ForConditionalGeneration architecture.
+
+    Without this, VLM sanitize uses a _Proxy that lacks self.mtp, silently
+    stripping all mtp.* tensors from the oQ output despite preserve_mtp=True.
+    """
+
+    VLM_CONFIG = {
+        "architectures": ["Qwen2_5_VLForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "num_hidden_layers": 28,
+        "hidden_size": 3584,
+    }
+
+    LLM_CONFIG = {
+        "architectures": ["Qwen2ForCausalLM"],
+        "model_type": "qwen3_5",
+        "num_hidden_layers": 28,
+        "hidden_size": 3584,
+    }
+
+    def test_vlm_config_without_text_only_attempts_vlm_path(self):
+        """Baseline: VLM config without text_only should try the VLM path."""
+        from unittest.mock import patch
+
+        from omlx.oq import _build_model_sanitizer
+
+        with patch("omlx.oq.logger") as mock_logger:
+            _build_model_sanitizer(self.VLM_CONFIG, text_only=False)
+
+        debug_messages = [str(c) for c in mock_logger.debug.call_args_list]
+        info_messages = [str(c) for c in mock_logger.info.call_args_list]
+        all_messages = " ".join(debug_messages + info_messages)
+        assert "mlx-vlm" in all_messages or "mlx-lm" in all_messages
+
+    def test_vlm_config_with_text_only_skips_vlm_path(self):
+        """With text_only=True, the VLM path must be skipped entirely."""
+        from unittest.mock import patch
+
+        from omlx.oq import _build_model_sanitizer
+
+        with patch("omlx.oq.logger") as mock_logger:
+            _build_model_sanitizer(self.VLM_CONFIG, text_only=True)
+
+        debug_messages = [str(c) for c in mock_logger.debug.call_args_list]
+        info_messages = [str(c) for c in mock_logger.info.call_args_list]
+        all_messages = " ".join(debug_messages + info_messages)
+        assert "mlx-vlm full sanitize" not in all_messages
+
+    def test_llm_config_unaffected_by_text_only(self):
+        """LLM configs (no ForConditionalGeneration) should always use the
+        mlx-lm path regardless of text_only."""
+        from unittest.mock import patch
+
+        from omlx.oq import _build_model_sanitizer
+
+        for text_only in (True, False):
+            with patch("omlx.oq.logger") as mock_logger:
+                _build_model_sanitizer(self.LLM_CONFIG, text_only=text_only)
+
+            debug_messages = [str(c) for c in mock_logger.debug.call_args_list]
+            info_messages = [str(c) for c in mock_logger.info.call_args_list]
+            all_messages = " ".join(debug_messages + info_messages)
+            assert "mlx-vlm full sanitize" not in all_messages
 
 
 # =============================================================================

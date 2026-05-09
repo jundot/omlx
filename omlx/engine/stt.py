@@ -260,8 +260,11 @@ class STTEngine(BaseNonStreamingEngine):
                 "duration": 0.0,
             }
 
-        with self._active_lock:
-            self._active_count += 1
+        activity_id = self._begin_activity(
+            "transcribing",
+            detail="Transcribing",
+            metadata={"file_size_bytes": file_size},
+        )
         try:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
@@ -276,7 +279,7 @@ class STTEngine(BaseNonStreamingEngine):
             )
             return result
         finally:
-            if self._decrement_active():
+            if self._end_activity(activity_id):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),

@@ -26,9 +26,9 @@ requirements = [
     "uvicorn>=0.23.0",
     # Tokenizers and transformers (aligned with pyproject.toml)
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
-    "transformers>=5.6.2",
-    "tokenizers>=0.22.2",
-    "huggingface-hub>=1.12.0",
+    "transformers>=5.0.0",
+    "tokenizers>=0.19.0",
+    "huggingface-hub>=0.23.0",
     # Other dependencies
     "numpy>=1.24.0",
     "tqdm>=4.66.0",
@@ -48,10 +48,10 @@ requirements = [
     "mcp>=1.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (0f903f9) - aligned with pyproject.toml
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@0f903f90aaae69e220e4a4bbbc065011548a2dfe",
-    # dflash-mlx v0.1.3 (814c4a1) — block diffusion speculative decoding + temperature sampling
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@814c4a1",
+    # mlx-vlm from commit (e41cd25) - aligned with pyproject.toml
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e41cd25565861500e48c076ab31aaeafee0ed80f",
+    # dflash-mlx v0.1.5.1 (110f261) — runtime_context, prefix cache (L1+L2), verify-specialized int4 qmm
+    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@110f261",
     "Pillow>=9.0.0",
     # ModelScope SDK for downloading models from ModelScope Hub
     "modelscope>=1.10.0",
@@ -71,7 +71,11 @@ requirements = [
     "phonemizer-fork>=3.3.2",
     "espeakng-loader>=0.2.4",
     # mlx-audio [stt] extra deps
-    "mistral-common[audio]>=0.4.2",
+    # transformers 5.x's tokenization_mistral_common imports ReasoningEffort
+    # which only exists in mistral-common>=1.10. Without this floor, the
+    # resolver lands on 1.9.x and WhisperProcessor.from_pretrained() silently
+    # fails (#1072, #1116).
+    "mistral-common[audio]>=1.10",
     # mlx-audio [sts] extra deps
     "webrtcvad>=2.0.10",
     # NOTE: mlx-audio is built from git and installed with --no-deps in build.py
@@ -107,7 +111,7 @@ platforms = [
 ]
 
 [tool.uv]
-exclude-newer = "2026-04-25T19:08:27Z"
+exclude-newer = "2026-04-23T00:00:00Z"
 environments = [
     "sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]

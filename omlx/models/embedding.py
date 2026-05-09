@@ -7,8 +7,8 @@ text embeddings using Apple's MLX framework, with native fallback
 for XLMRoBERTa and BERT embedding models.
 """
 
-import json
 import inspect
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +16,10 @@ from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
+
+from .mlx_embeddings_compat import (
+    patch_qwen3_vl_processor_for_torch_free_image_loading,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +178,7 @@ class MLXEmbeddingModel:
 
         # 2. Fallback to mlx-embeddings
         try:
+            patch_qwen3_vl_processor_for_torch_free_image_loading()
             from mlx_embeddings import load
 
             logger.info(f"Loading embedding model via mlx-embeddings: {self.model_name}")
@@ -215,17 +220,28 @@ class MLXEmbeddingModel:
             raise
 
     def _extract_embeddings_array(self, outputs):
-        """Extract embedding tensor from model outputs."""
+        """Extract embedding tensor from model outputs as a 2D (batch, hidden) array."""
         if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
-            return outputs.text_embeds
-        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-            return outputs.pooler_output
-        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
-            return mx.mean(outputs.last_hidden_state, axis=1)
-        raise ValueError(
-            "Model output does not contain expected embedding fields "
-            "(text_embeds, pooler_output, or last_hidden_state)"
-        )
+            embeddings = outputs.text_embeds
+        elif hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+            embeddings = outputs.pooler_output
+        elif (
+            hasattr(outputs, "last_hidden_state")
+            and outputs.last_hidden_state is not None
+        ):
+            embeddings = outputs.last_hidden_state
+        else:
+            raise ValueError(
+                "Model output does not contain expected embedding fields "
+                "(text_embeds, pooler_output, or last_hidden_state)"
+            )
+
+        # Some models (e.g. ModernBERT loaded as MaskedLM) skip pooling and return
+        # per-token features with shape (batch, seq_len, hidden). Mean pool so
+        # /v1/embeddings always emits one vector per input.
+        if embeddings.ndim == 3:
+            embeddings = mx.mean(embeddings, axis=1)
+        return embeddings
 
     def _validate_native_weights(
         self, model_instance, weights: Dict[str, Any]

@@ -63,6 +63,16 @@ class ModelSettings:
         dflash_enabled: Enable DFlash speculative decoding.
         dflash_draft_model: Path/repo for DFlash draft checkpoint.
         dflash_draft_quant_bits: Draft model quantization bits.
+        dflash_max_ctx: Token threshold to fall back to BatchedEngine (None = unlimited).
+        dflash_in_memory_cache: Enable DFlash L1 (RAM) prefix cache.
+        dflash_in_memory_cache_max_entries: L1 cache max entries (default 4, matches dflash balanced profile).
+        dflash_in_memory_cache_max_bytes: L1 cache byte budget.
+        dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
+        mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
+            When True, the BatchGenerator uses an MTP draft+verify path for single-request
+            decoding. Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually
+            exclusive with dflash_enabled and turboquant_kv_enabled. Concurrent requests on
+            the same model fall back to standard continuous batching automatically.
         is_pinned: Keep model loaded in memory.
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.
@@ -108,6 +118,18 @@ class ModelSettings:
     dflash_enabled: bool = False
     dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
     dflash_draft_quant_bits: Optional[int] = None  # Draft model quantization (None=bf16, 4)
+    dflash_max_ctx: Optional[int] = None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
+    # DFlash prefix cache (private to dflash; separate from omlx tiered cache because
+    # snapshots include draft model GDN state and target hidden chunks omlx never tracks)
+    dflash_in_memory_cache: bool = True
+    dflash_in_memory_cache_max_entries: int = 4  # Matches dflash balanced profile default
+    dflash_in_memory_cache_max_bytes: int = 8 * 1024 * 1024 * 1024  # 8 GiB (balanced profile default)
+    dflash_ssd_cache: bool = False  # Requires in-memory cache and an omlx paged SSD cache dir
+
+    # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
+    # uses MTP draft+verify path for single-request decoding. Compatible model_types:
+    # qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with dflash and turboquant.
+    mtp_enabled: bool = False
 
     # Model management flags
     is_pinned: bool = False
@@ -122,6 +144,22 @@ class ModelSettings:
     display_name: Optional[str] = None
     description: Optional[str] = None
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
+
+    def __post_init__(self) -> None:
+        # Native MTP is mutually exclusive with DFlash (also speculative) and
+        # TurboQuant KV (patches the same attention path). Reject combos at
+        # construction time so the conflict surfaces in the admin UI / API
+        # rather than at model load.
+        if self.mtp_enabled and self.dflash_enabled:
+            raise ValueError(
+                "mtp_enabled and dflash_enabled cannot both be True; choose one "
+                "speculative-decoding path per model"
+            )
+        if self.mtp_enabled and self.turboquant_kv_enabled:
+            raise ValueError(
+                "mtp_enabled and turboquant_kv_enabled cannot both be True; "
+                "TurboQuant patches the attention path that MTP relies on"
+            )
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

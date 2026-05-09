@@ -171,6 +171,34 @@ class TestSchedulerInitialization:
         assert scheduler.total_prompt_tokens == 0
         assert scheduler.total_completion_tokens == 0
 
+    def test_snapshot_for_admin_is_isolated_from_live_state(
+        self, mock_model, mock_tokenizer
+    ):
+        """Published admin snapshot must not mutate when live state changes."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="req-snap",
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+        request.prompt_token_ids = [1, 2, 3]
+        request.num_prompt_tokens = 3
+
+        scheduler.waiting.append(request)
+        scheduler.running["req-snap"] = request
+        scheduler._publish_admin_snapshot()
+
+        snap = scheduler.snapshot_for_admin()
+        assert snap["running_by_id"] == {"req-snap": request}
+        assert snap["waiting"] == [request]
+
+        scheduler.running.clear()
+        scheduler.waiting.clear()
+        # Snapshot reflects the published moment, not the live state.
+        assert snap["running_by_id"] == {"req-snap": request}
+        assert snap["waiting"] == [request]
+
 
 class TestSchedulerAddRequest:
     """Tests for Scheduler.add_request()."""
@@ -1444,6 +1472,67 @@ class TestSchedulerRotatingBlockAlignment:
         second_target = scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
         assert scheduler._deferred_clear_at == second_target
         assert scheduler._deferred_clear_at > first_target
+
+
+class TestPeriodicClearGating:
+    """Tests for the conditional periodic clear (#978/#1040 mitigation)."""
+
+    def test_periodic_clear_skipped_when_cache_below_threshold(
+        self, mock_model, mock_tokenizer
+    ):
+        """Periodic clear should NOT fire when MLX buffer pool is small.
+
+        The pre-fix behavior fired every mlx_cache_cleanup_interval steps
+        unconditionally, producing IOGPUFamily refcount transitions even
+        when there was nothing meaningful to release. After the fix, the
+        clear only fires when accumulated cache memory exceeds the
+        threshold (memory_limit/3 or absolute 2 GiB floor).
+        """
+        from omlx import scheduler as sched_mod
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._step_counter = scheduler.config.mlx_cache_cleanup_interval
+        scheduler._memory_limit_bytes = 0  # → use absolute 2 GiB threshold
+
+        # 1 GiB cached, well under the 2 GiB threshold
+        with patch.object(
+            sched_mod.mx, "get_cache_memory", return_value=1 * 1024**3
+        ):
+            assert scheduler._should_periodic_clear_cache() is False
+
+    def test_periodic_clear_fires_when_cache_above_threshold(
+        self, mock_model, mock_tokenizer
+    ):
+        """Periodic clear must fire when MLX buffer pool exceeds threshold."""
+        from omlx import scheduler as sched_mod
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._step_counter = scheduler.config.mlx_cache_cleanup_interval
+        scheduler._memory_limit_bytes = 0  # → 2 GiB absolute floor
+
+        # 3 GiB cached, exceeds the 2 GiB threshold
+        with patch.object(
+            sched_mod.mx, "get_cache_memory", return_value=3 * 1024**3
+        ):
+            assert scheduler._should_periodic_clear_cache() is True
+
+    def test_periodic_clear_threshold_scales_with_memory_limit(
+        self, mock_model, mock_tokenizer
+    ):
+        """Threshold must be max(memory_limit/3, 2 GiB) when limit is set."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        # Limit 30 GiB → threshold 10 GiB (memory_limit / 3)
+        scheduler._memory_limit_bytes = 30 * 1024**3
+        assert scheduler._periodic_clear_threshold_bytes() == 10 * 1024**3
+
+        # Limit 3 GiB → threshold 2 GiB (floor wins)
+        scheduler._memory_limit_bytes = 3 * 1024**3
+        assert scheduler._periodic_clear_threshold_bytes() == 2 * 1024**3
+
+        # No limit → 2 GiB absolute floor
+        scheduler._memory_limit_bytes = 0
+        assert scheduler._periodic_clear_threshold_bytes() == 2 * 1024**3
 
 
 class TestExtractCacheStatesCacheList:

@@ -1,0 +1,704 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for the DeepSeek V4 monkey-patch (PR 1192 port)."""
+
+import importlib
+import sys
+
+import pytest
+
+
+@pytest.fixture(scope="module")
+def applied_patch():
+    """Apply the patch once for the whole module. The patch itself is
+    idempotent so repeated calls are safe."""
+    from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+
+    apply_deepseek_v4_patch()
+    return True
+
+
+class TestPatchOrchestration:
+    """Top-level apply / idempotency / module registration checks."""
+
+    def test_apply_returns_true_first_time(self):
+        from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch, is_applied
+
+        # The patch may have been applied by a previous test run in the
+        # same process; force-reset is_applied to validate the flow.
+        # The module-level _APPLIED guard means we cannot un-apply, so
+        # this test is informational about the *current* state.
+        if is_applied():
+            assert apply_deepseek_v4_patch() is False
+        else:
+            assert apply_deepseek_v4_patch() is True
+            assert is_applied() is True
+
+    def test_apply_is_idempotent(self, applied_patch):
+        from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+
+        # After fixture has applied the patch, a second call must return False.
+        assert apply_deepseek_v4_patch() is False
+
+    def test_hyper_connection_registered(self, applied_patch):
+        assert "mlx_lm.models.hyper_connection" in sys.modules
+
+    def test_deepseek_v4_registered(self, applied_patch):
+        assert "mlx_lm.models.deepseek_v4" in sys.modules
+
+    def test_deepseek_v4_module_package(self, applied_patch):
+        mod = sys.modules["mlx_lm.models.deepseek_v4"]
+        # __package__ must be mlx_lm.models so relative imports inside
+        # the loaded file resolve through the real mlx_lm package.
+        assert mod.__package__ == "mlx_lm.models"
+
+
+class TestCacheInjection:
+    """PoolingCache / BatchPoolingCache injected into mlx_lm.models.cache."""
+
+    def test_pooling_cache_attribute(self, applied_patch):
+        import mlx_lm.models.cache as cache_mod
+
+        assert hasattr(cache_mod, "PoolingCache")
+        assert hasattr(cache_mod, "BatchPoolingCache")
+
+    def test_pooling_cache_module_attribute(self, applied_patch):
+        from mlx_lm.models.cache import BatchPoolingCache, PoolingCache
+
+        # The injected classes claim to live in mlx_lm.models.cache so
+        # any introspection (e.g. type(c).__module__) sees the right name.
+        assert PoolingCache.__module__ == "mlx_lm.models.cache"
+        assert BatchPoolingCache.__module__ == "mlx_lm.models.cache"
+
+    def test_pooling_cache_instantiation(self, applied_patch):
+        from mlx_lm.models.cache import PoolingCache
+
+        cache = PoolingCache(ratio=4)
+        assert cache.ratio == 4
+        assert cache.empty()
+        assert cache.size() == 0
+        assert cache.offset == 0
+
+
+class TestUtilsPatch:
+    """mlx_lm.utils.load_model + _load_safetensors + SAFETENSORS_DTYPE_FALLBACKS."""
+
+    def test_load_model_replaced(self, applied_patch):
+        import mlx_lm.utils as utils_mod
+
+        # The replaced function carries our docstring marker via its
+        # bound name; just check it's not the upstream one by virtue of
+        # the new attributes around it.
+        assert hasattr(utils_mod, "_load_safetensors")
+        assert hasattr(utils_mod, "SAFETENSORS_DTYPE_FALLBACKS")
+
+    def test_dtype_fallback_map(self, applied_patch):
+        import mlx_lm.utils as utils_mod
+
+        assert utils_mod.SAFETENSORS_DTYPE_FALLBACKS == {"F8_E8M0": "U8"}
+
+    def test_load_safetensors_passthrough_for_normal_dtype(
+        self, applied_patch, tmp_path
+    ):
+        """A safetensors file with a standard dtype must round-trip
+        through _load_safetensors unchanged (no header rewrite)."""
+        import mlx.core as mx
+        from mlx_lm.utils import _load_safetensors
+
+        path = tmp_path / "model.safetensors"
+        data = {"x": mx.zeros((4, 4), dtype=mx.float32)}
+        mx.save_safetensors(str(path), data)
+        loaded = _load_safetensors(str(path))
+        assert "x" in loaded
+        assert loaded["x"].shape == (4, 4)
+
+
+class TestGeneratePatch:
+    """mlx_lm.generate._make_cache replaced."""
+
+    def test_make_cache_replaced(self, applied_patch):
+        gen_mod = importlib.import_module("mlx_lm.generate")
+
+        assert hasattr(gen_mod, "_make_cache")
+        # Source must include PoolingCache → BatchPoolingCache branch.
+        # We can't easily compare functions, so just verify the new
+        # behavior: passing a model with a PoolingCache in make_cache
+        # produces a BatchPoolingCache.
+        from mlx_lm.models.cache import BatchPoolingCache, PoolingCache
+
+        class FakeModel:
+            def __init__(self):
+                self.layers = [None]
+
+            def make_cache(self):
+                return [PoolingCache(ratio=4)]
+
+        result = gen_mod._make_cache(FakeModel(), [0], None)
+        assert len(result) == 1
+        assert isinstance(result[0], BatchPoolingCache)
+
+
+class TestTokenizerPatch:
+    """mlx_lm.tokenizer_utils.AutoTokenizer wrapped with deepseek_v4 fallback."""
+
+    def test_autotokenizer_wrapped(self, applied_patch):
+        import mlx_lm.tokenizer_utils as tu
+
+        # Wrapped class still exposes from_pretrained.
+        assert hasattr(tu.AutoTokenizer, "from_pretrained")
+        # Class name preserved for any introspection.
+        assert tu.AutoTokenizer.__name__ == "AutoTokenizer"
+
+    def test_passthrough_on_success(self, applied_patch):
+        """When upstream AutoTokenizer.from_pretrained succeeds, the wrapper
+        must return its result unmodified — no fallback path taken."""
+        from unittest.mock import patch as mock_patch
+
+        from omlx.patches.deepseek_v4 import tokenizer_patch
+
+        sentinel = object()
+
+        class _FakeUpstream:
+            calls = []
+
+            @staticmethod
+            def from_pretrained(model_path, *args, **kwargs):
+                _FakeUpstream.calls.append((model_path, args, kwargs))
+                return sentinel
+
+        with mock_patch("transformers.AutoTokenizer", _FakeUpstream):
+            wrapper = tokenizer_patch._build_wrapper()
+            result = wrapper.from_pretrained("/fake/path", trust_remote_code=True)
+
+        assert result is sentinel
+        assert len(_FakeUpstream.calls) == 1
+        # Fallback never injected its own config kwarg.
+        assert "config" not in _FakeUpstream.calls[0][2]
+
+    def test_fallback_on_max_position_embeddings_error(self, applied_patch):
+        """The exact AttributeError that transformers raises when it cannot
+        recognize deepseek_v4 must trigger a retry with PreTrainedConfig()."""
+        from unittest.mock import patch as mock_patch
+
+        from omlx.patches.deepseek_v4 import tokenizer_patch
+
+        class _FakeUpstream:
+            calls = []
+
+            @staticmethod
+            def from_pretrained(model_path, *args, **kwargs):
+                _FakeUpstream.calls.append((model_path, args, kwargs))
+                if "config" in kwargs:
+                    return "FALLBACK_OK"
+                raise AttributeError(
+                    "'PreTrainedConfig' object has no attribute "
+                    "'max_position_embeddings'"
+                )
+
+        with mock_patch("transformers.AutoTokenizer", _FakeUpstream):
+            wrapper = tokenizer_patch._build_wrapper()
+            result = wrapper.from_pretrained("/fake/path")
+
+        assert result == "FALLBACK_OK"
+        assert len(_FakeUpstream.calls) == 2
+        # Second call must inject config=PreTrainedConfig().
+        assert "config" in _FakeUpstream.calls[1][2]
+
+    def test_fallback_on_deepseek_v4_value_error(self, applied_patch):
+        """ValueError mentioning deepseek_v4 also triggers fallback."""
+        from unittest.mock import patch as mock_patch
+
+        from omlx.patches.deepseek_v4 import tokenizer_patch
+
+        class _FakeUpstream:
+            calls = []
+
+            @staticmethod
+            def from_pretrained(model_path, *args, **kwargs):
+                _FakeUpstream.calls.append((model_path, args, kwargs))
+                if "config" in kwargs:
+                    return "FALLBACK_OK"
+                raise ValueError("Unrecognized configuration class for deepseek_v4")
+
+        with mock_patch("transformers.AutoTokenizer", _FakeUpstream):
+            wrapper = tokenizer_patch._build_wrapper()
+            result = wrapper.from_pretrained("/fake/path")
+
+        assert result == "FALLBACK_OK"
+        assert len(_FakeUpstream.calls) == 2
+
+    def test_unrelated_error_reraises(self, applied_patch):
+        """Errors outside the deepseek_v4 / max_position_embeddings signature
+        must NOT be swallowed."""
+        from unittest.mock import patch as mock_patch
+
+        import pytest as _pytest
+
+        from omlx.patches.deepseek_v4 import tokenizer_patch
+
+        class _FakeUpstream:
+            @staticmethod
+            def from_pretrained(*args, **kwargs):
+                raise ValueError("totally unrelated error")
+
+        with mock_patch("transformers.AutoTokenizer", _FakeUpstream):
+            wrapper = tokenizer_patch._build_wrapper()
+            with _pytest.raises(ValueError, match="totally unrelated"):
+                wrapper.from_pretrained("/fake/path")
+
+    def test_explicit_config_skips_fallback(self, applied_patch):
+        """If the caller already passed config=, we must not override it
+        even when the inner call raises a matching error."""
+        from unittest.mock import patch as mock_patch
+
+        import pytest as _pytest
+
+        from omlx.patches.deepseek_v4 import tokenizer_patch
+
+        class _FakeUpstream:
+            @staticmethod
+            def from_pretrained(*args, **kwargs):
+                # Caller-provided config is in kwargs; we still raise the
+                # max_position_embeddings error to verify the wrapper does
+                # not silently retry.
+                raise AttributeError(
+                    "'PreTrainedConfig' object has no attribute "
+                    "'max_position_embeddings'"
+                )
+
+        with mock_patch("transformers.AutoTokenizer", _FakeUpstream):
+            wrapper = tokenizer_patch._build_wrapper()
+            with _pytest.raises(AttributeError, match="max_position_embeddings"):
+                wrapper.from_pretrained("/fake/path", config="caller_supplied")
+
+    def test_class_attribute_forwarding(self, applied_patch):
+        """Class-level attribute access (e.g. AutoTokenizer.register) must
+        forward to the upstream class so mlx-lm's NewlineTokenizer
+        registration still works."""
+        import mlx_lm.tokenizer_utils as tu
+        from transformers import AutoTokenizer as upstream_at
+
+        # register is an upstream classmethod — wrapped class must expose it.
+        assert tu.AutoTokenizer.register is upstream_at.register
+
+
+class TestDSMLToolParser:
+    """tool_parser_v4 — DSML invoke / parameter grammar parsing."""
+
+    def test_single_invoke_typed_args(self, applied_patch):
+        from omlx.patches.deepseek_v4 import tool_parser_v4 as tp
+
+        text = (
+            '<｜DSML｜invoke name="get_weather">\n'
+            '<｜DSML｜parameter name="city" string="true">Seoul</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="days" string="false">7</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="imperial" string="false">false</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>"
+        )
+        result = tp.parse_tool_call(text)
+        assert result["name"] == "get_weather"
+        assert result["arguments"] == {
+            "city": "Seoul",
+            "days": 7,
+            "imperial": False,
+        }
+
+    def test_multiple_invokes_returns_list(self, applied_patch):
+        from omlx.patches.deepseek_v4 import tool_parser_v4 as tp
+
+        text = (
+            '<｜DSML｜invoke name="a">'
+            '<｜DSML｜parameter name="x" string="false">1</｜DSML｜parameter>'
+            "</｜DSML｜invoke>\n"
+            '<｜DSML｜invoke name="b">'
+            '<｜DSML｜parameter name="y" string="true">hello</｜DSML｜parameter>'
+            "</｜DSML｜invoke>"
+        )
+        result = tp.parse_tool_call(text)
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[0] == {"name": "a", "arguments": {"x": 1}}
+        assert result[1] == {"name": "b", "arguments": {"y": "hello"}}
+
+    def test_object_and_array_parameters(self, applied_patch):
+        from omlx.patches.deepseek_v4 import tool_parser_v4 as tp
+
+        text = (
+            '<｜DSML｜invoke name="search">\n'
+            '<｜DSML｜parameter name="filters" string="false">'
+            '{"category": "books", "min_price": 10}'
+            "</｜DSML｜parameter>\n"
+            '<｜DSML｜parameter name="ids" string="false">[1, 2, 3]</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>"
+        )
+        result = tp.parse_tool_call(text)
+        assert result["arguments"]["filters"] == {"category": "books", "min_price": 10}
+        assert result["arguments"]["ids"] == [1, 2, 3]
+
+    def test_no_invoke_raises(self, applied_patch):
+        import pytest as _pytest
+
+        from omlx.patches.deepseek_v4 import tool_parser_v4 as tp
+
+        with _pytest.raises(ValueError, match="No.*invoke.*block"):
+            tp.parse_tool_call("just some plain text without DSML markup")
+
+    def test_outer_markers_exposed(self, applied_patch):
+        from omlx.patches.deepseek_v4 import tool_parser_v4 as tp
+
+        # mlx-lm reads these as module attributes for stream detection.
+        assert tp.tool_call_start == "<｜DSML｜tool_calls>"
+        assert tp.tool_call_end == "</｜DSML｜tool_calls>"
+
+
+class TestChatTemplateV4:
+    """chat_template_v4 — DSML system prompt + tool_calls render."""
+
+    def test_outer_marker_uses_tool_calls_not_function_calls(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        # vllm's DeepSeekV4ToolParser overrides only the outer marker
+        # name (tool_calls vs V3.2's function_calls). Verify our copy
+        # made that one edit.
+        assert "function_calls" not in ct.tool_calls_template
+        assert "tool_calls" in ct.tool_calls_template
+        assert "function_calls" not in ct.TOOLS_SYSTEM_TEMPLATE
+
+    def test_inner_grammar_unchanged_from_v32(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        # Inner markers must still be invoke / parameter — V4 reuses V3.2's
+        # invoke/parameter grammar.
+        assert "invoke" in ct.tool_call_template
+        assert "parameter" in ct.encode_arguments_to_dsml(
+            {"name": "x", "arguments": '{"k": "v"}'}
+        )
+
+    def test_round_trip_encode_then_parse(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+        from omlx.patches.deepseek_v4 import tool_parser_v4 as tp
+
+        encoded_args = ct.encode_arguments_to_dsml(
+            {"name": "f", "arguments": '{"a": 1, "b": "hi", "c": [1, 2]}'}
+        )
+        invoke = ct.tool_call_template.format(
+            dsml_token=ct.dsml_token, name="f", arguments=encoded_args
+        )
+        block = ct.tool_calls_template.format(
+            dsml_token=ct.dsml_token, tool_calls=invoke
+        )
+        # Strip the outer markers as TokenizerWrapper would.
+        inner = (
+            block.replace(tp.tool_call_start, "").replace(tp.tool_call_end, "").strip()
+        )
+        parsed = tp.parse_tool_call(inner)
+        assert parsed == {"name": "f", "arguments": {"a": 1, "b": "hi", "c": [1, 2]}}
+
+    def test_user_only_request_with_tools_injects_dsml(self, applied_patch):
+        """User-only message + tools must still emit the DSML tools block.
+
+        Regression guard for the case where a Claude Code or OpenAI client
+        passes ``tools`` without a system message. ``render_message`` only
+        injects tools on system / developer roles, so ``encode_messages``
+        synthesises an empty system message up front when the first
+        message is a plain user. Without this fix the rendered prompt
+        omits the ``<functions>`` schema entirely and the model never
+        emits a tool_calls block.
+        """
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+        prompt = ct.apply_chat_template(
+            [{"role": "user", "content": "Weather in Seoul?"}],
+            tools=tools,
+            add_generation_prompt=True,
+        )
+        assert "<functions>" in prompt
+        assert "get_weather" in prompt
+        assert ct.dsml_token in prompt
+
+    def test_system_user_request_with_tools_unchanged(self, applied_patch):
+        """When a system message is already present, the synthetic prepend
+        path must not fire — the rendered prompt keeps the original system
+        content verbatim and only injects the tools schema once.
+        """
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+        prompt = ct.apply_chat_template(
+            [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Weather in Seoul?"},
+            ],
+            tools=tools,
+            add_generation_prompt=True,
+        )
+        assert "You are a helpful assistant." in prompt
+        # Only one tools block — no double-injection from synthetic prepend.
+        assert prompt.count("<functions>") == 1
+
+    def test_user_only_no_tools_no_prepend(self, applied_patch):
+        """No tools → no synthetic system. Plain user-only request renders
+        with just the BOS + user wrapper, matching V3.2 baseline."""
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        prompt = ct.apply_chat_template(
+            [{"role": "user", "content": "Hi"}],
+            add_generation_prompt=True,
+        )
+        assert "<functions>" not in prompt
+        assert "## Tools" not in prompt
+
+    def test_encode_arguments_accepts_dict(self, applied_patch):
+        """Anthropic /v1/messages history stores tool_call arguments as
+        a dict (anthropic_utils.py decodes the input before saving).
+        encode_arguments_to_dsml must accept that shape — not just the
+        OpenAI JSON-string convention — so multi-turn renders don't
+        raise TypeError when the assistant history is from Claude Code.
+        """
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        encoded = ct.encode_arguments_to_dsml(
+            {"name": "f", "arguments": {"location": "Seoul", "n": 3}}
+        )
+        assert 'name="location"' in encoded and "Seoul" in encoded
+        assert 'name="n"' in encoded and ">3<" in encoded
+        # string="true" for string params, "false" for non-string.
+        assert 'string="true"' in encoded
+        assert 'string="false"' in encoded
+
+    def test_assistant_tool_call_dict_arguments_round_trip(self, applied_patch):
+        """End-to-end multi-turn: assistant message history contains a
+        tool_use whose arguments came in as dict (Anthropic shape). The
+        rendered prompt must include the assistant's prior tool_call
+        block in DSML form so the model can continue the conversation
+        coherently.
+        """
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        messages = [
+            {"role": "user", "content": "Weather in Seoul?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": {"location": "Seoul"},
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "content": "sunny, 22C"},
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+        prompt = ct.apply_chat_template(
+            messages, tools=tools, add_generation_prompt=True
+        )
+        assert "<｜DSML｜tool_calls>" in prompt
+        assert 'invoke name="get_weather"' in prompt
+        assert "Seoul" in prompt
+        assert "sunny, 22C" in prompt
+
+
+class TestChatTemplateModuleRegistration:
+    """sys.modules registration so mlx-lm's importlib path picks up our types."""
+
+    def test_chat_template_module_registered(self, applied_patch):
+        import sys
+
+        assert "mlx_lm.chat_templates.deepseek_v4" in sys.modules
+        mod = sys.modules["mlx_lm.chat_templates.deepseek_v4"]
+        assert hasattr(mod, "apply_chat_template")
+
+    def test_tool_parser_module_registered(self, applied_patch):
+        import sys
+
+        assert "mlx_lm.tool_parsers.deepseek_v4" in sys.modules
+        mod = sys.modules["mlx_lm.tool_parsers.deepseek_v4"]
+        assert hasattr(mod, "parse_tool_call")
+        assert mod.tool_call_start == "<｜DSML｜tool_calls>"
+        assert mod.tool_call_end == "</｜DSML｜tool_calls>"
+
+
+class TestModelClassResolution:
+    """mlx_lm.utils._get_classes resolves deepseek_v4 to our injected classes."""
+
+    def test_get_classes_returns_injected_module(self, applied_patch):
+        from mlx_lm.utils import _get_classes
+
+        model_class, args_class = _get_classes({"model_type": "deepseek_v4"})
+        assert model_class.__module__ == "mlx_lm.models.deepseek_v4"
+        assert args_class.__module__ == "mlx_lm.models.deepseek_v4"
+        assert model_class.__name__ == "Model"
+        assert args_class.__name__ == "ModelArgs"
+
+
+class TestCacheHandlerRegistration:
+    """omlx CacheTypeRegistry resolves the new cache types to their handlers."""
+
+    def test_pooling_cache_resolves_to_handler(self, applied_patch):
+        from omlx.cache.type_registry import CacheTypeRegistry
+
+        handler = CacheTypeRegistry.get_handler_by_class_name("PoolingCache")
+        assert type(handler).__name__ == "PoolingCacheHandler"
+
+    def test_batch_pooling_cache_resolves_to_handler(self, applied_patch):
+        from omlx.cache.type_registry import CacheTypeRegistry
+
+        handler = CacheTypeRegistry.get_handler_by_class_name("BatchPoolingCache")
+        assert type(handler).__name__ == "BatchPoolingCacheHandler"
+
+    def test_pooling_cache_not_block_sliceable(self, applied_patch):
+        from omlx.cache.type_registry import CacheTypeRegistry
+
+        handler = CacheTypeRegistry.get_handler_by_class_name("PoolingCache")
+        assert handler.supports_block_slicing is False
+
+    def test_batch_pooling_cache_not_block_sliceable(self, applied_patch):
+        from omlx.cache.type_registry import CacheTypeRegistry
+
+        handler = CacheTypeRegistry.get_handler_by_class_name("BatchPoolingCache")
+        assert handler.supports_block_slicing is False
+
+    def test_detect_cache_type_pooling(self, applied_patch):
+        from mlx_lm.models.cache import PoolingCache
+
+        from omlx.cache.type_handlers import CacheType
+        from omlx.cache.type_registry import CacheTypeRegistry
+
+        cache = PoolingCache(ratio=4)
+        assert CacheTypeRegistry.detect_cache_type(cache) == CacheType.POOLING_CACHE
+
+
+class TestPoolingCacheStateRoundTrip:
+    """Handler extract_state → reconstruct_cache must preserve the pool tensor."""
+
+    def test_round_trip_with_pooled_tensor(self, applied_patch):
+        import mlx.core as mx
+        from mlx_lm.models.cache import PoolingCache
+
+        from omlx.cache.type_registry import CacheTypeRegistry
+
+        # Build a PoolingCache with a known pool.
+        ratio = 4
+        cache = PoolingCache(ratio=ratio)
+        # Simulate update_and_fetch having stuffed the pool with 8
+        # compressed tokens of dim 32.
+        pooled = mx.arange(1 * 8 * 32, dtype=mx.float32).reshape(1, 8, 32)
+        cache.pooled = pooled
+
+        handler = CacheTypeRegistry.get_handler_by_class_name("PoolingCache")
+        state = handler.extract_state(cache)
+        assert state["pooled"] is not None
+        assert state["pooled"].shape == (1, 8, 32)
+
+        restored = handler.reconstruct_cache(state, meta_state=ratio)
+        assert restored is not None
+        assert restored.ratio == ratio
+        assert restored.pooled.shape == (1, 8, 32)
+        # Verify content matches.
+        diff = mx.max(mx.abs(restored.pooled - pooled)).item()
+        assert diff == 0.0
+
+    def test_round_trip_empty_cache(self, applied_patch):
+        from mlx_lm.models.cache import PoolingCache
+
+        from omlx.cache.type_registry import CacheTypeRegistry
+
+        cache = PoolingCache(ratio=8)
+        handler = CacheTypeRegistry.get_handler_by_class_name("PoolingCache")
+        state = handler.extract_state(cache)
+        assert state["pooled"] is None
+        assert state["buf_kv"] is None
+
+        restored = handler.reconstruct_cache(state, meta_state=8)
+        assert restored is not None
+        assert restored.empty()
+        assert restored.ratio == 8
+
+    def test_seq_len_from_state(self, applied_patch):
+        import mlx.core as mx
+        from mlx_lm.models.cache import PoolingCache
+
+        from omlx.cache.type_registry import CacheTypeRegistry
+
+        cache = PoolingCache(ratio=4)
+        cache.pooled = mx.zeros((1, 12, 16), dtype=mx.float32)
+        handler = CacheTypeRegistry.get_handler_by_class_name("PoolingCache")
+        state = handler.extract_state(cache)
+        assert handler.get_seq_len(state) == 12
+
+
+class TestPreLoadDispatch:
+    """maybe_apply_pre_load_patches gates correctly on config.json model_type."""
+
+    def test_no_dispatch_for_other_model_type(self, tmp_path):
+        # Create a fake model dir with a non-deepseek config.
+        config_path = tmp_path / "config.json"
+        config_path.write_text('{"model_type": "llama"}')
+
+        from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+        # Should be a no-op (no exception). We can't easily assert that
+        # apply_deepseek_v4_patch was NOT called because earlier tests
+        # may have applied it already. Just verify no crash.
+        maybe_apply_pre_load_patches(str(tmp_path))
+
+    def test_no_dispatch_for_missing_config(self, tmp_path):
+        # No config.json present.
+        from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+        maybe_apply_pre_load_patches(str(tmp_path))
+
+    def test_dispatch_for_deepseek_v4(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        config_path.write_text('{"model_type": "deepseek_v4"}')
+
+        from omlx.patches.deepseek_v4 import is_applied
+        from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+        maybe_apply_pre_load_patches(str(tmp_path))
+        # Patch must be applied after this dispatch (or already applied).
+        assert is_applied() is True

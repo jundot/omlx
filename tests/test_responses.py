@@ -577,6 +577,13 @@ class TestBuildOutputItems:
         assert usage.input_tokens == 100
         assert usage.output_tokens == 50
         assert usage.total_tokens == 150
+        assert usage.input_tokens_details.cached_tokens == 0
+        assert usage.output_tokens_details.reasoning_tokens == 0
+
+    def test_response_usage_with_cached_tokens(self):
+        usage = build_response_usage(100, 50, cached_tokens=30)
+        assert usage.input_tokens == 100
+        assert usage.input_tokens_details.cached_tokens == 30
 
 
 class TestResponseObject:

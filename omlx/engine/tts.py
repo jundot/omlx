@@ -237,8 +237,11 @@ class TTSEngine(BaseNonStreamingEngine):
             audio = np.concatenate(audio_chunks, axis=0)
             return _audio_to_wav_bytes(audio, int(sample_rate))
 
-        with self._active_lock:
-            self._active_count += 1
+        activity_id = self._begin_activity(
+            "synthesizing speech",
+            detail="Synthesizing speech",
+            metadata={"text_length": len(text)},
+        )
         try:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
@@ -252,7 +255,7 @@ class TTSEngine(BaseNonStreamingEngine):
             )
             return result
         finally:
-            if self._decrement_active():
+            if self._end_activity(activity_id):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),
@@ -347,8 +350,11 @@ class TTSEngine(BaseNonStreamingEngine):
             )
             return sample_rate, 1, 2, self._audio_array_to_pcm_bytes(audio)
 
-        with self._active_lock:
-            self._active_count += 1
+        activity_id = self._begin_activity(
+            "streaming speech",
+            detail="Streaming speech",
+            metadata={"text_length": len(text)},
+        )
         try:
             loop = asyncio.get_running_loop()
             while True:
@@ -362,9 +368,14 @@ class TTSEngine(BaseNonStreamingEngine):
                     continue
                 chunk_count += 1
                 total_bytes += len(pcm_bytes)
+                self._update_activity(
+                    activity_id,
+                    chunk_count=chunk_count,
+                    output_bytes=total_bytes,
+                )
                 yield sample_rate, channels, sample_width, pcm_bytes
         finally:
-            if self._decrement_active():
+            if self._end_activity(activity_id):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),

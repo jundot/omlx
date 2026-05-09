@@ -36,9 +36,18 @@ dependencies = [
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
-    "transformers>=5.6.2",
-    "tokenizers>=0.22.2",
-    "huggingface-hub>=1.12.0",
+    "transformers>=5.0.0",
+    # transformers 5.x's tokenization_mistral_common module imports
+    # ReasoningEffort from mistral_common (added in 1.10). The audio extras
+    # transitively pull mistral-common via mlx-audio[stt], which historically
+    # resolved to 1.9.x and broke WhisperProcessor.from_pretrained() with a
+    # silent "Processor not found" on every Whisper model. Pinning the
+    # minimum here ensures resolution lands on a compatible version even
+    # without the audio extra installed.
+    # See pmarreck/omlx#1 for full repro and root cause.
+    "mistral-common>=1.10",
+    "tokenizers>=0.19.0",
+    "huggingface-hub>=0.23.0",
     "numpy>=1.24.0",
     "tqdm>=4.66.0",
     "pyyaml>=6.0",
@@ -60,11 +69,11 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (0f903f9) - latest main as of 2026-04-25
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@0f903f90aaae69e220e4a4bbbc065011548a2dfe",
+    # mlx-vlm from commit (e41cd25) - thread-local stream, DFlash GPU hang fix, hunyuan_vl/gemma3n cleanup
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e41cd25565861500e48c076ab31aaeafee0ed80f",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.3 (814c4a1) — block diffusion speculative decoding + temperature sampling
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@814c4a1",
+    # dflash-mlx v0.1.5.1 (110f261) — runtime_context, prefix cache (L1+L2), verify-specialized int4 qmm
+    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@110f261",
 ]
 
 [project.optional-dependencies]

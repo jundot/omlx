@@ -9,9 +9,11 @@ This module provides HTTP routes for the admin panel including:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -35,6 +37,7 @@ from .auth import (
     require_admin,
     validate_api_key,
     verify_api_key,
+    verify_session,
 )
 from ..settings import SubKeyEntry
 from ..model_profiles import EXCLUDED_FROM_PROFILES
@@ -127,6 +130,13 @@ class ModelSettingsRequest(BaseModel):
     dflash_enabled: Optional[bool] = None
     dflash_draft_model: Optional[str] = None
     dflash_draft_quant_bits: Optional[int] = None
+    dflash_max_ctx: Optional[int] = None
+    dflash_in_memory_cache: Optional[bool] = None
+    dflash_in_memory_cache_max_entries: Optional[int] = None
+    dflash_in_memory_cache_max_bytes: Optional[int] = None
+    dflash_ssd_cache: Optional[bool] = None
+    # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
+    mtp_enabled: Optional[bool] = None
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
@@ -178,6 +188,7 @@ class GlobalSettingsRequest(BaseModel):
     port: Optional[int] = None
     log_level: Optional[str] = None
     server_aliases: Optional[List[str]] = None
+    sse_keepalive_mode: Optional[str] = None
 
     # Model settings
     model_dirs: Optional[List[str]] = None
@@ -284,6 +295,7 @@ class OQStartRequest(BaseModel):
     sensitivity_model_path: str = ""
     text_only: bool = False
     dtype: str = "bfloat16"
+    preserve_mtp: bool = False
 
 
 class HFUploadRequest(BaseModel):
@@ -316,6 +328,109 @@ def _format_cache_size(size_bytes: int) -> str:
         return f"{gb:.0f}GB"
     mb = size_bytes / (1024 ** 2)
     return f"{mb:.0f}MB"
+
+
+def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
+    """Resolve dflash compatibility for an engine_pool model dict.
+
+    Returns ``(False, "")`` when dflash-mlx is not installed so the UI hides
+    the compat hint instead of pointing the user at an unrelated reason.
+    """
+    try:
+        from ..engine.dflash import is_dflash_compatible
+    except ImportError:
+        return False, ""
+    model_path = model_info.get("model_path") or ""
+    if not model_path:
+        return False, "model_path missing"
+    return is_dflash_compatible(model_path)
+
+
+def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
+    """Mirror of ``_dflash_compat_for_model`` for the native MTP toggle.
+
+    Returns ``(compatible, reason)``. Reason is empty on success and
+    suitable for surfacing to users (admin UI shows it under the toggle).
+
+    The check is conservative: even when the config declares MTP layers
+    we also peek at the safetensors weight index to verify that the
+    converter actually preserved the ``mtp.*`` tensors. Default mlx-lm
+    converters strip them; PR 990 ships a separate path that keeps them.
+    """
+    import json
+    from pathlib import Path
+
+    from ..utils.model_loading import _has_mtp_heads, _is_mtp_compatible
+
+    model_path = model_info.get("model_path") or ""
+    if not model_path:
+        return False, "model_path missing"
+    cfg_path = Path(model_path) / "config.json"
+    if not cfg_path.exists():
+        return False, "config.json not found"
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except Exception as e:
+        return False, f"failed to read config: {e}"
+    model_type = cfg.get("model_type")
+    if not _has_mtp_heads(cfg):
+        return False, "model has no MTP heads in config"
+    if not _is_mtp_compatible(cfg, model_type):
+        return False, (
+            f"model_type={model_type!r} is not on the MTP whitelist "
+            "(supported: qwen3_5*, qwen3_6*, deepseek_v4*)"
+        )
+    if not _model_has_mtp_weight_tensors(Path(model_path)):
+        return False, (
+            "Config declares MTP layers but the converted weights are missing "
+            "mtp.* tensors. Re-convert from HF with a converter that preserves "
+            "MTP weights."
+        )
+    return True, ""
+
+
+def _model_has_mtp_weight_tensors(model_dir) -> bool:
+    """Return True iff the model directory's weight files contain ``mtp.*`` keys.
+
+    Uses ``model.safetensors.index.json`` when present (cheap — only reads
+    the weight_map). Falls back to opening each ``*.safetensors`` and
+    checking its keys when no index is present (single-shard models).
+    Returns False on any error (we treat the model as incompatible rather
+    than risking a confusing load failure mid-inference).
+    """
+    import json
+    from pathlib import Path
+
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        # Library should be installed via mlx-lm deps; if it's not we can't
+        # peek the weights. Stay conservative and assume incompatible.
+        return False
+
+    model_dir = Path(model_dir)
+
+    # Preferred path: read the index file's weight_map (no tensor data loaded).
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            index = json.loads(index_path.read_text())
+            weight_map = index.get("weight_map", {})
+            return any("mtp." in key for key in weight_map.keys())
+        except Exception:
+            return False
+
+    # Single-shard fallback: enumerate keys via safe_open metadata. We
+    # short-circuit on the first ``mtp.*`` key.
+    for path in model_dir.glob("*.safetensors"):
+        try:
+            with safe_open(str(path), framework="numpy") as f:  # type: ignore[arg-type]
+                for key in f.keys():
+                    if "mtp." in key:
+                        return True
+        except Exception:
+            continue
+    return False
 
 
 def _apply_log_level_runtime(level: str) -> None:
@@ -1324,13 +1439,54 @@ async def delete_sub_key(
 # =============================================================================
 
 
+_SUPPORTED_MODELS_DOC_RE = re.compile(
+    r"Supported models:\s*\n((?:\s*-\s*\S.*\n?)+)",
+)
+
+
+def _models_from_docstring(fn) -> List[str]:
+    """Extract the ``Supported models:`` bullet list from an xgrammar 0.1.34+
+    structural-tag function's docstring. Returns ``[]`` if the section is
+    absent or unparseable."""
+    doc = inspect.getdoc(fn) or ""
+    match = _SUPPORTED_MODELS_DOC_RE.search(doc)
+    if not match:
+        return []
+    return [
+        line.strip().lstrip("-").strip()
+        for line in match.group(1).splitlines()
+        if line.strip().startswith("-")
+    ]
+
+
 @router.get("/api/grammar/parsers")
 async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     """Return available reasoning parser names from xgrammar.
 
-    Queries ``xgrammar.get_builtin_structural_tag_supported_models()`` at
-    runtime so the list stays in sync with the installed xgrammar version.
+    Supports both API generations:
+
+    - **xgrammar 0.1.34+** exposes a per-model registry at
+      ``xgrammar.builtin_structural_tag._structural_tag_registry``; supported
+      model names are pulled from each function's docstring.
+    - **xgrammar 0.1.32–0.1.33** exposes the now-removed helper
+      ``get_builtin_structural_tag_supported_models()``.
+
+    Returns ``[]`` if xgrammar is missing, fails to load (e.g. broken native
+    binding on macOS arm64), or has neither API available.
     """
+    # Prefer the 0.1.34+ registry so newer parsers (qwen3_6, gemma4,
+    # deepseek_v4, ...) are exposed.
+    try:
+        from xgrammar.builtin_structural_tag import _structural_tag_registry
+
+        return [
+            {"value": style, "label": style, "models": _models_from_docstring(fn)}
+            for style, fn in _structural_tag_registry.items()
+        ]
+    except Exception as e:
+        logger.debug("xgrammar 0.1.34+ registry unavailable: %s", e)
+
+    # Fall back to the pre-0.1.34 helper.
     try:
         from xgrammar import get_builtin_structural_tag_supported_models
 
@@ -1339,7 +1495,8 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
             {"value": style, "label": style, "models": models}
             for style, models in supported.items()
         ]
-    except ImportError:
+    except Exception as e:
+        logger.warning("xgrammar parser discovery unavailable: %s", e)
         return []
 
 
@@ -1376,11 +1533,23 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     # Get all model settings
     all_settings = settings_manager.get_all_settings() if settings_manager else {}
 
+    # SSD cache dir is set on the scheduler_config when the user enables paged
+    # SSD caching; admin UI consumes it to gate the dflash SSD toggle.
+    ssd_cache_dir = getattr(
+        getattr(engine_pool, "_scheduler_config", None),
+        "paged_ssd_cache_dir",
+        None,
+    )
+    dflash_ssd_cache_available = bool(ssd_cache_dir)
+
     # Combine model info with settings
     models = []
     for model_info in models_status:
         model_id = model_info["id"]
         settings = all_settings.get(model_id)
+
+        compat_ok, compat_reason = _dflash_compat_for_model(model_info)
+        mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
 
         model_data = {
             "id": model_id,
@@ -1397,6 +1566,11 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "thinking_default": model_info.get("thinking_default"),
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
             "last_access": model_info.get("last_access"),
+            "dflash_compatible": compat_ok,
+            "dflash_compatibility_reason": compat_reason,
+            "dflash_ssd_cache_available": dflash_ssd_cache_available,
+            "mtp_compatible": mtp_compat_ok,
+            "mtp_compatibility_reason": mtp_compat_reason,
         }
 
         # Add settings if available
@@ -1431,6 +1605,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_enabled": settings.dflash_enabled,
                 "dflash_draft_model": settings.dflash_draft_model,
                 "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
+                "dflash_max_ctx": settings.dflash_max_ctx,
+                "dflash_in_memory_cache": settings.dflash_in_memory_cache,
+                "dflash_in_memory_cache_max_entries": settings.dflash_in_memory_cache_max_entries,
+                "dflash_in_memory_cache_max_bytes": settings.dflash_in_memory_cache_max_bytes,
+                "dflash_ssd_cache": settings.dflash_ssd_cache,
+                "mtp_enabled": settings.mtp_enabled,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "trust_remote_code": settings.trust_remote_code,
@@ -1465,10 +1645,41 @@ async def unload_model(
     return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
 
 
+async def _require_admin_or_bearer(request: Request) -> bool:
+    """Allow admin session OR a valid Bearer API key (for CLI use)."""
+    gs = _get_global_settings() if _get_global_settings else None
+
+    # No-auth mode: always allow
+    if gs is not None and gs.auth.skip_api_key_verification:
+        return True
+
+    # Valid admin session cookie
+    if verify_session(request):
+        return True
+
+    # Bearer token matching the configured API key
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer ") and gs is not None:
+        token = auth_header[7:]
+        server_key = gs.auth.api_key or ""
+        sub_keys = gs.auth.sub_keys or []
+        if verify_api_key(token, server_key):
+            return True
+        for sk in sub_keys:
+            if verify_api_key(token, getattr(sk, "key", "")):
+                return True
+
+    raise HTTPException(
+        status_code=401,
+        detail="Admin authentication required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 @router.post("/api/models/{model_id}/load")
 async def load_model(
     model_id: str,
-    is_admin: bool = Depends(require_admin),
+    is_admin: bool = Depends(_require_admin_or_bearer),
 ):
     """Manually load a model into memory."""
     engine_pool = _get_engine_pool()
@@ -1654,11 +1865,133 @@ async def update_model_settings(
         current_settings.specprefill_threshold = request.specprefill_threshold or None
     # DFlash settings
     if "dflash_enabled" in sent:
-        current_settings.dflash_enabled = request.dflash_enabled or False
+        new_dflash_enabled = bool(request.dflash_enabled)
+        if new_dflash_enabled:
+            from ..engine.dflash import is_dflash_compatible
+
+            compat_ok, compat_reason = is_dflash_compatible(entry.model_path)
+            if not compat_ok:
+                raise HTTPException(status_code=400, detail=compat_reason)
+        current_settings.dflash_enabled = new_dflash_enabled
     if "dflash_draft_model" in sent:
         current_settings.dflash_draft_model = request.dflash_draft_model or None
     if "dflash_draft_quant_bits" in sent:
         current_settings.dflash_draft_quant_bits = request.dflash_draft_quant_bits or None
+    if "dflash_max_ctx" in sent:
+        # 0/None means "unlimited" — the engine treats None as no fallback threshold
+        value = request.dflash_max_ctx
+        current_settings.dflash_max_ctx = value if value and value > 0 else None
+    if "dflash_in_memory_cache" in sent:
+        current_settings.dflash_in_memory_cache = bool(request.dflash_in_memory_cache)
+    if "dflash_in_memory_cache_max_entries" in sent:
+        value = request.dflash_in_memory_cache_max_entries
+        current_settings.dflash_in_memory_cache_max_entries = (
+            int(value) if value and value > 0 else 4
+        )
+    if "dflash_in_memory_cache_max_bytes" in sent and request.dflash_in_memory_cache_max_bytes:
+        current_settings.dflash_in_memory_cache_max_bytes = int(
+            request.dflash_in_memory_cache_max_bytes
+        )
+    if "dflash_ssd_cache" in sent:
+        ssd_requested = bool(request.dflash_ssd_cache)
+        if ssd_requested:
+            in_mem_after = (
+                bool(request.dflash_in_memory_cache)
+                if "dflash_in_memory_cache" in sent
+                else current_settings.dflash_in_memory_cache
+            )
+            if not in_mem_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail="DFlash SSD cache requires the in-memory cache to be enabled.",
+                )
+            ssd_dir = getattr(
+                getattr(_get_engine_pool(), "_scheduler_config", None),
+                "paged_ssd_cache_dir",
+                None,
+            )
+            if not ssd_dir:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "DFlash SSD cache requires oMLX paged SSD cache to be enabled "
+                        "(set --paged-ssd-cache-dir or configure it in settings)."
+                    ),
+                )
+        current_settings.dflash_ssd_cache = ssd_requested
+
+    # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
+    if "mtp_enabled" in sent:
+        new_mtp_enabled = bool(request.mtp_enabled)
+        if new_mtp_enabled:
+            # Compatibility check: the model needs MTP heads in config.json AND
+            # the model_type must be one PR 990 / PR 15 covers AND the weight
+            # files must actually contain mtp.* tensors. The last check is
+            # the one that catches mlx-community converted weights where the
+            # default sanitize path stripped the MTP heads.
+            from ..utils.model_loading import _is_mtp_compatible
+            import json
+            from pathlib import Path
+
+            cfg_path = Path(entry.model_path) / "config.json"
+            if not cfg_path.exists():
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"MTP enabled but config.json missing at {cfg_path}; "
+                        "cannot verify MTP compatibility."
+                    ),
+                )
+            try:
+                cfg = json.loads(cfg_path.read_text())
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"MTP enabled but failed to read model config: {e}",
+                )
+            model_type = cfg.get("model_type")
+            if not _is_mtp_compatible(cfg, model_type):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Model is not MTP-compatible (model_type={model_type!r}, "
+                        f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
+                        "Native MTP requires Qwen3.5/3.6 or DeepSeek-V4 with MTP heads."
+                    ),
+                )
+            if not _model_has_mtp_weight_tensors(Path(entry.model_path)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Config declares MTP layers but the converted weights are "
+                        "missing mtp.* tensors. Re-convert from HF with a converter "
+                        "that preserves MTP weights. The default "
+                        "mlx-lm sanitize() path strips them."
+                    ),
+                )
+            # Mutual exclusion with DFlash / TurboQuant — ModelSettings.__post_init__
+            # also enforces this, but we surface a clearer error here.
+            dflash_after = (
+                bool(request.dflash_enabled)
+                if "dflash_enabled" in sent
+                else current_settings.dflash_enabled
+            )
+            if dflash_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
+                )
+            tq_after = (
+                bool(request.turboquant_kv_enabled)
+                if "turboquant_kv_enabled" in sent
+                else current_settings.turboquant_kv_enabled
+            )
+            if tq_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail="MTP and TurboQuant KV cannot both be enabled; TurboQuant patches the attention path MTP relies on.",
+                )
+        current_settings.mtp_enabled = new_mtp_enabled
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -1720,7 +2053,8 @@ async def update_model_settings(
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
 
-    # Warn if engine type or index_cache_freq changed while model is loaded
+    # Auto-unload (and re-load if pinned) when a setting that only takes
+    # effect at engine construction time is changed on a loaded model.
     requires_reload = (
         entry.engine is not None
         and (
@@ -1728,16 +2062,36 @@ async def update_model_settings(
             or "index_cache_freq" in sent
             or "dflash_enabled" in sent
             or "dflash_draft_model" in sent
+            or "dflash_draft_quant_bits" in sent
+            or "dflash_max_ctx" in sent
+            or "dflash_in_memory_cache" in sent
+            or "dflash_in_memory_cache_max_entries" in sent
+            or "dflash_in_memory_cache_max_bytes" in sent
+            or "dflash_ssd_cache" in sent
             # trust_remote_code is plumbed at model load time; toggling it on
             # an already-loaded engine has no effect until reload.
             or "trust_remote_code" in sent
         )
     )
+    auto_unloaded = False
+    auto_reloaded = False
     if requires_reload:
-        logger.info(
-            f"Settings changed for loaded model {model_id}. "
-            f"Reload required to take effect."
-        )
+        was_pinned = entry.is_pinned
+        try:
+            logger.info(
+                f"Settings changed for loaded model {model_id}, auto-unloading."
+            )
+            await engine_pool._unload_engine(model_id)
+            auto_unloaded = True
+        except Exception as e:
+            logger.warning(f"Auto-unload failed for {model_id}: {e}")
+        if auto_unloaded and was_pinned:
+            try:
+                await engine_pool._load_engine(model_id)
+                auto_reloaded = True
+                logger.info(f"Auto-reloaded pinned model {model_id} with new settings.")
+            except Exception as e:
+                logger.warning(f"Auto-reload failed for pinned model {model_id}: {e}")
 
     return {
         "success": True,
@@ -1746,6 +2100,8 @@ async def update_model_settings(
         "model_type": entry.model_type,
         "engine_type": entry.engine_type,
         "requires_reload": requires_reload,
+        "auto_unloaded": auto_unloaded,
+        "auto_reloaded": auto_reloaded,
     }
 
 
@@ -2167,6 +2523,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "port": global_settings.server.port,
             "log_level": global_settings.server.log_level,
             "server_aliases": list(global_settings.server.server_aliases),
+            "sse_keepalive_mode": global_settings.server.sse_keepalive_mode,
         },
         "model": {
             "model_dirs": [
@@ -2296,6 +2653,16 @@ async def update_global_settings(
         # Apply log level at runtime
         _apply_log_level_runtime(request.log_level)
         runtime_applied.append("log_level")
+    if request.sse_keepalive_mode is not None:
+        valid_modes = {"chunk", "comment", "off"}
+        if request.sse_keepalive_mode not in valid_modes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid sse_keepalive_mode: {request.sse_keepalive_mode} "
+                f"(must be one of {sorted(valid_modes)})",
+            )
+        global_settings.server.sse_keepalive_mode = request.sse_keepalive_mode
+        runtime_applied.append("sse_keepalive_mode")
 
     if request.server_aliases is not None:
         from ..utils.network import is_valid_alias
@@ -3182,6 +3549,7 @@ def _build_active_models_data() -> dict:
             "total_waiting_requests": 0,
         }
 
+    now = time.monotonic()
     tracker = get_prefill_tracker()
     status = engine_pool.get_status()
     models = []
@@ -3195,6 +3563,10 @@ def _build_active_models_data() -> dict:
         model_id = model_info["id"]
         active_requests = 0
         waiting_requests = 0
+        running_by_id = {}
+        waiting_ids = set()
+        waiting = []
+        activities = []
 
         # Get per-model active/waiting request counts.
         # Follow the same pattern as server.py /api/status endpoint.
@@ -3206,20 +3578,90 @@ def _build_active_models_data() -> dict:
                 core = getattr(async_core, "engine", None)
                 if core is not None:
                     collectors = getattr(core, "_output_collectors", {})
-                    active_request_ids = set(collectors.keys())
-                    active_requests = len(collectors)
+                    try:
+                        active_request_ids = set(collectors.keys())
+                        active_requests = len(collectors)
+                    except RuntimeError:
+                        # Scheduler state is mutated from the engine executor;
+                        # keep the dashboard endpoint best-effort rather than
+                        # failing on a concurrent dict resize.
+                        active_request_ids = set()
+                        active_requests = len(collectors)
+
                     sched = getattr(core, "scheduler", None)
-                    if sched is not None:
-                        waiting_requests = len(getattr(sched, "waiting", []))
+                    if sched is not None and hasattr(sched, "snapshot_for_admin"):
+                        snap = sched.snapshot_for_admin()
+                        running_by_id = snap["running_by_id"]
+                        waiting_queue = snap["waiting"]
+                        waiting_requests = len(waiting_queue)
+                        waiting_ids = {req.request_id for req in waiting_queue}
+                        waiting = [
+                            {
+                                "request_id": req.request_id,
+                                "queue_position": idx,
+                                "elapsed_seconds": max(0.0, now - req.arrival_time),
+                                "prompt_tokens": getattr(req, "num_prompt_tokens", 0),
+                            }
+                            for idx, req in enumerate(waiting_queue, start=1)
+                        ]
+            elif hasattr(entry.engine, "get_activity_snapshot"):
+                snapshot = entry.engine.get_activity_snapshot()
+                active_requests = snapshot.get("active_requests", 0)
+                activities = snapshot.get("activities", [])
 
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
 
-        # Generating = active requests that finished prefill
-        generating = [
-            {"request_id": rid}
-            for rid in sorted(active_request_ids - prefilling_ids)
-        ]
+        # Generating = active requests that finished prefill.
+        generating = []
+        for rid in sorted(active_request_ids - prefilling_ids - waiting_ids):
+            req = running_by_id.get(rid)
+            generated_tokens = getattr(req, "num_output_tokens", 0) if req else 0
+            started_at = getattr(req, "generation_started_at", None) if req else None
+            last_activity_at = getattr(req, "last_activity_at", None) if req else None
+            elapsed = max(0.0, now - started_at) if started_at else None
+            last_activity_age = (
+                max(0.0, now - last_activity_at) if last_activity_at else None
+            )
+            tokens_per_second = (
+                generated_tokens / elapsed if elapsed and elapsed > 0 else 0.0
+            )
+            generating.append(
+                {
+                    "request_id": rid,
+                    "elapsed_seconds": elapsed,
+                    "generated_tokens": generated_tokens,
+                    "tokens_per_second": tokens_per_second,
+                    "last_activity_age_seconds": last_activity_age,
+                    "prompt_tokens": getattr(req, "num_prompt_tokens", 0) if req else 0,
+                    "max_tokens": getattr(req, "max_tokens", None) if req else None,
+                }
+            )
+
+        loading_started_at = model_info.get("loading_started_at")
+        loading_elapsed_seconds = (
+            max(0.0, now - loading_started_at) if loading_started_at else None
+        )
+        loading_estimated_seconds = None
+        loading_remaining_seconds_estimate = None
+        if loading_elapsed_seconds is not None:
+            estimated_size_gb = model_info.get("estimated_size", 0) / (1024 ** 3)
+            # Model loaders do not expose byte-level progress, so use a
+            # deliberately conservative elapsed-time estimate and cap below
+            # complete until the model is actually loaded.
+            observed_seconds_per_gb = status.get("load_seconds_per_gb_estimate")
+            observations = status.get("load_time_observations", 0)
+            if observed_seconds_per_gb and observations >= 2:
+                # Adapt to this machine/session once we have more than a
+                # single potentially-misleading sample.
+                loading_estimated_seconds = max(
+                    3.0,
+                    1.0 + estimated_size_gb * float(observed_seconds_per_gb),
+                )
+                if loading_elapsed_seconds < loading_estimated_seconds:
+                    loading_remaining_seconds_estimate = max(
+                        0.0, loading_estimated_seconds - loading_elapsed_seconds
+                    )
 
         models.append({
             "id": model_id,
@@ -3229,8 +3671,13 @@ def _build_active_models_data() -> dict:
             ),
             "pinned": model_info.get("pinned", False),
             "is_loading": model_info.get("is_loading", False),
+            "loading_elapsed_seconds": loading_elapsed_seconds,
+            "loading_estimated_seconds": loading_estimated_seconds,
+            "loading_remaining_seconds_estimate": loading_remaining_seconds_estimate,
             "active_requests": active_requests,
             "waiting_requests": waiting_requests,
+            "waiting": waiting,
+            "activities": activities,
             "prefilling": prefilling,
             "generating": generating,
         })
@@ -4470,6 +4917,7 @@ async def list_oq_models(is_admin: bool = Depends(require_admin)):
 async def estimate_oq(
     model_path: str,
     oq_level: float,
+    preserve_mtp: bool = False,
     is_admin: bool = Depends(require_admin),
 ):
     """Estimate effective bpw and output size for a model at given oQ level."""
@@ -4477,7 +4925,11 @@ async def estimate_oq(
 
     try:
         result = await asyncio.to_thread(
-            estimate_bpw_and_size, model_path, oq_level
+            estimate_bpw_and_size,
+            model_path,
+            oq_level,
+            64,  # group_size (default)
+            preserve_mtp,
         )
         return result
     except Exception as e:
@@ -4512,6 +4964,7 @@ async def start_oq_quantization(
             sensitivity_model_path=request.sensitivity_model_path,
             text_only=request.text_only,
             dtype=request.dtype,
+            preserve_mtp=request.preserve_mtp,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

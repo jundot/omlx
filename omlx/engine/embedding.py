@@ -125,13 +125,23 @@ class EmbeddingEngine(BaseNonStreamingEngine):
                 truncation=truncation,
             )
 
-        with self._active_lock:
-            self._active_count += 1
+        activity_id = self._begin_activity(
+            "embedding",
+            detail="Embedding",
+            total_items=len(texts),
+            metadata={"input_count": len(texts)},
+        )
         try:
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(get_mlx_executor(), _embed_sync)
+            output = await loop.run_in_executor(get_mlx_executor(), _embed_sync)
+            self._update_activity(
+                activity_id,
+                token_count=output.total_tokens,
+                dimensions=output.dimensions,
+            )
+            return output
         finally:
-            if self._decrement_active():
+            if self._end_activity(activity_id):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),

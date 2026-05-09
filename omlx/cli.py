@@ -311,13 +311,23 @@ def launch_command(args):
         print("Start the server first: omlx serve")
         sys.exit(1)
 
-    # Get API key from CLI args
-    api_key = getattr(args, "api_key", None) or ""
+    # Get API key: CLI args > settings.json > empty
+    api_key = getattr(args, "api_key", None) or settings.auth.api_key or ""
 
     # Build headers for authenticated requests
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+
+    # Pre-fetch model status (context_window, max_tokens, model_type per model)
+    models_status_map: dict[str, dict] = {}
+    try:
+        resp = requests.get(f"{base_url}/v1/models/status", headers=headers, timeout=5)
+        if resp.ok:
+            for m in resp.json().get("models", []):
+                models_status_map[m["id"]] = m
+    except Exception:
+        pass
 
     # Determine model
     model = args.model
@@ -343,19 +353,13 @@ def launch_command(args):
             model = models[0]
             print(f"Using model: {model}")
         else:
-            print("Available models:")
-            for i, m in enumerate(models, 1):
-                print(f"  {i}. {m}")
-            while True:
-                try:
-                    choice = input("Select model number: ").strip()
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(models):
-                        model = models[idx]
-                        break
-                    print(f"Please enter 1-{len(models)}")
-                except (ValueError, EOFError):
-                    print(f"Please enter 1-{len(models)}")
+            models_info_list = [
+                {"id": m_id, **models_status_map.get(m_id, {})}
+                for m_id in models
+            ]
+            model = integration.select_model(
+                models_info_list, integration.display_name
+            )
 
     # Check if tool is installed
     if not integration.is_installed():
@@ -363,21 +367,11 @@ def launch_command(args):
         print(f"Install: {integration.install_hint}")
         sys.exit(1)
 
-    # Fetch model limits from server
-    context_window = None
-    max_tokens = None
-    model_type = None
-    try:
-        resp = requests.get(f"{base_url}/v1/models/status", headers=headers, timeout=5)
-        if resp.ok:
-            for m in resp.json().get("models", []):
-                if m["id"] == model:
-                    context_window = m.get("max_context_window")
-                    max_tokens = m.get("max_tokens")
-                    model_type = m.get("model_type")
-                    break
-    except Exception:
-        pass
+    # Resolve model limits from pre-fetched status
+    model_info = models_status_map.get(model, {})
+    context_window = model_info.get("max_context_window")
+    max_tokens = model_info.get("max_tokens")
+    model_type = model_info.get("model_type")
 
     # Launch
     print(f"Launching {integration.display_name} with model {model}...")
@@ -553,6 +547,16 @@ Example directory structure:
         default=None,
         help="Log level (default: info). trace includes full message content",
     )
+    serve_parser.add_argument(
+        "--sse-keepalive-mode",
+        type=str,
+        choices=["chunk", "comment", "off"],
+        default=None,
+        help="SSE keepalive emission mode (default: chunk). 'chunk' emits "
+        "protocol-aware no-op events compatible with strict clients like "
+        "OpenClaw / WorkBuddy; 'comment' emits the legacy ': keep-alive' SSE "
+        "comment; 'off' disables keepalive entirely",
+    )
 
     # Scheduler options (for BatchedEngine)
     serve_parser.add_argument(
@@ -668,7 +672,7 @@ Example directory structure:
     launch_parser.add_argument(
         "tool",
         type=str,
-        help="Tool to launch: codex, opencode, openclaw, pi, or 'list' to show available",
+        help="Tool to launch: claude, codex, opencode, openclaw, pi, or 'list' to show available",
     )
     launch_parser.add_argument(
         "--model",

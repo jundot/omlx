@@ -7,13 +7,11 @@ enabling larger effective cache sizes than GPU memory allows.
 """
 
 import errno
-import json
 import logging
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -32,6 +30,7 @@ def _has_mlx() -> bool:
     """Check if MLX is available."""
     try:
         import mlx.core  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -601,6 +600,7 @@ class TestPagedSSDCacheManagerWithMLX:
         """Mock MLX module for testing save/load without actual tensors."""
         try:
             import mlx.core as mx
+
             return mx
         except ImportError:
             pytest.skip("MLX not available")
@@ -653,8 +653,7 @@ class TestPagedSSDCacheManagerWithMLX:
 
         block_hash = b"test_load_meta_hash"
         cache_data = [
-            (mx.zeros((1, 8, 64, 64)), mx.zeros((1, 8, 64, 64)))
-            for _ in range(2)
+            (mx.zeros((1, 8, 64, 64)), mx.zeros((1, 8, 64, 64))) for _ in range(2)
         ]
 
         manager.save_block(
@@ -780,7 +779,10 @@ class TestPagedSSDCacheManagerWithMLX:
 
         mx.save_safetensors(
             str(legacy_file),
-            {"layer_0_keys": mx.zeros((1, 8, 32, 64)), "layer_0_values": mx.zeros((1, 8, 32, 64))},
+            {
+                "layer_0_keys": mx.zeros((1, 8, 32, 64)),
+                "layer_0_values": mx.zeros((1, 8, 32, 64)),
+            },
             metadata={
                 # Intentionally missing omlx_cache_format_version.
                 "block_hash": block_hash_hex,
@@ -808,6 +810,7 @@ class TestPagedSSDCacheManagerCacheList:
         """Import MLX or skip."""
         try:
             import mlx.core as mx
+
             return mx
         except ImportError:
             pytest.skip("MLX not available")
@@ -830,15 +833,21 @@ class TestPagedSSDCacheManagerCacheList:
         sub_values2 = mx.ones((1, 4, 32, 64))
 
         cache_data = [
-            ('__cache_list__', [(sub_keys1, sub_values1), (sub_keys2, sub_values2)]),
-            (mx.zeros((1, 8, 32, 64)), mx.ones((1, 8, 32, 64))),  # Standard KVCache layer
+            ("__cache_list__", [(sub_keys1, sub_values1), (sub_keys2, sub_values2)]),
+            (
+                mx.zeros((1, 8, 32, 64)),
+                mx.ones((1, 8, 32, 64)),
+            ),  # Standard KVCache layer
         ]
 
         layer_cache_types = ["CacheList", "KVCache"]
 
         result = ssd_cache.save_block(
-            block_hash, cache_data, token_count=32,
-            model_name="test", layer_cache_types=layer_cache_types,
+            block_hash,
+            cache_data,
+            token_count=32,
+            model_name="test",
+            layer_cache_types=layer_cache_types,
         )
         assert result is True
 
@@ -869,8 +878,11 @@ class TestPagedSSDCacheManagerCacheList:
         layer_cache_types = ["CacheList", "KVCache"]
 
         result = ssd_cache.save_block(
-            block_hash, cache_data, token_count=32,
-            model_name="test", layer_cache_types=layer_cache_types,
+            block_hash,
+            cache_data,
+            token_count=32,
+            model_name="test",
+            layer_cache_types=layer_cache_types,
         )
         assert result is True
 
@@ -889,7 +901,7 @@ class TestPagedSSDCacheManagerCacheList:
         sub_values = mx.ones((1, 8, 64, 64))
 
         cache_data = [
-            ('__cache_list__', [(sub_keys, sub_values)]),
+            ("__cache_list__", [(sub_keys, sub_values)]),
         ]
         layer_cache_types = ["CacheList"]
         layer_meta_states = [
@@ -897,7 +909,9 @@ class TestPagedSSDCacheManagerCacheList:
         ]
 
         ssd_cache.save_block(
-            block_hash, cache_data, token_count=64,
+            block_hash,
+            cache_data,
+            token_count=64,
             model_name="test",
             layer_cache_types=layer_cache_types,
             layer_meta_states=layer_meta_states,
@@ -919,22 +933,28 @@ class TestPagedSSDCacheManagerCacheList:
         sub-cache stores values with shape (B, 1, N, 0) — head_dim=0.
         """
         block_hash = b"zero_dim_cl_test_ha_"
-        sub_keys1 = mx.zeros((1, 1, 64, 512))   # Main attention kv_latent
-        sub_values1 = mx.zeros((1, 1, 64, 64))   # Main attention k_pe
-        sub_keys2 = mx.zeros((1, 1, 64, 128))    # Indexer keys
-        sub_values2 = mx.zeros((1, 1, 64, 0))    # Indexer values (zero head_dim)
+        sub_keys1 = mx.zeros((1, 1, 64, 512))  # Main attention kv_latent
+        sub_values1 = mx.zeros((1, 1, 64, 64))  # Main attention k_pe
+        sub_keys2 = mx.zeros((1, 1, 64, 128))  # Indexer keys
+        sub_values2 = mx.zeros((1, 1, 64, 0))  # Indexer values (zero head_dim)
 
         cache_data = [
-            ('__cache_list__', [
-                (sub_keys1, sub_values1),
-                (sub_keys2, sub_values2),
-            ]),
+            (
+                "__cache_list__",
+                [
+                    (sub_keys1, sub_values1),
+                    (sub_keys2, sub_values2),
+                ],
+            ),
         ]
         layer_cache_types = ["CacheList"]
 
         result = ssd_cache.save_block(
-            block_hash, cache_data, token_count=64,
-            model_name="test", layer_cache_types=layer_cache_types,
+            block_hash,
+            cache_data,
+            token_count=64,
+            model_name="test",
+            layer_cache_types=layer_cache_types,
         )
         assert result is True
 
@@ -960,7 +980,7 @@ class TestPagedSSDCacheManagerCacheList:
         sub_values = mx.zeros((1, 1, 32, 0))
 
         cache_data = [
-            ('__cache_list__', [(sub_keys, sub_values)]),
+            ("__cache_list__", [(sub_keys, sub_values)]),
         ]
         layer_cache_types = ["CacheList"]
         layer_meta_states = [
@@ -968,7 +988,9 @@ class TestPagedSSDCacheManagerCacheList:
         ]
 
         ssd_cache.save_block(
-            block_hash, cache_data, token_count=32,
+            block_hash,
+            cache_data,
+            token_count=32,
             model_name="test",
             layer_cache_types=layer_cache_types,
             layer_meta_states=layer_meta_states,
@@ -999,6 +1021,7 @@ class TestAsyncWriteAndTimeoutLoad:
         """Import MLX or skip."""
         try:
             import mlx.core as mx
+
             return mx
         except ImportError:
             pytest.skip("MLX not available")
@@ -1017,8 +1040,7 @@ class TestAsyncWriteAndTimeoutLoad:
         """Verify save_block() returns immediately and file appears async."""
         block_hash = b"async_save_test_hash"
         cache_data = [
-            (mx.zeros((1, 8, 64, 64)), mx.zeros((1, 8, 64, 64)))
-            for _ in range(4)
+            (mx.zeros((1, 8, 64, 64)), mx.zeros((1, 8, 64, 64))) for _ in range(4)
         ]
 
         t0 = time.time()
@@ -1041,6 +1063,7 @@ class TestAsyncWriteAndTimeoutLoad:
 
         # Wait for background writer to finish
         import time as time_mod
+
         for _ in range(50):  # Wait up to 5s
             file_path = ssd_cache._get_file_path(block_hash)
             if file_path.exists():
@@ -1053,8 +1076,7 @@ class TestAsyncWriteAndTimeoutLoad:
         """Verify that a block saved then immediately loaded is served from memory."""
         block_hash = b"pending_load_test_ha"
         cache_data = [
-            (mx.zeros((1, 8, 32, 64)), mx.ones((1, 8, 32, 64)))
-            for _ in range(2)
+            (mx.zeros((1, 8, 32, 64)), mx.ones((1, 8, 32, 64))) for _ in range(2)
         ]
 
         ssd_cache.save_block(
@@ -1075,9 +1097,7 @@ class TestAsyncWriteAndTimeoutLoad:
     def test_pending_writes_served_on_load_with_metadata(self, ssd_cache, mx):
         """Verify load_block_with_metadata also reads from pending writes."""
         block_hash = b"pending_meta_test_ha"
-        cache_data = [
-            (mx.zeros((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))
-        ]
+        cache_data = [(mx.zeros((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))]
 
         ssd_cache.save_block(
             block_hash=block_hash,
@@ -1099,9 +1119,7 @@ class TestAsyncWriteAndTimeoutLoad:
     def test_load_error_returns_none(self, ssd_cache, mx):
         """Verify that a corrupted file returns None and cleans up index."""
         block_hash = b"error_test_hash_1234"
-        cache_data = [
-            (mx.zeros((1, 8, 32, 64)), mx.zeros((1, 8, 32, 64)))
-        ]
+        cache_data = [(mx.zeros((1, 8, 32, 64)), mx.zeros((1, 8, 32, 64)))]
 
         # Save and wait for background write to complete
         ssd_cache.save_block(
@@ -1110,6 +1128,7 @@ class TestAsyncWriteAndTimeoutLoad:
             token_count=32,
         )
         import time as time_mod
+
         for _ in range(50):
             with ssd_cache._pending_write_hashes_lock:
                 if block_hash not in ssd_cache._pending_write_hashes:
@@ -1132,9 +1151,9 @@ class TestAsyncWriteAndTimeoutLoad:
         # The old implementation used ThreadPoolExecutor(max_workers=1) which
         # caused deadlocks when mx.load() in a worker thread contested Metal
         # GPU resources with the main inference thread. Verify it's gone.
-        assert not hasattr(ssd_cache, '_load_executor'), (
-            "_load_executor should not exist — it causes Metal GPU deadlocks"
-        )
+        assert not hasattr(
+            ssd_cache, "_load_executor"
+        ), "_load_executor should not exist — it causes Metal GPU deadlocks"
 
     def test_sequential_loads_no_queue_blocking(self, ssd_cache, mx):
         """Regression test: consecutive loads must not block each other."""
@@ -1145,9 +1164,7 @@ class TestAsyncWriteAndTimeoutLoad:
         for i in range(5):
             block_hash = f"seq_load_test_{i:04d}_".encode()[:20]
             hashes.append(block_hash)
-            cache_data = [
-                (mx.zeros((1, 8, 32, 64)), mx.zeros((1, 8, 32, 64)))
-            ]
+            cache_data = [(mx.zeros((1, 8, 32, 64)), mx.zeros((1, 8, 32, 64)))]
             ssd_cache.save_block(block_hash, cache_data, token_count=32)
 
         # Wait for all pending writes to flush
@@ -1167,19 +1184,18 @@ class TestAsyncWriteAndTimeoutLoad:
 
         # 5 loads from SSD should complete in well under 5s
         # (each ~2ms read + reconstruction)
-        assert elapsed < 5.0, (
-            f"Sequential loads took {elapsed:.1f}s — possible queue blocking"
-        )
+        assert (
+            elapsed < 5.0
+        ), f"Sequential loads took {elapsed:.1f}s — possible queue blocking"
 
     def test_writer_error_handling(self, ssd_cache, mx):
         """Verify that background writer errors clean up the index."""
         block_hash = b"writer_error_test_ha"
-        cache_data = [
-            (mx.zeros((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))
-        ]
+        cache_data = [(mx.zeros((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))]
 
         # Patch _write_safetensors_no_mx to simulate disk error in background writer
         import time as time_mod
+
         with patch(
             "omlx.cache.paged_ssd_cache._write_safetensors_no_mx",
             side_effect=OSError("Disk full"),
@@ -1208,14 +1224,13 @@ class TestAsyncWriteAndTimeoutLoad:
     def test_writer_enospc_logs_disk_full(self, ssd_cache, mx, caplog):
         """ENOSPC errors should log 'disk full' warning, not generic error."""
         block_hash = b"enospc_test_hash_123"
-        cache_data = [
-            (mx.zeros((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))
-        ]
+        cache_data = [(mx.zeros((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))]
 
         enospc = OSError("No space left on device")
         enospc.errno = errno.ENOSPC
 
         import time as time_mod
+
         with (
             patch(
                 "omlx.cache.paged_ssd_cache._write_safetensors_no_mx",
@@ -1272,8 +1287,7 @@ class TestAsyncWriteAndTimeoutLoad:
 
         block_hash = b"round_trip_flush_tes"
         cache_data = [
-            (mx.zeros((1, 8, 64, 64)), mx.ones((1, 8, 64, 64)))
-            for _ in range(4)
+            (mx.zeros((1, 8, 64, 64)), mx.ones((1, 8, 64, 64))) for _ in range(4)
         ]
 
         ssd_cache.save_block(
@@ -1315,6 +1329,7 @@ class TestAsyncBackgroundWrite:
     @pytest.fixture
     def mx(self):
         import mlx.core as mx
+
         return mx
 
     def test_extract_and_restore_float32(self, mx):
@@ -1357,7 +1372,9 @@ class TestAsyncBackgroundWrite:
     def test_extract_and_restore_int_types(self, mx):
         """Round-trip test for integer dtypes."""
         for mx_dtype, st_str in [
-            (mx.int8, "I8"), (mx.int32, "I32"), (mx.uint8, "U8"),
+            (mx.int8, "I8"),
+            (mx.int32, "I32"),
+            (mx.uint8, "U8"),
         ]:
             original = mx.array([1, 2, 3, 4], dtype=mx_dtype)
             mx.eval(original)
@@ -1417,9 +1434,7 @@ class TestAsyncBackgroundWrite:
         )
 
         block_hash = b"async_write_test_hsh"
-        cache_data = [
-            (mx.ones((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))
-        ]
+        cache_data = [(mx.ones((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))]
 
         # Patch mx.save_safetensors to ensure it's NOT called
         with patch("mlx.core.save_safetensors") as mock_save:
@@ -1436,8 +1451,8 @@ class TestAsyncBackgroundWrite:
         with manager._hot_cache_lock:
             pending = manager._hot_cache.get(block_hash)
         assert pending is not None
-        assert 'tensors_raw' in pending
-        assert 'arrays' not in pending  # Old key should not exist
+        assert "tensors_raw" in pending
+        assert "arrays" not in pending  # Old key should not exist
 
         # Wait for background write and verify file exists
         for _ in range(50):
@@ -1447,10 +1462,13 @@ class TestAsyncBackgroundWrite:
             time.sleep(0.05)
         assert file_path.exists()
 
-        # Verify file is loadable by mx.load
+        # Verify file is loadable by mx.load. V3 stores state elements as
+        # ``layer_{i}_state_{k}`` keys with a ``layer_{i}_state_count`` meta
+        # entry, polyfilled from V2 ``(keys, values)`` 2-tuples on save.
         loaded, meta = mx.load(str(file_path), return_metadata=True)
-        assert "layer_0_keys" in loaded
-        assert "layer_0_values" in loaded
+        assert "layer_0_state_0" in loaded
+        assert "layer_0_state_1" in loaded
+        assert meta.get("layer_0_state_count") == "2"
         assert meta["block_hash"] == block_hash.hex()
 
         manager.close()

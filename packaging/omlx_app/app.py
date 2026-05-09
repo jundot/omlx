@@ -212,6 +212,9 @@ class OMLXAppDelegate(NSObject):
 
         logger.info("oMLX menubar app launched successfully")
 
+        # Install omlx CLI symlink so `omlx launch claude` works from the terminal
+        self._install_cli_symlink()
+
         # Clean up leftover staged update from previous attempt
         from .updater import AppUpdater
 
@@ -245,6 +248,40 @@ class OMLXAppDelegate(NSObject):
                 3.0, self, "checkStatusItemVisibility:", None, False
             )
         )
+
+    def _install_cli_symlink(self) -> None:
+        """Install `omlx` CLI symlink so it's available in PATH.
+
+        Tries /usr/local/bin first (like ollama), falls back to ~/.local/bin.
+        Silently skips if neither directory is writable or the symlink already exists.
+        """
+        bundle = NSBundle.mainBundle()
+        exec_url = bundle.executableURL()
+        if exec_url is None:
+            return
+
+        macos_dir = Path(str(exec_url.path())).parent
+        cli_src = macos_dir / "omlx-cli"
+        if not cli_src.exists():
+            return
+
+        for target_dir in [Path("/usr/local/bin"), Path.home() / ".local" / "bin"]:
+            target = target_dir / "omlx"
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                if target.is_symlink():
+                    if target.resolve() == cli_src.resolve():
+                        return  # already correct
+                    target.unlink()
+                elif target.exists():
+                    return  # non-symlink file present, don't overwrite
+                target.symlink_to(cli_src)
+                logger.info(f"Installed CLI symlink: {target} → {cli_src}")
+                return
+            except OSError:
+                continue
+
+        logger.warning("Could not install omlx CLI symlink — no writable bin directory found")
 
     def _create_status_item(self):
         """Create the NSStatusItem and set accessibility metadata.

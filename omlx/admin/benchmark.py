@@ -77,6 +77,10 @@ class BenchmarkRun:
     task: Optional[asyncio.Task] = None
     results: list[dict] = field(default_factory=list)
     error_message: str = ""
+    # Experimental flags active when the benchmark started. When non-empty
+    # the run's results are not uploaded to omlx.ai community benchmarks
+    # because experimental features skew the numbers.
+    experimental_features: list[str] = field(default_factory=list)
 
 
 def get_run(bench_id: str) -> Optional[BenchmarkRun]:
@@ -394,6 +398,21 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
         parse_chip_info,
     )
 
+    # Skip upload when experimental features were active during the run.
+    # These features (DFlash, SpecPrefill, TurboQuant KV) skew throughput
+    # and would pollute the community leaderboard if mixed in unmarked.
+    if run.experimental_features:
+        await _send_event(run, {
+            "type": "upload_skipped",
+            "reason": "experimental_features",
+            "features": list(run.experimental_features),
+        })
+        logger.info(
+            f"Benchmark upload skipped: experimental features active: "
+            f"{run.experimental_features}"
+        )
+        return
+
     await _send_event(run, {
         "type": "progress",
         "phase": "upload",
@@ -577,6 +596,25 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     overall_start = time.perf_counter()
 
     try:
+        # Snapshot experimental flags at run start. Settings can change mid-run
+        # (user toggling DFlash/SpecPrefill/TurboQuant), and the produced
+        # numbers are tied to whatever was active when generation actually ran.
+        sm = getattr(engine_pool, "_settings_manager", None)
+        if sm is not None:
+            try:
+                s = sm.get_settings(request.model_id)
+                if getattr(s, "dflash_enabled", False):
+                    run.experimental_features.append("dflash")
+                if getattr(s, "specprefill_enabled", False):
+                    run.experimental_features.append("specprefill")
+                if getattr(s, "turboquant_kv_enabled", False):
+                    run.experimental_features.append("turboquant")
+            except Exception as e:
+                logger.warning(
+                    f"Benchmark: failed to read experimental flags for "
+                    f"{request.model_id}: {e}"
+                )
+
         # Phase 1: Unload all loaded models
         loaded_ids = engine_pool.get_loaded_model_ids()
         if loaded_ids:

@@ -56,6 +56,7 @@
                                         <option value="ko">{{ t('settings.language.ko') }}</option>
                                         <option value="ja">{{ t('settings.language.ja') }}</option>
                                         <option value="ru">{{ t('settings.language.ru') }}</option>
+                                        <option value="es">{{ t('settings.language.es') }}</option>
                                     </select>
                                 </div>
                             </div>
@@ -741,6 +742,28 @@
                                             <input type="number" x-model.number="globalSettings.cache.initial_cache_blocks"
                                                    min="1"
                                                    class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                    </div>
+
+                                    <!-- Streaming subsection -->
+                                    <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
+                                        <div class="flex items-center gap-2">
+                                            <i data-lucide="radio" class="w-3.5 h-3.5 text-neutral-400"></i>
+                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.streaming') }}</span>
+                                        </div>
+                                    </div>
+                                    <div class="divide-y divide-neutral-100">
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div class="flex-1">
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.sse_keepalive_mode') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.sse_keepalive_mode_hint') }}</p>
+                                            </div>
+                                            <select x-model="globalSettings.server.sse_keepalive_mode"
+                                                    class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                <option value="chunk">{{ t('settings.advanced.sse_keepalive_mode_chunk') }}</option>
+                                                <option value="comment">{{ t('settings.advanced.sse_keepalive_mode_comment') }}</option>
+                                                <option value="off">{{ t('settings.advanced.sse_keepalive_mode_off') }}</option>
+                                            </select>
                                         </div>
                                     </div>
                                 </div>

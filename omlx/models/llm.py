@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class GenerationOutput:
     """Output from text generation."""
+
     text: str
     tokens: list[int]
     finish_reason: str | None = None
@@ -27,6 +28,7 @@ class GenerationOutput:
 @dataclass
 class StreamingOutput:
     """Streaming output chunk."""
+
     text: str
     token: int
     finished: bool = False
@@ -76,6 +78,8 @@ class MLXLanguageModel:
         try:
             from mlx_lm import load
 
+            from ..utils.model_loading import maybe_apply_pre_load_patches
+
             logger.info(f"Loading model: {self.model_name}")
 
             # Build tokenizer config with model-specific fixes
@@ -83,6 +87,10 @@ class MLXLanguageModel:
                 self.model_name,
                 trust_remote_code=self.trust_remote_code,
             )
+
+            # Apply pre-load patches for models that need module injection
+            # before mlx_lm.load runs (e.g. DeepSeek V4 PR 1192).
+            maybe_apply_pre_load_patches(self.model_name)
 
             self.model, self.tokenizer = load(
                 self.model_name,
@@ -228,7 +236,7 @@ class MLXLanguageModel:
 
             yield StreamingOutput(
                 text=new_text,
-                token=response.token if hasattr(response, 'token') else 0,
+                token=response.token if hasattr(response, "token") else 0,
                 finished=finished,
                 finish_reason=finish_reason,
             )
@@ -265,7 +273,7 @@ class MLXLanguageModel:
             self.load()
 
         # Apply chat template
-        if hasattr(self.tokenizer, 'apply_chat_template'):
+        if hasattr(self.tokenizer, "apply_chat_template"):
             is_partial = detect_and_strip_partial(messages)
             # Build kwargs for apply_chat_template
             template_kwargs = {
@@ -298,9 +306,7 @@ class MLXLanguageModel:
                 )
         else:
             # Fallback: simple concatenation
-            prompt = "\n".join(
-                f"{msg['role']}: {msg['content']}" for msg in messages
-            )
+            prompt = "\n".join(f"{msg['role']}: {msg['content']}" for msg in messages)
             prompt += "\nassistant:"
 
         return self.generate(
@@ -323,14 +329,16 @@ class MLXLanguageModel:
         }
 
         # Try to get model config
-        if hasattr(self.model, 'config'):
+        if hasattr(self.model, "config"):
             config = self.model.config
-            info.update({
-                "vocab_size": getattr(config, 'vocab_size', None),
-                "hidden_size": getattr(config, 'hidden_size', None),
-                "num_layers": getattr(config, 'num_hidden_layers', None),
-                "num_heads": getattr(config, 'num_attention_heads', None),
-            })
+            info.update(
+                {
+                    "vocab_size": getattr(config, "vocab_size", None),
+                    "hidden_size": getattr(config, "hidden_size", None),
+                    "num_layers": getattr(config, "num_hidden_layers", None),
+                    "num_heads": getattr(config, "num_attention_heads", None),
+                }
+            )
 
         return info
 
