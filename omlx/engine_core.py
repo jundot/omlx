@@ -676,8 +676,17 @@ class EngineCore:
         # Shutdown scheduler (clears paged SSD cache if configured)
         self.scheduler.shutdown()
 
-        # Reset scheduler to clear BatchGenerator and all caches
-        self.scheduler.deep_reset()
+        # deep_reset syncs the Metal generation_stream, which is bound to
+        # the MLX executor thread.  Dispatch through the executor so the
+        # sync runs on the correct thread; fall back to a direct call if
+        # the executor is already shut down.
+        try:
+            self._mlx_executor.submit(self.scheduler.deep_reset).result()
+        except RuntimeError:
+            try:
+                self.scheduler.deep_reset()
+            except RuntimeError:
+                pass
 
         # Clear output collectors
         for collector in self._output_collectors.values():
