@@ -508,10 +508,10 @@ class PreferencesWindowController(NSObject):
         self.config.start_server_on_launch = bool(self.auto_start_checkbox.state())
         self.config.save()
 
+        from .server_manager import ServerStatus
+
         # Save API key
         if api_key:
-            from .server_manager import ServerStatus
-
             if self.server_manager.status == ServerStatus.RUNNING:
                 # Update running server via admin API (also saves to settings.json)
                 if not self.config.update_server_api_key_runtime(api_key):
@@ -519,6 +519,17 @@ class PreferencesWindowController(NSObject):
                     self.config.set_server_api_key(api_key)
             else:
                 self.config.set_server_api_key(api_key)
+
+        # Keep the server settings in sync with the DMG app's single model
+        # directory preference. The server reads settings.json on startup and
+        # keeps an in-memory copy while running.
+        if self.server_manager.status == ServerStatus.RUNNING:
+            if not self.config.update_model_dir_runtime(
+                self.config.get_effective_model_dir()
+            ):
+                self.config.sync_model_dir_to_server_settings(overwrite=True)
+        else:
+            self.config.sync_model_dir_to_server_settings(overwrite=True)
 
         self._apply_launch_at_login(self.config.launch_at_login)
 

@@ -22,7 +22,12 @@ import pytest
 
 # Import the modules under test
 sys.path.insert(0, str(Path(__file__).parent.parent / "packaging"))
-from omlx_app.config import ServerConfig, get_app_support_dir, get_config_path, get_log_path
+from omlx_app.config import (
+    ServerConfig,
+    get_app_support_dir,
+    get_config_path,
+    get_log_path,
+)
 from omlx_app.server_manager import PortConflict, ServerManager, ServerStatus
 
 
@@ -235,6 +240,26 @@ class TestServerConfig:
         assert result["model_dir"] == "/server/models"
         assert result["port"] == 9000
 
+    def test_load_server_settings_prefers_model_dirs(self, tmp_path: Path):
+        """Test loading primary model_dirs entry from server settings.json."""
+        config = ServerConfig(base_path=str(tmp_path))
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "model": {
+                        "model_dirs": ["/primary/models", "/secondary/models"],
+                        "model_dir": "/legacy/models",
+                    },
+                    "server": {"port": 9000},
+                }
+            )
+        )
+
+        result = config.load_server_settings()
+        assert result["model_dir"] == "/primary/models"
+        assert result["port"] == 9000
+
     def test_load_server_settings_missing_file(self, tmp_path: Path):
         """Test load_server_settings returns empty dict when no file."""
         config = ServerConfig(base_path=str(tmp_path))
@@ -316,6 +341,96 @@ class TestServerConfig:
             data = json.load(f)
         assert data["server"]["port"] == 7999
 
+    def test_sync_model_dir_to_server_settings_new_file(self, tmp_path: Path):
+        """Test syncing model directory creates settings.json if missing."""
+        model_dir = str(tmp_path / "models")
+        config = ServerConfig(base_path=str(tmp_path), model_dir=model_dir)
+        config.sync_model_dir_to_server_settings()
+
+        settings_file = tmp_path / "settings.json"
+        assert settings_file.exists()
+        with open(settings_file) as f:
+            data = json.load(f)
+        assert data["model"]["model_dirs"] == [model_dir]
+        assert data["model"]["model_dir"] == model_dir
+
+    def test_sync_model_dir_to_server_settings_preserves_existing_by_default(
+        self, tmp_path: Path
+    ):
+        """Test conservative sync preserves existing server model directories."""
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "auth": {"api_key": "preserved"},
+                    "model": {
+                        "model_dirs": ["/keep/models", "/keep/other"],
+                        "model_dir": "/keep/models",
+                    },
+                }
+            )
+        )
+
+        config = ServerConfig(base_path=str(tmp_path), model_dir="/new/models")
+        config.sync_model_dir_to_server_settings()
+
+        with open(settings_file) as f:
+            data = json.load(f)
+        assert data["auth"]["api_key"] == "preserved"
+        assert data["model"]["model_dirs"] == ["/keep/models", "/keep/other"]
+        assert data["model"]["model_dir"] == "/keep/models"
+
+    def test_sync_model_dir_to_server_settings_overwrites_when_requested(
+        self, tmp_path: Path
+    ):
+        """Test Preferences-style sync overwrites stale server model directory."""
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "auth": {"api_key": "preserved"},
+                    "model": {
+                        "model_dirs": ["/old/models"],
+                        "model_dir": "/old/models",
+                    },
+                }
+            )
+        )
+
+        config = ServerConfig(base_path=str(tmp_path), model_dir="/new/models")
+        config.sync_model_dir_to_server_settings(overwrite=True)
+
+        with open(settings_file) as f:
+            data = json.load(f)
+        assert data["auth"]["api_key"] == "preserved"
+        assert data["model"]["model_dirs"] == ["/new/models"]
+        assert data["model"]["model_dir"] == "/new/models"
+
+    def test_sync_model_dir_to_server_settings_overwrites_with_default(
+        self, tmp_path: Path
+    ):
+        """Test overwrite sync persists the default base_path/models directory."""
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "model": {
+                        "model_dirs": ["/old/models"],
+                        "model_dir": "/old/models",
+                    },
+                }
+            )
+        )
+
+        config = ServerConfig(base_path=str(tmp_path), model_dir="")
+        config.sync_model_dir_to_server_settings(overwrite=True)
+
+        default_model_dir = str(tmp_path / "models")
+        with open(settings_file) as f:
+            data = json.load(f)
+        assert data["model"]["model_dirs"] == [default_model_dir]
+        assert data["model"]["model_dir"] == default_model_dir
+
     def test_set_server_api_key_new_file(self, tmp_path: Path):
         """Test setting API key creates settings.json if not exists."""
         config = ServerConfig(base_path=str(tmp_path))
@@ -379,6 +494,43 @@ class TestServerConfig:
         mock_session.post.side_effect = req.ConnectionError("refused")
 
         result = config.update_server_api_key_runtime("new-key")
+        assert result is False
+
+    @patch("omlx_app.config.requests.Session")
+    def test_update_model_dir_runtime_success(self, mock_session_cls, tmp_path):
+        """Test runtime model directory update on running server."""
+        config = ServerConfig(base_path=str(tmp_path))
+        config.set_server_api_key("current-key")
+
+        mock_session = Mock()
+        mock_session_cls.return_value = mock_session
+        mock_session.post.side_effect = [
+            Mock(status_code=200),  # login
+            Mock(status_code=200),  # settings update
+        ]
+
+        result = config.update_model_dir_runtime("/new/models")
+        assert result is True
+        assert mock_session.post.call_count == 2
+        mock_session.post.assert_any_call(
+            "http://127.0.0.1:8000/admin/api/global-settings",
+            json={"model_dirs": ["/new/models"]},
+            timeout=2,
+        )
+
+    @patch("omlx_app.config.requests.Session")
+    def test_update_model_dir_runtime_server_down(self, mock_session_cls, tmp_path):
+        """Test runtime model directory update returns False when unreachable."""
+        import requests as req
+
+        config = ServerConfig(base_path=str(tmp_path))
+        config.set_server_api_key("current-key")
+
+        mock_session = Mock()
+        mock_session_cls.return_value = mock_session
+        mock_session.post.side_effect = req.ConnectionError("refused")
+
+        result = config.update_model_dir_runtime("/new/models")
         assert result is False
 
 
