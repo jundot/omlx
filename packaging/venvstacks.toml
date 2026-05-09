@@ -71,7 +71,11 @@ requirements = [
     "phonemizer-fork>=3.3.2",
     "espeakng-loader>=0.2.4",
     # mlx-audio [stt] extra deps
-    "mistral-common[audio]>=0.4.2",
+    # transformers 5.x's tokenization_mistral_common imports ReasoningEffort
+    # which only exists in mistral-common>=1.10. Without this floor, the
+    # resolver lands on 1.9.x and WhisperProcessor.from_pretrained() silently
+    # fails (#1072, #1116).
+    "mistral-common[audio]>=1.10",
     # mlx-audio [sts] extra deps
     "webrtcvad>=2.0.10",
     # NOTE: mlx-audio is built from git and installed with --no-deps in build.py
