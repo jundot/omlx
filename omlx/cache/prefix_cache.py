@@ -63,6 +63,32 @@ class _MRUPartialBlock:
     layer in the model is non-sliceable (RotatingKVCache, ArraysCache,
     etc.) the slot is left empty. Splicing into only the sliceable
     layers would create per-layer offset skew at decode time.
+
+    Memory accounting
+    -----------------
+    ``kv_data`` holds real ``mx.array`` allocations (produced by
+    ``_clone_tensor`` → ``mx.copy``), so the slot's memory cost is
+    automatically counted by ``mx.get_active_memory()``.  Every memory
+    enforcement and telemetry path in this codebase reads from there:
+
+    - process-level enforcer (``process_memory_enforcer.py``)
+    - prefill mid-loop limit check (``scheduler.py:1567``)
+    - prefill pre-flight peak check (``scheduler.py:3328``)
+    - generation admission guard (``scheduler.py:3377``)
+    - periodic clear threshold (``scheduler.py:_periodic_clear_threshold_bytes``)
+
+    There is no separate up-front KV budget that the slot could escape
+    (``_calculate_max_blocks`` is paged-SSD-only and returns a fixed
+    100k block-metadata count, not a memory budget).  The slot is
+    bounded at one ``block_size``-worth of KV per cache instance —
+    typically ~17 MiB for Kimi K2.5 / DeepSeek (MLA), ~41 MiB for
+    full-attention 70B models — held alive between completions and
+    admissions.  Future maintainers: do **not** add a separate
+    accounting hook for this slot.  The invariant that ``kv_data``
+    holds ``mx.array`` instances (not numpy/CPU copies) is what makes
+    the implicit accounting work; the test
+    ``test_kv_data_holds_mlx_arrays_for_active_memory_accounting``
+    pins it.
     """
 
     parent_hash: bytes | None

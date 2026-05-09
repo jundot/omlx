@@ -2757,6 +2757,46 @@ class TestMRUPartialBlockCache:
         # a guessed-wrong turn 2.
         assert prefix_cache._mru_partial is None
 
+    # --- accounting invariant ---
+
+    def test_kv_data_holds_mlx_arrays_for_active_memory_accounting(
+        self, prefix_cache, mx
+    ):
+        """The MRU slot's memory must flow through ``mx.get_active_memory()``.
+
+        The codebase enforces all KV-memory limits via ``mx.get_active_memory()``
+        (process_memory_enforcer, the three scheduler memory checkpoints,
+        the periodic-clear threshold, telemetry).  The MRU slot has no
+        separate accounting hook — it relies on the invariant that
+        ``kv_data`` holds real ``mx.array`` allocations, which MLX counts
+        in active memory automatically.
+
+        A "helpful" future change that stored CPU-side copies (e.g.
+        ``np.ndarray`` to dodge a perceived GPU-memory cost) would silently
+        escape every existing memory limit and only manifest as system OOM
+        under load.  Pin the invariant so that change is caught at test
+        time, not in production.
+        """
+        prefix_cache.store_cache(
+            "req-accounting",
+            [10, 20, 30, 40, 50, 60],
+            [self._kv_layer(mx, 6) for _ in range(4)],
+        )
+
+        partial = prefix_cache._mru_partial
+        assert partial is not None
+        assert len(partial.kv_data) == 4
+        for layer_idx, (keys, values) in enumerate(partial.kv_data):
+            assert isinstance(keys, mx.array), (
+                f"layer {layer_idx} keys is {type(keys).__name__}, not mx.array. "
+                f"MRU memory accounting depends on mx.array storage so the "
+                f"slot is visible to mx.get_active_memory()."
+            )
+            assert isinstance(values, mx.array), (
+                f"layer {layer_idx} values is {type(values).__name__}, "
+                f"not mx.array. See above."
+            )
+
     # --- threat model: H3 no-SSD config ---
 
     def test_no_stash_when_paged_ssd_cache_is_none(self, paged_cache, mx):
