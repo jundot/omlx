@@ -2331,6 +2331,36 @@ class TestExtractTextContentPreservesNamePartial:
         result = extract_text_content(messages)
         assert result[0].get("name") == "Kimi"
 
+    def test_preserves_partial_on_tool_call_message(self):
+        """partial field preserved on assistant message with tool_calls."""
+        messages = [
+            Message(
+                role="assistant",
+                content="Let me call a tool",
+                partial=True,
+                tool_calls=[
+                    {"id": "1", "function": {"name": "search", "arguments": "{}"}}
+                ],
+            ),
+        ]
+        result = extract_text_content(messages)
+        assert result[0].get("partial") is True
+
+    def test_preserves_partial_on_tool_call_message_multimodal(self):
+        """partial field preserved on assistant+tool_calls (multimodal path)."""
+        messages = [
+            Message(
+                role="assistant",
+                content="Let me call a tool",
+                partial=True,
+                tool_calls=[
+                    {"id": "1", "function": {"name": "search", "arguments": "{}"}}
+                ],
+            ),
+        ]
+        result = extract_multimodal_content(messages)
+        assert result[0].get("partial") is True
+
     def test_preserves_name_in_multimodal_extraction(self):
         """name field survives multimodal extraction."""
         messages = [

@@ -322,9 +322,29 @@ class DFlashEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
     ) -> str:
+        """Apply chat template to messages.
+
+        Args:
+            messages: List of chat messages
+            tools: Optional tool definitions
+            chat_template_kwargs: Optional kwargs for the chat template
+                (e.g. enable_thinking, reasoning_effort).
+            is_partial: Explicit partial-mode signal from the API server.
+                ``True``/``False`` — server has already decided; the ``partial``
+                key is cleaned from message dicts but no detection is performed.
+                ``None`` (default) — auto-detect from messages for backward
+                compatibility with direct engine callers.
+        """
         if hasattr(self._tokenizer_obj, "apply_chat_template"):
-            is_partial = detect_and_strip_partial(messages)
+            if is_partial is None:
+                is_partial = detect_and_strip_partial(messages)
+            else:
+                # Server already resolved partial; just clean residual keys
+                # so the chat template never sees the non-standard field.
+                for msg in messages:
+                    msg.pop("partial", None)
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": not is_partial,
@@ -357,10 +377,24 @@ class DFlashEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
     ) -> int:
+        """Count prompt tokens for chat messages after applying chat template.
+
+        Args:
+            messages: List of chat messages
+            tools: Optional tool definitions
+            chat_template_kwargs: Optional kwargs for chat template
+            is_partial: Explicit partial-mode signal (see _apply_chat_template).
+
+        Returns:
+            Number of prompt tokens
+        """
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(
-            messages, template_tools, chat_template_kwargs=chat_template_kwargs
+            messages, template_tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
         )
         return len(self._tokenizer_obj.encode(prompt))
 
@@ -841,8 +875,10 @@ class DFlashEngine(BaseEngine):
 
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
+        is_partial = kwargs.pop("is_partial", None)
         prompt = self._apply_chat_template(
-            messages, template_tools, chat_template_kwargs=ct_kwargs
+            messages, template_tools,
+            chat_template_kwargs=ct_kwargs, is_partial=is_partial,
         )
 
         return await self.generate(
@@ -870,8 +906,10 @@ class DFlashEngine(BaseEngine):
 
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
+        is_partial = kwargs.pop("is_partial", None)
         prompt = self._apply_chat_template(
-            messages, template_tools, chat_template_kwargs=ct_kwargs
+            messages, template_tools,
+            chat_template_kwargs=ct_kwargs, is_partial=is_partial,
         )
 
         async for output in self.stream_generate(

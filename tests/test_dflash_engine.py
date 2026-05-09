@@ -434,3 +434,83 @@ class TestDFlashThinkPrefix:
             pass
         engine = self._make_engine(_Tok())
         assert engine._think_prefix_text() == "<think>\n"
+
+
+class TestDFlashApplyChatTemplatePartialMode:
+    """Regression tests for partial-mode is_partial plumbing on DFlashEngine.
+
+    Mirrors TestApplyChatTemplatePartialMode in tests/test_batched_engine.py.
+    Catches the gap that a sibling text engine wasn't updated alongside
+    BatchedEngine when the API server began forwarding ``is_partial``.
+    """
+
+    def test_count_then_apply_chat_template_idempotent_under_partial_mode(self):
+        """Server flow: count_chat_tokens then _apply_chat_template on the
+        same messages list must render with identical partial-mode flags.
+
+        Mirrors the BatchedEngine regression test.  Without is_partial
+        plumbing on DFlashEngine, the API server's
+        ``count_chat_tokens(messages, ..., is_partial=is_partial)`` would
+        raise TypeError, and chat-path ``is_partial`` forwarding via
+        ``**kwargs`` would never reach ``_apply_chat_template`` --
+        re-introducing the in-place message mutation bug for any
+        dflash-routed request.
+        """
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        from unittest.mock import MagicMock
+
+        from omlx.api.utils import detect_and_strip_partial
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.return_value = "<formatted>"
+        mock_tokenizer.encode.return_value = [1, 2, 3]
+        engine._tokenizer_obj = mock_tokenizer
+
+        messages = [
+            {"role": "user", "content": "Generate JSON"},
+            {"role": "assistant", "content": "{", "partial": True},
+        ]
+
+        # Server flow: detect_and_strip_partial once at the API boundary,
+        # forward the resolved value to all engine methods.
+        is_partial = detect_and_strip_partial(messages)
+        assert is_partial is True
+
+        # Phase 1: count.
+        engine.count_chat_tokens(messages, is_partial=is_partial)
+        count_kwargs = dict(mock_tokenizer.apply_chat_template.call_args.kwargs)
+
+        # Phase 2: chat.  Operates on the same (now-stripped) messages list.
+        engine._apply_chat_template(messages, is_partial=is_partial)
+        chat_kwargs = dict(mock_tokenizer.apply_chat_template.call_args.kwargs)
+
+        # Both phases must render with identical partial-mode flags.
+        assert count_kwargs.get("continue_final_message") == chat_kwargs.get(
+            "continue_final_message"
+        ), (
+            "continue_final_message diverged across phases: "
+            f"count={count_kwargs.get('continue_final_message')}, "
+            f"chat={chat_kwargs.get('continue_final_message')}"
+        )
+        assert (
+            count_kwargs["add_generation_prompt"]
+            == chat_kwargs["add_generation_prompt"]
+        ), (
+            "add_generation_prompt diverged across phases: "
+            f"count={count_kwargs['add_generation_prompt']}, "
+            f"chat={chat_kwargs['add_generation_prompt']}"
+        )
+
+        # Specific contract: with partial=True forwarded, both phases use
+        # continue_final_message=True (not add_generation_prompt=True).
+        assert count_kwargs["continue_final_message"] is True
+        assert count_kwargs["add_generation_prompt"] is False
