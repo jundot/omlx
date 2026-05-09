@@ -549,6 +549,59 @@ class TestHotCacheStatsAccuracy:
         finally:
             mgr.close()
 
+    def test_get_stats_for_model_reports_hot_cache_size(self, tmp_path):
+        """get_stats_for_model() should report non-zero hot_cache_size_bytes."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "model_stats_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=10 * 1024**2,
+        )
+        try:
+            cache_data = [
+                (mx.zeros((1, 2, 16, 16)), mx.zeros((1, 2, 16, 16)))
+                for _ in range(2)
+            ]
+            mgr.save_block(
+                block_hash=b"model_stats_test",
+                cache_data=cache_data,
+                token_count=16,
+                model_name="test-model",
+                layer_cache_types=["KVCache"] * 2,
+            )
+
+            global_stats = mgr.get_stats()
+            model_stats = mgr.get_stats_for_model("test-model")
+
+            assert global_stats.hot_cache_size_bytes > 0
+            assert model_stats.hot_cache_size_bytes > 0
+            assert model_stats.hot_cache_size_bytes == global_stats.hot_cache_size_bytes
+            assert model_stats.hot_cache_entries == 1
+
+            mgr.save_block(
+                block_hash=b"other_model_test",
+                cache_data=cache_data,
+                token_count=16,
+                model_name="other-model",
+                layer_cache_types=["KVCache"] * 2,
+            )
+
+            global_stats = mgr.get_stats()
+            model_stats = mgr.get_stats_for_model("test-model")
+            other_stats = mgr.get_stats_for_model("other-model")
+
+            assert global_stats.hot_cache_entries == 2
+            assert model_stats.hot_cache_entries == 1
+            assert other_stats.hot_cache_entries == 1
+            assert model_stats.hot_cache_size_bytes > 0
+            assert other_stats.hot_cache_size_bytes > 0
+            assert model_stats.hot_cache_size_bytes < global_stats.hot_cache_size_bytes
+            assert (
+                model_stats.hot_cache_size_bytes + other_stats.hot_cache_size_bytes
+                == global_stats.hot_cache_size_bytes
+            )
+        finally:
+            mgr.close()
+
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestHotCacheWriteBack:
