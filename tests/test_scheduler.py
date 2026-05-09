@@ -171,6 +171,34 @@ class TestSchedulerInitialization:
         assert scheduler.total_prompt_tokens == 0
         assert scheduler.total_completion_tokens == 0
 
+    def test_snapshot_for_admin_is_isolated_from_live_state(
+        self, mock_model, mock_tokenizer
+    ):
+        """Published admin snapshot must not mutate when live state changes."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="req-snap",
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+        request.prompt_token_ids = [1, 2, 3]
+        request.num_prompt_tokens = 3
+
+        scheduler.waiting.append(request)
+        scheduler.running["req-snap"] = request
+        scheduler._publish_admin_snapshot()
+
+        snap = scheduler.snapshot_for_admin()
+        assert snap["running_by_id"] == {"req-snap": request}
+        assert snap["waiting"] == [request]
+
+        scheduler.running.clear()
+        scheduler.waiting.clear()
+        # Snapshot reflects the published moment, not the live state.
+        assert snap["running_by_id"] == {"req-snap": request}
+        assert snap["waiting"] == [request]
+
 
 class TestSchedulerAddRequest:
     """Tests for Scheduler.add_request()."""

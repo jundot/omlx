@@ -52,8 +52,10 @@ def test_active_models_generation_includes_activity_and_waiting_rows():
         num_prompt_tokens=30,
     )
     scheduler = SimpleNamespace(
-        running={"gen-1": running_request},
-        waiting=[waiting_request],
+        snapshot_for_admin=lambda: {
+            "running_by_id": {"gen-1": running_request},
+            "waiting": [waiting_request],
+        },
     )
 
     with (
@@ -91,7 +93,9 @@ def test_active_models_generation_includes_activity_and_waiting_rows():
 
 
 def test_active_models_loading_includes_elapsed_and_percent_estimate():
-    scheduler = SimpleNamespace(running={}, waiting=[])
+    scheduler = SimpleNamespace(
+        snapshot_for_admin=lambda: {"running_by_id": {}, "waiting": []},
+    )
 
     with (
         patch.object(

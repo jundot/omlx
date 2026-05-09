@@ -3589,36 +3589,21 @@ def _build_active_models_data() -> dict:
                         active_requests = len(collectors)
 
                     sched = getattr(core, "scheduler", None)
-                    if sched is not None:
-                        for attempt in range(2):
-                            try:
-                                running_by_id = dict(getattr(sched, "running", {}))
-                                waiting_queue = list(getattr(sched, "waiting", []))
-                                waiting_requests = len(waiting_queue)
-                                waiting_ids = {req.request_id for req in waiting_queue}
-                                waiting = [
-                                    {
-                                        "request_id": req.request_id,
-                                        "queue_position": idx,
-                                        "elapsed_seconds": max(0.0, now - req.arrival_time),
-                                        "prompt_tokens": getattr(req, "num_prompt_tokens", 0),
-                                    }
-                                    for idx, req in enumerate(waiting_queue, start=1)
-                                ]
-                                break
-                            except (RuntimeError, KeyError):
-                                if attempt == 0:
-                                    continue
-                                logger.debug(
-                                    "Active model scheduler snapshot raced; "
-                                    "falling back to aggregate counts only",
-                                    exc_info=True,
-                                )
-                                waiting_queue_ref = getattr(sched, "waiting", [])
-                                waiting_requests = len(waiting_queue_ref)
-                                running_by_id = {}
-                                waiting_ids = set()
-                                waiting = []
+                    if sched is not None and hasattr(sched, "snapshot_for_admin"):
+                        snap = sched.snapshot_for_admin()
+                        running_by_id = snap["running_by_id"]
+                        waiting_queue = snap["waiting"]
+                        waiting_requests = len(waiting_queue)
+                        waiting_ids = {req.request_id for req in waiting_queue}
+                        waiting = [
+                            {
+                                "request_id": req.request_id,
+                                "queue_position": idx,
+                                "elapsed_seconds": max(0.0, now - req.arrival_time),
+                                "prompt_tokens": getattr(req, "num_prompt_tokens", 0),
+                            }
+                            for idx, req in enumerate(waiting_queue, start=1)
+                        ]
             elif hasattr(entry.engine, "get_activity_snapshot"):
                 snapshot = entry.engine.get_activity_snapshot()
                 active_requests = snapshot.get("active_requests", 0)
