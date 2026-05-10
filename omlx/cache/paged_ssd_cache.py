@@ -1276,6 +1276,10 @@ class PagedSSDCacheManager(CacheManager):
             # Merge CacheList sub_count metadata
             metadata.update(cache_list_meta)
 
+            # Materialize lazy arrays on the inference thread (Metal-safe).
+            if self._hot_cache_only and arrays:
+                mx.eval(*arrays.values())  # noqa: S307 — MLX tensor eval, not Python eval
+
             # Caller (scheduler._cleanup_finished, async store-cache path)
             # already mx.eval's all real KV arrays on the inference thread
             # before submitting to the omlx-store-cache executor. The tiny
