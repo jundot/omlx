@@ -377,8 +377,13 @@ class TestBatchGeneratorDispatch:
         assert hasattr(GenerationBatch, "_omlx_mtp_patched")
 
     def test_is_mtp_eligible_requires_mtp_forward_and_solo_batch(self):
-        from omlx.patches import mlx_lm_mtp
-        from omlx.patches.mlx_lm_mtp.batch_generator import _is_mtp_eligible
+        from omlx.patches.mlx_lm_mtp import (
+            is_mtp_active,
+            set_mtp_active,
+        )
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        _is_mtp_eligible = batch_generator._is_mtp_eligible
 
         class _NonMtpModel:
             pass
@@ -405,17 +410,9 @@ class TestBatchGeneratorDispatch:
                 self.model = model
                 self.uids = uids
 
-        prior_active = mlx_lm_mtp.is_mtp_active()
+        prior_active = is_mtp_active()
         try:
-            # Head attached but the per-load mtp_active flag is off
-            # (e.g. VLM runtime patches attach unconditionally so weight
-            # load matches, while inference-time MTP stays disabled).
-            mlx_lm_mtp.set_mtp_active(False)
-            assert (
-                _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is False
-            )
-
-            mlx_lm_mtp.set_mtp_active(True)
+            set_mtp_active(False)
             # Non-MTP model never triggers the MTP path.
             assert _is_mtp_eligible(_GenBatch(_NonMtpModel(), uids=[1])) is False
             # Has mtp_forward but no attached head → still off.
@@ -423,6 +420,12 @@ class TestBatchGeneratorDispatch:
                 _is_mtp_eligible(_GenBatch(_MtpModelWithoutHead(), uids=[1]))
                 is False
             )
+            # Head attached but the per-load mtp_active flag is off
+            # (e.g. VLM runtime patches attach unconditionally so weight
+            # load matches, while inference-time MTP stays disabled).
+            assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is False
+
+            set_mtp_active(True)
             # Has both method and head + batch=1 + flag on → triggers the path.
             assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is True
             # MTP model with batch=2 falls back to standard step.
@@ -431,8 +434,113 @@ class TestBatchGeneratorDispatch:
             )
             # Empty batch never triggers.
             assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[])) is False
+            # Grammar-constrained decoding relies on GenerationBatch._step hooks,
+            # so MTP must stay off until it mirrors accept_token explicitly.
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(batch_generator, "_has_grammar_processors", lambda _: True)
+                assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is False
         finally:
-            mlx_lm_mtp.set_mtp_active(prior_active)
+            set_mtp_active(prior_active)
+
+    def test_mtp_state_valid_requires_single_matching_uid(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _MtpState,
+            _mtp_state_valid_for_batch,
+        )
+
+        state = _MtpState(uid=7)
+
+        assert _mtp_state_valid_for_batch(SimpleNamespace(uids=[7]), state) is True
+        assert _mtp_state_valid_for_batch(SimpleNamespace(uids=[8]), state) is False
+        assert _mtp_state_valid_for_batch(SimpleNamespace(uids=[7, 8]), state) is False
+        assert _mtp_state_valid_for_batch(SimpleNamespace(uids=[]), state) is False
+        assert _mtp_state_valid_for_batch(SimpleNamespace(uids=[7]), None) is False
+
+    def test_drop_invalid_mtp_state_after_batch_reshape(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _MtpState,
+            _drop_invalid_mtp_state,
+        )
+
+        batch = SimpleNamespace(uids=[1, 2], _omlx_mtp_state=_MtpState(uid=1))
+
+        dropped = _drop_invalid_mtp_state(batch, "test-reshape")
+
+        assert dropped is not None
+        assert not hasattr(batch, "_omlx_mtp_state")
+
+    def test_drop_invalid_mtp_state_keeps_matching_singleton(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _MtpState,
+            _drop_invalid_mtp_state,
+        )
+
+        state = _MtpState(uid=1)
+        batch = SimpleNamespace(uids=[1], _omlx_mtp_state=state)
+
+        kept = _drop_invalid_mtp_state(batch, "test-filter")
+
+        assert kept is state
+        assert batch._omlx_mtp_state is state
+
+    def test_prepare_mtp_state_lazy_activates_with_current_uid(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+
+            def mtp_forward(self, *_):
+                pass
+
+        batch = SimpleNamespace(
+            model=_MtpModel(),
+            uids=[42],
+            logits_processors=[],
+        )
+
+        def fake_post_init(gen_batch):
+            gen_batch._omlx_mtp_state = batch_generator._MtpState(
+                uid=gen_batch.uids[0]
+            )
+
+        monkeypatch.setattr(batch_generator, "_post_init_mtp", fake_post_init)
+
+        state = batch_generator._prepare_mtp_state_for_next(batch)
+
+        assert state is batch._omlx_mtp_state
+        assert state.uid == 42
+
+    def test_prepare_mtp_state_drops_stale_owner_and_reinitializes(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+
+            def mtp_forward(self, *_):
+                pass
+
+        old_state = batch_generator._MtpState(uid=1)
+        batch = SimpleNamespace(
+            model=_MtpModel(),
+            uids=[2],
+            logits_processors=[],
+            _omlx_mtp_state=old_state,
+        )
+
+        def fake_post_init(gen_batch):
+            gen_batch._omlx_mtp_state = batch_generator._MtpState(
+                uid=gen_batch.uids[0]
+            )
+
+        monkeypatch.setattr(batch_generator, "_post_init_mtp", fake_post_init)
+
+        state = batch_generator._prepare_mtp_state_for_next(batch)
+
+        assert state is batch._omlx_mtp_state
+        assert state is not old_state
+        assert state.uid == 2
 
 
 # ---------------------------------------------------------------------------
