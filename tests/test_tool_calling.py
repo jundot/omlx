@@ -2026,6 +2026,44 @@ class TestParseToolCallsLlama3JsonContent:
         text = '{"name": "get_weather", "parameters": {malformed}}'
         cleaned, tool_calls = parse_tool_calls(text, tok, tools=self._WEATHER_TOOLS)
 
-        # Either no match (regex picky on inner braces) or failed json.loads -
-        # both must result in no tool_calls and no exception.
+        # raw_decode rejects the malformed inner object — no tool_calls,
+        # no exception.
         assert tool_calls is None
+
+    def test_llama3_json_content_handles_deeply_nested_parameters(self):
+        """Parameters with nested objects >1 level deep must still match.
+
+        The earlier brace-balance regex only handled one level of nesting;
+        real tool schemas (e.g. filter expressions with nested predicates)
+        routinely exceed that. Switching to ``json.JSONDecoder.raw_decode``
+        accepts any valid JSON depth.
+        """
+        nested_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_events",
+                    "description": "Search events with nested filters",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"filter": {"type": "object"}},
+                        "required": ["filter"],
+                    },
+                },
+            }
+        ]
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+
+        text = (
+            '{"name": "search_events", "parameters": '
+            '{"filter": {"date": {"gte": "2026-01-01", "lt": "2027-01-01"}}}}'
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools=nested_tools)
+
+        assert tool_calls is not None and len(tool_calls) == 1
+        assert tool_calls[0].function.name == "search_events"
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "filter": {"date": {"gte": "2026-01-01", "lt": "2027-01-01"}}
+        }
+        assert cleaned == ""
