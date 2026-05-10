@@ -7,6 +7,7 @@ from omlx.eval.datasets import deterministic_sample, stratified_sample
 from omlx.eval.gsm8k import GSM8KBenchmark, _extract_numeric_answer, _normalize_number
 from omlx.eval.hellaswag import HellaSwagBenchmark
 from omlx.eval.livecodebench import _extract_code
+from omlx.eval.kmmlu import KMMLUBenchmark
 from omlx.eval.mmlu import MMLUBenchmark, _parse_choices
 from omlx.eval.truthfulqa import TruthfulQABenchmark
 
@@ -87,6 +88,35 @@ class TestMMLU:
     def test_get_category(self):
         assert self.bench.get_category({"subject": "math"}) == "math"
         assert self.bench.get_category({}) is None
+
+
+# --- KMMLU Tests ---
+
+
+class TestKMMLU:
+    def setup_method(self):
+        self.bench = KMMLUBenchmark()
+
+    async def test_load_dataset_maps_one_indexed_answers(self):
+        items = await self.bench.load_dataset(sample_size=0)
+
+        assert [item["answer"] for item in items[:5]] == ["B", "A", "A", "D", "C"]
+        assert all(item["answer"] in {"A", "B", "C", "D"} for item in items)
+
+    def test_format_prompt_uses_lettered_choices(self):
+        item = {
+            "question": "정답은?",
+            "choices": ["첫째", "둘째", "셋째", "넷째"],
+            "answer": "D",
+            "subject": "Accounting",
+        }
+
+        content = self.bench.format_prompt(item)[0]["content"]
+
+        assert "A. 첫째" in content
+        assert "B. 둘째" in content
+        assert "C. 셋째" in content
+        assert "D. 넷째" in content
 
 
 # --- HellaSwag Tests ---
