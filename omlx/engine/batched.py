@@ -561,7 +561,8 @@ class BatchedEngine(BaseEngine):
                 "specprefill_system_end"
             )
 
-        request_id = await self._engine.add_request(
+        engine = self._engine
+        request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             **specprefill_kwargs,
@@ -569,7 +570,7 @@ class BatchedEngine(BaseEngine):
 
         finished_normally = False
         try:
-            async for output in self._engine.stream_outputs(request_id):
+            async for output in engine.stream_outputs(request_id):
                 text = clean_special_tokens(output.output_text)
 
                 # Set finished_normally BEFORE yield, because the consumer
@@ -600,7 +601,7 @@ class BatchedEngine(BaseEngine):
                 logger.info(
                     f"[stream_generate] Aborting request {request_id} (finished_normally={finished_normally})"
                 )
-                await self._engine.abort_request(request_id)
+                await engine.abort_request(request_id)
             else:
                 logger.debug(
                     f"[stream_generate] Request {request_id} finished normally"
