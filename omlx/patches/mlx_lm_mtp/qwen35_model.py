@@ -712,10 +712,14 @@ def _patch_qwen3_5_moe() -> None:
                     # MTPLX (lightning-mlx convert) layout: MTP layer is dense
                     # — no per-expert tensors to stack/unfuse. The router/gate
                     # and shared_expert weights are passed through unchanged.
-                    has_experts = any(
-                        k.startswith(f"{prefix}.experts.") for k in new_weights
+                    # Probe by layout sentinel (O(1)) rather than scanning all
+                    # weight keys — matters on multi-thousand-tensor checkpoints.
+                    sentinel = (
+                        f"{prefix}.experts.gate_up_proj"
+                        if mtp_is_fused
+                        else f"{prefix}.experts.0.gate_proj.weight"
                     )
-                    if not has_experts:
+                    if sentinel not in new_weights:
                         continue
                     if mtp_is_fused:
                         _unfuse_experts(new_weights, prefix)

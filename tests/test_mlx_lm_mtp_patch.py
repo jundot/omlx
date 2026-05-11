@@ -245,6 +245,31 @@ class TestQwen35MoeSanitize:
         result = moe_model.sanitize(weights)
         assert f"{pfx}.switch_mlp.gate_proj.weight" in result
 
+    def test_sanitize_dense_mtplx_form(self, moe_model):
+        """MTPLX-format checkpoints ship a dense MLP at the MTP layer
+        (no ``experts.*`` keys). Sanitize must short-circuit, not attempt
+        to stack non-existent per-expert tensors.
+
+        Regression guard for samuelfaj/Ornstein3.6-35B-A3B-SABER-6bit-MTPLX.
+        """
+        import mlx.core as mx
+
+        weights = self._backbone_weights()
+        pfx = "language_model.mtp.layers.0.mlp"
+        weights[f"{pfx}.gate_proj.weight"] = mx.zeros((64, 128))
+        weights[f"{pfx}.up_proj.weight"] = mx.zeros((64, 128))
+        weights[f"{pfx}.down_proj.weight"] = mx.zeros((128, 64))
+        weights[f"{pfx}.gate.weight"] = mx.zeros((4, 64))
+        weights[f"{pfx}.shared_expert.gate_proj.weight"] = mx.zeros((64, 128))
+
+        result = moe_model.sanitize(weights)
+
+        # Dense MTP keys survive untouched.
+        assert f"{pfx}.gate_proj.weight" in result
+        assert f"{pfx}.shared_expert.gate_proj.weight" in result
+        # No bogus switch_mlp keys synthesized for the dense layer.
+        assert f"{pfx}.switch_mlp.gate_proj.weight" not in result
+
 
 class TestDeepseekV4Model:
     def test_skip_when_base_patch_not_applied(self, monkeypatch):
