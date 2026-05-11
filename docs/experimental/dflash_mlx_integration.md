@@ -90,7 +90,10 @@ Other model families (Llama, Gemma, etc.) are not supported — they require bot
 |---------|------|-------------|
 | `dflash_enabled` | bool | Enable/disable DFlash for this model |
 | `dflash_draft_model` | str | Path or HuggingFace repo for draft checkpoint |
-| `dflash_draft_quant_bits` | int\|None | Draft model quantization (None=bf16, 4=int4) |
+| `dflash_draft_quant_enabled` | bool | Draft model quantization enabled |
+| `dflash_draft_quant_weight_bits` | int | Draft model quantization weight bits |
+| `dflash_draft_quant_activation_bits` | int | Draft model quantization activation bits |
+| `dflash_draft_quant_group_size` | int | Draft model quantization group size |
 
 Configured via web admin UI → Model Settings → Experimental Features → DFlash.
 
@@ -240,7 +243,10 @@ DFlash check runs **before** engine type routing in `_load_engine()`. If `dflash
 Located in Model Settings → Advanced Settings → Experimental Features → DFlash:
 - **Toggle**: enable/disable DFlash
 - **Draft Model**: dropdown of available models
-- **Draft Quantization**: bf16 (default) / 4-bit
+- **Draft Quantization**: Disabled (default)
+  - **Weight Bits**: 2-bit / 4-bit (default) / 8-bit
+  - **Activation Bits**: 16-bit (default) / 32-bit
+  - **Group Size**: 32 / 64 (default) / 128
 
 ### Logging
 

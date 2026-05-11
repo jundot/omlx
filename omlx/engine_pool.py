@@ -637,7 +637,10 @@ class EnginePool:
                         engine = DFlashEngine(
                             model_name=entry.model_path,
                             draft_model_path=dflash_draft,
-                            draft_quant_bits=getattr(model_settings, "dflash_draft_quant_bits", None),
+                            draft_quant_enabled=getattr(model_settings, "dflash_draft_quant_enabled", False),
+                            draft_quant_weight_bits=getattr(model_settings, "dflash_draft_quant_weight_bits", 4),
+                            draft_quant_activation_bits=getattr(model_settings, "dflash_draft_quant_activation_bits", 16),
+                            draft_quant_group_size=getattr(model_settings, "dflash_draft_quant_group_size", 64),
                             model_settings=model_settings,
                             fallback_engine_type=effective_type,
                             scheduler_config=self._scheduler_config,

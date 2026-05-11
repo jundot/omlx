@@ -72,7 +72,10 @@ class DFlashEngine(BaseEngine):
         self,
         model_name: str,
         draft_model_path: str,
-        draft_quant_bits: int | None = None,
+        draft_quant_enabled: bool = False,
+        draft_quant_weight_bits: int = 4,
+        draft_quant_activation_bits: int = 16,
+        draft_quant_group_size: int = 64,
         model_settings: Any | None = None,
         fallback_engine_type: str = "batched",
         scheduler_config: Any | None = None,
@@ -80,7 +83,10 @@ class DFlashEngine(BaseEngine):
     ):
         self._model_name = model_name
         self._draft_model_path = draft_model_path
-        self._draft_quant_bits = draft_quant_bits
+        self._draft_quant_enabled = draft_quant_enabled
+        self._draft_quant_weight_bits = draft_quant_weight_bits
+        self._draft_quant_activation_bits = draft_quant_activation_bits
+        self._draft_quant_group_size = draft_quant_group_size
         self._model_settings = model_settings
         self._fallback_engine_type = fallback_engine_type
         self._scheduler_config = scheduler_config
@@ -137,15 +143,9 @@ class DFlashEngine(BaseEngine):
         return self._model_type_str
 
     @staticmethod
-    def _bits_to_quant_spec(bits: int | None) -> str | None:
-        """Convert legacy bits config into dflash 0.1.5's spec string format."""
-        if bits is None:
-            return None
-        if bits == 4:
-            return "w4"  # dflash defaults: act_bits=16, group_size=64
-        if bits == 8:
-            return "w8"
-        raise ValueError(f"unsupported draft_quant_bits: {bits}")
+    def _build_quant_spec(weight_bits: int, activation_bits: int, group_size: int) -> str:
+        """Convert draft quantization config into dflash 0.1.5's spec string format."""
+        return f"w{weight_bits}a{activation_bits}:gs{group_size}"
 
     def _resolve_dflash_l2_dir(self) -> Path | None:
         """Compute the dflash L2 cache directory under the omlx SSD cache root."""
@@ -199,7 +199,11 @@ class DFlashEngine(BaseEngine):
             model, tokenizer, meta = load_target_bundle(self._model_name)
             draft, draft_meta = load_draft_bundle(
                 self._draft_model_path,
-                draft_quant=self._bits_to_quant_spec(self._draft_quant_bits),
+                draft_quant=self._build_quant_spec(
+                    self._draft_quant_weight_bits,
+                    self._draft_quant_activation_bits,
+                    self._draft_quant_group_size,
+                ) if self._draft_quant_enabled else None,
             )
             return model, tokenizer, meta, draft
 

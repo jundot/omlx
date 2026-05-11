@@ -15,7 +15,10 @@ class TestDFlashModelSettings:
         settings = ModelSettings()
         assert settings.dflash_enabled is False
         assert settings.dflash_draft_model is None
-        assert settings.dflash_draft_quant_bits is None
+        assert settings.dflash_draft_quant_enabled is None
+        assert settings.dflash_draft_quant_weight_bits is None
+        assert settings.dflash_draft_quant_activation_bits is None
+        assert settings.dflash_draft_quant_group_size is None
         assert settings.dflash_max_ctx is None
         assert settings.dflash_in_memory_cache is True
         assert settings.dflash_in_memory_cache_max_entries == 4
@@ -41,14 +44,20 @@ class TestDFlashModelSettings:
         settings = ModelSettings(dflash_enabled=True)
         d = settings.to_dict()
         assert "dflash_draft_model" not in d
-        assert "dflash_draft_quant_bits" not in d
+        assert "dflash_draft_quant_enabled" not in d
+        assert "dflash_draft_quant_weight_bits" not in d
+        assert "dflash_draft_quant_activation_bits" not in d
+        assert "dflash_draft_quant_group_size" not in d
         assert "dflash_max_ctx" not in d
 
     def test_from_dict_with_dflash_fields(self):
         data = {
             "dflash_enabled": True,
             "dflash_draft_model": "z-lab/Qwen3.5-4B-DFlash",
-            "dflash_draft_quant_bits": 4,
+            "dflash_draft_quant_enabled": True,
+            "dflash_draft_quant_weight_bits": 4,
+            "dflash_draft_quant_activation_bits": 16,
+            "dflash_draft_quant_group_size": 64,
             "dflash_max_ctx": 8192,
             "dflash_in_memory_cache": False,
             "dflash_in_memory_cache_max_entries": 16,
@@ -58,7 +67,10 @@ class TestDFlashModelSettings:
         settings = ModelSettings.from_dict(data)
         assert settings.dflash_enabled is True
         assert settings.dflash_draft_model == "z-lab/Qwen3.5-4B-DFlash"
-        assert settings.dflash_draft_quant_bits == 4
+        assert settings.dflash_draft_quant_enabled is True
+        assert settings.dflash_draft_quant_weight_bits == 4
+        assert settings.dflash_draft_quant_activation_bits == 16
+        assert settings.dflash_draft_quant_group_size == 64
         assert settings.dflash_max_ctx == 8192
         assert settings.dflash_in_memory_cache is False
         assert settings.dflash_in_memory_cache_max_entries == 16
@@ -92,7 +104,10 @@ class TestDFlashModelSettings:
         original = ModelSettings(
             dflash_enabled=True,
             dflash_draft_model="z-lab/Qwen3.5-4B-DFlash",
-            dflash_draft_quant_bits=4,
+            dflash_draft_quant_enabled=True,
+            dflash_draft_quant_weight_bits=4,
+            dflash_draft_quant_activation_bits=16,
+            dflash_draft_quant_group_size=64,
             dflash_max_ctx=16384,
             dflash_in_memory_cache=False,
             dflash_ssd_cache=False,
@@ -101,7 +116,10 @@ class TestDFlashModelSettings:
         restored = ModelSettings.from_dict(d)
         assert restored.dflash_enabled == original.dflash_enabled
         assert restored.dflash_draft_model == original.dflash_draft_model
-        assert restored.dflash_draft_quant_bits == original.dflash_draft_quant_bits
+        assert restored.dflash_draft_quant_enabled == original.dflash_draft_quant_enabled
+        assert restored.dflash_draft_quant_weight_bits == original.dflash_draft_quant_weight_bits
+        assert restored.dflash_draft_quant_activation_bits == original.dflash_draft_quant_activation_bits
+        assert restored.dflash_draft_quant_group_size == original.dflash_draft_quant_group_size
         assert restored.dflash_max_ctx == original.dflash_max_ctx
         assert restored.dflash_in_memory_cache == original.dflash_in_memory_cache
         assert restored.dflash_ssd_cache == original.dflash_ssd_cache
@@ -123,12 +141,51 @@ class TestDFlashEngineInit:
         engine = DFlashEngine(
             model_name="test-model",
             draft_model_path="test-draft",
-            draft_quant_bits=4,
+            draft_quant_enabled=True,
+            draft_quant_weight_bits=4,
+            draft_quant_activation_bits=16,
+            draft_quant_group_size=64,
         )
         assert engine.model_name == "test-model"
         assert engine.tokenizer is None
         assert engine.model_type is None
         assert engine.has_active_requests() is False
+
+    def test_quant_enabled_false_uses_defaults(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            draft_quant_enabled=False,
+        )
+        assert engine._draft_quant_enabled is False
+        assert engine._draft_quant_weight_bits == 4
+        assert engine._draft_quant_activation_bits == 16
+        assert engine._draft_quant_group_size == 64
+
+    def test_quant_enabled_true_uses_custom_values(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            draft_quant_enabled=True,
+            draft_quant_weight_bits=8,
+            draft_quant_activation_bits=32,
+            draft_quant_group_size=128,
+        )
+        assert engine._draft_quant_enabled is True
+        assert engine._draft_quant_weight_bits == 8
+        assert engine._draft_quant_activation_bits == 32
+        assert engine._draft_quant_group_size == 128
+
 
     def test_get_stats_no_verify_mode(self):
         """Stats should not include verify_mode (removed in v2)."""
@@ -188,17 +245,15 @@ class TestDFlashEngineInit:
         assert engine._should_fallback([0] * 4095) is False
         assert engine._should_fallback([0] * 4096) is True
 
-    def test_bits_to_quant_spec(self):
+    def test_build_quant_spec(self):
         try:
             from omlx.engine.dflash import DFlashEngine
         except ImportError:
             pytest.skip("dflash-mlx not installed")
 
-        assert DFlashEngine._bits_to_quant_spec(None) is None
-        assert DFlashEngine._bits_to_quant_spec(4) == "w4"
-        assert DFlashEngine._bits_to_quant_spec(8) == "w8"
-        with pytest.raises(ValueError):
-            DFlashEngine._bits_to_quant_spec(2)
+        assert DFlashEngine._build_quant_spec(4, 16, 64) == "w4a16:gs64"
+        assert DFlashEngine._build_quant_spec(2, 32, 128) == "w2a32:gs128"
+        assert DFlashEngine._build_quant_spec(8, 16, 64) == "w8a16:gs64"
 
     def test_resolve_dflash_l2_dir_disabled_when_no_omlx_ssd(self, tmp_path):
         try:
