@@ -3088,6 +3088,55 @@ class Scheduler:
         )
         return uid
 
+    def _log_vlm_mtp_stats(
+        self, state: "_VLMMTPDecodeState", finish_reason: str
+    ) -> None:
+        """Emit one INFO line per finished vlm_mtp request with the drafter
+        acceptance rate measured for that request.
+
+        Reads ``Gemma4AssistantDraftModel.accept_lens`` — a list of accepted
+        draft counts per round, populated inside mlx-vlm's ``_mtp_rounds``.
+        The drafter mutates this in place and ``reset()`` (called at the
+        start of every new round-loop entry) clears it, so we have to read
+        before the next eligible request lands. The serialized routing in
+        ``_route_to_vlm_mtp`` guarantees one in-flight vlm_mtp generator
+        at a time, so the value we read here belongs to ``state.request``.
+        """
+        drafter = self._vlm_mtp_drafter
+        if drafter is None:
+            return
+        accept_lens = getattr(drafter.model, "accept_lens", None)
+        if not accept_lens:
+            return
+        try:
+            lens = [int(x) for x in accept_lens]
+        except Exception:
+            return
+        rounds = len(lens)
+        if rounds == 0:
+            return
+        total_accepted = sum(lens)
+        block_size = self._vlm_mtp_draft_block_size or int(
+            getattr(drafter.model.config, "block_size", 4)
+        )
+        max_per_round = max(1, block_size - 1)
+        acceptance_rate = total_accepted / (rounds * max_per_round)
+        avg_tokens_per_round = (total_accepted + rounds) / rounds
+        logger.info(
+            "vlm_mtp stats: request=%s finish=%s rounds=%d "
+            "accepted=%d/%d (%.1f%%) tokens_per_round=%.2f "
+            "emitted=%d block_size=%d",
+            state.request.request_id,
+            finish_reason,
+            rounds,
+            total_accepted,
+            rounds * max_per_round,
+            acceptance_rate * 100,
+            avg_tokens_per_round,
+            state.emitted,
+            block_size,
+        )
+
     def _step_vlm_mtp(self) -> list[_VLMMTPResponse]:
         """Advance every active vlm_mtp generator by one yield.
 
@@ -3106,6 +3155,7 @@ class Scheduler:
             except StopIteration:
                 # Round loop exited naturally — terminate with prompt cache
                 # so the prefix-cache layer can keep using it.
+                self._log_vlm_mtp_stats(state, "length")
                 responses.append(
                     _VLMMTPResponse(
                         uid=uid,
@@ -3144,6 +3194,9 @@ class Scheduler:
                 finish_reason = "stop"
             elif state.emitted >= state.max_tokens:
                 finish_reason = "length"
+
+            if finish_reason is not None:
+                self._log_vlm_mtp_stats(state, finish_reason)
 
             responses.append(
                 _VLMMTPResponse(
