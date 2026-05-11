@@ -1,14 +1,64 @@
 """Configuration management for oMLX menubar app."""
 
+import ipaddress
 import json
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_local_server_base_url(bind_host: Optional[str], port: int) -> str:
+    """HTTP base URL for reaching the server from this machine.
+
+    When the server binds to ``0.0.0.0`` or ``::``, loopback is used for health
+    and admin requests. When it binds to a specific address (LAN, Tailscale,
+    etc.), that address is used so local checks succeed.
+    """
+    raw = (bind_host or "").strip()
+    if not raw or raw in ("0.0.0.0", "::"):
+        host_for_url = "127.0.0.1"
+    elif raw in ("127.0.0.1", "localhost"):
+        host_for_url = "127.0.0.1"
+    elif raw == "::1":
+        host_for_url = "[::1]"
+    else:
+        try:
+            ip = ipaddress.ip_address(raw)
+            if ip.version == 6:
+                host_for_url = f"[{raw}]"
+            else:
+                host_for_url = raw
+        except ValueError:
+            host_for_url = raw
+    return f"http://{host_for_url}:{port}"
+
+
+def resolve_local_server_health_url(bind_host: Optional[str], port: int) -> str:
+    """Full ``/health`` URL for local monitoring."""
+    return f"{resolve_local_server_base_url(bind_host, port)}/health"
+
+
+def tcp_probe_connection_targets(
+    bind_host: Optional[str], port: int
+) -> List[Tuple[str, int]]:
+    """``(host, port)`` pairs to try for ``socket.create_connection`` port checks."""
+    raw = (bind_host or "").strip()
+    if not raw or raw in ("0.0.0.0", "::"):
+        return [("127.0.0.1", port)]
+    if raw in ("127.0.0.1", "localhost"):
+        return [("127.0.0.1", port)]
+    if raw == "::1":
+        return [("::1", port)]
+    try:
+        ip = ipaddress.ip_address(raw)
+        return [(str(ip), port)]
+    except ValueError:
+        return [(raw, port)]
 
 
 def get_app_support_dir() -> Path:
@@ -116,7 +166,7 @@ class ServerConfig:
 
         Returns True if successful, False if server is not reachable or auth fails.
         """
-        base_url = f"http://127.0.0.1:{self.port}"
+        base_url = resolve_local_server_base_url(self.get_server_bind_host(), self.port)
         current_key = self.get_server_api_key()
 
         try:
@@ -156,11 +206,26 @@ class ServerConfig:
             logger.debug(f"Failed to update API key on running server: {e}")
             return False
 
+    def get_server_bind_host(self) -> str:
+        """Return ``server.host`` from ``{base_path}/settings.json`` (may be empty)."""
+        settings_file = Path(self.base_path).expanduser() / "settings.json"
+        if not settings_file.exists():
+            return ""
+        try:
+            with open(settings_file) as f:
+                data = json.load(f)
+            host = data.get("server", {}).get("host")
+            if host is None:
+                return ""
+            return str(host).strip()
+        except (json.JSONDecodeError, OSError):
+            return ""
+
     def load_server_settings(self) -> dict:
-        """Load model_dir and port from server's settings.json.
+        """Load model_dir, port, and host from server's settings.json.
 
         Returns:
-            {"model_dir": str, "port": int} or empty dict if not found
+            ``model_dir``, ``port``, optional ``host``, or empty dict if not found
         """
         settings_file = Path(self.base_path).expanduser() / "settings.json"
         if not settings_file.exists():
@@ -175,6 +240,7 @@ class ServerConfig:
             return {
                 "model_dir": model_dir,
                 "port": data.get("server", {}).get("port", 8000),
+                "host": data.get("server", {}).get("host"),
             }
         except (json.JSONDecodeError, OSError):
             return {}
