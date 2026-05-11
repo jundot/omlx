@@ -75,6 +75,7 @@ class QuantTask:
     text_only: bool = False
     dtype: str = "bfloat16"
     preserve_mtp: bool = False
+    auto_proxy_sensitivity: bool = True
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -232,6 +233,7 @@ class OQManager:
         text_only: bool = False,
         dtype: str = "bfloat16",
         preserve_mtp: bool = False,
+        auto_proxy_sensitivity: bool = True,
     ) -> QuantTask:
         """Start a quantization job.
 
@@ -307,6 +309,7 @@ class OQManager:
             text_only=text_only,
             dtype=dtype,
             preserve_mtp=preserve_mtp,
+            auto_proxy_sensitivity=auto_proxy_sensitivity,
         )
         self._tasks[task_id] = task
 
@@ -464,6 +467,7 @@ class OQManager:
                     task.sensitivity_model_path,
                     task.dtype,
                     task.preserve_mtp,
+                    task.auto_proxy_sensitivity,
                 )
 
                 if task_id in self._cancelled:

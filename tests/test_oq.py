@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for oQ (oMLX Universal Dynamic Quantization)."""
 
-from unittest.mock import MagicMock
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -18,9 +20,12 @@ from omlx.oq import (
     _LEVEL_BITS,
     _MAX_MODEL_RAM_FRACTION,
     _OQ_BPW_TARGETS,
+    _PROXY_QUANT_BITS,
+    _PROXY_QUANT_GROUP_SIZE,
     _DiscoveredPlan,
     _TrackedTensor,
     _bpw_targets_for_level,
+    _build_proxy_for_sensitivity,
     _build_quant_plan,
     _discover_sanitize_plan,
     _extract_layer_index,
@@ -1388,6 +1393,150 @@ class TestModelExceedsRamGuard:
         assert not (nbytes > int(large_ram * _MAX_MODEL_RAM_FRACTION))
 
 
+class TestBuildProxyForSensitivity:
+    """Tests for the auto-built sensitivity proxy.
+
+    The proxy is created when the source model exceeds available RAM and the
+    user has not supplied a pre-quantized model via sensitivity_model_path.
+    Without it, quantize_oq_streaming aborts with a RuntimeError.
+    """
+
+    def test_invokes_mlx_lm_convert_with_uniform_4bit_affine(self, tmp_path):
+        """Proxy build delegates to mlx_lm.convert with uniform 4-bit affine."""
+        fake_convert = MagicMock()
+        with patch.dict(
+            "sys.modules", {"mlx_lm": MagicMock(convert=fake_convert)}
+        ):
+            proxy_dir = _build_proxy_for_sensitivity(
+                str(tmp_path / "src_model"), dtype="bfloat16"
+            )
+        assert fake_convert.call_count == 1
+        kwargs = fake_convert.call_args.kwargs
+        assert kwargs["hf_path"] == str(tmp_path / "src_model")
+        assert kwargs["quantize"] is True
+        assert kwargs["q_bits"] == _PROXY_QUANT_BITS
+        assert kwargs["q_group_size"] == _PROXY_QUANT_GROUP_SIZE
+        assert kwargs["q_mode"] == "affine"
+        assert kwargs["dtype"] == "bfloat16"
+        # Returned path is what was passed as mlx_path.
+        assert kwargs["mlx_path"] == str(proxy_dir)
+
+    def test_returns_path_under_system_temp(self, tmp_path):
+        """Proxy lives under the system temp dir, not next to the source."""
+        import tempfile
+
+        with patch.dict(
+            "sys.modules", {"mlx_lm": MagicMock(convert=MagicMock())}
+        ):
+            proxy_dir = _build_proxy_for_sensitivity(
+                str(tmp_path / "src_model"), dtype="bfloat16"
+            )
+        # tempfile.gettempdir() is the system temp root (e.g. /tmp).
+        assert str(proxy_dir).startswith(tempfile.gettempdir())
+        assert proxy_dir.name.startswith("omlx_oq_proxy_")
+
+    def test_caller_is_responsible_for_cleanup(self, tmp_path):
+        """The helper does not auto-delete the proxy; caller cleans up."""
+        fake_convert = MagicMock(
+            side_effect=lambda **kw: __import__("os").makedirs(kw["mlx_path"])
+        )
+        with patch.dict(
+            "sys.modules", {"mlx_lm": MagicMock(convert=fake_convert)}
+        ):
+            proxy_dir = _build_proxy_for_sensitivity(
+                str(tmp_path / "src_model"), dtype="bfloat16"
+            )
+        # The directory should still exist after the helper returns.
+        assert proxy_dir.exists()
+
+    def test_propagates_dtype_argument(self, tmp_path):
+        """dtype is forwarded so the proxy matches the target output dtype."""
+        fake_convert = MagicMock()
+        with patch.dict(
+            "sys.modules", {"mlx_lm": MagicMock(convert=fake_convert)}
+        ):
+            _build_proxy_for_sensitivity(
+                str(tmp_path / "src_model"), dtype="float16"
+            )
+        assert fake_convert.call_args.kwargs["dtype"] == "float16"
+
+    def test_working_dir_pins_proxy_to_output_volume(self, tmp_path):
+        """working_dir sets where mkdtemp anchors the proxy.
+
+        Critical on Linux where /tmp can be tmpfs (RAM-backed): the caller
+        passes the output volume so the proxy lands on actual disk and the
+        OOM-driven proxy build does not defeat itself.
+        """
+        anchor = tmp_path / "out_volume"
+        anchor.mkdir()
+        with patch.dict(
+            "sys.modules", {"mlx_lm": MagicMock(convert=MagicMock())}
+        ):
+            proxy_dir = _build_proxy_for_sensitivity(
+                str(tmp_path / "src_model"),
+                dtype="bfloat16",
+                working_dir=str(anchor),
+            )
+        assert proxy_dir.parent == anchor
+
+
+class TestSensitivityRequiredEnforcement:
+    """Regression tests: quantize_oq_streaming must abort when sensitivity
+    measurement cannot run, rather than silently producing an output that
+    skipped the data-driven step.
+    """
+
+    def test_opt_out_with_model_exceeding_ram_raises(self, tmp_path, monkeypatch):
+        """auto_proxy_sensitivity=False + model > RAM -> RuntimeError."""
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save({"w": np.zeros((128, 256), dtype=np.float32)}, str(src / "w.safetensors"))
+        (src / "config.json").write_text('{"model_type": "llama"}')
+
+        # Force OOM by pretending system has 0 bytes of RAM.
+        from omlx import settings as _settings
+
+        monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
+
+        with pytest.raises(RuntimeError, match="auto_proxy_sensitivity is disabled"):
+            quantize_oq_streaming(
+                str(src),
+                str(tmp_path / "out"),
+                4,
+                auto_proxy_sensitivity=False,
+            )
+
+    def test_proxy_build_failure_raises(self, tmp_path, monkeypatch):
+        """auto_proxy_sensitivity=True + proxy build fails -> RuntimeError."""
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save({"w": np.zeros((128, 256), dtype=np.float32)}, str(src / "w.safetensors"))
+        (src / "config.json").write_text('{"model_type": "llama"}')
+
+        from omlx import settings as _settings
+
+        monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
+        # Stub mlx_lm.convert so that the proxy build raises.
+        fake_mlx_lm = MagicMock()
+        fake_mlx_lm.convert = MagicMock(side_effect=RuntimeError("simulated build fail"))
+        monkeypatch.setitem(sys.modules, "mlx_lm", fake_mlx_lm)
+
+        with pytest.raises(RuntimeError, match="auto-proxy sensitivity failed"):
+            quantize_oq_streaming(
+                str(src),
+                str(tmp_path / "out"),
+                4,
+                auto_proxy_sensitivity=True,
+            )
+
 
 # =============================================================================
 # Test on-the-fly FP8 dequant in _LazyTensorIndex
@@ -1560,7 +1709,40 @@ def _make_fp8_model(model_dir, n_layers=2, hidden=128, n_experts=0,
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestQuantizeOqStreamingFp8:
-    """End-to-end tests for quantize_oq_streaming with FP8 source models."""
+    """End-to-end tests for quantize_oq_streaming with FP8 source models.
+
+    These tests exercise the FP8 dequant + streaming write path on synthetic
+    safetensors data, so the source models cannot be loaded by mlx_lm.load.
+    Real sensitivity measurement would fail; we mock it out per class to keep
+    the focus on the FP8 dequant path. The sensitivity-required contract is
+    covered separately by TestSensitivityRequiredEnforcement.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _mock_sensitivity(self, monkeypatch):
+        """Bypass real sensitivity measurement for synthetic FP8 fixtures."""
+        from omlx import oq as _oq
+
+        def _fake_measure(model_path, config, oq_level, **_kw):
+            n = (
+                config.get("num_hidden_layers")
+                or config.get("text_config", {}).get("num_hidden_layers")
+                or 4
+            )
+            return {i: 0.1 for i in range(n)}
+
+        monkeypatch.setattr(_oq, "_measure_sensitivity", _fake_measure)
+        monkeypatch.setattr(
+            _oq, "_measure_sensitivity_from_quantized_model", _fake_measure
+        )
+        # Auto-proxy path: skip the actual mlx_lm.convert build since
+        # synthetic FP8 fixtures cannot be loaded; treat the proxy as a no-op
+        # and let the mocked measurement above produce the scores.
+        monkeypatch.setattr(
+            _oq,
+            "_build_proxy_for_sensitivity",
+            lambda *a, **k: Path("/dev/null"),
+        )
 
     def test_mxfp_source_produces_output(self, tmp_path):
         """MXFP (.scale suffix) FP8 model quantizes without error."""
