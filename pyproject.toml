@@ -65,6 +65,9 @@ dependencies = [
     # Server
     "fastapi>=0.108.0",
     "uvicorn>=0.23.0",
+    # python-multipart is needed by audio_routes.py (File/Form uploads), which
+    # server.py unconditionally imports regardless of the [audio] extra.
+    "python-multipart>=0.0.5",
     # JSON Schema validation for structured output
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
@@ -93,7 +96,6 @@ audio = [
     # stt extra: tiktoken, mistral-common[audio]
     # sts extra: tts deps + stt deps + webrtcvad
     "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
-    "python-multipart>=0.0.5",
 ]
 dev = [
     "pytest>=7.0.0",
