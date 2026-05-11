@@ -745,11 +745,17 @@ class PagedSSDCacheManager(CacheManager):
         for evicted_hash, evicted in evicted_entries:
             self._enqueue_ssd_write(evicted_hash, evicted)
 
-    def _enqueue_ssd_write(self, block_hash: bytes, entry: dict) -> bool:
+    def _enqueue_ssd_write(
+        self, block_hash: bytes, entry: dict, *, blocking: bool = False,
+    ) -> bool:
         """Enqueue a hot cache entry for SSD background write.
 
         Used when evicting from hot cache or flushing on shutdown.
         Adds block to SSD index before enqueueing write.
+
+        When *blocking* is True, waits briefly for queue space instead of
+        dropping the block immediately.  This is used during shutdown to
+        let the writer thread drain between submissions.
         """
         if self._hot_cache_only:
             return False
@@ -771,7 +777,11 @@ class PagedSSDCacheManager(CacheManager):
         with self._pending_write_hashes_lock:
             self._pending_write_hashes.add(block_hash)
         try:
-            self._write_queue.put_nowait((block_hash, tensors_raw, metadata, file_path))
+            item = (block_hash, tensors_raw, metadata, file_path)
+            if blocking:
+                self._write_queue.put(item, timeout=0.5)
+            else:
+                self._write_queue.put_nowait(item)
             logger.debug(
                 f"Evicted hot cache block to SSD write queue: "
                 f"{block_hash.hex()[:16]}..."
@@ -2169,20 +2179,33 @@ class PagedSSDCacheManager(CacheManager):
         """Close the SSD cache manager, flushing hot cache and pending writes."""
         logger.info("Shutting down PagedSSDCacheManager...")
 
-        # Flush hot cache entries to SSD before shutdown
+        # Flush hot cache entries to SSD before shutdown.
+        # Use blocking=True so the flush waits for the writer thread to
+        # drain queue space rather than dropping blocks via put_nowait().
         if self._hot_cache_enabled:
             with self._hot_cache_lock:
                 entries_to_flush = list(self._hot_cache.items())
             flushed = 0
+            dropped = 0
             for block_hash, entry in entries_to_flush:
-                # Skip blocks already written to SSD
+                if self._writer_thread and not self._writer_thread.is_alive():
+                    logger.warning(
+                        "Writer thread died during shutdown flush, "
+                        f"aborting ({flushed} flushed, "
+                        f"{len(entries_to_flush) - flushed - dropped} remaining)"
+                    )
+                    break
                 blk_meta = entry.get("block_metadata")
                 if blk_meta and blk_meta.file_path.exists():
                     continue
-                if self._enqueue_ssd_write(block_hash, entry):
+                if self._enqueue_ssd_write(block_hash, entry, blocking=True):
                     flushed += 1
+                else:
+                    dropped += 1
             if flushed:
                 logger.info(f"Flushed {flushed} hot cache blocks to SSD write queue")
+            if dropped:
+                logger.warning(f"Dropped {dropped} hot cache blocks during flush")
 
         # Signal writer thread to stop (after processing remaining queue)
         if self._writer_thread:
