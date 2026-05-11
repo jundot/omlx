@@ -433,6 +433,76 @@ def _restore_or_trim_caches(prompt_cache: List[Any]) -> bool:
     return True
 
 
+def _rollback_after_reject(
+    model: Any,
+    prompt_cache: List[Any],
+    gdn_states: Optional[list],
+    accepted: int = 0,
+    block_size: int = 2,
+) -> bool:
+    """Roll back per-layer cache state after a rejected MTP draft token.
+
+    Two mechanisms are supported, dispatched on the model's capability:
+
+    1. **mlx-vlm path** — when the model exposes ``rollback_speculative_cache``
+       (Qwen3.5 LanguageModel ships with it upstream) AND ``gdn_states`` is
+       populated, we delegate to that method. It batches the per-layer SSM
+       replay into a single ``gated_delta_update`` call and trims KV
+       caches by ``block_size - (accepted + 1)``. The backbone forward was
+       run with both confirmed and draft tokens; the rollback replays only
+       the accepted prefix through the original pre-update state.
+
+    2. **mlx-lm path** (PR 990) — per-layer ``cache.rollback_state`` snapshot
+       written by the patched ``GatedDeltaNet.__call__`` during the
+       confirmed/draft split. We restore the snapshot for SSM layers and
+       trim KV layers by 1. ``gdn_states`` is None in this path.
+
+    Returns True on success. False means a cache layer in the list supports
+    neither mechanism, in which case the caller falls back to the standard
+    non-MTP step.
+    """
+    if gdn_states is not None and hasattr(model, "rollback_speculative_cache"):
+        model.rollback_speculative_cache(
+            prompt_cache, gdn_states, accepted, block_size
+        )
+        return True
+    return _restore_or_trim_caches(prompt_cache)
+
+
+def _call_backbone(
+    model: Any,
+    inputs: Any,
+    cache: List[Any],
+    n_confirmed: int = 0,
+) -> Tuple[Any, Any, Optional[list]]:
+    """Run the backbone with ``return_hidden=True`` and normalise the result.
+
+    Returns ``(logits, hidden_pre_norm, gdn_states_or_None)``:
+
+    - mlx-lm path returns the 2-tuple ``(logits, hidden)``; ``gdn_states``
+      is ``None`` and rollback uses ``cache.rollback_state``.
+    - mlx-vlm path returns the 3-tuple ``(logits, hidden, gdn_states)`` so
+      a rejected draft can be rolled back via
+      ``rollback_speculative_cache``.
+
+    ``n_confirmed`` is forwarded so the mlx-lm path can split its
+    GatedDeltaNet forward into confirmed and draft chunks. mlx-vlm
+    discards it (irrelevant — rollback is post-hoc, not splitwise).
+    """
+    kwargs = {"cache": cache, "return_hidden": True}
+    if n_confirmed:
+        kwargs["n_confirmed"] = n_confirmed
+    result = model(inputs, **kwargs)
+    if isinstance(result, tuple):
+        if len(result) == 3:
+            return result
+        if len(result) == 2:
+            return result[0], result[1], None
+    raise TypeError(
+        f"backbone returned unexpected shape: {type(result).__name__}"
+    )
+
+
 def _clear_rollback(prompt_cache: List[Any]) -> None:
     """Drop ``rollback_state`` snapshots after a draft is accepted."""
     for c in prompt_cache:
@@ -491,10 +561,11 @@ def _post_init_mtp(gen_batch: Any) -> None:
     else:
         prev_buf = None
 
-    # 1-token backbone forward at main_tok with hidden state.
+    # 1-token backbone forward at main_tok with hidden state. No draft yet,
+    # so no rollback is possible — discard gdn_states.
     with mx.stream(_get_generation_stream()):
-        logits, hidden = gen_batch.model(
-            main_tok[:, None], cache=gen_batch.prompt_cache, return_hidden=True
+        logits, hidden, _ = _call_backbone(
+            gen_batch.model, main_tok[:, None], gen_batch.prompt_cache
         )
 
     next_main_logits = logits[:, -1, :]  # (1, vocab) — distribution after main_tok
@@ -653,10 +724,10 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     # accurate (everything lands in sample_ms), but cumulative timing is.
     t0 = time.perf_counter()
     with mx.stream(_get_generation_stream()):
-        logits, hidden = gen_batch.model(
+        logits, hidden, gdn_states = _call_backbone(
+            gen_batch.model,
             inputs[None, :],
-            cache=gen_batch.prompt_cache,
-            return_hidden=True,
+            gen_batch.prompt_cache,
             n_confirmed=1,
         )
         verify_logits = logits[:, 0, :]
@@ -740,7 +811,12 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     # Reject path.
     state.stats.rejects += 1
     t0 = time.perf_counter()
-    if not _restore_or_trim_caches(gen_batch.prompt_cache):
+    # accepted=0 means only the confirmed token (verify position) is kept;
+    # block_size=2 covers both the confirmed and the rejected draft.
+    if not _rollback_after_reject(
+        gen_batch.model, gen_batch.prompt_cache, gdn_states,
+        accepted=0, block_size=2,
+    ):
         if procs is not None:
             _trim_token_buffer(gen_batch, 1)
         raise _MtpStepFallback("cache layer rejects rollback")

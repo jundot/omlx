@@ -83,6 +83,25 @@ def maybe_apply_pre_load_patches(
                     "(model has MTP heads but mtp_enabled=False; head not attached)",
                     model_name,
                 )
+
+        # mlx-vlm side: when the model loads via VLMBatchedEngine
+        # (e.g. ``qwen3_5_moe`` with vision_config), the mlx-lm patch
+        # alone can't attach an MTP head to the mlx-vlm classes.
+        # Apply the parallel runtime patch on mlx-vlm so the MTPModule is
+        # instantiated on ``LanguageModel.__init__``.
+        if mtp_enabled:
+            try:
+                from ..patches.mlx_vlm_mtp import (
+                    apply_mlx_vlm_mtp_runtime_patch,
+                )
+            except Exception:
+                pass
+            else:
+                if apply_mlx_vlm_mtp_runtime_patch():
+                    logger.info(
+                        "mlx-vlm runtime MTP patch applied for %s",
+                        model_name,
+                    )
     elif (
         model_settings is not None
         and getattr(model_settings, "mtp_enabled", False)
