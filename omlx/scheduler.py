@@ -37,6 +37,7 @@ from mlx_lm.generate import (
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_logits_processors
 
+from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
 from .exceptions import is_cache_corruption_error
@@ -781,6 +782,7 @@ class Scheduler:
         self.paged_cache_manager: PagedCacheManager | None = None
         self.block_aware_cache: BlockAwarePrefixCache | None = None
         self.paged_ssd_cache_manager: PagedSSDCacheManager | None = None
+        self._cache_rate_tracker = CacheRateTracker()
         self.memory_monitor: MemoryMonitor | None = None
 
         # Initialize paged SSD cache if paged_ssd_cache_dir is specified
@@ -5322,6 +5324,7 @@ class Scheduler:
         # Clear caches
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
+        self._cache_rate_tracker.clear()
 
         # Clear UID mappings
         self.request_id_to_uid.clear()
@@ -5651,6 +5654,7 @@ class Scheduler:
         # Clear caches
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
+        self._cache_rate_tracker.clear()
 
         # Clear detokenizers
         self._request_detokenizers.clear()
@@ -6083,6 +6087,35 @@ class Scheduler:
 
         return verified
 
+    def _collect_cache_counters(self) -> dict[str, int] | None:
+        if self.block_aware_cache is None:
+            return None
+
+        prefix_stats = self.block_aware_cache.get_stats()
+        counters = {
+            "prefix_hits": prefix_stats.hits,
+            "prefix_misses": prefix_stats.misses,
+            "prefix_tokens_matched": prefix_stats.tokens_matched_total,
+            "prefix_tokens_requested": prefix_stats.tokens_requested_total,
+            "prefix_tokens_saved": prefix_stats.tokens_saved,
+            "evictions": prefix_stats.evictions,
+        }
+
+        if self.paged_ssd_cache_manager is not None:
+            ssd = self.paged_ssd_cache_manager.get_stats()
+            hot_hits = ssd.hot_cache_hits
+            total_loads = ssd.loads
+            counters.update({
+                "ssd_hot_hits": hot_hits,
+                "ssd_disk_loads": max(0, total_loads - hot_hits),
+                "ssd_saves": ssd.saves,
+                "ssd_errors": ssd.errors,
+                "hot_cache_evictions": ssd.hot_cache_evictions,
+                "hot_cache_promotions": ssd.hot_cache_promotions,
+            })
+
+        return counters
+
     def get_ssd_cache_stats(self) -> dict[str, Any] | None:
         """Get paged SSD + prefix cache observability statistics."""
         stats = {}
@@ -6091,14 +6124,17 @@ class Scheduler:
             stats["ssd_cache"] = self.paged_ssd_cache_manager.get_stats()
 
         if self.paged_cache_manager is not None:
-            # In paged SSD-only mode, all cache data is on paged SSD
             stats["indexed_blocks"] = self.paged_cache_manager.cold_block_count
             stats["block_size"] = self.config.paged_cache_block_size
 
         if self.block_aware_cache is not None:
-            # Expose prefix-cache observability so UI can distinguish
-            # "0 indexed blocks" from "sub-block cached (<block_size)".
             stats["prefix_cache"] = self.block_aware_cache.get_stats_dict()
+
+        counters = self._collect_cache_counters()
+        if counters:
+            stats["cache_rates"] = self._cache_rate_tracker.snapshot_and_get_rates(
+                counters
+            )
 
         return stats if stats else None
 

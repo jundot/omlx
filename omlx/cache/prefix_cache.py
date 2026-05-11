@@ -117,6 +117,8 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_saved = 0
         self._partial_block_skips = 0
         self._partial_tokens_skipped = 0
+        self._tokens_matched_total = 0
+        self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
 
@@ -285,6 +287,8 @@ class BlockAwarePrefixCache(CacheManager):
             num_prefix_tokens = len(tokens) - len(remaining)
             self._hits += 1
             self._tokens_saved += num_prefix_tokens
+            self._tokens_matched_total += num_prefix_tokens
+            self._tokens_requested_total += len(tokens)
 
             logger.debug(
                 f"Cache hit for {request_id}: "
@@ -310,6 +314,8 @@ class BlockAwarePrefixCache(CacheManager):
             remaining = tokens[prefix_len:]
             self._hits += 1
             self._tokens_saved += prefix_len
+            self._tokens_matched_total += prefix_len
+            self._tokens_requested_total += len(tokens)
 
             logger.debug(
                 f"Prefix index hit for {request_id}: " f"{prefix_len} tokens matched"
@@ -319,6 +325,7 @@ class BlockAwarePrefixCache(CacheManager):
 
         # No cache hit
         self._misses += 1
+        self._tokens_requested_total += len(tokens)
         logger.debug(f"Cache miss for {request_id}")
         return None, tokens
 
@@ -2367,6 +2374,8 @@ class BlockAwarePrefixCache(CacheManager):
             block_size=self.block_size,
             last_partial_tokens_skipped=self._last_partial_tokens_skipped,
             last_tokens_to_next_block=self._last_tokens_to_next_block,
+            tokens_matched_total=self._tokens_matched_total,
+            tokens_requested_total=self._tokens_requested_total,
         )
 
     def get_stats_dict(self) -> dict[str, Any]:
@@ -2393,6 +2402,8 @@ class BlockAwarePrefixCache(CacheManager):
             "block_size": self.block_size,
             "last_partial_tokens_skipped": self._last_partial_tokens_skipped,
             "last_tokens_to_next_block": self._last_tokens_to_next_block,
+            "tokens_matched_total": self._tokens_matched_total,
+            "tokens_requested_total": self._tokens_requested_total,
             "active_requests": len(self._request_tables),
             **paged_stats,
         }
@@ -2404,6 +2415,8 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_saved = 0
         self._partial_block_skips = 0
         self._partial_tokens_skipped = 0
+        self._tokens_matched_total = 0
+        self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
         self.paged_cache.reset_stats()
