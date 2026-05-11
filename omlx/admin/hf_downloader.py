@@ -107,10 +107,10 @@ _DTYPE_TO_QUANT = {
     "Q8": "int8",
     "Q4": "int4",
     "Q2": "int2",
-    "Q6_K": "int4",
-    "Q5_K": "int8",
+    "Q6_K": "int6",
+    "Q5_K": "int5",
     "Q4_K": "int4",
-    "Q3_K": "int4",
+    "Q3_K": "int3",
     "Q2_K": "int2",
 }
 
