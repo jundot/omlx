@@ -26,6 +26,8 @@ Usage:
 import asyncio
 import contextlib
 import copy
+import importlib
+import json
 import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -140,6 +142,159 @@ def _patch_video_processor_bug():
         pass
 
     _video_processor_patched = True
+
+
+_torch_free_ip_patched = False
+
+
+def _patch_torch_free_image_processor():
+    """Route mlx-vlm OCR processors around torch-gated AutoImageProcessor.
+
+    transformers 5.5+ ships ``AutoImageProcessor`` as a ``DummyObject`` that
+    raises ``ImportError`` on attribute access without torch+torchvision
+    installed. mlx-vlm's ``GlmOcrProcessor.from_pretrained`` and
+    ``DotsOcrProcessor.from_pretrained`` call ``AutoImageProcessor.from_pretrained``
+    directly, so they raise on oMLX's torch-free env.
+    ``install_auto_processor_patch`` then silently swallows the ``ImportError``
+    and falls back to a ``TokenizersBackend`` with no ``image_processor`` —
+    image content is dropped at ``prepare_inputs()``. See #1131, #1175.
+
+    transformers ships torch-free PIL-backend variants of these image
+    processors (e.g. ``Glm46VImageProcessorPil``, ``Qwen2VLImageProcessorPil``).
+    This patch wraps the affected mlx-vlm processors' ``from_pretrained`` so
+    they substitute the PIL class when ``AutoImageProcessor`` raises.
+    """
+    global _torch_free_ip_patched
+    if _torch_free_ip_patched:
+        return
+
+    try:
+        import transformers
+    except ImportError:
+        return
+
+    if not getattr(transformers.AutoImageProcessor, "is_dummy", False):
+        # torch+torchvision available, AutoImageProcessor works as-is.
+        _torch_free_ip_patched = True
+        return
+
+    for module_path, cls_name in (
+        ("mlx_vlm.models.glm_ocr.processing", "GlmOcrProcessor"),
+        ("mlx_vlm.models.dots_ocr.processing_dots_ocr", "DotsVLProcessor"),
+    ):
+        try:
+            mod = importlib.import_module(module_path)
+            cls = getattr(mod, cls_name)
+            _wrap_from_pretrained_with_pil_image_processor(cls)
+            logger.debug("Wrapped %s.from_pretrained with PIL fallback", cls_name)
+        except (ImportError, AttributeError) as exc:
+            logger.debug(
+                "Skipped torch-free image processor patch for %s: %s",
+                cls_name,
+                exc,
+            )
+
+    _torch_free_ip_patched = True
+
+
+def _wrap_from_pretrained_with_pil_image_processor(cls):
+    """Wrap a ProcessorMixin subclass's ``from_pretrained`` so an ``ImportError``
+    from ``AutoImageProcessor`` triggers PIL fallback instantiation."""
+    if getattr(cls.from_pretrained, "_omlx_torch_free_patched", False):
+        return
+
+    orig = cls.from_pretrained
+
+    @classmethod
+    def patched(cls_inner, path, **kwargs):
+        try:
+            return orig(path, **kwargs)
+        except ImportError as exc:
+            msg = str(exc)
+            if "Torchvision" not in msg and "PyTorch" not in msg:
+                raise
+            logger.info(
+                "AutoImageProcessor unavailable (torch-free env); routing %s "
+                "to PIL image processor",
+                cls_inner.__name__,
+            )
+            return _build_processor_via_pil_image_processor(cls_inner, path, **kwargs)
+
+    patched.__func__._omlx_torch_free_patched = True
+    cls.from_pretrained = patched
+
+
+def _build_processor_via_pil_image_processor(cls, path, **kwargs):
+    """Construct a ProcessorMixin instance using transformers' PIL-backend
+    image processor (looked up via ``IMAGE_PROCESSOR_MAPPING_NAMES``) instead
+    of the torch-gated ``AutoImageProcessor``."""
+    from transformers import AutoTokenizer
+    from transformers.models.auto.auto_mappings import IMAGE_PROCESSOR_MAPPING_NAMES
+
+    trust = kwargs.pop("trust_remote_code", True)
+
+    # Look up image_processor_type from processor_config.json (preferred,
+    # nested under "image_processor") or preprocessor_config.json (legacy).
+    p = Path(path)
+    ip_type = None
+    for fname in ("processor_config.json", "preprocessor_config.json"):
+        cfg_path = p / fname
+        if not cfg_path.exists():
+            continue
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        ip_type = (
+            cfg.get("image_processor", {}).get("image_processor_type")
+            or cfg.get("image_processor_type")
+        )
+        if ip_type:
+            break
+
+    if not ip_type:
+        raise ImportError(
+            f"Cannot determine image_processor_type for {path}; install "
+            "torch+torchvision or upgrade mlx-vlm."
+        )
+
+    pil_cls = _resolve_pil_image_processor_class(ip_type, IMAGE_PROCESSOR_MAPPING_NAMES)
+    if pil_cls is None:
+        raise ImportError(
+            f"No torch-free PIL image processor for image_processor_type={ip_type}."
+        )
+
+    image_processor = pil_cls.from_pretrained(str(path), trust_remote_code=trust)
+    tokenizer = AutoTokenizer.from_pretrained(str(path), trust_remote_code=trust, **kwargs)
+
+    # mlx-vlm helper: load chat_template.jinja into tokenizer if present.
+    try:
+        from mlx_vlm.models.base import load_chat_template
+        load_chat_template(tokenizer, str(path))
+    except (ImportError, AttributeError):
+        pass
+
+    return cls(image_processor=image_processor, tokenizer=tokenizer)
+
+
+def _resolve_pil_image_processor_class(ip_type, mapping_names):
+    """Find a non-dummy PIL backend class matching ``ip_type`` via
+    ``IMAGE_PROCESSOR_MAPPING_NAMES``."""
+    for model_type, mapping in mapping_names.items():
+        if mapping.get("torchvision") != ip_type and mapping.get("pil") != ip_type:
+            continue
+        pil_name = mapping.get("pil")
+        if not pil_name:
+            continue
+        module_name = (
+            f"transformers.models.{model_type}.image_processing_pil_{model_type}"
+        )
+        try:
+            mod = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        candidate = getattr(mod, pil_name, None)
+        if candidate is not None and not getattr(candidate, "is_dummy", False):
+            return candidate
+    return None
 
 
 def _fix_processor_none_pixels(processor):
@@ -437,6 +592,7 @@ class VLMBatchedEngine(BaseEngine):
 
         def _load_vlm_sync():
             _patch_video_processor_bug()
+            _patch_torch_free_image_processor()
             with _strip_audio_config_if_orphaned(Path(self._model_name)):
                 return vlm_load(
                     self._model_name, trust_remote_code=self._trust_remote_code
