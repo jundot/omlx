@@ -803,9 +803,16 @@ class Scheduler:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
         Pre-conditions enforced by the caller (_cleanup_finished):
-        - All mx.array references in cache_to_store have already been
-          mx.eval()'d on the inference thread, so save_block's internal
-          mx.eval is a no-op.
+        - mx.async_eval() was called on the inference thread for all
+          KV cache arrays, dispatching materialization asynchronously
+          without blocking the inference thread. async_eval completes
+          Metal command enqueueing before returning, so all commands
+          are submitted by the time executor.submit() runs.
+        - This worker calls mx.synchronize() (global barrier — waits
+          all streams) to ensure materialization is complete before
+          extracting tensor bytes. Stream-scoped sync is not possible
+          here because generation_stream is thread-local to the
+          inference thread.
         - bfloat16 view+eval inside _extract_tensor_bytes runs on this
           worker's default mx stream, isolated from generation_stream;
           the underlying buffer is read-only at this point.
@@ -816,6 +823,8 @@ class Scheduler:
         threading.RLock so concurrent access from main and worker is safe.
         """
         try:
+            with self._phase_timer("store_cache_worker_sync"):
+                mx.synchronize()
             block_table = self.block_aware_cache.store_cache(
                 request_id,
                 token_sequence_to_store,
@@ -4094,14 +4103,13 @@ class Scheduler:
                             )
                             intermediate_snapshots = None
 
-                            # Boundary merge + a batched mx.eval all on the
-                            # inference thread. The eval forces every array
-                            # we hand to the worker into a materialized state
-                            # so the worker's _extract_tensor_bytes is a pure
-                            # memcpy (mx.eval inside save_block becomes a
-                            # no-op). bfloat16 view+eval inside the worker
-                            # then runs on its own default stream, isolated
-                            # from generation_stream.
+                            # Boundary merge + async_eval on the inference
+                            # thread. async_eval dispatches KV array
+                            # materialization without blocking, so the
+                            # inference thread can start the next request
+                            # immediately. The worker calls
+                            # mx.synchronize() to wait for completion
+                            # before extracting bytes.
                             with (
                                 self._phase_timer("store_cache_main_prep"),
                                 mx.stream(generation_stream),
@@ -4138,8 +4146,7 @@ class Scheduler:
                                     )
                                 )
                                 if pre_eval_arrays:
-                                    with self._phase_timer("store_cache_main_eval"):
-                                        mx.eval(*pre_eval_arrays)
+                                    mx.async_eval(*pre_eval_arrays)
 
                             if self._store_cache_executor is not None:
                                 store_future = self._store_cache_executor.submit(
