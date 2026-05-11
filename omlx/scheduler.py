@@ -41,7 +41,48 @@ from .cache.prefix_cache import BlockAwarePrefixCache
 from .exceptions import is_cache_corruption_error
 from .prefill_progress import get_prefill_tracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
 from .utils.sampling import make_sampler as omlx_make_sampler
+
+
+@dataclass
+class _VLMMTPDecodeState:
+    """Per-request state for vlm_mtp decode that bypasses BatchGenerator.
+
+    The wrapper generator yields plain Python ints (single-request mode).
+    Scheduler iterates it one token per ``step()`` and feeds each token
+    into ``_process_batch_responses`` via a synthesized ``_VLMMTPResponse``.
+    """
+
+    generator: Any  # Generator[int, None, None] from run_vlm_mtp_decode
+    request: Request
+    prompt_cache: list[Any]
+    sampler: Callable[[Any], Any]
+    state_machine: Any
+    max_tokens: int
+    # Plain stop-token set (EOS + request-specific) for direct membership
+    # check; mlx-lm's SequenceStateMachine doesn't expose a "did the last
+    # token finish" helper, so we keep a copy.
+    stop_token_ids: set[int] = field(default_factory=set)
+    emitted: int = 0
+    finished: bool = False
+
+
+@dataclass
+class _VLMMTPResponse:
+    """BatchGenerator.Response shim emitted by the vlm_mtp decode loop.
+
+    Same field surface used by ``_process_batch_responses``: ``uid``,
+    ``token``, ``finish_reason``, ``logprobs``, and an optional
+    ``prompt_cache`` returned on the terminal yield so paged-cache reuse
+    keeps working.
+    """
+
+    uid: int
+    token: int
+    finish_reason: Optional[str] = None
+    logprobs: Any = None
+    prompt_cache: Any = None
 
 
 def _sync_and_clear_cache():
@@ -515,6 +556,18 @@ class Scheduler:
         self._specprefill_draft_model: Any | None = None
         # Track active specprefill request for RoPE cleanup
         self._specprefill_active_request_id: str | None = None
+
+        # VLM MTP: gemma4_assistant drafter attached by VLMBatchedEngine.
+        # When set, eligible requests bypass mlx-lm BatchGenerator for decode
+        # and run through mlx-vlm's _mtp_rounds round loop instead.
+        self._vlm_mtp_drafter: VLMMTPDrafter | None = None
+        # Active vlm_mtp decode generators keyed by synthesized negative uid
+        # (negative to make collision with BatchGenerator uids impossible).
+        self._vlm_mtp_active: dict[int, _VLMMTPDecodeState] = {}
+        self._vlm_mtp_next_uid: int = -1
+        # Per-request settings snapshot for vlm_mtp routing (block size etc.).
+        # Injected by VLMBatchedEngine.set_vlm_mtp_drafter alongside the drafter.
+        self._vlm_mtp_draft_block_size: int | None = None
 
         # Phase timing instrumentation for cache-on overhead diagnostics.
         # Accumulated wall-time per phase + invocation count, dumped at request
@@ -2872,6 +2925,221 @@ class Scheduler:
         else:
             logger.info("SpecPrefill: draft model set (no SSD cache)")
 
+    def set_vlm_mtp_drafter(
+        self,
+        drafter: VLMMTPDrafter | None,
+        draft_block_size: int | None = None,
+    ) -> None:
+        """Attach a gemma4_assistant drafter for VLM MTP speculative decode.
+
+        Called by ``VLMBatchedEngine.set_vlm_mtp_drafter`` once the assistant
+        artifact is loaded. ``None`` clears the toggle.
+        """
+        self._vlm_mtp_drafter = drafter
+        self._vlm_mtp_draft_block_size = draft_block_size
+        if drafter is not None:
+            logger.info(
+                "VLM MTP drafter attached to scheduler (block_size=%s)",
+                draft_block_size,
+            )
+
+    def _route_to_vlm_mtp(
+        self,
+        request: Request,
+        prefilled_cache: list[Any],
+        last_tokens: list[int],
+        sampler: Callable[[Any], Any],
+        state_machine: Any,
+    ) -> int | None:
+        """Bypass BatchGenerator and stand up a vlm_mtp generator instead.
+
+        Runs the final forward on ``last_tokens`` with ``return_hidden=True``
+        and ``return_shared_kv=True`` so the drafter has the targets it
+        needs, samples the first bonus token from the resulting logits, and
+        returns a synthesized uid that ``step()`` will drive.
+
+        Returns ``None`` if the eligibility check fails at the last second
+        (drafter missing, language model lacks rollback hook, etc.) so the
+        caller can fall back to the normal BatchGenerator path.
+        """
+        drafter = self._vlm_mtp_drafter
+        if drafter is None:
+            return None
+
+        lm = getattr(self.model, "_language_model", None)
+        if lm is None or not hasattr(lm, "rollback_speculative_cache"):
+            logger.warning(
+                "vlm_mtp toggle on but model lacks _language_model with "
+                "rollback_speculative_cache (model=%s); falling back to "
+                "standard decode for request %s",
+                type(self.model).__name__,
+                request.request_id,
+            )
+            return None
+
+        if not last_tokens:
+            logger.warning(
+                "vlm_mtp routing skipped: last_tokens empty for request %s",
+                request.request_id,
+            )
+            return None
+
+        last_arr = mx.array(last_tokens)[None]  # (1, len_last)
+        try:
+            with mx.stream(generation_stream):
+                out = lm(
+                    last_arr,
+                    cache=prefilled_cache,
+                    return_hidden=True,
+                    return_shared_kv=True,
+                )
+                mx.eval([c.state for c in prefilled_cache])
+        except Exception as e:
+            logger.warning(
+                "vlm_mtp final-prefill forward failed (%s); falling back "
+                "to standard decode for request %s",
+                e,
+                request.request_id,
+            )
+            return None
+
+        logits = out.logits[:, -1, :]
+        first_bonus_arr = sampler(logits)  # mx.array shape [1]
+        mx.eval(first_bonus_arr)
+
+        hidden_states = out.hidden_states
+        if isinstance(hidden_states, list):
+            hidden = hidden_states[-1]
+        else:
+            hidden = hidden_states
+        # Slice to last position so the drafter sees a [B, 1, H] tensor
+        # regardless of how many tokens this forward processed.
+        if hidden.shape[1] > 1:
+            hidden = hidden[:, -1:, :]
+
+        # Combine base stop tokens (EOS, Harmony, generation_config) with
+        # request-specific stop_token_ids — same shape as _build_state_machine.
+        eos_ids: set[int] = self._get_stop_tokens()
+        if request.sampling_params.stop_token_ids:
+            eos_ids.update(request.sampling_params.stop_token_ids)
+
+        try:
+            generator = run_vlm_mtp_decode(
+                target_language_model=lm,
+                drafter=drafter,
+                prompt_cache=prefilled_cache,
+                hidden=hidden,
+                shared_kv_states=out.shared_kv_states,
+                first_bonus=int(first_bonus_arr.item()),
+                max_tokens=request.sampling_params.max_tokens,
+                sampler=sampler,
+                draft_block_size=self._vlm_mtp_draft_block_size,
+                token_dtype=mx.int32,
+                eos_token_ids=eos_ids or None,
+            )
+        except Exception as e:
+            logger.warning(
+                "vlm_mtp generator setup failed (%s); falling back for %s",
+                e,
+                request.request_id,
+            )
+            return None
+
+        uid = self._vlm_mtp_next_uid
+        self._vlm_mtp_next_uid -= 1
+        self._vlm_mtp_active[uid] = _VLMMTPDecodeState(
+            generator=generator,
+            request=request,
+            prompt_cache=prefilled_cache,
+            sampler=sampler,
+            state_machine=state_machine,
+            max_tokens=request.sampling_params.max_tokens,
+            stop_token_ids=set(eos_ids),
+        )
+        logger.info(
+            "vlm_mtp decode started: request=%s uid=%d block_size=%s",
+            request.request_id,
+            uid,
+            self._vlm_mtp_draft_block_size,
+        )
+        return uid
+
+    def _step_vlm_mtp(self) -> list[_VLMMTPResponse]:
+        """Advance every active vlm_mtp generator by one yield.
+
+        Returns the synthesized responses for ``_process_batch_responses``.
+        Mirrors mlx-lm BatchGenerator's per-step contract: one
+        ``GenerationBatch.Response``-shaped object per active uid.
+        """
+        if not self._vlm_mtp_active:
+            return []
+
+        responses: list[_VLMMTPResponse] = []
+        for uid, state in list(self._vlm_mtp_active.items()):
+            try:
+                with mx.stream(generation_stream):
+                    token_val = next(state.generator)
+            except StopIteration:
+                # Round loop exited naturally — terminate with prompt cache
+                # so the prefix-cache layer can keep using it.
+                responses.append(
+                    _VLMMTPResponse(
+                        uid=uid,
+                        token=0,
+                        finish_reason="length",
+                        prompt_cache=state.prompt_cache,
+                    )
+                )
+                state.finished = True
+                continue
+
+            # Single-request mode yields ints; batch mode (not yet routed
+            # by omlx) would yield a list. Guard so the path stays robust
+            # if we widen routing later.
+            if isinstance(token_val, list):
+                # Take the first row (we only route singles for now).
+                tok = next((t for t in token_val if t is not None), None)
+                if tok is None:
+                    responses.append(
+                        _VLMMTPResponse(
+                            uid=uid,
+                            token=0,
+                            finish_reason="length",
+                            prompt_cache=state.prompt_cache,
+                        )
+                    )
+                    state.finished = True
+                    continue
+                token = int(tok)
+            else:
+                token = int(token_val)
+
+            state.emitted += 1
+            finish_reason: str | None = None
+            if state.stop_token_ids and token in state.stop_token_ids:
+                finish_reason = "stop"
+            elif state.emitted >= state.max_tokens:
+                finish_reason = "length"
+
+            responses.append(
+                _VLMMTPResponse(
+                    uid=uid,
+                    token=token,
+                    finish_reason=finish_reason,
+                    prompt_cache=(
+                        state.prompt_cache if finish_reason is not None else None
+                    ),
+                )
+            )
+            if finish_reason is not None:
+                state.finished = True
+
+        # Drop finished entries.
+        for uid in [u for u, s in self._vlm_mtp_active.items() if s.finished]:
+            del self._vlm_mtp_active[uid]
+
+        return responses
+
     def _try_specprefill_scoring(self, request: Request) -> None:
         """Score tokens with draft model if SpecPrefill is applicable.
 
@@ -3099,7 +3367,14 @@ class Scheduler:
             return False
 
     def _remove_uid_from_active_batch(self, uid: int) -> None:
-        """Remove UID from BatchGenerator safely."""
+        """Remove UID from BatchGenerator safely.
+
+        vlm_mtp uses negative uids that BatchGenerator never sees; the
+        per-uid generator state is owned by ``_vlm_mtp_active`` and gets
+        dropped when ``_step_vlm_mtp`` marks the entry finished.
+        """
+        if uid < 0:
+            return
         if self.batch_generator is None:
             return
 
@@ -3804,6 +4079,32 @@ class Scheduler:
             # NOTE: TurboQuant KV conversion is not applied during prefill.
             # See _do_external_prefill() comment for rationale (#771).
 
+            # VLM MTP routing: if a gemma4_assistant drafter is attached, run
+            # an extra last-token forward to capture hidden + shared_kv_states,
+            # sample the first bonus, and hand the request to a vlm_mtp
+            # generator instead of BatchGenerator. Falls through on any
+            # eligibility issue so other speculative paths stay intact.
+            if self._vlm_mtp_drafter is not None and cache_to_use is not None:
+                vlm_mtp_uid = self._route_to_vlm_mtp(
+                    request, cache_to_use, tokens_to_process, sampler, sm
+                )
+                if vlm_mtp_uid is not None:
+                    self.request_id_to_uid[request.request_id] = vlm_mtp_uid
+                    self.uid_to_request_id[vlm_mtp_uid] = request.request_id
+                    now = time.monotonic()
+                    request.batch_uid = vlm_mtp_uid
+                    request.status = RequestStatus.RUNNING
+                    request.generation_started_at = now
+                    request.last_activity_at = now
+                    self.running[request.request_id] = request
+                    scheduled.append(request)
+                    self.total_prompt_tokens += request.num_prompt_tokens
+                    logger.debug(
+                        f"Scheduled request {request.request_id} via vlm_mtp "
+                        f"(uid={vlm_mtp_uid}, {request.num_prompt_tokens} prompt tokens)"
+                    )
+                    continue
+
             # Insert into BatchGenerator with pre-filled cache + last token.
             # BatchGenerator only handles decode from here.
             #
@@ -4449,8 +4750,16 @@ class Scheduler:
             # Run generation step if we have running requests.
             # Use next_generated() which returns only GenerationBatch.Response
             # objects (prefill is handled externally before insert).
-            if self.batch_generator is not None and self.running:
-                responses = self.batch_generator.next_generated()
+            if (self.batch_generator is not None or self._vlm_mtp_active) and self.running:
+                if self.batch_generator is not None:
+                    responses = list(self.batch_generator.next_generated())
+                else:
+                    responses = []
+                # Drive vlm_mtp generators alongside BatchGenerator. Order
+                # matters only for log determinism; _process_batch_responses
+                # is per-uid.
+                if self._vlm_mtp_active:
+                    responses.extend(self._step_vlm_mtp())
                 output.has_work = True
 
                 if responses:

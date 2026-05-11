@@ -551,17 +551,24 @@ class VLMBatchedEngine(BaseEngine):
     def set_vlm_mtp_drafter(self, drafter: Any) -> None:
         """Attach a loaded gemma4_assistant drafter for VLM MTP decoding.
 
-        Phase 2A: drafter is held for inspection / Phase 2B integration but
-        does not yet affect decode behavior. The toggle is observable via
-        admin/api and tests but produces no perf change.
+        Passes the drafter (and the configured draft-block size) down to
+        the scheduler so eligible requests get routed to mlx-vlm's MTP
+        round loop at decode time.
         """
         self._vlm_mtp_drafter = drafter
+        block_size = None
+        if self._model_settings is not None:
+            block_size = getattr(self._model_settings, "vlm_mtp_draft_block_size", None)
         scheduler = None
         if self._engine is not None and hasattr(self._engine, "engine"):
             scheduler = getattr(self._engine.engine, "scheduler", None)
-        if scheduler is not None:
-            scheduler._vlm_mtp_drafter = drafter  # noqa: SLF001
-        logger.info("VLM MTP drafter attached to engine: %s", self._model_name)
+        if scheduler is not None and hasattr(scheduler, "set_vlm_mtp_drafter"):
+            scheduler.set_vlm_mtp_drafter(drafter, draft_block_size=block_size)
+        logger.info(
+            "VLM MTP drafter attached to engine: %s (block_size=%s)",
+            self._model_name,
+            block_size,
+        )
 
     @property
     def vlm_mtp_drafter(self) -> Any | None:

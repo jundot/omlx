@@ -69,21 +69,9 @@ def test_load_vlm_mtp_drafter_swallows_load_exception():
     assert result is None
 
 
-def test_vlmmtpdrafter_bind_is_idempotent():
-    """``reset(target)`` must be called at most once even if bind_to is
-    called repeatedly. The drafter mutates global target state on each
-    call, so duplicate binds would corrupt the embed table reference."""
-    fake_model = _fake_drafter_model("gemma4_assistant")
-    drafter = vlm_mtp.VLMMTPDrafter(fake_model, "mtp", "/p")
-    target = MagicMock()
-    drafter.bind_to(target)
-    drafter.bind_to(target)
-    drafter.bind_to(target)
-    fake_model.reset.assert_called_once_with(target)
-
-
 def test_run_vlm_mtp_decode_single_request_dispatches_to_mtp_rounds():
-    """Single-int first_bonus routes to ``_mtp_rounds`` and yields ints."""
+    """Single-int first_bonus routes to ``_mtp_rounds``, yields first_bonus
+    then any tokens that the round loop emits."""
     fake_model = _fake_drafter_model("gemma4_assistant")
     drafter = vlm_mtp.VLMMTPDrafter(fake_model, "mtp", "/p")
     target = MagicMock()
@@ -107,11 +95,10 @@ def test_run_vlm_mtp_decode_single_request_dispatches_to_mtp_rounds():
             )
         )
 
-    assert out == [11, 22, 33]
+    # first_bonus 7 is yielded by the wrapper before _mtp_rounds takes over
+    assert out == [7, 11, 22, 33]
     m_single.assert_called_once()
     m_batch.assert_not_called()
-    # Bind happens before the loop runs
-    fake_model.reset.assert_called_once_with(target)
     # first_bonus int forwarded as int
     kwargs = m_single.call_args.kwargs
     assert kwargs["first_bonus"] == 7
@@ -119,8 +106,8 @@ def test_run_vlm_mtp_decode_single_request_dispatches_to_mtp_rounds():
 
 
 def test_run_vlm_mtp_decode_batch_dispatches_to_mtp_rounds_batch():
-    """Multi-row mx.array first_bonus routes to ``_mtp_rounds_batch`` and
-    yields the per-row list shape."""
+    """Multi-row mx.array first_bonus routes to ``_mtp_rounds_batch``,
+    emits first_bonus row then the round-loop rows."""
     fake_model = _fake_drafter_model("gemma4_assistant")
     drafter = vlm_mtp.VLMMTPDrafter(fake_model, "mtp", "/p")
     target = MagicMock()
@@ -146,7 +133,8 @@ def test_run_vlm_mtp_decode_batch_dispatches_to_mtp_rounds_batch():
             )
         )
 
-    assert out == [[1, None, 3], [None, None, None]]
+    # First yielded row is the first_bonus row (one int per request).
+    assert out == [[1, 2, 3], [1, None, 3], [None, None, None]]
     m_batch.assert_called_once()
     m_single.assert_not_called()
     kwargs = m_batch.call_args.kwargs
@@ -166,7 +154,7 @@ def test_run_vlm_mtp_decode_single_scalar_array_unwraps_to_int():
         patch.object(vlm_mtp, "_mtp_rounds", return_value=iter([])) as m_single,
         patch.object(vlm_mtp, "_mtp_rounds_batch") as m_batch,
     ):
-        list(
+        out = list(
             vlm_mtp.run_vlm_mtp_decode(
                 target_language_model=target,
                 drafter=drafter,
@@ -179,6 +167,9 @@ def test_run_vlm_mtp_decode_single_scalar_array_unwraps_to_int():
             )
         )
 
+    # _mtp_rounds yields nothing here, so only the wrapper's first_bonus
+    # emit makes it into the stream.
+    assert out == [42]
     m_single.assert_called_once()
     m_batch.assert_not_called()
     assert m_single.call_args.kwargs["first_bonus"] == 42

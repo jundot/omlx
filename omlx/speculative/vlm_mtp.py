@@ -60,23 +60,16 @@ GEMMA4_ASSISTANT_MODEL_TYPES: tuple[str, ...] = ("gemma4_assistant",)
 class VLMMTPDrafter:
     """Holds a loaded drafter together with the metadata omlx needs.
 
-    Loading is deferred to :meth:`load_for_target` so the engine_pool can
-    surface load errors with the target model id in the message.
+    ``model.reset(target)`` is intentionally NOT called here: mlx-vlm's
+    ``_mtp_rounds`` / ``_mtp_rounds_batch`` call it themselves at the
+    start of every round-loop entry, so adding an extra reset would just
+    duplicate the bind step (and could mask a target-model swap).
     """
 
     def __init__(self, model: nn.Module, draft_kind: str, source_path: str) -> None:
         self.model = model
         self.draft_kind = draft_kind
         self.source_path = source_path
-        self._is_bound = False
-
-    def bind_to(self, target_language_model: nn.Module) -> None:
-        """Call drafter.reset(target) once so the assistant captures the
-        target's embed_tokens reference."""
-        if self._is_bound:
-            return
-        self.model.reset(target_language_model)
-        self._is_bound = True
 
 
 def load_vlm_mtp_drafter(path: str) -> Optional[VLMMTPDrafter]:
@@ -151,15 +144,20 @@ def run_vlm_mtp_decode(
     """Stream decoded tokens via mlx-vlm's MTP rounds.
 
     Yields plain Python ints for single-request decode (``first_bonus`` is
-    ``int``), or ``List[Optional[int]]`` rows for batched decode
-    (``first_bonus`` is an ``mx.array`` of shape ``[B]``). ``None`` slots
-    in the batched form mark rows that have finished.
-    """
-    drafter.bind_to(target_language_model)
+    ``int`` or a B=1 ``mx.array``), or ``List[Optional[int]]`` rows for
+    batched decode (B > 1 ``mx.array``). ``None`` slots in the batched
+    form mark rows that have finished.
 
+    The wrapper yields ``first_bonus`` as its first value: mlx-vlm's
+    ``_mtp_rounds`` / ``_mtp_rounds_batch`` expect the caller to have
+    already emitted the bonus token before the round loop starts
+    (``emitted = 1`` baked in at the top of both helpers).
+    """
     is_batch = isinstance(first_bonus, mx.array) and first_bonus.size > 1
 
     if is_batch:
+        first_bonus_list = first_bonus.tolist()  # forces eval once
+        yield [int(x) for x in first_bonus_list]
         eos_set = set(eos_token_ids) if eos_token_ids else None
         for tokens, _ in _mtp_rounds_batch(
             target_language_model,
@@ -182,6 +180,8 @@ def run_vlm_mtp_decode(
         first_bonus_int = int(first_bonus.item())
     else:
         first_bonus_int = int(first_bonus)
+
+    yield first_bonus_int
 
     for tok, _ in _mtp_rounds(
         target_language_model,
