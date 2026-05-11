@@ -650,13 +650,21 @@ def _patch_qwen3_5_moe() -> None:
     def _stack_per_expert(weights, prefix, num_experts):
         if f"{prefix}.experts.0.gate_proj.weight" not in weights:
             return
+        # Metal-knowledge: also stack quantization metadata (.scales, .biases)
+        # so oQ-quantized MoE MTP layers load correctly. Without this, only
+        # .weight gets stacked and the per-expert scales/biases remain as
+        # extra unwanted parameters — "Received N parameters not in model".
         for n in ("gate_proj", "up_proj", "down_proj"):
-            weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(
-                [
-                    weights.pop(f"{prefix}.experts.{e}.{n}.weight")
-                    for e in range(num_experts)
-                ]
-            )
+            for suffix in ("weight", "scales", "biases"):
+                first_key = f"{prefix}.experts.0.{n}.{suffix}"
+                if first_key not in weights:
+                    continue
+                weights[f"{prefix}.switch_mlp.{n}.{suffix}"] = mx.stack(
+                    [
+                        weights.pop(f"{prefix}.experts.{e}.{n}.{suffix}")
+                        for e in range(num_experts)
+                    ]
+                )
 
     def sanitize(self, weights):
         new_weights = {}

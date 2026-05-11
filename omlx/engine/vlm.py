@@ -586,6 +586,17 @@ class VLMBatchedEngine(BaseEngine):
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
 
+        # Apply pre-load patches (MTP runtime patch, etc.) before the model
+        # is instantiated, so the patched ``__init__`` runs. ``maybe_apply``
+        # is a no-op when the model is incompatible.
+        try:
+            from ..utils.model_loading import maybe_apply_pre_load_patches
+            maybe_apply_pre_load_patches(
+                self._model_name, model_settings=self._model_settings
+            )
+        except Exception as e:
+            logger.debug(f"pre-load patches skipped: {e}")
+
         # Load VLM model on the global MLX executor to avoid blocking the event loop
         # while ensuring no concurrent Metal operations. See issue #85.
         from ..engine_core import get_mlx_executor
