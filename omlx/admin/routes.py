@@ -137,6 +137,10 @@ class ModelSettingsRequest(BaseModel):
     dflash_ssd_cache: Optional[bool] = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: Optional[bool] = None
+    # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
+    vlm_mtp_enabled: Optional[bool] = None
+    vlm_mtp_draft_model: Optional[str] = None
+    vlm_mtp_draft_block_size: Optional[int] = None
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
@@ -1612,6 +1616,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_in_memory_cache_max_bytes": settings.dflash_in_memory_cache_max_bytes,
                 "dflash_ssd_cache": settings.dflash_ssd_cache,
                 "mtp_enabled": settings.mtp_enabled,
+                "vlm_mtp_enabled": settings.vlm_mtp_enabled,
+                "vlm_mtp_draft_model": settings.vlm_mtp_draft_model,
+                "vlm_mtp_draft_block_size": settings.vlm_mtp_draft_block_size,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "trust_remote_code": settings.trust_remote_code,
@@ -1993,6 +2000,51 @@ async def update_model_settings(
                     detail="MTP and TurboQuant KV cannot both be enabled; TurboQuant patches the attention path MTP relies on.",
                 )
         current_settings.mtp_enabled = new_mtp_enabled
+
+    # VLM MTP (mlx-vlm 191d7c8+, gemma4_assistant drafter)
+    if "vlm_mtp_enabled" in sent:
+        new_vlm_mtp = bool(request.vlm_mtp_enabled)
+        if new_vlm_mtp:
+            drafter_after = (
+                request.vlm_mtp_draft_model
+                if "vlm_mtp_draft_model" in sent
+                else current_settings.vlm_mtp_draft_model
+            )
+            if not drafter_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "vlm_mtp_enabled requires vlm_mtp_draft_model "
+                        "(path to a gemma4_assistant drafter, "
+                        "e.g. 'gemma-4-26B-A4B-it-assistant')."
+                    ),
+                )
+            # Mutex enforced again at ModelSettings.__post_init__ for
+            # last-mile safety, but surface a clearer error here.
+            for other_field, other_label in (
+                ("dflash_enabled", "DFlash"),
+                ("specprefill_enabled", "SpecPrefill"),
+                ("mtp_enabled", "MTP"),
+                ("turboquant_kv_enabled", "TurboQuant KV"),
+            ):
+                other_after = (
+                    bool(getattr(request, other_field))
+                    if other_field in sent
+                    else getattr(current_settings, other_field)
+                )
+                if other_after:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"vlm_mtp_enabled and {other_label} cannot both be "
+                            "enabled; choose one speculative-decoding path."
+                        ),
+                    )
+        current_settings.vlm_mtp_enabled = new_vlm_mtp
+    if "vlm_mtp_draft_model" in sent:
+        current_settings.vlm_mtp_draft_model = request.vlm_mtp_draft_model or None
+    if "vlm_mtp_draft_block_size" in sent:
+        current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None

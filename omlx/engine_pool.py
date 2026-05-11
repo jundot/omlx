@@ -834,6 +834,46 @@ class EnginePool:
             self._current_model_memory += entry.estimated_size
             load_completed = True
 
+            # VLM MTP: load gemma4_assistant drafter and attach to engine.
+            # Fail-soft — drafter load issues never block the target engine.
+            if (
+                model_settings is not None
+                and getattr(model_settings, "vlm_mtp_enabled", False)
+                and getattr(model_settings, "vlm_mtp_draft_model", None)
+                and hasattr(engine, "set_vlm_mtp_drafter")
+            ):
+                drafter_id = model_settings.vlm_mtp_draft_model
+                drafter_entry = self._entries.get(drafter_id)
+                drafter_path = (
+                    drafter_entry.model_path if drafter_entry else drafter_id
+                )
+
+                def _load_drafter_sync(path: str = drafter_path):
+                    from .speculative.vlm_mtp import load_vlm_mtp_drafter
+                    return load_vlm_mtp_drafter(path)
+
+                loop = asyncio.get_running_loop()
+                try:
+                    drafter = await loop.run_in_executor(
+                        get_mlx_executor(), _load_drafter_sync
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"VLM MTP drafter load raised for {model_id} "
+                        f"(drafter={drafter_id}): {e} — toggle ignored"
+                    )
+                    drafter = None
+                if drafter is not None:
+                    engine.set_vlm_mtp_drafter(drafter)
+                    logger.info(
+                        f"VLM MTP enabled for {model_id}, drafter={drafter_id}"
+                    )
+                else:
+                    logger.warning(
+                        f"VLM MTP toggle on for {model_id} but drafter "
+                        f"load failed; toggle ignored"
+                    )
+
             # Propagate memory limit to new engine's scheduler
             if self._process_memory_enforcer is not None:
                 self._process_memory_enforcer._propagate_memory_limit()

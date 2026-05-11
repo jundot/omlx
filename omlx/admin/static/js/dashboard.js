@@ -1566,6 +1566,9 @@
                     mtp_enabled: settings.mtp_enabled || false,
                     mtp_compatible: model.mtp_compatible === true,
                     mtp_compatibility_reason: model.mtp_compatibility_reason || '',
+                    vlm_mtp_enabled: settings.vlm_mtp_enabled || false,
+                    vlm_mtp_draft_model: settings.vlm_mtp_draft_model || '',
+                    vlm_mtp_draft_block_size: settings.vlm_mtp_draft_block_size ?? null,
                     ctKwargEntries,
                     trust_remote_code: settings.trust_remote_code || false,
                 };
@@ -1664,6 +1667,14 @@
                                     && !!this.modelSettings.dflash_ssd_cache_available
                                     && !!this.modelSettings.dflash_ssd_cache,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
+                                vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
+                                vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
+                                    ? (this.modelSettings.vlm_mtp_draft_model || null)
+                                    : null,
+                                vlm_mtp_draft_block_size: this.modelSettings.vlm_mtp_enabled
+                                    && this.modelSettings.vlm_mtp_draft_block_size
+                                    ? parseInt(this.modelSettings.vlm_mtp_draft_block_size)
+                                    : null,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
                             };
                         })()),
