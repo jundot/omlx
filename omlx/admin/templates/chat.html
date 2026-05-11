@@ -420,9 +420,6 @@
                     <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX" class="w-[30px] h-[30px]" x-cloak>
                     <span class="font-semibold">{{ t('chat.brand') }}</span>
                 </a>
-                <button @click="sidebarOpen = false" class="p-1.5 hover:bg-surface-muted rounded-md" style="color: var(--text-primary);">
-                    <i data-lucide="panel-left-close" class="w-4 h-4"></i>
-                </button>
             </div>
         </div>
 
@@ -494,7 +491,8 @@
                 <i data-lucide="menu" class="w-5 h-5"></i>
             </button>
             <button @click="sidebarOpen = !sidebarOpen" class="p-2 hover:bg-surface-muted rounded-lg hidden md:block" style="color: var(--text-primary);">
-                <i data-lucide="panel-left" class="w-5 h-5"></i>
+                <i data-lucide="panel-left-open" class="w-5 h-5" x-show="!sidebarOpen"></i>
+                <i data-lucide="panel-left-close" class="w-5 h-5" x-show="sidebarOpen"></i>
             </button>
 
             <!-- Model Selector -->
