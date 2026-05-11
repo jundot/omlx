@@ -160,6 +160,10 @@
                     total_num_files: 0,
                     total_size_bytes: 0,
                     effective_block_sizes: [],
+                    hot_cache_size_bytes: 0,
+                    hot_cache_entries: 0,
+                    hot_cache_max_bytes: 0,
+                    disk_max_bytes: 0,
                 },
             },
             alltimeStats: {
@@ -190,6 +194,7 @@
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
             showClearSsdCacheConfirm: false,
+            showClearHotCacheConfirm: false,
             _statsRefreshTimer: null,
 
             // Log viewer state
@@ -2149,12 +2154,25 @@
 
             async clearSsdCache() {
                 try {
-                    await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
+                    const resp = await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
+                    if (!resp.ok) console.error('SSD cache clear failed:', resp.status);
                     this.showClearSsdCacheConfirm = false;
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear SSD cache:', err);
                     this.showClearSsdCacheConfirm = false;
+                }
+            },
+
+            async clearHotCache() {
+                try {
+                    const resp = await fetch('/admin/api/hot-cache/clear', { method: 'POST' });
+                    if (!resp.ok) console.error('Hot cache clear failed:', resp.status);
+                    this.showClearHotCacheConfirm = false;
+                    await this.loadStats();
+                } catch (err) {
+                    console.error('Failed to clear hot cache:', err);
+                    this.showClearHotCacheConfirm = false;
                 }
             },
 
@@ -2176,6 +2194,36 @@
                 if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B';
                 if (num >= 10000000) return (num / 1000000).toFixed(1) + 'M';
                 return num.toLocaleString();
+            },
+
+            cacheObsCumulative(stats, selectedModel) {
+                const entries = stats.runtime_cache?.models || [];
+                if (entries.length === 0) return {};
+
+                if (selectedModel) {
+                    const entry = entries.find(m => m.id === selectedModel);
+                    return entry?.cache_rates?.cumulative || {};
+                }
+
+                const sumKeys = ['prefix_hits', 'prefix_misses', 'evictions', 'ssd_hot_hits', 'ssd_disk_loads', 'ssd_saves', 'hot_cache_evictions', 'hot_cache_promotions'];
+                let agg = {};
+
+                for (const m of entries) {
+                    const c = m.cache_rates?.cumulative;
+                    if (!c || Object.keys(c).length === 0) continue;
+                    for (const k of sumKeys) {
+                        agg[k] = (agg[k] || 0) + (c[k] || 0);
+                    }
+                }
+
+                const ph = agg.prefix_hits || 0;
+                const pm = agg.prefix_misses || 0;
+                const sh = agg.ssd_hot_hits || 0;
+                const sd = agg.ssd_disk_loads || 0;
+                agg.prefix_hit_rate = (ph + pm) > 0 ? ph / (ph + pm) : 0;
+                agg.ssd_hot_rate = (sh + sd) > 0 ? sh / (sh + sd) : 0;
+
+                return agg;
             },
 
             getStatFontClass(value) {
@@ -2237,6 +2285,18 @@
                 if (seconds < 15) return 'bg-green-400 animate-pulse';
                 if (seconds < 30) return 'bg-amber-400 animate-pulse';
                 return 'bg-red-400';
+            },
+
+            get runtimeHotCachePercent() {
+                const rc = this.stats.runtime_cache;
+                if (!rc || !rc.hot_cache_max_bytes) return 0;
+                return Math.min(100, (rc.hot_cache_size_bytes / rc.hot_cache_max_bytes) * 100);
+            },
+
+            get runtimeSsdCachePercent() {
+                const rc = this.stats.runtime_cache;
+                if (!rc || !rc.disk_max_bytes) return 0;
+                return Math.min(100, (rc.total_size_bytes / rc.disk_max_bytes) * 100);
             },
 
             get activeModelsMemoryPercent() {
