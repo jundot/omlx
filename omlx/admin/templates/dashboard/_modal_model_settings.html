@@ -826,16 +826,19 @@
                                     </div>
                                     <div x-show="modelSettings.vlm_mtp_enabled" class="space-y-2">
                                         <label class="block text-xs font-medium text-neutral-600">{{ t('modal.model_settings.vlm_mtp_draft_model') }}</label>
-                                        <input type="text"
-                                               x-model="modelSettings.vlm_mtp_draft_model"
-                                               placeholder="gemma-4-26B-A4B-it-assistant"
-                                               class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-black" />
+                                        <select x-model="modelSettings.vlm_mtp_draft_model"
+                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-black bg-white">
+                                            <option value="">{{ t('modal.model_settings.vlm_mtp_draft_model_placeholder') }}</option>
+                                            <template x-for="m in models.filter(m => /assistant/i.test(m.id))" :key="m.id">
+                                                <option :value="m.id" x-text="m.id"></option>
+                                            </template>
+                                        </select>
                                         <label class="block text-xs font-medium text-neutral-600 mt-2">{{ t('modal.model_settings.vlm_mtp_block_size') }}</label>
                                         <input type="number"
                                                min="1"
                                                max="16"
                                                x-model.number="modelSettings.vlm_mtp_draft_block_size"
-                                               placeholder="default"
+                                               placeholder="4"
                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-black" />
                                     </div>
                                 </div>
