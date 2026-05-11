@@ -2966,6 +2966,30 @@ class Scheduler:
         if drafter is None:
             return None
 
+        # Gemma4AssistantDraftModel keeps ``_shared_kv`` / ``_input_embed`` on
+        # the module instance, so multiple in-flight ``_mtp_rounds`` generators
+        # share one drafter and effectively serialize on it: each round has
+        # to ``set_shared_kv`` for its own request before ``draft_block`` runs.
+        # Output stays correct because target-side verify is the source of
+        # truth in speculative decoding (a stale-drafter round just rejects
+        # everything and falls back to a target-only step), but the
+        # per-request tok/s is roughly halved under concurrency. Empirically
+        # at 4 concurrent, vlm_mtp gives ~14 tok/s each vs BatchGenerator's
+        # ~27 tok/s each — BG's batched matmul beats serialized speculative
+        # rounds. So we route only the first eligible request through
+        # vlm_mtp and let subsequent concurrent requests fall back. A future
+        # commit can swap this gate for true batched MTP via
+        # ``_mtp_rounds_batch`` if and when omlx prefill exposes batched
+        # hidden/shared_kv outputs.
+        if self._vlm_mtp_active:
+            logger.info(
+                "vlm_mtp routing skipped for %s: drafter is busy with %d "
+                "request(s); falling back to BatchGenerator",
+                request.request_id,
+                len(self._vlm_mtp_active),
+            )
+            return None
+
         lm = getattr(self.model, "_language_model", None)
         if lm is None or not hasattr(lm, "rollback_speculative_cache"):
             logger.warning(
