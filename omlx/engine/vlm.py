@@ -606,6 +606,13 @@ class VLMBatchedEngine(BaseEngine):
             tool_parser_type = _mlx_lm_infer(chat_template)
             if tool_parser_type is None:
                 return
+            
+            # Validation whitelist for dynamic loading
+            allowed_parsers = {"gemma", "llama", "mistral", "hermes", "phi", "qwen"}
+            if tool_parser_type not in allowed_parsers:
+                logger.warning(f"Unauthorized VLM tool parser type: {tool_parser_type}")
+                return
+
             try:
                 tool_module = importlib.import_module(
                     f"mlx_lm.tool_parsers.{tool_parser_type}"

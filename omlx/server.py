@@ -1125,7 +1125,7 @@ def init_server(
         init_auth(global_settings.auth.secret_key, lambda: _server_state.global_settings)
 
     # Configure CORS middleware from settings
-    cors_origins = global_settings.server.cors_origins if global_settings else ["*"]
+    cors_origins = global_settings.server.cors_origins if global_settings else ["http://localhost:*", "http://127.0.0.1:*"]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
