@@ -69,8 +69,8 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (e41cd25) - thread-local stream, DFlash GPU hang fix, hunyuan_vl/gemma3n cleanup
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e41cd25565861500e48c076ab31aaeafee0ed80f",
+    # mlx-vlm from commit (191d7c8) - Gemma4 MTP speculative decoding, APC, server metrics, Molmo2 fp16 fix, new VLM models
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@191d7c88bdcc98ac209a57823855b725275a1fa0",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.5.1 (110f261) — runtime_context, prefix cache (L1+L2), verify-specialized int4 qmm
     "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@110f261",

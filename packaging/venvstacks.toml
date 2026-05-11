@@ -48,8 +48,8 @@ requirements = [
     "mcp>=1.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (e41cd25) - aligned with pyproject.toml
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e41cd25565861500e48c076ab31aaeafee0ed80f",
+    # mlx-vlm from commit (191d7c8) - aligned with pyproject.toml
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@191d7c88bdcc98ac209a57823855b725275a1fa0",
     # dflash-mlx v0.1.5.1 (110f261) — runtime_context, prefix cache (L1+L2), verify-specialized int4 qmm
     "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@110f261",
     "Pillow>=9.0.0",
