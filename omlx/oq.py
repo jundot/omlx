@@ -2147,9 +2147,9 @@ def quantize_oq_streaming(
             exceeds available RAM, automatically build a temporary uniform
             4-bit proxy on disk and run sensitivity measurement on it,
             preserving oQ's data-driven mixed-precision allocation. When
-            False, falls back to a position-based heuristic (degraded
-            quality) on RAM-exceeding models. Ignored if sensitivity_model_path
-            is set explicitly.
+            False, the quantization is aborted on RAM-exceeding models so
+            that callers cannot accidentally ship a position-based
+            pseudo-oQ. Ignored if sensitivity_model_path is set explicitly.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -2263,37 +2263,49 @@ def quantize_oq_streaming(
                 num_samples=128, seq_length=256,
             )
         except Exception as e:
-            logger.error(
+            raise RuntimeError(
                 f"oQ{oq_level:g}: auto-proxy sensitivity failed ({e}). "
-                "Falling back to position-based sensitivity. Pass "
-                "sensitivity_model_path with a pre-quantized version of "
-                "this model to recover oQ accuracy."
-            )
-            sensitivity_map = {}
+                "Refusing to fall back to position-based pseudo-oQ. "
+                "Pass sensitivity_model_path with a pre-quantized version "
+                "of this model, or run on a machine with enough RAM for "
+                "full-fp16 sensitivity measurement."
+            ) from e
         finally:
             if _proxy_dir is not None and _proxy_dir.exists():
                 shutil.rmtree(_proxy_dir, ignore_errors=True)
                 logger.info(f"oQ{oq_level:g}: cleaned up proxy at {_proxy_dir}")
     elif _model_exceeds_ram:
-        logger.warning(
+        raise RuntimeError(
             f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION*100)}% "
-            "of system RAM and auto_proxy_sensitivity is disabled. Falling "
-            "back to position-based sensitivity (degraded oQ quality). Pass "
-            "sensitivity_model_path with a pre-quantized version of this "
-            "model to recover oQ accuracy."
+            "of system RAM and auto_proxy_sensitivity is disabled. "
+            "Refusing to fall back to position-based pseudo-oQ. "
+            "Enable auto_proxy_sensitivity, pass sensitivity_model_path "
+            "with a pre-quantized version of this model, or run on a "
+            "machine with enough RAM."
         )
-        sensitivity_map = {}
     else:
         logger.info(f"oQ{oq_level:g}: measuring layer sensitivity for streaming path")
         sensitivity_map = _measure_sensitivity(
             model_path, config, oq_level,
             num_samples=128, seq_length=256,
         )
-    if sensitivity_map:
-        config["_oq_sensitivity_map"] = {
-            str(k): v for k, v in sensitivity_map.items()
-        }
-        logger.info(f"oQ{oq_level:g}: sensitivity applied ({len(sensitivity_map)} layers)")
+
+    # Single enforcement point: refuse to ship a position-based pseudo-oQ.
+    # Inner measurement helpers may return {} on load/calib/layer-discovery
+    # failure; treat that as a hard error here instead of silently letting
+    # the protection-floor U-shape become the only signal.
+    if not sensitivity_map:
+        raise RuntimeError(
+            f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
+            "Refusing to proceed with position-based pseudo-oQ. Check the "
+            "preceding log lines for the root cause (model load, "
+            "calibration data, or layer discovery), and either fix it or "
+            "pass an explicit sensitivity_model_path."
+        )
+    config["_oq_sensitivity_map"] = {
+        str(k): v for k, v in sensitivity_map.items()
+    }
+    logger.info(f"oQ{oq_level:g}: sensitivity applied ({len(sensitivity_map)} layers)")
 
     named_shapes = _collect_named_weight_shapes_from_weights(all_weights)
     if text_only:
@@ -2980,9 +2992,8 @@ def _measure_sensitivity(
 
             model, tokenizer = lm_load(model_path, lazy=True)
     except Exception as e:
-        logger.warning(
-            f"Sensitivity measurement: model load failed ({e}), "
-            "using position-based"
+        logger.error(
+            f"Sensitivity measurement: model load failed ({e})"
         )
         return {}
 
@@ -3011,9 +3022,9 @@ def _build_proxy_for_sensitivity(
     """Build a temporary uniform 4-bit proxy for sensitivity measurement.
 
     Used when the source model exceeds available RAM and full-fp16
-    sensitivity measurement is not feasible. The proxy keeps oQ data-driven
-    instead of falling back to a position-based heuristic that would
-    silently degrade output quality.
+    sensitivity measurement is not feasible. The proxy keeps oQ data-driven;
+    without it, quantize_oq_streaming refuses to proceed rather than ship a
+    position-based pseudo-oQ.
 
     ``working_dir`` controls where the proxy is written. Defaults to the
     system temp dir when None, but callers should pass the parent of the
@@ -3059,7 +3070,7 @@ def _measure_sensitivity_from_quantized_model(
     try:
         model, tokenizer = lm_load(model_path, lazy=True)
     except Exception as e:
-        logger.warning(f"Sensitivity proxy load failed ({e}), using position-based")
+        logger.error(f"Sensitivity proxy load failed ({e})")
         return {}
 
     calib_data = _load_calibration_data(
