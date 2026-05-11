@@ -2265,6 +2265,9 @@ async def create_chat_completion(
     elif _server_state.settings_manager and ms.specprefill_threshold is not None:
         chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
 
+    if request.stop:
+        chat_kwargs["stop"] = request.stop
+
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(

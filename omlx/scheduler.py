@@ -1686,16 +1686,34 @@ class Scheduler:
         """Build a SequenceStateMachine for per-request stop tokens.
 
         Combines base stop tokens (EOS, Harmony) with request-specific
-        stop_token_ids into a single state machine that tells
-        BatchGenerator when to stop generating for this request.
+        stop_token_ids and tokenized stop strings into a single state
+        machine that tells BatchGenerator when to stop generating for
+        this request.
         """
         stop_tokens_set = self._get_stop_tokens()
         if request.sampling_params.stop_token_ids:
             stop_tokens_set.update(request.sampling_params.stop_token_ids)
 
-        if stop_tokens_set:
-            # Each stop token is a single-element sequence.
-            transitions = {"normal": [([t], None) for t in stop_tokens_set]}
+        transitions: dict[str, list] = {
+            "normal": [([t], None) for t in stop_tokens_set]
+        }
+
+        # Tokenize stop strings into token sequences. mlx-lm's
+        # SequenceStateMachine uses Aho-Corasick, so per-token match
+        # cost stays O(1) regardless of how many sequences are added.
+        # BPE merge edge cases (where a stop string boundary lands
+        # mid-token) may miss; that is a known limitation.
+        for stop_str in request.sampling_params.stop or []:
+            if not isinstance(stop_str, str) or not stop_str:
+                continue
+            try:
+                seq = self.tokenizer.encode(stop_str, add_special_tokens=False)
+            except TypeError:
+                seq = self.tokenizer.encode(stop_str)
+            if seq:
+                transitions["normal"].append((list(seq), None))
+
+        if transitions["normal"]:
             return SequenceStateMachine(transitions, initial="normal")
         return SequenceStateMachine({}, initial="normal")
 
@@ -4312,6 +4330,30 @@ class Scheduler:
                     # Fallback to single-token decode
                     new_text = self.tokenizer.decode([response.token])
 
+                # Text-level stop-string fallback. Catches BPE edge cases
+                # where the tokenized stop sequence does not match the
+                # model's actual output tokens (e.g. " delta" vs "delta").
+                # Only scans the tail to keep cost O(stop_len) per step.
+                stop_strs = request.sampling_params.stop or []
+                if stop_strs and not is_finished and detokenizer is not None:
+                    full_text = detokenizer.text
+                    prev_len = len(full_text) - len(new_text)
+                    for ss in stop_strs:
+                        if not ss:
+                            continue
+                        scan_start = max(0, prev_len - len(ss) + 1)
+                        idx_in_tail = full_text.find(ss, scan_start)
+                        if idx_in_tail < 0:
+                            continue
+                        is_finished = True
+                        is_stop = True
+                        response.finish_reason = "stop"
+                        if idx_in_tail >= prev_len:
+                            new_text = new_text[: idx_in_tail - prev_len]
+                        else:
+                            new_text = ""
+                        break
+
             # Prepend <think> tag for first chunk if this is a reasoning model
             # (skip when a protocol parser already manages reasoning formatting)
             if parser_session is None and getattr(request, "needs_think_prefix", False):
@@ -4382,6 +4424,20 @@ class Scheduler:
                     # Decode full output
                     output.output_text = self.tokenizer.decode(request.output_token_ids)
                     request.output_text = output.output_text
+
+                    # Trim accumulated output text at the first stop string
+                    # match so non-streaming responses do not include the
+                    # stop sequence itself (matches OpenAI semantics).
+                    if is_stop:
+                        stop_strs = request.sampling_params.stop or []
+                        for ss in stop_strs:
+                            if not ss:
+                                continue
+                            cut = output.output_text.find(ss)
+                            if cut >= 0:
+                                output.output_text = output.output_text[:cut]
+                                request.output_text = output.output_text
+                                break
 
                 # Extract cache for future reuse.
                 # In the new API, prompt_cache is a direct value (not callable).
