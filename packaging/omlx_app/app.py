@@ -62,10 +62,9 @@ from Foundation import (
     NSURL,
 )
 
-from .config import ServerConfig, resolve_local_server_base_url
 from omlx.utils.release_check import select_latest_stable_release
 
-from .config import ServerConfig
+from .config import ServerConfig, resolve_local_server_base_url
 from .server_manager import PortConflict, ServerManager, ServerStatus
 
 logger = logging.getLogger(__name__)

@@ -296,7 +296,7 @@ class ServerConfig:
         value to settings.json. Returns False if the server is unreachable or
         authentication fails.
         """
-        base_url = f"http://127.0.0.1:{self.port}"
+        base_url = resolve_local_server_base_url(self.get_server_bind_host(), self.port)
         current_key = self.get_server_api_key()
 
         try:

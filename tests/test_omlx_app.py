@@ -559,6 +559,28 @@ class TestServerConfig:
         result = config.update_model_dir_runtime("/new/models")
         assert result is False
 
+    @patch("omlx_app.config.requests.Session")
+    def test_update_model_dir_runtime_custom_bind(self, mock_session_cls, tmp_path):
+        """Runtime model dir update hits custom bind host, not 127.0.0.1."""
+        config = ServerConfig(base_path=str(tmp_path), port=8000)
+        config.set_server_api_key("current-key")
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"server": {"host": "100.64.0.5", "port": 8000}})
+        )
+
+        mock_session = Mock()
+        mock_session_cls.return_value = mock_session
+        mock_session.post.side_effect = [
+            Mock(status_code=200),  # login
+            Mock(status_code=200),  # settings update
+        ]
+
+        result = config.update_model_dir_runtime("/new/models")
+        assert result is True
+        posted_urls = [c.args[0] for c in mock_session.post.call_args_list]
+        assert all("100.64.0.5" in u for u in posted_urls)
+        assert not any("127.0.0.1" in u for u in posted_urls)
+
 
 class TestResolveLocalServerUrls:
     """Tests for bind-host-aware local URL resolution."""
