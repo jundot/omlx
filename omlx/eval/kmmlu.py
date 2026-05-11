@@ -17,7 +17,7 @@ from .datasets import load_jsonl, stratified_sample
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent / "data"
-ANSWER_MAP = {0: "A", 1: "B", 2: "C", 3: "D"}
+ANSWER_MAP = {1: "A", 2: "B", 3: "C", 4: "D"}
 
 
 def _format_subject_name(subject: str) -> str:
@@ -28,7 +28,7 @@ def _format_question(item: dict) -> str:
     question = item["question"]
     choices = item["choices"]
     parts = [question]
-    for i, choice in enumerate(choices):
+    for i, choice in enumerate(choices, start=1):
         parts.append(f"{ANSWER_MAP[i]}. {choice}")
     return "\n".join(parts)
 
