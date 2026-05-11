@@ -828,6 +828,50 @@ class _TrackedTensor:
     def astype(self, dtype):
         return _TrackedTensor(self.shape, dtype, list(self.sources), "astype")
 
+    def moveaxis(self, src, dst):
+        """Mirror ``mx.array.moveaxis`` for streaming discovery.
+
+        Stock mlx-vlm sanitizers call this as an instance method
+        (e.g. ``value.moveaxis(2, 1)`` to fix conv1d weight layout). Without
+        this method the streaming discovery falls back to eager sanitize,
+        which loads the entire model into Metal memory — fatal for >120 GB
+        checkpoints. The ``(src, dst)`` pair is stored in the ``axis`` slot
+        so the writeback phase can replay the exact permutation.
+        """
+        new_shape = list(self.shape)
+        moved = new_shape.pop(src)
+        new_shape.insert(dst, moved)
+        result = _TrackedTensor(
+            tuple(new_shape), self.dtype, list(self.sources), "moveaxis"
+        )
+        result.axis = (int(src), int(dst))
+        return result
+
+    def transpose(self, *axes):
+        """Mirror ``mx.array.transpose`` for streaming discovery.
+
+        Accepts either ``transpose(2, 0, 1)`` or ``transpose((2, 0, 1))``;
+        ``transpose()`` with no args is reverse-axes (same as ``.T``).
+        Used by Qwen3-VL VisionModel.sanitize and other vision-tower
+        sanitizers that reshape patch weights. The permutation tuple is
+        stored in the ``axis`` slot so the writeback phase can replay it
+        exactly — ``mx.transpose(arr)`` with no args gives reverse-axes
+        which is wrong for permutations like ``(0, 2, 3, 4, 1)``.
+        """
+        if not axes:
+            new_shape = tuple(reversed(self.shape))
+            perm = tuple(reversed(range(self.ndim)))
+        else:
+            if len(axes) == 1 and isinstance(axes[0], (tuple, list)):
+                axes = tuple(axes[0])
+            new_shape = tuple(self.shape[i] for i in axes)
+            perm = tuple(int(a) for a in axes)
+        result = _TrackedTensor(
+            new_shape, self.dtype, list(self.sources), "transpose"
+        )
+        result.axis = perm
+        return result
+
     @property
     def T(self):
         return _TrackedTensor(tuple(reversed(self.shape)), self.dtype, list(self.sources), "transpose")
@@ -1033,7 +1077,9 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
             dims = list(range(tensor.ndim))
             dims.insert(dst_ax, dims.pop(src_ax))
             new_shape = tuple(tensor.shape[d] for d in dims)
-            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources), "moveaxis")
+            result = _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources), "moveaxis")
+            result.axis = (int(src_ax), int(dst_ax))
+            return result
         return _orig["moveaxis"](tensor, src_ax, dst_ax)
 
     def _fake_transpose(tensor, axes=None):
@@ -1041,7 +1087,9 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
             if axes is None:
                 axes = list(reversed(range(tensor.ndim)))
             new_shape = tuple(tensor.shape[a] for a in axes)
-            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources), "transpose")
+            result = _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources), "transpose")
+            result.axis = tuple(int(a) for a in axes)
+            return result
         return _orig["transpose"](tensor, axes=axes)
 
     def _noop(*a, **kw): pass
@@ -1212,21 +1260,33 @@ class _DiscoveredPlan:
             mx.clear_cache()
             return result
 
-        # NOTE: discovery records transform TYPE but not parameters.
-        # These hardcoded values cover all current mlx-lm/mlx-vlm sanitize
-        # patterns. If a future model uses different parameters, discovery
-        # will fail and the eager sanitize fallback handles it safely.
+        # NOTE: discovery records transform TYPE; for ``transpose`` and
+        # ``moveaxis`` the actual permutation is captured in
+        # ``info["axis"]`` (see _TrackedTensor.transpose/.moveaxis and
+        # _fake_transpose/_fake_moveaxis). The ``add`` writeback still
+        # hardcodes ``+1.0`` because that's the only norm-shift pattern
+        # we know of; if a sanitize adds a different scalar, discovery
+        # should be extended to capture it.
         if transform == "add":
             arr = self._materialize_source(sources[0])
             return arr + 1.0  # norm weight += 1.0 pattern
 
         if transform == "transpose":
             arr = self._materialize_source(sources[0])
-            return mx.transpose(arr)  # full axis reverse
+            axes = info.get("axis")
+            if axes is None:
+                # Pre-perm-aware discovery: full axis reverse (legacy ``.T``).
+                return mx.transpose(arr)
+            return mx.transpose(arr, axes=list(axes))
 
         if transform == "moveaxis":
             arr = self._materialize_source(sources[0])
-            return mx.moveaxis(arr, 2, 1)  # conv1d weight permute
+            params = info.get("axis")
+            if params is None:
+                # Legacy: assumed conv1d weight permute (2, 1).
+                return mx.moveaxis(arr, 2, 1)
+            src_ax, dst_ax = params
+            return mx.moveaxis(arr, src_ax, dst_ax)
 
         if "split_" in transform:
             # split_N_M means take part N of M
