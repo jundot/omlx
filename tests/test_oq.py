@@ -1398,8 +1398,7 @@ class TestBuildProxyForSensitivity:
 
     The proxy is created when the source model exceeds available RAM and the
     user has not supplied a pre-quantized model via sensitivity_model_path.
-    Without it, quantize_oq_streaming refuses to proceed rather than ship a
-    position-based pseudo-oQ.
+    Without it, quantize_oq_streaming aborts with a RuntimeError.
     """
 
     def test_invokes_mlx_lm_convert_with_uniform_4bit_affine(self, tmp_path):
@@ -1482,11 +1481,9 @@ class TestBuildProxyForSensitivity:
 
 
 class TestSensitivityRequiredEnforcement:
-    """Regression tests for the 'no position-based pseudo-oQ' guarantee.
-
-    When sensitivity measurement cannot run for any reason, quantize_oq_streaming
-    must raise RuntimeError instead of silently letting the protection-floor
-    U-shape become the only signal.
+    """Regression tests: quantize_oq_streaming must abort when sensitivity
+    measurement cannot run, rather than silently producing an output that
+    skipped the data-driven step.
     """
 
     def test_opt_out_with_model_exceeding_ram_raises(self, tmp_path, monkeypatch):
@@ -1505,7 +1502,7 @@ class TestSensitivityRequiredEnforcement:
 
         monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
 
-        with pytest.raises(RuntimeError, match="position-based pseudo-oQ"):
+        with pytest.raises(RuntimeError, match="auto_proxy_sensitivity is disabled"):
             quantize_oq_streaming(
                 str(src),
                 str(tmp_path / "out"),
@@ -1717,8 +1714,8 @@ class TestQuantizeOqStreamingFp8:
     These tests exercise the FP8 dequant + streaming write path on synthetic
     safetensors data, so the source models cannot be loaded by mlx_lm.load.
     Real sensitivity measurement would fail; we mock it out per class to keep
-    the focus on the FP8 dequant path. The 'no position-based pseudo-oQ'
-    contract is covered separately by TestSensitivityRequiredEnforcement.
+    the focus on the FP8 dequant path. The sensitivity-required contract is
+    covered separately by TestSensitivityRequiredEnforcement.
     """
 
     @pytest.fixture(autouse=True)

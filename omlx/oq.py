@@ -2147,9 +2147,9 @@ def quantize_oq_streaming(
             exceeds available RAM, automatically build a temporary uniform
             4-bit proxy on disk and run sensitivity measurement on it,
             preserving oQ's data-driven mixed-precision allocation. When
-            False, the quantization is aborted on RAM-exceeding models so
-            that callers cannot accidentally ship a position-based
-            pseudo-oQ. Ignored if sensitivity_model_path is set explicitly.
+            False, the quantization aborts on RAM-exceeding models with a
+            RuntimeError so callers always get a real sensitivity-driven
+            output. Ignored if sensitivity_model_path is set explicitly.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -2265,7 +2265,6 @@ def quantize_oq_streaming(
         except Exception as e:
             raise RuntimeError(
                 f"oQ{oq_level:g}: auto-proxy sensitivity failed ({e}). "
-                "Refusing to fall back to position-based pseudo-oQ. "
                 "Pass sensitivity_model_path with a pre-quantized version "
                 "of this model, or run on a machine with enough RAM for "
                 "full-fp16 sensitivity measurement."
@@ -2278,7 +2277,6 @@ def quantize_oq_streaming(
         raise RuntimeError(
             f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION*100)}% "
             "of system RAM and auto_proxy_sensitivity is disabled. "
-            "Refusing to fall back to position-based pseudo-oQ. "
             "Enable auto_proxy_sensitivity, pass sensitivity_model_path "
             "with a pre-quantized version of this model, or run on a "
             "machine with enough RAM."
@@ -2290,15 +2288,14 @@ def quantize_oq_streaming(
             num_samples=128, seq_length=256,
         )
 
-    # Single enforcement point: refuse to ship a position-based pseudo-oQ.
-    # Inner measurement helpers may return {} on load/calib/layer-discovery
-    # failure; treat that as a hard error here instead of silently letting
-    # the protection-floor U-shape become the only signal.
+    # Single enforcement point. Inner measurement helpers may return {} on
+    # load / calibration / layer-discovery failure; treat that as a hard
+    # error here so the rest of quantize_oq_streaming never runs without a
+    # data-driven sensitivity map.
     if not sensitivity_map:
         raise RuntimeError(
             f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
-            "Refusing to proceed with position-based pseudo-oQ. Check the "
-            "preceding log lines for the root cause (model load, "
+            "Check the preceding log lines for the root cause (model load, "
             "calibration data, or layer discovery), and either fix it or "
             "pass an explicit sensitivity_model_path."
         )
@@ -3023,8 +3020,7 @@ def _build_proxy_for_sensitivity(
 
     Used when the source model exceeds available RAM and full-fp16
     sensitivity measurement is not feasible. The proxy keeps oQ data-driven;
-    without it, quantize_oq_streaming refuses to proceed rather than ship a
-    position-based pseudo-oQ.
+    without it, quantize_oq_streaming aborts the run with a RuntimeError.
 
     ``working_dir`` controls where the proxy is written. Defaults to the
     system temp dir when None, but callers should pass the parent of the
