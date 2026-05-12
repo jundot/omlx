@@ -72,8 +72,8 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (191d7c8) - Gemma4 MTP speculative decoding, APC, server metrics, Molmo2 fp16 fix, new VLM models
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@191d7c88bdcc98ac209a57823855b725275a1fa0",
+    # mlx-vlm from commit (f96138e) - Gemma4 MTP server batching (PR #1166), speculative utils refactor (PR #1169), Qwen native MTP drafter, MiniCPM-V 4.6
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@f96138eef1f5ce7fb5d97f8dd41a664a195b5659",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.5.1 (20d68db) — original bstnxbt repo. Gemma4 support, runtime package refactor, stable prefix snapshot reuse
     "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@20d68db3b3c0ae3dd6d3a2f0d3c10b2344ee514e",

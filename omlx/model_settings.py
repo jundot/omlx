@@ -142,7 +142,7 @@ class ModelSettings:
     # qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with dflash and turboquant.
     mtp_enabled: bool = False
 
-    # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+).
+    # VLM MTP speculative decoding via external assistant drafter (mlx-vlm f96138e+).
     # Target = Gemma4 VLM body, drafter = "gemma-4-26B-A4B-it-assistant"
     # (model_type "gemma4_assistant"). Mutually exclusive with all other speculative
     # paths because the wrapper bypasses mlx-lm BatchGenerator at decode time.

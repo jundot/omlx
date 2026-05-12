@@ -2015,7 +2015,7 @@ async def update_model_settings(
                 )
         current_settings.mtp_enabled = new_mtp_enabled
 
-    # VLM MTP (mlx-vlm 191d7c8+, gemma4_assistant drafter)
+    # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
     if "vlm_mtp_enabled" in sent:
         new_vlm_mtp = bool(request.vlm_mtp_enabled)
         if new_vlm_mtp:
