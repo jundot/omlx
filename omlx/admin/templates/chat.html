@@ -372,11 +372,18 @@
         position: relative;
     }
 
-    .user-edit-btn {
+    .user-message-actions {
         position: absolute;
-        left: -32px;
-        top: 50%;
-        transform: translateY(-50%);
+        left: -64px;
+        top: 4px;
+        display: flex;
+        flex-direction: row;
+        gap: 4px;
+        opacity: 0;
+        transition: opacity 0.15s;
+    }
+
+    .user-message-action-btn {
         width: 28px;
         height: 28px;
         display: flex;
@@ -388,14 +395,13 @@
         color: var(--text-tertiary);
         cursor: pointer;
         transition: all 0.15s;
-        opacity: 0;
     }
 
-    .user-message:hover .user-edit-btn {
+    .user-message:hover .user-message-actions {
         opacity: 1;
     }
 
-    .user-edit-btn:hover {
+    .user-message-action-btn:hover {
         background: var(--bg-secondary);
         color: var(--text-secondary);
     }
@@ -581,7 +587,7 @@
             display: none;
         }
 
-        .user-edit-btn {
+        .user-message-actions {
             left: -28px;
         }
 
@@ -804,7 +810,8 @@
                 style="color: var(--text-primary);">
                 <i data-lucide="menu" class="w-5 h-5"></i>
             </button>
-            <button @click="sidebarOpen = !sidebarOpen" class="p-2 hover:bg-surface-muted rounded-lg hidden md:block" style="color: var(--text-primary);">
+            <button @click="sidebarOpen = !sidebarOpen" class="p-2 hover:bg-surface-muted rounded-lg hidden md:block"
+                style="color: var(--text-primary);">
                 <i data-lucide="panel-left-open" class="w-5 h-5" x-show="!sidebarOpen"></i>
                 <i data-lucide="panel-left-close" class="w-5 h-5" x-show="sidebarOpen"></i>
             </button>
@@ -872,10 +879,16 @@
                         <!-- User Message -->
                         <div x-show="msg.role === 'user'" class="flex justify-end">
                             <div class="user-message" :class="{ 'is-editing': editingIndex === index }">
-                                <button @click="startEdit(index)" class="user-edit-btn"
-                                    title="{{ t('chat.edit_tooltip') }}">
-                                    <i data-lucide="pencil" class="w-4 h-4"></i>
-                                </button>
+                                <div x-show="editingIndex !== index" class="user-message-actions">
+                                    <button @click="copyMessage(msg.content)" class="user-message-action-btn"
+                                        title="{{ t('chat.copy_tooltip') }}">
+                                        <i data-lucide="copy" class="w-4 h-4"></i>
+                                    </button>
+                                    <button @click="startEdit(index)" class="user-message-action-btn"
+                                        title="{{ t('chat.edit_tooltip') }}">
+                                        <i data-lucide="pencil" class="w-4 h-4"></i>
+                                    </button>
+                                </div>
                                 <template x-if="editingIndex !== index">
                                     <div>
                                         <!-- Images from content array -->
@@ -1341,23 +1354,23 @@
 
                 const serverApiKey = {{ api_key | tojson }};
 
-                if (serverApiKey) {
-                    localStorage.setItem('omlx_chat_api_key', serverApiKey);
-                }
+        if (serverApiKey) {
+            localStorage.setItem('omlx_chat_api_key', serverApiKey);
+        }
 
-                const storedKey = localStorage.getItem('omlx_chat_api_key');
-                if (storedKey) {
-                    this.apiKeySet = true;
-                    await this.loadModels();
-                    this.loadChatHistory();
-                    this.fetchMcpTools();
-                }
+        const storedKey = localStorage.getItem('omlx_chat_api_key');
+        if (storedKey) {
+            this.apiKeySet = true;
+            await this.loadModels();
+            this.loadChatHistory();
+            this.fetchMcpTools();
+        }
 
-                this.applyTheme();
+        this.applyTheme();
 
-                this.$nextTick(() => {
-                    this.setupScrollListener();
-                });
+        this.$nextTick(() => {
+            this.setupScrollListener();
+        });
 
     },
 
