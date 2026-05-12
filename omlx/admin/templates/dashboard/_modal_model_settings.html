@@ -582,8 +582,14 @@
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.turboquant_kv') }}</span>
                                             <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.turboquant_kv_hint') }}</p>
                                         </div>
-                                        <button type="button" @click="modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
-                                                :class="modelSettings.turboquant_kv_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                        <button type="button"
+                                                @click="if (!modelSettings.is_paroquant) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
+                                                :disabled="modelSettings.is_paroquant"
+                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : ''"
+                                                :class="[
+                                                    modelSettings.turboquant_kv_enabled ? 'bg-black' : 'bg-neutral-200',
+                                                    modelSettings.is_paroquant ? 'opacity-40 cursor-not-allowed' : ''
+                                                ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.turboquant_kv_enabled ? 'translate-x-5' : 'translate-x-0'"
                                                   class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -612,8 +618,14 @@
                                                 <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.index_cache') }}</span>
                                                 <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.index_cache_hint') }} (<a href="https://github.com/THUDM/IndexCache" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">GitHub</a>)</p>
                                             </div>
-                                            <button type="button" @click="modelSettings.enableIndexCache = !modelSettings.enableIndexCache; if (!modelSettings.enableIndexCache) modelSettings.index_cache_freq = null;"
-                                                    :class="modelSettings.enableIndexCache ? 'bg-black' : 'bg-neutral-200'"
+                                            <button type="button"
+                                                    @click="if (!modelSettings.is_paroquant) { modelSettings.enableIndexCache = !modelSettings.enableIndexCache; if (!modelSettings.enableIndexCache) modelSettings.index_cache_freq = null; }"
+                                                    :disabled="modelSettings.is_paroquant"
+                                                    :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : ''"
+                                                    :class="[
+                                                        modelSettings.enableIndexCache ? 'bg-black' : 'bg-neutral-200',
+                                                        modelSettings.is_paroquant ? 'opacity-40 cursor-not-allowed' : ''
+                                                    ]"
                                                     class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="modelSettings.enableIndexCache ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -634,8 +646,14 @@
                                             <span class="text-sm font-medium text-neutral-700">SpecPrefill</span>
                                             <p class="text-xs text-neutral-500 mt-0.5">Attention-based sparse prefill for MoE/hybrid models. (<a href="https://arxiv.org/abs/2502.02789" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">Paper</a>) (<a href="https://huggingface.co/Thump604/specprefill-paper" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">HuggingFace</a>)</p>
                                         </div>
-                                        <button type="button" @click="modelSettings.specprefill_enabled = !modelSettings.specprefill_enabled"
-                                                :class="modelSettings.specprefill_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                        <button type="button"
+                                                @click="if (!modelSettings.is_paroquant) modelSettings.specprefill_enabled = !modelSettings.specprefill_enabled"
+                                                :disabled="modelSettings.is_paroquant"
+                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : ''"
+                                                :class="[
+                                                    modelSettings.specprefill_enabled ? 'bg-black' : 'bg-neutral-200',
+                                                    modelSettings.is_paroquant ? 'opacity-40 cursor-not-allowed' : ''
+                                                ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.specprefill_enabled ? 'translate-x-5' : 'translate-x-0'"
                                                   class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -846,11 +864,12 @@
                                                class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.vlm_mtp_conflict') }}</p>
                                         </div>
                                         <button type="button"
-                                                @click="if (!modelSettings.dflash_enabled && !modelSettings.specprefill_enabled && !modelSettings.mtp_enabled && !modelSettings.turboquant_kv_enabled) modelSettings.vlm_mtp_enabled = !modelSettings.vlm_mtp_enabled"
-                                                :disabled="modelSettings.dflash_enabled || modelSettings.specprefill_enabled || modelSettings.mtp_enabled || modelSettings.turboquant_kv_enabled"
+                                                @click="if (!modelSettings.is_paroquant && !modelSettings.dflash_enabled && !modelSettings.specprefill_enabled && !modelSettings.mtp_enabled && !modelSettings.turboquant_kv_enabled) modelSettings.vlm_mtp_enabled = !modelSettings.vlm_mtp_enabled"
+                                                :disabled="modelSettings.is_paroquant || modelSettings.dflash_enabled || modelSettings.specprefill_enabled || modelSettings.mtp_enabled || modelSettings.turboquant_kv_enabled"
+                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : ''"
                                                 :class="[
                                                     modelSettings.vlm_mtp_enabled ? 'bg-black' : 'bg-neutral-200',
-                                                    (modelSettings.dflash_enabled || modelSettings.specprefill_enabled || modelSettings.mtp_enabled || modelSettings.turboquant_kv_enabled) ? 'opacity-40 cursor-not-allowed' : ''
+                                                    (modelSettings.is_paroquant || modelSettings.dflash_enabled || modelSettings.specprefill_enabled || modelSettings.mtp_enabled || modelSettings.turboquant_kv_enabled) ? 'opacity-40 cursor-not-allowed' : ''
                                                 ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.vlm_mtp_enabled ? 'translate-x-5' : 'translate-x-0'"

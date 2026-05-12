@@ -340,12 +340,48 @@ def _format_cache_size(size_bytes: int) -> str:
     return f"{mb:.0f}MB"
 
 
+_PAROQUANT_REASON = (
+    "Not supported on paroquant models yet (compatibility not verified)"
+)
+
+
+def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
+    """Detect whether a model is paroquant-quantized.
+
+    Returns ``(is_paroquant, reason)``. ``is_paroquant`` is True iff
+    ``config.json`` declares ``quantization_config.quant_method == "paroquant"``.
+    Reason is the user-facing string surfaced as a tooltip/banner on the
+    admin model settings modal when paroquant gates an experimental toggle.
+    """
+    import json
+    from pathlib import Path
+
+    model_path = model_info.get("model_path") or ""
+    if not model_path:
+        return False, ""
+    cfg_path = Path(model_path) / "config.json"
+    if not cfg_path.exists():
+        return False, ""
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except Exception:
+        return False, ""
+    qcfg = cfg.get("quantization_config") or {}
+    method = (qcfg.get("quant_method") or "").lower()
+    if method == "paroquant":
+        return True, _PAROQUANT_REASON
+    return False, ""
+
+
 def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     """Resolve dflash compatibility for an engine_pool model dict.
 
     Returns ``(False, "")`` when dflash-mlx is not installed so the UI hides
     the compat hint instead of pointing the user at an unrelated reason.
     """
+    is_paro, paro_reason = _paroquant_compat_for_model(model_info)
+    if is_paro:
+        return False, paro_reason
     try:
         from ..engine.dflash import is_dflash_compatible
     except ImportError:
@@ -371,6 +407,10 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     from pathlib import Path
 
     from ..utils.model_loading import _has_mtp_heads, _is_mtp_compatible
+
+    is_paro, paro_reason = _paroquant_compat_for_model(model_info)
+    if is_paro:
+        return False, paro_reason
 
     model_path = model_info.get("model_path") or ""
     if not model_path:
@@ -1558,6 +1598,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         model_id = model_info["id"]
         settings = all_settings.get(model_id)
 
+        is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
 
@@ -1581,6 +1622,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "dflash_ssd_cache_available": dflash_ssd_cache_available,
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
+            "is_paroquant": is_paroquant,
+            "paroquant_reason": paroquant_reason,
         }
 
         # Add settings if available
@@ -5104,6 +5147,15 @@ async def start_oq_quantization(
         raise HTTPException(
             status_code=400,
             detail="Invalid dtype. Must be 'bfloat16' or 'float16'",
+        )
+    is_paro, _ = _paroquant_compat_for_model({"model_path": request.model_path})
+    if is_paro:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Model is already quantized with paroquant; "
+                "oQ re-quantization is not supported"
+            ),
         )
     try:
         task = await _oq_manager.start_quantization(
