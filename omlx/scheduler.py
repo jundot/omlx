@@ -258,6 +258,107 @@ except ImportError:
     pass
 
 
+# Monkey-patch ChunkedKVCache for Llama-4 (Scout / Maverick): mlx_lm's
+# ChunkedKVCache lacks the batch-aware methods (`merge`, `filter`, `extract`,
+# `size`, `extend`) that BatchGenerator's continuous-batching code path
+# expects, so any chat completion targeting a Llama-4 model raises
+# `Cache corruption not recoverable: <ChunkedKVCache> does not yet support
+# batching with history` and returns 500.
+#
+# Real continuous batching with chunked attention is unimplemented upstream;
+# this patch installs batch=1 pass-throughs so serialized requests work.
+# Run the server with `--max-concurrent-requests 1` to honor the assumption.
+try:
+    from mlx_lm.models.cache import ChunkedKVCache as _CKVCache
+
+    _ckvcache_methods_skipped: list[str] = []
+
+    if not hasattr(_CKVCache, "merge"):
+        @classmethod
+        def _ckvcache_merge_passthrough(cls, caches):
+            if len(caches) == 1:
+                return caches[0]
+            raise NotImplementedError(
+                "ChunkedKVCache.merge for batch_size > 1 is not implemented. "
+                "Run with --max-concurrent-requests 1 when serving Llama-4."
+            )
+
+        _CKVCache.merge = _ckvcache_merge_passthrough
+    else:
+        _ckvcache_methods_skipped.append("merge")
+
+    if not hasattr(_CKVCache, "filter"):
+        def _ckvcache_filter_passthrough(self, batch_indices):
+            try:
+                n = len(batch_indices)
+            except TypeError:
+                n = int(getattr(batch_indices, "shape", (0,))[0] or 0)
+            if n == 0:
+                self.keys = None
+                self.values = None
+                self.offset = 0
+                self.start_position = 0
+                return
+            if n == 1:
+                return
+            raise NotImplementedError(
+                f"ChunkedKVCache.filter with batch_size={n} > 1 is not "
+                "implemented. Run with --max-concurrent-requests 1 when "
+                "serving Llama-4."
+            )
+
+        _CKVCache.filter = _ckvcache_filter_passthrough
+    else:
+        _ckvcache_methods_skipped.append("filter")
+
+    if not hasattr(_CKVCache, "extract"):
+        def _ckvcache_extract_passthrough(self, idx):
+            return self
+
+        _CKVCache.extract = _ckvcache_extract_passthrough
+    else:
+        _ckvcache_methods_skipped.append("extract")
+
+    if not hasattr(_CKVCache, "size"):
+        def _ckvcache_size(self):
+            return max(0, self.offset - self.start_position)
+
+        _CKVCache.size = _ckvcache_size
+    else:
+        _ckvcache_methods_skipped.append("size")
+
+    if not hasattr(_CKVCache, "extend"):
+        def _ckvcache_extend_passthrough(self, other):
+            if other is None or other.empty():
+                return
+            if self.empty():
+                self.keys = other.keys
+                self.values = other.values
+                self.offset = other.offset
+                self.start_position = other.start_position
+                return
+            raise NotImplementedError(
+                "ChunkedKVCache.extend across non-empty caches is not "
+                "supported. Run with --max-concurrent-requests 1."
+            )
+
+        _CKVCache.extend = _ckvcache_extend_passthrough
+    else:
+        _ckvcache_methods_skipped.append("extend")
+
+    if _ckvcache_methods_skipped:
+        # Upstream may have landed implementations between mlx_lm upgrades.
+        # Surface which ones so a regression in Llama-4 batching is visible
+        # to operators without diffing the patch against installed mlx_lm.
+        logger.info(
+            "ChunkedKVCache patch: methods already present upstream, "
+            "skipped: %s",
+            ", ".join(_ckvcache_methods_skipped),
+        )
+except ImportError:
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Monkey-patch PromptProcessingBatch.prompt to set mRoPE deltas before the
 # prompt processing loop.  Without this, batched VLM prompt processing
@@ -284,6 +385,9 @@ PromptProcessingBatch.prompt = _patched_ppb_prompt
 
 
 # Cache class names known to be sliceable (no boundary snapshots needed).
+# ChunkedKVCache is included once the batch=1 patch above installs its
+# extract/filter/size pass-throughs; without it Llama-4 requests fall
+# back to the snapshot path unnecessarily.
 _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
     {
         "KVCache",
@@ -291,6 +395,7 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "QuantizedKVCache",
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
+        "ChunkedKVCache",
     }
 )
 
