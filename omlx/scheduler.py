@@ -16,6 +16,7 @@ import copy
 import gc
 import logging
 import os
+import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
@@ -85,6 +86,15 @@ class _VLMMTPResponse:
     prompt_cache: Any = None
 
 
+# Serializes Metal buffer-protocol access from the async store-cache worker
+# against inference-thread mx.clear_cache / mx.synchronize calls that can
+# invalidate the underlying buffer pool. Closes a SIGABRT path where
+# _async_store_cache_worker reads tensor bytes via memoryview while the
+# inference thread concurrently issues a reclaim-triggering mx op.
+# See: https://github.com/jundot/omlx/issues/1106
+_mx_buffer_access_lock = threading.RLock()
+
+
 def _sync_and_clear_cache():
     """Synchronize in-flight GPU work before clearing the Metal buffer cache.
 
@@ -94,18 +104,38 @@ def _sync_and_clear_cache():
     'completeMemory() prepare count underflow' kernel panic on M4 hardware
     (and SIGSEGV/SIGABRT on M3).
 
-    See: https://github.com/jundot/omlx/issues/300, #888
+    Held under _mx_buffer_access_lock so the async store-cache worker cannot
+    observe a half-reclaimed Metal buffer pool while it is in the middle of
+    reading tensor bytes via the Python buffer protocol (#1106).
+
+    See: https://github.com/jundot/omlx/issues/300, #888, #1106
     """
-    # Generation_stream may not have in-flight work on the current thread
-    # (e.g. external prefill submits to the default stream). On some MLX
-    # builds mx.synchronize raises "There is no Stream(gpu, 0) in current
-    # thread" in that case; swallow it since there is nothing to drain.
+    with _mx_buffer_access_lock:
+        # Generation_stream may not have in-flight work on the current thread
+        # (e.g. external prefill submits to the default stream). On some MLX
+        # builds mx.synchronize raises "There is no Stream(gpu, 0) in current
+        # thread" in that case; swallow it since there is nothing to drain.
+        try:
+            mx.synchronize(generation_stream)
+        except RuntimeError:
+            pass
+        mx.synchronize()  # default stream
+        mx.clear_cache()
+
+
+def _safe_sync_generation_stream():
+    """mx.synchronize(generation_stream) that tolerates cross-thread calls.
+
+    Generation_stream is owned by the _mlx_executor thread. Teardown paths
+    that run on the main thread (via EngineCore.close) hit "no Stream in
+    current thread" RuntimeError. Swallow that specific case so cleanup can
+    proceed; re-raise anything else so real GPU errors stay visible.
+    """
     try:
         mx.synchronize(generation_stream)
-    except RuntimeError:
-        pass
-    mx.synchronize()  # default stream
-    mx.clear_cache()
+    except RuntimeError as e:
+        if "no Stream" not in str(e):
+            raise
 
 
 # Import tiered cache components
@@ -228,6 +258,107 @@ except ImportError:
     pass
 
 
+# Monkey-patch ChunkedKVCache for Llama-4 (Scout / Maverick): mlx_lm's
+# ChunkedKVCache lacks the batch-aware methods (`merge`, `filter`, `extract`,
+# `size`, `extend`) that BatchGenerator's continuous-batching code path
+# expects, so any chat completion targeting a Llama-4 model raises
+# `Cache corruption not recoverable: <ChunkedKVCache> does not yet support
+# batching with history` and returns 500.
+#
+# Real continuous batching with chunked attention is unimplemented upstream;
+# this patch installs batch=1 pass-throughs so serialized requests work.
+# Run the server with `--max-concurrent-requests 1` to honor the assumption.
+try:
+    from mlx_lm.models.cache import ChunkedKVCache as _CKVCache
+
+    _ckvcache_methods_skipped: list[str] = []
+
+    if not hasattr(_CKVCache, "merge"):
+        @classmethod
+        def _ckvcache_merge_passthrough(cls, caches):
+            if len(caches) == 1:
+                return caches[0]
+            raise NotImplementedError(
+                "ChunkedKVCache.merge for batch_size > 1 is not implemented. "
+                "Run with --max-concurrent-requests 1 when serving Llama-4."
+            )
+
+        _CKVCache.merge = _ckvcache_merge_passthrough
+    else:
+        _ckvcache_methods_skipped.append("merge")
+
+    if not hasattr(_CKVCache, "filter"):
+        def _ckvcache_filter_passthrough(self, batch_indices):
+            try:
+                n = len(batch_indices)
+            except TypeError:
+                n = int(getattr(batch_indices, "shape", (0,))[0] or 0)
+            if n == 0:
+                self.keys = None
+                self.values = None
+                self.offset = 0
+                self.start_position = 0
+                return
+            if n == 1:
+                return
+            raise NotImplementedError(
+                f"ChunkedKVCache.filter with batch_size={n} > 1 is not "
+                "implemented. Run with --max-concurrent-requests 1 when "
+                "serving Llama-4."
+            )
+
+        _CKVCache.filter = _ckvcache_filter_passthrough
+    else:
+        _ckvcache_methods_skipped.append("filter")
+
+    if not hasattr(_CKVCache, "extract"):
+        def _ckvcache_extract_passthrough(self, idx):
+            return self
+
+        _CKVCache.extract = _ckvcache_extract_passthrough
+    else:
+        _ckvcache_methods_skipped.append("extract")
+
+    if not hasattr(_CKVCache, "size"):
+        def _ckvcache_size(self):
+            return max(0, self.offset - self.start_position)
+
+        _CKVCache.size = _ckvcache_size
+    else:
+        _ckvcache_methods_skipped.append("size")
+
+    if not hasattr(_CKVCache, "extend"):
+        def _ckvcache_extend_passthrough(self, other):
+            if other is None or other.empty():
+                return
+            if self.empty():
+                self.keys = other.keys
+                self.values = other.values
+                self.offset = other.offset
+                self.start_position = other.start_position
+                return
+            raise NotImplementedError(
+                "ChunkedKVCache.extend across non-empty caches is not "
+                "supported. Run with --max-concurrent-requests 1."
+            )
+
+        _CKVCache.extend = _ckvcache_extend_passthrough
+    else:
+        _ckvcache_methods_skipped.append("extend")
+
+    if _ckvcache_methods_skipped:
+        # Upstream may have landed implementations between mlx_lm upgrades.
+        # Surface which ones so a regression in Llama-4 batching is visible
+        # to operators without diffing the patch against installed mlx_lm.
+        logger.info(
+            "ChunkedKVCache patch: methods already present upstream, "
+            "skipped: %s",
+            ", ".join(_ckvcache_methods_skipped),
+        )
+except ImportError:
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Monkey-patch PromptProcessingBatch.prompt to set mRoPE deltas before the
 # prompt processing loop.  Without this, batched VLM prompt processing
@@ -254,6 +385,9 @@ PromptProcessingBatch.prompt = _patched_ppb_prompt
 
 
 # Cache class names known to be sliceable (no boundary snapshots needed).
+# ChunkedKVCache is included once the batch=1 patch above installs its
+# extract/filter/size pass-throughs; without it Llama-4 requests fall
+# back to the snapshot path unnecessarily.
 _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
     {
         "KVCache",
@@ -261,6 +395,7 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "QuantizedKVCache",
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
+        "ChunkedKVCache",
     }
 )
 
@@ -876,18 +1011,25 @@ class Scheduler:
         threading.RLock so concurrent access from main and worker is safe.
         """
         try:
-            with self._phase_timer("store_cache_worker_sync"):
-                mx.synchronize()
-            block_table = self.block_aware_cache.store_cache(
-                request_id,
-                token_sequence_to_store,
-                cache_to_store,
-                model_cache_config=model_cache_config,
-                boundary_snapshots=intermediate_snapshots,
-                extra_keys=extra_keys,
-                extra_key_token_start=extra_key_token_start,
-                extra_key_ranges=extra_key_ranges,
-            )
+            # Hold _mx_buffer_access_lock across the worker's mx-buffer
+            # access. store_cache eventually drives _extract_tensor_bytes,
+            # which reads raw bytes via the buffer protocol; serializing
+            # against inference-thread mx.clear_cache / mx.synchronize calls
+            # prevents a SIGABRT when those reclaim the underlying Metal
+            # buffer pool mid-read (#1106).
+            with _mx_buffer_access_lock:
+                with self._phase_timer("store_cache_worker_sync"):
+                    mx.synchronize()
+                block_table = self.block_aware_cache.store_cache(
+                    request_id,
+                    token_sequence_to_store,
+                    cache_to_store,
+                    model_cache_config=model_cache_config,
+                    boundary_snapshots=intermediate_snapshots,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
+                )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table and self.paged_cache_manager is not None:
@@ -924,7 +1066,7 @@ class Scheduler:
                     )
             # Run batch_generator.remove on the inference thread.
             try:
-                mx.synchronize(generation_stream)
+                _safe_sync_generation_stream()
                 self._remove_uid_from_active_batch(uid)
                 if hasattr(self.model, "unregister_rope_delta"):
                     self.model.unregister_rope_delta(uid)
@@ -2171,7 +2313,7 @@ class Scheduler:
             # Synchronize pending generation_stream operations before
             # accessing batch cache tensors.
             with self._phase_timer("boundary_capture_sync"):
-                mx.synchronize(generation_stream)
+                _safe_sync_generation_stream()
             with self._phase_timer("boundary_capture_extract"):
                 with mx.stream(generation_stream):
                     result = self.batch_generator.extract_cache([uid])
@@ -3548,7 +3690,7 @@ class Scheduler:
             # that replaces references to arrays still used by in-flight
             # Metal command buffers.  Without this barrier the Metal driver
             # can hit 'completeMemory() prepare count underflow'.
-            mx.synchronize(generation_stream)
+            _safe_sync_generation_stream()
             self._remove_uid_from_active_batch(uid)
             if hasattr(self.model, "unregister_rope_delta"):
                 self.model.unregister_rope_delta(uid)
@@ -4491,7 +4633,7 @@ class Scheduler:
         # can conflict with async Metal operations on the generation stream.
         if finished_ids:
             with self._phase_timer("cleanup_finished_sync"):
-                mx.synchronize(generation_stream)
+                _safe_sync_generation_stream()
 
         # SpecPrefill: restore original RoPE if active request finished
         for rid in finished_ids:
@@ -4655,7 +4797,7 @@ class Scheduler:
                     # used by in-flight Metal command buffers from the previous
                     # batch_generator.next() call.  Without this barrier the Metal
                     # driver can hit 'completeMemory() prepare count underflow'.
-                    mx.synchronize(generation_stream)
+                    _safe_sync_generation_stream()
                     self._remove_uid_from_active_batch(uid)
                     if hasattr(self.model, "unregister_rope_delta"):
                         self.model.unregister_rope_delta(uid)
@@ -4923,8 +5065,7 @@ class Scheduler:
                         + len(responses)
                     )
                     if self._tokens_since_clear_cache >= 1024:
-                        mx.synchronize(generation_stream)
-                        mx.clear_cache()
+                        _sync_and_clear_cache()
                         self._tokens_since_clear_cache = 0
 
         except _PrefillAbortedError:

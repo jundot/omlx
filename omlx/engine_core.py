@@ -673,11 +673,19 @@ class EngineCore:
 
         self._closed = True
 
-        # Shutdown scheduler (clears paged SSD cache if configured)
-        self.scheduler.shutdown()
-
-        # Reset scheduler to clear BatchGenerator and all caches
-        self.scheduler.deep_reset()
+        # Both shutdown() and deep_reset() touch generation_stream (directly
+        # or via _drain_pending_async_removes / _do_abort_request). The
+        # stream is bound to the MLX executor thread, so dispatch both
+        # through the executor; fall back to a direct call if the executor
+        # is already shut down.
+        for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
+            try:
+                self._mlx_executor.submit(fn).result()
+            except RuntimeError:
+                try:
+                    fn()
+                except RuntimeError:
+                    pass
 
         # Clear output collectors
         for collector in self._output_collectors.values():

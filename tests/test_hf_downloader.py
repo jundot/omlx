@@ -492,15 +492,68 @@ class TestHFDownloader:
         model_dir.mkdir(parents=True, exist_ok=True)
         downloader = HFDownloader(model_dir=str(model_dir))
 
-        # Create a partial download directory
-        target = model_dir / "model"
-        target.mkdir()
+        # Partial download lands at {model_dir}/{owner}/{model}
+        org_dir = model_dir / "owner"
+        target = org_dir / "model"
+        target.mkdir(parents=True)
         (target / "partial.bin").write_bytes(b"x" * 100)
 
         task = DownloadTask(task_id="t1", repo_id="owner/model")
         downloader._cleanup_partial(task)
 
         assert not target.exists()
+        # Empty org folder should also be removed.
+        assert not org_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_partial_keeps_org_folder_with_siblings(self, model_dir):
+        """Org folder must survive cleanup when it still has other models."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        org_dir = model_dir / "owner"
+        target = org_dir / "model"
+        target.mkdir(parents=True)
+        (target / "partial.bin").write_bytes(b"x")
+
+        sibling = org_dir / "other-model"
+        sibling.mkdir()
+        (sibling / "config.json").write_text("{}")
+
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._cleanup_partial(task)
+
+        assert not target.exists()
+        assert org_dir.exists()
+        assert sibling.exists()
+
+    @pytest.mark.asyncio
+    async def test_download_uses_owner_model_layout(self, model_dir):
+        """snapshot_download must receive local_dir under the org subfolder."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download"
+        ) as mock_download:
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.siblings = []
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            await downloader.start_download("Jundot/Qwen3.6-27B-oQ8-mtp")
+            await asyncio.sleep(0.5)
+
+            # The actual download call (last call; the first is dry_run).
+            call_kwargs = mock_download.call_args[1]
+            assert call_kwargs["local_dir"] == str(
+                model_dir / "Jundot" / "Qwen3.6-27B-oQ8-mtp"
+            )
+
+            await downloader.shutdown()
 
 
 # =============================================================================
@@ -607,6 +660,111 @@ class TestHFDownloaderRoutes:
 
             assert not (model_dir_with_models / "model-a").exists()
             mock_pool.discover_models.assert_called_once()
+        finally:
+            routes_module._get_global_settings = orig_settings
+            routes_module._get_engine_pool = orig_pool
+            routes_module._get_settings_manager = orig_mgr
+
+    @pytest.mark.asyncio
+    async def test_delete_model_organized_drops_empty_org_folder(self, tmp_path):
+        """Deleting the last model in an org folder should drop the empty org dir."""
+        from omlx.admin.routes import delete_hf_model
+
+        import omlx.admin.routes as routes_module
+
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        org_dir = model_dir / "Jundot"
+        model_path = org_dir / "Qwen-only-child"
+        model_path.mkdir(parents=True)
+        (model_path / "config.json").write_text(
+            '{"architectures": ["Qwen2ForCausalLM"]}'
+        )
+        (model_path / "model.safetensors").write_bytes(b"x" * 8)
+
+        mock_settings = MagicMock()
+        mock_settings.model.get_model_dirs.return_value = [model_dir]
+
+        mock_pool = MagicMock()
+        mock_pool.get_loaded_model_ids.return_value = []
+        mock_pool._entries = {}
+        mock_pool.discover_models = MagicMock()
+
+        mock_settings_mgr = MagicMock()
+        mock_settings_mgr.get_pinned_model_ids.return_value = []
+
+        orig_settings = routes_module._get_global_settings
+        orig_pool = routes_module._get_engine_pool
+        orig_mgr = routes_module._get_settings_manager
+
+        routes_module._get_global_settings = lambda: mock_settings
+        routes_module._get_engine_pool = lambda: mock_pool
+        routes_module._get_settings_manager = lambda: mock_settings_mgr
+
+        try:
+            result = await delete_hf_model(
+                model_name="Qwen-only-child", is_admin=True
+            )
+            assert result["success"] is True
+            assert not model_path.exists()
+            assert not org_dir.exists()
+        finally:
+            routes_module._get_global_settings = orig_settings
+            routes_module._get_engine_pool = orig_pool
+            routes_module._get_settings_manager = orig_mgr
+
+    @pytest.mark.asyncio
+    async def test_delete_model_organized_keeps_org_with_siblings(self, tmp_path):
+        """Deleting one model in an org folder should keep the org dir if siblings remain."""
+        from omlx.admin.routes import delete_hf_model
+
+        import omlx.admin.routes as routes_module
+
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        org_dir = model_dir / "Jundot"
+        org_dir.mkdir()
+
+        target = org_dir / "Qwen-to-delete"
+        target.mkdir()
+        (target / "config.json").write_text(
+            '{"architectures": ["Qwen2ForCausalLM"]}'
+        )
+        (target / "model.safetensors").write_bytes(b"x" * 8)
+
+        sibling = org_dir / "Qwen-keeper"
+        sibling.mkdir()
+        (sibling / "config.json").write_text(
+            '{"architectures": ["Qwen2ForCausalLM"]}'
+        )
+
+        mock_settings = MagicMock()
+        mock_settings.model.get_model_dirs.return_value = [model_dir]
+
+        mock_pool = MagicMock()
+        mock_pool.get_loaded_model_ids.return_value = []
+        mock_pool._entries = {}
+        mock_pool.discover_models = MagicMock()
+
+        mock_settings_mgr = MagicMock()
+        mock_settings_mgr.get_pinned_model_ids.return_value = []
+
+        orig_settings = routes_module._get_global_settings
+        orig_pool = routes_module._get_engine_pool
+        orig_mgr = routes_module._get_settings_manager
+
+        routes_module._get_global_settings = lambda: mock_settings
+        routes_module._get_engine_pool = lambda: mock_pool
+        routes_module._get_settings_manager = lambda: mock_settings_mgr
+
+        try:
+            result = await delete_hf_model(
+                model_name="Qwen-to-delete", is_admin=True
+            )
+            assert result["success"] is True
+            assert not target.exists()
+            assert org_dir.exists()
+            assert sibling.exists()
         finally:
             routes_module._get_global_settings = orig_settings
             routes_module._get_engine_pool = orig_pool
@@ -1699,8 +1857,8 @@ class TestStallDetection:
         # Use a very short stall timeout for testing
         monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 2)
 
-        target = model_dir / "model"
-        target.mkdir()
+        target = model_dir / "owner" / "model"
+        target.mkdir(parents=True)
         # Create a file so current_size > 0 (needed to trigger stall detection)
         (target / "partial.bin").write_bytes(b"x" * 1000)
 
