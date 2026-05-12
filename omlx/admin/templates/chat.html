@@ -157,11 +157,16 @@
         align-self: flex-end;
     }
 
+    .user-message.is-editing {
+        width: min(768px, 100%);
+    }
+
     .user-message-bubble {
         background: var(--bg-secondary);
         border-radius: 24px;
         padding: 8px 16px;
         font-size: 14px;
+        line-height: 1.6;
         color: var(--text-primary);
         max-width: 100%;
         min-width: 0;
@@ -171,7 +176,11 @@
 
     .user-message-bubble p {
         color: var(--text-primary) !important;
-        margin: 0;
+        margin: 0 0 1em;
+    }
+
+    .user-message-bubble p:last-child {
+        margin-bottom: 0;
     }
 
     .user-message-bubble * {
@@ -395,9 +404,9 @@
     .inline-edit-textarea {
         width: 100%;
         min-width: 280px;
-        max-width: 600px;
         min-height: 80px;
         max-height: 300px;
+        box-sizing: border-box;
         resize: vertical;
         padding: 12px 16px;
         border: 2px solid #2d3748;
@@ -862,7 +871,7 @@
                     <div class="message-fade-in">
                         <!-- User Message -->
                         <div x-show="msg.role === 'user'" class="flex justify-end">
-                            <div class="user-message">
+                            <div class="user-message" :class="{ 'is-editing': editingIndex === index }">
                                 <button @click="startEdit(index)" class="user-edit-btn"
                                     title="{{ t('chat.edit_tooltip') }}">
                                     <i data-lucide="pencil" class="w-4 h-4"></i>
