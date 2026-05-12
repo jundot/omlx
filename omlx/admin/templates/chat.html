@@ -1329,31 +1329,26 @@
             _prefillInterval: null,      // setInterval handle for pre-generation polling
 
             async init() {
-                // Auto-inject API key from server (admin session already authenticated)
-                const serverApiKey = {{ api_key | tojson
-            }
-        };
-        if (serverApiKey) {
-            localStorage.setItem('omlx_chat_api_key', serverApiKey);
-        }
 
-        // Check for stored API key
-        const storedKey = localStorage.getItem('omlx_chat_api_key');
-        if (storedKey) {
-            this.apiKeySet = true;
-            await this.loadModels();
-            this.loadChatHistory();
-            this.fetchMcpTools();
-        }
+                const serverApiKey = {{ api_key | tojson }};
 
-        // Apply theme
-        this.applyTheme();
+                if (serverApiKey) {
+                    localStorage.setItem('omlx_chat_api_key', serverApiKey);
+                }
 
+                const storedKey = localStorage.getItem('omlx_chat_api_key');
+                if (storedKey) {
+                    this.apiKeySet = true;
+                    await this.loadModels();
+                    this.loadChatHistory();
+                    this.fetchMcpTools();
+                }
 
-        // Setup scroll listener for auto-scroll management
-        this.$nextTick(() => {
-            this.setupScrollListener();
-        });
+                this.applyTheme();
+
+                this.$nextTick(() => {
+                    this.setupScrollListener();
+                });
 
     },
 
