@@ -707,5 +707,6 @@
   "models.table.size": "Size",
   "models.table.downloads": "Downloads",
   "models.table.likes": "Likes",
-  "models.table.action": "Action"
+  "models.table.action": "Action",
+  "models.table.quantization": "Quant"
 }

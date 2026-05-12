@@ -114,9 +114,6 @@ _DTYPE_TO_QUANT = {
     "Q2_K": "int2",
 }
 
-# Quant labels for matching model names
-_QUANT_LABELS = ["4bit", "8bit", "16bit", "4-bit", "8-bit", "16-bit", "q4", "q8", "q4_k", "q8_k", "q6_k"]
-
 # Minimum downloads to be included in recommendations.
 _MIN_DOWNLOADS = 100
 
