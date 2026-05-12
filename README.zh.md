@@ -191,7 +191,7 @@ brew services info omlx     # 查看状态
 
 ### 集成
 
-在管理后台中一键设置 OpenClaw、OpenCode 和 Codex。无需手动编辑配置文件。
+在管理后台中一键设置 OpenClaw、OpenCode、Codex、Copilot 和 Pi。无需手动编辑配置文件。
 
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX 集成" width="720">
@@ -371,3 +371,4 @@ python build.py --dmg-only
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX 从 vllm-mlx v0.1.0 起步，经过大幅演进，增加了多模型服务、分层 KV 缓存、完整分页缓存支持的 VLM、管理后台和 macOS 菜单栏应用
 - [venvstacks](https://venvstacks.lmstudio.ai) - macOS 应用包的便携 Python 环境分层
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon 嵌入模型支持
+- [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Apple Silicon 上的块扩散推测解码 (Block diffusion speculative decoding)
