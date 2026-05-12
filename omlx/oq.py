@@ -2174,6 +2174,27 @@ def quantize_oq_streaming(
         config = json.load(f)
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
 
+    # TEMP: DeepSeek V4 sensitivity measurement is unsupported.
+    # - Raw self-sensitivity load_weights fails on missing mtp.0.{e,h}_proj.biases
+    #   because mlx-lm's deepseek_v4 patch attaches MTP projections in
+    #   quantized form while raw checkpoints ship .weight + .scale only.
+    # - Proxy sensitivity (sensitivity_model_path=<8bit>) fails because
+    #   ``_forward_layer`` does not recognize ``DeepseekV4Block.__call__``'s
+    #   (x, mask, cache, input_ids) signature.
+    # Fixing both requires changes outside the oq.py / VLM-MTP scope of
+    # this fix, so abort early with a clear message until that follow-up
+    # lands. Remove this guard once the deepseek_v4 patch + _forward_layer
+    # support land.
+    if config.get("model_type") == "deepseek_v4":
+        raise RuntimeError(
+            "oQ quantization for deepseek_v4 (DeepSeek-V4-Flash) is not "
+            "supported yet: sensitivity measurement fails on both raw load "
+            "(missing mtp.0.{e,h}_proj.biases — model class expects quantized "
+            "form) and proxy load (_forward_layer can't match DeepseekV4Block "
+            "signature). Pending follow-up in mlx-lm deepseek_v4 patch + "
+            "oq.py _forward_layer."
+        )
+
     cb("loading", 5.0)
 
     weight_files = sorted(source.glob("*.safetensors"))
