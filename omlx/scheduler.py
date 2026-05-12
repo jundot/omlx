@@ -108,6 +108,14 @@ def _sync_and_clear_cache():
     mx.clear_cache()
 
 
+def _safe_sync_generation_stream():
+    """mx.synchronize(generation_stream) that tolerates cross-thread calls."""
+    try:
+        mx.synchronize(generation_stream)
+    except RuntimeError:
+        pass
+
+
 # Import tiered cache components
 try:
     from .cache.boundary_snapshot_store import BoundarySnapshotSSDStore
@@ -924,7 +932,7 @@ class Scheduler:
                     )
             # Run batch_generator.remove on the inference thread.
             try:
-                mx.synchronize(generation_stream)
+                _safe_sync_generation_stream()
                 self._remove_uid_from_active_batch(uid)
                 if hasattr(self.model, "unregister_rope_delta"):
                     self.model.unregister_rope_delta(uid)
@@ -2171,7 +2179,7 @@ class Scheduler:
             # Synchronize pending generation_stream operations before
             # accessing batch cache tensors.
             with self._phase_timer("boundary_capture_sync"):
-                mx.synchronize(generation_stream)
+                _safe_sync_generation_stream()
             with self._phase_timer("boundary_capture_extract"):
                 with mx.stream(generation_stream):
                     result = self.batch_generator.extract_cache([uid])
@@ -3548,7 +3556,7 @@ class Scheduler:
             # that replaces references to arrays still used by in-flight
             # Metal command buffers.  Without this barrier the Metal driver
             # can hit 'completeMemory() prepare count underflow'.
-            mx.synchronize(generation_stream)
+            _safe_sync_generation_stream()
             self._remove_uid_from_active_batch(uid)
             if hasattr(self.model, "unregister_rope_delta"):
                 self.model.unregister_rope_delta(uid)
@@ -4491,7 +4499,7 @@ class Scheduler:
         # can conflict with async Metal operations on the generation stream.
         if finished_ids:
             with self._phase_timer("cleanup_finished_sync"):
-                mx.synchronize(generation_stream)
+                _safe_sync_generation_stream()
 
         # SpecPrefill: restore original RoPE if active request finished
         for rid in finished_ids:
@@ -4655,7 +4663,7 @@ class Scheduler:
                     # used by in-flight Metal command buffers from the previous
                     # batch_generator.next() call.  Without this barrier the Metal
                     # driver can hit 'completeMemory() prepare count underflow'.
-                    mx.synchronize(generation_stream)
+                    _safe_sync_generation_stream()
                     self._remove_uid_from_active_batch(uid)
                     if hasattr(self.model, "unregister_rope_delta"):
                         self.model.unregister_rope_delta(uid)
@@ -4923,7 +4931,7 @@ class Scheduler:
                         + len(responses)
                     )
                     if self._tokens_since_clear_cache >= 1024:
-                        mx.synchronize(generation_stream)
+                        _safe_sync_generation_stream()
                         mx.clear_cache()
                         self._tokens_since_clear_cache = 0
 

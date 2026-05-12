@@ -229,7 +229,10 @@ class TTSEngine(BaseNonStreamingEngine):
             audio_chunks = []
 
             for result in results:
-                audio_chunks.append(np.array(result.audio))
+                audio = result.audio
+                if isinstance(audio, mx.array) and audio.dtype == mx.bfloat16:
+                    audio = audio.astype(mx.float32)
+                audio_chunks.append(np.array(audio))
 
             if not audio_chunks:
                 raise RuntimeError("TTS model produced no audio output")
