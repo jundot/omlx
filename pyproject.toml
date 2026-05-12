@@ -97,6 +97,13 @@ audio = [
     # sts extra: tts deps + stt deps + webrtcvad
     "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
 ]
+paroquant = [
+    # ParoQuant runtime loader for paroquant-quantized models. Installed
+    # with --no-deps semantics here because the official [mlx] extra pulls
+    # torchvision, which the load path doesn't actually use (verified end
+    # to end on 0.1.14). The DMG build installs the same pin via build.py.
+    "paroquant==0.1.14",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",

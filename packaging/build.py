@@ -554,6 +554,12 @@ def build_venvstacks():
     # so it can't go through venvstacks' uv resolver.
     _install_mlx_audio(EXPORT_DIR)
 
+    # Install paroquant --no-deps. The official [mlx] extra requires
+    # torchvision which the mlx load path doesn't actually use; verified
+    # end-to-end on 0.1.14. All real deps (mlx, mlx-lm, mlx-vlm, numpy,
+    # huggingface_hub) are already in the framework layer.
+    _install_paroquant(EXPORT_DIR)
+
     # Bundle spacy language model for Kokoro TTS.
     # misaki's en.G2P tries spacy.cli.download() at runtime, which fails in
     # the code-signed app bundle (read-only site-packages).
@@ -605,6 +611,45 @@ def _install_mlx_audio(export_dir: Path):
 
     shutil.rmtree(audio_wheels)
     print("  ✓ mlx-audio installed")
+
+
+# paroquant version — keep in sync with pyproject.toml [paroquant] extra
+_PAROQUANT_VERSION = "0.1.14"
+
+
+def _install_paroquant(export_dir: Path):
+    """Build paroquant wheel from PyPI and install --no-deps into framework."""
+    print("\n  Building paroquant wheel...")
+    paro_wheels = SCRIPT_DIR / "_paroquant_wheels"
+    if paro_wheels.exists():
+        shutil.rmtree(paro_wheels)
+    paro_wheels.mkdir()
+
+    run_cmd([
+        sys.executable, "-m", "pip", "wheel",
+        "--no-deps", "--wheel-dir", str(paro_wheels),
+        f"paroquant=={_PAROQUANT_VERSION}",
+    ])
+
+    fw_site = (
+        export_dir
+        / "framework-mlx-framework"
+        / "lib"
+        / "python3.11"
+        / "site-packages"
+    )
+    if not fw_site.exists():
+        print(f"  ✗ site-packages not found: {fw_site}")
+        return
+
+    import zipfile
+    for whl in paro_wheels.glob("*.whl"):
+        print(f"    Installing {whl.name} (--no-deps)")
+        with zipfile.ZipFile(whl) as zf:
+            zf.extractall(fw_site)
+
+    shutil.rmtree(paro_wheels)
+    print("  ✓ paroquant installed")
 
 
 # spacy language model — required by misaki (Kokoro TTS G2P)
