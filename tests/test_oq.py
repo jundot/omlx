@@ -2063,4 +2063,101 @@ class TestBuildModelSanitizerTextOnly:
 
 
 # =============================================================================
-# Test GPTQ quantization
+# Test _build_proxy_for_sensitivity MTP patch integration
+# =============================================================================
+
+
+class TestBuildProxyForSensitivityMtpPatch:
+    """Tests for the MTP patch gating in _build_proxy_for_sensitivity.
+
+    The function must temporarily activate the MTP patch during
+    ``mlx_lm.convert()`` so that MTP-bearing models (Qwen3.5, DeepSeek-V4)
+    are converted correctly. After conversion the previous MTP state must
+    be restored regardless of success or failure.
+    """
+
+    def _make_mocks(self, patch_return=True, is_active=False, convert_side_effect=None):
+        mock_apply = MagicMock(return_value=patch_return)
+        mock_is_active = MagicMock(return_value=is_active)
+        mock_set_active = MagicMock()
+        mock_convert = MagicMock(side_effect=convert_side_effect)
+        return (
+            MagicMock(
+                apply_mlx_lm_mtp_patch=mock_apply,
+                is_mtp_active=mock_is_active,
+                set_mtp_active=mock_set_active,
+            ),
+            mock_apply, mock_is_active, mock_set_active, mock_convert,
+        )
+
+    def _patch(self, monkeypatch, mtp_mod, mock_convert):
+        monkeypatch.setitem(sys.modules, "omlx.patches.mlx_lm_mtp", mtp_mod)
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(convert=mock_convert))
+
+    def test_happy_path_with_active_patch(self, tmp_path, monkeypatch):
+        """MTP patch applied → state toggled → convert called with correct kwargs → state restored."""
+        mtp_mod, mock_apply, mock_is_active, mock_set_active, mock_convert = self._make_mocks()
+        self._patch(monkeypatch, mtp_mod, mock_convert)
+
+        result = _build_proxy_for_sensitivity(
+            "/my/model", dtype="bfloat16", working_dir=str(tmp_path), trust_remote_code=True,
+        )
+
+        assert isinstance(result, Path)
+        assert result.name.startswith("omlx_oq_proxy_")
+        assert result.parent == tmp_path
+
+        mock_apply.assert_called_once()
+        assert mock_set_active.call_count == 2
+        assert mock_set_active.call_args_list[0] == ((True,),)
+        assert mock_set_active.call_args_list[-1] == ((False,),)
+
+        kw = mock_convert.call_args.kwargs
+        assert kw["hf_path"] == "/my/model"
+        assert kw["quantize"] is True
+        assert kw["q_bits"] == _PROXY_QUANT_BITS
+        assert kw["q_group_size"] == _PROXY_QUANT_GROUP_SIZE
+        assert kw["q_mode"] == "affine"
+        assert kw["dtype"] == "bfloat16"
+        assert kw["trust_remote_code"] is True
+
+    @pytest.mark.parametrize("prev_state", [False, True])
+    def test_state_restored_on_error(self, tmp_path, monkeypatch, prev_state):
+        """Convert error → finally block restores previous MTP state."""
+        mtp_mod, _, _, mock_set_active, mock_convert = self._make_mocks(
+            convert_side_effect=RuntimeError("boom"), is_active=prev_state,
+        )
+        self._patch(monkeypatch, mtp_mod, mock_convert)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _build_proxy_for_sensitivity(
+                "/fake/model", dtype="float16", working_dir=str(tmp_path),
+            )
+
+        assert mock_set_active.call_count == 2
+        assert mock_set_active.call_args_list[-1] == ((prev_state,),)
+
+    def test_patch_returns_false_no_toggle(self, tmp_path, monkeypatch):
+        """apply_mlx_lm_mtp_patch returns False → no MTP toggle, convert is still called."""
+        mtp_mod, _, _, mock_set_active, mock_convert = self._make_mocks(patch_return=False)
+        self._patch(monkeypatch, mtp_mod, mock_convert)
+
+        _build_proxy_for_sensitivity(
+            "/fake/model", dtype="float16", working_dir=str(tmp_path),
+        )
+
+        mock_set_active.assert_not_called()
+        mock_convert.assert_called_once()
+
+    def test_import_fails_graceful_degradation(self, tmp_path, monkeypatch):
+        """MTP patch import raises → function proceeds without MTP gating."""
+        mock_convert = MagicMock()
+        monkeypatch.setitem(sys.modules, "omlx.patches.mlx_lm_mtp", None)
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(convert=mock_convert))
+
+        result = _build_proxy_for_sensitivity(
+            "/fake/model", dtype="float16", working_dir=str(tmp_path),
+        )
+
+        assert isinstance(result, Path)
+        mock_convert.assert_called_once()
