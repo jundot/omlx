@@ -330,7 +330,8 @@ class TestBatchGeneratorDispatch:
 
         assert hasattr(GenerationBatch, "_omlx_mtp_patched")
 
-    def test_is_mtp_eligible_requires_mtp_forward_and_solo_batch(self):
+    def test_is_mtp_eligible_requires_active_mtp_head_and_solo_batch(self):
+        from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
         from omlx.patches.mlx_lm_mtp.batch_generator import _is_mtp_eligible
 
         class _NonMtpModel:
@@ -358,18 +359,28 @@ class TestBatchGeneratorDispatch:
                 self.model = model
                 self.uids = uids
 
-        # Non-MTP model never triggers the MTP path.
-        assert _is_mtp_eligible(_GenBatch(_NonMtpModel(), uids=[1])) is False
-        # Has mtp_forward but no attached head → still off (mtp_enabled was False).
-        assert (
-            _is_mtp_eligible(_GenBatch(_MtpModelWithoutHead(), uids=[1])) is False
-        )
-        # Has both method and head + batch=1 → triggers the path.
-        assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is True
-        # MTP model with batch=2 falls back to standard step.
-        assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1, 2])) is False
-        # Empty batch never triggers.
-        assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[])) is False
+        prev = is_mtp_active()
+        try:
+            # Head presence alone is not enough; the load-time mtp_enabled
+            # flag must also be active.
+            set_mtp_active(False)
+            assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is False
+
+            set_mtp_active(True)
+            # Non-MTP model never triggers the MTP path.
+            assert _is_mtp_eligible(_GenBatch(_NonMtpModel(), uids=[1])) is False
+            # Has mtp_forward but no attached head -> still off.
+            assert (
+                _is_mtp_eligible(_GenBatch(_MtpModelWithoutHead(), uids=[1])) is False
+            )
+            # Has method + head + active flag + batch=1 -> triggers the path.
+            assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is True
+            # MTP model with batch=2 falls back to standard step.
+            assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1, 2])) is False
+            # Empty batch never triggers.
+            assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[])) is False
+        finally:
+            set_mtp_active(prev)
 
 
 # ---------------------------------------------------------------------------
