@@ -50,8 +50,8 @@ requirements = [
     "openai-harmony",
     # mlx-vlm from commit (191d7c8) - aligned with pyproject.toml
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@191d7c88bdcc98ac209a57823855b725275a1fa0",
-    # dflash-mlx v0.1.5.1 (110f261) — runtime_context, prefix cache (L1+L2), verify-specialized int4 qmm
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@110f261",
+    # dflash-mlx v0.1.5.1 (20d68db) — original bstnxbt repo. Gemma4 support, runtime package refactor, stable prefix snapshot reuse
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@20d68db3b3c0ae3dd6d3a2f0d3c10b2344ee514e",
     "Pillow>=9.0.0",
     # ModelScope SDK for downloading models from ModelScope Hub
     "modelscope>=1.10.0",

@@ -3,10 +3,10 @@
 DFlash engine for block diffusion speculative decoding.
 
 This engine wraps dflash-mlx (>= 0.1.5) to provide 3-4x faster decoding on
-Apple Silicon. By default it serves all requests through dflash; setting
-``model_settings.dflash_max_ctx`` opts into evicting the dflash models and
-delegating long-context requests to omlx's BatchedEngine/VLMBatchedEngine
-(paged cache, SSD cache, continuous batching).
+Apple Silicon for Qwen and Gemma4 model families. By default it serves all
+requests through dflash; setting ``model_settings.dflash_max_ctx`` opts into
+evicting the dflash models and delegating long-context requests to omlx's
+BatchedEngine/VLMBatchedEngine (paged cache, SSD cache, continuous batching).
 """
 
 import asyncio
@@ -31,10 +31,13 @@ logger = logging.getLogger(__name__)
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
-    DFlash 0.1.5 only registers ``QwenGdnTargetOps``, so any non-Qwen target
-    raises ``NotImplementedError`` from ``resolve_target_ops`` at load time.
-    Mirroring dflash's heuristic here lets the admin UI disable the toggle
-    upfront with a clear reason instead of letting the backend crash.
+    DFlash 0.1.5 registers QwenGdnTargetOps and Gemma4TargetOps. The
+    top-level ``model_type`` is the canonical discriminator: Gemma4 multimodal
+    configs use ``gemma4`` at the top, while MTP-only variants (e.g. the
+    Gemma4 ``-assistant`` checkpoint) declare ``gemma4_assistant`` even
+    though their nested ``text_config.model_type`` is still ``gemma4_text``.
+    Reading top-level only keeps the gate aligned with what dflash will
+    actually load.
 
     Returns:
         (is_compatible, reason). ``reason`` is empty when compatible.
@@ -47,10 +50,14 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
             cfg = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
         return False, f"failed to read config.json: {e}"
-    model_type = str(cfg.get("model_type", "")).lower()
-    if "qwen" not in model_type:
+
+    model_type = str(cfg.get("model_type") or "").lower()
+
+    is_qwen = "qwen" in model_type
+    is_gemma4 = model_type in ("gemma4", "gemma4_text")
+    if not (is_qwen or is_gemma4):
         return False, (
-            f"DFlash currently supports only Qwen models "
+            f"DFlash supports only Qwen and Gemma4 models "
             f"(model_type='{cfg.get('model_type', '')}')"
         )
     return True, ""
@@ -95,7 +102,9 @@ class DFlashEngine(BaseEngine):
         )
 
         self._target_model = None
+        self._target_ops = None
         self._draft_model = None
+        self._draft_backend = None
         self._tokenizer_obj = None
         self._executor_tokenizer = None
         self._loaded = False
@@ -177,7 +186,7 @@ class DFlashEngine(BaseEngine):
         return self._omlx_ssd_cache_dir / "dflash_l2"
 
     def _build_runtime_context(self) -> Any:
-        from dflash_mlx.runtime_context import (
+        from dflash_mlx.runtime.context import (
             build_runtime_context,
             runtime_config_from_profile,
         )
@@ -206,9 +215,13 @@ class DFlashEngine(BaseEngine):
         loop = asyncio.get_running_loop()
 
         def _load_models():
-            from dflash_mlx.runtime import load_draft_bundle, load_target_bundle
+            from dflash_mlx.draft_backend import make_draft_backend
+            from dflash_mlx.runtime.loading import (
+                load_draft_bundle,
+                load_target_bundle,
+            )
 
-            model, tokenizer, meta = load_target_bundle(self._model_name)
+            target_bundle = load_target_bundle(self._model_name)
             draft, draft_meta = load_draft_bundle(
                 self._draft_model_path,
                 draft_quant=self._build_quant_spec(
@@ -217,10 +230,15 @@ class DFlashEngine(BaseEngine):
                     self._draft_quant_group_size,
                 ) if self._draft_quant_enabled else None,
             )
-            return model, tokenizer, meta, draft
+            draft_backend = make_draft_backend()
+            return target_bundle, draft, draft_backend
 
         result = await loop.run_in_executor(get_mlx_executor(), _load_models)
-        self._target_model, self._tokenizer_obj, target_meta, self._draft_model = result
+        target_bundle, self._draft_model, self._draft_backend = result
+        self._target_model = target_bundle.model
+        self._tokenizer_obj = target_bundle.tokenizer
+        self._target_ops = target_bundle.target_ops
+        target_meta = target_bundle.meta
 
         # Deep-copy tokenizer for executor-thread usage (dflash generation).
         # The original self._tokenizer_obj stays for event-loop operations
@@ -251,7 +269,7 @@ class DFlashEngine(BaseEngine):
 
     async def _evict_dflash_and_start_fallback(self) -> None:
         """Evict dflash models from memory, verify release, then start fallback engine."""
-        from dflash_mlx.server.prefix_cache_flow import shutdown_dflash_prefix_cache
+        from dflash_mlx.cache.manager import shutdown_runtime_cache_manager
 
         from ..engine_core import get_mlx_executor
 
@@ -259,11 +277,13 @@ class DFlashEngine(BaseEngine):
         pre_active = mx.get_active_memory()
 
         # Release dflash model and cache references
-        shutdown_dflash_prefix_cache()
+        shutdown_runtime_cache_manager()
         self._dflash_prefix_cache = None
         self._runtime_context = None
         self._target_model = None
+        self._target_ops = None
         self._draft_model = None
+        self._draft_backend = None
         self._executor_tokenizer = None
 
         # Force memory reclaim with settle barrier
@@ -314,19 +334,21 @@ class DFlashEngine(BaseEngine):
         )
 
     async def stop(self) -> None:
-        from dflash_mlx.server.prefix_cache_flow import shutdown_dflash_prefix_cache
+        from dflash_mlx.cache.manager import shutdown_runtime_cache_manager
 
         if self._fallback_engine is not None:
             await self._fallback_engine.stop()
             self._fallback_engine = None
         try:
-            shutdown_dflash_prefix_cache()
+            shutdown_runtime_cache_manager()
         except Exception as exc:
-            logger.debug(f"shutdown_dflash_prefix_cache: {exc}")
+            logger.debug(f"shutdown_runtime_cache_manager: {exc}")
         self._dflash_prefix_cache = None
         self._runtime_context = None
         self._target_model = None
+        self._target_ops = None
         self._draft_model = None
+        self._draft_backend = None
         self._tokenizer_obj = None
         self._executor_tokenizer = None
         self._in_fallback_mode = False
@@ -506,15 +528,19 @@ class DFlashEngine(BaseEngine):
 
         event_iter = stream_dflash_generate(
             target_model=self._target_model,
+            target_ops=self._target_ops,
             tokenizer=self._executor_tokenizer,
             draft_model=self._draft_model,
+            draft_backend=self._draft_backend,
             prompt="",
             max_new_tokens=max_tokens,
             stop_token_ids=stop_ids,
             prompt_tokens_override=prompt_tokens,
             prefix_snapshot=prefix_flow.snapshot,
+            snapshot_service=prefix_flow.snapshot_service,
             stable_prefix_len=prefix_flow.stable_prefix_len,
-            prefix_cache=prefix_flow.cache,
+            prefix_cache_active=prefix_flow.cache_active,
+            publish_generation_snapshot=prefix_flow.publish_generation_snapshot,
             runtime_context=self._runtime_context,
         )
         return event_iter, prefix_flow, stop_ids
@@ -535,6 +561,8 @@ class DFlashEngine(BaseEngine):
         return promptly so the single MLX executor thread is freed for the
         next request.
         """
+        from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+
         event_iter = None
         try:
             event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
@@ -555,17 +583,8 @@ class DFlashEngine(BaseEngine):
                     logger.info("DFlash generation aborted by client")
                     break
 
-                event_type = event.get("event")
-
-                if event_type == "prefill_snapshot_ready":
-                    prefix_flow.handle_prefill_snapshot(event)
-                    continue
-                if event_type == "generation_snapshot_ready":
-                    prefix_flow.handle_generation_snapshot(event)
-                    continue
-
-                if event_type == "token":
-                    token_id = event["token_id"]
+                if isinstance(event, TokenEvent):
+                    token_id = int(event.token_id)
                     # Skip EOS/stop tokens from output
                     if token_id in stop_ids:
                         continue
@@ -578,14 +597,14 @@ class DFlashEngine(BaseEngine):
                         queue.put((text, [token_id], False, None)), loop
                     )
 
-                elif event_type == "summary":
-                    gen_tokens = event.get("generation_tokens", 0)
-                    accept_ratio = event.get("acceptance_ratio", 0)
-                    cycles = event.get("cycles_completed", 0)
-                    elapsed_us = event.get("elapsed_us", 0)
+                elif isinstance(event, SummaryEvent):
+                    gen_tokens = int(event.generation_tokens)
+                    accept_ratio = float(event.acceptance_ratio)
+                    cycles = int(event.cycles_completed)
+                    elapsed_us = int(event.elapsed_us)
                     elapsed_s = elapsed_us / 1e6 if elapsed_us else 0
                     gen_tps = gen_tokens / elapsed_s if elapsed_s > 0 else 0
-                    fallback = event.get("fallback_ar", False)
+                    fallback = bool(event.fallback_ar)
                     logger.info(
                         f"DFlash generation complete: "
                         f"{gen_tokens} tokens, "
@@ -595,7 +614,7 @@ class DFlashEngine(BaseEngine):
                         f"{', fallback=AR' if fallback else ''}"
                     )
                     metrics = {
-                        "prompt_tokens": event.get("prompt_token_count", 0),
+                        "prompt_tokens": int(event.prompt_token_count),
                         "completion_tokens": gen_tokens,
                         "acceptance_ratio": accept_ratio,
                         "cycles_completed": cycles,
@@ -603,6 +622,10 @@ class DFlashEngine(BaseEngine):
                     asyncio.run_coroutine_threadsafe(
                         queue.put(("", [], True, metrics)), loop
                     )
+
+                # Cycle, memory, prefill, and snapshot events are consumed by the
+                # runtime cache manager and metrics layers — omlx does not surface
+                # them so all other event types are intentionally ignored.
 
         except Exception as e:
             logger.error(f"DFlash streaming generation error: {e}")
@@ -676,6 +699,8 @@ class DFlashEngine(BaseEngine):
         stop_event = threading.Event()
 
         def _run():
+            from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+
             event_iter = None
             try:
                 event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
@@ -683,24 +708,17 @@ class DFlashEngine(BaseEngine):
                     max_tokens=max_tokens,
                 )
                 tokens: list[int] = []
-                summary: dict[str, Any] | None = None
+                summary: SummaryEvent | None = None
                 for event in event_iter:
                     if stop_event.is_set():
                         logger.info("DFlash generation aborted by client")
                         break
-                    event_type = event.get("event")
-                    if event_type == "prefill_snapshot_ready":
-                        prefix_flow.handle_prefill_snapshot(event)
-                        continue
-                    if event_type == "generation_snapshot_ready":
-                        prefix_flow.handle_generation_snapshot(event)
-                        continue
-                    if event_type == "token":
-                        token_id = int(event["token_id"])
+                    if isinstance(event, TokenEvent):
+                        token_id = int(event.token_id)
                         if token_id in stop_ids:
                             continue
                         tokens.append(token_id)
-                    elif event_type == "summary":
+                    elif isinstance(event, SummaryEvent):
                         summary = event
                 return summary, tokens
             finally:
@@ -727,8 +745,6 @@ class DFlashEngine(BaseEngine):
             except Exception:
                 pass
             raise
-        summary = summary or {}
-
         text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
         text = clean_special_tokens(text)
 
@@ -741,11 +757,17 @@ class DFlashEngine(BaseEngine):
         if self._detect_needs_think_prefix(prompt_tokens):
             text = self._think_prefix_text() + text
 
+        prompt_token_count = (
+            int(summary.prompt_token_count) if summary is not None else len(prompt_tokens)
+        )
+        completion_token_count = (
+            int(summary.generation_tokens) if summary is not None else len(generated)
+        )
         return GenerationOutput(
             text=text,
             tokens=generated,
-            prompt_tokens=summary.get("prompt_token_count", len(prompt_tokens)),
-            completion_tokens=summary.get("generation_tokens", len(generated)),
+            prompt_tokens=prompt_token_count,
+            completion_tokens=completion_token_count,
             finish_reason="stop",
         )
 

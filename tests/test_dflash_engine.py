@@ -372,6 +372,65 @@ class TestDFlashCompatibility:
         assert compatible is False
         assert "config.json" in reason
 
+    def test_gemma4_top_level_is_compatible(self, tmp_path):
+        try:
+            from omlx.engine.dflash import is_dflash_compatible
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        self._write_config(tmp_path, "gemma4")
+        compatible, reason = is_dflash_compatible(tmp_path)
+        assert compatible is True
+        assert reason == ""
+
+    def test_gemma4_text_top_level_is_compatible(self, tmp_path):
+        """Top-level model_type=gemma4_text is also accepted (text-only variant)."""
+        try:
+            from omlx.engine.dflash import is_dflash_compatible
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        self._write_config(tmp_path, "gemma4_text")
+        compatible, reason = is_dflash_compatible(tmp_path)
+        assert compatible is True
+        assert reason == ""
+
+    def test_gemma4_assistant_is_incompatible(self, tmp_path):
+        """MTP -assistant variants declare gemma4_assistant at the top level
+        even though their text_config.model_type is gemma4_text. The toggle
+        must read top-level only to keep these out of the DFlash gate."""
+        try:
+            from omlx.engine.dflash import is_dflash_compatible
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        (tmp_path / "config.json").write_text(json.dumps({
+            "model_type": "gemma4_assistant",
+            "text_config": {"model_type": "gemma4_text"},
+        }))
+        compatible, reason = is_dflash_compatible(tmp_path)
+        assert compatible is False
+        assert "gemma4_assistant" in reason
+
+    def test_gemma3_is_incompatible(self, tmp_path):
+        """Gemma3 has no DFlash backend and must not pass the gate."""
+        try:
+            from omlx.engine.dflash import is_dflash_compatible
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        self._write_config(tmp_path, "gemma3_text")
+        compatible, reason = is_dflash_compatible(tmp_path)
+        assert compatible is False
+        assert "Gemma4" in reason
+
+    def test_incompatible_reason_mentions_both_families(self, tmp_path):
+        try:
+            from omlx.engine.dflash import is_dflash_compatible
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        self._write_config(tmp_path, "mistral")
+        compatible, reason = is_dflash_compatible(tmp_path)
+        assert compatible is False
+        assert "Qwen" in reason
+        assert "Gemma4" in reason
+
 
 class TestDFlashEnginePoolRouting:
     """Test that EnginePool routes to DFlashEngine based on settings."""

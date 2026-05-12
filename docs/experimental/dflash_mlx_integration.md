@@ -64,16 +64,17 @@ DFlashEngine is a `BaseEngine` implementation that:
 
 ### Dependency
 
-- `dflash-mlx` pinned to `jundot/dflash-mlx@8e1df22` (fork with temperature sampling patch)
-- Upstream: `bstnxbt/dflash-mlx@fc7101b`
+- `dflash-mlx` pinned to `bstnxbt/dflash-mlx@20d68db` (original repo, v0.1.5.1, includes Gemma4 backend + runtime package refactor)
 - Listed as required dependency in `pyproject.toml` and `packaging/venvstacks.toml`
 
 ### Supported models
 
-DFlash draft checkpoints currently exist for Qwen3.5 family only:
+DFlash registers `QwenGdnTargetOps` and `Gemma4TargetOps`. Draft checkpoints currently exist for the Qwen3.x and Gemma4 families:
 
 | Target model | Draft checkpoint |
 |--------------|-----------------|
+| Qwen/Qwen3-4B | z-lab/Qwen3-4B-DFlash-b16 |
+| Qwen/Qwen3-8B | z-lab/Qwen3-8B-DFlash-b16 |
 | Qwen/Qwen3.5-4B | z-lab/Qwen3.5-4B-DFlash |
 | Qwen/Qwen3.5-9B | z-lab/Qwen3.5-9B-DFlash |
 | Qwen/Qwen3.5-27B | z-lab/Qwen3.5-27B-DFlash |
@@ -81,8 +82,14 @@ DFlash draft checkpoints currently exist for Qwen3.5 family only:
 | mlx-community/Qwen3.5-27B-4bit | z-lab/Qwen3.5-27B-DFlash |
 | Qwen/Qwen3.5-35B-A3B | z-lab/Qwen3.5-35B-A3B-DFlash |
 | mlx-community/Qwen3.5-35B-A3B-4bit | z-lab/Qwen3.5-35B-A3B-DFlash |
+| Qwen/Qwen3.6-27B | z-lab/Qwen3.6-27B-DFlash |
+| Qwen/Qwen3.6-35B-A3B | z-lab/Qwen3.6-35B-A3B-DFlash |
+| google/gemma-4-31b-it | z-lab/gemma-4-31B-it-DFlash |
+| google/gemma-4-26b-a4b-it | z-lab/gemma-4-26B-A4B-it-DFlash |
 
-Other model families (Llama, Gemma, etc.) are not supported — they require both a trained DFlash draft checkpoint and a compatible target adapter in dflash-mlx.
+Other model families (Llama, Gemma3, etc.) are not supported — they require both a trained DFlash draft checkpoint and a compatible target adapter in dflash-mlx.
+
+Note: the `-DFlash` suffix is specific to DFlash draft checkpoints. Gemma4 also ships an `-assistant` variant (e.g. `gemma-4-26B-A4B-it-assistant`) that targets MTP speculative decoding via mlx-vlm — do not mix these in the DFlash toggle.
 
 ### Per-model settings
 

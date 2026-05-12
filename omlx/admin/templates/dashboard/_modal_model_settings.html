@@ -679,7 +679,7 @@
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">DFlash</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">Block diffusion speculative decoding for 3-4x faster generation. Requires a DFlash draft model checkpoint.<br><strong>Single-stream only: requests run one at a time.</strong><br>* MLX impl by bstnxbt(<a href="https://github.com/bstnxbt/dflash-mlx" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">GitHub</a>)</p>
+                                            <p class="text-xs text-neutral-500 mt-0.5">Block diffusion speculative decoding for 3-4x faster generation. Supports Qwen (3, 3.5, 3.6) and Gemma4 model families. Requires a DFlash draft model checkpoint.<br><strong>Single-stream only: requests run one at a time.</strong><br>* MLX impl by bstnxbt(<a href="https://github.com/bstnxbt/dflash-mlx" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">GitHub</a>)</p>
                                             <p x-show="!modelSettings.dflash_compatible && modelSettings.dflash_compatibility_reason"
                                                class="text-xs text-amber-600 mt-1"
                                                x-text="modelSettings.dflash_compatibility_reason"></p>
@@ -707,7 +707,7 @@
                                                     <option :value="m.model_path || m.id" x-text="m.id" :selected="modelSettings.dflash_draft_model === (m.model_path || m.id)"></option>
                                                 </template>
                                             </select>
-                                            <p class="text-xs text-neutral-400 mt-1">DFlash draft checkpoint (e.g. z-lab/Qwen3-4B-DFlash-b16)</p>
+                                            <p class="text-xs text-neutral-400 mt-1">DFlash draft checkpoint (e.g. z-lab/Qwen3-4B-DFlash-b16, z-lab/gemma-4-26B-A4B-it-DFlash). Note: -DFlash suffix only; -assistant variants are for MTP.</p>
                                         </div>
                                         <div class="bg-neutral-50 rounded-xl">
                                             <div class="flex items-start justify-between gap-3">
