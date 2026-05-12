@@ -613,17 +613,12 @@ class EnginePool:
             # encoder weights are ignored because the patched mtp_forward only
             # exists on the language model path. mtp_enabled was already
             # validated as mutually exclusive with dflash / turboquant in
-            # ModelSettings.__post_init__.
-            if (
-                model_settings is not None
-                and getattr(model_settings, "mtp_enabled", False)
-                and effective_type == "vlm"
-            ):
-                logger.info(
-                    f"MTP enabled for VLM model {model_id}; "
-                    f"forcing LM-only dispatch, vision components ignored"
-                )
-                effective_type = "batched"
+            # metal-knowledge: with the mlx-vlm runtime MTP patch (see
+            # omlx/patches/mlx_vlm_mtp/qwen35_moe_vlm_runtime.py) VLM models
+            # can run MTP natively while keeping vision intact. The old
+            # force-LM-dispatch shortcut here is obsolete for patched
+            # model families; let VLMBatchedEngine handle MTP-enabled VLMs.
+            pass
 
             # Check if DFlash is enabled — takes priority over engine type
             # since DFlash has its own model loading pipeline

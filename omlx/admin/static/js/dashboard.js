@@ -41,7 +41,7 @@
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
-                integrations: { codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
+                integrations: { copilot_model: null, codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
@@ -173,6 +173,17 @@
             // Server connectivity info (from /admin/api/server-info)
             serverAliases: [],
             selectedAlias: '',
+
+            // Server-restart state machine (driven by Settings > Server > Restart).
+            // status transitions: idle → restarting → waiting → idle (success)
+            //                   |                   |
+            //                   |                   └─→ error (timeout / non-200)
+            //                   └─→ unsupported (no menubar supervisor)
+            //                   └─→ error (POST failed)
+            restartServer: {
+                status: 'idle',
+                message: '',
+            },
 
             statsScope: 'session',
             selectedStatsModel: '',
@@ -1840,6 +1851,109 @@
                 }
             },
 
+            async restartServerStart() {
+                if (this.restartServer.status === 'restarting'
+                    || this.restartServer.status === 'waiting') {
+                    return;
+                }
+                if (!window.confirm(window.t('settings.server.restart_confirm'))) {
+                    return;
+                }
+
+                this.restartServer = {
+                    status: 'restarting',
+                    message: window.t('settings.server.restart_status_sending'),
+                };
+
+                let response;
+                try {
+                    response = await fetch('/admin/api/server/restart', { method: 'POST' });
+                } catch (err) {
+                    // Network errors mid-restart are expected if the server
+                    // dies before sending the 202; fall through to polling.
+                    this.restartServer = {
+                        status: 'waiting',
+                        message: window.t('settings.server.restart_status_waiting'),
+                    };
+                    this._restartServerPoll();
+                    return;
+                }
+
+                if (response.status === 503) {
+                    let msg = window.t('settings.server.restart_status_unavailable');
+                    try {
+                        const data = await response.json();
+                        if (data && data.detail) msg = data.detail;
+                    } catch (e) { /* ignore */ }
+                    this.restartServer = { status: 'unsupported', message: msg };
+                    return;
+                }
+
+                if (response.status === 401) {
+                    window.location.href = '/admin';
+                    return;
+                }
+
+                if (response.status !== 202) {
+                    this.restartServer = {
+                        status: 'error',
+                        message: window.t('settings.server.restart_status_unexpected')
+                            .replace('{status}', String(response.status)),
+                    };
+                    return;
+                }
+
+                this.restartServer = {
+                    status: 'waiting',
+                    message: window.t('settings.server.restart_status_waiting'),
+                };
+                this._restartServerPoll();
+            },
+
+            _restartServerPoll() {
+                const deadline = Date.now() + 60000;  // 60s max wait
+                let sawDownAt = 0;
+                const tick = async () => {
+                    if (Date.now() > deadline) {
+                        this.restartServer = {
+                            status: 'error',
+                            message: window.t('settings.server.restart_status_timeout'),
+                        };
+                        return;
+                    }
+                    let alive = false;
+                    try {
+                        const r = await fetch('/health', { cache: 'no-store' });
+                        alive = r.ok;
+                    } catch (e) {
+                        alive = false;
+                    }
+                    if (!alive) {
+                        // First time we see it down — record it. We require a
+                        // down-then-up transition before declaring success, so
+                        // a fast supervisor that hasn't killed the old process
+                        // yet doesn't trick us into "instant success".
+                        if (!sawDownAt) sawDownAt = Date.now();
+                        setTimeout(tick, 1000);
+                        return;
+                    }
+                    // Alive again. If we never observed the down state, the
+                    // restart hasn't actually fired yet — keep polling.
+                    if (!sawDownAt) {
+                        setTimeout(tick, 1000);
+                        return;
+                    }
+                    this.restartServer = {
+                        status: 'idle',
+                        message: window.t('settings.server.restart_status_back'),
+                    };
+                    // Small delay so the user sees the success state, then
+                    // reload to ensure all caches/sessions re-sync.
+                    setTimeout(() => window.location.reload(), 500);
+                };
+                tick();
+            },
+
             get llmModels() {
                 return this.models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type);
             },
@@ -1916,6 +2030,10 @@
                 return this._launchCmd('codex');
             },
 
+            get copilotCommand() {
+                return this._launchCmd('copilot');
+            },
+
             get opencodeCommand() {
                 return this._launchCmd('opencode');
             },
@@ -1935,6 +2053,7 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
+                            integrations_copilot_model: this.globalSettings.integrations.copilot_model,
                             integrations_codex_model: this.globalSettings.integrations.codex_model,
                             integrations_opencode_model: this.globalSettings.integrations.opencode_model,
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
@@ -2902,7 +3021,7 @@
                     return { auto: false, percent: Math.min(99, Math.max(1, percent)) };
                 }
                 // Handle percent format (e.g., "69%")
-                const percent = parseInt(value.replace('%', ''));
+                const percent = parseInt(value.replace(/%/g, ''));
                 if (isNaN(percent)) return { auto: false, percent: 90 };
                 return { auto: false, percent: Math.min(99, Math.max(0, percent)) };
             },

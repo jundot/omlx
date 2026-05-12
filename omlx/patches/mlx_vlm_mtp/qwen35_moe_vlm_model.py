@@ -62,13 +62,12 @@ def apply() -> bool:
         for layer_idx in range(self.config.text_config.num_hidden_layers):
             _unfuse_layer_experts(f"model.language_model.layers.{layer_idx}.mlp")
 
-        # MTP expert layers also ship in fused form (Qwen3.6) and must be
-        # unfused here so the oQ quantization sees the same per-projection
-        # shapes as the model class expects (switch_mlp.{gate,up,down}_proj).
-        # Without this, oQ stores fused experts.gate_up_proj on disk and
-        # mlx-lm's load-time unfuse can't recover the per-tensor quantization
-        # bits — class_predicate misses the lookup → wrong-bit init → shape
-        # mismatch.
+        # MTP expert layers ship in two possible formats:
+        #   - Fused ``experts.gate_up_proj`` (Qwen3.6)
+        #   - Per-expert ``experts.{N}.{gate,up,down}_proj.weight`` (Qwen3.5)
+        # Both must be normalised to the switch_mlp form here so oQ
+        # quantization sees the same per-projection shapes as the model
+        # class expects.
         # Note: mlx-vlm's TextConfig dataclass doesn't expose
         # ``mtp_num_hidden_layers``, so we discover MTP layer indices from
         # the weight keys themselves.
@@ -81,8 +80,25 @@ def apply() -> bool:
                 and k.split(".")[2].isdigit()
             }
         )
+        num_experts = int(getattr(self.config.text_config, "num_experts", 0) or 0)
         for layer_idx in mtp_layer_idxs:
-            _unfuse_layer_experts(f"mtp.layers.{layer_idx}.mlp")
+            prefix = f"mtp.layers.{layer_idx}.mlp"
+            if f"{prefix}.switch_mlp.gate_proj.weight" in weights:
+                continue  # already in switch_mlp form
+            gate_up_key = f"{prefix}.experts.gate_up_proj"
+            if gate_up_key in weights:
+                _unfuse_layer_experts(prefix)
+            elif num_experts > 0 and f"{prefix}.experts.0.gate_proj.weight" in weights:
+                # Per-expert form — stack into switch_mlp tensors so the
+                # oQ pipeline emits one quantized tensor per projection
+                # (rather than 256 tiny tensors each with its own scales).
+                for n in ("gate_proj", "up_proj", "down_proj"):
+                    weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(
+                        [
+                            weights.pop(f"{prefix}.experts.{e}.{n}.weight")
+                            for e in range(num_experts)
+                        ]
+                    )
 
         norm_keys = (
             ".input_layernorm.weight",
@@ -112,7 +128,10 @@ def apply() -> bool:
                 key = "language_model." + key
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
-                value = value.moveaxis(2, 1)
+                # mx.moveaxis goes through the streaming-discovery
+                # monkey-patch in omlx.oq when called with _TrackedTensor;
+                # the instance method on the tracker doesn't exist.
+                value = mx.moveaxis(value, 2, 1)
             if should_shift_norm_weights and any(
                 key.endswith(sfx) for sfx in norm_keys
             ):

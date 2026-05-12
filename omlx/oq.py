@@ -1566,6 +1566,20 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
             except Exception as patch_err:
                 logger.debug(f"mlx-vlm MTP patch not applied: {patch_err}")
 
+            # Remap language_model.model.visual.* -> vision_tower.* for
+            # Qwen3.6-35B-A3B's nested ViT layout. Wraps whichever
+            # Model.sanitize is current; no-op when already installed or
+            # when upstream mlx-vlm grows the rule itself.
+            try:
+                from omlx.patches.qwen3_6_nested_visual import (
+                    apply_qwen3_6_nested_visual_patch,
+                )
+                apply_qwen3_6_nested_visual_patch()
+            except Exception as patch_err:
+                logger.debug(
+                    f"qwen3_6 nested-visual patch not applied: {patch_err}"
+                )
+
             model_module, _ = get_model_and_args(config)
             model_config_cls = model_module.ModelConfig
             model_config = model_config_cls.from_dict(config)
@@ -2174,6 +2188,27 @@ def quantize_oq_streaming(
         config = json.load(f)
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
 
+    # TEMP: DeepSeek V4 sensitivity measurement is unsupported.
+    # - Raw self-sensitivity load_weights fails on missing mtp.0.{e,h}_proj.biases
+    #   because mlx-lm's deepseek_v4 patch attaches MTP projections in
+    #   quantized form while raw checkpoints ship .weight + .scale only.
+    # - Proxy sensitivity (sensitivity_model_path=<8bit>) fails because
+    #   ``_forward_layer`` does not recognize ``DeepseekV4Block.__call__``'s
+    #   (x, mask, cache, input_ids) signature.
+    # Fixing both requires changes outside the oq.py / VLM-MTP scope of
+    # this fix, so abort early with a clear message until that follow-up
+    # lands. Remove this guard once the deepseek_v4 patch + _forward_layer
+    # support land.
+    if config.get("model_type") == "deepseek_v4":
+        raise RuntimeError(
+            "oQ quantization for deepseek_v4 (DeepSeek-V4-Flash) is not "
+            "supported yet: sensitivity measurement fails on both raw load "
+            "(missing mtp.0.{e,h}_proj.biases — model class expects quantized "
+            "form) and proxy load (_forward_layer can't match DeepseekV4Block "
+            "signature). Pending follow-up in mlx-lm deepseek_v4 patch + "
+            "oq.py _forward_layer."
+        )
+
     cb("loading", 5.0)
 
     weight_files = sorted(source.glob("*.safetensors"))
@@ -2310,6 +2345,17 @@ def quantize_oq_streaming(
             k: v for k, v in named_shapes.items()
             if not _is_vision_tensor(k) and not _is_audio_tensor(k)
         }
+    if not preserve_mtp:
+        # Match the eager path (_should_skip_tensor): when MTP heads are
+        # not being preserved, drop ``mtp.*`` tensors from the plan so the
+        # quantizer doesn't reserve bits for them and the output shards
+        # don't include them. Otherwise the output would carry the source
+        # mtp.* weights while the config's mtp_num_hidden_layers gets
+        # zeroed by _normalize_mtp_in_config — a config/weights mismatch
+        # that breaks VLM load with "Received N parameters not in model".
+        named_shapes = {
+            k: v for k, v in named_shapes.items() if not _is_mtp_tensor(k)
+        }
     _level_targets = _bpw_targets_for_level(oq_level)
     if _level_targets is not None:
         _t = target_bpw if target_bpw is not None else _level_targets[0]
@@ -2352,6 +2398,14 @@ def quantize_oq_streaming(
         if text_only and (
             _is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name)
         ):
+            del w_mx
+            processed_bytes += tensor_bytes
+            continue
+
+        if not preserve_mtp and _is_mtp_tensor(tensor_name):
+            # Strip MTP tensors when the caller asked not to preserve them.
+            # _normalize_mtp_in_config will zero mtp_num_hidden_layers in
+            # the output config so the result stays self-consistent.
             del w_mx
             processed_bytes += tensor_bytes
             continue
@@ -2976,23 +3030,55 @@ def _measure_sensitivity(
     """Measure sensitivity by loading model temporarily. Used by streaming path."""
     is_vlm = "vision_config" in config
 
+    # Apply the same MTP runtime patches that production load and the
+    # main quantize path use. Sanitize patches are already global (from
+    # _build_model_sanitizer above), so loaded weights arrive with
+    # ``language_model.mtp.*`` keys; without the runtime patch the
+    # mlx-vlm LanguageModel.__init__ never attaches ``self.mtp`` and
+    # load_weights rejects the MTP tensors with "parameters not in model".
     try:
-        if is_vlm:
-            from mlx_vlm.utils import load_model as vlm_load_model
-
-            model = vlm_load_model(Path(model_path), lazy=True)
-            from mlx_lm import load as lm_load
-
-            _, tokenizer = lm_load(model_path, lazy=True)
-        else:
-            from mlx_lm import load as lm_load
-
-            model, tokenizer = lm_load(model_path, lazy=True)
-    except Exception as e:
-        logger.error(
-            f"Sensitivity measurement: model load failed ({e})"
+        from omlx.patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            is_mtp_active,
+            set_mtp_active,
         )
-        return {}
+        _have_lm_patch = apply_mlx_lm_mtp_patch()
+    except Exception:
+        _have_lm_patch = False
+        is_mtp_active = None
+        set_mtp_active = None
+
+    if is_vlm:
+        try:
+            from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
+            apply_mlx_vlm_mtp_runtime_patch()
+        except Exception as e:
+            logger.debug(f"mlx-vlm runtime MTP patch skipped: {e}")
+
+    prev_active = is_mtp_active() if _have_lm_patch else False
+    try:
+        if _have_lm_patch:
+            set_mtp_active(True)
+        try:
+            if is_vlm:
+                from mlx_vlm.utils import load_model as vlm_load_model
+
+                model = vlm_load_model(Path(model_path), lazy=True)
+                from mlx_lm import load as lm_load
+
+                _, tokenizer = lm_load(model_path, lazy=True)
+            else:
+                from mlx_lm import load as lm_load
+
+                model, tokenizer = lm_load(model_path, lazy=True)
+        except Exception as e:
+            logger.error(
+                f"Sensitivity measurement: model load failed ({e})"
+            )
+            return {}
+    finally:
+        if _have_lm_patch:
+            set_mtp_active(prev_active)
 
     sensitivity = _measure_sensitivity_from_model(
         model, tokenizer, config, oq_level,
@@ -3031,23 +3117,43 @@ def _build_proxy_for_sensitivity(
 
     The caller is responsible for deleting the returned directory.
     """
-    from mlx_lm import convert
+    try:
+        from omlx.patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            is_mtp_active,
+            set_mtp_active,
+        )
+        _have_lm_patch = apply_mlx_lm_mtp_patch()
+    except Exception:
+        _have_lm_patch = False
+        is_mtp_active = None
+        set_mtp_active = None
 
-    # mlx-lm's convert() refuses to write into a pre-existing directory,
-    # so reserve a unique temp name and let convert() create it.
-    proxy_dir = Path(tempfile.mkdtemp(prefix="omlx_oq_proxy_", dir=working_dir))
-    shutil.rmtree(proxy_dir)
-    convert(
-        hf_path=model_path,
-        mlx_path=str(proxy_dir),
-        quantize=True,
-        q_bits=_PROXY_QUANT_BITS,
-        q_group_size=_PROXY_QUANT_GROUP_SIZE,
-        q_mode="affine",
-        dtype=dtype,
-        trust_remote_code=trust_remote_code,
-    )
-    return proxy_dir
+    prev_active = is_mtp_active() if _have_lm_patch else False
+    try:
+        if _have_lm_patch:
+            set_mtp_active(True)
+
+        from mlx_lm import convert
+
+        # mlx-lm's convert() refuses to write into a pre-existing directory,
+        # so reserve a unique temp name and let convert() create it.
+        proxy_dir = Path(tempfile.mkdtemp(prefix="omlx_oq_proxy_", dir=working_dir))
+        shutil.rmtree(proxy_dir)
+        convert(
+            hf_path=model_path,
+            mlx_path=str(proxy_dir),
+            quantize=True,
+            q_bits=_PROXY_QUANT_BITS,
+            q_group_size=_PROXY_QUANT_GROUP_SIZE,
+            q_mode="affine",
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+        )
+        return proxy_dir
+    finally:
+        if _have_lm_patch:
+            set_mtp_active(prev_active)
 
 
 def _measure_sensitivity_from_quantized_model(
@@ -3063,11 +3169,35 @@ def _measure_sensitivity_from_quantized_model(
     """
     from mlx_lm import load as lm_load
 
+    # Mirror the main quantize path's MTP patch sequence so an
+    # MTP-bearing quantized proxy (e.g. a Qwen3.5 LLM oQ output with
+    # preserve_mtp=True) loads cleanly. Without set_mtp_active(True) the
+    # mlx-lm __init__ skips ``self.mtp`` and the load rejects the
+    # ``mtp.*`` weights present in the proxy.
     try:
-        model, tokenizer = lm_load(model_path, lazy=True)
-    except Exception as e:
-        logger.error(f"Sensitivity proxy load failed ({e})")
-        return {}
+        from omlx.patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            is_mtp_active,
+            set_mtp_active,
+        )
+        _have_lm_patch = apply_mlx_lm_mtp_patch()
+    except Exception:
+        _have_lm_patch = False
+        is_mtp_active = None
+        set_mtp_active = None
+
+    prev_active = is_mtp_active() if _have_lm_patch else False
+    try:
+        if _have_lm_patch:
+            set_mtp_active(True)
+        try:
+            model, tokenizer = lm_load(model_path, lazy=True)
+        except Exception as e:
+            logger.error(f"Sensitivity proxy load failed ({e})")
+            return {}
+    finally:
+        if _have_lm_patch:
+            set_mtp_active(prev_active)
 
     calib_data = _load_calibration_data(
         tokenizer, dataset=calib_dataset,

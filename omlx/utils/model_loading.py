@@ -83,6 +83,25 @@ def maybe_apply_pre_load_patches(
                     "(model has MTP heads but mtp_enabled=False; head not attached)",
                     model_name,
                 )
+
+        # mlx-vlm side: when the model loads via VLMBatchedEngine
+        # (e.g. ``qwen3_5_moe`` with vision_config), the mlx-lm patch
+        # alone can't attach an MTP head to the mlx-vlm classes.
+        # Apply the parallel runtime patch on mlx-vlm so the MTPModule is
+        # instantiated on ``LanguageModel.__init__``.
+        if mtp_enabled:
+            try:
+                from ..patches.mlx_vlm_mtp import (
+                    apply_mlx_vlm_mtp_runtime_patch,
+                )
+            except Exception:
+                pass
+            else:
+                if apply_mlx_vlm_mtp_runtime_patch():
+                    logger.info(
+                        "mlx-vlm runtime MTP patch applied for %s",
+                        model_name,
+                    )
     elif (
         model_settings is not None
         and getattr(model_settings, "mtp_enabled", False)
@@ -94,6 +113,26 @@ def maybe_apply_pre_load_patches(
             model_type,
             _has_mtp_heads(config),
         )
+
+    # qwen3_5_moe covers Qwen3.6 too (HF config sets model_type=qwen3_5_moe).
+    # The nested-visual sanitize wrap remaps language_model.model.visual.*
+    # to vision_tower.* for Qwen3.6's nested ViT layout. Wraps whichever
+    # Model.sanitize is current (stock mlx-vlm or mlx_vlm_mtp runtime), so
+    # the call has to land after apply_mlx_vlm_mtp_runtime_patch above.
+    # No-op when the wrap's already installed or mlx-vlm isn't importable.
+    if model_type and model_type.startswith("qwen3_5_moe"):
+        try:
+            from ..patches.qwen3_6_nested_visual import (
+                apply_qwen3_6_nested_visual_patch,
+            )
+        except Exception as e:
+            logger.debug("qwen3_6 nested-visual patch import failed: %s", e)
+        else:
+            if apply_qwen3_6_nested_visual_patch():
+                logger.info(
+                    "qwen3_6 nested-visual sanitize wrap applied for %s",
+                    model_name,
+                )
 
 
 def _has_mtp_heads(config: dict) -> bool:

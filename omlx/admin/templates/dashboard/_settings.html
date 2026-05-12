@@ -256,6 +256,36 @@
                                         <option value="trace">{{ t('settings.server.log_level_trace') }}</option>
                                     </select>
                                 </div>
+                                <!-- Restart server -->
+                                <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div class="flex flex-col gap-1 min-w-0">
+                                        <label class="text-sm text-neutral-700">{{ t('settings.server.restart_label') }}</label>
+                                        <p class="text-xs text-neutral-500">{{ t('settings.server.restart_desc') }}</p>
+                                        <!-- Status line is always rendered (empty when idle) so the row
+                                             height stays constant across state transitions. Color is
+                                             state-driven; the reserved min-height prevents layout shift
+                                             when restartServer.message goes from "" to text. -->
+                                        <p class="text-xs mt-1 min-h-[1rem]"
+                                           :class="restartServer.status === 'error' ? 'text-red-500'
+                                                 : restartServer.status === 'unsupported' ? 'text-amber-600'
+                                                 : 'text-neutral-500'"
+                                           x-text="restartServer.message"></p>
+                                    </div>
+                                    <button type="button"
+                                            @click="restartServerStart()"
+                                            :disabled="restartServer.status === 'restarting' || restartServer.status === 'waiting'"
+                                            class="inline-flex items-center justify-center gap-2 h-10 min-w-[12rem] px-4 text-sm font-medium text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-all whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed">
+                                        <i x-show="restartServer.status === 'restarting' || restartServer.status === 'waiting'" x-cloak
+                                           data-lucide="loader-2" class="w-4 h-4 animate-spin shrink-0"></i>
+                                        <i x-show="restartServer.status !== 'restarting' && restartServer.status !== 'waiting'"
+                                           data-lucide="rotate-cw" class="w-4 h-4 shrink-0"></i>
+                                        <span x-text="restartServer.status === 'restarting'
+                                                       ? '{{ t('settings.server.restart_button_restarting') }}'
+                                                       : (restartServer.status === 'waiting'
+                                                           ? '{{ t('settings.server.restart_button_waiting') }}'
+                                                           : '{{ t('settings.server.restart_button') }}')"></span>
+                                    </button>
+                                </div>
                             </div>
                         </div>
 

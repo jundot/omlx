@@ -6,10 +6,11 @@ Background
 
 mlx-vlm 191d7c8 added a Multi-Token Prediction (MTP) speculative decoding
 path for Gemma 4 with an external assistant drafter (model_type
-``gemma4_assistant``). The core loop lives in
-``mlx_vlm.generate._mtp_rounds`` / ``_mtp_rounds_batch`` and operates on
-plain ``mx.array`` state plus an ``mlx_lm`` ``KVCache`` list, so omlx can
-reuse it without porting the algorithm.
+``gemma4_assistant``). f96138e (PR #1169) then moved the core round loop
+out of ``mlx_vlm.generate`` and into ``mlx_vlm.speculative.utils``, where
+``_mtp_rounds`` / ``_mtp_rounds_batch`` now live. The functions still
+operate on plain ``mx.array`` state plus an ``mlx_lm`` ``KVCache`` list,
+so omlx can reuse them without porting the algorithm.
 
 This module hides the mlx-vlm internal symbols behind a small, typed
 interface. Anything that needs to change when mlx-vlm rev's its MTP API
@@ -33,7 +34,6 @@ generated tokens.
 
 from __future__ import annotations
 
-import importlib
 import logging
 from typing import Any, Callable, Generator, List, Optional, Set, Union
 
@@ -42,14 +42,12 @@ import mlx.nn as nn
 
 from mlx_vlm.speculative import load_drafter as _vlm_load_drafter
 
+# PR #1169 (f96138e) moved the MTP round loop helpers from ``mlx_vlm.generate``
+# into ``mlx_vlm.speculative.utils``. Import directly from the new location —
+# the symbols are still ``_``-prefixed but this is now their canonical home.
+from mlx_vlm.speculative.utils import _mtp_rounds, _mtp_rounds_batch  # noqa: SLF001
+
 logger = logging.getLogger(__name__)
-
-
-# mlx-vlm exposes ``generate`` as a top-level function shadowing the module,
-# so importlib is the only reliable way to reach the module-level helpers.
-_mlx_vlm_generate = importlib.import_module("mlx_vlm.generate")
-_mtp_rounds = _mlx_vlm_generate._mtp_rounds  # noqa: SLF001 — intentional pin
-_mtp_rounds_batch = _mlx_vlm_generate._mtp_rounds_batch  # noqa: SLF001
 
 
 # What model_type strings count as a gemma4 assistant drafter. Kept as a

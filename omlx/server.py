@@ -1999,7 +1999,7 @@ async def create_completion(
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
-        logger.info(f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+        logger.info(f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}")
 
         get_server_metrics().record_request_complete(
             prompt_tokens=total_prompt_tokens,
@@ -2293,7 +2293,7 @@ async def create_chat_completion(
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-        logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+        logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {output.prompt_tokens}")
 
         get_server_metrics().record_request_complete(
             prompt_tokens=output.prompt_tokens,
@@ -2688,6 +2688,8 @@ async def stream_completion(
             generation_duration=gen_duration,
             model_id=resolve_model_id(request.model) or request.model,
         )
+        tokens_per_sec = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
+        logger.info(f"Completion: {last_output.completion_tokens} tokens in {end_time - start_time:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {last_output.prompt_tokens}")
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
@@ -2999,6 +3001,8 @@ async def stream_chat_completion(
             generation_duration=gen_duration,
             model_id=resolved_model or request.model,
         )
+        tokens_per_sec = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
+        logger.info(f"Chat completion: {last_output.completion_tokens} tokens in {end_time - start_time:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {last_output.prompt_tokens}")
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
@@ -3151,17 +3155,33 @@ async def stream_anthropic_messages(
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
-                        # Close thinking block if transitioning to text
-                        if thinking_block_started and not text_block_started:
-                            yield create_content_block_stop_event(index=block_index)
-                            block_index += 1
-                            thinking_block_started = False
-                        if not text_block_started:
-                            yield create_content_block_start_event(
-                                index=block_index, block_type="text"
-                            )
-                            text_block_started = True
-                        yield create_text_delta_event(index=block_index, text=content_delta)
+                        # When tools are requested AND we haven't yet opened
+                        # a text block, drop pure-whitespace deltas. Models
+                        # often emit a leading newline around <tool_call>
+                        # envelopes that tool_filter passes through
+                        # (whitespace isn't part of the envelope markers).
+                        # Without this guard, the `\n` opens a text block
+                        # that then holds only whitespace — surfacing as
+                        # a phantom empty-ish text block before the
+                        # tool_use blocks.
+                        if (
+                            not text_block_started
+                            and kwargs.get("tools")
+                            and not content_delta.strip()
+                        ):
+                            pass  # drop leading whitespace adjacent to tool envelopes
+                        else:
+                            # Close thinking block if transitioning to text
+                            if thinking_block_started and not text_block_started:
+                                yield create_content_block_stop_event(index=block_index)
+                                block_index += 1
+                                thinking_block_started = False
+                            if not text_block_started:
+                                yield create_content_block_start_event(
+                                    index=block_index, block_type="text"
+                                )
+                                text_block_started = True
+                            yield create_text_delta_event(index=block_index, text=content_delta)
 
             if output.finished:
                 break
@@ -3232,19 +3252,8 @@ async def stream_anthropic_messages(
                 text_block_started = True
             yield create_text_delta_event(index=block_index, text=remaining)
 
-    # 4. Close open blocks
-    if thinking_block_started and not text_block_started:
-        # Only thinking was emitted, close it
-        yield create_content_block_stop_event(index=block_index)
-        block_index += 1
-    if text_block_started:
-        yield create_content_block_stop_event(index=block_index)
-    elif not thinking_block_started:
-        # No content at all - create empty text block
-        yield create_content_block_start_event(index=block_index, block_type="text")
-        yield create_content_block_stop_event(index=block_index)
-
-    # 5. Handle tool calls
+    # 5. Handle tool calls (moved before block-closing so empty-text-block
+    # emission can skip when tool_use blocks will follow).
     # For Harmony models, use tool_calls from output (parsed by HarmonyStreamingParser)
     # For other models, parse from accumulated text
     tool_calls = None
@@ -3276,6 +3285,22 @@ async def stream_anthropic_messages(
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
 
+    # 4. Close open blocks
+    if thinking_block_started and not text_block_started:
+        # Only thinking was emitted, close it
+        yield create_content_block_stop_event(index=block_index)
+        block_index += 1
+    if text_block_started:
+        yield create_content_block_stop_event(index=block_index)
+    elif not thinking_block_started and not tool_calls:
+        # No content AND no tool_calls — emit an empty text block so the
+        # message is well-formed. When tool_calls will follow, skip this —
+        # the tool_use blocks carry the semantic content, and an empty
+        # preceding text block confuses SDK clients that treat content[0]
+        # as authoritative.
+        yield create_content_block_start_event(index=block_index, block_type="text")
+        yield create_content_block_stop_event(index=block_index)
+
     # Reverse Gemma 4 parameter renaming
     if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
         for tc in tool_calls:
@@ -3288,7 +3313,14 @@ async def stream_anthropic_messages(
                     pass
 
     # Emit tool_use blocks if present
-    tool_block_start = block_index + 1
+    # When neither text nor thinking was streamed AND the empty-text-block
+    # emission was skipped (because tool_calls are about to follow), the
+    # tool_use block takes index 0. Otherwise it follows the last emitted
+    # text/thinking block at block_index+1.
+    if not text_block_started and not thinking_block_started:
+        tool_block_start = 0
+    else:
+        tool_block_start = block_index + 1
     if tool_calls:
         for i, tc in enumerate(tool_calls, start=tool_block_start):
             # Start tool_use block
