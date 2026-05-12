@@ -2976,23 +2976,55 @@ def _measure_sensitivity(
     """Measure sensitivity by loading model temporarily. Used by streaming path."""
     is_vlm = "vision_config" in config
 
+    # Apply the same MTP runtime patches that production load and the
+    # main quantize path use. Sanitize patches are already global (from
+    # _build_model_sanitizer above), so loaded weights arrive with
+    # ``language_model.mtp.*`` keys; without the runtime patch the
+    # mlx-vlm LanguageModel.__init__ never attaches ``self.mtp`` and
+    # load_weights rejects the MTP tensors with "parameters not in model".
     try:
-        if is_vlm:
-            from mlx_vlm.utils import load_model as vlm_load_model
-
-            model = vlm_load_model(Path(model_path), lazy=True)
-            from mlx_lm import load as lm_load
-
-            _, tokenizer = lm_load(model_path, lazy=True)
-        else:
-            from mlx_lm import load as lm_load
-
-            model, tokenizer = lm_load(model_path, lazy=True)
-    except Exception as e:
-        logger.error(
-            f"Sensitivity measurement: model load failed ({e})"
+        from omlx.patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            is_mtp_active,
+            set_mtp_active,
         )
-        return {}
+        _have_lm_patch = apply_mlx_lm_mtp_patch()
+    except Exception:
+        _have_lm_patch = False
+        is_mtp_active = None
+        set_mtp_active = None
+
+    if is_vlm:
+        try:
+            from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
+            apply_mlx_vlm_mtp_runtime_patch()
+        except Exception as e:
+            logger.debug(f"mlx-vlm runtime MTP patch skipped: {e}")
+
+    prev_active = is_mtp_active() if _have_lm_patch else False
+    try:
+        if _have_lm_patch:
+            set_mtp_active(True)
+        try:
+            if is_vlm:
+                from mlx_vlm.utils import load_model as vlm_load_model
+
+                model = vlm_load_model(Path(model_path), lazy=True)
+                from mlx_lm import load as lm_load
+
+                _, tokenizer = lm_load(model_path, lazy=True)
+            else:
+                from mlx_lm import load as lm_load
+
+                model, tokenizer = lm_load(model_path, lazy=True)
+        except Exception as e:
+            logger.error(
+                f"Sensitivity measurement: model load failed ({e})"
+            )
+            return {}
+    finally:
+        if _have_lm_patch:
+            set_mtp_active(prev_active)
 
     sensitivity = _measure_sensitivity_from_model(
         model, tokenizer, config, oq_level,
@@ -3063,11 +3095,35 @@ def _measure_sensitivity_from_quantized_model(
     """
     from mlx_lm import load as lm_load
 
+    # Mirror the main quantize path's MTP patch sequence so an
+    # MTP-bearing quantized proxy (e.g. a Qwen3.5 LLM oQ output with
+    # preserve_mtp=True) loads cleanly. Without set_mtp_active(True) the
+    # mlx-lm __init__ skips ``self.mtp`` and the load rejects the
+    # ``mtp.*`` weights present in the proxy.
     try:
-        model, tokenizer = lm_load(model_path, lazy=True)
-    except Exception as e:
-        logger.error(f"Sensitivity proxy load failed ({e})")
-        return {}
+        from omlx.patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            is_mtp_active,
+            set_mtp_active,
+        )
+        _have_lm_patch = apply_mlx_lm_mtp_patch()
+    except Exception:
+        _have_lm_patch = False
+        is_mtp_active = None
+        set_mtp_active = None
+
+    prev_active = is_mtp_active() if _have_lm_patch else False
+    try:
+        if _have_lm_patch:
+            set_mtp_active(True)
+        try:
+            model, tokenizer = lm_load(model_path, lazy=True)
+        except Exception as e:
+            logger.error(f"Sensitivity proxy load failed ({e})")
+            return {}
+    finally:
+        if _have_lm_patch:
+            set_mtp_active(prev_active)
 
     calib_data = _load_calibration_data(
         tokenizer, dataset=calib_dataset,
