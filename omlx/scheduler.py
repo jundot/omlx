@@ -3318,6 +3318,8 @@ class Scheduler:
         scheduled = []
         rejected_outputs: list[RequestOutput] = []
 
+        from .prefill_progress import get_prefill_tracker
+
         # Track cache status of first scheduled request to ensure homogeneity
         # None = not determined yet, True = has cache, False = no cache
         batch_cache_status: bool | None = None
