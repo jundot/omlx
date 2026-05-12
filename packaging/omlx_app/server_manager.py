@@ -358,7 +358,6 @@ class ServerManager:
             # supervisor types (launchd, systemd, etc.) can advertise
             # themselves independently.
             env["OMLX_SUPERVISED"] = "menubar"
-            env["OMLX_SUPERVISOR_PID"] = str(os.getpid())
 
             self._process = subprocess.Popen(
                 cmd,

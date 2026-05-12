@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import sys
 import time
 from collections import deque
@@ -2563,9 +2564,6 @@ def _schedule_self_terminate(delay: float = 0.5) -> None:
     instead of mocking ``asyncio.get_running_loop`` globally (which
     interferes with FastAPI's TestClient portal).
     """
-    import os
-    import signal
-
     pid = os.getpid()
 
     def _kill() -> None:
