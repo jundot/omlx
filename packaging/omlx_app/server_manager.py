@@ -351,6 +351,15 @@ class ServerManager:
                     current = p + ":" + current
             env["PATH"] = current
 
+            # Tell the server it is running under the menubar supervisor.
+            # The admin restart endpoint reads this to know whether the
+            # process will be revived after a self-SIGTERM. Set to a
+            # supervisor identifier rather than a bare "1" so future
+            # supervisor types (launchd, systemd, etc.) can advertise
+            # themselves independently.
+            env["OMLX_SUPERVISED"] = "menubar"
+            env["OMLX_SUPERVISOR_PID"] = str(os.getpid())
+
             self._process = subprocess.Popen(
                 cmd,
                 env=env,

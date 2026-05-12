@@ -2556,6 +2556,69 @@ async def get_server_info(is_admin: bool = Depends(require_admin)):
     }
 
 
+def _schedule_self_terminate(delay: float = 0.5) -> None:
+    """Schedule ``os.kill(getpid(), SIGTERM)`` on the running loop.
+
+    Extracted from the restart handler so tests can patch this seam
+    instead of mocking ``asyncio.get_running_loop`` globally (which
+    interferes with FastAPI's TestClient portal).
+    """
+    import os
+    import signal
+
+    pid = os.getpid()
+
+    def _kill() -> None:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            # Already exited (e.g. concurrent SIGTERM) — nothing to do.
+            pass
+        except Exception:  # pragma: no cover — best-effort signal.
+            logger.exception("Failed to self-terminate for restart")
+
+    asyncio.get_running_loop().call_later(delay, _kill)
+
+
+@router.post("/api/server/restart")
+async def restart_server(is_admin: bool = Depends(require_admin)):
+    """Trigger a server restart via the menubar supervisor.
+
+    The handler does not perform the restart itself — it returns 202 and
+    schedules ``os.kill(os.getpid(), SIGTERM)`` 500ms after the response
+    is queued. The menubar app's ``ServerManager._health_check_loop``
+    detects the process exit and respawns the server with a short
+    backoff (~5s).
+
+    Gated by the ``OMLX_SUPERVISED`` environment variable so plain
+    ``omlx serve`` (no supervisor) returns 503 rather than killing the
+    server with no respawn path.
+    """
+    supervisor = os.environ.get("OMLX_SUPERVISED")
+    if not supervisor:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Server is not running under a supervisor that can "
+                "respawn it. Restart unavailable — use the menu bar "
+                "app's Restart, or restart from your shell."
+            ),
+        )
+
+    _schedule_self_terminate(0.5)
+    logger.warning("Server restart requested (supervisor=%s)", supervisor)
+
+    # 5s backoff in ServerManager + ~1-2s startup = ~7s downtime budget.
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "restarting",
+            "supervisor": supervisor,
+            "expected_downtime_seconds": 7,
+        },
+    )
+
+
 @router.get("/api/global-settings")
 async def get_global_settings(is_admin: bool = Depends(require_admin)):
     """

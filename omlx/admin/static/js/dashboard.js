@@ -174,6 +174,17 @@
             serverAliases: [],
             selectedAlias: '',
 
+            // Server-restart state machine (driven by Settings > Server > Restart).
+            // status transitions: idle → restarting → waiting → idle (success)
+            //                   |                   |
+            //                   |                   └─→ error (timeout / non-200)
+            //                   └─→ unsupported (no menubar supervisor)
+            //                   └─→ error (POST failed)
+            restartServer: {
+                status: 'idle',
+                message: '',
+            },
+
             statsScope: 'session',
             selectedStatsModel: '',
             showClearStatsConfirm: false,
@@ -1838,6 +1849,109 @@
                 } catch (err) {
                     console.error('Failed to load server info:', err);
                 }
+            },
+
+            async restartServerStart() {
+                if (this.restartServer.status === 'restarting'
+                    || this.restartServer.status === 'waiting') {
+                    return;
+                }
+                if (!window.confirm(window.t('settings.server.restart_confirm'))) {
+                    return;
+                }
+
+                this.restartServer = {
+                    status: 'restarting',
+                    message: window.t('settings.server.restart_status_sending'),
+                };
+
+                let response;
+                try {
+                    response = await fetch('/admin/api/server/restart', { method: 'POST' });
+                } catch (err) {
+                    // Network errors mid-restart are expected if the server
+                    // dies before sending the 202; fall through to polling.
+                    this.restartServer = {
+                        status: 'waiting',
+                        message: window.t('settings.server.restart_status_waiting'),
+                    };
+                    this._restartServerPoll();
+                    return;
+                }
+
+                if (response.status === 503) {
+                    let msg = window.t('settings.server.restart_status_unavailable');
+                    try {
+                        const data = await response.json();
+                        if (data && data.detail) msg = data.detail;
+                    } catch (e) { /* ignore */ }
+                    this.restartServer = { status: 'unsupported', message: msg };
+                    return;
+                }
+
+                if (response.status === 401) {
+                    window.location.href = '/admin';
+                    return;
+                }
+
+                if (response.status !== 202) {
+                    this.restartServer = {
+                        status: 'error',
+                        message: window.t('settings.server.restart_status_unexpected')
+                            .replace('{status}', String(response.status)),
+                    };
+                    return;
+                }
+
+                this.restartServer = {
+                    status: 'waiting',
+                    message: window.t('settings.server.restart_status_waiting'),
+                };
+                this._restartServerPoll();
+            },
+
+            _restartServerPoll() {
+                const deadline = Date.now() + 60000;  // 60s max wait
+                let sawDownAt = 0;
+                const tick = async () => {
+                    if (Date.now() > deadline) {
+                        this.restartServer = {
+                            status: 'error',
+                            message: window.t('settings.server.restart_status_timeout'),
+                        };
+                        return;
+                    }
+                    let alive = false;
+                    try {
+                        const r = await fetch('/health', { cache: 'no-store' });
+                        alive = r.ok;
+                    } catch (e) {
+                        alive = false;
+                    }
+                    if (!alive) {
+                        // First time we see it down — record it. We require a
+                        // down-then-up transition before declaring success, so
+                        // a fast supervisor that hasn't killed the old process
+                        // yet doesn't trick us into "instant success".
+                        if (!sawDownAt) sawDownAt = Date.now();
+                        setTimeout(tick, 1000);
+                        return;
+                    }
+                    // Alive again. If we never observed the down state, the
+                    // restart hasn't actually fired yet — keep polling.
+                    if (!sawDownAt) {
+                        setTimeout(tick, 1000);
+                        return;
+                    }
+                    this.restartServer = {
+                        status: 'idle',
+                        message: window.t('settings.server.restart_status_back'),
+                    };
+                    // Small delay so the user sees the success state, then
+                    // reload to ensure all caches/sessions re-sync.
+                    setTimeout(() => window.location.reload(), 500);
+                };
+                tick();
             },
 
             get llmModels() {
