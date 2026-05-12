@@ -215,3 +215,57 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
             logger.info(f"IndexCache applied: freq={index_cache_freq}")
 
     return model
+
+
+def maybe_load_custom_quantization(
+    model_name: str,
+    *,
+    tokenizer_config: dict[str, Any] | None = None,
+    trust_remote_code: bool = False,
+    is_vlm: bool,
+) -> tuple[Any, Any] | None:
+    """Load models that require a custom upstream quantization loader.
+
+    Returns ``None`` when the model does not declare a known custom
+    quantization method.
+    """
+    config_path = Path(model_name) / "config.json"
+    if not config_path.exists():
+        return None
+
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception as e:
+        logger.debug(
+            "Could not read %s for custom quantization dispatch: %s",
+            config_path,
+            e,
+        )
+        return None
+
+    quant_config = config.get("quantization_config")
+    quant_method = quant_config.get("quant_method") if quant_config else None
+
+    if not quant_method:
+        return None
+
+    if quant_method.lower() == "paroquant":
+        try:
+            from paroquant.inference.backends.mlx.load import load as paro_load
+        except ImportError as e:
+            raise ImportError(
+                "This model uses ParoQuant. Install it separately with: "
+                'pip install "paroquant[mlx]"'
+            ) from e
+
+        model, processor, loaded_is_vlm = paro_load(model_name, force_text=not is_vlm)
+        if is_vlm and not loaded_is_vlm:
+            raise ValueError(
+                "ParoQuant loader returned a text-only model for VLM load: "
+                f"{model_name}"
+            )
+    else:
+        # The quant method may be already supported by mlx-lm; simply return None.
+        return None
+
+    return model, processor

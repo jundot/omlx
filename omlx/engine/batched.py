@@ -205,7 +205,10 @@ class BatchedEngine(BaseEngine):
 
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
-        from ..utils.model_loading import maybe_apply_pre_load_patches
+        from ..utils.model_loading import (
+            maybe_load_custom_quantization,
+            maybe_apply_pre_load_patches,
+        )
 
         # Build tokenizer config with model-specific fixes
         tokenizer_config = get_tokenizer_config(
@@ -226,6 +229,16 @@ class BatchedEngine(BaseEngine):
         from ..engine_core import get_mlx_executor
 
         def _load_model_sync():
+            custom_loaded = maybe_load_custom_quantization(
+                self._model_name,
+                tokenizer_config=tokenizer_config,
+                trust_remote_code=self._trust_remote_code,
+                is_vlm=False,
+            )
+            if custom_loaded is not None:
+                model, processor = custom_loaded
+                return model, getattr(processor, "tokenizer", processor)
+
             return load(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
