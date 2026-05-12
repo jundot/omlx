@@ -203,12 +203,26 @@ def _model_has_mtp_module(model: Any) -> bool:
 
 def _is_mtp_eligible(gen_batch: Any) -> bool:
     """``__init__`` and ``next`` only engage MTP for single-sequence batches
-    when the model exposes ``mtp_forward`` *and* has an attached MTP head."""
+    when the model exposes ``mtp_forward``, has an attached MTP head, and
+    the process-wide ``mtp_active`` flag is on.
+
+    The MTP head may be attached unconditionally (e.g. by the mlx-vlm
+    runtime patches, which need it for weight-load matching even when
+    inference-time MTP is off) — so head presence alone is not enough
+    to decide whether to run the draft/verify cycle. ``is_mtp_active``
+    reflects the per-load ``model_settings.mtp_enabled`` choice.
+    """
     if not hasattr(gen_batch, "model"):
         return False
     if not hasattr(gen_batch.model, "mtp_forward"):
         return False
     if not _model_has_mtp_module(gen_batch.model):
+        return False
+    try:
+        from . import is_mtp_active
+        if not is_mtp_active():
+            return False
+    except Exception:
         return False
     uids = getattr(gen_batch, "uids", None)
     if uids is None or len(uids) != 1:
@@ -230,7 +244,13 @@ def _ineligibility_reason(gen_batch: Any) -> str:
             "has no mtp_forward (qwen35 patch may not have applied to this class)"
         )
     if not _model_has_mtp_module(gen_batch.model):
-        return "model has no attached mtp head (mtp_enabled was False at load time)"
+        return "model has no attached mtp head"
+    try:
+        from . import is_mtp_active
+        if not is_mtp_active():
+            return "mtp_active flag is off (model_settings.mtp_enabled was False at load time)"
+    except Exception:
+        return "is_mtp_active import failed"
     uids = getattr(gen_batch, "uids", None)
     if uids is None:
         return "GenerationBatch has no uids"

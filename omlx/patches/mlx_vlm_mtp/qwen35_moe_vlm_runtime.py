@@ -205,13 +205,13 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
 
     def __init__(self, args, config=None):
         original_init(self, args, config)
+        # Always attach MTPModule when the config declares MTP heads, so
+        # mlx-vlm's load_weights (which skips Model.sanitize for is_mlx_format
+        # checkpoints) can place the persisted mtp.* tensors. MTP speculative
+        # decode invocation is gated downstream by
+        # ``mlx_lm_mtp.batch_generator._is_mtp_eligible`` via ``is_mtp_active``.
         n_mtp = int(getattr(args, "mtp_num_hidden_layers", 0) or 0)
-        try:
-            from ..mlx_lm_mtp import is_mtp_active
-            active = bool(is_mtp_active())
-        except Exception:
-            active = False
-        if n_mtp > 0 and active:
+        if n_mtp > 0:
             self.mtp = q35moe_lang.MTPModule(args)
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
