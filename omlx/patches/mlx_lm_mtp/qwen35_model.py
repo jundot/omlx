@@ -676,22 +676,35 @@ def _patch_qwen3_5_moe() -> None:
             getattr(self.language_model.args, "mtp_num_hidden_layers", 0) or 0
         )
         if mtp_num > 0:
-            num_experts = self.language_model.args.num_experts
-            mtp_is_fused = (
-                "language_model.mtp.layers.0.mlp.experts.gate_up_proj"
-                in new_weights
+            has_any_mtp = any(
+                k.startswith("language_model.mtp.") for k in new_weights
             )
-            for layer_idx in range(mtp_num):
-                prefix = f"language_model.mtp.layers.{layer_idx}.mlp"
-                # Idempotent: oQ outputs already store experts in switch_mlp
-                # form (mlx-vlm sanitize patch unfuses MTP experts before
-                # quantization). Skip the load-time unfuse/stack in that case.
-                if f"{prefix}.switch_mlp.gate_proj.weight" in new_weights:
-                    continue
-                if mtp_is_fused:
-                    _unfuse_experts(new_weights, prefix)
-                else:
-                    _stack_per_expert(new_weights, prefix, num_experts)
+            if not has_any_mtp:
+                logger.debug(
+                    "mtp_num_hidden_layers=%d but no MTP weights found; "
+                    "model may have been quantized without preserve_mtp",
+                    mtp_num,
+                )
+            else:
+                num_experts = self.language_model.args.num_experts
+                mtp_is_fused = (
+                    "language_model.mtp.layers.0.mlp.experts.gate_up_proj"
+                    in new_weights
+                )
+                for layer_idx in range(mtp_num):
+                    prefix = f"language_model.mtp.layers.{layer_idx}.mlp"
+                    # Idempotent: oQ outputs already store experts in
+                    # switch_mlp form (mlx-vlm sanitize patch unfuses MTP
+                    # experts before quantization). Skip the load-time
+                    # unfuse/stack in that case.
+                    if f"{prefix}.switch_mlp.gate_proj.weight" in new_weights:
+                        continue
+                    if mtp_is_fused:
+                        if f"{prefix}.experts.gate_up_proj" in new_weights:
+                            _unfuse_experts(new_weights, prefix)
+                    else:
+                        if f"{prefix}.experts.0.gate_proj.weight" in new_weights:
+                            _stack_per_expert(new_weights, prefix, num_experts)
 
         return self.language_model.sanitize(new_weights)
 
