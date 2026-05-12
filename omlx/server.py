@@ -1993,7 +1993,7 @@ async def create_completion(
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
-        logger.info(f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+        logger.info(f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}")
 
         get_server_metrics().record_request_complete(
             prompt_tokens=total_prompt_tokens,
@@ -2682,6 +2682,8 @@ async def stream_completion(
             generation_duration=gen_duration,
             model_id=resolve_model_id(request.model) or request.model,
         )
+        tokens_per_sec = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
+        logger.info(f"Completion: {last_output.completion_tokens} tokens in {end_time - start_time:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {last_output.prompt_tokens}")
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
