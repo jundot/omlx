@@ -607,9 +607,10 @@ class HFDownloader:
                 task.status = DownloadStatus.DOWNLOADING
                 task.started_at = time.time()
 
-                # Derive model name from repo_id (last part)
-                model_name = task.repo_id.split("/")[-1]
-                target_dir = self._model_dir / model_name
+                # Preserve {owner}/{model} layout to match other tools
+                # (LMStudio, huggingface-cli) and avoid duplicate downloads
+                # when sharing a model directory.
+                target_dir = self._model_dir / task.repo_id
 
                 api, endpoint = _get_hf_api()
 
@@ -839,11 +840,22 @@ class HFDownloader:
 
     def _cleanup_partial(self, task: DownloadTask) -> None:
         """Remove partially downloaded model directory."""
-        model_name = task.repo_id.split("/")[-1]
-        target_dir = self._model_dir / model_name
+        target_dir = self._model_dir / task.repo_id
         if target_dir.exists():
             try:
                 shutil.rmtree(target_dir)
                 logger.info(f"Cleaned up partial download: {target_dir}")
             except Exception as e:
                 logger.error(f"Failed to clean up {target_dir}: {e}")
+        # Drop empty org folder so cancelled downloads do not leave
+        # stub directories behind.
+        parent = target_dir.parent
+        if (
+            parent != self._model_dir
+            and parent.exists()
+            and not any(parent.iterdir())
+        ):
+            try:
+                parent.rmdir()
+            except OSError as e:
+                logger.debug(f"Could not remove empty org folder {parent}: {e}")

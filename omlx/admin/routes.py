@@ -4412,6 +4412,20 @@ async def delete_hf_model(
         logger.error(f"Failed to delete model directory {model_path}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete model: {e}")
 
+    # If the model was inside an org folder (organized layout) and that
+    # folder is now empty, drop it so the listing stays tidy.
+    parent = model_path.parent
+    if (
+        parent != parent_model_dir
+        and parent.exists()
+        and not any(parent.iterdir())
+    ):
+        try:
+            parent.rmdir()
+            logger.info(f"Removed empty org folder: {parent}")
+        except OSError as e:
+            logger.debug(f"Could not remove empty org folder {parent}: {e}")
+
     # Re-discover models
     if engine_pool is not None:
         settings_manager = _get_settings_manager()

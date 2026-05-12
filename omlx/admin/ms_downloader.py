@@ -8,6 +8,7 @@ with directory-size-based progress polling.
 import asyncio
 import logging
 import os
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -642,9 +643,10 @@ class MSDownloader:
                 task.status = DownloadStatus.DOWNLOADING
                 task.started_at = time.time()
 
-                # Derive model name from model_id (last part)
-                model_name = task.repo_id.split("/")[-1]
-                target_dir = self._model_dir / model_name
+                # Preserve {owner}/{model} layout to match other tools
+                # (LMStudio, huggingface-cli) and avoid duplicate downloads
+                # when sharing a model directory.
+                target_dir = self._model_dir / task.repo_id
 
                 # Get total file size for progress estimation
                 try:
@@ -690,14 +692,26 @@ class MSDownloader:
                         f"MS Download was cancelled during execution: {task.repo_id}. "
                         "Cleaning up downloaded files..."
                     )
-                    # Clean up the downloaded directory
                     if target_dir.exists():
-                        import shutil
                         try:
                             shutil.rmtree(target_dir)
                             logger.info(f"Cleaned up cancelled download: {target_dir}")
                         except Exception as cleanup_err:
                             logger.warning(f"Failed to clean up {target_dir}: {cleanup_err}")
+                    # Drop empty org folder left behind by the cancelled download.
+                    parent = target_dir.parent
+                    if (
+                        parent != self._model_dir
+                        and parent.exists()
+                        and not any(parent.iterdir())
+                    ):
+                        try:
+                            parent.rmdir()
+                        except OSError as cleanup_err:
+                            logger.debug(
+                                f"Could not remove empty org folder {parent}: "
+                                f"{cleanup_err}"
+                            )
                     return
 
                 # Success
