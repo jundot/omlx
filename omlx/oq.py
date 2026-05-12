@@ -2310,6 +2310,17 @@ def quantize_oq_streaming(
             k: v for k, v in named_shapes.items()
             if not _is_vision_tensor(k) and not _is_audio_tensor(k)
         }
+    if not preserve_mtp:
+        # Match the eager path (_should_skip_tensor): when MTP heads are
+        # not being preserved, drop ``mtp.*`` tensors from the plan so the
+        # quantizer doesn't reserve bits for them and the output shards
+        # don't include them. Otherwise the output would carry the source
+        # mtp.* weights while the config's mtp_num_hidden_layers gets
+        # zeroed by _normalize_mtp_in_config — a config/weights mismatch
+        # that breaks VLM load with "Received N parameters not in model".
+        named_shapes = {
+            k: v for k, v in named_shapes.items() if not _is_mtp_tensor(k)
+        }
     _level_targets = _bpw_targets_for_level(oq_level)
     if _level_targets is not None:
         _t = target_bpw if target_bpw is not None else _level_targets[0]
@@ -2352,6 +2363,14 @@ def quantize_oq_streaming(
         if text_only and (
             _is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name)
         ):
+            del w_mx
+            processed_bytes += tensor_bytes
+            continue
+
+        if not preserve_mtp and _is_mtp_tensor(tensor_name):
+            # Strip MTP tensors when the caller asked not to preserve them.
+            # _normalize_mtp_in_config will zero mtp_num_hidden_layers in
+            # the output config so the result stays self-consistent.
             del w_mx
             processed_bytes += tensor_bytes
             continue
