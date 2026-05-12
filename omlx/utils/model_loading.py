@@ -220,14 +220,14 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
 def maybe_load_custom_quantization(
     model_name: str,
     *,
-    tokenizer_config: dict[str, Any] | None = None,
-    trust_remote_code: bool = False,
     is_vlm: bool,
 ) -> tuple[Any, Any] | None:
     """Load models that require a custom upstream quantization loader.
 
     Returns ``None`` when the model does not declare a known custom
-    quantization method.
+    quantization method. The custom loaders (e.g. paroquant) handle
+    their own tokenizer/processor wiring, so omlx's tokenizer_config
+    and trust_remote_code are not forwarded.
     """
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():

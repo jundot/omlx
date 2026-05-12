@@ -266,8 +266,6 @@ class MLXRerankerModel:
         tokenizer_config = {"trust_remote_code": self.trust_remote_code}
         custom_loaded = maybe_load_custom_quantization(
             model_path,
-            tokenizer_config=tokenizer_config,
-            trust_remote_code=self.trust_remote_code,
             is_vlm=False,
         )
         if custom_loaded is not None:
@@ -342,8 +340,6 @@ class MLXRerankerModel:
         tokenizer_config = {"trust_remote_code": self.trust_remote_code}
         custom_loaded = maybe_load_custom_quantization(
             model_path,
-            tokenizer_config=tokenizer_config,
-            trust_remote_code=self.trust_remote_code,
             is_vlm=False,
         )
         if custom_loaded is not None:

@@ -97,8 +97,6 @@ class MLXLanguageModel:
 
             custom_loaded = maybe_load_custom_quantization(
                 self.model_name,
-                tokenizer_config=tokenizer_config,
-                trust_remote_code=self.trust_remote_code,
                 is_vlm=False,
             )
             if custom_loaded is not None:

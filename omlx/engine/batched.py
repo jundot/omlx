@@ -231,8 +231,6 @@ class BatchedEngine(BaseEngine):
         def _load_model_sync():
             custom_loaded = maybe_load_custom_quantization(
                 self._model_name,
-                tokenizer_config=tokenizer_config,
-                trust_remote_code=self._trust_remote_code,
                 is_vlm=False,
             )
             if custom_loaded is not None:
