@@ -437,16 +437,47 @@
         <!-- Chat History -->
         <div class="flex-1 min-h-0 overflow-y-auto custom-scrollbar px-3">
             <template x-for="chat in chatHistory" :key="chat.id">
-                <div @click="loadChat(chat.id)"
+                <div @click="if (renamingChatId !== chat.id) loadChat(chat.id)"
                      class="group flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer hover:bg-surface-muted mb-1"
                      :class="{ 'bg-surface-muted': currentChatId === chat.id }">
                     <i data-lucide="message-square" class="w-4 h-4 flex-shrink-0" style="color: var(--text-muted);"></i>
-                    <span class="text-sm truncate flex-1" style="color: var(--text-primary);" x-text="chat.title || window.t('chat.new_chat_title')"></span>
-                    <button @click.stop="deleteChat(chat.id)"
-                            class="opacity-0 group-hover:opacity-100 p-1 hover:bg-danger-bg rounded transition-opacity"
-                            title="{{ t('chat.delete_tooltip') }}">
-                        <i data-lucide="trash-2" class="w-3 h-3 text-danger"></i>
-                    </button>
+                    <template x-if="renamingChatId === chat.id">
+                        <div class="flex items-center gap-1 flex-1 min-w-0">
+                            <input
+                                x-model="renameDraft"
+                                @click.stop
+                                @keydown.enter.prevent="saveRenamedChat(chat.id)"
+                                @keydown.escape.prevent="cancelRenamingChat()"
+                                class="flex-1 min-w-0 text-sm px-2 py-1 rounded-md border border-line focus:outline-none focus:border-line-strong"
+                                style="background: var(--bg-primary); color: var(--text-primary);"
+                            >
+                            <button @click.stop="saveRenamedChat(chat.id)"
+                                    class="p-1 hover:bg-surface-alt rounded transition-colors"
+                                    :title="window.t('chat.rename_save_tooltip')">
+                                <i data-lucide="check" class="w-3 h-3" style="color: var(--success, #16a34a);"></i>
+                            </button>
+                            <button @click.stop="cancelRenamingChat()"
+                                    class="p-1 hover:bg-surface-alt rounded transition-colors"
+                                    :title="window.t('chat.rename_cancel_tooltip')">
+                                <i data-lucide="x" class="w-3 h-3" style="color: var(--text-muted);"></i>
+                            </button>
+                        </div>
+                    </template>
+                    <template x-if="renamingChatId !== chat.id">
+                        <div class="flex items-center gap-0 flex-1 min-w-0">
+                            <span class="text-sm truncate flex-1" style="color: var(--text-primary);" x-text="chat.title || window.t('chat.new_chat_title')"></span>
+                            <button @click.stop="startRenamingChat(chat)"
+                                    class="opacity-0 group-hover:opacity-100 p-1 hover:bg-surface-alt rounded transition-opacity"
+                                    title="{{ t('chat.rename_tooltip') }}">
+                                <i data-lucide="pencil" class="w-3 h-3" style="color: var(--text-muted);"></i>
+                            </button>
+                            <button @click.stop="deleteChat(chat.id)"
+                                    class="opacity-0 group-hover:opacity-100 p-1 hover:bg-danger-bg rounded transition-opacity"
+                                    title="{{ t('chat.delete_tooltip') }}">
+                                <i data-lucide="trash-2" class="w-3 h-3 text-danger"></i>
+                            </button>
+                        </div>
+                    </template>
                 </div>
             </template>
         </div>
@@ -945,6 +976,8 @@
             editingIndex: null,
             editContent: '',
             editImages: [],              // Preserve images during edit
+            renamingChatId: null,
+            renameDraft: '',
 
             // Image Upload State
             uploadImages: [],            // Array of { id, base64 } for pending images (max 10)
@@ -1366,6 +1399,7 @@
                 if (!this.currentChatId || this.messages.length === 0) return;
 
                 const existingIndex = this.chatHistory.findIndex(c => c.id === this.currentChatId);
+                const existingChat = existingIndex >= 0 ? this.chatHistory[existingIndex] : null;
 
                 // Strip base64 image data from content arrays to avoid localStorage quota issues
                 const messagesForStorage = this.messages.map(msg => {
@@ -1381,12 +1415,15 @@
                     };
                 });
 
-                const title = this.getTextContent(this.messages[0]?.content)?.slice(0, 50)
-                    || window.t('chat.new_chat_title');
+                const title = existingChat?.manualTitle
+                    ? (existingChat.title || window.t('chat.new_chat_title'))
+                    : (this.getTextContent(this.messages[0]?.content)?.slice(0, 50)
+                        || window.t('chat.new_chat_title'));
 
                 const chatData = {
                     id: this.currentChatId,
                     title,
+                    manualTitle: existingChat?.manualTitle || false,
                     messages: messagesForStorage,
                     model: this.currentModel,
                     systemPrompt: this.systemPrompt,
@@ -1402,6 +1439,27 @@
                 // Keep only last 50 chats
                 this.chatHistory = this.chatHistory.slice(0, 50);
                 this.saveChatHistory();
+            },
+
+            startRenamingChat(chat) {
+                this.renamingChatId = chat.id;
+                this.renameDraft = chat.title || window.t('chat.new_chat_title');
+            },
+
+            cancelRenamingChat() {
+                this.renamingChatId = null;
+                this.renameDraft = '';
+            },
+
+            saveRenamedChat(chatId) {
+                const chat = this.chatHistory.find(c => c.id === chatId);
+                if (!chat) return;
+
+                chat.title = this.renameDraft.trim() || window.t('chat.new_chat_title');
+                chat.manualTitle = true;
+                chat.updatedAt = new Date().toISOString();
+                this.saveChatHistory();
+                this.cancelRenamingChat();
             },
 
             async sendMessage() {
