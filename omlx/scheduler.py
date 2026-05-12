@@ -109,11 +109,18 @@ def _sync_and_clear_cache():
 
 
 def _safe_sync_generation_stream():
-    """mx.synchronize(generation_stream) that tolerates cross-thread calls."""
+    """mx.synchronize(generation_stream) that tolerates cross-thread calls.
+
+    Generation_stream is owned by the _mlx_executor thread. Teardown paths
+    that run on the main thread (via EngineCore.close) hit "no Stream in
+    current thread" RuntimeError. Swallow that specific case so cleanup can
+    proceed; re-raise anything else so real GPU errors stay visible.
+    """
     try:
         mx.synchronize(generation_stream)
-    except RuntimeError:
-        pass
+    except RuntimeError as e:
+        if "no Stream" not in str(e):
+            raise
 
 
 # Import tiered cache components

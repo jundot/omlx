@@ -673,20 +673,19 @@ class EngineCore:
 
         self._closed = True
 
-        # Shutdown scheduler (clears paged SSD cache if configured)
-        self.scheduler.shutdown()
-
-        # deep_reset syncs the Metal generation_stream, which is bound to
-        # the MLX executor thread.  Dispatch through the executor so the
-        # sync runs on the correct thread; fall back to a direct call if
-        # the executor is already shut down.
-        try:
-            self._mlx_executor.submit(self.scheduler.deep_reset).result()
-        except RuntimeError:
+        # Both shutdown() and deep_reset() touch generation_stream (directly
+        # or via _drain_pending_async_removes / _do_abort_request). The
+        # stream is bound to the MLX executor thread, so dispatch both
+        # through the executor; fall back to a direct call if the executor
+        # is already shut down.
+        for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
             try:
-                self.scheduler.deep_reset()
+                self._mlx_executor.submit(fn).result()
             except RuntimeError:
-                pass
+                try:
+                    fn()
+                except RuntimeError:
+                    pass
 
         # Clear output collectors
         for collector in self._output_collectors.values():
