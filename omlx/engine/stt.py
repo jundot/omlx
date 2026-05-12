@@ -11,7 +11,7 @@ when mlx-audio is not installed.
 import asyncio
 import gc
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
 
 import mlx.core as mx
 
@@ -19,6 +19,33 @@ from ..engine_core import get_mlx_executor
 from .base import BaseNonStreamingEngine
 
 logger = logging.getLogger(__name__)
+
+
+_ISO_TO_QWEN3_ASR_LANG: dict[str, str] = {
+    "zh": "Chinese",
+    "yue": "Cantonese",
+    "en": "English",
+    "de": "German",
+    "es": "Spanish",
+    "fr": "French",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "ko": "Korean",
+    "ja": "Japanese",
+}
+
+
+def _normalize_stt_generate_language(language: str | None) -> str | None:
+    """Map OpenAI-style ISO codes to language names accepted by mlx-audio."""
+    if language is None:
+        return None
+
+    normalized = language.strip()
+    if not normalized:
+        return None
+
+    return _ISO_TO_QWEN3_ASR_LANG.get(normalized.lower(), normalized)
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +99,7 @@ def _validate_stt_processor(model_name: str, model: Any) -> None:
     # to None when WhisperProcessor.from_pretrained() failed on load.
     if not hasattr(model, "_processor"):
         return
-    if getattr(model, "_processor") is not None:
+    if model._processor is not None:
         return
     raise RuntimeError(_missing_processor_hint(model_name))
 
@@ -171,9 +198,9 @@ class STTEngine(BaseNonStreamingEngine):
     async def transcribe(
         self,
         audio_path: str,
-        language: Optional[str] = None,
+        language: str | None = None,
         **kwargs,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Transcribe an audio file.
 
@@ -228,7 +255,12 @@ class STTEngine(BaseNonStreamingEngine):
         def _transcribe_sync():
             # Call model.generate() directly instead of
             # generate_transcription() which writes files to disk.
-            result = model.generate(audio_path, **kwargs)
+            gen_kwargs = dict(kwargs)
+            generate_language = _normalize_stt_generate_language(language)
+            if generate_language is not None:
+                gen_kwargs["language"] = generate_language
+
+            result = model.generate(audio_path, **gen_kwargs)
 
             # result is typically an STTOutput dataclass with:
             # text, segments, language, total_time, etc.
@@ -286,7 +318,7 @@ class STTEngine(BaseNonStreamingEngine):
                     lambda: (mx.synchronize(), mx.clear_cache()),
                 )
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
         return {
             "model_name": self._model_name,

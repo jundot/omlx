@@ -10,11 +10,11 @@ required. Integration tests (marked @pytest.mark.slow) need a real model.
 
 import io
 import wave
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-
 
 # ---------------------------------------------------------------------------
 # WAV fixture helpers
@@ -78,17 +78,20 @@ def _make_mock_pool(stt_engine=None, model_id: str = "whisper-tiny") -> MagicMoc
 @pytest.fixture
 def audio_client():
     """TestClient for the audio router with a mocked STT engine."""
+    from fastapi import FastAPI
+
     from omlx.api.audio_routes import router
 
-    from fastapi import FastAPI
     app = FastAPI()
     app.include_router(router)
 
     mock_pool = _make_mock_pool()
 
-    with patch("omlx.api.audio_routes._get_engine_pool", return_value=mock_pool):
-        with TestClient(app, raise_server_exceptions=False) as client:
-            yield client, mock_pool
+    with (
+        patch("omlx.api.audio_routes._get_engine_pool", return_value=mock_pool),
+        TestClient(app, raise_server_exceptions=False) as client,
+    ):
+        yield client, mock_pool
 
 
 def _ensure_audio_routes(app):
@@ -99,6 +102,74 @@ def _ensure_audio_routes(app):
     existing = {getattr(r, "path", "") for r in app.routes}
     if not audio_paths & existing:
         app.include_router(audio_router)
+
+
+class TestSTTEngineLanguageForwarding:
+    """Unit tests for STTEngine language handling."""
+
+    @pytest.mark.asyncio
+    async def test_transcribe_maps_iso_language_and_forwards_kwargs(self, tmp_path):
+        """OpenAI ISO language codes reach mlx-audio as supported names."""
+        from omlx.engine.stt import STTEngine
+
+        generate_call = {}
+
+        class FakeModel:
+            def generate(self, audio_path, **kwargs):
+                generate_call["audio_path"] = audio_path
+                generate_call["kwargs"] = kwargs
+                return SimpleNamespace(
+                    text="hello",
+                    language=None,
+                    segments=[],
+                    total_time=0.1,
+                )
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        result = await engine.transcribe(
+            str(audio_path),
+            language="zh",
+            temperature=0.0,
+        )
+
+        assert generate_call["audio_path"] == str(audio_path)
+        assert generate_call["kwargs"] == {
+            "language": "Chinese",
+            "temperature": 0.0,
+        }
+        assert result["language"] == "zh"
+
+    @pytest.mark.asyncio
+    async def test_transcribe_omits_empty_language(self, tmp_path):
+        """Empty language values keep mlx-audio in its default mode."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, **kwargs):
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="hello",
+                    language=None,
+                    segments=[],
+                    total_time=0.1,
+                )
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        await engine.transcribe(str(audio_path), language=" ")
+
+        assert "language" not in generate_kwargs
 
 
 @pytest.fixture
@@ -419,8 +490,6 @@ class TestSTTProcessorErrors:
         """``load_model`` raising ``Can't load feature extractor`` becomes a
         clear message pointing at ``preprocessor_config.json``."""
         import asyncio
-
-        from omlx.engine import stt as stt_mod
 
         def _failing_load(*args, **kwargs):
             raise OSError(
