@@ -810,9 +810,7 @@ class PagedSSDCacheManager(CacheManager):
         with self._hot_cache_lock:
             old = self._hot_cache.pop(block_hash, None)
             if old:
-                self._hot_cache_total_bytes -= self._hot_cache_entry_size(
-                    old["tensors_raw"]
-                )
+                self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
 
     def _promote_to_hot_cache(
         self,
@@ -2120,7 +2118,7 @@ class PagedSSDCacheManager(CacheManager):
                     if blk_meta is None or not _matches(blk_meta.model_name):
                         continue
                     hot_entries.append(entry)
-                    hot_size += self._hot_cache_entry_size(entry["tensors_raw"])
+                    hot_size += self._hot_cache_entry_size(entry)
 
             return PagedSSDCacheStats(
                 hits=self._stats["hits"],
