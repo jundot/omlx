@@ -41,7 +41,7 @@
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
-                integrations: { codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
+                integrations: { copilot_model: null, codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
@@ -2030,6 +2030,10 @@
                 return this._launchCmd('codex');
             },
 
+            get copilotCommand() {
+                return this._launchCmd('copilot');
+            },
+
             get opencodeCommand() {
                 return this._launchCmd('opencode');
             },
@@ -2049,6 +2053,7 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
+                            integrations_copilot_model: this.globalSettings.integrations.copilot_model,
                             integrations_codex_model: this.globalSettings.integrations.codex_model,
                             integrations_opencode_model: this.globalSettings.integrations.opencode_model,
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,

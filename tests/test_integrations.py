@@ -10,6 +10,7 @@ import pytest
 from omlx.integrations import get_integration, list_integrations
 from omlx.integrations.claude import ClaudeCodeIntegration
 from omlx.integrations.codex import CodexIntegration
+from omlx.integrations.copilot import CopilotIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
 from omlx.integrations.pi import PiIntegration
@@ -18,12 +19,13 @@ from omlx.integrations.pi import PiIntegration
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 5
+        assert len(integrations) == 6
         names = {i.name for i in integrations}
-        assert names == {"claude", "codex", "opencode", "openclaw", "pi"}
+        assert names == {"claude", "copilot", "codex", "opencode", "openclaw", "pi"}
 
     def test_get_integration(self):
         assert get_integration("claude") is not None
+        assert get_integration("copilot") is not None
         assert get_integration("codex") is not None
         assert get_integration("opencode") is not None
         assert get_integration("openclaw") is not None
@@ -658,11 +660,109 @@ class TestClaudeCodeIntegration:
         assert "CLAUDE_CODE_SUBAGENT_MODEL" not in env
 
 
+class TestCopilotIntegration:
+    def test_get_command(self):
+        copilot = CopilotIntegration()
+        cmd = copilot.get_command(port=8000, api_key="key", model="qwen3.5")
+        assert "omlx launch copilot" in cmd
+        assert "--model qwen3.5" in cmd
+
+    def test_get_command_no_model(self):
+        copilot = CopilotIntegration()
+        cmd = copilot.get_command(port=8000, api_key="", model="")
+        assert "select-a-model" in cmd
+
+    def test_type(self):
+        copilot = CopilotIntegration()
+        assert copilot.type == "env_var"
+        assert copilot.display_name == "Copilot CLI"
+        assert copilot.install_check == "copilot"
+
+    def test_launch_sets_provider_env(self):
+        copilot = CopilotIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["binary"] = binary
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch("omlx.integrations.copilot.os.environ", base_env),
+            patch("omlx.integrations.copilot.os.execvpe", side_effect=fake_execvpe),
+        ):
+            copilot.launch(
+                port=8000,
+                api_key="secret",
+                model="qwen3.5",
+                context_window=131072,
+                max_tokens=8192,
+            )
+
+        env = captured["env"]
+        assert captured["binary"] == "copilot"
+        assert captured["argv"] == ["copilot"]
+        assert env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8000/v1"
+        assert env["COPILOT_PROVIDER_TYPE"] == "openai"
+        assert env["COPILOT_PROVIDER_WIRE_API"] == "responses"
+        assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "secret"
+        assert env["COPILOT_MODEL"] == "qwen3.5"
+        assert env["COPILOT_PROVIDER_MODEL_ID"] == "qwen3.5"
+        assert env["COPILOT_PROVIDER_WIRE_MODEL"] == "qwen3.5"
+        assert env["COPILOT_PROVIDER_MAX_PROMPT_TOKENS"] == "131072"
+        assert env["COPILOT_PROVIDER_MAX_OUTPUT_TOKENS"] == "8192"
+        assert "PYTHONHOME" not in env
+        assert "PYTHONPATH" not in env
+        assert "PYTHONDONTWRITEBYTECODE" not in env
+
+    def test_launch_open_server_uses_omlx_token(self):
+        copilot = CopilotIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.copilot.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.copilot.os.execvpe", side_effect=fake_execvpe),
+        ):
+            copilot.launch(port=8000, api_key="", model="qwen3.5")
+
+        assert captured["env"]["COPILOT_PROVIDER_BEARER_TOKEN"] == "omlx"
+
+    def test_launch_without_model_or_limits(self):
+        copilot = CopilotIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.copilot.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.copilot.os.execvpe", side_effect=fake_execvpe),
+        ):
+            copilot.launch(port=8000, api_key="key", model="")
+
+        env = captured["env"]
+        assert "COPILOT_MODEL" not in env
+        assert "COPILOT_PROVIDER_MODEL_ID" not in env
+        assert "COPILOT_PROVIDER_WIRE_MODEL" not in env
+        assert "COPILOT_PROVIDER_MAX_PROMPT_TOKENS" not in env
+        assert "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS" not in env
+
+
 class TestIntegrationSettings:
     def test_settings_dataclass(self):
         from omlx.settings import IntegrationSettings
 
         settings = IntegrationSettings()
+        assert settings.copilot_model is None
         assert settings.codex_model is None
         assert settings.opencode_model is None
         assert settings.openclaw_model is None
@@ -674,6 +774,7 @@ class TestIntegrationSettings:
 
         settings = IntegrationSettings(codex_model="qwen3.5")
         d = settings.to_dict()
+        assert d["copilot_model"] is None
         assert d["codex_model"] == "qwen3.5"
         assert d["opencode_model"] is None
         assert d["pi_model"] is None
@@ -683,8 +784,9 @@ class TestIntegrationSettings:
         from omlx.settings import IntegrationSettings
 
         settings = IntegrationSettings.from_dict(
-            {"codex_model": "llama", "opencode_model": "qwen"}
+            {"copilot_model": "gpt-oss", "codex_model": "llama", "opencode_model": "qwen"}
         )
+        assert settings.copilot_model == "gpt-oss"
         assert settings.codex_model == "llama"
         assert settings.opencode_model == "qwen"
         assert settings.openclaw_model is None

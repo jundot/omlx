@@ -251,6 +251,7 @@ class GlobalSettingsRequest(BaseModel):
     claude_code_haiku_model: Optional[str] = None
 
     # Other integrations settings
+    integrations_copilot_model: Optional[str] = None
     integrations_codex_model: Optional[str] = None
     integrations_opencode_model: Optional[str] = None
     integrations_openclaw_model: Optional[str] = None
@@ -3086,6 +3087,9 @@ async def update_global_settings(
 
     # Apply integrations settings (Live - immediately applied)
     integrations_changed = False
+    if "integrations_copilot_model" in request.model_fields_set:
+        global_settings.integrations.copilot_model = request.integrations_copilot_model
+        integrations_changed = True
     if "integrations_codex_model" in request.model_fields_set:
         global_settings.integrations.codex_model = request.integrations_codex_model
         integrations_changed = True
@@ -3112,6 +3116,7 @@ async def update_global_settings(
         runtime_applied.append("integrations")
         logger.info(
             f"Integration settings updated: "
+            f"copilot={global_settings.integrations.copilot_model}, "
             f"codex={global_settings.integrations.codex_model}, "
             f"opencode={global_settings.integrations.opencode_model}, "
             f"openclaw={global_settings.integrations.openclaw_model}, "
