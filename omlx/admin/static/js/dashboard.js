@@ -3021,7 +3021,7 @@
                     return { auto: false, percent: Math.min(99, Math.max(1, percent)) };
                 }
                 // Handle percent format (e.g., "69%")
-                const percent = parseInt(value.replace('%', ''));
+                const percent = parseInt(value.replace(/%/g, ''));
                 if (isNaN(percent)) return { auto: false, percent: 90 };
                 return { auto: false, percent: Math.min(99, Math.max(0, percent)) };
             },
