@@ -944,6 +944,83 @@ class TestStreamingHelperFunctions:
         assert "tool_use" in stop_reasons
 
     @pytest.mark.asyncio
+    async def test_anthropic_tool_only_stream_starts_with_tool_use_block(self):
+        """A tool-only response should not emit an empty text block before tool_use."""
+        from omlx.server import stream_anthropic_messages
+        from omlx.api.anthropic_models import MessagesRequest
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="",
+                new_text="",
+                completion_tokens=1,
+                finished=True,
+                finish_reason="tool_calls",
+                tool_calls=[{
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"SF\"}",
+                }],
+            ),
+        ])
+
+        anthropic_tools = [{
+            "name": "get_weather",
+            "description": "Get weather",
+            "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        }]
+        internal_tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": anthropic_tools[0]["input_schema"],
+            },
+        }]
+        request = MessagesRequest(
+            model="test-model",
+            max_tokens=256,
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+            tools=anthropic_tools,
+        )
+
+        events = []
+        async for event in stream_anthropic_messages(
+            engine,
+            [{"role": "user", "content": "Hi"}],
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=internal_tools,
+        ):
+            events.append(event)
+
+        parsed_events = []
+        for event in events:
+            for line in event.split("\n"):
+                if line.startswith("data: "):
+                    parsed_events.append(json.loads(line[6:]))
+
+        block_starts = [
+            event
+            for event in parsed_events
+            if event.get("type") == "content_block_start"
+        ]
+        assert block_starts[0]["index"] == 0
+        assert block_starts[0]["content_block"]["type"] == "tool_use"
+        assert all(
+            event["content_block"]["type"] != "text"
+            for event in block_starts
+        )
+
+    @pytest.mark.asyncio
     async def test_stream_chat_completion_with_tools_and_tool_calls_keeps_prior_content(self):
         """A tool_call finish should end the turn, not suppress already-generated text."""
         from omlx.server import stream_chat_completion
