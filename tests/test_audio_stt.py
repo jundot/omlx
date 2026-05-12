@@ -293,6 +293,123 @@ class TestSTTEndpointBasic:
         )
         assert response.status_code == 200
 
+    def test_max_tokens_forwarded_to_engine(self, server_audio_client):
+        """max_tokens= form field is passed through to engine.transcribe()."""
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny", "max_tokens": "32768"},
+        )
+
+        assert response.status_code == 200
+        assert captured.get("max_tokens") == 32768
+
+    def test_max_tokens_omitted_when_not_set_and_no_setting(self, server_audio_client):
+        """max_tokens is not passed when neither request nor per-model setting set it."""
+        from unittest.mock import patch
+
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        # No settings manager => model's own default applies; nothing forwarded.
+        with patch(
+            "omlx.api.audio_routes._get_settings_manager",
+            return_value=None,
+        ):
+            response = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+                data={"model": "whisper-tiny"},
+            )
+
+        assert response.status_code == 200
+        assert "max_tokens" not in captured
+
+    def test_max_tokens_falls_back_to_per_model_setting(self, server_audio_client):
+        """When request omits max_tokens, ModelSettings.max_tokens is used."""
+        from unittest.mock import MagicMock, patch
+
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        # Stand in for ModelSettingsManager that returns max_tokens=65536
+        # for any model id.
+        fake_settings = MagicMock(max_tokens=65536)
+        fake_manager = MagicMock()
+        fake_manager.get_settings.return_value = fake_settings
+
+        with patch(
+            "omlx.api.audio_routes._get_settings_manager",
+            return_value=fake_manager,
+        ):
+            response = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+                data={"model": "whisper-tiny"},
+            )
+
+        assert response.status_code == 200
+        assert captured.get("max_tokens") == 65536
+
+    def test_max_tokens_request_overrides_per_model_setting(self, server_audio_client):
+        """An explicit request max_tokens beats the per-model setting."""
+        from unittest.mock import MagicMock, patch
+
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        fake_settings = MagicMock(max_tokens=65536)
+        fake_manager = MagicMock()
+        fake_manager.get_settings.return_value = fake_settings
+
+        with patch(
+            "omlx.api.audio_routes._get_settings_manager",
+            return_value=fake_manager,
+        ):
+            response = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+                data={"model": "whisper-tiny", "max_tokens": "4096"},
+            )
+
+        assert response.status_code == 200
+        assert captured.get("max_tokens") == 4096
+
 
 # ---------------------------------------------------------------------------
 # TestSTTEndpointResponseFormat
