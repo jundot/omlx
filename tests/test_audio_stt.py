@@ -109,7 +109,12 @@ class TestSTTEngineLanguageForwarding:
 
     @pytest.mark.asyncio
     async def test_transcribe_maps_iso_language_and_forwards_kwargs(self, tmp_path):
-        """OpenAI ISO language codes reach mlx-audio as supported names."""
+        """OpenAI ISO language codes reach mlx-audio as lowercase full-names.
+
+        Lowercase is what both backends accept: Whisper's TO_LANGUAGE_CODE
+        normalizes "chinese" -> "zh" for the language token, and Qwen3-ASR
+        lowercases its supported-language list before matching.
+        """
         from omlx.engine.stt import STTEngine
 
         generate_call = {}
@@ -139,10 +144,37 @@ class TestSTTEngineLanguageForwarding:
 
         assert generate_call["audio_path"] == str(audio_path)
         assert generate_call["kwargs"] == {
-            "language": "Chinese",
+            "language": "chinese",
             "temperature": 0.0,
         }
         assert result["language"] == "zh"
+
+    @pytest.mark.asyncio
+    async def test_transcribe_passes_unknown_language_through(self, tmp_path):
+        """Unknown / non-ISO inputs are forwarded as-is so backends can still try."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, **kwargs):
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="hello",
+                    language=None,
+                    segments=[],
+                    total_time=0.1,
+                )
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        await engine.transcribe(str(audio_path), language="Klingon")
+
+        assert generate_kwargs["language"] == "Klingon"
 
     @pytest.mark.asyncio
     async def test_transcribe_omits_empty_language(self, tmp_path):

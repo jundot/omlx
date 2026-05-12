@@ -21,23 +21,27 @@ from .base import BaseNonStreamingEngine
 logger = logging.getLogger(__name__)
 
 
-_ISO_TO_QWEN3_ASR_LANG: dict[str, str] = {
-    "zh": "Chinese",
-    "yue": "Cantonese",
-    "en": "English",
-    "de": "German",
-    "es": "Spanish",
-    "fr": "French",
-    "it": "Italian",
-    "pt": "Portuguese",
-    "ru": "Russian",
-    "ko": "Korean",
-    "ja": "Japanese",
+# Lowercase full-names work for both Qwen3-ASR (its _build_prompt lowercases
+# the supported-language list before lookup) and Whisper (its TO_LANGUAGE_CODE
+# normalizer maps lowercase names to ISO codes). Capitalized names would break
+# Whisper because `<|Chinese|>` is not a valid language token.
+_ISO_TO_STT_LANG: dict[str, str] = {
+    "zh": "chinese",
+    "yue": "cantonese",
+    "en": "english",
+    "de": "german",
+    "es": "spanish",
+    "fr": "french",
+    "it": "italian",
+    "pt": "portuguese",
+    "ru": "russian",
+    "ko": "korean",
+    "ja": "japanese",
 }
 
 
 def _normalize_stt_generate_language(language: str | None) -> str | None:
-    """Map OpenAI-style ISO codes to language names accepted by mlx-audio."""
+    """Map OpenAI-style ISO codes to language names accepted by mlx-audio backends."""
     if language is None:
         return None
 
@@ -45,7 +49,7 @@ def _normalize_stt_generate_language(language: str | None) -> str | None:
     if not normalized:
         return None
 
-    return _ISO_TO_QWEN3_ASR_LANG.get(normalized.lower(), normalized)
+    return _ISO_TO_STT_LANG.get(normalized.lower(), normalized)
 
 
 # ---------------------------------------------------------------------------
