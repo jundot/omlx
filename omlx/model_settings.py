@@ -62,7 +62,10 @@ class ModelSettings:
         specprefill_threshold: Min tokens to trigger SpecPrefill.
         dflash_enabled: Enable DFlash speculative decoding.
         dflash_draft_model: Path/repo for DFlash draft checkpoint.
-        dflash_draft_quant_bits: Draft model quantization bits.
+        dflash_draft_quant_enabled: Enable draft model quantization.
+        dflash_draft_quant_weight_bits: Quantization weight bits (2, 4, 8).
+        dflash_draft_quant_activation_bits: Quantization activation bits (16, 32).
+        dflash_draft_quant_group_size: Quantization group size (32, 64, 128).
         dflash_max_ctx: Token threshold to fall back to BatchedEngine (None = unlimited).
         dflash_in_memory_cache: Enable DFlash L1 (RAM) prefix cache.
         dflash_in_memory_cache_max_entries: L1 cache max entries (default 4, matches dflash balanced profile).
@@ -73,6 +76,11 @@ class ModelSettings:
             decoding. Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually
             exclusive with dflash_enabled and turboquant_kv_enabled. Concurrent requests on
             the same model fall back to standard continuous batching automatically.
+        vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
+            drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
+            "gemma4_assistant" model.
+        vlm_mtp_draft_model: Path/repo of the assistant drafter (e.g. "gemma-4-26B-A4B-it-assistant").
+        vlm_mtp_draft_block_size: Tokens drafted per round (None = mlx-vlm default).
         is_pinned: Keep model loaded in memory.
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.
@@ -117,7 +125,10 @@ class ModelSettings:
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool = False
     dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
-    dflash_draft_quant_bits: Optional[int] = None  # Draft model quantization (None=bf16, 4)
+    dflash_draft_quant_enabled: Optional[bool] = None
+    dflash_draft_quant_weight_bits: Optional[int] = None  # 2, 4, 8
+    dflash_draft_quant_activation_bits: Optional[int] = None  # 16, 32
+    dflash_draft_quant_group_size: Optional[int] = None  # 32, 64, 128
     dflash_max_ctx: Optional[int] = None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
     # DFlash prefix cache (private to dflash; separate from omlx tiered cache because
     # snapshots include draft model GDN state and target hidden chunks omlx never tracks)
@@ -130,6 +141,14 @@ class ModelSettings:
     # uses MTP draft+verify path for single-request decoding. Compatible model_types:
     # qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with dflash and turboquant.
     mtp_enabled: bool = False
+
+    # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+).
+    # Target = Gemma4 VLM body, drafter = "gemma-4-26B-A4B-it-assistant"
+    # (model_type "gemma4_assistant"). Mutually exclusive with all other speculative
+    # paths because the wrapper bypasses mlx-lm BatchGenerator at decode time.
+    vlm_mtp_enabled: bool = False
+    vlm_mtp_draft_model: Optional[str] = None  # Path / model id of the assistant drafter
+    vlm_mtp_draft_block_size: Optional[int] = None  # Tokens per draft round (None = mlx-vlm default)
 
     # Model management flags
     is_pinned: bool = False
@@ -160,6 +179,22 @@ class ModelSettings:
                 "mtp_enabled and turboquant_kv_enabled cannot both be True; "
                 "TurboQuant patches the attention path that MTP relies on"
             )
+        # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
+        # at decode time, so it cannot coexist with any other speculative path
+        # or with TurboQuant (which mutates the same cache objects).
+        if self.vlm_mtp_enabled:
+            conflicts = [
+                ("dflash_enabled", self.dflash_enabled),
+                ("specprefill_enabled", self.specprefill_enabled),
+                ("mtp_enabled", self.mtp_enabled),
+                ("turboquant_kv_enabled", self.turboquant_kv_enabled),
+            ]
+            for name, value in conflicts:
+                if value:
+                    raise ValueError(
+                        f"vlm_mtp_enabled and {name} cannot both be True; "
+                        "choose one speculative path per model"
+                    )
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

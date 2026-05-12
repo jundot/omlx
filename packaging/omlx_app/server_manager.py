@@ -15,7 +15,13 @@ from typing import Callable, Optional, Union
 
 import requests
 
-from .config import ServerConfig, get_log_path
+from .config import (
+    ServerConfig,
+    get_log_path,
+    resolve_local_server_base_url,
+    resolve_local_server_health_url,
+    tcp_probe_connection_targets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,10 +104,14 @@ class ServerManager:
                 logger.error(f"Status callback error: {e}")
 
     def _get_health_url(self) -> str:
-        return f"http://127.0.0.1:{self.config.port}/health"
+        return resolve_local_server_health_url(
+            self.config.get_server_bind_host(), self.config.port
+        )
 
     def get_api_url(self) -> str:
-        return f"http://127.0.0.1:{self.config.port}"
+        return resolve_local_server_base_url(
+            self.config.get_server_bind_host(), self.config.port
+        )
 
     def check_health(self) -> bool:
         try:
@@ -223,13 +233,16 @@ class ServerManager:
 
     def _is_port_in_use(self) -> bool:
         """Check if the configured port is already in use."""
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1)
-                s.connect(("127.0.0.1", self.config.port))
-                return True
-        except (ConnectionRefusedError, OSError):
-            return False
+        if self._find_port_owner_pid() is not None:
+            return True
+        bind = self.config.get_server_bind_host()
+        for host, port in tcp_probe_connection_targets(bind, self.config.port):
+            try:
+                with socket.create_connection((host, port), timeout=1):
+                    return True
+            except OSError:
+                continue
+        return False
 
     def _is_omlx_server(self) -> bool:
         """Check if the process on the port is an oMLX server."""

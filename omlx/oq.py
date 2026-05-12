@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import shutil
+import tempfile
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,12 @@ OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
 _OQ_DEFAULT_GROUP_SIZE = 64
 
 _MAX_MODEL_RAM_FRACTION = 0.8
+
+# Auto-built proxy for sensitivity measurement when the source model
+# exceeds available RAM. Uniform 4-bit affine quant — same shape as a
+# user-supplied --sensitivity-model, but built on demand.
+_PROXY_QUANT_BITS = 4
+_PROXY_QUANT_GROUP_SIZE = 64
 
 _LEVEL_BITS: dict[float, int] = {2: 2, 3: 3, 3.5: 3, 4: 4, 5: 5, 6: 6, 8: 8}
 
@@ -2112,6 +2119,7 @@ def quantize_oq_streaming(
     sensitivity_model_path: str = "",
     dtype: str = "bfloat16",
     preserve_mtp: bool = False,
+    auto_proxy_sensitivity: bool = True,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -2135,6 +2143,13 @@ def quantize_oq_streaming(
             are stripped *and* the output config's mtp_num_hidden_layers /
             num_nextn_predict_layers are normalized to 0 to keep the
             quantized model self-consistent.
+        auto_proxy_sensitivity: When True (default) and the source model
+            exceeds available RAM, automatically build a temporary uniform
+            4-bit proxy on disk and run sensitivity measurement on it,
+            preserving oQ's data-driven mixed-precision allocation. When
+            False, the quantization aborts on RAM-exceeding models with a
+            RuntimeError so callers always get a real sensitivity-driven
+            output. Ignored if sensitivity_model_path is set explicitly.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -2227,24 +2242,67 @@ def quantize_oq_streaming(
             sensitivity_model_path, config, oq_level,
             num_samples=128, seq_length=256,
         )
-    else:
-        if _model_exceeds_ram:
-            logger.info(
-                f"oQ{oq_level:g}: skipping full-model sensitivity (model exceeds RAM), "
-                "using position-based sensitivity"
+    elif _model_exceeds_ram and auto_proxy_sensitivity:
+        logger.warning(
+            f"oQ{oq_level:g}: model size ({_model_bytes/1e9:.1f} GB) exceeds "
+            f"{int(_MAX_MODEL_RAM_FRACTION*100)}% of system RAM "
+            f"({_system_ram/1e9:.1f} GB). Auto-building a uniform "
+            f"{_PROXY_QUANT_BITS}-bit proxy on disk so sensitivity "
+            "measurement stays data-driven."
+        )
+        _proxy_dir: Path | None = None
+        try:
+            _proxy_dir = _build_proxy_for_sensitivity(
+                model_path, dtype=dtype, working_dir=str(output.parent),
             )
-            sensitivity_map = {}
-        else:
-            logger.info(f"oQ{oq_level:g}: measuring layer sensitivity for streaming path")
-            sensitivity_map = _measure_sensitivity(
-                model_path, config, oq_level,
+            logger.info(
+                f"oQ{oq_level:g}: proxy ready at {_proxy_dir}, measuring sensitivity"
+            )
+            sensitivity_map = _measure_sensitivity_from_quantized_model(
+                str(_proxy_dir), config, oq_level,
                 num_samples=128, seq_length=256,
             )
-    if sensitivity_map:
-        config["_oq_sensitivity_map"] = {
-            str(k): v for k, v in sensitivity_map.items()
-        }
-        logger.info(f"oQ{oq_level:g}: sensitivity applied ({len(sensitivity_map)} layers)")
+        except Exception as e:
+            raise RuntimeError(
+                f"oQ{oq_level:g}: auto-proxy sensitivity failed ({e}). "
+                "Pass sensitivity_model_path with a pre-quantized version "
+                "of this model, or run on a machine with enough RAM for "
+                "full-fp16 sensitivity measurement."
+            ) from e
+        finally:
+            if _proxy_dir is not None and _proxy_dir.exists():
+                shutil.rmtree(_proxy_dir, ignore_errors=True)
+                logger.info(f"oQ{oq_level:g}: cleaned up proxy at {_proxy_dir}")
+    elif _model_exceeds_ram:
+        raise RuntimeError(
+            f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION*100)}% "
+            "of system RAM and auto_proxy_sensitivity is disabled. "
+            "Enable auto_proxy_sensitivity, pass sensitivity_model_path "
+            "with a pre-quantized version of this model, or run on a "
+            "machine with enough RAM."
+        )
+    else:
+        logger.info(f"oQ{oq_level:g}: measuring layer sensitivity for streaming path")
+        sensitivity_map = _measure_sensitivity(
+            model_path, config, oq_level,
+            num_samples=128, seq_length=256,
+        )
+
+    # Single enforcement point. Inner measurement helpers may return {} on
+    # load / calibration / layer-discovery failure; treat that as a hard
+    # error here so the rest of quantize_oq_streaming never runs without a
+    # data-driven sensitivity map.
+    if not sensitivity_map:
+        raise RuntimeError(
+            f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
+            "Check the preceding log lines for the root cause (model load, "
+            "calibration data, or layer discovery), and either fix it or "
+            "pass an explicit sensitivity_model_path."
+        )
+    config["_oq_sensitivity_map"] = {
+        str(k): v for k, v in sensitivity_map.items()
+    }
+    logger.info(f"oQ{oq_level:g}: sensitivity applied ({len(sensitivity_map)} layers)")
 
     named_shapes = _collect_named_weight_shapes_from_weights(all_weights)
     if text_only:
@@ -2931,9 +2989,8 @@ def _measure_sensitivity(
 
             model, tokenizer = lm_load(model_path, lazy=True)
     except Exception as e:
-        logger.warning(
-            f"Sensitivity measurement: model load failed ({e}), "
-            "using position-based"
+        logger.error(
+            f"Sensitivity measurement: model load failed ({e})"
         )
         return {}
 
@@ -2952,6 +3009,47 @@ def _measure_sensitivity(
 _REQUANT_VALID_BITS = {2, 3, 4, 5, 6, 8}
 
 
+def _build_proxy_for_sensitivity(
+    model_path: str,
+    *,
+    dtype: str,
+    working_dir: str | None = None,
+    trust_remote_code: bool = False,
+) -> Path:
+    """Build a temporary uniform 4-bit proxy for sensitivity measurement.
+
+    Used when the source model exceeds available RAM and full-fp16
+    sensitivity measurement is not feasible. The proxy keeps oQ data-driven;
+    without it, quantize_oq_streaming aborts the run with a RuntimeError.
+
+    ``working_dir`` controls where the proxy is written. Defaults to the
+    system temp dir when None, but callers should pass the parent of the
+    output directory so the proxy lands on the same volume the user has
+    already provisioned for the quantized output. This avoids the trap of
+    Linux ``/tmp`` being tmpfs (RAM-backed), which would defeat the whole
+    point of the OOM-driven proxy.
+
+    The caller is responsible for deleting the returned directory.
+    """
+    from mlx_lm import convert
+
+    # mlx-lm's convert() refuses to write into a pre-existing directory,
+    # so reserve a unique temp name and let convert() create it.
+    proxy_dir = Path(tempfile.mkdtemp(prefix="omlx_oq_proxy_", dir=working_dir))
+    shutil.rmtree(proxy_dir)
+    convert(
+        hf_path=model_path,
+        mlx_path=str(proxy_dir),
+        quantize=True,
+        q_bits=_PROXY_QUANT_BITS,
+        q_group_size=_PROXY_QUANT_GROUP_SIZE,
+        q_mode="affine",
+        dtype=dtype,
+        trust_remote_code=trust_remote_code,
+    )
+    return proxy_dir
+
+
 def _measure_sensitivity_from_quantized_model(
     model_path: str, config: dict, oq_level,
     calib_dataset="code_multilingual",
@@ -2968,7 +3066,7 @@ def _measure_sensitivity_from_quantized_model(
     try:
         model, tokenizer = lm_load(model_path, lazy=True)
     except Exception as e:
-        logger.warning(f"Sensitivity proxy load failed ({e}), using position-based")
+        logger.error(f"Sensitivity proxy load failed ({e})")
         return {}
 
     calib_data = _load_calibration_data(

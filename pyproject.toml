@@ -65,15 +65,18 @@ dependencies = [
     # Server
     "fastapi>=0.108.0",
     "uvicorn>=0.23.0",
+    # python-multipart is needed by audio_routes.py (File/Form uploads), which
+    # server.py unconditionally imports regardless of the [audio] extra.
+    "python-multipart>=0.0.5",
     # JSON Schema validation for structured output
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (e41cd25) - thread-local stream, DFlash GPU hang fix, hunyuan_vl/gemma3n cleanup
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e41cd25565861500e48c076ab31aaeafee0ed80f",
+    # mlx-vlm from commit (191d7c8) - Gemma4 MTP speculative decoding, APC, server metrics, Molmo2 fp16 fix, new VLM models
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@191d7c88bdcc98ac209a57823855b725275a1fa0",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.5.1 (110f261) — runtime_context, prefix cache (L1+L2), verify-specialized int4 qmm
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@110f261",
+    # dflash-mlx v0.1.5.1 (20d68db) — original bstnxbt repo. Gemma4 support, runtime package refactor, stable prefix snapshot reuse
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@20d68db3b3c0ae3dd6d3a2f0d3c10b2344ee514e",
 ]
 
 [project.optional-dependencies]
@@ -93,7 +96,6 @@ audio = [
     # stt extra: tiktoken, mistral-common[audio]
     # sts extra: tts deps + stt deps + webrtcvad
     "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
-    "python-multipart>=0.0.5",
 ]
 dev = [
     "pytest>=7.0.0",

@@ -33,6 +33,7 @@ from AppKit import (
 )
 from Foundation import NSData, NSObject
 
+from .config import resolve_local_server_base_url
 from .server_manager import PortConflict
 from .widgets import PastableSecureTextField
 
@@ -653,8 +654,10 @@ class WelcomeWindowController(NSObject):
     @objc.IBAction
     def openDashboard_(self, sender):
         """Open the admin dashboard and close welcome window."""
-        port = self.config.port
-        webbrowser.open(f"http://127.0.0.1:{port}/admin")
+        base = resolve_local_server_base_url(
+            self.config.get_server_bind_host(), self.config.port
+        )
+        webbrowser.open(f"{base}/admin")
         self.window.close()
 
     @objc.IBAction

@@ -129,7 +129,10 @@ class ModelSettingsRequest(BaseModel):
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: Optional[bool] = None
     dflash_draft_model: Optional[str] = None
-    dflash_draft_quant_bits: Optional[int] = None
+    dflash_draft_quant_enabled: Optional[bool] = None
+    dflash_draft_quant_weight_bits: Optional[int] = None
+    dflash_draft_quant_activation_bits: Optional[int] = None
+    dflash_draft_quant_group_size: Optional[int] = None
     dflash_max_ctx: Optional[int] = None
     dflash_in_memory_cache: Optional[bool] = None
     dflash_in_memory_cache_max_entries: Optional[int] = None
@@ -137,6 +140,10 @@ class ModelSettingsRequest(BaseModel):
     dflash_ssd_cache: Optional[bool] = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: Optional[bool] = None
+    # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
+    vlm_mtp_enabled: Optional[bool] = None
+    vlm_mtp_draft_model: Optional[str] = None
+    vlm_mtp_draft_block_size: Optional[int] = None
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
@@ -296,6 +303,7 @@ class OQStartRequest(BaseModel):
     text_only: bool = False
     dtype: str = "bfloat16"
     preserve_mtp: bool = False
+    auto_proxy_sensitivity: bool = True
 
 
 class HFUploadRequest(BaseModel):
@@ -1604,13 +1612,19 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "specprefill_threshold": settings.specprefill_threshold,
                 "dflash_enabled": settings.dflash_enabled,
                 "dflash_draft_model": settings.dflash_draft_model,
-                "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
+                "dflash_draft_quant_enabled": settings.dflash_draft_quant_enabled,
+                "dflash_draft_quant_weight_bits": settings.dflash_draft_quant_weight_bits,
+                "dflash_draft_quant_activation_bits": settings.dflash_draft_quant_activation_bits,
+                "dflash_draft_quant_group_size": settings.dflash_draft_quant_group_size,
                 "dflash_max_ctx": settings.dflash_max_ctx,
                 "dflash_in_memory_cache": settings.dflash_in_memory_cache,
                 "dflash_in_memory_cache_max_entries": settings.dflash_in_memory_cache_max_entries,
                 "dflash_in_memory_cache_max_bytes": settings.dflash_in_memory_cache_max_bytes,
                 "dflash_ssd_cache": settings.dflash_ssd_cache,
                 "mtp_enabled": settings.mtp_enabled,
+                "vlm_mtp_enabled": settings.vlm_mtp_enabled,
+                "vlm_mtp_draft_model": settings.vlm_mtp_draft_model,
+                "vlm_mtp_draft_block_size": settings.vlm_mtp_draft_block_size,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "trust_remote_code": settings.trust_remote_code,
@@ -1875,8 +1889,14 @@ async def update_model_settings(
         current_settings.dflash_enabled = new_dflash_enabled
     if "dflash_draft_model" in sent:
         current_settings.dflash_draft_model = request.dflash_draft_model or None
-    if "dflash_draft_quant_bits" in sent:
-        current_settings.dflash_draft_quant_bits = request.dflash_draft_quant_bits or None
+    if "dflash_draft_quant_enabled" in sent:
+        current_settings.dflash_draft_quant_enabled = bool(request.dflash_draft_quant_enabled) if request.dflash_draft_quant_enabled is not None else None
+    if "dflash_draft_quant_weight_bits" in sent:
+        current_settings.dflash_draft_quant_weight_bits = int(request.dflash_draft_quant_weight_bits) if request.dflash_draft_quant_weight_bits is not None else None
+    if "dflash_draft_quant_activation_bits" in sent:
+        current_settings.dflash_draft_quant_activation_bits = int(request.dflash_draft_quant_activation_bits) if request.dflash_draft_quant_activation_bits is not None else None
+    if "dflash_draft_quant_group_size" in sent:
+        current_settings.dflash_draft_quant_group_size = int(request.dflash_draft_quant_group_size) if request.dflash_draft_quant_group_size is not None else None
     if "dflash_max_ctx" in sent:
         # 0/None means "unlimited" — the engine treats None as no fallback threshold
         value = request.dflash_max_ctx
@@ -1993,6 +2013,51 @@ async def update_model_settings(
                 )
         current_settings.mtp_enabled = new_mtp_enabled
 
+    # VLM MTP (mlx-vlm 191d7c8+, gemma4_assistant drafter)
+    if "vlm_mtp_enabled" in sent:
+        new_vlm_mtp = bool(request.vlm_mtp_enabled)
+        if new_vlm_mtp:
+            drafter_after = (
+                request.vlm_mtp_draft_model
+                if "vlm_mtp_draft_model" in sent
+                else current_settings.vlm_mtp_draft_model
+            )
+            if not drafter_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "vlm_mtp_enabled requires vlm_mtp_draft_model "
+                        "(path to a gemma4_assistant drafter, "
+                        "e.g. 'gemma-4-26B-A4B-it-assistant')."
+                    ),
+                )
+            # Mutex enforced again at ModelSettings.__post_init__ for
+            # last-mile safety, but surface a clearer error here.
+            for other_field, other_label in (
+                ("dflash_enabled", "DFlash"),
+                ("specprefill_enabled", "SpecPrefill"),
+                ("mtp_enabled", "MTP"),
+                ("turboquant_kv_enabled", "TurboQuant KV"),
+            ):
+                other_after = (
+                    bool(getattr(request, other_field))
+                    if other_field in sent
+                    else getattr(current_settings, other_field)
+                )
+                if other_after:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"vlm_mtp_enabled and {other_label} cannot both be "
+                            "enabled; choose one speculative-decoding path."
+                        ),
+                    )
+        current_settings.vlm_mtp_enabled = new_vlm_mtp
+    if "vlm_mtp_draft_model" in sent:
+        current_settings.vlm_mtp_draft_model = request.vlm_mtp_draft_model or None
+    if "vlm_mtp_draft_block_size" in sent:
+        current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
+
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
     if request.is_pinned is not None:
@@ -2062,7 +2127,10 @@ async def update_model_settings(
             or "index_cache_freq" in sent
             or "dflash_enabled" in sent
             or "dflash_draft_model" in sent
-            or "dflash_draft_quant_bits" in sent
+            or "dflash_draft_quant_enabled" in sent
+            or "dflash_draft_quant_weight_bits" in sent
+            or "dflash_draft_quant_activation_bits" in sent
+            or "dflash_draft_quant_group_size" in sent
             or "dflash_max_ctx" in sent
             or "dflash_in_memory_cache" in sent
             or "dflash_in_memory_cache_max_entries" in sent
@@ -4965,6 +5033,7 @@ async def start_oq_quantization(
             text_only=request.text_only,
             dtype=request.dtype,
             preserve_mtp=request.preserve_mtp,
+            auto_proxy_sensitivity=request.auto_proxy_sensitivity,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
