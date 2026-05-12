@@ -13,21 +13,13 @@ from pydantic import BaseModel
 
 
 class AudioTranscriptionRequest(BaseModel):
-    """OpenAI-compatible audio transcription request.
-
-    ``max_tokens`` is an oMLX extension (no equivalent in the OpenAI shape) that
-    raises the per-call output cap for STT models whose ``generate(..., max_tokens=...)``
-    default is too tight for long files — e.g. mlx-audio's VibeVoice-ASR caps at
-    8192 tokens (~24 min of audio) by default while the model itself supports
-    ~60 min / 64k context. When ``None``, the model's own default is used.
-    """
+    """OpenAI-compatible audio transcription request."""
 
     model: str
     language: Optional[str] = None
     prompt: Optional[str] = None
     response_format: Optional[str] = "json"
     temperature: Optional[float] = 0.0
-    max_tokens: Optional[int] = None
 
 
 class AudioTranscriptionResponse(BaseModel):
