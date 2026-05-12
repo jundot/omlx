@@ -72,10 +72,10 @@ class DFlashEngine(BaseEngine):
         self,
         model_name: str,
         draft_model_path: str,
-        draft_quant_enabled: bool = False,
-        draft_quant_weight_bits: int = 4,
-        draft_quant_activation_bits: int = 16,
-        draft_quant_group_size: int = 64,
+        draft_quant_enabled: bool | None = None,
+        draft_quant_weight_bits: int | None = None,
+        draft_quant_activation_bits: int | None = None,
+        draft_quant_group_size: int | None = None,
         model_settings: Any | None = None,
         fallback_engine_type: str = "batched",
         scheduler_config: Any | None = None,
@@ -143,9 +143,21 @@ class DFlashEngine(BaseEngine):
         return self._model_type_str
 
     @staticmethod
-    def _build_quant_spec(weight_bits: int, activation_bits: int, group_size: int) -> str:
-        """Convert draft quantization config into dflash 0.1.5's spec string format."""
-        return f"w{weight_bits}a{activation_bits}:gs{group_size}"
+    def _build_quant_spec(
+        weight_bits: int | None,
+        activation_bits: int | None,
+        group_size: int | None,
+    ) -> str:
+        """Convert draft quantization config into dflash 0.1.5's spec string format.
+
+        None values fall back to dflash defaults (w4a16:gs64), so the spec stays
+        valid when a profile or external API sets `enabled=True` without filling
+        in every bit value.
+        """
+        wb = weight_bits if weight_bits is not None else 4
+        ab = activation_bits if activation_bits is not None else 16
+        gs = group_size if group_size is not None else 64
+        return f"w{wb}a{ab}:gs{gs}"
 
     def _resolve_dflash_l2_dir(self) -> Path | None:
         """Compute the dflash L2 cache directory under the omlx SSD cache root."""

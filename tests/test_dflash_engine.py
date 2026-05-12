@@ -151,7 +151,7 @@ class TestDFlashEngineInit:
         assert engine.model_type is None
         assert engine.has_active_requests() is False
 
-    def test_quant_enabled_false_uses_defaults(self):
+    def test_quant_disabled_keeps_none(self):
         try:
             from omlx.engine.dflash import DFlashEngine
         except ImportError:
@@ -160,12 +160,11 @@ class TestDFlashEngineInit:
         engine = DFlashEngine(
             model_name="test-model",
             draft_model_path="test-draft",
-            draft_quant_enabled=False,
         )
-        assert engine._draft_quant_enabled is False
-        assert engine._draft_quant_weight_bits == 4
-        assert engine._draft_quant_activation_bits == 16
-        assert engine._draft_quant_group_size == 64
+        assert engine._draft_quant_enabled is None
+        assert engine._draft_quant_weight_bits is None
+        assert engine._draft_quant_activation_bits is None
+        assert engine._draft_quant_group_size is None
 
     def test_quant_enabled_true_uses_custom_values(self):
         try:
@@ -254,6 +253,20 @@ class TestDFlashEngineInit:
         assert DFlashEngine._build_quant_spec(4, 16, 64) == "w4a16:gs64"
         assert DFlashEngine._build_quant_spec(2, 32, 128) == "w2a32:gs128"
         assert DFlashEngine._build_quant_spec(8, 16, 64) == "w8a16:gs64"
+
+    def test_build_quant_spec_none_fields_fall_back_to_dflash_defaults(self):
+        """None bit values must coalesce to dflash 0.1.5 defaults so the spec
+        stays parseable when a profile or external API sets enabled=True
+        without populating every field."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        assert DFlashEngine._build_quant_spec(None, None, None) == "w4a16:gs64"
+        assert DFlashEngine._build_quant_spec(8, None, None) == "w8a16:gs64"
+        assert DFlashEngine._build_quant_spec(None, 32, None) == "w4a32:gs64"
+        assert DFlashEngine._build_quant_spec(None, None, 128) == "w4a16:gs128"
 
     def test_resolve_dflash_l2_dir_disabled_when_no_omlx_ssd(self, tmp_path):
         try:
