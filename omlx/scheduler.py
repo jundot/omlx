@@ -16,6 +16,7 @@ import copy
 import gc
 import logging
 import os
+import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
@@ -85,6 +86,15 @@ class _VLMMTPResponse:
     prompt_cache: Any = None
 
 
+# Serializes Metal buffer-protocol access from the async store-cache worker
+# against inference-thread mx.clear_cache / mx.synchronize calls that can
+# invalidate the underlying buffer pool. Closes a SIGABRT path where
+# _async_store_cache_worker reads tensor bytes via memoryview while the
+# inference thread concurrently issues a reclaim-triggering mx op.
+# See: https://github.com/jundot/omlx/issues/1106
+_mx_buffer_access_lock = threading.RLock()
+
+
 def _sync_and_clear_cache():
     """Synchronize in-flight GPU work before clearing the Metal buffer cache.
 
@@ -94,18 +104,23 @@ def _sync_and_clear_cache():
     'completeMemory() prepare count underflow' kernel panic on M4 hardware
     (and SIGSEGV/SIGABRT on M3).
 
-    See: https://github.com/jundot/omlx/issues/300, #888
+    Held under _mx_buffer_access_lock so the async store-cache worker cannot
+    observe a half-reclaimed Metal buffer pool while it is in the middle of
+    reading tensor bytes via the Python buffer protocol (#1106).
+
+    See: https://github.com/jundot/omlx/issues/300, #888, #1106
     """
-    # Generation_stream may not have in-flight work on the current thread
-    # (e.g. external prefill submits to the default stream). On some MLX
-    # builds mx.synchronize raises "There is no Stream(gpu, 0) in current
-    # thread" in that case; swallow it since there is nothing to drain.
-    try:
-        mx.synchronize(generation_stream)
-    except RuntimeError:
-        pass
-    mx.synchronize()  # default stream
-    mx.clear_cache()
+    with _mx_buffer_access_lock:
+        # Generation_stream may not have in-flight work on the current thread
+        # (e.g. external prefill submits to the default stream). On some MLX
+        # builds mx.synchronize raises "There is no Stream(gpu, 0) in current
+        # thread" in that case; swallow it since there is nothing to drain.
+        try:
+            mx.synchronize(generation_stream)
+        except RuntimeError:
+            pass
+        mx.synchronize()  # default stream
+        mx.clear_cache()
 
 
 def _safe_sync_generation_stream():
@@ -891,18 +906,25 @@ class Scheduler:
         threading.RLock so concurrent access from main and worker is safe.
         """
         try:
-            with self._phase_timer("store_cache_worker_sync"):
-                mx.synchronize()
-            block_table = self.block_aware_cache.store_cache(
-                request_id,
-                token_sequence_to_store,
-                cache_to_store,
-                model_cache_config=model_cache_config,
-                boundary_snapshots=intermediate_snapshots,
-                extra_keys=extra_keys,
-                extra_key_token_start=extra_key_token_start,
-                extra_key_ranges=extra_key_ranges,
-            )
+            # Hold _mx_buffer_access_lock across the worker's mx-buffer
+            # access. store_cache eventually drives _extract_tensor_bytes,
+            # which reads raw bytes via the buffer protocol; serializing
+            # against inference-thread mx.clear_cache / mx.synchronize calls
+            # prevents a SIGABRT when those reclaim the underlying Metal
+            # buffer pool mid-read (#1106).
+            with _mx_buffer_access_lock:
+                with self._phase_timer("store_cache_worker_sync"):
+                    mx.synchronize()
+                block_table = self.block_aware_cache.store_cache(
+                    request_id,
+                    token_sequence_to_store,
+                    cache_to_store,
+                    model_cache_config=model_cache_config,
+                    boundary_snapshots=intermediate_snapshots,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
+                )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table and self.paged_cache_manager is not None:
@@ -4938,8 +4960,7 @@ class Scheduler:
                         + len(responses)
                     )
                     if self._tokens_since_clear_cache >= 1024:
-                        _safe_sync_generation_stream()
-                        mx.clear_cache()
+                        _sync_and_clear_cache()
                         self._tokens_since_clear_cache = 0
 
         except _PrefillAbortedError:
