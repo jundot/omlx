@@ -648,6 +648,8 @@ def _patch_qwen3_5_moe() -> None:
         )
 
     def _stack_per_expert(weights, prefix, num_experts):
+        if f"{prefix}.experts.0.gate_proj.weight" not in weights:
+            return
         for n in ("gate_proj", "up_proj", "down_proj"):
             weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(
                 [
@@ -700,11 +702,9 @@ def _patch_qwen3_5_moe() -> None:
                     if f"{prefix}.switch_mlp.gate_proj.weight" in new_weights:
                         continue
                     if mtp_is_fused:
-                        if f"{prefix}.experts.gate_up_proj" in new_weights:
-                            _unfuse_experts(new_weights, prefix)
+                        _unfuse_experts(new_weights, prefix)
                     else:
-                        if f"{prefix}.experts.0.gate_proj.weight" in new_weights:
-                            _stack_per_expert(new_weights, prefix, num_experts)
+                        _stack_per_expert(new_weights, prefix, num_experts)
 
         return self.language_model.sanitize(new_weights)
 
