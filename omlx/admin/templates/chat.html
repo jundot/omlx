@@ -64,28 +64,64 @@
         background-color: var(--bg-primary) !important;
         color: var(--text-primary) !important;
     }
-    html, body {
+
+    html,
+    body {
         height: 100%;
         overflow: hidden;
     }
+
     .chat-shell {
         height: 100dvh;
         min-height: 100vh;
     }
 
     /* Scrollbar */
-    .custom-scrollbar::-webkit-scrollbar { width: 6px; }
-    .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-    .custom-scrollbar::-webkit-scrollbar-thumb { background: var(--border-normal); border-radius: 3px; }
+    .custom-scrollbar::-webkit-scrollbar {
+        width: 6px;
+    }
+
+    .custom-scrollbar::-webkit-scrollbar-track {
+        background: transparent;
+    }
+
+    .custom-scrollbar::-webkit-scrollbar-thumb {
+        background: var(--border-normal);
+        border-radius: 3px;
+    }
 
     /* Sidebar */
-    .sidebar-width { width: 260px; min-width: 260px; }
-    .sidebar-hidden { width: 0 !important; min-width: 0 !important; overflow: hidden; }
-    .sidebar-transition { transition: all 0.25s ease; }
+    .sidebar-width {
+        width: 260px;
+        min-width: 260px;
+    }
+
+    .sidebar-hidden {
+        width: 0 !important;
+        min-width: 0 !important;
+        overflow: hidden;
+    }
+
+    .sidebar-transition {
+        transition: all 0.25s ease;
+    }
 
     /* Messages */
-    .message-fade-in { animation: fadeIn 0.3s ease; }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    .message-fade-in {
+        animation: fadeIn 0.3s ease;
+    }
+
+    @keyframes fadeIn {
+        from {
+            opacity: 0;
+            transform: translateY(10px);
+        }
+
+        to {
+            opacity: 1;
+            transform: translateY(0);
+        }
+    }
 
     .assistant-message {
         background: var(--bg-primary);
@@ -102,6 +138,7 @@
         align-items: center;
         color: var(--text-primary);
     }
+
     .message-header svg {
         color: var(--text-tertiary);
     }
@@ -131,13 +168,16 @@
         overflow-wrap: anywhere;
         word-break: break-word;
     }
+
     .user-message-bubble p {
         color: var(--text-primary) !important;
         margin: 0;
     }
+
     .user-message-bubble * {
         color: var(--text-primary);
     }
+
     .user-message-bubble pre {
         max-width: 100%;
         overflow-x: auto;
@@ -148,72 +188,234 @@
         padding: 0.75em 1em;
         margin: 0.5em 0 0;
     }
+
     .user-message-bubble code {
         background-color: var(--code-bg);
         border-radius: 0.25em;
         padding: 0.125em 0.25em;
         font-size: 0.875em;
     }
+
     .user-message-bubble pre code {
         background: transparent;
         padding: 0;
     }
 
     /* Loading dots */
-    .loading-dots { display: flex; gap: 4px; align-items: center; }
-    .loading-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); animation: pulse 1.4s infinite; }
-    .loading-dot:nth-child(2) { animation-delay: 0.2s; }
-    .loading-dot:nth-child(3) { animation-delay: 0.4s; }
-    @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+    .loading-dots {
+        display: flex;
+        gap: 4px;
+        align-items: center;
+    }
+
+    .loading-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--text-muted);
+        animation: pulse 1.4s infinite;
+    }
+
+    .loading-dot:nth-child(2) {
+        animation-delay: 0.2s;
+    }
+
+    .loading-dot:nth-child(3) {
+        animation-delay: 0.4s;
+    }
+
+    @keyframes pulse {
+
+        0%,
+        100% {
+            opacity: 0.4;
+        }
+
+        50% {
+            opacity: 1;
+        }
+    }
 
     /* Markdown content */
-    .markdown-content { line-height: 1.6; color: var(--text-primary); min-width: 0; overflow-wrap: break-word; }
-    .markdown-content h1, .markdown-content h2, .markdown-content h3 { font-weight: 600; margin-top: 1.5em; margin-bottom: 0.5em; color: var(--text-primary); }
-    .markdown-content h1 { font-size: 1.5em; }
-    .markdown-content h2 { font-size: 1.3em; }
-    .markdown-content h3 { font-size: 1.1em; }
-    .markdown-content p { margin-bottom: 1em; color: var(--text-primary); }
-    .markdown-content ul, .markdown-content ol { margin-bottom: 1em; padding-left: 1.5em; color: var(--text-primary); }
-    .markdown-content li { margin-bottom: 0.25em; color: var(--text-primary); }
-    .markdown-content code { background-color: var(--code-bg); padding: 0.125em 0.25em; border-radius: 0.25em; font-size: 0.875em; color: var(--text-primary); }
-    .markdown-content pre { background-color: var(--code-bg); border-radius: 0.5em; padding: 1em; margin: 1em 0; overflow-x: auto; }
-    .markdown-content pre code { background: none; padding: 0; color: var(--text-primary); }
-    .markdown-content table { border-collapse: collapse; margin: 1em 0; font-size: 0.875em; display: block; overflow-x: auto; max-width: 100%; }
-    .markdown-content th, .markdown-content td { border: 1px solid var(--border-faint); padding: 0.5em 0.75em; text-align: left; white-space: nowrap; }
-    .markdown-content th { background: var(--bg-secondary); font-weight: 600; }
-    .markdown-content tr:nth-child(even) { background: var(--bg-secondary); }
+    .markdown-content {
+        line-height: 1.6;
+        color: var(--text-primary);
+        min-width: 0;
+        overflow-wrap: break-word;
+    }
+
+    .markdown-content h1,
+    .markdown-content h2,
+    .markdown-content h3 {
+        font-weight: 600;
+        margin-top: 1.5em;
+        margin-bottom: 0.5em;
+        color: var(--text-primary);
+    }
+
+    .markdown-content h1 {
+        font-size: 1.5em;
+    }
+
+    .markdown-content h2 {
+        font-size: 1.3em;
+    }
+
+    .markdown-content h3 {
+        font-size: 1.1em;
+    }
+
+    .markdown-content p {
+        margin-bottom: 1em;
+        color: var(--text-primary);
+    }
+
+    .markdown-content ul,
+    .markdown-content ol {
+        margin-bottom: 1em;
+        padding-left: 1.5em;
+        color: var(--text-primary);
+    }
+
+    .markdown-content li {
+        margin-bottom: 0.25em;
+        color: var(--text-primary);
+    }
+
+    .markdown-content code {
+        background-color: var(--code-bg);
+        padding: 0.125em 0.25em;
+        border-radius: 0.25em;
+        font-size: 0.875em;
+        color: var(--text-primary);
+    }
+
+    .markdown-content pre {
+        background-color: var(--code-bg);
+        border-radius: 0.5em;
+        padding: 1em;
+        margin: 1em 0;
+        overflow-x: auto;
+    }
+
+    .markdown-content pre code {
+        background: none;
+        padding: 0;
+        color: var(--text-primary);
+    }
+
+    .markdown-content table {
+        border-collapse: collapse;
+        margin: 1em 0;
+        font-size: 0.875em;
+        display: block;
+        overflow-x: auto;
+        max-width: 100%;
+    }
+
+    .markdown-content th,
+    .markdown-content td {
+        border: 1px solid var(--border-faint);
+        padding: 0.5em 0.75em;
+        text-align: left;
+        white-space: nowrap;
+    }
+
+    .markdown-content th {
+        background: var(--bg-secondary);
+        font-weight: 600;
+    }
+
+    .markdown-content tr:nth-child(even) {
+        background: var(--bg-secondary);
+    }
 
     /* Code block copy button */
-    .code-block-wrapper { position: relative; }
-    .code-copy-btn {
-        position: absolute; top: 0.5em; right: 0.5em;
-        background: var(--bg-secondary); border: 1px solid var(--border-faint);
-        border-radius: 0.375em; padding: 0.25em 0.5em; font-size: 0.7em; cursor: pointer;
-        opacity: 0; transition: opacity 0.2s; color: var(--text-secondary);
+    .code-block-wrapper {
+        position: relative;
     }
-    .code-block-wrapper:hover .code-copy-btn { opacity: 1; }
-    .code-copy-btn:hover { background: var(--bg-tertiary); }
+
+    .code-copy-btn {
+        position: absolute;
+        top: 0.5em;
+        right: 0.5em;
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-faint);
+        border-radius: 0.375em;
+        padding: 0.25em 0.5em;
+        font-size: 0.7em;
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity 0.2s;
+        color: var(--text-secondary);
+    }
+
+    .code-block-wrapper:hover .code-copy-btn {
+        opacity: 1;
+    }
+
+    .code-copy-btn:hover {
+        background: var(--bg-tertiary);
+    }
 
     /* User message edit button */
-    .user-message { position: relative; }
-    .user-edit-btn {
-        position: absolute; left: -32px; top: 50%; transform: translateY(-50%);
-        width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
-        border-radius: 6px; border: none; background: transparent; color: var(--text-tertiary);
-        cursor: pointer; transition: all 0.15s; opacity: 0;
+    .user-message {
+        position: relative;
     }
-    .user-message:hover .user-edit-btn { opacity: 1; }
-    .user-edit-btn:hover { background: var(--bg-secondary); color: var(--text-secondary); }
+
+    .user-edit-btn {
+        position: absolute;
+        left: -32px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 28px;
+        height: 28px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 6px;
+        border: none;
+        background: transparent;
+        color: var(--text-tertiary);
+        cursor: pointer;
+        transition: all 0.15s;
+        opacity: 0;
+    }
+
+    .user-message:hover .user-edit-btn {
+        opacity: 1;
+    }
+
+    .user-edit-btn:hover {
+        background: var(--bg-secondary);
+        color: var(--text-secondary);
+    }
 
     /* Inline edit */
     .inline-edit-textarea {
-        width: 100%; min-width: 280px; max-width: 600px;
-        min-height: 80px; max-height: 300px; resize: vertical;
-        padding: 12px 16px; border: 2px solid #2d3748; border-radius: 16px;
-        background: var(--bg-primary); color: var(--text-primary);
-        font-family: inherit; font-size: 14px; line-height: 1.6; outline: none;
+        width: 100%;
+        min-width: 280px;
+        max-width: 600px;
+        min-height: 80px;
+        max-height: 300px;
+        resize: vertical;
+        padding: 12px 16px;
+        border: 2px solid #2d3748;
+        border-radius: 16px;
+        background: var(--bg-primary);
+        color: var(--text-primary);
+        font-family: inherit;
+        font-size: 14px;
+        line-height: 1.6;
+        outline: none;
     }
-    .inline-edit-actions { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
+
+    .inline-edit-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 8px;
+        justify-content: flex-end;
+    }
 
 
     /* Thinking container */
@@ -224,6 +426,7 @@
         margin: 0.5em 0.75rem;
         overflow: hidden;
     }
+
     .thinking-header {
         display: flex;
         align-items: center;
@@ -235,27 +438,33 @@
         background: var(--bg-secondary);
         border-bottom: 1px solid var(--border-faint);
     }
+
     .thinking-header:hover {
         background: var(--bg-tertiary);
     }
+
     .thinking-icon {
         width: 14px;
         height: 14px;
         flex-shrink: 0;
     }
+
     .thinking-text {
         flex: 1;
         font-weight: 400;
     }
+
     .thinking-toggle {
         width: 14px;
         height: 14px;
         transition: transform 0.2s ease;
         transform: rotate(180deg);
     }
+
     .thinking-toggle.collapsed {
         transform: rotate(0deg);
     }
+
     .thinking-content {
         padding: 1rem;
         font-size: 0.8125rem;
@@ -265,15 +474,44 @@
         max-height: 400px;
         overflow-y: auto;
     }
+
     /* Preserve thinking text style when markdown-content class is also applied */
-    .thinking-markdown { font-size: 0.8125rem !important; color: var(--text-secondary) !important; }
-    .thinking-markdown p { margin-bottom: 0.5em; color: var(--text-secondary); }
-    .thinking-markdown p:last-child { margin-bottom: 0; }
-    .thinking-markdown h1, .thinking-markdown h2, .thinking-markdown h3 { color: var(--text-secondary); font-size: 0.9rem; }
-    .thinking-markdown li { color: var(--text-secondary); }
-    .thinking-markdown code { font-size: 0.75rem; }
-    .thinking-markdown pre { font-size: 0.75rem; }
-    .thinking-content.collapsed { display: none; }
+    .thinking-markdown {
+        font-size: 0.8125rem !important;
+        color: var(--text-secondary) !important;
+    }
+
+    .thinking-markdown p {
+        margin-bottom: 0.5em;
+        color: var(--text-secondary);
+    }
+
+    .thinking-markdown p:last-child {
+        margin-bottom: 0;
+    }
+
+    .thinking-markdown h1,
+    .thinking-markdown h2,
+    .thinking-markdown h3 {
+        color: var(--text-secondary);
+        font-size: 0.9rem;
+    }
+
+    .thinking-markdown li {
+        color: var(--text-secondary);
+    }
+
+    .thinking-markdown code {
+        font-size: 0.75rem;
+    }
+
+    .thinking-markdown pre {
+        font-size: 0.75rem;
+    }
+
+    .thinking-content.collapsed {
+        display: none;
+    }
 
     /* Input area */
     .input-container {
@@ -282,21 +520,27 @@
         background: var(--bg-primary);
         transition: border-color 0.2s;
     }
+
     .input-container:focus-within {
         border-color: var(--text-tertiary);
     }
+
     .input-container textarea {
         box-shadow: none !important;
     }
+
     .input-container textarea:focus {
         box-shadow: none !important;
     }
+
     .input-container textarea::placeholder {
         color: var(--text-muted);
     }
 
     /* API Key Modal */
-    .api-key-modal.hidden { display: none; }
+    .api-key-modal.hidden {
+        display: none;
+    }
 
     /* Drag and drop state */
     .input-container.drag-over {
@@ -307,14 +551,37 @@
 
     /* Mobile responsive */
     @media (max-width: 768px) {
-        .sidebar-width { position: fixed; z-index: 50; height: 100%; }
-        .sidebar-hidden { transform: translateX(-100%); }
-        .sidebar-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 40; }
-        .sidebar-overlay.hidden { display: none; }
-        .user-edit-btn { left: -28px; }
+        .sidebar-width {
+            position: fixed;
+            z-index: 50;
+            height: 100%;
+        }
+
+        .sidebar-hidden {
+            transform: translateX(-100%);
+        }
+
+        .sidebar-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 40;
+        }
+
+        .sidebar-overlay.hidden {
+            display: none;
+        }
+
+        .user-edit-btn {
+            left: -28px;
+        }
 
         /* Prevent iOS auto-zoom on input focus (requires >= 16px) */
-        textarea, input[type="text"], input[type="password"] { font-size: 16px !important; }
+        textarea,
+        input[type="text"],
+        input[type="password"] {
+            font-size: 16px !important;
+        }
     }
 
     /* Image modal */
@@ -328,6 +595,7 @@
         z-index: 9999;
         cursor: zoom-out;
     }
+
     .image-modal img {
         max-width: 90%;
         max-height: 90%;
@@ -335,6 +603,7 @@
         border-radius: 8px;
         box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
     }
+
     .image-modal-close {
         position: absolute;
         top: 20px;
@@ -351,6 +620,7 @@
         justify-content: center;
         transition: background 0.2s;
     }
+
     .image-modal-close:hover {
         background: rgba(255, 255, 255, 0.2);
     }
@@ -365,9 +635,11 @@
         background: var(--bg-tertiary);
         border-radius: 8px;
     }
+
     .edit-images-preview .edit-image-item {
         position: relative;
     }
+
     .edit-images-preview img {
         width: 64px;
         height: 64px;
@@ -381,26 +653,25 @@
 {% block content %}
 <script>
     // Apply theme immediately before render to prevent flash
-    (function() {
+    (function () {
         const theme = localStorage.getItem('omlx-chat-theme') || 'light';
         document.documentElement.setAttribute('data-theme', theme);
     })();
 </script>
 <div class="chat-shell flex overflow-hidden" x-data="chatApp()" x-init="init()">
     <!-- API Key Modal -->
-    <div class="api-key-modal fixed inset-0 bg-black/50 flex items-center justify-center z-[1000]" :class="{ 'hidden': apiKeySet }" x-cloak>
+    <div class="api-key-modal fixed inset-0 bg-black/50 flex items-center justify-center z-[1000]"
+        :class="{ 'hidden': apiKeySet }" x-cloak>
         <div class="bg-surface rounded-2xl p-8 max-w-[400px] w-[90%] shadow-2xl">
             <h2 class="text-xl font-bold mb-2">{{ t('login.login.label_api_key') }}</h2>
             <p class="text-sm text-fg-tertiary mb-4">{{ t('chat.api_key_prompt') }}</p>
-            <input
-                type="password"
-                x-model="apiKeyInput"
-                @keydown.enter="saveApiKey"
+            <input type="password" x-model="apiKeyInput" @keydown.enter="saveApiKey"
                 placeholder="{{ t('chat.api_key_placeholder') }}"
                 class="w-full px-4 py-3 border border-line rounded-xl mb-4 focus:outline-none focus:border-line-strong"
-                style="background: var(--bg-primary); color: var(--text-primary);"
-            >
-            <button @click="saveApiKey" class="w-full bg-accent text-accent-fg px-6 py-3 rounded-xl font-medium transition-all hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed" :disabled="!apiKeyInput.trim()">
+                style="background: var(--bg-primary); color: var(--text-primary);">
+            <button @click="saveApiKey"
+                class="w-full bg-accent text-accent-fg px-6 py-3 rounded-xl font-medium transition-all hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed"
+                :disabled="!apiKeyInput.trim()">
                 {{ t('chat.api_key_continue') }}
             </button>
         </div>
@@ -411,13 +682,15 @@
 
     <!-- Sidebar -->
     <div class="sidebar-width h-full bg-surface border-r border-line flex flex-col sidebar-transition"
-         :class="{ 'sidebar-hidden': !sidebarOpen }">
+        :class="{ 'sidebar-hidden': !sidebarOpen }">
         <!-- Sidebar Header -->
         <div class="p-4 border-b border-line flex-shrink-0">
             <div class="flex items-center justify-between">
                 <a href="/admin/dashboard" class="flex items-center gap-2 hover:opacity-80 transition-opacity">
-                    <img x-show="activeTheme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX" class="w-[30px] h-[30px]">
-                    <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX" class="w-[30px] h-[30px]" x-cloak>
+                    <img x-show="activeTheme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX"
+                        class="w-[30px] h-[30px]">
+                    <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX"
+                        class="w-[30px] h-[30px]" x-cloak>
                     <span class="font-semibold">{{ t('chat.brand') }}</span>
                 </a>
             </div>
@@ -425,7 +698,9 @@
 
         <!-- New Chat Button -->
         <div class="p-3 flex-shrink-0">
-            <button @click="startNewChat()" class="w-full flex items-center gap-2 px-3 py-2 bg-surface-muted hover:bg-surface-alt rounded-lg text-sm font-medium transition-colors" style="color: var(--text-primary);">
+            <button @click="startNewChat()"
+                class="w-full flex items-center gap-2 px-3 py-2 bg-surface-muted hover:bg-surface-alt rounded-lg text-sm font-medium transition-colors"
+                style="color: var(--text-primary);">
                 <i data-lucide="plus" class="w-4 h-4"></i>
                 {{ t('chat.new_chat') }}
             </button>
@@ -434,37 +709,65 @@
         <!-- Chat History -->
         <div class="flex-1 min-h-0 overflow-y-auto custom-scrollbar px-3">
             <template x-for="chat in chatHistory" :key="chat.id">
-                <div @click="loadChat(chat.id)"
-                     class="group flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer hover:bg-surface-muted mb-1"
-                     :class="{ 'bg-surface-muted': currentChatId === chat.id }">
+                <div @click="if (renamingChatId !== chat.id) loadChat(chat.id)"
+                    class="group flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer hover:bg-surface-muted mb-1"
+                    :class="{ 'bg-surface-muted': currentChatId === chat.id }">
                     <i data-lucide="message-square" class="w-4 h-4 flex-shrink-0" style="color: var(--text-muted);"></i>
-                    <span class="text-sm truncate flex-1" style="color: var(--text-primary);" x-text="chat.title || window.t('chat.new_chat_title')"></span>
-                    <button @click.stop="deleteChat(chat.id)"
-                            class="opacity-0 group-hover:opacity-100 p-1 hover:bg-danger-bg rounded transition-opacity"
-                            title="{{ t('chat.delete_tooltip') }}">
-                        <i data-lucide="trash-2" class="w-3 h-3 text-danger"></i>
-                    </button>
+                    <template x-if="renamingChatId === chat.id">
+                        <div class="flex items-center gap-1 flex-1 min-w-0">
+                            <input x-model="renameDraft" @click.stop @keydown.enter.prevent="saveRenamedChat(chat.id)"
+                                @keydown.escape.prevent="cancelRenamingChat()"
+                                class="flex-1 min-w-0 text-sm px-2 py-1 rounded-md border border-line focus:outline-none focus:border-line-strong"
+                                style="background: var(--bg-primary); color: var(--text-primary);">
+                            <button @click.stop="saveRenamedChat(chat.id)"
+                                class="p-1 hover:bg-surface-alt rounded transition-colors"
+                                :title="window.t('chat.rename_save_tooltip')">
+                                <i data-lucide="check" class="w-3 h-3" style="color: var(--success, #16a34a);"></i>
+                            </button>
+                            <button @click.stop="cancelRenamingChat()"
+                                class="p-1 hover:bg-surface-alt rounded transition-colors"
+                                :title="window.t('chat.rename_cancel_tooltip')">
+                                <i data-lucide="x" class="w-3 h-3" style="color: var(--text-muted);"></i>
+                            </button>
+                        </div>
+                    </template>
+                    <template x-if="renamingChatId !== chat.id">
+                        <div class="flex items-center gap-0 flex-1 min-w-0">
+                            <span class="text-sm truncate flex-1" style="color: var(--text-primary);"
+                                x-text="chat.title || window.t('chat.new_chat_title')"></span>
+                            <button @click.stop="startRenamingChat(chat)"
+                                class="opacity-0 group-hover:opacity-100 p-1 hover:bg-surface-alt rounded transition-opacity"
+                                title="{{ t('chat.rename_tooltip') }}">
+                                <i data-lucide="pencil" class="w-3 h-3" style="color: var(--text-muted);"></i>
+                            </button>
+                            <button @click.stop="deleteChat(chat.id)"
+                                class="opacity-0 group-hover:opacity-100 p-1 hover:bg-danger-bg rounded transition-opacity"
+                                title="{{ t('chat.delete_tooltip') }}">
+                                <i data-lucide="trash-2" class="w-3 h-3 text-danger"></i>
+                            </button>
+                        </div>
+                    </template>
                 </div>
             </template>
         </div>
 
         <!-- Sidebar Footer -->
         <div class="p-2 border-t border-line space-y-0.5 flex-shrink-0">
-            <a href="/admin/dashboard" class="flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
+            <a href="/admin/dashboard"
+                class="flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
                 <i data-lucide="settings" class="w-3 h-3"></i>
                 {{ t('chat.admin_settings') }}
             </a>
             <!-- Theme Select -->
             <div class="relative w-full">
-                <div class="flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
+                <div
+                    class="flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
                     <i data-lucide="sun-moon" class="w-3 h-3" x-show="theme === 'auto'"></i>
                     <i data-lucide="sun" class="w-3 h-3" x-show="theme === 'light'"></i>
                     <i data-lucide="moon" class="w-3 h-3" x-show="theme === 'dark'"></i>
-                    <select
-                        @change="setTheme($event.target.value)"
+                    <select @change="setTheme($event.target.value)"
                         class="flex-1 bg-transparent border-none outline-none cursor-pointer appearance-none text-inherit"
-                        x-model="theme"
-                    >
+                        x-model="theme">
                         <option value="auto">{{ t('navbar.theme.auto') }}</option>
                         <option value="light">{{ t('navbar.theme.light_mode') }}</option>
                         <option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
@@ -472,11 +775,12 @@
                 </div>
             </div>
             <button @click="clearAllHistory()" x-show="chatHistory.length > 0"
-                    class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-danger hover:bg-danger-bg rounded">
+                class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-danger hover:bg-danger-bg rounded">
                 <i data-lucide="trash-2" class="w-3 h-3"></i>
                 {{ t('chat.clear_all_history') }}
             </button>
-            <button @click="clearApiKey()" class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
+            <button @click="clearApiKey()"
+                class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
                 <i data-lucide="key" class="w-3 h-3"></i>
                 {{ t('chat.change_api_key') }}
             </button>
@@ -487,7 +791,8 @@
     <div class="flex-1 flex flex-col bg-surface overflow-hidden min-w-0">
         <!-- Header -->
         <header class="h-14 px-4 border-b border-line flex items-center justify-between bg-surface flex-shrink-0">
-            <button @click="sidebarOpen = true" class="p-2 hover:bg-surface-muted rounded-lg md:hidden" style="color: var(--text-primary);">
+            <button @click="sidebarOpen = true" class="p-2 hover:bg-surface-muted rounded-lg md:hidden"
+                style="color: var(--text-primary);">
                 <i data-lucide="menu" class="w-5 h-5"></i>
             </button>
             <button @click="sidebarOpen = !sidebarOpen" class="p-2 hover:bg-surface-muted rounded-lg hidden md:block" style="color: var(--text-primary);">
@@ -497,35 +802,37 @@
 
             <!-- Model Selector -->
             <div class="relative" x-data="{ open: false }">
-                <button @click="open = !open" class="flex items-center gap-2 px-3 py-1.5 text-sm font-medium hover:bg-surface-muted rounded-lg" style="color: var(--text-primary);">
+                <button @click="open = !open"
+                    class="flex items-center gap-2 px-3 py-1.5 text-sm font-medium hover:bg-surface-muted rounded-lg"
+                    style="color: var(--text-primary);">
                     <i data-lucide="cpu" class="w-4 h-4"></i>
                     <span x-text="currentModel || window.t('chat.select_model')"></span>
                     <i data-lucide="chevron-down" class="w-4 h-4"></i>
                 </button>
                 <div x-show="open" @click.away="open = false" x-cloak
-                     class="absolute top-full mt-1 left-1/2 -translate-x-1/2 border border-line rounded-lg shadow-lg py-1 min-w-[360px] max-w-[500px] max-h-60 overflow-y-auto z-50"
-                     style="background: var(--bg-primary); border-color: var(--border-faint);">
+                    class="absolute top-full mt-1 left-1/2 -translate-x-1/2 border border-line rounded-lg shadow-lg py-1 min-w-[360px] max-w-[500px] max-h-60 overflow-y-auto z-50"
+                    style="background: var(--bg-primary); border-color: var(--border-faint);">
                     <template x-for="model in availableModels" :key="model.id">
                         <button @click="selectModel(model.id); open = false"
-                                class="w-full px-3 py-2 text-sm text-left hover:bg-surface-muted"
-                                :class="{ 'bg-surface-muted': currentModel === model.id }"
-                                style="color: var(--text-primary);">
+                            class="w-full px-3 py-2 text-sm text-left hover:bg-surface-muted"
+                            :class="{ 'bg-surface-muted': currentModel === model.id }"
+                            style="color: var(--text-primary);">
                             <span x-text="model.id"></span>
                         </button>
                     </template>
-                    <div x-show="availableModels.length === 0" class="px-3 py-2 text-sm" style="color: var(--text-tertiary);">
+                    <div x-show="availableModels.length === 0" class="px-3 py-2 text-sm"
+                        style="color: var(--text-tertiary);">
                         {{ t('chat.no_models') }}
                     </div>
                 </div>
             </div>
 
             <button @click="systemPromptDraft = systemPrompt; showSystemPromptModal = true"
-                    class="p-2 hover:bg-surface-muted rounded-lg relative"
-                    style="color: var(--text-primary);"
-                    :title="window.t('chat.system_prompt.title')">
+                class="p-2 hover:bg-surface-muted rounded-lg relative" style="color: var(--text-primary);"
+                :title="window.t('chat.system_prompt.title')">
                 <i data-lucide="settings" class="w-5 h-5"></i>
                 <span x-show="systemPrompt.trim()" x-cloak
-                      class="absolute top-1 right-1 w-2 h-2 bg-accent rounded-full"></span>
+                    class="absolute top-1 right-1 w-2 h-2 bg-accent rounded-full"></span>
             </button>
         </header>
 
@@ -535,8 +842,10 @@
             <div x-show="messages.length === 0" class="h-full flex items-center justify-center" x-cloak>
                 <div class="text-center max-w-lg px-4">
                     <div class="flex items-center justify-center gap-3 mb-4">
-                        <img x-show="activeTheme === 'light'" src="/admin/static/logo-light.svg" alt="oMLX" class="w-[60px] h-[60px]">
-                        <img x-show="activeTheme === 'dark'" src="/admin/static/logo-dark.svg" alt="oMLX" class="w-[60px] h-[60px]" x-cloak>
+                        <img x-show="activeTheme === 'light'" src="/admin/static/logo-light.svg" alt="oMLX"
+                            class="w-[60px] h-[60px]">
+                        <img x-show="activeTheme === 'dark'" src="/admin/static/logo-dark.svg" alt="oMLX"
+                            class="w-[60px] h-[60px]" x-cloak>
                         <h1 class="text-2xl font-bold">{{ t('chat.welcome_heading') }}</h1>
                     </div>
                     <p class="text-fg-tertiary mb-6">{{ t('chat.welcome_description') }}</p>
@@ -554,7 +863,8 @@
                         <!-- User Message -->
                         <div x-show="msg.role === 'user'" class="flex justify-end">
                             <div class="user-message">
-                                <button @click="startEdit(index)" class="user-edit-btn" title="{{ t('chat.edit_tooltip') }}">
+                                <button @click="startEdit(index)" class="user-edit-btn"
+                                    title="{{ t('chat.edit_tooltip') }}">
                                     <i data-lucide="pencil" class="w-4 h-4"></i>
                                 </button>
                                 <template x-if="editingIndex !== index">
@@ -562,8 +872,10 @@
                                         <!-- Images from content array -->
                                         <template x-if="getImageUrls(msg.content).length > 0">
                                             <div class="flex flex-wrap gap-2 mb-2">
-                                                <template x-for="imgUrl in getImageUrls(msg.content)" :key="imgUrl.substring(0, 50)">
-                                                    <img :src="imgUrl" @click="openImageModal(imgUrl)" class="max-w-48 max-h-48 object-cover rounded-lg cursor-pointer">
+                                                <template x-for="imgUrl in getImageUrls(msg.content)"
+                                                    :key="imgUrl.substring(0, 50)">
+                                                    <img :src="imgUrl" @click="openImageModal(imgUrl)"
+                                                        class="max-w-48 max-h-48 object-cover rounded-lg cursor-pointer">
                                                 </template>
                                             </div>
                                         </template>
@@ -571,16 +883,19 @@
                                         <template x-if="hasStrippedImages(msg.content)">
                                             <div class="flex flex-wrap gap-2 mb-2">
                                                 <template x-for="(_, i) in getStrippedImageCount(msg.content)" :key="i">
-                                                    <div class="w-20 h-20 bg-surface-muted border border-dashed border-line-strong rounded-lg flex flex-col items-center justify-center text-fg-muted text-[10px] gap-0.5">
+                                                    <div
+                                                        class="w-20 h-20 bg-surface-muted border border-dashed border-line-strong rounded-lg flex flex-col items-center justify-center text-fg-muted text-[10px] gap-0.5">
                                                         <i data-lucide="image" class="w-5 h-5"></i>
-                                                        <span x-text="window.t('chat.image_not_available') || 'Image'"></span>
+                                                        <span
+                                                            x-text="window.t('chat.image_not_available') || 'Image'"></span>
                                                     </div>
                                                 </template>
                                             </div>
                                         </template>
                                         <!-- Text content -->
                                         <template x-if="getTextContent(msg.content)">
-                                            <div class="user-message-bubble" x-html="renderMarkdown(getTextContent(msg.content))"></div>
+                                            <div class="user-message-bubble"
+                                                x-html="renderMarkdown(getTextContent(msg.content))"></div>
                                         </template>
                                     </div>
                                 </template>
@@ -594,16 +909,19 @@
                                                 </div>
                                             </template>
                                         </div>
-                                        <textarea
-                                            x-model="editContent"
+                                        <textarea x-model="editContent"
                                             @keydown.enter.ctrl="if (!$event.isComposing && $event.keyCode !== 229) saveEdit(index)"
-                                            @keydown.escape="cancelEdit"
-                                            class="inline-edit-textarea"
-                                            x-init="$nextTick(() => { $el.focus(); $el.setSelectionRange($el.value.length, $el.value.length); })"
-                                        ></textarea>
+                                            @keydown.escape="cancelEdit" class="inline-edit-textarea"
+                                            x-init="$nextTick(() => { $el.focus(); $el.setSelectionRange($el.value.length, $el.value.length); })"></textarea>
                                         <div class="inline-edit-actions">
-                                            <button @click="cancelEdit" class="px-3 py-1.5 text-sm border rounded-lg hover:bg-surface-muted" style="border-color: var(--border-normal); color: var(--text-secondary);">{{ t('chat.edit_cancel') }}</button>
-                                            <button @click="saveEdit(index)" class="px-3 py-1.5 text-sm bg-accent text-accent-fg rounded-lg hover:bg-accent-hover" style="color: var(--btn-primary-text);">{{ t('chat.edit_save') }}</button>
+                                            <button @click="cancelEdit"
+                                                class="px-3 py-1.5 text-sm border rounded-lg hover:bg-surface-muted"
+                                                style="border-color: var(--border-normal); color: var(--text-secondary);">{{
+                                                t('chat.edit_cancel') }}</button>
+                                            <button @click="saveEdit(index)"
+                                                class="px-3 py-1.5 text-sm bg-accent text-accent-fg rounded-lg hover:bg-accent-hover"
+                                                style="color: var(--btn-primary-text);">{{ t('chat.edit_save')
+                                                }}</button>
                                         </div>
                                     </div>
                                 </template>
@@ -613,61 +931,77 @@
                         <!-- Assistant Message -->
                         <div x-show="msg.role === 'assistant' && msg._ui !== false" class="assistant-message">
                             <div class="message-header">
-                                <div class="flex items-center gap-2 text-sm font-medium" style="color: var(--text-primary);">
+                                <div class="flex items-center gap-2 text-sm font-medium"
+                                    style="color: var(--text-primary);">
                                     <i data-lucide="cpu" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                                     <span x-text="msg.model || currentModel || window.t('chat.assistant_label')"></span>
                                 </div>
                                 <div class="flex gap-1">
                                     <!-- Timeline toggle: only visible when timeline data is attached -->
                                     <button x-show="msg._perfLog?.length > 0"
-                                            @click="msg._perfVisible = !msg._perfVisible"
-                                            class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent cursor-pointer transition-all hover:bg-surface-alt"
-                                            :style="msg._perfVisible ? 'color:var(--text-primary);' : 'color:var(--text-tertiary);'"
-                                            :title="msg._perfVisible ? 'Hide timeline' : 'Show timeline (' + msg._perfTotal + ')'">
+                                        @click="msg._perfVisible = !msg._perfVisible"
+                                        class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent cursor-pointer transition-all hover:bg-surface-alt"
+                                        :style="msg._perfVisible ? 'color:var(--text-primary);' : 'color:var(--text-tertiary);'"
+                                        :title="msg._perfVisible ? 'Hide timeline' : 'Show timeline (' + msg._perfTotal + ')'">
                                         <i data-lucide="activity" class="w-4 h-4"></i>
                                     </button>
-                                    <button @click="copyMessage(msg.content)" class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary" title="{{ t('chat.copy_tooltip') }}">
+                                    <button @click="copyMessage(msg.content)"
+                                        class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary"
+                                        title="{{ t('chat.copy_tooltip') }}">
                                         <i data-lucide="copy" class="w-4 h-4"></i>
                                     </button>
-                                    <button @click="regenerateMessage(index)" class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary" title="{{ t('chat.regenerate_tooltip') }}">
+                                    <button @click="regenerateMessage(index)"
+                                        class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary"
+                                        title="{{ t('chat.regenerate_tooltip') }}">
                                         <i data-lucide="refresh-cw" class="w-4 h-4"></i>
                                     </button>
                                 </div>
                             </div>
                             <!-- Collapsible performance timeline -->
                             <div x-show="msg._perfVisible === true && msg._perfLog?.length > 0"
-                                 class="px-1 pt-1 pb-2 mb-1 border-b space-y-0.5"
-                                 style="border-color: var(--border-normal);">
+                                class="px-1 pt-1 pb-2 mb-1 border-b space-y-0.5"
+                                style="border-color: var(--border-normal);">
                                 <template x-for="(entry, ei) in msg._perfLog" :key="ei">
-                                    <div class="flex items-center gap-2 text-xs font-mono" style="color: var(--text-muted);">
-                                        <span x-text="entry.t" style="min-width:6ch;flex-shrink:0;color:var(--text-tertiary);"></span>
-                                        <i x-show="entry.icon === 'wrench'" data-lucide="wrench" class="w-3 h-3 flex-shrink-0"></i>
-                                        <span x-show="entry.icon === 'check'" style="color:var(--text-success);">&#10003;</span>
-                                        <span x-show="entry.icon === 'error'" style="color:var(--text-danger);">&#10007;</span>
+                                    <div class="flex items-center gap-2 text-xs font-mono"
+                                        style="color: var(--text-muted);">
+                                        <span x-text="entry.t"
+                                            style="min-width:6ch;flex-shrink:0;color:var(--text-tertiary);"></span>
+                                        <i x-show="entry.icon === 'wrench'" data-lucide="wrench"
+                                            class="w-3 h-3 flex-shrink-0"></i>
+                                        <span x-show="entry.icon === 'check'"
+                                            style="color:var(--text-success);">&#10003;</span>
+                                        <span x-show="entry.icon === 'error'"
+                                            style="color:var(--text-danger);">&#10007;</span>
                                         <span x-text="entry.text"></span>
                                     </div>
                                 </template>
-                                <p class="text-xs font-mono mt-1" style="color: var(--text-tertiary);" x-text="msg._perfTotal"></p>
+                                <p class="text-xs font-mono mt-1" style="color: var(--text-tertiary);"
+                                    x-text="msg._perfTotal"></p>
                             </div>
                             <!-- Thinking bubble (collapsed by default) -->
                             <template x-if="msg._thinking">
                                 <div class="thinking-container mt-2">
                                     <div class="thinking-header" @click="msg._thinkingOpen = !msg._thinkingOpen">
-                                        <svg class="thinking-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+                                        <svg class="thinking-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                            stroke-width="2">
+                                            <circle cx="12" cy="12" r="10" />
+                                            <path d="M12 8v4M12 16h.01" />
+                                        </svg>
                                         <span class="thinking-text">Thinking</span>
-                                        <svg class="thinking-toggle" :class="{ collapsed: !msg._thinkingOpen }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg>
+                                        <svg class="thinking-toggle" :class="{ collapsed: !msg._thinkingOpen }"
+                                            viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <polyline points="18 15 12 9 6 15" />
+                                        </svg>
                                     </div>
                                     <div class="thinking-content markdown-content thinking-markdown"
-                                         :class="{ collapsed: !msg._thinkingOpen }"
-                                         data-math-pending="true"
-                                         :data-math-version="msg._thinking ? String(msg._thinking.length) : '0'"
-                                         x-html="renderMarkdown(msg._thinking)"></div>
+                                        :class="{ collapsed: !msg._thinkingOpen }" data-math-pending="true"
+                                        :data-math-version="msg._thinking ? String(msg._thinking.length) : '0'"
+                                        x-html="renderMarkdown(msg._thinking)"></div>
                                 </div>
                             </template>
-                            <div class="message-body markdown-content"
-                                 data-math-pending="true"
-                                 :data-math-version="typeof msg.content === 'string' ? String(msg.content.length) : '0'"
-                                 x-html="renderMarkdown(msg.content)"></div>
+                            <div class="message-body markdown-content" data-math-pending="true"
+                                :data-math-version="typeof msg.content === 'string' ? String(msg.content.length) : '0'"
+                                x-html="renderMarkdown(msg.content)"></div>
                         </div>
 
                     </div>
@@ -683,12 +1017,14 @@
                         <div class="flex gap-1">
                             <!-- Timeline toggle for streaming -->
                             <button @click="statusTimelineVisible = !statusTimelineVisible"
-                                    class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent cursor-pointer transition-all hover:bg-surface-alt"
-                                    :style="statusTimelineVisible ? 'color:var(--text-primary);' : 'color:var(--text-tertiary);'"
-                                    title="Toggle timeline">
+                                class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent cursor-pointer transition-all hover:bg-surface-alt"
+                                :style="statusTimelineVisible ? 'color:var(--text-primary);' : 'color:var(--text-tertiary);'"
+                                title="Toggle timeline">
                                 <i data-lucide="activity" class="w-4 h-4"></i>
                             </button>
-                            <button @click="stopStreaming()" class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary" title="{{ t('chat.stop_tooltip') }}">
+                            <button @click="stopStreaming()"
+                                class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary"
+                                title="{{ t('chat.stop_tooltip') }}">
                                 <i data-lucide="square" class="w-4 h-4"></i>
                             </button>
                         </div>
@@ -697,26 +1033,46 @@
                         <!-- Accumulated timeline entries — only shown when toggled open -->
                         <div x-show="statusTimelineVisible && statusLog.length > 0" class="space-y-0.5 mb-1 mt-0.5">
                             <template x-for="(entry, idx) in statusLog" :key="idx">
-                                <div class="flex items-center gap-2 text-xs font-mono" style="color:var(--text-tertiary);">
+                                <div class="flex items-center gap-2 text-xs font-mono"
+                                    style="color:var(--text-tertiary);">
                                     <span x-text="entry.t" style="min-width:6ch;flex-shrink:0;opacity:0.5;"></span>
                                     <!-- Inline SVGs avoid Lucide re-init issues inside x-for -->
                                     <span x-show="entry.icon === 'wrench'" style="flex-shrink:0;display:inline-flex;">
-                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none"
+                                            stroke="currentColor" stroke-width="2">
+                                            <path
+                                                d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+                                        </svg>
                                     </span>
-                                    <span x-show="entry.icon === 'check'" style="color:var(--text-success);flex-shrink:0;">
-                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                                    <span x-show="entry.icon === 'check'"
+                                        style="color:var(--text-success);flex-shrink:0;">
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none"
+                                            stroke="currentColor" stroke-width="2.5">
+                                            <polyline points="20 6 9 17 4 12" />
+                                        </svg>
                                     </span>
-                                    <span x-show="entry.icon === 'error'" style="color:var(--text-danger);flex-shrink:0;">
-                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+                                    <span x-show="entry.icon === 'error'"
+                                        style="color:var(--text-danger);flex-shrink:0;">
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none"
+                                            stroke="currentColor" stroke-width="2">
+                                            <circle cx="12" cy="12" r="10" />
+                                            <line x1="15" y1="9" x2="9" y2="15" />
+                                            <line x1="9" y1="9" x2="15" y2="15" />
+                                        </svg>
                                     </span>
                                     <span x-text="entry.text"></span>
                                 </div>
                             </template>
                         </div>
                         <!-- Live status line — always visible while streaming, hidden once final content arrives -->
-                        <div x-show="!finalContent" class="flex items-center gap-2 text-xs font-mono py-1" style="color:var(--text-tertiary);">
+                        <div x-show="!finalContent" class="flex items-center gap-2 text-xs font-mono py-1"
+                            style="color:var(--text-tertiary);">
                             <span x-show="engineStatus?.icon === 'wrench'" style="flex-shrink:0;display:inline-flex;">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2">
+                                    <path
+                                        d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+                                </svg>
                             </span>
                             <span x-text="engineStatus?.text || 'Starting'"></span>
                             <span class="loading-dots" style="display:inline-flex;gap:2px;margin:0;">
@@ -729,17 +1085,24 @@
                         <!-- Live thinking bubble — shown while reasoning_content is arriving -->
                         <div x-show="streamingThinking" class="thinking-container mb-2">
                             <div class="thinking-header" @click="streamingThinkingOpen = !streamingThinkingOpen">
-                                <svg class="thinking-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+                                <svg class="thinking-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2">
+                                    <circle cx="12" cy="12" r="10" />
+                                    <path d="M12 8v4M12 16h.01" />
+                                </svg>
                                 <span class="thinking-text" x-text="finalContent ? 'Thinking' : 'Thinking...'"></span>
-                                <svg class="thinking-toggle" :class="{ collapsed: !streamingThinkingOpen }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg>
+                                <svg class="thinking-toggle" :class="{ collapsed: !streamingThinkingOpen }"
+                                    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="18 15 12 9 6 15" />
+                                </svg>
                             </div>
                             <div class="thinking-content markdown-content thinking-markdown"
-                                 :class="{ collapsed: !streamingThinkingOpen }"
-                                 data-math-pending="true"
-                                 :data-math-version="String(streamingThinking.length)"
-                                 x-html="renderMarkdown(streamingThinking)"></div>
+                                :class="{ collapsed: !streamingThinkingOpen }" data-math-pending="true"
+                                :data-math-version="String(streamingThinking.length)"
+                                x-html="renderMarkdown(streamingThinking)"></div>
                         </div>
-                        <div x-show="streamingContent" class="markdown-content" x-ref="streamingOutput" x-effect="updateStreamingDOM()"></div>
+                        <div x-show="streamingContent" class="markdown-content" x-ref="streamingOutput"
+                            x-effect="updateStreamingDOM()"></div>
                     </div>
                 </div>
             </div>
@@ -748,13 +1111,11 @@
         <!-- Input Area -->
         <div class="p-4 border-t border-line bg-surface flex-shrink-0">
             <div class="max-w-4xl mx-auto">
-                <div class="input-container" :class="{ 'drag-over': isDragOver }"
-                     @dragover.prevent="isDragOver = true" @dragleave.prevent="isDragOver = false"
-                     @drop.prevent="isDragOver = false; handleDrop($event)">
+                <div class="input-container" :class="{ 'drag-over': isDragOver }" @dragover.prevent="isDragOver = true"
+                    @dragleave.prevent="isDragOver = false" @drop.prevent="isDragOver = false; handleDrop($event)">
                     <!-- Hidden file input for image upload (multiple) -->
-                    <input type="file" id="imageInput" accept="image/*" multiple
-                           x-ref="imageInput" @change="handleImageSelect($event)"
-                           class="hidden">
+                    <input type="file" id="imageInput" accept="image/*" multiple x-ref="imageInput"
+                        @change="handleImageSelect($event)" class="hidden">
 
                     <!-- Image preview area (multi-image) -->
                     <div x-show="uploadImages.length > 0" class="flex flex-wrap gap-2 px-2 pt-2" x-cloak>
@@ -762,8 +1123,8 @@
                             <div class="relative group">
                                 <img :src="img.base64" class="h-16 w-16 object-cover rounded-lg border border-line">
                                 <button @click="removeImage(idx)"
-                                        class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center bg-surface-alt border border-line-strong text-fg-tertiary cursor-pointer transition-all opacity-0 group-hover:opacity-100 hover:bg-surface-muted hover:text-fg"
-                                        :title="window.t('chat.remove_image')">
+                                    class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center bg-surface-alt border border-line-strong text-fg-tertiary cursor-pointer transition-all opacity-0 group-hover:opacity-100 hover:bg-surface-muted hover:text-fg"
+                                    :title="window.t('chat.remove_image')">
                                     <i data-lucide="x" class="w-3 h-3"></i>
                                 </button>
                             </div>
@@ -772,38 +1133,30 @@
 
                     <div class="flex items-end">
                         <!-- Image upload button (only for VLM models) -->
-                        <button x-show="hasVisionSupport()"
-                                @click="$refs.imageInput.click()"
-                                :disabled="!apiKeySet || !currentModel || isStreaming || uploadImages.length >= 10"
-                                class="p-3 shrink-0 transition-colors text-fg-tertiary hover:text-fg-secondary disabled:opacity-50 disabled:cursor-not-allowed"
-                                :title="window.t('chat.upload_image')">
+                        <button x-show="hasVisionSupport()" @click="$refs.imageInput.click()"
+                            :disabled="!apiKeySet || !currentModel || isStreaming || uploadImages.length >= 10"
+                            class="p-3 shrink-0 transition-colors text-fg-tertiary hover:text-fg-secondary disabled:opacity-50 disabled:cursor-not-allowed"
+                            :title="window.t('chat.upload_image')">
                             <i data-lucide="image" class="w-5 h-5"></i>
                         </button>
 
-                        <textarea
-                            x-ref="messageInput"
-                            x-model="inputMessage"
+                        <textarea x-ref="messageInput" x-model="inputMessage"
                             @keydown.enter="if (!isMobile && !$event.shiftKey && !$event.isComposing && $event.keyCode !== 229) { $event.preventDefault(); sendMessage(); }"
-                            @input="autoResize($event.target)"
-                            @paste="handlePaste($event)"
+                            @input="autoResize($event.target)" @paste="handlePaste($event)"
                             :placeholder="isMobile ? window.t('chat.input_placeholder_mobile') : window.t('chat.input_placeholder')"
-                            :disabled="!apiKeySet || !currentModel || isStreaming"
-                            rows="1"
+                            :disabled="!apiKeySet || !currentModel || isStreaming" rows="1"
                             class="flex-1 px-4 py-3 bg-transparent resize-none outline-none text-sm max-h-32"
-                            style="color: var(--text-primary);"
-                        ></textarea>
+                            style="color: var(--text-primary);"></textarea>
                         <div class="relative flex-shrink-0">
-                            <button
-                                @click="sendMessage()"
+                            <button @click="sendMessage()"
                                 :disabled="(!inputMessage.trim() && uploadImages.length === 0) || !apiKeySet || !currentModel || isStreaming"
-                                class="w-10 h-10 m-1 bg-accent hover:bg-accent-hover disabled:bg-surface-muted rounded-full transition-colors flex items-center justify-center"
-                            >
+                                class="w-10 h-10 m-1 bg-accent hover:bg-accent-hover disabled:bg-surface-muted rounded-full transition-colors flex items-center justify-center">
                                 <i data-lucide="arrow-up" class="w-4 h-4 text-accent-fg"></i>
                             </button>
                             <!-- Image count badge -->
                             <div x-show="uploadImages.length > 0"
-                                 class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-accent text-accent-fg text-[10px] flex items-center justify-center rounded-full pointer-events-none"
-                                 x-text="uploadImages.length"></div>
+                                class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-accent text-accent-fg text-[10px] flex items-center justify-center rounded-full pointer-events-none"
+                                x-text="uploadImages.length"></div>
                         </div>
                     </div>
                 </div>
@@ -812,10 +1165,8 @@
     </div>
 
     <!-- Image Modal -->
-    <div x-show="imageModal.show" x-cloak
-         class="image-modal"
-         @click="closeImageModal()"
-         @keydown.escape.window="closeImageModal()">
+    <div x-show="imageModal.show" x-cloak class="image-modal" @click="closeImageModal()"
+        @keydown.escape.window="closeImageModal()">
         <button class="image-modal-close" @click="closeImageModal()">
             <i data-lucide="x" class="w-5 h-5"></i>
         </button>
@@ -824,41 +1175,39 @@
 
     <!-- System Prompt Modal -->
     <div x-show="showSystemPromptModal" x-cloak
-         class="fixed inset-0 bg-black/50 flex items-center justify-center z-[1000]"
-         @click="showSystemPromptModal = false"
-         @keydown.escape.window="showSystemPromptModal = false">
+        class="fixed inset-0 bg-black/50 flex items-center justify-center z-[1000]"
+        @click="showSystemPromptModal = false" @keydown.escape.window="showSystemPromptModal = false">
         <div class="bg-surface rounded-2xl p-6 max-w-[500px] w-[90%] shadow-2xl" @click.stop>
             <div class="flex items-center justify-between mb-4">
                 <h3 class="text-lg font-bold" style="color: var(--text-primary);">
                     {{ t('chat.system_prompt.title') }}
                 </h3>
-                <button @click="showSystemPromptModal = false" class="p-1 hover:bg-surface-muted rounded-lg" style="color: var(--text-tertiary);">
+                <button @click="showSystemPromptModal = false" class="p-1 hover:bg-surface-muted rounded-lg"
+                    style="color: var(--text-tertiary);">
                     <i data-lucide="x" class="w-5 h-5"></i>
                 </button>
             </div>
             <p class="text-sm mb-3" style="color: var(--text-tertiary);">
                 {{ t('chat.system_prompt.description') }}
             </p>
-            <textarea x-model="systemPromptDraft" rows="6"
-                      :placeholder="window.t('chat.system_prompt.placeholder')"
-                      class="w-full px-4 py-3 border border-line rounded-xl mb-4 focus:outline-none focus:border-line-strong resize-y"
-                      style="background: var(--bg-primary); color: var(--text-primary);"
-            ></textarea>
+            <textarea x-model="systemPromptDraft" rows="6" :placeholder="window.t('chat.system_prompt.placeholder')"
+                class="w-full px-4 py-3 border border-line rounded-xl mb-4 focus:outline-none focus:border-line-strong resize-y"
+                style="background: var(--bg-primary); color: var(--text-primary);"></textarea>
             <div class="flex items-center justify-between">
-                <button @click="systemPromptDraft = ''; systemPrompt = ''; localStorage.removeItem('omlx_chat_system_prompt'); showSystemPromptModal = false"
-                        class="text-sm px-3 py-2 hover:bg-surface-muted rounded-lg"
-                        style="color: var(--text-tertiary);"
-                        x-show="systemPrompt.trim()">
+                <button
+                    @click="systemPromptDraft = ''; systemPrompt = ''; localStorage.removeItem('omlx_chat_system_prompt'); showSystemPromptModal = false"
+                    class="text-sm px-3 py-2 hover:bg-surface-muted rounded-lg" style="color: var(--text-tertiary);"
+                    x-show="systemPrompt.trim()">
                     {{ t('chat.system_prompt.clear') }}
                 </button>
                 <div class="flex items-center gap-2 ml-auto">
                     <button @click="showSystemPromptModal = false"
-                            class="px-4 py-2 text-sm rounded-xl hover:bg-surface-muted"
-                            style="color: var(--text-primary);">
+                        class="px-4 py-2 text-sm rounded-xl hover:bg-surface-muted" style="color: var(--text-primary);">
                         {{ t('chat.system_prompt.cancel') }}
                     </button>
-                    <button @click="systemPrompt = systemPromptDraft; localStorage.setItem('omlx_chat_system_prompt', systemPrompt); showSystemPromptModal = false"
-                            class="px-4 py-2 text-sm bg-accent text-accent-fg rounded-xl hover:bg-accent-hover">
+                    <button
+                        @click="systemPrompt = systemPromptDraft; localStorage.setItem('omlx_chat_system_prompt', systemPrompt); showSystemPromptModal = false"
+                        class="px-4 py-2 text-sm bg-accent text-accent-fg rounded-xl hover:bg-accent-hover">
                         {{ t('chat.system_prompt.save') }}
                     </button>
                 </div>
@@ -943,6 +1292,8 @@
             editingIndex: null,
             editContent: '',
             editImages: [],              // Preserve images during edit
+            renamingChatId: null,
+            renameDraft: '',
 
             // Image Upload State
             uploadImages: [],            // Array of { id, base64 } for pending images (max 10)
@@ -979,750 +1330,799 @@
 
             async init() {
                 // Auto-inject API key from server (admin session already authenticated)
-                const serverApiKey = {{ api_key | tojson }};
-                if (serverApiKey) {
-                    localStorage.setItem('omlx_chat_api_key', serverApiKey);
-                }
+                const serverApiKey = {{ api_key | tojson
+            }
+        };
+        if (serverApiKey) {
+            localStorage.setItem('omlx_chat_api_key', serverApiKey);
+        }
 
-                // Check for stored API key
-                const storedKey = localStorage.getItem('omlx_chat_api_key');
-                if (storedKey) {
-                    this.apiKeySet = true;
-                    await this.loadModels();
-                    this.loadChatHistory();
-                    this.fetchMcpTools();
-                }
+        // Check for stored API key
+        const storedKey = localStorage.getItem('omlx_chat_api_key');
+        if (storedKey) {
+            this.apiKeySet = true;
+            await this.loadModels();
+            this.loadChatHistory();
+            this.fetchMcpTools();
+        }
 
-                // Apply theme
-                this.applyTheme();
+        // Apply theme
+        this.applyTheme();
 
 
-                // Setup scroll listener for auto-scroll management
-                this.$nextTick(() => {
-                    this.setupScrollListener();
-                });
+        // Setup scroll listener for auto-scroll management
+        this.$nextTick(() => {
+            this.setupScrollListener();
+        });
 
-            },
+    },
 
             // ===== VLM Detection =====
 
             async fetchModelTypes() {
-                try {
-                    const resp = await fetch('/v1/models/status', {
-                        headers: { 'Authorization': `Bearer ${this.getApiKey()}` }
-                    });
-                    if (!resp.ok) return;
-                    const data = await resp.json();
-                    const map = {};
-                    for (const m of (data.models || [])) {
-                        map[m.id] = m.model_type || 'llm';
-                    }
-                    this.modelTypeMap = map;
-                } catch (e) {
-                    // Model status endpoint unavailable
-                }
-            },
+        try {
+            const resp = await fetch('/v1/models/status', {
+                headers: { 'Authorization': `Bearer ${this.getApiKey()}` }
+            });
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const map = {};
+            for (const m of (data.models || [])) {
+                map[m.id] = m.model_type || 'llm';
+            }
+            this.modelTypeMap = map;
+        } catch (e) {
+            // Model status endpoint unavailable
+        }
+    },
 
-            hasVisionSupport() {
-                return this.modelTypeMap[this.currentModel] === 'vlm';
-            },
+    hasVisionSupport() {
+        return this.modelTypeMap[this.currentModel] === 'vlm';
+    },
 
             // ===== MCP Tools =====
 
             async fetchMcpTools() {
-                try {
-                    const resp = await fetch('/v1/mcp/tools', {
-                        headers: { 'Authorization': `Bearer ${this.getApiKey()}` }
-                    });
-                    if (!resp.ok) return;
-                    const data = await resp.json();
-                    this.mcpTools = (data.tools || []).map(t => ({
-                        type: 'function',
-                        function: {
-                            name: t.name,
-                            description: t.description || '',
-                            parameters: t.parameters || { type: 'object', properties: {} }
-                        }
-                    }));
-                } catch (e) { /* MCP not configured */ }
-            },
-
-            // ===== Engine Status =====
-
-            setEngineStatus(status, { log = true } = {}) {
-                this.engineStatus = status;
-                if (log && status) {
-                    const elapsed = ((Date.now() - this._statusStart) / 1000).toFixed(1);
-                    const last = this.statusLog[this.statusLog.length - 1];
-                    if (!last || last.text !== status.text || last.icon !== (status.icon || null)) {
-                        this.statusLog.push({ t: `+${elapsed}s`, text: status.text, icon: status.icon || null });
-                    }
+        try {
+            const resp = await fetch('/v1/mcp/tools', {
+                headers: { 'Authorization': `Bearer ${this.getApiKey()}` }
+            });
+            if (!resp.ok) return;
+            const data = await resp.json();
+            this.mcpTools = (data.tools || []).map(t => ({
+                type: 'function',
+                function: {
+                    name: t.name,
+                    description: t.description || '',
+                    parameters: t.parameters || { type: 'object', properties: {} }
                 }
-            },
+            }));
+        } catch (e) { /* MCP not configured */ }
+    },
 
-            startPrefillPolling() {
-                this.stopPrefillPolling();
-                this._prefillInterval = setInterval(() => this._pollPrefill(), 500);
-            },
+    // ===== Engine Status =====
 
-            stopPrefillPolling() {
-                if (this._prefillInterval) {
-                    clearInterval(this._prefillInterval);
-                    this._prefillInterval = null;
-                }
-            },
+    setEngineStatus(status, { log = true } = {}) {
+        this.engineStatus = status;
+        if (log && status) {
+            const elapsed = ((Date.now() - this._statusStart) / 1000).toFixed(1);
+            const last = this.statusLog[this.statusLog.length - 1];
+            if (!last || last.text !== status.text || last.icon !== (status.icon || null)) {
+                this.statusLog.push({ t: `+${elapsed}s`, text: status.text, icon: status.icon || null });
+            }
+        }
+    },
+
+    startPrefillPolling() {
+        this.stopPrefillPolling();
+        this._prefillInterval = setInterval(() => this._pollPrefill(), 500);
+    },
+
+    stopPrefillPolling() {
+        if (this._prefillInterval) {
+            clearInterval(this._prefillInterval);
+            this._prefillInterval = null;
+        }
+    },
 
             async _pollPrefill() {
-                try {
-                    const resp = await fetch('/admin/api/stats', { credentials: 'same-origin' });
-                    if (!resp.ok) return;
-                    const data = await resp.json();
-                    const models = data.active_models?.models || [];
-                    const model = models.find(m => m.id === this.currentModel);
-                    if (this.engineStatus?.icon === 'wrench') return; // don't overwrite tool status
-                    if (model?.is_loading || (!model && models.some(m => m.is_loading))) {
-                        this.setEngineStatus({ text: 'Loading model' });
-                    } else if (model?.prefilling?.length > 0) {
-                        const p = model.prefilling[0];
-                        if (p.total > 0) {
-                            const pct = Math.round(p.processed / p.total * 100);
-                            if (pct >= 100) {
-                                this.engineStatus = { text: 'Generating' }; // prefill done, now generating
-                            } else {
-                                const speed = p.speed > 0 ? ` · ${Math.round(p.speed)} tok/s` : '';
-                                this.engineStatus = { text: `Prefilling ${pct}%${speed}` };
-                            }
-                        } else {
-                            this.engineStatus = { text: 'Prefilling' };
-                        }
-                    } else if (model?.generating?.length > 0) {
-                        this.setEngineStatus({ text: 'Generating' });
+        try {
+            const resp = await fetch('/admin/api/stats', { credentials: 'same-origin' });
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const models = data.active_models?.models || [];
+            const model = models.find(m => m.id === this.currentModel);
+            if (this.engineStatus?.icon === 'wrench') return; // don't overwrite tool status
+            if (model?.is_loading || (!model && models.some(m => m.is_loading))) {
+                this.setEngineStatus({ text: 'Loading model' });
+            } else if (model?.prefilling?.length > 0) {
+                const p = model.prefilling[0];
+                if (p.total > 0) {
+                    const pct = Math.round(p.processed / p.total * 100);
+                    if (pct >= 100) {
+                        this.engineStatus = { text: 'Generating' }; // prefill done, now generating
+                    } else {
+                        const speed = p.speed > 0 ? ` · ${Math.round(p.speed)} tok/s` : '';
+                        this.engineStatus = { text: `Prefilling ${pct}%${speed}` };
                     }
-                } catch (e) { /* ignore poll errors */ }
-            },
-
-            // ===== Image Modal Functions =====
-
-            openImageModal(url) {
-                if (!url) return;
-                this.imageModal = { show: true, src: url };
-            },
-
-            closeImageModal() {
-                this.imageModal = { show: false, src: '' };
-            },
-
-            // ===== Image Upload Functions =====
-
-            handleDrop(event) {
-                if (!this.hasVisionSupport()) return;
-                const files = event.dataTransfer?.files;
-                if (files) {
-                    Array.from(files).forEach(f => this.loadImageFile(f));
+                } else {
+                    this.engineStatus = { text: 'Prefilling' };
                 }
-            },
+            } else if (model?.generating?.length > 0) {
+                this.setEngineStatus({ text: 'Generating' });
+            }
+        } catch (e) { /* ignore poll errors */ }
+    },
 
-            handleImageSelect(event) {
-                const files = event.target.files;
-                if (!files) return;
-                Array.from(files).forEach(f => this.loadImageFile(f));
-                event.target.value = '';
-            },
+    // ===== Image Modal Functions =====
 
-            loadImageFile(file) {
-                if (!file.type.startsWith('image/')) {
-                    alert(window.t('chat.error.invalid_image_type'));
-                    return;
+    openImageModal(url) {
+        if (!url) return;
+        this.imageModal = { show: true, src: url };
+    },
+
+    closeImageModal() {
+        this.imageModal = { show: false, src: '' };
+    },
+
+    // ===== Image Upload Functions =====
+
+    handleDrop(event) {
+        if (!this.hasVisionSupport()) return;
+        const files = event.dataTransfer?.files;
+        if (files) {
+            Array.from(files).forEach(f => this.loadImageFile(f));
+        }
+    },
+
+    handleImageSelect(event) {
+        const files = event.target.files;
+        if (!files) return;
+        Array.from(files).forEach(f => this.loadImageFile(f));
+        event.target.value = '';
+    },
+
+    loadImageFile(file) {
+        if (!file.type.startsWith('image/')) {
+            alert(window.t('chat.error.invalid_image_type'));
+            return;
+        }
+
+        const maxSize = 10 * 1024 * 1024;
+        if (file.size > maxSize) {
+            alert(window.t('chat.error.image_too_large'));
+            return;
+        }
+
+        if (this.uploadImages.length >= 10) return;
+
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            this.uploadImages.push({
+                id: Date.now() + '_' + Math.random().toString(36).substr(2, 5),
+                base64: e.target.result
+            });
+        };
+        reader.onerror = () => {
+            alert(window.t('chat.error.image_load_failed'));
+        };
+        reader.readAsDataURL(file);
+    },
+
+    removeImage(index) {
+        this.uploadImages.splice(index, 1);
+    },
+
+    handlePaste(event) {
+        if (!this.hasVisionSupport()) return;
+        const items = event.clipboardData?.items;
+        if (!items) return;
+
+        for (const item of items) {
+            if (item.type.startsWith('image/')) {
+                const file = item.getAsFile();
+                if (file) {
+                    this.loadImageFile(file);
+                    event.preventDefault();
+                    break;
                 }
+            }
+        }
+    },
 
-                const maxSize = 10 * 1024 * 1024;
-                if (file.size > maxSize) {
-                    alert(window.t('chat.error.image_too_large'));
-                    return;
-                }
+    // ===== Content Helpers =====
 
-                if (this.uploadImages.length >= 10) return;
+    getTextContent(content) {
+        if (typeof content === 'string') return content;
+        if (Array.isArray(content)) {
+            return content.filter(p => p.type === 'text').map(p => p.text).join('\n');
+        }
+        return '';
+    },
 
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    this.uploadImages.push({
-                        id: Date.now() + '_' + Math.random().toString(36).substr(2, 5),
-                        base64: e.target.result
-                    });
-                };
-                reader.onerror = () => {
-                    alert(window.t('chat.error.image_load_failed'));
-                };
-                reader.readAsDataURL(file);
-            },
+    getImageUrls(content) {
+        if (!Array.isArray(content)) return [];
+        return content
+            .filter(p => p.type === 'image_url' && p.image_url?.url)
+            .map(p => p.image_url.url);
+    },
 
-            removeImage(index) {
-                this.uploadImages.splice(index, 1);
-            },
+    hasStrippedImages(content) {
+        if (!Array.isArray(content)) return false;
+        return content.some(p => p.type === 'image_url' && !p.image_url?.url);
+    },
 
-            handlePaste(event) {
-                if (!this.hasVisionSupport()) return;
-                const items = event.clipboardData?.items;
-                if (!items) return;
+    getStrippedImageCount(content) {
+        if (!Array.isArray(content)) return [];
+        const count = content.filter(p => p.type === 'image_url' && !p.image_url?.url).length;
+        return new Array(count);
+    },
 
-                for (const item of items) {
-                    if (item.type.startsWith('image/')) {
-                        const file = item.getAsFile();
-                        if (file) {
-                            this.loadImageFile(file);
-                            event.preventDefault();
-                            break;
-                        }
+    // ===== End Image Upload Functions =====
+
+    // Setup scroll listener for messages container
+    setupScrollListener() {
+        const container = document.getElementById('messagesContainer');
+        if (!container) return;
+
+        let lastScrollTop = container.scrollTop;
+        container.addEventListener('scroll', () => {
+            // Detect if user is manually scrolling
+            clearTimeout(this.scrollTimeout);
+            this.isUserScrolling = true;
+
+            // Check if at bottom (with threshold)
+            const threshold = 50;
+            const isAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
+            const scrolledUp = container.scrollTop < lastScrollTop;
+            lastScrollTop = container.scrollTop;
+
+            if (isAtBottom) {
+                // User scrolled to bottom, re-enable auto-scroll
+                this.autoScrollEnabled = true;
+            } else if (scrolledUp) {
+                // User scrolled up - disable auto-scroll until they reach the bottom again
+                this.autoScrollEnabled = false;
+            }
+
+            // Reset user scrolling flag after scroll ends
+            this.scrollTimeout = setTimeout(() => {
+                this.isUserScrolling = false;
+            }, 150);
+        });
+    },
+
+    saveApiKey() {
+        if (!this.apiKeyInput.trim()) return;
+        localStorage.setItem('omlx_chat_api_key', this.apiKeyInput.trim());
+        this.apiKeySet = true;
+        this.apiKeyInput = '';
+        this.loadModels();
+        this.loadChatHistory();
+    },
+
+    clearApiKey() {
+        if (confirm(window.t('chat.confirm_change_api_key'))) {
+            localStorage.removeItem('omlx_chat_api_key');
+            this.apiKeySet = false;
+            this.messages = [];
+            this.currentChatId = null;
+        }
+    },
+
+    getApiKey() {
+        return localStorage.getItem('omlx_chat_api_key') || '';
+    },
+
+            async loadModels() {
+        try {
+            // Fetch models and server health in parallel
+            const [modelsResponse, healthResponse] = await Promise.all([
+                fetch('/v1/models', {
+                    headers: {
+                        'Authorization': `Bearer ${this.getApiKey()}`
                     }
-                }
-            },
+                }),
+                fetch('/health')
+            ]);
 
-            // ===== Content Helpers =====
-
-            getTextContent(content) {
-                if (typeof content === 'string') return content;
-                if (Array.isArray(content)) {
-                    return content.filter(p => p.type === 'text').map(p => p.text).join('\n');
-                }
-                return '';
-            },
-
-            getImageUrls(content) {
-                if (!Array.isArray(content)) return [];
-                return content
-                    .filter(p => p.type === 'image_url' && p.image_url?.url)
-                    .map(p => p.image_url.url);
-            },
-
-            hasStrippedImages(content) {
-                if (!Array.isArray(content)) return false;
-                return content.some(p => p.type === 'image_url' && !p.image_url?.url);
-            },
-
-            getStrippedImageCount(content) {
-                if (!Array.isArray(content)) return [];
-                const count = content.filter(p => p.type === 'image_url' && !p.image_url?.url).length;
-                return new Array(count);
-            },
-
-            // ===== End Image Upload Functions =====
-
-            // Setup scroll listener for messages container
-            setupScrollListener() {
-                const container = document.getElementById('messagesContainer');
-                if (!container) return;
-
-                let lastScrollTop = container.scrollTop;
-                container.addEventListener('scroll', () => {
-                    // Detect if user is manually scrolling
-                    clearTimeout(this.scrollTimeout);
-                    this.isUserScrolling = true;
-
-                    // Check if at bottom (with threshold)
-                    const threshold = 50;
-                    const isAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
-                    const scrolledUp = container.scrollTop < lastScrollTop;
-                    lastScrollTop = container.scrollTop;
-
-                    if (isAtBottom) {
-                        // User scrolled to bottom, re-enable auto-scroll
-                        this.autoScrollEnabled = true;
-                    } else if (scrolledUp) {
-                        // User scrolled up - disable auto-scroll until they reach the bottom again
-                        this.autoScrollEnabled = false;
-                    }
-
-                    // Reset user scrolling flag after scroll ends
-                    this.scrollTimeout = setTimeout(() => {
-                        this.isUserScrolling = false;
-                    }, 150);
-                });
-            },
-
-            saveApiKey() {
-                if (!this.apiKeyInput.trim()) return;
-                localStorage.setItem('omlx_chat_api_key', this.apiKeyInput.trim());
-                this.apiKeySet = true;
-                this.apiKeyInput = '';
-                this.loadModels();
-                this.loadChatHistory();
-            },
-
-            clearApiKey() {
-                if (confirm(window.t('chat.confirm_change_api_key'))) {
+            if (!modelsResponse.ok) {
+                if (modelsResponse.status === 401) {
+                    alert(window.t('chat.error.incorrect_api_key'));
                     localStorage.removeItem('omlx_chat_api_key');
                     this.apiKeySet = false;
                     this.messages = [];
                     this.currentChatId = null;
-                }
-            },
-
-            getApiKey() {
-                return localStorage.getItem('omlx_chat_api_key') || '';
-            },
-
-            async loadModels() {
-                try {
-                    // Fetch models and server health in parallel
-                    const [modelsResponse, healthResponse] = await Promise.all([
-                        fetch('/v1/models', {
-                            headers: {
-                                'Authorization': `Bearer ${this.getApiKey()}`
-                            }
-                        }),
-                        fetch('/health')
-                    ]);
-
-                    if (!modelsResponse.ok) {
-                        if (modelsResponse.status === 401) {
-                            alert(window.t('chat.error.incorrect_api_key'));
-                            localStorage.removeItem('omlx_chat_api_key');
-                            this.apiKeySet = false;
-                            this.messages = [];
-                            this.currentChatId = null;
-                            return;
-                        }
-                        throw new Error('Failed to load models');
-                    }
-
-                    const modelsData = await modelsResponse.json();
-                    const allModels = modelsData.data || [];
-
-                    // Fetch model types first (needed for filtering and VLM detection)
-                    await this.fetchModelTypes();
-
-                    // Filter out audio/embedding/reranker — chat only works with LLM/VLM
-                    this.availableModels = allModels.filter(m => {
-                        const t = (this.modelTypeMap[m.id] || '').toLowerCase();
-                        return !t.startsWith('audio_') && t !== 'embedding' && t !== 'reranker';
-                    });
-                    // Get default model from health endpoint
-                    let defaultModel = null;
-                    if (healthResponse.ok) {
-                        const healthData = await healthResponse.json();
-                        defaultModel = healthData.default_model;
-                    }
-
-                    // Auto-select default model if set, otherwise first model
-                    if (!this.currentModel && this.availableModels.length > 0) {
-                        if (defaultModel && this.availableModels.some(m => m.id === defaultModel)) {
-                            this.currentModel = defaultModel;
-                        } else {
-                            this.currentModel = this.availableModels[0].id;
-                        }
-                    }
-                } catch (error) {
-                    console.error('Error loading models:', error);
-                }
-            },
-
-            selectModel(modelId) {
-                this.currentModel = modelId;
-            },
-
-            loadChatHistory() {
-                const history = localStorage.getItem('omlx_chat_history');
-                if (history) {
-                    try {
-                        this.chatHistory = JSON.parse(history);
-                    } catch (e) {
-                        this.chatHistory = [];
-                    }
-                }
-            },
-
-            saveChatHistory() {
-                localStorage.setItem('omlx_chat_history', JSON.stringify(this.chatHistory));
-            },
-
-            startNewChat() {
-                this.currentChatId = 'chat_' + Date.now();
-                this.messages = [];
-                this.uploadImages = [];
-                this.systemPrompt = localStorage.getItem('omlx_chat_system_prompt') || '';
-                this.isMobile = window.innerWidth < 768;
-                this.sidebarOpen = window.innerWidth >= 768;
-                this.resetStreamRenderState();
-            },
-
-            loadChat(chatId) {
-                const chat = this.chatHistory.find(c => c.id === chatId);
-                if (chat) {
-                    this.currentChatId = chatId;
-                    this.messages = chat.messages || [];
-                    this.systemPrompt = chat.systemPrompt || '';
-                    if (chat.model) {
-                        this.currentModel = chat.model;
-                    }
-                    this.scheduleEnhanceMessages();
-                }
-                this.isMobile = window.innerWidth < 768;
-                this.sidebarOpen = window.innerWidth >= 768;
-            },
-
-            saveCurrentChat() {
-                if (!this.currentChatId || this.messages.length === 0) return;
-
-                const existingIndex = this.chatHistory.findIndex(c => c.id === this.currentChatId);
-
-                // Strip base64 image data from content arrays to avoid localStorage quota issues
-                const messagesForStorage = this.messages.map(msg => {
-                    if (!Array.isArray(msg.content)) return msg;
-                    return {
-                        ...msg,
-                        content: msg.content.map(part => {
-                            if (part.type === 'image_url') {
-                                return { type: 'image_url', image_url: { url: '' } };
-                            }
-                            return part;
-                        })
-                    };
-                });
-
-                const title = this.getTextContent(this.messages[0]?.content)?.slice(0, 50)
-                    || window.t('chat.new_chat_title');
-
-                const chatData = {
-                    id: this.currentChatId,
-                    title,
-                    messages: messagesForStorage,
-                    model: this.currentModel,
-                    systemPrompt: this.systemPrompt,
-                    updatedAt: new Date().toISOString()
-                };
-
-                if (existingIndex >= 0) {
-                    this.chatHistory[existingIndex] = chatData;
-                } else {
-                    this.chatHistory.unshift(chatData);
-                }
-
-                // Keep only last 50 chats
-                this.chatHistory = this.chatHistory.slice(0, 50);
-                this.saveChatHistory();
-            },
-
-            async sendMessage() {
-                const userText = this.inputMessage.trim();
-                const images = [...this.uploadImages];
-
-                if (!userText && images.length === 0) return;
-                if (!this.currentModel || this.isStreaming) return;
-
-                // Clear input state
-                this.inputMessage = '';
-                this.uploadImages = [];
-                this.$nextTick(() => {
-                    if (this.$refs.messageInput) {
-                        this.resetTextareaHeight(this.$refs.messageInput);
-                    }
-                });
-
-                if (!this.currentChatId) {
-                    this.currentChatId = 'chat_' + Date.now();
-                }
-
-                // Build message content (OpenAI content array for images, string for text-only)
-                let content;
-                if (images.length > 0) {
-                    content = [];
-                    for (const img of images) {
-                        content.push({ type: 'image_url', image_url: { url: img.base64 } });
-                    }
-                    if (userText) {
-                        content.push({ type: 'text', text: userText });
-                    }
-                } else {
-                    content = userText;
-                }
-
-                this.messages.push({ role: 'user', content });
-                this.forceScrollToBottom();
-                await this.streamResponse();
-            },
-
-            async streamResponse(depth = 0) {
-                if (depth > this.MAX_TOOL_DEPTH) {
-                    this.messages.push({
-                        role: 'assistant',
-                        content: `Error: Maximum tool call depth (${this.MAX_TOOL_DEPTH}) exceeded. The model may be stuck in a loop.`,
-                        model: this.currentModel,
-                        _perfVisible: false,
-                    });
-                    this.saveCurrentChat();
-                    this.isStreaming = false;
-                    this.streamingContent = '';
-                    this.engineStatus = null;
-                    this.stopPrefillPolling();
-                    this.abortController = null;
                     return;
                 }
-                // Initialise timing and status log once, at the top of a new prompt
-                if (depth === 0) {
-                    this.statusLog = [];
-                    this._statusStart = Date.now();
-                    this._toolTimers = {};
-                    this.finalContent = false;
-                    this.statusTimelineVisible = false;
-                    this.streamingThinking = '';
-                    this.streamingThinkingOpen = false;
-                    this.resetStreamRenderState();
+                throw new Error('Failed to load models');
+            }
+
+            const modelsData = await modelsResponse.json();
+            const allModels = modelsData.data || [];
+
+            // Fetch model types first (needed for filtering and VLM detection)
+            await this.fetchModelTypes();
+
+            // Filter out audio/embedding/reranker — chat only works with LLM/VLM
+            this.availableModels = allModels.filter(m => {
+                const t = (this.modelTypeMap[m.id] || '').toLowerCase();
+                return !t.startsWith('audio_') && t !== 'embedding' && t !== 'reranker';
+            });
+            // Get default model from health endpoint
+            let defaultModel = null;
+            if (healthResponse.ok) {
+                const healthData = await healthResponse.json();
+                defaultModel = healthData.default_model;
+            }
+
+            // Auto-select default model if set, otherwise first model
+            if (!this.currentModel && this.availableModels.length > 0) {
+                if (defaultModel && this.availableModels.some(m => m.id === defaultModel)) {
+                    this.currentModel = defaultModel;
+                } else {
+                    this.currentModel = this.availableModels[0].id;
                 }
-                this.isStreaming = true;
+            }
+        } catch (error) {
+            console.error('Error loading models:', error);
+        }
+    },
+
+    selectModel(modelId) {
+        this.currentModel = modelId;
+    },
+
+    loadChatHistory() {
+        const history = localStorage.getItem('omlx_chat_history');
+        if (history) {
+            try {
+                this.chatHistory = JSON.parse(history);
+            } catch (e) {
+                this.chatHistory = [];
+            }
+        }
+    },
+
+    saveChatHistory() {
+        localStorage.setItem('omlx_chat_history', JSON.stringify(this.chatHistory));
+    },
+
+    startNewChat() {
+        this.currentChatId = 'chat_' + Date.now();
+        this.messages = [];
+        this.uploadImages = [];
+        this.systemPrompt = localStorage.getItem('omlx_chat_system_prompt') || '';
+        this.isMobile = window.innerWidth < 768;
+        this.sidebarOpen = window.innerWidth >= 768;
+        this.resetStreamRenderState();
+    },
+
+    loadChat(chatId) {
+        const chat = this.chatHistory.find(c => c.id === chatId);
+        if (chat) {
+            this.currentChatId = chatId;
+            this.messages = chat.messages || [];
+            this.systemPrompt = chat.systemPrompt || '';
+            if (chat.model) {
+                this.currentModel = chat.model;
+            }
+            this.scheduleEnhanceMessages();
+        }
+        this.isMobile = window.innerWidth < 768;
+        this.sidebarOpen = window.innerWidth >= 768;
+    },
+
+    saveCurrentChat() {
+        if (!this.currentChatId || this.messages.length === 0) return;
+
+        const existingIndex = this.chatHistory.findIndex(c => c.id === this.currentChatId);
+        const existingChat = existingIndex >= 0 ? this.chatHistory[existingIndex] : null;
+
+        // Strip base64 image data from content arrays to avoid localStorage quota issues
+        const messagesForStorage = this.messages.map(msg => {
+            if (!Array.isArray(msg.content)) return msg;
+            return {
+                ...msg,
+                content: msg.content.map(part => {
+                    if (part.type === 'image_url') {
+                        return { type: 'image_url', image_url: { url: '' } };
+                    }
+                    return part;
+                })
+            };
+        });
+
+        const title = existingChat?.manualTitle
+            ? (existingChat.title || window.t('chat.new_chat_title'))
+            : (this.getTextContent(this.messages[0]?.content)?.slice(0, 50)
+                || window.t('chat.new_chat_title'));
+
+        const chatData = {
+            id: this.currentChatId,
+            title,
+            manualTitle: existingChat?.manualTitle || false,
+            messages: messagesForStorage,
+            model: this.currentModel,
+            systemPrompt: this.systemPrompt,
+            updatedAt: new Date().toISOString()
+        };
+
+        if (existingIndex >= 0) {
+            this.chatHistory[existingIndex] = chatData;
+        } else {
+            this.chatHistory.unshift(chatData);
+        }
+
+        // Keep only last 50 chats
+        this.chatHistory = this.chatHistory.slice(0, 50);
+        this.saveChatHistory();
+    },
+
+    startRenamingChat(chat) {
+        this.renamingChatId = chat.id;
+        this.renameDraft = chat.title || window.t('chat.new_chat_title');
+    },
+
+    cancelRenamingChat() {
+        this.renamingChatId = null;
+        this.renameDraft = '';
+    },
+
+    saveRenamedChat(chatId) {
+        const chat = this.chatHistory.find(c => c.id === chatId);
+        if (!chat) return;
+
+        chat.title = this.renameDraft.trim() || window.t('chat.new_chat_title');
+        chat.manualTitle = true;
+        chat.updatedAt = new Date().toISOString();
+        this.saveChatHistory();
+        this.cancelRenamingChat();
+    },
+
+            async sendMessage() {
+        const userText = this.inputMessage.trim();
+        const images = [...this.uploadImages];
+
+        if (!userText && images.length === 0) return;
+        if (!this.currentModel || this.isStreaming) return;
+
+        // Clear input state
+        this.inputMessage = '';
+        this.uploadImages = [];
+        this.$nextTick(() => {
+            if (this.$refs.messageInput) {
+                this.resetTextareaHeight(this.$refs.messageInput);
+            }
+        });
+
+        if (!this.currentChatId) {
+            this.currentChatId = 'chat_' + Date.now();
+        }
+
+        // Build message content (OpenAI content array for images, string for text-only)
+        let content;
+        if (images.length > 0) {
+            content = [];
+            for (const img of images) {
+                content.push({ type: 'image_url', image_url: { url: img.base64 } });
+            }
+            if (userText) {
+                content.push({ type: 'text', text: userText });
+            }
+        } else {
+            content = userText;
+        }
+
+        this.messages.push({ role: 'user', content });
+        this.forceScrollToBottom();
+        await this.streamResponse();
+    },
+
+            async streamResponse(depth = 0) {
+        if (depth > this.MAX_TOOL_DEPTH) {
+            this.messages.push({
+                role: 'assistant',
+                content: `Error: Maximum tool call depth (${this.MAX_TOOL_DEPTH}) exceeded. The model may be stuck in a loop.`,
+                model: this.currentModel,
+                _perfVisible: false,
+            });
+            this.saveCurrentChat();
+            this.isStreaming = false;
+            this.streamingContent = '';
+            this.engineStatus = null;
+            this.stopPrefillPolling();
+            this.abortController = null;
+            return;
+        }
+        // Initialise timing and status log once, at the top of a new prompt
+        if (depth === 0) {
+            this.statusLog = [];
+            this._statusStart = Date.now();
+            this._toolTimers = {};
+            this.finalContent = false;
+            this.statusTimelineVisible = false;
+            this.streamingThinking = '';
+            this.streamingThinkingOpen = false;
+            this.resetStreamRenderState();
+        }
+        this.isStreaming = true;
+        this.streamingContent = '';
+        this.abortController = new AbortController();
+        this.autoScrollEnabled = true;
+        this.setEngineStatus({ text: 'Starting' });
+        this.startPrefillPolling();
+
+        // Build messages for API - pass through tool_calls/tool_call_id for MCP loop
+        const messagesForApi = this.messages
+            .filter(msg => ['user', 'assistant', 'tool', 'system'].includes(msg.role))
+            .map(msg => {
+                const m = { role: msg.role, content: msg.content ?? null };
+                if (msg.tool_calls) m.tool_calls = msg.tool_calls;
+                if (msg.tool_call_id) m.tool_call_id = msg.tool_call_id;
+                return m;
+            });
+        // Prepend system prompt if set
+        if (this.systemPrompt.trim()) {
+            messagesForApi.unshift({
+                role: 'system',
+                content: this.systemPrompt.trim()
+            });
+        }
+
+        try {
+            const response = await fetch('/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.getApiKey()}`
+                },
+                body: JSON.stringify({
+                    model: this.currentModel,
+                    messages: messagesForApi,
+                    stream: true,
+                    stream_options: { include_usage: true },
+                    ...(this.mcpTools.length > 0 && { tools: this.mcpTools })
+                }),
+                signal: this.abortController.signal
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(errorText || `Error: ${response.status}`);
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            const toolCallsMap = {}; // accumulate streaming tool_call chunks by index
+            let finishReason = null;
+            let firstToken = false;  // flipped on first content/reasoning delta
+            let lastUsage = null;    // filled by the stream_options usage chunk
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    if (line.trim() === '' || line.trim() === 'data: [DONE]') continue;
+
+                    if (line.startsWith('data: ')) {
+                        try {
+                            const data = JSON.parse(line.slice(6));
+                            const choice = data.choices?.[0];
+                            const delta = choice?.delta;
+                            if (choice?.finish_reason) finishReason = choice.finish_reason;
+
+                            // Usage chunk arrives as { choices: [], usage: {...} }
+                            if (data.usage && !delta) {
+                                lastUsage = data.usage;
+                                continue;
+                            }
+
+                            // Accumulate streaming tool_call chunks
+                            if (delta?.tool_calls) {
+                                if (!firstToken) { firstToken = true; this.stopPrefillPolling(); }
+                                for (const tc of delta.tool_calls) {
+                                    const i = tc.index ?? 0;
+                                    if (!toolCallsMap[i]) toolCallsMap[i] = { id: '', type: 'function', function: { name: '', arguments: '' } };
+                                    if (tc.id) toolCallsMap[i].id = tc.id;
+                                    if (tc.function?.name) toolCallsMap[i].function.name += tc.function.name;
+                                    if (tc.function?.arguments) toolCallsMap[i].function.arguments += tc.function.arguments;
+                                }
+                                // Clear any thinking content so it doesn't show as response text
+                                // Also reset thinking state so the close tag isn't appended later
+                                if (this.streamingContent) {
+                                    this.streamingContent = '';
+                                    this.thinkingState.isInThinking = false;
+                                    this.thinkingState.thinkingStartTime = null;
+                                }
+                                // Update live status
+                                const names = Object.values(toolCallsMap).map(t => t.function.name).filter(Boolean);
+                                if (names.length > 0) {
+                                    const unique = [...new Set(names)];
+                                    const liveLabel = names.length > 3
+                                        ? `Calling ${unique.slice(0, 2).join(', ')} +${names.length - 2} more`
+                                        : `Calling ${names.join(', ')}`;
+                                    this.engineStatus = { text: liveLabel, icon: 'wrench' };
+                                }
+                            }
+
+                            if (delta?.reasoning_content) {
+                                if (!firstToken) { firstToken = true; this.stopPrefillPolling(); }
+                                if (!this.thinkingState.isInThinking) {
+                                    this.thinkingState.isInThinking = true;
+                                    this.thinkingState.thinkingStartTime = Date.now();
+                                    this.setEngineStatus({ text: 'Thinking' });
+                                }
+                                // Accumulate into live thinking bubble
+                                this.streamingThinking += delta.reasoning_content;
+                            }
+
+                            if (delta?.content) {
+                                if (!firstToken) {
+                                    firstToken = true;
+                                    this.stopPrefillPolling();
+                                }
+                                // Log thinking duration to timeline when content starts
+                                if (this.thinkingState.isInThinking) {
+                                    const thinkSecs = ((Date.now() - this.thinkingState.thinkingStartTime) / 1000).toFixed(1);
+                                    this.setEngineStatus({ text: `Thought for ${thinkSecs}s` });
+                                    this.thinkingState.isInThinking = false;
+                                    this.thinkingState.thinkingStartTime = null;
+                                }
+                                // Only set finalContent on non-whitespace content
+                                if (!this.finalContent && delta.content.trim()) {
+                                    this.finalContent = true;
+                                    this.engineStatus = null;
+                                }
+                                this.streamingContent += delta.content;
+                                this.scrollToBottom();
+                            }
+                        } catch (e) {
+                            console.error('Error parsing SSE:', e);
+                        }
+                    }
+                }
+            }
+
+            // If model ended while still thinking (tool-call turn), log elapsed and reset
+            if (this.thinkingState.isInThinking) {
+                const thinkSecs = ((Date.now() - this.thinkingState.thinkingStartTime) / 1000).toFixed(1);
+                this.setEngineStatus({ text: `Thought for ${thinkSecs}s` });
+                this.thinkingState.isInThinking = false;
+                this.thinkingState.thinkingStartTime = null;
+            }
+
+            // Log usage metrics as a single compact entry
+            if (lastUsage) {
+                const { prompt_tokens: pt, completion_tokens: ct,
+                    prompt_tokens_per_second: ptps, generation_tokens_per_second: gtps,
+                    time_to_first_token: ttft } = lastUsage;
+                const parts = [];
+                if (pt != null) parts.push(`${pt}t prompt`);
+                if (ct != null) parts.push(`${ct}t generated`);
+                if (ptps != null) parts.push(`prefill ${Math.round(ptps)} tok/s`);
+                if (gtps != null) parts.push(`gen ${Math.round(gtps)} tok/s`);
+                if (ttft != null) parts.push(`ttft ${ttft}s`);
+                if (parts.length) this.setEngineStatus({ text: parts.join(' · ') });
+            }
+
+            const toolCalls = Object.values(toolCallsMap);
+            if (toolCalls.length > 0) {
+                // Log the resolved tool set once — summarise when count is large
+                const names = toolCalls.map(t => t.function.name).filter(Boolean);
+                const uniqueNames = [...new Set(names)];
+                const label = toolCalls.length > 3
+                    ? `Calling ${uniqueNames.slice(0, 2).join(', ')} +${toolCalls.length - 2} more`
+                    : `Calling ${names.join(', ')}`;
+                if (names.length) this.setEngineStatus({ text: label, icon: 'wrench' });
+
+                // Store the assistant tool_calls turn (hidden from chat UI)
+                this.messages.push({
+                    role: 'assistant',
+                    content: this.streamingContent || null,
+                    model: this.currentModel,
+                    tool_calls: toolCalls,
+                    _ui: false,
+                });
+
+                // Record per-tool start times for elapsed tracking
+                toolCalls.forEach((tc) => { this._toolTimers[tc.function.name] = Date.now(); });
+
+                // Execute all tools in parallel
+                const results = await Promise.all(toolCalls.map(async (tc, i) => {
+                    const toolName = tc.function.name;
+                    let args = {};
+                    try { args = JSON.parse(tc.function.arguments || '{}'); } catch (e) { }
+                    try {
+                        const timeoutSignal = AbortSignal.timeout?.(this.TOOL_TIMEOUT_MS);
+                        const combinedSignal = this.abortController?.signal && timeoutSignal
+                            ? AbortSignal.any([this.abortController.signal, timeoutSignal])
+                            : (timeoutSignal || this.abortController?.signal);
+                        const execResp = await fetch('/v1/mcp/execute', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.getApiKey()}` },
+                            body: JSON.stringify({ tool_name: toolName, arguments: args }),
+                            signal: combinedSignal,
+                        });
+                        const elapsed = ((Date.now() - (this._toolTimers[toolName] || Date.now())) / 1000).toFixed(2);
+                        if (!execResp.ok) {
+                            return { content: `Error: HTTP ${execResp.status}`, error: true, toolName, elapsed };
+                        }
+                        const execData = await execResp.json();
+                        const content = typeof execData.content === 'string'
+                            ? execData.content
+                            : JSON.stringify(execData.content ?? execData);
+                        return { content, error: false, toolName, elapsed };
+                    } catch (e) {
+                        const elapsed = ((Date.now() - (this._toolTimers[toolName] || Date.now())) / 1000).toFixed(2);
+                        const isTimeout = e.name === 'TimeoutError';
+                        const msg = isTimeout ? `Error: Tool timed out after ${this.TOOL_TIMEOUT_MS / 1000}s` : `Error: ${e.message}`;
+                        return { content: msg, error: true, toolName, elapsed };
+                    }
+                }));
+
+                // Log each tool outcome to the status timeline
+                results.forEach((result) => {
+                    if (result.error) {
+                        this.setEngineStatus({ text: `${result.toolName} failed`, icon: 'error' });
+                    } else {
+                        this.setEngineStatus({ text: `${result.toolName} done in ${result.elapsed}s`, icon: 'check' });
+                    }
+                });
+
+                // Push hidden tool result messages
+                toolCalls.forEach((tc, i) => {
+                    this.messages.push({ role: 'tool', tool_call_id: tc.id, content: results[i].content, _ui: false });
+                });
+
+                this.saveCurrentChat();
+                if (this.abortController?.signal.aborted) {
+                    return;
+                }
+
                 this.streamingContent = '';
-                this.abortController = new AbortController();
-                this.autoScrollEnabled = true;
-                this.setEngineStatus({ text: 'Starting' });
-                this.startPrefillPolling();
+                this.resetStreamRenderState();
 
-                // Build messages for API - pass through tool_calls/tool_call_id for MCP loop
-                const messagesForApi = this.messages
-                    .filter(msg => ['user', 'assistant', 'tool', 'system'].includes(msg.role))
-                    .map(msg => {
-                        const m = { role: msg.role, content: msg.content ?? null };
-                        if (msg.tool_calls) m.tool_calls = msg.tool_calls;
-                        if (msg.tool_call_id) m.tool_call_id = msg.tool_call_id;
-                        return m;
-                    });
-                // Prepend system prompt if set
-                if (this.systemPrompt.trim()) {
-                    messagesForApi.unshift({
-                        role: 'system',
-                        content: this.systemPrompt.trim()
-                    });
+                // Recurse — model synthesises final answer using tool results
+                await this.streamResponse(depth + 1);
+                return;
+            }
+            // --- end MCP tool call loop ---
+
+            // Always push the completed assistant message — even if content is empty.
+            // This prevents the streaming box from disappearing with no replacement
+            // when the model emits only whitespace, only reasoning tokens, or nothing at all.
+            this.messages.push({
+                role: 'assistant',
+                content: this.streamingContent || '',
+                model: this.currentModel,
+                _perfVisible: false,
+                _thinking: this.streamingThinking || null,
+                _thinkingOpen: false,
+            });
+            this.saveCurrentChat();
+            this.scheduleEnhanceMessages();
+
+        } catch (error) {
+            console.log('[streamResponse] catch error:', error.name, error.message);
+            if (error.name === 'AbortError') {
+                console.log('[streamResponse] AbortError caught - stream stopped by user');
+                // Reset thinking state (reasoning now lives in streamingThinking, not streamingContent)
+                if (this.thinkingState.isInThinking) {
+                    this.thinkingState.isInThinking = false;
+                    this.thinkingState.thinkingStartTime = null;
                 }
-
-                try {
-                    const response = await fetch('/v1/chat/completions', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${this.getApiKey()}`
-                        },
-                        body: JSON.stringify({
-                            model: this.currentModel,
-                            messages: messagesForApi,
-                            stream: true,
-                            stream_options: { include_usage: true },
-                            ...(this.mcpTools.length > 0 && { tools: this.mcpTools })
-                        }),
-                        signal: this.abortController.signal
-                    });
-
-                    if (!response.ok) {
-                        const errorText = await response.text();
-                        throw new Error(errorText || `Error: ${response.status}`);
-                    }
-
-                    const reader = response.body.getReader();
-                    const decoder = new TextDecoder();
-                    let buffer = '';
-                    const toolCallsMap = {}; // accumulate streaming tool_call chunks by index
-                    let finishReason = null;
-                    let firstToken = false;  // flipped on first content/reasoning delta
-                    let lastUsage = null;    // filled by the stream_options usage chunk
-
-                    while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) break;
-
-                        buffer += decoder.decode(value, { stream: true });
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop() || '';
-
-                        for (const line of lines) {
-                            if (line.trim() === '' || line.trim() === 'data: [DONE]') continue;
-
-                            if (line.startsWith('data: ')) {
-                                try {
-                                    const data = JSON.parse(line.slice(6));
-                                    const choice = data.choices?.[0];
-                                    const delta = choice?.delta;
-                                    if (choice?.finish_reason) finishReason = choice.finish_reason;
-
-                                    // Usage chunk arrives as { choices: [], usage: {...} }
-                                    if (data.usage && !delta) {
-                                        lastUsage = data.usage;
-                                        continue;
-                                    }
-
-                                    // Accumulate streaming tool_call chunks
-                                    if (delta?.tool_calls) {
-                                        if (!firstToken) { firstToken = true; this.stopPrefillPolling(); }
-                                        for (const tc of delta.tool_calls) {
-                                            const i = tc.index ?? 0;
-                                            if (!toolCallsMap[i]) toolCallsMap[i] = { id: '', type: 'function', function: { name: '', arguments: '' } };
-                                            if (tc.id) toolCallsMap[i].id = tc.id;
-                                            if (tc.function?.name) toolCallsMap[i].function.name += tc.function.name;
-                                            if (tc.function?.arguments) toolCallsMap[i].function.arguments += tc.function.arguments;
-                                        }
-                                        // Clear any thinking content so it doesn't show as response text
-                                        // Also reset thinking state so the close tag isn't appended later
-                                        if (this.streamingContent) {
-                                            this.streamingContent = '';
-                                            this.thinkingState.isInThinking = false;
-                                            this.thinkingState.thinkingStartTime = null;
-                                        }
-                                        // Update live status
-                                        const names = Object.values(toolCallsMap).map(t => t.function.name).filter(Boolean);
-                                        if (names.length > 0) {
-                                            const unique = [...new Set(names)];
-                                            const liveLabel = names.length > 3
-                                                ? `Calling ${unique.slice(0, 2).join(', ')} +${names.length - 2} more`
-                                                : `Calling ${names.join(', ')}`;
-                                            this.engineStatus = { text: liveLabel, icon: 'wrench' };
-                                        }
-                                    }
-
-                                    if (delta?.reasoning_content) {
-                                        if (!firstToken) { firstToken = true; this.stopPrefillPolling(); }
-                                        if (!this.thinkingState.isInThinking) {
-                                            this.thinkingState.isInThinking = true;
-                                            this.thinkingState.thinkingStartTime = Date.now();
-                                            this.setEngineStatus({ text: 'Thinking' });
-                                        }
-                                        // Accumulate into live thinking bubble
-                                        this.streamingThinking += delta.reasoning_content;
-                                    }
-
-                                    if (delta?.content) {
-                                        if (!firstToken) {
-                                            firstToken = true;
-                                            this.stopPrefillPolling();
-                                        }
-                                        // Log thinking duration to timeline when content starts
-                                        if (this.thinkingState.isInThinking) {
-                                            const thinkSecs = ((Date.now() - this.thinkingState.thinkingStartTime) / 1000).toFixed(1);
-                                            this.setEngineStatus({ text: `Thought for ${thinkSecs}s` });
-                                            this.thinkingState.isInThinking = false;
-                                            this.thinkingState.thinkingStartTime = null;
-                                        }
-                                        // Only set finalContent on non-whitespace content
-                                        if (!this.finalContent && delta.content.trim()) {
-                                            this.finalContent = true;
-                                            this.engineStatus = null;
-                                        }
-                                        this.streamingContent += delta.content;
-                                        this.scrollToBottom();
-                                    }
-                                } catch (e) {
-                                    console.error('Error parsing SSE:', e);
-                                }
-                            }
-                        }
-                    }
-
-                    // If model ended while still thinking (tool-call turn), log elapsed and reset
-                    if (this.thinkingState.isInThinking) {
-                        const thinkSecs = ((Date.now() - this.thinkingState.thinkingStartTime) / 1000).toFixed(1);
-                        this.setEngineStatus({ text: `Thought for ${thinkSecs}s` });
-                        this.thinkingState.isInThinking = false;
-                        this.thinkingState.thinkingStartTime = null;
-                    }
-
-                    // Log usage metrics as a single compact entry
-                    if (lastUsage) {
-                        const { prompt_tokens: pt, completion_tokens: ct,
-                                prompt_tokens_per_second: ptps, generation_tokens_per_second: gtps,
-                                time_to_first_token: ttft } = lastUsage;
-                        const parts = [];
-                        if (pt != null) parts.push(`${pt}t prompt`);
-                        if (ct != null) parts.push(`${ct}t generated`);
-                        if (ptps != null) parts.push(`prefill ${Math.round(ptps)} tok/s`);
-                        if (gtps != null) parts.push(`gen ${Math.round(gtps)} tok/s`);
-                        if (ttft != null) parts.push(`ttft ${ttft}s`);
-                        if (parts.length) this.setEngineStatus({ text: parts.join(' · ') });
-                    }
-
-                    const toolCalls = Object.values(toolCallsMap);
-                    if (toolCalls.length > 0) {
-                        // Log the resolved tool set once — summarise when count is large
-                        const names = toolCalls.map(t => t.function.name).filter(Boolean);
-                        const uniqueNames = [...new Set(names)];
-                        const label = toolCalls.length > 3
-                            ? `Calling ${uniqueNames.slice(0, 2).join(', ')} +${toolCalls.length - 2} more`
-                            : `Calling ${names.join(', ')}`;
-                        if (names.length) this.setEngineStatus({ text: label, icon: 'wrench' });
-
-                        // Store the assistant tool_calls turn (hidden from chat UI)
-                        this.messages.push({
-                            role: 'assistant',
-                            content: this.streamingContent || null,
-                            model: this.currentModel,
-                            tool_calls: toolCalls,
-                            _ui: false,
-                        });
-
-                        // Record per-tool start times for elapsed tracking
-                        toolCalls.forEach((tc) => { this._toolTimers[tc.function.name] = Date.now(); });
-
-                        // Execute all tools in parallel
-                        const results = await Promise.all(toolCalls.map(async (tc, i) => {
-                            const toolName = tc.function.name;
-                            let args = {};
-                            try { args = JSON.parse(tc.function.arguments || '{}'); } catch (e) {}
-                            try {
-                                const timeoutSignal = AbortSignal.timeout?.(this.TOOL_TIMEOUT_MS);
-                                const combinedSignal = this.abortController?.signal && timeoutSignal
-                                    ? AbortSignal.any([this.abortController.signal, timeoutSignal])
-                                    : (timeoutSignal || this.abortController?.signal);
-                                const execResp = await fetch('/v1/mcp/execute', {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.getApiKey()}` },
-                                    body: JSON.stringify({ tool_name: toolName, arguments: args }),
-                                    signal: combinedSignal,
-                                });
-                                const elapsed = ((Date.now() - (this._toolTimers[toolName] || Date.now())) / 1000).toFixed(2);
-                                if (!execResp.ok) {
-                                    return { content: `Error: HTTP ${execResp.status}`, error: true, toolName, elapsed };
-                                }
-                                const execData = await execResp.json();
-                                const content = typeof execData.content === 'string'
-                                    ? execData.content
-                                    : JSON.stringify(execData.content ?? execData);
-                                return { content, error: false, toolName, elapsed };
-                            } catch (e) {
-                                const elapsed = ((Date.now() - (this._toolTimers[toolName] || Date.now())) / 1000).toFixed(2);
-                                const isTimeout = e.name === 'TimeoutError';
-                                const msg = isTimeout ? `Error: Tool timed out after ${this.TOOL_TIMEOUT_MS / 1000}s` : `Error: ${e.message}`;
-                                return { content: msg, error: true, toolName, elapsed };
-                            }
-                        }));
-
-                        // Log each tool outcome to the status timeline
-                        results.forEach((result) => {
-                            if (result.error) {
-                                this.setEngineStatus({ text: `${result.toolName} failed`, icon: 'error' });
-                            } else {
-                                this.setEngineStatus({ text: `${result.toolName} done in ${result.elapsed}s`, icon: 'check' });
-                            }
-                        });
-
-                        // Push hidden tool result messages
-                        toolCalls.forEach((tc, i) => {
-                            this.messages.push({ role: 'tool', tool_call_id: tc.id, content: results[i].content, _ui: false });
-                        });
-
-                        this.saveCurrentChat();
-                        if (this.abortController?.signal.aborted) {
-                            return;
-                        }
-
-                        this.streamingContent = '';
-                        this.resetStreamRenderState();
-
-                        // Recurse — model synthesises final answer using tool results
-                        await this.streamResponse(depth + 1);
-                        return;
-                    }
-                    // --- end MCP tool call loop ---
-
-                    // Always push the completed assistant message — even if content is empty.
-                    // This prevents the streaming box from disappearing with no replacement
-                    // when the model emits only whitespace, only reasoning tokens, or nothing at all.
+                // Stream was stopped by user — push whatever was accumulated
+                if (this.streamingContent || this.streamingThinking) {
                     this.messages.push({
                         role: 'assistant',
-                        content: this.streamingContent || '',
+                        content: this.streamingContent,
                         model: this.currentModel,
                         _perfVisible: false,
                         _thinking: this.streamingThinking || null,
@@ -1730,242 +2130,220 @@
                     });
                     this.saveCurrentChat();
                     this.scheduleEnhanceMessages();
-
-                } catch (error) {
-                    console.log('[streamResponse] catch error:', error.name, error.message);
-                    if (error.name === 'AbortError') {
-                        console.log('[streamResponse] AbortError caught - stream stopped by user');
-                        // Reset thinking state (reasoning now lives in streamingThinking, not streamingContent)
-                        if (this.thinkingState.isInThinking) {
-                            this.thinkingState.isInThinking = false;
-                            this.thinkingState.thinkingStartTime = null;
-                        }
-                        // Stream was stopped by user — push whatever was accumulated
-                        if (this.streamingContent || this.streamingThinking) {
-                            this.messages.push({
-                                role: 'assistant',
-                                content: this.streamingContent,
-                                model: this.currentModel,
-                                _perfVisible: false,
-                                _thinking: this.streamingThinking || null,
-                                _thinkingOpen: false,
-                            });
-                            this.saveCurrentChat();
-                            this.scheduleEnhanceMessages();
-                        }
-                    } else {
-                        console.error('Streaming error:', error);
-                        this.messages.push({
-                            role: 'assistant',
-                            content: `Error: ${error.message}`,
-                            model: this.currentModel,
-                            _perfVisible: false,
-                        });
-                        this.scheduleEnhanceMessages();
-                    }
-                } finally {
-                    // Attach performance timeline and thinking to the final assistant message, once per prompt
-                    if (depth === 0) {
-                        for (let i = this.messages.length - 1; i >= 0; i--) {
-                            const msg = this.messages[i];
-                            if (msg.role === 'assistant' && msg._ui !== false) {
-                                if (this.statusLog.length > 0) {
-                                    const totalTime = ((Date.now() - this._statusStart) / 1000).toFixed(2) + 's total';
-                                    msg._perfLog = [...this.statusLog];
-                                    msg._perfTotal = totalTime;
-                                }
-                                if (this.streamingThinking) {
-                                    msg._thinking = this.streamingThinking;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    this.isStreaming = false;
-                    this.streamingContent = '';
-                    this.resetStreamRenderState();
-                    this.engineStatus = null;
-                    // Don't reset finalContent here — keeps the status block hidden after completion
-                    // It gets reset at the start of the next depth=0 streamResponse call
-                    this._toolTimers = {};
-                    this.stopPrefillPolling();
-                    this.abortController = null;
-                    this.thinkingAutoScroll = true;
                 }
-            },
-
-            stopStreaming() {
-                console.log('[stopStreaming] called, abortController:', this.abortController);
-                if (this.abortController) {
-                    console.log('[stopStreaming] calling abort()');
-                    this.abortController.abort();
-                    console.log('[stopStreaming] abort() called');
-                } else {
-                    console.log('[stopStreaming] abortController is null');
+            } else {
+                console.error('Streaming error:', error);
+                this.messages.push({
+                    role: 'assistant',
+                    content: `Error: ${error.message}`,
+                    model: this.currentModel,
+                    _perfVisible: false,
+                });
+                this.scheduleEnhanceMessages();
+            }
+        } finally {
+            // Attach performance timeline and thinking to the final assistant message, once per prompt
+            if (depth === 0) {
+                for (let i = this.messages.length - 1; i >= 0; i--) {
+                    const msg = this.messages[i];
+                    if (msg.role === 'assistant' && msg._ui !== false) {
+                        if (this.statusLog.length > 0) {
+                            const totalTime = ((Date.now() - this._statusStart) / 1000).toFixed(2) + 's total';
+                            msg._perfLog = [...this.statusLog];
+                            msg._perfTotal = totalTime;
+                        }
+                        if (this.streamingThinking) {
+                            msg._thinking = this.streamingThinking;
+                        }
+                        break;
+                    }
                 }
-            },
+            }
+            this.isStreaming = false;
+            this.streamingContent = '';
+            this.resetStreamRenderState();
+            this.engineStatus = null;
+            // Don't reset finalContent here — keeps the status block hidden after completion
+            // It gets reset at the start of the next depth=0 streamResponse call
+            this._toolTimers = {};
+            this.stopPrefillPolling();
+            this.abortController = null;
+            this.thinkingAutoScroll = true;
+        }
+    },
+
+    stopStreaming() {
+        console.log('[stopStreaming] called, abortController:', this.abortController);
+        if (this.abortController) {
+            console.log('[stopStreaming] calling abort()');
+            this.abortController.abort();
+            console.log('[stopStreaming] abort() called');
+        } else {
+            console.log('[stopStreaming] abortController is null');
+        }
+    },
 
             async regenerateMessage(index) {
-                if (this.isStreaming) return;
+        if (this.isStreaming) return;
 
-                // Find the user message before this assistant message
-                const messagesToKeep = this.messages.slice(0, index);
-                this.messages = messagesToKeep;
-                this.scheduleEnhanceMessages();
+        // Find the user message before this assistant message
+        const messagesToKeep = this.messages.slice(0, index);
+        this.messages = messagesToKeep;
+        this.scheduleEnhanceMessages();
 
-                await this.streamResponse();
-            },
+        await this.streamResponse();
+    },
 
-            _copyFallback(text) {
-                const textarea = document.createElement('textarea');
-                textarea.value = text;
-                textarea.style.position = 'fixed';
-                textarea.style.opacity = '0';
-                document.body.appendChild(textarea);
-                textarea.select();
-                try {
-                    document.execCommand('copy');
-                } catch (err) {
-                    console.error('Failed to copy:', err);
-                }
-                document.body.removeChild(textarea);
-            },
+    _copyFallback(text) {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+            document.execCommand('copy');
+        } catch (err) {
+            console.error('Failed to copy:', err);
+        }
+        document.body.removeChild(textarea);
+    },
 
-            _copyText(text) {
-                return new Promise((resolve) => {
-                    if (navigator.clipboard && window.isSecureContext) {
-                        navigator.clipboard.writeText(text).then(resolve).catch(() => {
-                            this._copyFallback(text);
-                            resolve();
-                        });
-                    } else {
-                        this._copyFallback(text);
-                        resolve();
-                    }
+    _copyText(text) {
+        return new Promise((resolve) => {
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(text).then(resolve).catch(() => {
+                    this._copyFallback(text);
+                    resolve();
                 });
-            },
+            } else {
+                this._copyFallback(text);
+                resolve();
+            }
+        });
+    },
 
-            copyMessage(content) {
-                this._copyText(this.getTextContent(content));
-            },
+    copyMessage(content) {
+        this._copyText(this.getTextContent(content));
+    },
 
-            // Edit functions
-            startEdit(index) {
-                if (this.isStreaming || this.editingIndex !== null) return;
-                this.editingIndex = index;
-                this.editContent = this.getTextContent(this.messages[index].content);
-                // Preserve images from the original message
-                this.editImages = this.getImageUrls(this.messages[index].content);
-            },
+    // Edit functions
+    startEdit(index) {
+        if (this.isStreaming || this.editingIndex !== null) return;
+        this.editingIndex = index;
+        this.editContent = this.getTextContent(this.messages[index].content);
+        // Preserve images from the original message
+        this.editImages = this.getImageUrls(this.messages[index].content);
+    },
 
-            cancelEdit() {
-                this.editingIndex = null;
-                this.editContent = '';
-                this.editImages = [];
-            },
+    cancelEdit() {
+        this.editingIndex = null;
+        this.editContent = '';
+        this.editImages = [];
+    },
 
             async saveEdit(index) {
-                if (!this.editContent.trim() || this.isStreaming) return;
+        if (!this.editContent.trim() || this.isStreaming) return;
 
-                const newContent = this.editContent.trim();
+        const newContent = this.editContent.trim();
 
-                // Remove all messages from this index onwards
-                this.messages = this.messages.slice(0, index);
-                this.scheduleEnhanceMessages();
+        // Remove all messages from this index onwards
+        this.messages = this.messages.slice(0, index);
+        this.scheduleEnhanceMessages();
 
-                // Build message content, preserving images
-                let content;
-                if (this.editImages.length > 0) {
-                    content = [];
-                    for (const img of this.editImages) {
-                        content.push({ type: 'image_url', image_url: { url: img } });
-                    }
-                    content.push({ type: 'text', text: newContent });
-                } else {
-                    content = newContent;
-                }
+        // Build message content, preserving images
+        let content;
+        if (this.editImages.length > 0) {
+            content = [];
+            for (const img of this.editImages) {
+                content.push({ type: 'image_url', image_url: { url: img } });
+            }
+            content.push({ type: 'text', text: newContent });
+        } else {
+            content = newContent;
+        }
 
-                // Add edited user message
-                this.messages.push({
-                    role: 'user',
-                    content
-                });
+        // Add edited user message
+        this.messages.push({
+            role: 'user',
+            content
+        });
 
-                // Reset edit state
-                this.editingIndex = null;
-                this.editContent = '';
-                this.editImages = [];
+        // Reset edit state
+        this.editingIndex = null;
+        this.editContent = '';
+        this.editImages = [];
 
-                // Scroll and get new response
-                this.scrollToBottom();
-                await this.streamResponse();
-            },
+        // Scroll and get new response
+        this.scrollToBottom();
+        await this.streamResponse();
+    },
 
-            // Delete chat
-            deleteChat(chatId) {
-                if (!confirm(window.t('chat.confirm_delete_chat'))) return;
+    // Delete chat
+    deleteChat(chatId) {
+        if (!confirm(window.t('chat.confirm_delete_chat'))) return;
 
-                this.chatHistory = this.chatHistory.filter(c => c.id !== chatId);
-                this.saveChatHistory();
+        this.chatHistory = this.chatHistory.filter(c => c.id !== chatId);
+        this.saveChatHistory();
 
-                // If deleted current chat, start new
-                if (this.currentChatId === chatId) {
-                    this.startNewChat();
-                }
+        // If deleted current chat, start new
+        if (this.currentChatId === chatId) {
+            this.startNewChat();
+        }
 
-            },
+    },
 
-            // Clear all history
-            clearAllHistory() {
-                if (!confirm(window.t('chat.confirm_clear_all'))) return;
+    // Clear all history
+    clearAllHistory() {
+        if (!confirm(window.t('chat.confirm_clear_all'))) return;
 
-                this.chatHistory = [];
-                this.saveChatHistory();
-                this.startNewChat();
+        this.chatHistory = [];
+        this.saveChatHistory();
+        this.startNewChat();
 
-            },
+    },
 
-            // Thinking/Reasoning tag processing
-            escapeHtml(text) {
-                const div = document.createElement('div');
-                div.textContent = text;
-                return div.innerHTML;
-            },
+    // Thinking/Reasoning tag processing
+    escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    },
 
-            extractThinking(text) {
-                const thinkingRegex = /<think>([\s\S]*?)<\/think(?:\s+data-elapsed="(\d+)")?>/g;
-                const thinkingBlocks = [];
-                let cleanText = text;
-                let match;
+    extractThinking(text) {
+        const thinkingRegex = /<think>([\s\S]*?)<\/think(?:\s+data-elapsed="(\d+)")?>/g;
+        const thinkingBlocks = [];
+        let cleanText = text;
+        let match;
 
-                while ((match = thinkingRegex.exec(text)) !== null) {
-                    thinkingBlocks.push({
-                        content: match[1].trim(),
-                        elapsed: match[2] ? parseInt(match[2]) : null,
-                        placeholder: `THINKINGPLACEHOLDER${thinkingBlocks.length}`
-                    });
-                }
+        while ((match = thinkingRegex.exec(text)) !== null) {
+            thinkingBlocks.push({
+                content: match[1].trim(),
+                elapsed: match[2] ? parseInt(match[2]) : null,
+                placeholder: `THINKINGPLACEHOLDER${thinkingBlocks.length}`
+            });
+        }
 
-                // Remove thinking tags from the main text
-                cleanText = text.replace(thinkingRegex, '').trim();
+        // Remove thinking tags from the main text
+        cleanText = text.replace(thinkingRegex, '').trim();
 
-                return { thinkingBlocks, cleanText };
-            },
+        return { thinkingBlocks, cleanText };
+    },
 
-            renderThinkingBlock(content, index, messageId, elapsed) {
-                let thinkingTime;
-                if (elapsed != null) {
-                    thinkingTime = (elapsed / 1000).toFixed(1);
-                } else {
-                    // Fallback estimate for history reload (no timing data)
-                    const wordsPerSecond = 3;
-                    const wordCount = content.split(/\s+/).length;
-                    thinkingTime = Math.max(1, Math.round(wordCount / wordsPerSecond));
-                }
+    renderThinkingBlock(content, index, messageId, elapsed) {
+        let thinkingTime;
+        if (elapsed != null) {
+            thinkingTime = (elapsed / 1000).toFixed(1);
+        } else {
+            // Fallback estimate for history reload (no timing data)
+            const wordsPerSecond = 3;
+            const wordCount = content.split(/\s+/).length;
+            thinkingTime = Math.max(1, Math.round(wordCount / wordsPerSecond));
+        }
 
-                const uniqueId = `${messageId || Date.now()}_${index}`;
+        const uniqueId = `${messageId || Date.now()}_${index}`;
 
-                return `
+        return `
                     <div class="thinking-container">
                         <div class="thinking-header" onclick="document.getElementById('thinking-content-${uniqueId}').classList.toggle('collapsed'); document.getElementById('thinking-toggle-${uniqueId}').classList.toggle('collapsed');">
                             <svg class="thinking-icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -1982,68 +2360,68 @@
                         </div>
                     </div>
                 `;
-            },
+    },
 
-            renderMarkdown(text) {
-                if (!text) return '';
-                try {
-                    // Extract thinking blocks first
-                    const { thinkingBlocks, cleanText } = this.extractThinking(text);
+    renderMarkdown(text) {
+        if (!text) return '';
+        try {
+            // Extract thinking blocks first
+            const { thinkingBlocks, cleanText } = this.extractThinking(text);
 
-                    // Parse clean text with marked and sanitize
-                    let html = DOMPurify.sanitize(marked.parse(cleanText));
+            // Parse clean text with marked and sanitize
+            let html = DOMPurify.sanitize(marked.parse(cleanText));
 
-                    // Add thinking blocks at the beginning if they exist
-                    if (thinkingBlocks.length > 0) {
-                        const messageTimestamp = Date.now();
-                        const thinkingHtml = thinkingBlocks.map((block, index) =>
-                            this.renderThinkingBlock(block.content, index, messageTimestamp, block.elapsed)
-                        ).join('');
-                        html = thinkingHtml + html;
-                    }
+            // Add thinking blocks at the beginning if they exist
+            if (thinkingBlocks.length > 0) {
+                const messageTimestamp = Date.now();
+                const thinkingHtml = thinkingBlocks.map((block, index) =>
+                    this.renderThinkingBlock(block.content, index, messageTimestamp, block.elapsed)
+                ).join('');
+                html = thinkingHtml + html;
+            }
 
-                    return html;
-                } catch (e) {
-                    return text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            return html;
+        } catch (e) {
+            return text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+    },
+
+    // Render markdown for streaming content (pure HTML generator, no side effects)
+    renderStreamingMarkdown(text) {
+        if (!text) return '';
+
+        try {
+            let html = '';
+            let remaining = text;
+
+            // Process complete think blocks first
+            const completeThinkRegex = /<think>([\s\S]*?)<\/think(?:\s+data-elapsed="(\d+)")?>/g;
+            let lastIndex = 0;
+            let match;
+            let blockIndex = 0;
+
+            while ((match = completeThinkRegex.exec(text)) !== null) {
+                const beforeContent = text.substring(lastIndex, match.index);
+                if (beforeContent.trim()) {
+                    html += DOMPurify.sanitize(marked.parse(beforeContent));
                 }
-            },
+                const elapsed = match[2] ? parseInt(match[2]) : null;
+                html += this.renderThinkingBlock(match[1].trim(), blockIndex++, 'streaming', elapsed);
+                lastIndex = match.index + match[0].length;
+            }
 
-            // Render markdown for streaming content (pure HTML generator, no side effects)
-            renderStreamingMarkdown(text) {
-                if (!text) return '';
+            remaining = text.substring(lastIndex);
 
-                try {
-                    let html = '';
-                    let remaining = text;
+            const incompleteThinkIndex = remaining.indexOf('<think>');
+            if (incompleteThinkIndex !== -1) {
+                const beforeIncomplete = remaining.substring(0, incompleteThinkIndex);
+                if (beforeIncomplete.trim()) {
+                    html += DOMPurify.sanitize(marked.parse(beforeIncomplete));
+                }
 
-                    // Process complete think blocks first
-                    const completeThinkRegex = /<think>([\s\S]*?)<\/think(?:\s+data-elapsed="(\d+)")?>/g;
-                    let lastIndex = 0;
-                    let match;
-                    let blockIndex = 0;
+                const thinkingContent = remaining.substring(incompleteThinkIndex + 7);
 
-                    while ((match = completeThinkRegex.exec(text)) !== null) {
-                        const beforeContent = text.substring(lastIndex, match.index);
-                        if (beforeContent.trim()) {
-                            html += DOMPurify.sanitize(marked.parse(beforeContent));
-                        }
-                        const elapsed = match[2] ? parseInt(match[2]) : null;
-                        html += this.renderThinkingBlock(match[1].trim(), blockIndex++, 'streaming', elapsed);
-                        lastIndex = match.index + match[0].length;
-                    }
-
-                    remaining = text.substring(lastIndex);
-
-                    const incompleteThinkIndex = remaining.indexOf('<think>');
-                    if (incompleteThinkIndex !== -1) {
-                        const beforeIncomplete = remaining.substring(0, incompleteThinkIndex);
-                        if (beforeIncomplete.trim()) {
-                            html += DOMPurify.sanitize(marked.parse(beforeIncomplete));
-                        }
-
-                        const thinkingContent = remaining.substring(incompleteThinkIndex + 7);
-
-                        html += `
+                html += `
                             <div class="thinking-container" id="streaming-thinking-container">
                                 <div class="thinking-header" onclick="this.parentElement.querySelector('.thinking-content').classList.toggle('collapsed');">
                                     <svg class="thinking-icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -2057,384 +2435,369 @@
                                 </div>
                             </div>
                         `;
-                    } else if (remaining.trim()) {
-                        html += DOMPurify.sanitize(marked.parse(remaining));
-                    }
+            } else if (remaining.trim()) {
+                html += DOMPurify.sanitize(marked.parse(remaining));
+            }
 
-                    return html;
-                } catch (e) {
-                    return text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                }
-            },
+            return html;
+        } catch (e) {
+            return text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+    },
 
-            // Efficiently update streaming DOM without destroying thinking container
-            updateStreamingDOM() {
-                const container = this.$refs.streamingOutput;
-                if (!container) return;
+    // Efficiently update streaming DOM without destroying thinking container
+    updateStreamingDOM() {
+        const container = this.$refs.streamingOutput;
+        if (!container) return;
 
-                if (!this.streamingContent) {
-                    container.innerHTML = '';
-                    this.resetStreamRenderState();
-                    return;
-                }
+        if (!this.streamingContent) {
+            container.innerHTML = '';
+            this.resetStreamRenderState();
+            return;
+        }
 
-                const text = this.streamingContent;
+        const text = this.streamingContent;
 
-                if (text.includes('<think>')) {
-                    container.innerHTML = this.renderStreamingMarkdown(text);
+        if (text.includes('<think>')) {
+            container.innerHTML = this.renderStreamingMarkdown(text);
 
-                    this.$nextTick(() => {
-                        this.addCodeCopyButtons(container);
-                        this.renderMathInRoot(container);
-                        this.scrollToBottom();
-                    });
-                    return;
-                }
+            this.$nextTick(() => {
+                this.addCodeCopyButtons(container);
+                this.renderMathInRoot(container);
+                this.scrollToBottom();
+            });
+            return;
+        }
 
-                const { stableRoot, tailRoot } = this.ensureStreamingRoots(container);
-                const cutoff = this.findStableRenderCutoff(text);
-                const safeCutoff = Math.max(cutoff, this.streamRenderState.stableIndex);
+        const { stableRoot, tailRoot } = this.ensureStreamingRoots(container);
+        const cutoff = this.findStableRenderCutoff(text);
+        const safeCutoff = Math.max(cutoff, this.streamRenderState.stableIndex);
 
-                if (safeCutoff > this.streamRenderState.stableIndex) {
-                    this.streamRenderState.stableText = text.slice(0, safeCutoff);
-                    stableRoot.innerHTML = this.streamRenderState.stableText
-                        ? DOMPurify.sanitize(marked.parse(this.streamRenderState.stableText))
-                        : '';
-                    this.addCodeCopyButtons(stableRoot);
-                    this.renderMathInRoot(stableRoot);
-                    this.streamRenderState.stableIndex = safeCutoff;
-                }
+        if (safeCutoff > this.streamRenderState.stableIndex) {
+            this.streamRenderState.stableText = text.slice(0, safeCutoff);
+            stableRoot.innerHTML = this.streamRenderState.stableText
+                ? DOMPurify.sanitize(marked.parse(this.streamRenderState.stableText))
+                : '';
+            this.addCodeCopyButtons(stableRoot);
+            this.renderMathInRoot(stableRoot);
+            this.streamRenderState.stableIndex = safeCutoff;
+        }
 
-                const tailText = text.slice(this.streamRenderState.stableIndex);
-                tailRoot.innerHTML = tailText ? DOMPurify.sanitize(marked.parse(tailText)) : '';
+        const tailText = text.slice(this.streamRenderState.stableIndex);
+        tailRoot.innerHTML = tailText ? DOMPurify.sanitize(marked.parse(tailText)) : '';
 
-                this.$nextTick(() => {
-                    this.scrollToBottom();
-                });
-            },
+        this.$nextTick(() => {
+            this.scrollToBottom();
+        });
+    },
 
-            ensureStreamingRoots(container) {
-                let stableRoot = container.querySelector('[data-streaming-stable-root]');
-                let tailRoot = container.querySelector('[data-streaming-tail-root]');
-                if (!stableRoot || !tailRoot) {
-                    this.resetStreamingRoots(container);
-                    stableRoot = container.querySelector('[data-streaming-stable-root]');
-                    tailRoot = container.querySelector('[data-streaming-tail-root]');
-                }
-                return { stableRoot, tailRoot };
-            },
+    ensureStreamingRoots(container) {
+        let stableRoot = container.querySelector('[data-streaming-stable-root]');
+        let tailRoot = container.querySelector('[data-streaming-tail-root]');
+        if (!stableRoot || !tailRoot) {
+            this.resetStreamingRoots(container);
+            stableRoot = container.querySelector('[data-streaming-stable-root]');
+            tailRoot = container.querySelector('[data-streaming-tail-root]');
+        }
+        return { stableRoot, tailRoot };
+    },
 
-            resetStreamingRoots(container) {
-                container.innerHTML = `
+    resetStreamingRoots(container) {
+        container.innerHTML = `
                     <div data-streaming-stable-root="true"></div>
                     <div data-streaming-tail-root="true"></div>
                 `;
-                this.resetStreamRenderState();
-            },
+        this.resetStreamRenderState();
+    },
 
-            resetStreamRenderState() {
-                this.streamRenderState.stableIndex = 0;
-                this.streamRenderState.stableText = '';
-            },
+    resetStreamRenderState() {
+        this.streamRenderState.stableIndex = 0;
+        this.streamRenderState.stableText = '';
+    },
 
-            addCodeCopyButtons(root = null) {
-                const container = root || document.getElementById('messagesContainer');
-                if (!container) return;
+    addCodeCopyButtons(root = null) {
+        const container = root || document.getElementById('messagesContainer');
+        if (!container) return;
 
-                const codeBlocks = container.querySelectorAll('pre code');
-                codeBlocks.forEach(codeBlock => {
-                    const pre = codeBlock.parentElement;
+        const codeBlocks = container.querySelectorAll('pre code');
+        codeBlocks.forEach(codeBlock => {
+            const pre = codeBlock.parentElement;
 
-                    // Wrap in container if not already
-                    if (!pre.parentElement.classList.contains('code-block-wrapper')) {
-                        const wrapper = document.createElement('div');
-                        wrapper.className = 'code-block-wrapper';
-                        pre.parentElement.insertBefore(wrapper, pre);
-                        wrapper.appendChild(pre);
-                    }
+            // Wrap in container if not already
+            if (!pre.parentElement.classList.contains('code-block-wrapper')) {
+                const wrapper = document.createElement('div');
+                wrapper.className = 'code-block-wrapper';
+                pre.parentElement.insertBefore(wrapper, pre);
+                wrapper.appendChild(pre);
+            }
 
-                    // Check if button already exists
-                    if (pre.parentElement.querySelector('.code-copy-btn')) return;
+            // Check if button already exists
+            if (pre.parentElement.querySelector('.code-copy-btn')) return;
 
-                    // Create copy button
-                    const copyBtn = document.createElement('button');
-                    copyBtn.className = 'code-copy-btn';
-                    copyBtn.textContent = 'Copy';
-                    copyBtn.onclick = (e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        this._copyText(codeBlock.textContent).then(() => {
-                            copyBtn.textContent = 'Copied!';
-                            setTimeout(() => copyBtn.textContent = 'Copy', 2000);
-                        });
-                    };
-                    pre.parentElement.appendChild(copyBtn);
+            // Create copy button
+            const copyBtn = document.createElement('button');
+            copyBtn.className = 'code-copy-btn';
+            copyBtn.textContent = 'Copy';
+            copyBtn.onclick = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this._copyText(codeBlock.textContent).then(() => {
+                    copyBtn.textContent = 'Copied!';
+                    setTimeout(() => copyBtn.textContent = 'Copy', 2000);
                 });
-            },
+            };
+            pre.parentElement.appendChild(copyBtn);
+        });
+    },
 
-            renderMathInRoot(root, retries = 0) {
-                if (!root) return;
-                if (typeof renderMathInElement === 'undefined') {
-                    if (retries < 20) {
-                        setTimeout(() => this.renderMathInRoot(root, retries + 1), 100);
-                    }
-                    return;
+    renderMathInRoot(root, retries = 0) {
+        if (!root) return;
+        if (typeof renderMathInElement === 'undefined') {
+            if (retries < 20) {
+                setTimeout(() => this.renderMathInRoot(root, retries + 1), 100);
+            }
+            return;
+        }
+
+        try {
+            renderMathInElement(root, {
+                delimiters: [
+                    { left: '$$', right: '$$', display: true },
+                    { left: '$', right: '$', display: false },
+                    { left: '\\[', right: '\\]', display: true },
+                    { left: '\\(', right: '\\)', display: false }
+                ],
+                throwOnError: false,
+                strict: false,
+                ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
+                ignoredClasses: ['hljs']
+            });
+        } catch (e) {
+            console.error('Math rendering error:', e);
+        }
+    },
+
+    renderPendingMath(root = null) {
+        const container = root || document.getElementById('messagesContainer');
+        if (!container) return;
+
+        const targets = container.querySelectorAll('[data-math-pending="true"]');
+        targets.forEach((element) => {
+            const version = element.dataset.mathVersion || '0';
+            if (element.dataset.mathRenderedVersion === version) return;
+            this.renderMathInRoot(element);
+            element.dataset.mathRenderedVersion = version;
+        });
+    },
+
+    scheduleEnhanceMessages() {
+        this.$nextTick(() => {
+            const container = document.getElementById('messagesContainer');
+            if (!container) return;
+            this.addCodeCopyButtons(container);
+            this.renderPendingMath(container);
+        });
+    },
+
+    findStableRenderCutoff(text) {
+        if (!text) return 0;
+
+        let inFence = false;
+        let inInlineCode = false;
+        let inInlineMath = false;
+        let inDisplayMath = false;
+        let inParenMath = false;
+        let inBracketMath = false;
+        let lastSafeBoundary = 0;
+        let lastWasNewline = false;
+        let lastPromotedBoundary = 0;
+
+        for (let i = 0; i < text.length; i++) {
+            const ch = text[i];
+            const prev = i > 0 ? text[i - 1] : '';
+            const nextTwo = text.slice(i, i + 2);
+            const nextThree = text.slice(i, i + 3);
+            const escaped = prev === '\\';
+
+            if (!inInlineCode && !inInlineMath && !inDisplayMath && !inParenMath && !inBracketMath && nextThree === '```') {
+                inFence = !inFence;
+                i += 2;
+                lastWasNewline = false;
+                continue;
+            }
+
+            if (!inFence && !inInlineMath && !inDisplayMath && !inParenMath && !inBracketMath && ch === '`' && !escaped) {
+                inInlineCode = !inInlineCode;
+                lastWasNewline = false;
+                continue;
+            }
+
+            if (!inFence && !inInlineCode) {
+                if (!inInlineMath && !inParenMath && !inBracketMath && nextTwo === '$$' && !escaped) {
+                    inDisplayMath = !inDisplayMath;
+                    i += 1;
+                    lastWasNewline = false;
+                    continue;
                 }
 
-                try {
-                    renderMathInElement(root, {
-                        delimiters: [
-                            {left: '$$', right: '$$', display: true},
-                            {left: '$', right: '$', display: false},
-                            {left: '\\[', right: '\\]', display: true},
-                            {left: '\\(', right: '\\)', display: false}
-                        ],
-                        throwOnError: false,
-                        strict: false,
-                        ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
-                        ignoredClasses: ['hljs']
-                    });
-                } catch (e) {
-                    console.error('Math rendering error:', e);
-                }
-            },
-
-            renderPendingMath(root = null) {
-                const container = root || document.getElementById('messagesContainer');
-                if (!container) return;
-
-                const targets = container.querySelectorAll('[data-math-pending="true"]');
-                targets.forEach((element) => {
-                    const version = element.dataset.mathVersion || '0';
-                    if (element.dataset.mathRenderedVersion === version) return;
-                    this.renderMathInRoot(element);
-                    element.dataset.mathRenderedVersion = version;
-                });
-            },
-
-            scheduleEnhanceMessages() {
-                this.$nextTick(() => {
-                    const container = document.getElementById('messagesContainer');
-                    if (!container) return;
-                    this.addCodeCopyButtons(container);
-                    this.renderPendingMath(container);
-                });
-            },
-
-            findStableRenderCutoff(text) {
-                if (!text) return 0;
-
-                let inFence = false;
-                let inInlineCode = false;
-                let inInlineMath = false;
-                let inDisplayMath = false;
-                let inParenMath = false;
-                let inBracketMath = false;
-                let lastSafeBoundary = 0;
-                let lastWasNewline = false;
-                let lastPromotedBoundary = 0;
-
-                for (let i = 0; i < text.length; i++) {
-                    const ch = text[i];
-                    const prev = i > 0 ? text[i - 1] : '';
-                    const nextTwo = text.slice(i, i + 2);
-                    const nextThree = text.slice(i, i + 3);
-                    const escaped = prev === '\\';
-
-                    if (!inInlineCode && !inInlineMath && !inDisplayMath && !inParenMath && !inBracketMath && nextThree === '```') {
-                        inFence = !inFence;
-                        i += 2;
-                        lastWasNewline = false;
-                        continue;
-                    }
-
-                    if (!inFence && !inInlineMath && !inDisplayMath && !inParenMath && !inBracketMath && ch === '`' && !escaped) {
-                        inInlineCode = !inInlineCode;
-                        lastWasNewline = false;
-                        continue;
-                    }
-
-                    if (!inFence && !inInlineCode) {
-                        if (!inInlineMath && !inParenMath && !inBracketMath && nextTwo === '$$' && !escaped) {
-                            inDisplayMath = !inDisplayMath;
-                            i += 1;
-                            lastWasNewline = false;
-                            continue;
-                        }
-
-                        if (!inDisplayMath && !inInlineMath && !inBracketMath && nextTwo === '\\(' && !escaped) {
-                            inParenMath = true;
-                            i += 1;
-                            lastWasNewline = false;
-                            continue;
-                        }
-
-                        if (inParenMath && nextTwo === '\\)' && !escaped) {
-                            inParenMath = false;
-                            i += 1;
-                            lastWasNewline = false;
-                            continue;
-                        }
-
-                        if (!inDisplayMath && !inInlineMath && !inParenMath && nextTwo === '\\[' && !escaped) {
-                            inBracketMath = true;
-                            i += 1;
-                            lastWasNewline = false;
-                            continue;
-                        }
-
-                        if (inBracketMath && nextTwo === '\\]' && !escaped) {
-                            inBracketMath = false;
-                            i += 1;
-                            lastWasNewline = false;
-                            continue;
-                        }
-
-                        if (!inDisplayMath && !inParenMath && !inBracketMath && ch === '$' && !escaped) {
-                            inInlineMath = !inInlineMath;
-                            lastWasNewline = false;
-                            continue;
-                        }
-                    }
-
-                    const balanced = !inFence && !inInlineCode && !inInlineMath && !inDisplayMath && !inParenMath && !inBracketMath;
-
-                    if (balanced) {
-                        if (ch === '\n' && lastWasNewline) {
-                            lastSafeBoundary = i + 1;
-                            lastPromotedBoundary = lastSafeBoundary;
-                        } else if ((ch === '.' || ch === '!' || ch === '?' || ch === '\n') && (i + 1 - lastPromotedBoundary) >= 240) {
-                            lastSafeBoundary = i + 1;
-                            lastPromotedBoundary = lastSafeBoundary;
-                        }
-                    }
-
-                    lastWasNewline = ch === '\n';
+                if (!inDisplayMath && !inInlineMath && !inBracketMath && nextTwo === '\\(' && !escaped) {
+                    inParenMath = true;
+                    i += 1;
+                    lastWasNewline = false;
+                    continue;
                 }
 
-                return lastSafeBoundary;
-            },
-
-            // Check if scroll is at bottom
-            isAtBottom() {
-                const container = document.getElementById('messagesContainer');
-                if (!container) return true;
-                const threshold = 50;
-                return container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
-            },
-
-            // Scroll to bottom (respects autoScrollEnabled unless forced)
-            scrollToBottom(force = false) {
-                this.$nextTick(() => {
-                    const container = document.getElementById('messagesContainer');
-                    if (!container) return;
-
-                    // Only scroll if auto-scroll is enabled or forced
-                    if (!force && !this.autoScrollEnabled) return;
-
-                    container.scrollTo({
-                        top: container.scrollHeight,
-                        behavior: force ? 'auto' : 'smooth'
-                    });
-                });
-            },
-
-            // Force scroll to bottom and re-enable auto-scroll
-            forceScrollToBottom() {
-                this.autoScrollEnabled = true;
-                this.scrollToBottom(true);
-            },
-
-            // Scroll thinking content (respects thinkingAutoScroll, restores position if needed)
-            scrollThinkingContent() {
-                const thinkingContent = document.getElementById('streaming-thinking-content');
-                if (!thinkingContent) return;
-
-                // Setup scroll listener if not already done
-                if (!thinkingContent.hasAttribute('data-scroll-listener')) {
-                    thinkingContent.setAttribute('data-scroll-listener', 'true');
-                    this.setupThinkingScrollListener(thinkingContent);
+                if (inParenMath && nextTwo === '\\)' && !escaped) {
+                    inParenMath = false;
+                    i += 1;
+                    lastWasNewline = false;
+                    continue;
                 }
 
-                if (this.thinkingAutoScroll) {
-                    // Auto-scroll to bottom
-                    thinkingContent.scrollTop = thinkingContent.scrollHeight;
-                } else {
-                    // Restore saved scroll position
-                    thinkingContent.scrollTop = this.thinkingScrollPosition;
-                }
-            },
-
-            // Setup scroll listener for thinking content
-            setupThinkingScrollListener(element) {
-                element.addEventListener('scroll', () => {
-                    clearTimeout(this.thinkingScrollTimeout);
-
-                    // Save current scroll position
-                    this.thinkingScrollPosition = element.scrollTop;
-
-                    // Check if at bottom
-                    const threshold = 30;
-                    const isAtBottom = element.scrollHeight - element.scrollTop - element.clientHeight <= threshold;
-
-                    if (isAtBottom) {
-                        this.thinkingAutoScroll = true;
-                    } else {
-                        this.thinkingAutoScroll = false;
-                    }
-
-                    this.thinkingScrollTimeout = setTimeout(() => {
-                        // Scroll ended
-                    }, 150);
-                });
-            },
-
-            autoResize(el) {
-                el.style.height = 'auto';
-                el.style.height = Math.min(el.scrollHeight, 128) + 'px';
-            },
-
-            resetTextareaHeight(el) {
-                if (!el) return;
-                el.style.height = 'auto';
-            },
-
-            setTheme(theme) {
-                this.theme = theme;
-                localStorage.setItem('omlx-chat-theme', this.theme);
-                this.applyTheme();
-            },
-
-            applyTheme() {
-                // Clean up existing listener
-                if (this.systemThemeListener) {
-                    window.matchMedia('(prefers-color-scheme: dark)').removeEventListener('change', this.systemThemeListener);
-                    this.systemThemeListener = null;
+                if (!inDisplayMath && !inInlineMath && !inParenMath && nextTwo === '\\[' && !escaped) {
+                    inBracketMath = true;
+                    i += 1;
+                    lastWasNewline = false;
+                    continue;
                 }
 
-                if (this.theme === 'auto') {
-                    // Detect system theme
-                    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-                    this.activeTheme = prefersDark ? 'dark' : 'light';
-
-                    // Add listener for system theme changes
-                    this.systemThemeListener = (e) => {
-                        this.activeTheme = e.matches ? 'dark' : 'light';
-                        document.documentElement.setAttribute('data-theme', this.activeTheme);
-
-                        const lightTheme = document.getElementById('hljs-light-theme');
-                        const darkTheme = document.getElementById('hljs-dark-theme');
-                        if (lightTheme && darkTheme) {
-                            lightTheme.disabled = this.activeTheme === 'dark';
-                            darkTheme.disabled = this.activeTheme === 'light';
-                        }
-                    };
-                    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', this.systemThemeListener);
-                } else {
-                    // Use explicit theme
-                    this.activeTheme = this.theme;
+                if (inBracketMath && nextTwo === '\\]' && !escaped) {
+                    inBracketMath = false;
+                    i += 1;
+                    lastWasNewline = false;
+                    continue;
                 }
 
+                if (!inDisplayMath && !inParenMath && !inBracketMath && ch === '$' && !escaped) {
+                    inInlineMath = !inInlineMath;
+                    lastWasNewline = false;
+                    continue;
+                }
+            }
+
+            const balanced = !inFence && !inInlineCode && !inInlineMath && !inDisplayMath && !inParenMath && !inBracketMath;
+
+            if (balanced) {
+                if (ch === '\n' && lastWasNewline) {
+                    lastSafeBoundary = i + 1;
+                    lastPromotedBoundary = lastSafeBoundary;
+                } else if ((ch === '.' || ch === '!' || ch === '?' || ch === '\n') && (i + 1 - lastPromotedBoundary) >= 240) {
+                    lastSafeBoundary = i + 1;
+                    lastPromotedBoundary = lastSafeBoundary;
+                }
+            }
+
+            lastWasNewline = ch === '\n';
+        }
+
+        return lastSafeBoundary;
+    },
+
+    // Check if scroll is at bottom
+    isAtBottom() {
+        const container = document.getElementById('messagesContainer');
+        if (!container) return true;
+        const threshold = 50;
+        return container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
+    },
+
+    // Scroll to bottom (respects autoScrollEnabled unless forced)
+    scrollToBottom(force = false) {
+        this.$nextTick(() => {
+            const container = document.getElementById('messagesContainer');
+            if (!container) return;
+
+            // Only scroll if auto-scroll is enabled or forced
+            if (!force && !this.autoScrollEnabled) return;
+
+            container.scrollTo({
+                top: container.scrollHeight,
+                behavior: force ? 'auto' : 'smooth'
+            });
+        });
+    },
+
+    // Force scroll to bottom and re-enable auto-scroll
+    forceScrollToBottom() {
+        this.autoScrollEnabled = true;
+        this.scrollToBottom(true);
+    },
+
+    // Scroll thinking content (respects thinkingAutoScroll, restores position if needed)
+    scrollThinkingContent() {
+        const thinkingContent = document.getElementById('streaming-thinking-content');
+        if (!thinkingContent) return;
+
+        // Setup scroll listener if not already done
+        if (!thinkingContent.hasAttribute('data-scroll-listener')) {
+            thinkingContent.setAttribute('data-scroll-listener', 'true');
+            this.setupThinkingScrollListener(thinkingContent);
+        }
+
+        if (this.thinkingAutoScroll) {
+            // Auto-scroll to bottom
+            thinkingContent.scrollTop = thinkingContent.scrollHeight;
+        } else {
+            // Restore saved scroll position
+            thinkingContent.scrollTop = this.thinkingScrollPosition;
+        }
+    },
+
+    // Setup scroll listener for thinking content
+    setupThinkingScrollListener(element) {
+        element.addEventListener('scroll', () => {
+            clearTimeout(this.thinkingScrollTimeout);
+
+            // Save current scroll position
+            this.thinkingScrollPosition = element.scrollTop;
+
+            // Check if at bottom
+            const threshold = 30;
+            const isAtBottom = element.scrollHeight - element.scrollTop - element.clientHeight <= threshold;
+
+            if (isAtBottom) {
+                this.thinkingAutoScroll = true;
+            } else {
+                this.thinkingAutoScroll = false;
+            }
+
+            this.thinkingScrollTimeout = setTimeout(() => {
+                // Scroll ended
+            }, 150);
+        });
+    },
+
+    autoResize(el) {
+        el.style.height = 'auto';
+        el.style.height = Math.min(el.scrollHeight, 128) + 'px';
+    },
+
+    resetTextareaHeight(el) {
+        if (!el) return;
+        el.style.height = 'auto';
+    },
+
+    setTheme(theme) {
+        this.theme = theme;
+        localStorage.setItem('omlx-chat-theme', this.theme);
+        this.applyTheme();
+    },
+
+    applyTheme() {
+        // Clean up existing listener
+        if (this.systemThemeListener) {
+            window.matchMedia('(prefers-color-scheme: dark)').removeEventListener('change', this.systemThemeListener);
+            this.systemThemeListener = null;
+        }
+
+        if (this.theme === 'auto') {
+            // Detect system theme
+            const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+            this.activeTheme = prefersDark ? 'dark' : 'light';
+
+            // Add listener for system theme changes
+            this.systemThemeListener = (e) => {
+                this.activeTheme = e.matches ? 'dark' : 'light';
                 document.documentElement.setAttribute('data-theme', this.activeTheme);
 
                 const lightTheme = document.getElementById('hljs-light-theme');
@@ -2443,7 +2806,22 @@
                     lightTheme.disabled = this.activeTheme === 'dark';
                     darkTheme.disabled = this.activeTheme === 'light';
                 }
-            }
+            };
+            window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', this.systemThemeListener);
+        } else {
+            // Use explicit theme
+            this.activeTheme = this.theme;
+        }
+
+        document.documentElement.setAttribute('data-theme', this.activeTheme);
+
+        const lightTheme = document.getElementById('hljs-light-theme');
+        const darkTheme = document.getElementById('hljs-dark-theme');
+        if (lightTheme && darkTheme) {
+            lightTheme.disabled = this.activeTheme === 'dark';
+            darkTheme.disabled = this.activeTheme === 'light';
+        }
+    }
         };
     }
 </script>
