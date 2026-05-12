@@ -2723,6 +2723,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "opencode_model": global_settings.integrations.opencode_model,
             "openclaw_model": global_settings.integrations.openclaw_model,
             "pi_model": global_settings.integrations.pi_model,
+            "copilot_model": global_settings.integrations.copilot_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
         },
         "system": {
