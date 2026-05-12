@@ -14,12 +14,38 @@ Note: mlx_lm.load() is mocked to avoid loading real models.
 """
 
 from abc import ABC
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch, AsyncMock
 
 import pytest
 
 from omlx.engine.base import BaseEngine, BaseNonStreamingEngine, GenerationOutput
+
+
+class FakeStreamingCore:
+    """Minimal async engine core for stream cleanup tests."""
+
+    def __init__(self):
+        self.aborted_request_id = None
+
+    async def add_request(self, **kwargs):
+        return "request-1"
+
+    async def stream_outputs(self, request_id):
+        yield SimpleNamespace(
+            output_text="partial",
+            new_text="partial",
+            prompt_tokens=1,
+            completion_tokens=1,
+            finished=False,
+            finish_reason=None,
+            tool_calls=None,
+            cached_tokens=0,
+        )
+
+    async def abort_request(self, request_id):
+        self.aborted_request_id = request_id
 
 
 class TestGenerationOutput:
@@ -267,6 +293,29 @@ class TestBatchedEngineInitialization:
         engine = BatchedEngine(model_name="test-model")
 
         assert engine.model_type is None
+
+
+class TestBatchedEngineStreamingCleanup:
+    """Tests for streaming generator cleanup paths."""
+
+    @pytest.mark.asyncio
+    async def test_stream_abort_uses_captured_engine_if_engine_cleared(self):
+        """Generator finalization aborts on the original engine reference."""
+        from omlx.engine.batched import BatchedEngine
+
+        fake_engine = FakeStreamingCore()
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = fake_engine
+
+        stream = engine.stream_generate("hello")
+        first = await stream.__anext__()
+        assert first.text == "partial"
+
+        engine._engine = None
+        await stream.aclose()
+
+        assert fake_engine.aborted_request_id == "request-1"
 
 
 class TestBatchedEngineApplyChatTemplate:

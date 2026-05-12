@@ -11,6 +11,7 @@ Tests cover:
 """
 
 import copy
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -87,6 +88,56 @@ def _make_loaded_engine(model_type=None, tokenizer=None, **overrides):
     engine._engine = MagicMock()
 
     return engine
+
+
+class FakeStreamingCore:
+    """Minimal async engine core for VLM stream cleanup tests."""
+
+    def __init__(self):
+        self.aborted_request_id = None
+
+    async def add_request(self, **kwargs):
+        return "vlm-request-1"
+
+    async def stream_outputs(self, request_id):
+        yield SimpleNamespace(
+            output_text="partial",
+            new_text="partial",
+            prompt_tokens=1,
+            completion_tokens=1,
+            finished=False,
+            finish_reason=None,
+            tool_calls=None,
+            cached_tokens=0,
+        )
+
+    async def abort_request(self, request_id):
+        self.aborted_request_id = request_id
+
+
+# ---------------------------------------------------------------------------
+# Test stream cleanup
+# ---------------------------------------------------------------------------
+
+class TestVLMStreamingCleanup:
+    """Tests for streaming generator cleanup paths."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+    async def test_stream_abort_uses_captured_engine_if_engine_cleared(self):
+        """Generator finalization aborts on the original engine reference."""
+        fake_engine = FakeStreamingCore()
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = fake_engine
+
+        stream = engine.stream_generate("hello")
+        first = await stream.__anext__()
+        assert first.text == "partial"
+
+        engine._engine = None
+        await stream.aclose()
+
+        assert fake_engine.aborted_request_id == "vlm-request-1"
 
 
 # ---------------------------------------------------------------------------

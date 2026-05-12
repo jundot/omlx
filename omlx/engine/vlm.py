@@ -1559,7 +1559,8 @@ class VLMBatchedEngine(BaseEngine):
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
-        request_id = await self._engine.add_request(
+        engine = self._engine
+        request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             vlm_inputs_embeds=vlm_inputs_embeds,
@@ -1572,7 +1573,7 @@ class VLMBatchedEngine(BaseEngine):
 
         finished_normally = False
         try:
-            async for output in self._engine.stream_outputs(request_id):
+            async for output in engine.stream_outputs(request_id):
                 text = clean_special_tokens(output.output_text)
 
                 if output.finished:
@@ -1593,7 +1594,7 @@ class VLMBatchedEngine(BaseEngine):
         finally:
             if not finished_normally:
                 logger.info(f"[vlm_stream_generate] Aborting request {request_id}")
-                await self._engine.abort_request(request_id)
+                await engine.abort_request(request_id)
 
     async def chat(
         self,
