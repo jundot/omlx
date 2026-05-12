@@ -3638,10 +3638,7 @@ async def create_anthropic_message(
                         pass
 
         response = convert_internal_to_anthropic_response(
-            # Bug fix: `if cleaned_text` treats empty-string (fully-consumed tool
-            # markup) as falsy and leaks the uncleaned `regular_content`. Use
-            # `is not None` so a deliberate empty cleanup stays empty.
-            text=cleaned_text.strip() if cleaned_text is not None else regular_content,
+            text=cleaned_text.strip() if cleaned_text else "",
             model=request.model,
             prompt_tokens=scale_anthropic_tokens(output.prompt_tokens, request.model),
             completion_tokens=scale_anthropic_tokens(output.completion_tokens, request.model),
