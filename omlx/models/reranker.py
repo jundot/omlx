@@ -260,13 +260,25 @@ class MLXRerankerModel:
         """Load a CausalLM-based reranker model using mlx-lm."""
         from mlx_lm import load as mlx_lm_load
 
+        from ..utils.model_loading import maybe_load_custom_quantization
+
         model_path = str(self.model_name)
-        loaded = mlx_lm_load(
+        tokenizer_config = {"trust_remote_code": self.trust_remote_code}
+        custom_loaded = maybe_load_custom_quantization(
             model_path,
-            tokenizer_config={"trust_remote_code": self.trust_remote_code},
+            tokenizer_config=tokenizer_config,
+            trust_remote_code=self.trust_remote_code,
+            is_vlm=False,
         )
-        model = loaded[0]
-        tokenizer_wrapper = loaded[1]
+        if custom_loaded is not None:
+            model, tokenizer_wrapper = custom_loaded
+        else:
+            loaded = mlx_lm_load(
+                model_path,
+                tokenizer_config=tokenizer_config,
+            )
+            model = loaded[0]
+            tokenizer_wrapper = loaded[1]
 
         # mlx-lm returns a TokenizerWrapper; unwrap to get the underlying
         # transformers tokenizer which supports __call__ for batch encoding.
@@ -324,13 +336,25 @@ class MLXRerankerModel:
         """
         from mlx_lm import load as mlx_lm_load
 
+        from ..utils.model_loading import maybe_load_custom_quantization
+
         model_path = str(self.model_name)
-        loaded = mlx_lm_load(
+        tokenizer_config = {"trust_remote_code": self.trust_remote_code}
+        custom_loaded = maybe_load_custom_quantization(
             model_path,
-            tokenizer_config={"trust_remote_code": self.trust_remote_code},
+            tokenizer_config=tokenizer_config,
+            trust_remote_code=self.trust_remote_code,
+            is_vlm=False,
         )
-        model = loaded[0]
-        tokenizer_wrapper = loaded[1]
+        if custom_loaded is not None:
+            model, tokenizer_wrapper = custom_loaded
+        else:
+            loaded = mlx_lm_load(
+                model_path,
+                tokenizer_config=tokenizer_config,
+            )
+            model = loaded[0]
+            tokenizer_wrapper = loaded[1]
 
         # mlx-lm returns a TokenizerWrapper; unwrap to get the underlying
         # transformers tokenizer which supports __call__ for batch encoding.

@@ -707,7 +707,16 @@ class VLMBatchedEngine(BaseEngine):
                 try:
                     from mlx_lm import load as mlx_lm_load
 
+                    from ..utils.model_loading import maybe_load_custom_quantization
+
                     def _load_draft():
+                        custom_loaded = maybe_load_custom_quantization(
+                            specprefill_draft,
+                            is_vlm=False,
+                        )
+                        if custom_loaded is not None:
+                            draft_model, _ = custom_loaded
+                            return draft_model
                         draft_model, _ = mlx_lm_load(specprefill_draft)
                         return draft_model
                     draft_model = await loop.run_in_executor(get_mlx_executor(), _load_draft)

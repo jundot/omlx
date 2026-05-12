@@ -78,7 +78,10 @@ class MLXLanguageModel:
         try:
             from mlx_lm import load
 
-            from ..utils.model_loading import maybe_apply_pre_load_patches
+            from ..utils.model_loading import (
+                maybe_apply_pre_load_patches,
+                maybe_load_custom_quantization,
+            )
 
             logger.info(f"Loading model: {self.model_name}")
 
@@ -92,10 +95,21 @@ class MLXLanguageModel:
             # before mlx_lm.load runs (e.g. DeepSeek V4 PR 1192).
             maybe_apply_pre_load_patches(self.model_name)
 
-            self.model, self.tokenizer = load(
+            custom_loaded = maybe_load_custom_quantization(
                 self.model_name,
                 tokenizer_config=tokenizer_config,
+                trust_remote_code=self.trust_remote_code,
+                is_vlm=False,
             )
+            if custom_loaded is not None:
+                model, processor = custom_loaded
+                self.model = model
+                self.tokenizer = getattr(processor, "tokenizer", processor)
+            else:
+                self.model, self.tokenizer = load(
+                    self.model_name,
+                    tokenizer_config=tokenizer_config,
+                )
 
             self._loaded = True
             logger.info(f"Model loaded successfully: {self.model_name}")
