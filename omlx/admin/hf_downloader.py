@@ -610,6 +610,7 @@ class HFDownloader:
                 # Derive model name from repo_id (last part)
                 model_name = task.repo_id.split("/")[-1]
                 target_dir = self._model_dir / model_name
+                self._prepare_download_target(target_dir)
 
                 api, endpoint = _get_hf_api()
 
@@ -836,6 +837,20 @@ class HFDownloader:
         except OSError:
             pass
         return total
+
+    @staticmethod
+    def _prepare_download_target(target_dir: Path) -> None:
+        """Prepare a local_dir path for Hugging Face downloads."""
+        if target_dir.is_symlink() and not target_dir.exists():
+            target_dir.unlink()
+            logger.info(f"Removed stale download symlink: {target_dir}")
+
+        if target_dir.exists() and not target_dir.is_dir():
+            raise FileExistsError(
+                f"Download target exists and is not a directory: {target_dir}"
+            )
+
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
 
     def _cleanup_partial(self, task: DownloadTask) -> None:
         """Remove partially downloaded model directory."""
