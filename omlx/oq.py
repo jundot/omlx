@@ -1566,6 +1566,20 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
             except Exception as patch_err:
                 logger.debug(f"mlx-vlm MTP patch not applied: {patch_err}")
 
+            # Remap language_model.model.visual.* -> vision_tower.* for
+            # Qwen3.6-35B-A3B's nested ViT layout. Wraps whichever
+            # Model.sanitize is current; no-op when already installed or
+            # when upstream mlx-vlm grows the rule itself.
+            try:
+                from omlx.patches.qwen3_6_nested_visual import (
+                    apply_qwen3_6_nested_visual_patch,
+                )
+                apply_qwen3_6_nested_visual_patch()
+            except Exception as patch_err:
+                logger.debug(
+                    f"qwen3_6 nested-visual patch not applied: {patch_err}"
+                )
+
             model_module, _ = get_model_and_args(config)
             model_config_cls = model_module.ModelConfig
             model_config = model_config_cls.from_dict(config)

@@ -114,6 +114,26 @@ def maybe_apply_pre_load_patches(
             _has_mtp_heads(config),
         )
 
+    # qwen3_5_moe covers Qwen3.6 too (HF config sets model_type=qwen3_5_moe).
+    # The nested-visual sanitize wrap remaps language_model.model.visual.*
+    # to vision_tower.* for Qwen3.6's nested ViT layout. Wraps whichever
+    # Model.sanitize is current (stock mlx-vlm or mlx_vlm_mtp runtime), so
+    # the call has to land after apply_mlx_vlm_mtp_runtime_patch above.
+    # No-op when the wrap's already installed or mlx-vlm isn't importable.
+    if model_type and model_type.startswith("qwen3_5_moe"):
+        try:
+            from ..patches.qwen3_6_nested_visual import (
+                apply_qwen3_6_nested_visual_patch,
+            )
+        except Exception as e:
+            logger.debug("qwen3_6 nested-visual patch import failed: %s", e)
+        else:
+            if apply_qwen3_6_nested_visual_patch():
+                logger.info(
+                    "qwen3_6 nested-visual sanitize wrap applied for %s",
+                    model_name,
+                )
+
 
 def _has_mtp_heads(config: dict) -> bool:
     """True iff the model config declares any MTP head layers."""
