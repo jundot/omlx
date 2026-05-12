@@ -428,6 +428,11 @@
                                                         </button>
                                                     </th>
                                                     <th class="px-4 py-3 text-left">
+                                                        <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">
+                                                            {{ t('models.table.quantization') }}
+                                                        </span>
+                                                    </th>
+                                                    <th class="px-4 py-3 text-left">
                                                         <button @click="toggleTableSort('size')" class="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
                                                             {{ t('models.table.size') }}
                                                             <span x-show="hfTableSort === 'size'" class="text-neutral-700">
@@ -460,7 +465,7 @@
                                             <tbody class="divide-y divide-neutral-100">
                                                 <template x-if="getPagedModels(hfRecommendedTab).length === 0">
                                                     <tr>
-                                                        <td colspan="5" class="px-4 py-8 text-center">
+                                                        <td colspan="6" class="px-4 py-8 text-center">
                                                             <p class="text-sm text-neutral-500" x-text="hfRecommendedTab === 'trending' ? window.t('models.browse.no_trending') : window.t('models.browse.no_popular')"></p>
                                                         </td>
                                                     </tr>
@@ -470,6 +475,11 @@
                                                         <td class="px-4 py-3">
                                                             <button @click="openModelDetail(model.repo_id)"
                                                                     class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer max-w-[200px] lg:max-w-[300px]" x-text="model.name"></button>
+                                                        </td>
+                                                        <td class="px-4 py-3">
+                                                            <span x-show="model.quantization"
+                                                                  class="px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider rounded-full bg-blue-100 text-blue-700"
+                                                                  x-text="model.quantization"></span>
                                                         </td>
                                                         <td class="px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="model.size_formatted"></td>
                                                         <td class="px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="formatDownloads(model.downloads)"></td>
@@ -537,6 +547,11 @@
                                                             </button>
                                                         </th>
                                                         <th class="px-4 py-3 text-left">
+                                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">
+                                                                {{ t('models.table.quantization') }}
+                                                            </span>
+                                                        </th>
+                                                        <th class="px-4 py-3 text-left">
                                                             <button @click="toggleTableSort('size')" class="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
                                                                 {{ t('models.table.size') }}
                                                                 <span x-show="hfTableSort === 'size'" class="text-neutral-700">
@@ -572,6 +587,11 @@
                                                             <td class="px-4 py-3">
                                                                 <button @click="openModelDetail(model.repo_id)"
                                                                         class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer font-mono text-xs max-w-[200px] lg:max-w-[300px]" x-text="model.repo_id"></button>
+                                                            </td>
+                                                            <td class="px-4 py-3">
+                                                                <span x-show="model.quantization"
+                                                                      class="px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider rounded-full bg-blue-100 text-blue-700"
+                                                                      x-text="model.quantization"></span>
                                                             </td>
                                                             <td class="px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="model.size > 0 ? model.size_formatted : '-'"></td>
                                                             <td class="px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="formatDownloads(model.downloads)"></td>
