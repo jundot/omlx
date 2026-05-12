@@ -129,7 +129,10 @@ class ModelSettingsRequest(BaseModel):
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: Optional[bool] = None
     dflash_draft_model: Optional[str] = None
-    dflash_draft_quant_bits: Optional[int] = None
+    dflash_draft_quant_enabled: Optional[bool] = None
+    dflash_draft_quant_weight_bits: Optional[int] = None
+    dflash_draft_quant_activation_bits: Optional[int] = None
+    dflash_draft_quant_group_size: Optional[int] = None
     dflash_max_ctx: Optional[int] = None
     dflash_in_memory_cache: Optional[bool] = None
     dflash_in_memory_cache_max_entries: Optional[int] = None
@@ -1609,7 +1612,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "specprefill_threshold": settings.specprefill_threshold,
                 "dflash_enabled": settings.dflash_enabled,
                 "dflash_draft_model": settings.dflash_draft_model,
-                "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
+                "dflash_draft_quant_enabled": settings.dflash_draft_quant_enabled,
+                "dflash_draft_quant_weight_bits": settings.dflash_draft_quant_weight_bits,
+                "dflash_draft_quant_activation_bits": settings.dflash_draft_quant_activation_bits,
+                "dflash_draft_quant_group_size": settings.dflash_draft_quant_group_size,
                 "dflash_max_ctx": settings.dflash_max_ctx,
                 "dflash_in_memory_cache": settings.dflash_in_memory_cache,
                 "dflash_in_memory_cache_max_entries": settings.dflash_in_memory_cache_max_entries,
@@ -1883,8 +1889,14 @@ async def update_model_settings(
         current_settings.dflash_enabled = new_dflash_enabled
     if "dflash_draft_model" in sent:
         current_settings.dflash_draft_model = request.dflash_draft_model or None
-    if "dflash_draft_quant_bits" in sent:
-        current_settings.dflash_draft_quant_bits = request.dflash_draft_quant_bits or None
+    if "dflash_draft_quant_enabled" in sent:
+        current_settings.dflash_draft_quant_enabled = bool(request.dflash_draft_quant_enabled) if request.dflash_draft_quant_enabled is not None else None
+    if "dflash_draft_quant_weight_bits" in sent:
+        current_settings.dflash_draft_quant_weight_bits = int(request.dflash_draft_quant_weight_bits) if request.dflash_draft_quant_weight_bits is not None else None
+    if "dflash_draft_quant_activation_bits" in sent:
+        current_settings.dflash_draft_quant_activation_bits = int(request.dflash_draft_quant_activation_bits) if request.dflash_draft_quant_activation_bits is not None else None
+    if "dflash_draft_quant_group_size" in sent:
+        current_settings.dflash_draft_quant_group_size = int(request.dflash_draft_quant_group_size) if request.dflash_draft_quant_group_size is not None else None
     if "dflash_max_ctx" in sent:
         # 0/None means "unlimited" — the engine treats None as no fallback threshold
         value = request.dflash_max_ctx
@@ -2115,7 +2127,10 @@ async def update_model_settings(
             or "index_cache_freq" in sent
             or "dflash_enabled" in sent
             or "dflash_draft_model" in sent
-            or "dflash_draft_quant_bits" in sent
+            or "dflash_draft_quant_enabled" in sent
+            or "dflash_draft_quant_weight_bits" in sent
+            or "dflash_draft_quant_activation_bits" in sent
+            or "dflash_draft_quant_group_size" in sent
             or "dflash_max_ctx" in sent
             or "dflash_in_memory_cache" in sent
             or "dflash_in_memory_cache_max_entries" in sent

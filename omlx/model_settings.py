@@ -62,7 +62,10 @@ class ModelSettings:
         specprefill_threshold: Min tokens to trigger SpecPrefill.
         dflash_enabled: Enable DFlash speculative decoding.
         dflash_draft_model: Path/repo for DFlash draft checkpoint.
-        dflash_draft_quant_bits: Draft model quantization bits.
+        dflash_draft_quant_enabled: Enable draft model quantization.
+        dflash_draft_quant_weight_bits: Quantization weight bits (2, 4, 8).
+        dflash_draft_quant_activation_bits: Quantization activation bits (16, 32).
+        dflash_draft_quant_group_size: Quantization group size (32, 64, 128).
         dflash_max_ctx: Token threshold to fall back to BatchedEngine (None = unlimited).
         dflash_in_memory_cache: Enable DFlash L1 (RAM) prefix cache.
         dflash_in_memory_cache_max_entries: L1 cache max entries (default 4, matches dflash balanced profile).
@@ -122,7 +125,10 @@ class ModelSettings:
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool = False
     dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
-    dflash_draft_quant_bits: Optional[int] = None  # Draft model quantization (None=bf16, 4)
+    dflash_draft_quant_enabled: Optional[bool] = None
+    dflash_draft_quant_weight_bits: Optional[int] = None  # 2, 4, 8
+    dflash_draft_quant_activation_bits: Optional[int] = None  # 16, 32
+    dflash_draft_quant_group_size: Optional[int] = None  # 32, 64, 128
     dflash_max_ctx: Optional[int] = None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
     # DFlash prefix cache (private to dflash; separate from omlx tiered cache because
     # snapshots include draft model GDN state and target hidden chunks omlx never tracks)

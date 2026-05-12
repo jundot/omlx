@@ -1552,7 +1552,10 @@
                     specprefill_threshold: settings.specprefill_threshold || null,
                     dflash_enabled: settings.dflash_enabled || false,
                     dflash_draft_model: settings.dflash_draft_model || '',
-                    dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
+                    dflash_draft_quant_enabled: settings.dflash_draft_quant_enabled || false,
+                    dflash_draft_quant_weight_bits: settings.dflash_draft_quant_weight_bits || 4,
+                    dflash_draft_quant_activation_bits: settings.dflash_draft_quant_activation_bits || 16,
+                    dflash_draft_quant_group_size: settings.dflash_draft_quant_group_size || 64,
                     dflash_max_ctx: settings.dflash_max_ctx ?? null,
                     dflash_in_memory_cache: settings.dflash_in_memory_cache !== false,
                     dflash_in_memory_cache_max_entries: settings.dflash_in_memory_cache_max_entries || 4,
@@ -1647,8 +1650,15 @@
                                     : null,
                                 dflash_enabled: this.modelSettings.dflash_enabled,
                                 dflash_draft_model: this.modelSettings.dflash_draft_model || null,
-                                dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_bits)
+                                dflash_draft_quant_enabled: this.modelSettings.dflash_enabled && !!this.modelSettings.dflash_draft_quant_enabled,
+                                dflash_draft_quant_weight_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
+                                    ? parseInt(this.modelSettings.dflash_draft_quant_weight_bits)
+                                    : null,
+                                dflash_draft_quant_activation_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
+                                    ? parseInt(this.modelSettings.dflash_draft_quant_activation_bits)
+                                    : null,
+                                dflash_draft_quant_group_size: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
+                                    ? parseInt(this.modelSettings.dflash_draft_quant_group_size)
                                     : null,
                                 dflash_max_ctx: this.modelSettings.dflash_enabled && this.modelSettings.dflash_max_ctx
                                     ? parseInt(this.modelSettings.dflash_max_ctx)
@@ -1743,7 +1753,10 @@
                         this.modelSettings.specprefill_threshold = null;
                         this.modelSettings.dflash_enabled = false;
                         this.modelSettings.dflash_draft_model = null;
-                        this.modelSettings.dflash_draft_quant_bits = null;
+                        this.modelSettings.dflash_draft_quant_enabled = false;
+                        this.modelSettings.dflash_draft_quant_weight_bits = null;
+                        this.modelSettings.dflash_draft_quant_activation_bits = null;
+                        this.modelSettings.dflash_draft_quant_group_size = null;
                         this.modelSettings.dflash_max_ctx = null;
                         this.modelSettings.dflash_in_memory_cache = true;
                         this.modelSettings.dflash_in_memory_cache_max_entries = 4;
