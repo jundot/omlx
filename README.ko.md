@@ -10,10 +10,13 @@
 <p align="center"><b>Mac에 최적화된 LLM 추론 서버</b><br>Continuous Batching과 다단계 KV 캐시로 최적화된 추론 서버를, 메뉴바에서 편리하게</p>
 
 <p align="center">
+<a href="https://www.buymeacoffee.com/jundot"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
-  <a href="https://buymeacoffee.com/jundot"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=black" alt="Buy Me a Coffee"></a>
 </p>
 
 <p align="center">
@@ -84,7 +87,7 @@ Python 3.10+와 Apple Silicon (M1/M2/M3/M4)이 필요합니다.
 
 ### macOS 앱
 
-Applications 폴더에서 oMLX를 실행하세요. 환영 화면에서 세 단계만 따라하면 됩니다 — 모델 디렉토리 설정, 서버 시작, 첫 모델 다운로드. 끝입니다.
+Applications 폴더에서 oMLX를 실행하세요. 환영 화면에서 세 단계만 따라하면 됩니다 — 모델 디렉토리 설정, 서버 시작, 첫 모델 다운로드. 끝입니다. OpenClaw, OpenCode, Codex, Copilot에 연결하려면 [통합](#통합)을 참조하세요.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX 환영 화면" width="360">
@@ -122,7 +125,7 @@ Apple Silicon에서 텍스트 LLM, 비전-언어 모델(VLM), OCR 모델, 임베
 
 ### 관리자 대시보드
 
-`/admin`에서 실시간 모니터링, 모델 관리, 채팅, 벤치마크, 모델별 설정을 위한 웹 UI를 제공합니다. 한국어, 영어, 일본어, 중국어를 지원합니다. 모든 CDN 의존성이 번들되어 완전한 오프라인 운영이 가능합니다.
+`/admin`에서 실시간 모니터링, 모델 관리, 채팅, 벤치마크, 모델별 설정을 위한 웹 UI를 제공합니다. 한국어, 영어, 일본어, 중국어, 러시아어를 지원합니다. 모든 CDN 의존성이 번들되어 완전한 오프라인 운영이 가능합니다.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX 관리자 대시보드" width="720">
@@ -187,6 +190,14 @@ Claude Code에서 작은 컨텍스트 모델을 실행하기 위한 컨텍스트
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX 모델 다운로드" width="720">
+</p>
+
+### 통합
+
+관리자 대시보드에서 OpenClaw, OpenCode, Codex, Copilot, Pi를 원클릭으로 설정합니다. 설정 파일을 수동으로 편집할 필요가 없습니다.
+
+<p align="center">
+  <img src="docs/images/omlx_integrations.png" alt="oMLX 통합" width="720">
 </p>
 
 ### 성능 벤치마크
@@ -360,3 +371,4 @@ python build.py --dmg-only
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX는 vllm-mlx v0.1.0에서 시작하여 멀티 모델 서빙, 계층형 KV 캐시, 페이지드 캐시를 완전 지원하는 VLM, 관리자 패널, macOS 메뉴 바 앱으로 크게 발전했습니다
 - [venvstacks](https://venvstacks.lmstudio.ai) - macOS 앱 번들을 위한 포터블 Python 환경 레이어링
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon을 위한 임베딩 모델 지원
+- [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Apple Silicon에서의 블록 디퓨전 speculative decoding

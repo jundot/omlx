@@ -10,10 +10,13 @@
 <p align="center"><b>LLM 推理，为你的 Mac 优化</b><br>连续批处理和分层 KV 缓存，直接从菜单栏管理。</p>
 
 <p align="center">
+<a href="https://www.buymeacoffee.com/jundot"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
-  <a href="https://buymeacoffee.com/jundot"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=black" alt="Buy Me a Coffee"></a>
 </p>
 
 <p align="center">
@@ -84,7 +87,7 @@ pip install -e ".[mcp]"   # 含 MCP（Model Context Protocol）支持
 
 ### macOS 应用
 
-从 Applications 文件夹启动 oMLX。欢迎界面会引导你完成三个步骤 — 模型目录设置、服务器启动、首个模型下载。就是这样。要连接 OpenClaw、OpenCode 或 Codex，请参阅[集成](#集成)。
+从 Applications 文件夹启动 oMLX。欢迎界面会引导你完成三个步骤 — 模型目录设置、服务器启动、首个模型下载。就是这样。要连接 OpenClaw、OpenCode、Codex 或 Copilot，请参阅[集成](#集成)。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX 欢迎界面" width="360">
@@ -122,7 +125,7 @@ brew services info omlx     # 查看状态
 
 ### 管理后台
 
-在 `/admin` 提供实时监控、模型管理、聊天、基准测试和模型级设置的 Web UI。支持英语、韩语、日语和中文。所有 CDN 依赖已内置，完全支持离线运行。
+在 `/admin` 提供实时监控、模型管理、聊天、基准测试和模型级设置的 Web UI。支持英语、韩语、日语、中文和俄语。所有 CDN 依赖已内置，完全支持离线运行。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX 管理后台" width="720">
