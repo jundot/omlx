@@ -3994,6 +3994,22 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                     exc,
                 )
 
+        # MRU partials chain from paged-block hashes whose KV bytes are
+        # gone after the ssd_manager.clear() above.  Drop them so the
+        # admin "clear all warm caches" intent is honoured symmetrically.
+        # Single-tier behaviour (no clear) is the surviving-stash hazard
+        # the peer review caught for this endpoint.
+        block_aware_cache = getattr(scheduler, "block_aware_cache", None)
+        if block_aware_cache is not None:
+            try:
+                block_aware_cache.clear_mru_partials()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear MRU partials for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+
     # Phase 2: remove any remaining files on disk (covers unloaded models)
     global_settings = _get_global_settings()
     if global_settings is not None:
