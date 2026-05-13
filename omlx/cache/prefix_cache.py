@@ -754,6 +754,24 @@ class BlockAwarePrefixCache(CacheManager):
         """
         return self._mru_partial is not None
 
+    def _can_reconstruct(self) -> bool:
+        """Whether ``reconstruct_cache`` has a path to return non-``None``.
+
+        Used as a guard at both the MRU stash site (``_update_mru_partial``)
+        and the canonical reconstruct entry (``reconstruct_cache``).  Co-
+        locating the two checks keeps them in lockstep — a future fetch
+        path that bypasses ``PagedSSDCacheManager`` (memory-only mode,
+        alternate backends) updates exactly one predicate.
+
+        Note the predicate is ``manager is not None``, not "SSD writes are
+        enabled."  ``hot_cache_only=True`` (omlx setting / OMLX_HOT_CACHE_ONLY
+        env) keeps the manager but skips the disk writer thread; reconstruct
+        still works because ``load_block_with_metadata`` short-circuits to
+        the hot tier.  The gate fires only when no manager is configured
+        at all — typically a test/dev scenario.
+        """
+        return HAS_MLX and self.paged_ssd_cache is not None
+
     def _all_layers_sliceable(
         self, layer_cache_types: list[str] | None
     ) -> bool:
@@ -801,16 +819,16 @@ class BlockAwarePrefixCache(CacheManager):
     ) -> None:
         """Refresh the MRU partial slot from a just-completed store_cache.
 
-        Clears the slot in every "no eligible tail" branch (no trailing
-        tokens, non-tensor data, MLX missing, hybrid model, no SSD
-        configured, extraction failure, or ambiguous cache layout) so a
-        stale partial cannot survive into a future ``apply_mru_partial``.
+        Clears the slot in every "no eligible tail" branch — no trailing
+        tokens, non-tensor data, no reconstruct path configured (see
+        ``_can_reconstruct``), hybrid model, extraction failure, or
+        ambiguous cache layout — so a stale partial cannot survive into
+        a future ``apply_mru_partial``.
         """
         if (
             trailing_partial_tokens == 0
             or not is_tensor_data
-            or not HAS_MLX
-            or self.paged_ssd_cache is None
+            or not self._can_reconstruct()
             or not self._all_layers_sliceable(layer_cache_types)
         ):
             self._mru_partial = None
@@ -1710,15 +1728,16 @@ class BlockAwarePrefixCache(CacheManager):
         if not block_table or not block_table.block_ids:
             return None
 
-        if not HAS_MLX:
-            logger.warning("Cannot reconstruct cache: MLX not available")
+        if not self._can_reconstruct():
+            if not HAS_MLX:
+                logger.warning("Cannot reconstruct cache: MLX not available")
+            else:
+                logger.warning(
+                    "Cannot reconstruct cache: PagedSSDCacheManager not configured"
+                )
             return None
-
-        if self.paged_ssd_cache is None:
-            logger.warning(
-                "Cannot reconstruct cache: PagedSSDCacheManager not configured"
-            )
-            return None
+        # _can_reconstruct() guarantees this; narrow for the type checker.
+        assert self.paged_ssd_cache is not None
 
         try:
             # Collect cache data from valid blocks (stop at first invalid)

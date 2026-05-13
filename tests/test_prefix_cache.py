@@ -2818,14 +2818,21 @@ class TestMRUPartialBlockCache:
                 f"not mx.array. See above."
             )
 
-    # --- threat model: H3 no-SSD config ---
+    # --- threat model: no-reconstruct-path config ---
 
     def test_no_stash_when_paged_ssd_cache_is_none(self, paged_cache, mx):
-        """Without an SSD manager, ``reconstruct_cache`` returns ``None``,
-        which means ``apply_mru_partial`` is unreachable from the scheduler.
-        Stashing in this configuration would only produce dead memory
-        (a multi-MB tensor reference held until the next ``store_cache``
-        with no possible consumer)."""
+        """Without a ``PagedSSDCacheManager`` instance, ``reconstruct_cache``
+        returns ``None`` (``_can_reconstruct() is False``) and
+        ``apply_mru_partial`` is unreachable from the scheduler.  Stashing
+        in this configuration would only produce dead memory.
+
+        Note: this is distinct from ``hot_cache_only=True``, where the
+        manager IS present (the disk writer thread is what's disabled,
+        not the manager itself).  In that mode the MRU stash IS expected
+        to populate — ``load_block_with_metadata`` short-circuits to the
+        hot tier and reconstruct still works.  The gate keys on manager
+        presence, not on whether SSD writes are happening.
+        """
         cache = BlockAwarePrefixCache(
             model=MockModel(num_layers=4),
             paged_cache_manager=paged_cache,
@@ -2840,6 +2847,32 @@ class TestMRUPartialBlockCache:
 
         assert cache._mru_partial is None
         assert cache.has_mru_partial() is False
+
+    def test_can_reconstruct_helper_reflects_manager_presence(
+        self, paged_cache, mock_ssd
+    ):
+        """``_can_reconstruct`` is the canonical predicate keeping the
+        MRU stash gate and the ``reconstruct_cache`` guard in lockstep.
+
+        It returns False only when no manager is configured at all.
+        ``hot_cache_only=True`` configurations (manager present, disk
+        writer disabled) return True because reconstruct still works
+        via the hot-tier short-circuit in
+        ``PagedSSDCacheManager.load_block_with_metadata``.
+        """
+        cache_with = BlockAwarePrefixCache(
+            model=MockModel(num_layers=2),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+        assert cache_with._can_reconstruct() is True
+
+        cache_without = BlockAwarePrefixCache(
+            model=MockModel(num_layers=2),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=None,
+        )
+        assert cache_without._can_reconstruct() is False
 
     # --- apply: real round-trip ---
 
