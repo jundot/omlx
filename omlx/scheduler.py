@@ -2052,7 +2052,11 @@ class Scheduler:
                 len(state.last_token), request.num_prompt_tokens, cache_info,
             )
 
-    def _advance_chunked_prefills(self, scheduled: "list[Request]") -> None:
+    def _advance_chunked_prefills(
+        self,
+        scheduled: "list[Request]",
+        rejected: "list[RequestOutput]",
+    ) -> None:
         """Process one prefill chunk per in-flight chunked-prefill request.
 
         Called at the start of each step() before _schedule_waiting(). Each
@@ -2063,6 +2067,9 @@ class Scheduler:
         Args:
             scheduled: The step's running list of newly-scheduled requests;
                 completed chunked-prefill requests are appended here.
+            rejected: Per-step rejected outputs. A chunked prefill that hits
+                the memory hard limit emits a finish_reason="error" entry
+                here so the engine can surface the failure to the client.
         """
         if not self.prefilling:
             return
@@ -2088,8 +2095,18 @@ class Scheduler:
             except RuntimeError as e:
                 logger.error("Chunked prefill failed for %s: %s", rid, e)
                 self._prefill_states.pop(rid, None)
-                # Remove from requests so the engine can report an error.
                 self.requests.pop(rid, None)
+                get_prefill_tracker().remove(rid)
+                # Surface the failure to the engine. Without this, the
+                # request is silently dropped and the client hangs.
+                rejected.append(
+                    RequestOutput(
+                        request_id=rid,
+                        finished=True,
+                        finish_reason="error",
+                        error=str(e),
+                    )
+                )
                 continue
 
             if not done:
@@ -5387,8 +5404,9 @@ class Scheduler:
             # Must run before _schedule_waiting() so that completing prefills
             # are inserted into BatchGenerator before the decode step.
             chunked_scheduled: list[Request] = []
+            chunked_rejected: list[RequestOutput] = []
             if self.prefilling:
-                self._advance_chunked_prefills(chunked_scheduled)
+                self._advance_chunked_prefills(chunked_scheduled, chunked_rejected)
 
             # Schedule waiting requests
             scheduled, rejected = self._schedule_waiting()
@@ -5397,6 +5415,9 @@ class Scheduler:
                 scheduled = chunked_scheduled + scheduled
             output.scheduled_request_ids = [r.request_id for r in scheduled]
             output.num_scheduled_tokens = sum(r.num_prompt_tokens for r in scheduled)
+            if chunked_rejected:
+                output.outputs.extend(chunked_rejected)
+                output.has_work = True
             if rejected:
                 output.outputs.extend(rejected)
                 output.has_work = True

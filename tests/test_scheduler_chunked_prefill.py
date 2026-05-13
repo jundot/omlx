@@ -15,6 +15,7 @@ from omlx.request import Request, RequestStatus, SamplingParams
 from omlx.scheduler import (
     Scheduler,
     SchedulerConfig,
+    _PrefillAbortedError,
     _PrefillState,
 )
 
@@ -265,9 +266,11 @@ class TestAdvanceChunkedPrefills:
     def test_no_op_when_queue_empty(self):
         sched = _make_scheduler()
         scheduled = []
+        rejected = []
         # Should not raise
-        sched._advance_chunked_prefills(scheduled)
+        sched._advance_chunked_prefills(scheduled, rejected)
         assert scheduled == []
+        assert rejected == []
 
     def test_advances_chunk_when_not_done(self):
         """Requests that still have tokens stay in prefilling queue."""
@@ -280,12 +283,14 @@ class TestAdvanceChunkedPrefills:
 
         with patch.object(sched, "_step_prefill_chunk", return_value=False) as mock_step:
             scheduled = []
-            sched._advance_chunked_prefills(scheduled)
+            rejected = []
+            sched._advance_chunked_prefills(scheduled, rejected)
 
         mock_step.assert_called_once_with(state)
         # Not done → stays in prefilling, not moved to running
         assert req in sched.prefilling
         assert scheduled == []
+        assert rejected == []
         assert req.request_id not in sched.running
 
     def test_inserts_when_done(self):
@@ -303,13 +308,15 @@ class TestAdvanceChunkedPrefills:
         with patch.object(sched, "_step_prefill_chunk", return_value=True):
             with patch.object(sched, "_emit_final_boundary_if_needed"):
                 scheduled = []
-                sched._advance_chunked_prefills(scheduled)
+                rejected = []
+                sched._advance_chunked_prefills(scheduled, rejected)
 
         # Moved to running, removed from prefilling
         assert req not in sched.prefilling
         assert req.request_id not in sched._prefill_states
         assert req.request_id in sched.running
         assert req in scheduled
+        assert rejected == []
         assert req.status == RequestStatus.RUNNING
 
     def test_skips_aborted_request(self):
@@ -320,15 +327,15 @@ class TestAdvanceChunkedPrefills:
         sched.prefilling.append(req)
 
         scheduled = []
-        sched._advance_chunked_prefills(scheduled)  # Must not raise
+        rejected = []
+        sched._advance_chunked_prefills(scheduled, rejected)  # Must not raise
 
         assert scheduled == []
+        assert rejected == []
         assert len(sched.prefilling) == 0
 
     def test_abort_during_chunk_discards_state(self):
         """_PrefillAbortedError from _step_prefill_chunk is swallowed cleanly."""
-        from omlx.scheduler import _PrefillAbortedError
-
         sched = _make_scheduler()
         req = _make_request("r1")
         sched.requests[req.request_id] = req
@@ -341,11 +348,41 @@ class TestAdvanceChunkedPrefills:
             side_effect=_PrefillAbortedError([], 4)
         ):
             scheduled = []
-            sched._advance_chunked_prefills(scheduled)  # Must not raise
+            rejected = []
+            sched._advance_chunked_prefills(scheduled, rejected)  # Must not raise
 
         assert req.request_id not in sched._prefill_states
         assert req not in sched.prefilling
         assert scheduled == []
+        assert rejected == []
+
+    def test_runtime_error_surfaces_as_request_error(self):
+        """RuntimeError mid-chunk yields a finish_reason=\"error\" RequestOutput."""
+        sched = _make_scheduler()
+        req = _make_request("oom")
+        sched.requests[req.request_id] = req
+        state = _make_prefill_state(sched, req)
+        sched.prefilling.append(req)
+        sched._prefill_states[req.request_id] = state
+
+        with patch.object(
+            sched, "_step_prefill_chunk",
+            side_effect=RuntimeError("Memory limit exceeded")
+        ):
+            scheduled = []
+            rejected = []
+            sched._advance_chunked_prefills(scheduled, rejected)
+
+        assert req.request_id not in sched._prefill_states
+        assert req not in sched.prefilling
+        assert req.request_id not in sched.requests
+        assert scheduled == []
+        assert len(rejected) == 1
+        out = rejected[0]
+        assert out.request_id == "oom"
+        assert out.finished is True
+        assert out.finish_reason == "error"
+        assert "Memory limit" in out.error
 
     def test_multiple_requests_all_advanced(self):
         """All requests in prefilling get one chunk advanced per call."""
@@ -367,7 +404,7 @@ class TestAdvanceChunkedPrefills:
             return False  # All still in-progress
 
         with patch.object(sched, "_step_prefill_chunk", side_effect=fake_step):
-            sched._advance_chunked_prefills([])
+            sched._advance_chunked_prefills([], [])
 
         assert call_count == 3  # One chunk per request
 
