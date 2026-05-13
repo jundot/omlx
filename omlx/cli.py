@@ -301,8 +301,13 @@ def launch_command(args):
     host = args.host or settings.server.host
     port = args.port or settings.server.port
 
+    # 0.0.0.0 is a valid bind address but not a valid connect address.
+    # Fall back to localhost so launch can reach the server regardless
+    # of which interface it was bound to.
+    connect_host = host if host and host != "0.0.0.0" else "127.0.0.1"
+
     # Check if oMLX server is running
-    base_url = f"http://{host}:{port}"
+    base_url = f"http://{connect_host}:{port}"
     try:
         resp = requests.get(f"{base_url}/health", timeout=3)
         resp.raise_for_status()
@@ -380,7 +385,7 @@ def launch_command(args):
         port=port,
         api_key=api_key,
         model=model,
-        host=host,
+        host=connect_host,
         tools_profile=tools_profile,
         context_window=context_window,
         max_tokens=max_tokens,
