@@ -20,10 +20,18 @@ struct DownloadsScreen: View {
                 isEditingMirror: $vm.isEditingMirror,
                 mirrorDraft: $vm.mirrorDraft,
                 mirrorBusy: vm.mirrorBusy,
+                searchResults: vm.searchResults,
+                searchLoading: vm.searchLoading,
+                searchDismissed: vm.searchDismissed,
                 onSubmit: { vm.startDownload(client: services.client) },
                 onSaveMirror: { vm.saveMirror(client: services.client) },
-                onResetMirror: { vm.resetMirror(client: services.client) }
+                onResetMirror: { vm.resetMirror(client: services.client) },
+                onPickResult: { vm.pickSearchResult($0) },
+                onDismissSearch: { vm.dismissSearch() }
             )
+            .onChange(of: vm.repoText) { _, newValue in
+                vm.updateSearch(query: newValue, client: services.client)
+            }
 
             ActiveDownloadsSection(
                 tasks: vm.activeTasks,
@@ -68,12 +76,21 @@ private struct AddFromHFSection: View {
     @Binding var isEditingMirror: Bool
     @Binding var mirrorDraft: String
     let mirrorBusy: Bool
+    let searchResults: [HFModelInfo]
+    let searchLoading: Bool
+    let searchDismissed: Bool
     let onSubmit: () -> Void
     let onSaveMirror: () -> Void
     let onResetMirror: () -> Void
+    let onPickResult: (HFModelInfo) -> Void
+    let onDismissSearch: () -> Void
 
     @Environment(\.omlxTheme) private var theme
     @FocusState private var mirrorFocused: Bool
+
+    private var showsDropdown: Bool {
+        !searchDismissed && (searchLoading || !searchResults.isEmpty)
+    }
 
     var body: some View {
         SectionHeader("Add Model from Hugging Face")
@@ -89,6 +106,11 @@ private struct AddFromHFSection: View {
                         )
                         .frame(maxWidth: .infinity)
                         .onSubmit(onSubmit)
+                        if searchLoading {
+                            ProgressView()
+                                .controlSize(.small)
+                                .padding(.trailing, 2)
+                        }
                         Button {
                             onSubmit()
                         } label: {
@@ -97,6 +119,14 @@ private struct AddFromHFSection: View {
                         }
                         .buttonStyle(.omlx(.primary))
                         .disabled(repoText.isEmpty || isStarting)
+                    }
+                    if showsDropdown {
+                        SearchDropdown(
+                            results: searchResults,
+                            isLoading: searchLoading,
+                            onPick: onPickResult,
+                            onDismiss: onDismissSearch
+                        )
                     }
                     if isEditingMirror {
                         mirrorEditor
@@ -165,6 +195,93 @@ private struct AddFromHFSection: View {
                 .disabled(mirrorBusy)
         }
         .onAppear { mirrorFocused = true }
+    }
+}
+
+// MARK: - Search dropdown
+
+private struct SearchDropdown: View {
+    let results: [HFModelInfo]
+    let isLoading: Bool
+    let onPick: (HFModelInfo) -> Void
+    let onDismiss: () -> Void
+
+    @Environment(\.omlxTheme) private var theme
+
+    /// Cap visible rows at 8 — anything more is noise and the user can keep
+    /// typing to narrow further. The HF API returns up to `limit` items
+    /// (20 by default in the VM), we just truncate the visible slice.
+    private var visible: ArraySlice<HFModelInfo> { results.prefix(8) }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if results.isEmpty && isLoading {
+                HStack(spacing: 8) {
+                    Text("Searching…")
+                        .font(.omlxText(11))
+                        .foregroundStyle(theme.textTertiary)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            } else {
+                ForEach(Array(visible.enumerated()), id: \.element.repoId) { idx, m in
+                    Button {
+                        onPick(m)
+                    } label: {
+                        row(model: m)
+                    }
+                    .buttonStyle(.plain)
+                    if idx < visible.count - 1 {
+                        Divider().opacity(0.4)
+                    }
+                }
+            }
+        }
+        .background(theme.groupBg)
+        .overlay(
+            RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
+                .strokeBorder(theme.groupBorder, lineWidth: 0.5)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
+        .onExitCommand(perform: onDismiss)
+    }
+
+    private func row(model m: HFModelInfo) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "cube.transparent")
+                .font(.system(size: 11))
+                .foregroundStyle(theme.textTertiary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(m.repoId)
+                    .font(.omlxMono(12))
+                    .foregroundStyle(theme.text)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let detail = secondaryLine(m) {
+                    Text(detail)
+                        .font(.omlxText(10.5))
+                        .foregroundStyle(theme.textTertiary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 6)
+            if let downloads = m.downloads, downloads > 0 {
+                Text(formatNumber(downloads))
+                    .font(.omlxMono(10.5))
+                    .foregroundStyle(theme.textTertiary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+    }
+
+    private func secondaryLine(_ m: HFModelInfo) -> String? {
+        var parts: [String] = []
+        if let p = m.paramsFormatted, !p.isEmpty { parts.append(p) }
+        if let s = m.sizeFormatted, !s.isEmpty { parts.append(s) }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
 
@@ -450,6 +567,18 @@ final class DownloadsScreenVM: ObservableObject {
     @Published var mirrorDraft: String = ""
     @Published private(set) var mirrorBusy: Bool = false
 
+    /// Auto-complete suggestions for the manual repo input. Cleared when
+    /// the input is empty, exactly matches a chosen repo, or the user
+    /// dismisses the dropdown with Esc.
+    @Published private(set) var searchResults: [HFModelInfo] = []
+    @Published private(set) var searchLoading: Bool = false
+    @Published var searchDismissed: Bool = false
+    private var searchTask: Task<Void, Never>?
+    /// Last query string sent to the server. Used so we don't refetch the
+    /// same query after it's been satisfied (e.g. the user clicked a
+    /// suggestion which set repoText to that exact value).
+    private var lastSearchQuery: String = ""
+
     /// Host the user sees on the Downloads screen. Strips scheme so the
     /// inline label reads like `huggingface.co` / `hf-mirror.com` per design.
     var mirrorHost: String {
@@ -535,6 +664,67 @@ final class DownloadsScreenVM: ObservableObject {
     func resetMirror(client: OMLXClient) {
         mirrorDraft = ""
         saveMirror(client: client)
+    }
+
+    // MARK: Autocomplete
+
+    /// Driven by .onChange(of: vm.repoText) in the view. Cancels any in-
+    /// flight search, debounces 300 ms, then fires GET /admin/api/hf/search.
+    /// Stays quiet when input is < 2 chars or matches the previous result
+    /// (avoids hammering the API for trivial keystrokes).
+    func updateSearch(query rawQuery: String, client: OMLXClient) {
+        let q = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        searchTask?.cancel()
+        if q.isEmpty {
+            searchResults = []
+            searchLoading = false
+            searchDismissed = false
+            lastSearchQuery = ""
+            return
+        }
+        if q == lastSearchQuery && !searchResults.isEmpty {
+            return
+        }
+        if q.count < 2 {
+            // Too short to be useful — wait for more characters.
+            return
+        }
+        searchDismissed = false
+        searchTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            if Task.isCancelled { return }
+            guard let self else { return }
+            self.searchLoading = true
+            defer { Task { @MainActor [weak self] in self?.searchLoading = false } }
+            do {
+                let resp = try await client.searchHFModels(query: q, limit: 20)
+                if Task.isCancelled { return }
+                self.searchResults = resp.models
+                self.lastSearchQuery = q
+            } catch is CancellationError {
+                return
+            } catch {
+                // Treat search failures as soft — keep the input usable for
+                // direct repo-id paste, just don't surface the error in the
+                // download lastError slot.
+                self.searchResults = []
+            }
+        }
+    }
+
+    func pickSearchResult(_ model: HFModelInfo) {
+        repoText = model.repoId
+        // Picking a result means we don't want a popup again for the same
+        // string — store it as the satisfied query.
+        lastSearchQuery = model.repoId
+        searchResults = []
+        searchDismissed = true
+    }
+
+    func dismissSearch() {
+        searchTask?.cancel()
+        searchResults = []
+        searchDismissed = true
     }
 
     func stop() {
