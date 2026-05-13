@@ -608,3 +608,259 @@ class TestEngineCorePropagation:
         req = core.scheduler.add_request.call_args[0][0]
         assert not hasattr(req, "_specprefill_threshold")
         assert not hasattr(req, "_specprefill_keep_pct")
+
+
+# ---------------------------------------------------------------------------
+# Synthetic helpers shared by TestScoreTokensSelf
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_kvcache(n_tokens, n_heads, head_dim):
+    """Return a minimal KVCache-like object with pre-filled keys/values."""
+
+    class _FakeKVCache:
+        def __init__(self):
+            # Keys/values shaped (1, n_heads, n_tokens, head_dim)
+            self.keys = mx.ones((1, n_heads, n_tokens, head_dim)) * 0.1
+            self.values = mx.zeros((1, n_heads, n_tokens, head_dim))
+            self.offset = n_tokens
+
+        @property
+        def state(self):
+            return (self.keys, self.values)
+
+    return _FakeKVCache()
+
+
+def _make_fake_model(n_layers=8, n_heads=4, head_dim=16, vocab=256):
+    """Build a minimal model stub compatible with score_tokens_self.
+
+    Each layer has a ``self_attn`` that:
+      - stores fixed keys in cache (so _compute_importance can read them)
+      - returns queries shaped (1, n_heads, seq_len, head_dim) when the
+        ``_llama_extract_queries`` extractor is invoked
+      - passes hidden state through unchanged
+
+    The model exposes ``make_cache()`` (used by ``make_prompt_cache`` fallback)
+    and a ``__call__`` that iterates layers exactly as a real transformer would.
+    """
+    hidden = n_heads * head_dim
+
+    class FakeAttn:
+        def __init__(self, layer_idx, n_heads, head_dim):
+            self._idx = layer_idx
+            self.n_heads = n_heads
+            self.num_attention_heads = n_heads
+            self.num_key_value_heads = n_heads
+            self.head_dim = head_dim
+            # rope attribute marks this as a standard Llama-style attention
+            self.rope = lambda q, offset=0: q
+
+        def q_proj(self, x):
+            B, L, D = x.shape
+            return mx.ones((B, L, self.n_heads * self.head_dim))
+
+        def __call__(self, x, mask=None, cache=None, **kwargs):
+            B, L, D = x.shape
+            if cache is not None:
+                # Write dummy keys/values so _compute_importance can read them
+                new_k = mx.ones((B, self.n_heads, L, self.head_dim)) * (self._idx + 1) * 0.1
+                new_v = mx.zeros((B, self.n_heads, L, self.head_dim))
+                if hasattr(cache, "keys") and cache.keys is not None:
+                    cache.keys = mx.concatenate([cache.keys, new_k], axis=2)
+                    cache.values = mx.concatenate([cache.values, new_v], axis=2)
+                else:
+                    cache.keys = new_k
+                    cache.values = new_v
+                cache.offset = cache.offset + L if hasattr(cache, "offset") else L
+            return x  # identity — hidden state passes through
+
+    class FakeLayer:
+        def __init__(self, layer_idx, n_heads, head_dim):
+            self.self_attn = FakeAttn(layer_idx, n_heads, head_dim)
+
+        def __call__(self, x, mask=None, cache=None, **kwargs):
+            return self.self_attn(x, mask=mask, cache=cache, **kwargs)
+
+    class FakeKVCache:
+        def __init__(self):
+            self.keys = None
+            self.values = None
+            self.offset = 0
+
+        @property
+        def state(self):
+            if self.keys is None:
+                return mx.zeros((1,))
+            return (self.keys, self.values)
+
+    class FakeModel:
+        def __init__(self):
+            self.layers = [FakeLayer(i, n_heads, head_dim) for i in range(n_layers)]
+            self._n_layers = n_layers
+            self._n_heads = n_heads
+            self._head_dim = head_dim
+            self._vocab = vocab
+
+        def __call__(self, x, cache=None, **kwargs):
+            h = mx.ones((*x.shape, hidden))
+            for i, layer in enumerate(self.layers):
+                h = layer(h, cache=cache[i] if cache is not None else None)
+            # Return dummy logits — never evaluated by score_tokens_self
+            return mx.zeros((*x.shape, vocab))
+
+        def make_cache(self):
+            return [FakeKVCache() for _ in range(self._n_layers)]
+
+    return FakeModel()
+
+
+class TestScoreTokensSelf:
+    """Tests for score_tokens_self() — draft-model-free importance scoring."""
+
+    def test_output_shape_matches_token_count(self):
+        """importance vector length must equal the number of input tokens."""
+        from omlx.patches.specprefill import score_tokens_self
+
+        model = _make_fake_model(n_layers=8, n_heads=4, head_dim=16)
+        tokens = list(range(64))
+        importance = score_tokens_self(model, tokens, n_score_layers=2,
+                                       n_tail_queries=4, pool_kernel=0)
+        assert importance.shape == (64,)
+
+    def test_importance_is_finite_and_nonnegative(self):
+        """All importance scores must be finite and ≥ 0."""
+        from omlx.patches.specprefill import score_tokens_self
+
+        model = _make_fake_model(n_layers=8, n_heads=4, head_dim=16)
+        importance = score_tokens_self(model, list(range(32)), n_score_layers=2,
+                                       n_tail_queries=4, pool_kernel=0)
+        assert mx.all(mx.isfinite(importance)).item()
+        assert mx.all(importance >= 0).item()
+
+    def test_attention_modules_restored_after_scoring(self):
+        """All self_attn modules must be back to their originals after the call."""
+        from omlx.patches.specprefill import score_tokens_self
+
+        model = _make_fake_model(n_layers=6, n_heads=2, head_dim=8)
+        originals = [layer.self_attn for layer in model.layers]
+
+        score_tokens_self(model, list(range(20)), n_score_layers=3,
+                          n_tail_queries=2, pool_kernel=0)
+
+        for i, layer in enumerate(model.layers):
+            assert layer.self_attn is originals[i], (
+                f"Layer {i} self_attn was not restored"
+            )
+
+    def test_attention_modules_restored_after_exception(self):
+        """Modules must be restored even if scoring raises mid-way."""
+        from omlx.patches.specprefill import _ScoringComplete, score_tokens_self
+
+        model = _make_fake_model(n_layers=6, n_heads=2, head_dim=8)
+        originals = [layer.self_attn for layer in model.layers]
+
+        # Patch layer 1's self_attn to raise during its own __call__ so we
+        # exercise the exception path inside the prefill loop.
+        real_attn_1 = model.layers[1].self_attn
+
+        class _BombAttn:
+            def __call__(self, *a, **kw):
+                raise RuntimeError("boom")
+
+            def __getattr__(self, name):
+                return getattr(real_attn_1, name)
+
+        model.layers[1].self_attn = _BombAttn()
+        originals[1] = model.layers[1].self_attn  # update expected
+
+        try:
+            score_tokens_self(model, list(range(20)), n_score_layers=3,
+                               n_tail_queries=2, pool_kernel=0)
+        except Exception:
+            pass  # scoring may fail — we only care about cleanup
+
+        for i, layer in enumerate(model.layers):
+            assert layer.self_attn is originals[i], (
+                f"Layer {i} self_attn not restored after exception"
+            )
+
+    def test_n_score_layers_clamped_to_model_depth(self):
+        """Requesting more score layers than the model has must not crash."""
+        from omlx.patches.specprefill import score_tokens_self
+
+        model = _make_fake_model(n_layers=4, n_heads=2, head_dim=8)
+        # n_score_layers=99 > n_layers=4 — should clamp silently
+        importance = score_tokens_self(model, list(range(16)), n_score_layers=99,
+                                       n_tail_queries=2, pool_kernel=0)
+        assert importance.shape == (16,)
+
+    def test_n_tail_queries_clamped_to_prompt_length(self):
+        """n_tail_queries > n_prompt-1 must not crash."""
+        from omlx.patches.specprefill import score_tokens_self
+
+        model = _make_fake_model(n_layers=4, n_heads=2, head_dim=8)
+        importance = score_tokens_self(model, list(range(5)), n_score_layers=2,
+                                       n_tail_queries=100, pool_kernel=0)
+        assert importance.shape == (5,)
+
+    def test_mx_array_tokens_accepted(self):
+        """Passing tokens as an mx.array (not a list) must work."""
+        from omlx.patches.specprefill import score_tokens_self
+
+        model = _make_fake_model(n_layers=4, n_heads=2, head_dim=8)
+        tokens = mx.array(list(range(16)))
+        importance = score_tokens_self(model, tokens, n_score_layers=2,
+                                       n_tail_queries=4, pool_kernel=0)
+        assert importance.shape == (16,)
+
+    def test_progress_callback_called(self):
+        """progress_callback must be invoked at least once during scoring."""
+        from omlx.patches.specprefill import score_tokens_self
+
+        model = _make_fake_model(n_layers=6, n_heads=2, head_dim=8)
+        calls = []
+
+        def cb(processed, total, phase):
+            calls.append((processed, total, phase))
+
+        score_tokens_self(model, list(range(32)), n_score_layers=2,
+                          n_tail_queries=4, pool_kernel=0,
+                          progress_callback=cb)
+        assert len(calls) > 0
+        # Final call must report completion
+        assert calls[-1][0] == calls[-1][1]
+
+    @pytest.mark.asyncio
+    async def test_engine_core_self_score_flag_propagates(self):
+        """specprefill_self_score=True must set the request fields correctly."""
+        from unittest.mock import MagicMock
+
+        from omlx.engine_core import EngineCore
+        from omlx.request import SamplingParams
+
+        core = object.__new__(EngineCore)
+        core._output_collectors = {}
+        core._active_requests = {}
+        core._stream_states = {}
+        core._finished_events = {}
+        core._mlx_executor = None  # use default thread pool for run_in_executor
+
+        mock_scheduler = MagicMock(spec=[])
+        mock_scheduler._specprefill_draft_model = None
+        mock_scheduler.add_request = MagicMock()
+        core.scheduler = mock_scheduler
+
+        mock_config = MagicMock(spec=[])
+        mock_config.stream_interval = 0
+        core.config = mock_config
+
+        await core.add_request(
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(),
+            specprefill_self_score=True,
+        )
+
+        req = mock_scheduler.add_request.call_args[0][0]
+        assert req._specprefill_self_score is True
+        assert req._specprefill_enabled is True

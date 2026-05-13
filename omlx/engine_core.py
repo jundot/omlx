@@ -289,6 +289,7 @@ class EngineCore:
         specprefill_keep_pct: Optional[float] = None,
         specprefill_threshold: Optional[int] = None,
         specprefill_system_end: Optional[int] = None,
+        specprefill_self_score: Optional[bool] = None,
     ) -> str:
         """
         Add a request for processing.
@@ -305,6 +306,8 @@ class EngineCore:
             specprefill: Per-request SpecPrefill override (True/False/None)
             specprefill_keep_pct: Per-request keep rate override
             specprefill_threshold: Per-request threshold override (min tokens)
+            specprefill_self_score: Use target model self-scoring (no draft model
+                required).  Auto-enables SpecPrefill for this request.
 
         Returns:
             The request ID
@@ -341,6 +344,9 @@ class EngineCore:
             request._specprefill_threshold = specprefill_threshold
         if specprefill_system_end is not None and specprefill_system_end > 0:
             request.specprefill_system_end = specprefill_system_end
+        if specprefill_self_score:
+            request._specprefill_self_score = True
+            request._specprefill_enabled = True  # no draft model needed
 
         # Setup output collector with stream_interval from config
         self._output_collectors[request_id] = RequestOutputCollector(aggregate=True)

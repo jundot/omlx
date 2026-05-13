@@ -530,6 +530,9 @@ class SchedulerConfig:
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
     mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
 
+    # Self-scoring SpecPrefill (no draft model required)
+    specprefill_self_score_layers: int = 4  # Attention layers used for the scoring pass
+
 
 @dataclass
 class SchedulerOutput:
@@ -3384,10 +3387,11 @@ class Scheduler:
         was already scored in a previous turn, the draft cache is restored
         and only the new suffix is prefilled through the draft model.
         """
-        if self._specprefill_draft_model is None:
+        specprefill_enabled = getattr(request, "_specprefill_enabled", False)
+        self_score_requested = getattr(request, "_specprefill_self_score", False)
+        if self._specprefill_draft_model is None and not self_score_requested:
             return
 
-        specprefill_enabled = getattr(request, "_specprefill_enabled", False)
         if not specprefill_enabled:
             return
 
@@ -3429,12 +3433,20 @@ class Scheduler:
         model_id = os.path.basename(self.config.model_name.rstrip("/"))
 
         try:
-            from .patches.specprefill import score_tokens, select_chunks
+            from .patches.specprefill import select_chunks
 
-            # Draft prefix cache lookup
+            use_self_score = (
+                self._specprefill_draft_model is None
+                and getattr(request, "_specprefill_self_score", False)
+            )
+
+            if self._specprefill_draft_model is None and not use_self_score:
+                return
+
+            # Draft prefix cache lookup (only relevant when draft model is present)
             draft_cache = None
             draft_cached_tokens = 0
-            if self._draft_prefix_cache is not None:
+            if self._draft_prefix_cache is not None and not use_self_score:
                 try:
                     block_table, draft_remaining = self._draft_prefix_cache.fetch_cache(
                         request.request_id, tokens_to_score
@@ -3480,13 +3492,25 @@ class Scheduler:
             )
 
             t0 = time.monotonic()
-            importance, used_cache = score_tokens(
-                self._specprefill_draft_model,
-                tokens_to_score,
-                prefill_step_size=self.config.prefill_step_size,
-                existing_cache=draft_cache,
-                progress_callback=_score_progress,
-            )
+            used_cache = None
+            if use_self_score:
+                from .patches.specprefill import score_tokens_self
+                importance = score_tokens_self(
+                    self.model,
+                    tokens_to_score,
+                    n_score_layers=self.config.specprefill_self_score_layers,
+                    prefill_step_size=self.config.prefill_step_size,
+                    progress_callback=_score_progress,
+                )
+            else:
+                from .patches.specprefill import score_tokens
+                importance, used_cache = score_tokens(
+                    self._specprefill_draft_model,
+                    tokens_to_score,
+                    prefill_step_size=self.config.prefill_step_size,
+                    existing_cache=draft_cache,
+                    progress_callback=_score_progress,
+                )
             selected = select_chunks(importance, keep_pct=keep_pct)
             t_score = time.monotonic() - t0
 
@@ -3531,7 +3555,7 @@ class Scheduler:
                 f"(keep={n_selected/n_to_score*100:.0f}%, {', '.join(extras)})"
             )
 
-            # Save draft cache for next turn
+            # Save draft cache for next turn (skip for self-score: no cache to persist)
             if self._draft_prefix_cache is not None and used_cache is not None:
                 try:
                     extracted, mcc = self._extract_cache_states(used_cache)
@@ -3549,7 +3573,8 @@ class Scheduler:
             # the generation_stream is drained before Metal buffers are
             # returned to the pool — a bare mx.clear_cache() here can race
             # with in-flight async evals and trigger a kernel panic (#557).
-            del used_cache
+            if used_cache is not None:
+                del used_cache
             _sync_and_clear_cache()
 
             # Mark scoring complete (auto-removes tracker entry).

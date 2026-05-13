@@ -319,14 +319,23 @@ def _detect_query_extractor(attn_obj) -> Callable:
 # ---------------------------------------------------------------------------
 
 
-def _patch_attention_for_capture(model, query_buffer, query_extractor):
+def _patch_attention_for_capture(model, query_buffer, query_extractor,
+                                  layers_to_patch=None):
     """Replace attention modules with capture wrappers.
+
+    Args:
+        layers_to_patch: optional set of layer indices to patch.  When
+            provided, only those layers receive capture wrappers; all others
+            are left untouched.  Callers that omit this argument get the
+            original behaviour (all attention layers are patched).
 
     Returns (originals, attn_layer_indices) for cleanup.
     """
     originals = []
     attn_indices = []
     for layer_idx, layer in _find_attention_layers(model):
+        if layers_to_patch is not None and layer_idx not in layers_to_patch:
+            continue
         buf_idx = len(attn_indices)
         attn_indices.append(layer_idx)
         orig = _get_attn_module(layer)
@@ -737,6 +746,31 @@ class _OffsetAdjustedRoPE:
         return self._original(x, offset=offset + self._adjustment)
 
 
+class _ScoringComplete(BaseException):
+    """Sentinel: raised to abort a forward pass after the last scored layer.
+
+    Inherits BaseException (not Exception) so bare ``except Exception`` handlers
+    inside model code do not accidentally swallow it.  Caught only by
+    ``score_tokens_self()``.
+    """
+
+
+class _EarlyExitAttn:
+    """Replaces an attention module to abort the forward pass immediately.
+
+    Install on the first attention layer that should NOT be scored.
+    When called it raises ``_ScoringComplete`` before any Q/K/V work is done,
+    which stops Python graph construction for all subsequent layers.
+    MLX will only execute Metal ops for the layers that ran before this stub.
+    """
+
+    def __call__(self, x, mask=None, cache=None, **kwargs):
+        raise _ScoringComplete()
+
+    def __getattr__(self, name: str):
+        raise AttributeError(name)
+
+
 def _get_dims(rope_module):
     """Extract rotary dimensions from any RoPE variant."""
     for attr in ("_dims", "dim", "dims"):
@@ -752,6 +786,153 @@ def _get_pre_scale(rope_module):
     if hasattr(rope_module, "_scale") and hasattr(rope_module, "dim"):
         return rope_module._scale
     return 1.0
+
+
+def score_tokens_self(
+    model,
+    tokens,
+    n_score_layers: int = 4,
+    n_tail_queries: int = 8,
+    pool_kernel: int = 13,
+    prefill_step_size: int = 2048,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> mx.array:
+    """Score token importance using the first n_score_layers of the target model.
+
+    No draft model required.  Runs a partial forward pass (first
+    ``n_score_layers`` attention layers) using an early-exit exception to
+    stop Python graph construction before the remaining layers are built.
+    MLX therefore executes Metal ops only for those first N layers.
+
+    Q vectors from the last ``n_tail_queries`` prompt positions are used as a
+    proxy for future-generation queries (analogous to the lookahead-decode
+    queries in ``score_tokens``), scoring which earlier tokens each of those
+    final positions attends to.
+
+    Args:
+        model: Target language model (the same model that will be passed to
+            ``sparse_prefill`` afterwards).
+        tokens: list or mx.array of token IDs for the prompt to score.
+        n_score_layers: number of attention layers to run (default 4).
+        n_tail_queries: Q vectors from the last N prompt positions used for
+            scoring (default 8).
+        pool_kernel: smoothing kernel size for importance (default 13, 0=off).
+        prefill_step_size: chunk size for the scoring pass (default 2048).
+        progress_callback: optional callable(processed, total, phase).
+
+    Returns:
+        importance (M,) array — same format as ``score_tokens()``; no cache
+        is returned because the truncated-pass cache is not worth persisting.
+    """
+    from mlx_lm.models.cache import make_prompt_cache
+
+    if isinstance(tokens, mx.array):
+        tokens = tokens.tolist()
+    n_prompt = len(tokens)
+    n_tail_queries = min(n_tail_queries, max(1, n_prompt - 1))
+
+    # Full-size cache — no layer truncation; _build_layer_to_cache_map and
+    # make_prompt_cache use the real model structure (safe for Gemma4, etc.)
+    cache = make_prompt_cache(model)
+
+    attn_layers = _find_attention_layers(model)
+    n_all_attn = len(attn_layers)
+    n_score = min(n_score_layers, n_all_attn)
+
+    attn_obj = _get_attn_module(attn_layers[0][1])
+    n_attn_heads = getattr(
+        attn_obj,
+        "num_attention_heads",
+        getattr(attn_obj, "n_heads", getattr(attn_obj, "num_heads", None)),
+    )
+    n_kv_heads = getattr(
+        attn_obj, "num_key_value_heads", getattr(attn_obj, "n_kv_heads", None)
+    )
+    query_extractor = _detect_query_extractor(attn_obj)
+
+    layer_to_cache = _build_layer_to_cache_map(model)
+    score_layer_indices = {idx for idx, _ in attn_layers[:n_score]}
+    score_cache_list = [
+        cache[layer_to_cache[i]]
+        for i, _ in attn_layers[:n_score]
+        if i in layer_to_cache
+    ]
+
+    # Patch only the first n_score attention layers for Q capture.
+    # The next attention layer (index n_score) receives _EarlyExitAttn, which
+    # is installed separately so cleanup ordering is unambiguous.
+    query_buffer: list = [[] for _ in range(n_all_attn)]
+    patches, attn_indices = _patch_attention_for_capture(
+        model, query_buffer, query_extractor,
+        layers_to_patch=score_layer_indices,
+    )
+
+    early_exit_patch = None
+    if n_score < n_all_attn:
+        _, exit_layer = attn_layers[n_score]
+        orig_exit_attn = _get_attn_module(exit_layer)
+        _set_attn_module(exit_layer, _EarlyExitAttn())
+        early_exit_patch = (exit_layer, orig_exit_attn)
+
+    try:
+        prompt = mx.array(tokens)
+        processed = 0
+
+        while processed < n_prompt:
+            chunk = min(prefill_step_size, n_prompt - processed)
+            if progress_callback is not None:
+                progress_callback(processed, n_prompt, "self_scoring")
+            try:
+                model(prompt[processed : processed + chunk][None], cache=cache)
+            except _ScoringComplete:
+                pass
+            # Evaluate only the scored layers' cache states; layers beyond
+            # n_score were never added to the compute graph this iteration.
+            mx.eval([c.state for c in score_cache_list])
+            processed += chunk
+
+        if progress_callback is not None:
+            progress_callback(n_prompt, n_prompt, "self_scoring")
+
+    finally:
+        _unpatch_attention_capture(model, patches)
+        if early_exit_patch is not None:
+            _set_attn_module(early_exit_patch[0], early_exit_patch[1])
+
+    # Build trimmed query buffer: one entry per scored layer containing only
+    # Q vectors from the last n_tail_queries prompt positions.
+    trimmed_buffer = []
+    for i, _ in attn_layers[:n_score]:
+        if i not in attn_indices:
+            trimmed_buffer.append([])
+            continue
+        buf_slot = attn_indices.index(i)
+        captures = query_buffer[buf_slot]
+        if not captures:
+            trimmed_buffer.append([])
+            continue
+        full_q = mx.concatenate(captures, axis=2)           # (1, heads, n_prompt, d)
+        trimmed_buffer.append([full_q[:, :, -n_tail_queries:, :]])
+
+    score_caches = [
+        cache[layer_to_cache[i]]
+        for i, _ in attn_layers[:n_score]
+        if i in layer_to_cache
+    ]
+
+    importance = _compute_importance(
+        trimmed_buffer,
+        score_caches,
+        n_prompt,
+        n_attn_heads,
+        n_kv_heads,
+        pool_kernel=pool_kernel if pool_kernel > 0 else None,
+    )
+    mx.eval(importance)
+
+    del cache, query_buffer, trimmed_buffer
+    mx.clear_cache()
+    return importance
 
 
 # ===========================================================================

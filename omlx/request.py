@@ -187,6 +187,7 @@ class Request:
     specprefill_total_tokens: int = 0  # Original total token count (M)
     specprefill_position_offset: int = 0  # RoPE offset = M - N
     specprefill_system_end: int = 0  # Token index where system prompt ends
+    _specprefill_self_score: bool = False  # Use target model self-scoring (no draft)
 
     # Cache corruption recovery
     cache_corruption_retries: int = 0   # Per-request corruption retry counter
