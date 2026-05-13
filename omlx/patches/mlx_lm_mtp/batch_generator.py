@@ -60,6 +60,8 @@ from __future__ import annotations
 import logging
 import math
 import random
+import sys
+import types
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, List, Optional, Tuple
@@ -79,10 +81,20 @@ def apply() -> bool:
     if _PATCHED:
         return True
 
+    root = sys.modules.get("mlx_lm")
+    if root is not None and (
+        not isinstance(root, types.ModuleType) or not hasattr(root, "__path__")
+    ):
+        logger.debug("mlx_lm root is not a package")
+        return False
+
     try:
         from mlx_lm.generate import GenerationBatch
     except ImportError:
         logger.debug("mlx_lm.generate.GenerationBatch not importable")
+        return False
+    if not isinstance(GenerationBatch, type):
+        logger.debug("mlx_lm.generate.GenerationBatch is not a class")
         return False
 
     if hasattr(GenerationBatch, "_omlx_mtp_patched"):
