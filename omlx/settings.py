@@ -217,6 +217,9 @@ class SchedulerSettings:
     """Scheduler configuration settings."""
 
     max_concurrent_requests: int = 8
+    # When True, long prefills are interleaved with decode steps.
+    # Reduces TTFT for concurrent requests at the cost of per-step overhead.
+    chunked_prefill: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -233,7 +236,10 @@ class SchedulerSettings:
             value = data.get("completion_batch_size")
         if value is None:
             value = 8
-        return cls(max_concurrent_requests=value)
+        return cls(
+            max_concurrent_requests=value,
+            chunked_prefill=bool(data.get("chunked_prefill", False)),
+        )
 
 
 @dataclass
@@ -377,7 +383,7 @@ class ModelIdleTimeoutSettings:
         return {"idle_timeout_seconds": self.idle_timeout_seconds}
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ModelIdleTimeoutSettings":
+    def from_dict(cls, data: dict[str, Any]) -> ModelIdleTimeoutSettings:
         """Create from dictionary."""
         return cls(
             idle_timeout_seconds=data.get("idle_timeout_seconds"),
@@ -468,7 +474,7 @@ class HuggingFaceSettings:
         return {"endpoint": self.endpoint}
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "HuggingFaceSettings":
+    def from_dict(cls, data: dict[str, Any]) -> HuggingFaceSettings:
         """Create from dictionary."""
         return cls(endpoint=data.get("endpoint", ""))
 
@@ -484,7 +490,7 @@ class ModelScopeSettings:
         return {"endpoint": self.endpoint}
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ModelScopeSettings":
+    def from_dict(cls, data: dict[str, Any]) -> ModelScopeSettings:
         """Create from dictionary."""
         return cls(endpoint=data.get("endpoint", ""))
 
@@ -508,7 +514,7 @@ class NetworkSettings:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "NetworkSettings":
+    def from_dict(cls, data: dict[str, Any]) -> NetworkSettings:
         """Create from dictionary."""
         return cls(
             http_proxy=data.get("http_proxy", ""),
@@ -601,7 +607,7 @@ class UISettings:
         return {"language": self.language}
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "UISettings":
+    def from_dict(cls, data: dict[str, Any]) -> UISettings:
         """Create from dictionary."""
         return cls(language=data.get("language", "en"))
 
@@ -637,9 +643,9 @@ class ClaudeCodeSettings:
             context_scaling_enabled=data.get("context_scaling_enabled", False),
             target_context_size=data.get("target_context_size", 200000),
             mode=data.get("mode", "cloud"),
-            opus_model=data.get("opus_model", None),
-            sonnet_model=data.get("sonnet_model", None),
-            haiku_model=data.get("haiku_model", None),
+            opus_model=data.get("opus_model"),
+            sonnet_model=data.get("sonnet_model"),
+            haiku_model=data.get("haiku_model"),
         )
 
 
@@ -669,11 +675,11 @@ class IntegrationSettings:
     def from_dict(cls, data: dict[str, Any]) -> IntegrationSettings:
         """Create from dictionary."""
         return cls(
-            codex_model=data.get("codex_model", None),
-            opencode_model=data.get("opencode_model", None),
-            openclaw_model=data.get("openclaw_model", None),
-            pi_model=data.get("pi_model", None),
-            copilot_model=data.get("copilot_model", None),
+            codex_model=data.get("codex_model"),
+            opencode_model=data.get("opencode_model"),
+            openclaw_model=data.get("openclaw_model"),
+            pi_model=data.get("pi_model"),
+            copilot_model=data.get("copilot_model"),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
         )
 
@@ -1209,6 +1215,7 @@ class GlobalSettings:
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
+            chunked_prefill=self.scheduler.chunked_prefill,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

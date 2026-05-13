@@ -198,6 +198,31 @@ class _PrefillAbortedError(Exception):
         )
 
 
+@dataclass
+class _PrefillState:
+    """Intermediate state for a request undergoing chunked prefill.
+
+    When chunked_prefill=True, a long prefill is spread across multiple
+    step() calls (one prefill_step_size chunk per step). This dataclass
+    holds all the state needed to resume prefill between steps.
+    """
+
+    request: Any
+    cache: list  # Accumulated prompt_cache (mutated in-place by each chunk)
+    tokens_remaining: Any  # mx.array shape (1, N) — tokens not yet prefilled
+    last_token: list  # tokens[-1:] — passed to batch_generator.insert()
+    tokens_processed: int  # Cumulative count for boundary snapshot math
+    base_size: int  # Prefix cache offset at prefill start (for alignment)
+    emitted_boundaries: dict  # {request_id: int} — last emitted boundary count
+    boundary_enabled: bool  # Whether boundary snapshots are active
+    block_size: int  # Copied from config.paged_cache_block_size
+    total_length: int  # len(original tokens) for completeness
+    # Pre-built insert-time params (set by _schedule_waiting before enqueuing)
+    sampler: Any = None
+    sm: Any = None
+    per_row_lps: Any = None
+
+
 # ---------------------------------------------------------------------------
 # Monkey-patch GenerationBatch._step to call grammar accept_token() after
 # sampling.  In the pipelined _step(), logits processors fill the bitmask
@@ -504,6 +529,10 @@ class SchedulerConfig:
     # BatchGenerator settings (passed directly to mlx-lm)
     completion_batch_size: int = 32
     prefill_step_size: int = 2048
+    # When True, long prefills are processed one chunk per step() call,
+    # interleaved with decode steps for already-running requests. This
+    # reduces TTFT for concurrent requests but adds per-step overhead.
+    chunked_prefill: bool = False
 
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block
@@ -666,6 +695,10 @@ class Scheduler:
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
         self.running: dict[str, Request] = {}  # Running requests by ID
+        # Chunked prefill queue: requests whose prefill spans multiple steps.
+        # Populated when chunked_prefill=True and prompt exceeds prefill_step_size.
+        self.prefilling: deque[Request] = deque()
+        self._prefill_states: dict[str, _PrefillState] = {}
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
 
@@ -1831,6 +1864,262 @@ class Scheduler:
             self.model._language_model._rope_deltas = _saved_rope_deltas
 
         return prompt_cache, last_token
+
+    # ------------------------------------------------------------------
+    # Chunked prefill helpers (used when config.chunked_prefill=True)
+    # ------------------------------------------------------------------
+
+    def _begin_prefill(
+        self,
+        request: "Request",
+        tokens: list[int],
+        existing_cache: "list[Any] | None",
+    ) -> _PrefillState:
+        """Initialise a _PrefillState for a non-VLM request.
+
+        Performs all once-per-request setup (cache creation, boundary config,
+        token splitting) without running any model forward passes.
+        """
+        if hasattr(self.model, "clear_vlm_position_state"):
+            self.model.clear_vlm_position_state()
+
+        prompt_cache = existing_cache if existing_cache is not None else make_prompt_cache(self.model)
+
+        block_size = self.config.paged_cache_block_size
+        boundary_enabled = (
+            block_size > 0
+            and self.block_aware_cache is not None
+            and _prompt_cache_needs_snapshots(prompt_cache)
+        )
+        base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
+        if (
+            boundary_enabled
+            and hasattr(request, "cached_tokens")
+            and request.cached_tokens > 0
+            and base_size != request.cached_tokens
+        ):
+            logger.debug(
+                "Cache base_size mismatch: computed %d, expected %d "
+                "(cached_tokens). Using cached_tokens for boundary alignment.",
+                base_size,
+                request.cached_tokens,
+            )
+            base_size = request.cached_tokens
+
+        prefill_tokens = tokens[:-1]
+        last_token = tokens[-1:]
+        input_arr = mx.array(prefill_tokens)[None]  # (1, N-1)
+
+        return _PrefillState(
+            request=request,
+            cache=prompt_cache,
+            tokens_remaining=input_arr,
+            last_token=last_token,
+            tokens_processed=0,
+            base_size=base_size,
+            emitted_boundaries={},
+            boundary_enabled=boundary_enabled,
+            block_size=block_size,
+            total_length=len(tokens),
+        )
+
+    def _step_prefill_chunk(self, state: _PrefillState) -> bool:
+        """Process one prefill chunk from *state*.
+
+        Runs the model on at most prefill_step_size tokens, evals the cache,
+        emits any due boundary snapshot, checks for abort, and clears Metal
+        intermediates.
+
+        Returns:
+            True when all tokens_remaining have been consumed (prefill done).
+
+        Raises:
+            _PrefillAbortedError: If the request is aborted between chunks.
+            RuntimeError: If the hard memory limit is exceeded.
+        """
+        if state.tokens_remaining.shape[1] == 0:
+            return True
+
+        n = min(self.config.prefill_step_size, state.tokens_remaining.shape[1])
+
+        # Clamp to the next block boundary so boundary snapshots fire exactly.
+        if state.boundary_enabled and state.block_size > 0:
+            current_total = state.base_size + state.tokens_processed
+            next_boundary = ((current_total // state.block_size) + 1) * state.block_size
+            delta = (next_boundary - state.base_size) - state.tokens_processed
+            if delta > 0:
+                n = min(n, delta)
+            n = max(1, n)
+
+        chunk = state.tokens_remaining[:, :n]
+        state.tokens_remaining = state.tokens_remaining[:, n:]
+        self.model(chunk, cache=state.cache)
+        mx.eval([c.state for c in state.cache])
+        state.tokens_processed += n
+
+        # Boundary snapshot
+        if state.boundary_enabled:
+            total_tokens = state.base_size + state.tokens_processed
+            rid = state.request.request_id
+            if (
+                total_tokens > 0
+                and total_tokens % state.block_size == 0
+                and state.emitted_boundaries.get(rid, -1) < total_tokens
+            ):
+                self._emit_prefill_boundary_snapshot(state.request, state.cache, total_tokens)
+                state.emitted_boundaries[rid] = total_tokens
+
+        # Hard memory limit
+        if self._memory_hard_limit_bytes > 0:
+            active = mx.get_active_memory()
+            if active > self._memory_hard_limit_bytes:
+                raise RuntimeError(
+                    f"Memory limit exceeded during chunked prefill at "
+                    f"{state.tokens_processed}/{state.total_length - 1} tokens"
+                )
+
+        # Abort check (direct request_id lookup — no temp uid in chunked path)
+        if state.request.request_id in self._pending_abort_ids:
+            raise _PrefillAbortedError([], state.tokens_processed)
+
+        _sync_and_clear_cache()
+        return state.tokens_remaining.shape[1] == 0
+
+    def _emit_final_boundary_if_needed(self, state: _PrefillState) -> None:
+        """Emit a final boundary snapshot if the prefill landed on a boundary."""
+        if not state.boundary_enabled:
+            return
+        total_tokens = state.base_size + state.tokens_processed
+        rid = state.request.request_id
+        if (
+            total_tokens > 0
+            and total_tokens % state.block_size == 0
+            and state.emitted_boundaries.get(rid, -1) < total_tokens
+        ):
+            self._emit_prefill_boundary_snapshot(state.request, state.cache, total_tokens)
+
+    def _insert_prefilled_request(
+        self,
+        request: "Request",
+        state: _PrefillState,
+        scheduled: "list[Request]",
+    ) -> None:
+        """Insert a fully-prefilled request into BatchGenerator.
+
+        Handles the batch_generator.insert() call, uid bookkeeping, and moving
+        the request to self.running. Called from both the inline chunked path
+        (first chunk completed immediately) and _advance_chunked_prefills()
+        (last chunk completed across steps).
+
+        Precondition: state.sampler, state.sm, state.per_row_lps are set.
+        """
+        if request.sampling_params.seed is not None:
+            mx.random.seed(request.sampling_params.seed)
+
+        per_row_lps = state.per_row_lps if state.per_row_lps is not None else []
+        uids = self.batch_generator.insert(
+            [state.last_token],
+            max_tokens=[request.sampling_params.max_tokens],
+            caches=[state.cache] if state.cache else None,
+            samplers=[state.sampler],
+            logits_processors=[per_row_lps],
+            state_machines=[state.sm],
+        )
+
+        if uids:
+            uid = uids[0]
+            self.request_id_to_uid[request.request_id] = uid
+            self.uid_to_request_id[uid] = request.request_id
+            now = time.monotonic()
+            request.batch_uid = uid
+            request.status = RequestStatus.RUNNING
+            request.generation_started_at = now
+            request.last_activity_at = now
+            self.running[request.request_id] = request
+            scheduled.append(request)
+
+            if hasattr(self.model, "register_rope_delta"):
+                self.model.register_rope_delta(uid, request.rope_deltas)
+
+            self.total_prompt_tokens += request.num_prompt_tokens
+            cache_info = (
+                f", {request.cached_tokens} cached" if request.cached_tokens > 0 else ""
+            )
+            logger.debug(
+                "Scheduled chunked-prefill request %s (uid=%d) "
+                "with %d tokens (%d total)%s",
+                request.request_id, uid,
+                len(state.last_token), request.num_prompt_tokens, cache_info,
+            )
+
+    def _advance_chunked_prefills(self, scheduled: "list[Request]") -> None:
+        """Process one prefill chunk per in-flight chunked-prefill request.
+
+        Called at the start of each step() before _schedule_waiting(). Each
+        call advances every request in self.prefilling by one prefill_step_size
+        chunk. When a request's prefill completes it is inserted into
+        BatchGenerator and moved to self.running.
+
+        Args:
+            scheduled: The step's running list of newly-scheduled requests;
+                completed chunked-prefill requests are appended here.
+        """
+        if not self.prefilling:
+            return
+
+        still_prefilling: deque[Request] = deque()
+
+        for request in self.prefilling:
+            rid = request.request_id
+            state = self._prefill_states.get(rid)
+
+            # State missing means the request was aborted and cleaned up by
+            # _do_abort_request() between steps — just skip it.
+            if state is None:
+                continue
+
+            try:
+                done = self._step_prefill_chunk(state)
+            except _PrefillAbortedError:
+                # Request aborted mid-chunk. Discard state; the abort will
+                # be fully processed by _process_pending_aborts() next step.
+                self._prefill_states.pop(rid, None)
+                continue
+            except RuntimeError as e:
+                logger.error("Chunked prefill failed for %s: %s", rid, e)
+                self._prefill_states.pop(rid, None)
+                # Remove from requests so the engine can report an error.
+                self.requests.pop(rid, None)
+                continue
+
+            if not done:
+                still_prefilling.append(request)
+                continue
+
+            # Prefill complete — emit final boundary snapshot and insert.
+            self._prefill_states.pop(rid, None)
+            self._emit_final_boundary_if_needed(state)
+            _sync_and_clear_cache()
+
+            # Ensure a BatchGenerator exists (may not if all requests were
+            # previously in chunked prefill with no running decode).
+            self._ensure_batch_generator(request.sampling_params)
+            if self.batch_generator is None:
+                # Unlikely, but if BG creation fails put request back.
+                logger.error(
+                    "BatchGenerator unavailable at chunked-prefill completion "
+                    "for %s; requeueing.", rid
+                )
+                still_prefilling.append(request)
+                self._prefill_states[rid] = state
+                continue
+
+            # Clean up the prefill-progress tracker entry.
+            get_prefill_tracker().remove(rid)
+
+            self._insert_prefilled_request(request, state, scheduled)
+
+        self.prefilling = still_prefilling
 
     def _build_state_machine(self, request: "Request") -> SequenceStateMachine:
         """Build a SequenceStateMachine for per-request stop tokens.
@@ -3705,6 +3994,13 @@ class Scheduler:
             except ValueError:
                 pass
 
+        # Remove from chunked-prefill queue (if mid-prefill)
+        if request_id in self._prefill_states:
+            self._prefill_states.pop(request_id, None)
+            self.prefilling = deque(
+                r for r in self.prefilling if r.request_id != request_id
+            )
+
         # Remove from running (BatchGenerator)
         if request.request_id in self.request_id_to_uid:
             uid = self.request_id_to_uid[request.request_id]
@@ -3786,7 +4082,7 @@ class Scheduler:
         Without this, an idle server would never reach the target step and
         stale buffers would accumulate indefinitely.
         """
-        return bool(self.waiting or self.running or self._deferred_clear_at is not None)
+        return bool(self.waiting or self.prefilling or self.running or self._deferred_clear_at is not None)
 
     def fail_all_requests(self) -> list[str]:
         """Remove all running and waiting requests after unrecoverable error.
@@ -3809,6 +4105,14 @@ class Scheduler:
                 req._extracted_cache = None
                 req.prompt_cache = None
         self.running.clear()
+        for request in list(self.prefilling):
+            failed_ids.append(request.request_id)
+            req = self.requests.pop(request.request_id, None)
+            if req is not None:
+                req._extracted_cache = None
+                req.prompt_cache = None
+        self.prefilling.clear()
+        self._prefill_states.clear()
         for request in list(self.waiting):
             failed_ids.append(request.request_id)
             req = self.requests.pop(request.request_id, None)
@@ -4290,13 +4594,6 @@ class Scheduler:
             # Only the last token goes to insert() for the first decode step.
             # SpecPrefill already handled its own prefill above, so skip for those.
             if request.specprefill_indices is None and len(tokens_to_process) > 1:
-                # Assign UID early so progress callbacks can map uid->request_id
-                # during external prefill. Use a temporary UID that will be replaced
-                # by the real one from insert().
-                temp_uid = id(request)  # unique, won't collide with BatchGenerator UIDs
-                self.request_id_to_uid[request.request_id] = temp_uid
-                self.uid_to_request_id[temp_uid] = request.request_id
-
                 vlm_embeds = None
                 if request.vlm_inputs_embeds is not None:
                     vlm_embeds = (
@@ -4304,6 +4601,44 @@ class Scheduler:
                         request.vlm_extra_kwargs or {},
                         request.cached_tokens,
                     )
+
+                # Chunked prefill: non-VLM prompts longer than one step are
+                # spread across multiple step() calls. The first chunk is run
+                # here; subsequent chunks run in _advance_chunked_prefills().
+                if (
+                    self.config.chunked_prefill
+                    and vlm_embeds is None
+                    and len(tokens_to_process) > self.config.prefill_step_size + 1
+                ):
+                    sm = self._build_state_machine(request)
+                    per_row_lps = list(logits_processors) if logits_processors else []
+                    state = self._begin_prefill(request, tokens_to_process, cache_to_use)
+                    state.sampler = sampler
+                    state.sm = sm
+                    state.per_row_lps = per_row_lps
+
+                    try:
+                        done = self._step_prefill_chunk(state)
+                    except _PrefillAbortedError:
+                        raise
+
+                    if done:
+                        self._emit_final_boundary_if_needed(state)
+                        _sync_and_clear_cache()
+                        get_prefill_tracker().remove(request.request_id)
+                        self._insert_prefilled_request(request, state, scheduled)
+                    else:
+                        self.prefilling.append(request)
+                        self._prefill_states[request.request_id] = state
+                    continue  # Skip normal prefill + insert path
+
+                # Normal (non-chunked) full prefill path.
+                # Assign a temporary UID so progress callbacks can map
+                # uid→request_id during external prefill. Replaced by the
+                # real UID returned from insert().
+                temp_uid = id(request)  # unique, won't collide with BatchGenerator UIDs
+                self.request_id_to_uid[request.request_id] = temp_uid
+                self.uid_to_request_id[temp_uid] = request.request_id
 
                 prefilled_cache, last_token = self._do_external_prefill(
                     request,
@@ -5048,8 +5383,18 @@ class Scheduler:
             self._check_memory_pressure()
 
         try:
+            # Advance in-flight chunked prefills (one chunk per request).
+            # Must run before _schedule_waiting() so that completing prefills
+            # are inserted into BatchGenerator before the decode step.
+            chunked_scheduled: list[Request] = []
+            if self.prefilling:
+                self._advance_chunked_prefills(chunked_scheduled)
+
             # Schedule waiting requests
             scheduled, rejected = self._schedule_waiting()
+            # Merge chunked-prefill completions into the scheduled list.
+            if chunked_scheduled:
+                scheduled = chunked_scheduled + scheduled
             output.scheduled_request_ids = [r.request_id for r in scheduled]
             output.num_scheduled_tokens = sum(r.num_prompt_tokens for r in scheduled)
             if rejected:
@@ -5214,6 +5559,7 @@ class Scheduler:
         """Get scheduler statistics."""
         stats = {
             "num_waiting": len(self.waiting),
+            "num_prefilling": len(self.prefilling),
             "num_running": len(self.running),
             "num_requests_processed": self.num_requests_processed,
             "total_prompt_tokens": self.total_prompt_tokens,
@@ -5240,6 +5586,8 @@ class Scheduler:
             self._do_abort_request(request_id)
 
         self.waiting.clear()
+        self.prefilling.clear()
+        self._prefill_states.clear()
         self.running.clear()
         self.requests.clear()
         self.finished_req_ids.clear()
