@@ -206,6 +206,34 @@ class TestMSDownloader:
 
             await downloader.shutdown()
 
+    @pytest.mark.asyncio
+    async def test_download_uses_owner_model_layout(self, model_dir):
+        """ms_snapshot_download must receive local_dir under the org subfolder."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = MSDownloader(model_dir=str(model_dir))
+
+        with patch(
+            "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
+        ), patch(
+            "omlx.admin.ms_downloader._get_ms_api"
+        ) as mock_get_api, patch(
+            "omlx.admin.ms_downloader.ms_snapshot_download"
+        ) as mock_download:
+            mock_api = MagicMock()
+            mock_api.get_model_files.return_value = []
+            mock_get_api.return_value = mock_api
+
+            await downloader.start_download("qwen/Qwen2.5-7B-Instruct-MLX")
+            await asyncio.sleep(0.5)
+
+            assert mock_download.called
+            call_kwargs = mock_download.call_args[1]
+            assert call_kwargs["local_dir"] == str(
+                model_dir / "qwen" / "Qwen2.5-7B-Instruct-MLX"
+            )
+
+            await downloader.shutdown()
+
     # --- Cancel Download ---
 
     @pytest.mark.asyncio

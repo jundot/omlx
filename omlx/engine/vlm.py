@@ -585,6 +585,7 @@ class VLMBatchedEngine(BaseEngine):
 
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
+        from ..utils.model_loading import maybe_load_custom_quantization
 
         # Apply pre-load patches (MTP runtime patch, etc.) before the model
         # is instantiated, so the patched ``__init__`` runs. ``maybe_apply``
@@ -605,6 +606,14 @@ class VLMBatchedEngine(BaseEngine):
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
             with _strip_audio_config_if_orphaned(Path(self._model_name)):
+                custom_loaded = maybe_load_custom_quantization(
+                    self._model_name,
+                    is_vlm=True,
+                )
+                if custom_loaded is not None:
+                    model, processor = custom_loaded
+                    return model, processor
+
                 return vlm_load(
                     self._model_name, trust_remote_code=self._trust_remote_code
                 )
@@ -698,7 +707,16 @@ class VLMBatchedEngine(BaseEngine):
                 try:
                     from mlx_lm import load as mlx_lm_load
 
+                    from ..utils.model_loading import maybe_load_custom_quantization
+
                     def _load_draft():
+                        custom_loaded = maybe_load_custom_quantization(
+                            specprefill_draft,
+                            is_vlm=False,
+                        )
+                        if custom_loaded is not None:
+                            draft_model, _ = custom_loaded
+                            return draft_model
                         draft_model, _ = mlx_lm_load(specprefill_draft)
                         return draft_model
                     draft_model = await loop.run_in_executor(get_mlx_executor(), _load_draft)

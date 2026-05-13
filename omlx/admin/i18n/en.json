@@ -367,6 +367,7 @@
   "settings.language.ja": "日本語",
   "settings.language.ru": "Русский",
   "settings.language.es": "Español",
+  "settings.language.fr": "Français",
   "settings.save.button": "Save Settings",
   "settings.save.saving": "Saving...",
   "settings.models.section_label": "Model Settings",

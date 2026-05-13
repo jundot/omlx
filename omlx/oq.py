@@ -805,7 +805,27 @@ class _TrackedTensor:
         new_shape = list(self.shape)
         if isinstance(idx, tuple):
             if Ellipsis in idx:
-                raise NotImplementedError("Ellipsis indexing not supported in _TrackedTensor")
+                # Expand Ellipsis to explicit slice(None) for the missing axes
+                # so the tuple-handling branch below (incl. half-split detection)
+                # works for sanitize patterns like gate_up[..., :mid, :].
+                rank = len(new_shape)
+                explicit = sum(
+                    1 for p in idx if p is not Ellipsis and p is not None
+                )
+                pad = max(0, rank - explicit)
+                expanded: list = []
+                seen = False
+                for part in idx:
+                    if part is Ellipsis:
+                        if seen:
+                            raise ValueError(
+                                "only one Ellipsis allowed in index"
+                            )
+                        seen = True
+                        expanded.extend([slice(None)] * pad)
+                    else:
+                        expanded.append(part)
+                idx = tuple(expanded)
             result_shape = []
             axis = 0
             split_info = None
@@ -2252,20 +2272,28 @@ def quantize_oq_streaming(
             )
         except Exception as e:
             if _model_exceeds_ram:
-                logger.error(
-                    f"Streaming discovery failed ({e}), skipping eager "
-                    "sanitize (model exceeds RAM). Output tensor names "
-                    "may not match inference expectations."
-                )
-            else:
-                logger.warning(
-                    f"Streaming discovery failed ({e}), falling back to eager sanitize"
-                )
-                try:
-                    all_weights = sanitize_fn(all_weights)
-                    logger.info(f"oQ{oq_level:g}: eager sanitize applied, {len(all_weights)} tensors")
-                except Exception as e2:
-                    logger.warning(f"Sanitize failed ({e2}), using original names")
+                # Silent skip used to produce broken artifacts (see #1204):
+                # the source layout (e.g. fused experts.gate_up_proj) never
+                # got remapped to inference-expected names, and load failed
+                # with "Received N parameters not in model". Hard-fail so the
+                # caller sees the cause immediately.
+                raise RuntimeError(
+                    f"oQ{oq_level:g}: streaming sanitize-plan discovery "
+                    f"failed ({e}) and the eager fallback is unsafe with "
+                    f"model size {_model_bytes / 1e9:.1f} GB exceeding "
+                    f"{int(_MAX_MODEL_RAM_FRACTION * 100)}% of system RAM "
+                    f"({_system_ram / 1e9:.1f} GB). Run on a machine with "
+                    "enough RAM, or extend _TrackedTensor to cover the "
+                    "indexing pattern the sanitize uses."
+                ) from e
+            logger.warning(
+                f"Streaming discovery failed ({e}), falling back to eager sanitize"
+            )
+            try:
+                all_weights = sanitize_fn(all_weights)
+                logger.info(f"oQ{oq_level:g}: eager sanitize applied, {len(all_weights)} tensors")
+            except Exception as e2:
+                logger.warning(f"Sanitize failed ({e2}), using original names")
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
 
