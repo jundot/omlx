@@ -29,6 +29,13 @@ def maybe_apply_pre_load_patches(
 
     Safe to call repeatedly; the patches are idempotent.
     """
+    # Reset the process-wide MTP flag so non-MTP-compatible models (or
+    # models with mtp_enabled=False) are not polluted by a prior model
+    # load that left the flag True.
+    from ..patches.mlx_lm_mtp import set_mtp_active
+
+    set_mtp_active(False)
+
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
         return

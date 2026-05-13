@@ -310,8 +310,21 @@ class BatchedEngine(BaseEngine):
                 try:
 
                     def _load_draft():
-                        draft_model, _ = load(specprefill_draft)
-                        return draft_model
+                        from ..patches.mlx_lm_mtp import set_mtp_active
+
+                        was_mtp = False
+                        try:
+                            from ..patches.mlx_lm_mtp import is_mtp_active
+
+                            was_mtp = is_mtp_active()
+                        except Exception:
+                            pass
+                        set_mtp_active(False)
+                        try:
+                            draft_model, _ = load(specprefill_draft)
+                            return draft_model
+                        finally:
+                            set_mtp_active(was_mtp)
 
                     draft_model = await loop.run_in_executor(
                         get_mlx_executor(), _load_draft
