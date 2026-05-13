@@ -1,5 +1,6 @@
 // PR 7 — Status screen. Lays out:
-//   • ServerHero (shared with Server screen)
+//   • ServerHeroCard (the same card the Server screen mounts; defined in
+//     ServerScreen.swift)
 //   • Session Stats — 4 StatTiles from /admin/api/stats (scope segmented)
 //   • System — slice of /admin/api/global-settings + uptime from /api/stats
 //   • Updates — three-state row + Channel/AutoCheck/AutoDownload (UpdateController stub)
@@ -15,7 +16,11 @@ struct StatusScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ServerHeroSlim()
+            // Same hero card the Server screen uses (omlx-screens.jsx:75
+            // and :833 reuse `ServerHero`). Pass no VM — Status doesn't
+            // expose port/host editors, so Restart just bounces the cached
+            // endpoint.
+            ServerHeroCard()
 
             SectionHeader("Session Stats") {
                 Segmented(selection: $vm.scope, options: [
@@ -28,17 +33,28 @@ struct StatusScreen: View {
 
             SectionHeader("System", subtitle: vm.systemSubtitle)
             ListGroup {
-                Row(label: "oMLX Version") {
-                    Text(vm.versionText)
+                Row(label: "GPU Wired Memory") {
+                    GpuMemoryTrailing(stats: vm.stats)
+                }
+                Row(label: "System RAM") {
+                    SystemRamTrailing(metrics: vm.metrics)
+                }
+                Row(
+                    label: "GPU Utilization",
+                    sublabel: "Approximate · active request load"
+                ) {
+                    Text(vm.gpuUtilizationText)
                         .font(.omlxMono(12))
-                        .foregroundStyle(.secondary)
+                }
+                Row(label: "Thermal State") {
+                    ThermalTrailing(state: vm.metrics.thermalState)
                 }
                 Row(label: "Server Uptime") {
                     Text(vm.uptimeText)
                         .font(.omlxMono(12))
                 }
-                Row(label: "Server", isLast: true) {
-                    Text(vm.endpointText)
+                Row(label: "oMLX Version", isLast: true) {
+                    Text(vm.versionText)
                         .font(.omlxMono(12))
                         .foregroundStyle(.secondary)
                 }
@@ -64,74 +80,16 @@ struct StatusScreen: View {
     }
 }
 
-// MARK: - Slim hero (Status screen variant — no buttons, just status info)
-
-private struct ServerHeroSlim: View {
-    @EnvironmentObject private var services: AppServices
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        HStack(spacing: 16) {
-            Squircle(gradient: SquircleGradient.server, size: 44) {
-                Text("oM")
-                    .font(.omlxText(18, weight: .heavy))
-                    .kerning(-0.4)
-                    .foregroundStyle(.white)
-            }
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 10) {
-                    Text("oMLX Server")
-                        .font(.omlxText(16, weight: .semibold))
-                        .foregroundStyle(theme.text)
-                    StatusPill(status: pillStatus)
-                }
-                Text(subtitle)
-                    .font(.omlxText(11.5))
-                    .foregroundStyle(theme.textSecondary)
-            }
-            Spacer()
-        }
-        .padding(14)
-        .background(theme.groupBg)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(theme.groupBorder, lineWidth: 0.5)
-        )
-        .padding(.horizontal, 14)
-        .padding(.bottom, 14)
-    }
-
-    private var pillStatus: StatusPill.Status {
-        switch services.serverState {
-        case .running:      return .running
-        case .starting:     return .starting
-        case .stopping:     return .stopping
-        case .stopped:      return .stopped
-        case .unresponsive: return .custom(color: theme.amberDot, label: "Unresponsive", fillBg: true)
-        case .failed:       return .error
-        }
-    }
-
-    private var subtitle: String {
-        let host = services.config.host, port = services.config.port
-        switch services.serverState {
-        case .running, .unresponsive: return "Listening on \(host):\(port)"
-        case .starting:               return "Starting…"
-        case .stopping:               return "Stopping…"
-        case .stopped:                return "Not running"
-        case .failed(let m):          return m
-        }
-    }
-}
-
 // MARK: - Stat tiles
 
 private struct StatTilesRow: View {
     let stats: StatsDTO?
 
     var body: some View {
-        HStack(spacing: 10) {
+        // `.top` alignment + each tile claiming `maxHeight: .infinity` keeps
+        // the four cards visually flush even when one of them wraps a
+        // subtitle to two lines at narrower widths.
+        HStack(alignment: .top, spacing: 10) {
             StatTile(
                 label: "Total Tokens",
                 value: stats.map { fmtNum($0.totalTokensServed) } ?? "—",
@@ -154,6 +112,7 @@ private struct StatTilesRow: View {
                 sub: stats.map { "\(($0.activeModels.totalActiveRequests ?? 0)) in flight" }
             )
         }
+        .fixedSize(horizontal: false, vertical: true)
         .padding(.horizontal, 14)
         .padding(.bottom, 4)
     }
@@ -187,7 +146,9 @@ private struct StatTile: View {
             }
         }
         .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        // maxHeight: .infinity lets every tile match the tallest sibling so
+        // the card backgrounds line up even when one subtitle wraps.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(theme.groupBg)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
@@ -202,6 +163,118 @@ private struct StatTile: View {
         case .success: return theme.greenDot
         case .warning: return theme.amberDot
         case .danger:  return theme.redDot
+        }
+    }
+}
+
+// MARK: - System rows
+
+/// Horizontal usage bar shared by the GPU memory + system RAM rows.
+/// 140pt × 4pt to match the JSX `.metric-bar` block in the redesign.
+private struct UsageBar: View {
+    let progress: Double
+    let tint: Color
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(theme.codeBg)
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(tint)
+                .frame(width: 140 * max(0, min(progress, 1)))
+                .animation(.easeOut(duration: 0.4), value: progress)
+        }
+        .frame(width: 140, height: 4)
+    }
+}
+
+private struct GpuMemoryTrailing: View {
+    let stats: StatsDTO?
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        let used = stats?.activeModels.modelMemoryUsed
+        let max = stats?.activeModels.modelMemoryMax
+        HStack(spacing: 10) {
+            UsageBar(progress: progress, tint: theme.blueDot)
+            Text(labelText(used: used, max: max))
+                .font(.omlxMono(11))
+                .foregroundStyle(theme.textSecondary)
+                .frame(minWidth: 110, alignment: .trailing)
+        }
+    }
+
+    private var progress: Double {
+        guard
+            let used = stats?.activeModels.modelMemoryUsed,
+            let max = stats?.activeModels.modelMemoryMax,
+            max > 0
+        else { return 0 }
+        return Double(used) / Double(max)
+    }
+
+    private func labelText(used: Int64?, max: Int64?) -> String {
+        guard let used, let max else { return "—" }
+        let u = SystemMetricsPoller.formatBytesAsGB(UInt64(Swift.max(0, used)))
+        let m = SystemMetricsPoller.formatBytesAsGB(UInt64(Swift.max(0, max)))
+        return "\(u) / \(m) GB"
+    }
+}
+
+private struct SystemRamTrailing: View {
+    @ObservedObject var metrics: SystemMetricsPoller
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        HStack(spacing: 10) {
+            UsageBar(progress: progress, tint: theme.text.opacity(0.7))
+            Text(labelText)
+                .font(.omlxMono(11))
+                .foregroundStyle(theme.textSecondary)
+                .frame(minWidth: 110, alignment: .trailing)
+        }
+    }
+
+    private var progress: Double {
+        guard let used = metrics.ramUsedBytes,
+              let total = metrics.ramTotalBytes,
+              total > 0
+        else { return 0 }
+        return Double(used) / Double(total)
+    }
+
+    private var labelText: String {
+        guard let used = metrics.ramUsedBytes,
+              let total = metrics.ramTotalBytes
+        else { return "—" }
+        let u = SystemMetricsPoller.formatBytesAsGB(used)
+        let t = SystemMetricsPoller.formatBytesAsGB(total)
+        return "\(u) / \(t) GB"
+    }
+}
+
+private struct ThermalTrailing: View {
+    let state: ProcessInfo.ThermalState
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        let severity = SystemMetricsPoller.severity(for: state)
+        HStack(spacing: 8) {
+            Circle()
+                .fill(color(for: severity))
+                .frame(width: 8, height: 8)
+            Text(SystemMetricsPoller.label(for: severity))
+                .font(.omlxText(12))
+                .foregroundStyle(theme.text)
+        }
+    }
+
+    private func color(for severity: ThermalSeverity) -> Color {
+        switch severity {
+        case .nominal:               return theme.greenDot
+        case .fair, .serious:        return theme.amberDot
+        case .critical:              return theme.redDot
         }
     }
 }
@@ -387,6 +460,11 @@ final class StatusScreenVM: ObservableObject {
     @Published var scope: String = "session"
     @Published var stats: StatsDTO?
     @Published var lastError: String?
+    /// Loaded once on appear from `scheduler.max_concurrent_requests`.
+    /// 8 is the server's default — used as the divisor before settings load
+    /// so the % column doesn't read 0/0 on first paint.
+    @Published var maxConcurrent: Int = 8
+    @Published var metrics = SystemMetricsPoller()
 
     private weak var client: OMLXClient?
     private var pollTask: Task<Void, Never>?
@@ -418,8 +496,27 @@ final class StatusScreenVM: ObservableObject {
         return "\(host):\(port)"
     }
 
+    var gpuUtilizationPercent: Double {
+        let active = Double(stats?.activeModels.totalActiveRequests ?? 0)
+        let cap = Double(max(1, maxConcurrent))
+        return min(100.0, active / cap * 100.0)
+    }
+
+    var gpuUtilizationText: String {
+        // Trailing "%" looks better tight against the number; the value
+        // is rounded to int so the row doesn't jitter at 12.499 → 12.500.
+        String(format: "%d%%", Int(gpuUtilizationPercent.rounded()))
+    }
+
     func start(client: OMLXClient) async {
         self.client = client
+        metrics.start()
+        // Load the scheduler cap once; failing silently is fine — the
+        // default keeps the % column readable until the server responds.
+        if let settings = try? await client.getGlobalSettings(),
+           let max = settings.scheduler?.maxConcurrentRequests {
+            self.maxConcurrent = max
+        }
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -433,6 +530,7 @@ final class StatusScreenVM: ObservableObject {
     func stop() {
         pollTask?.cancel()
         pollTask = nil
+        metrics.stop()
     }
 
     private func tick() async {
