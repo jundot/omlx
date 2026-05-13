@@ -1,15 +1,18 @@
 // PR 9 — Security.
 //
 // Three sections:
-//   • API Key — copyable current key (when configured) + a setup form when
-//                not yet configured (POST /admin/api/setup-api-key)
+//   • API Key — editable masked field with show/regenerate/copy/save.
+//                Routes through /admin/api/setup-api-key for first-time
+//                setup, and /admin/api/global-settings (`api_key` field)
+//                for updates to an already-configured key.
 //   • Authentication — `skip_api_key_verification` toggle (no-auth mode)
 //   • Sub Keys — list + create + delete via /admin/api/sub-keys (POST/DELETE)
 //
-// The main API key is shown as a CodeChip; the design hides it behind
-// "show password" but admins copy it into client configs all the time, so
-// click-to-copy is the right ergonomics. Sub keys are read+show-once (the
-// key is only revealed in the row that lists them — same as the GET response).
+// The main key is rendered as a SecureField with an explicit show toggle
+// rather than the always-visible CodeChip — administrators routinely have
+// this screen open over shoulder-surfable displays, and the copy button
+// covers the "stash it into a client config" case without exposing the
+// plaintext.
 
 import SwiftUI
 import AppKit
@@ -42,11 +45,6 @@ private struct APIKeySection: View {
     @ObservedObject var vm: SecurityScreenVM
     let client: OMLXClient
 
-    @State private var setup1: String = ""
-    @State private var setup2: String = ""
-
-    @Environment(\.omlxTheme) private var theme
-
     var body: some View {
         SectionHeader(
             "API Key",
@@ -54,53 +52,163 @@ private struct APIKeySection: View {
         )
 
         ListGroup {
-            if vm.apiKeySet {
-                Row(label: "Status", isLast: true) {
-                    HStack(spacing: 8) {
-                        StatusPill(status: .running)
-                        if let key = vm.apiKey, !key.isEmpty {
-                            CodeChip(value: key)
-                        }
+            APIKeyEditorRow(vm: vm, client: client)
+        }
+    }
+}
+
+private struct APIKeyEditorRow: View {
+    @ObservedObject var vm: SecurityScreenVM
+    let client: OMLXClient
+
+    @State private var draft: String = ""
+    @State private var showKey: Bool = false
+    @State private var copied: Bool = false
+    @State private var saving: Bool = false
+
+    @FocusState private var focused: Bool
+
+    @Environment(\.omlxTheme) private var theme
+
+    private var loaded: String { vm.apiKey ?? "" }
+    private var isDirty: Bool { draft != loaded }
+    private var trimmed: String { draft.trimmingCharacters(in: .whitespaces) }
+    /// Server-side rule: ≥ 4 printable chars, no whitespace. We mirror the
+    /// admin route's `validate_api_key` so the Save button can't enable for
+    /// a key the server will reject.
+    private var canSave: Bool {
+        isDirty
+            && trimmed.count >= 4
+            && !draft.contains(where: { $0.isWhitespace })
+            && !saving
+    }
+
+    private var sublabel: String {
+        vm.apiKeySet
+            ? "Used to authenticate /v1 and admin requests. ≥ 4 printable chars, no whitespace."
+            : "Set one before exposing the server. ≥ 4 printable chars, no whitespace."
+    }
+
+    var body: some View {
+        Row(label: "API Key", sublabel: sublabel, isLast: true) {
+            HStack(spacing: 6) {
+                field
+                iconButton(systemName: showKey ? "eye.slash" : "eye",
+                           help: showKey ? "Hide key" : "Show key") {
+                    showKey.toggle()
+                }
+                iconButton(systemName: "arrow.triangle.2.circlepath",
+                           help: "Generate a random key") {
+                    draft = APIKeyGenerator.random()
+                    showKey = true
+                }
+                iconButton(systemName: copied ? "checkmark" : "doc.on.doc",
+                           help: "Copy to clipboard",
+                           tint: copied ? theme.successText : theme.textSecondary,
+                           disabled: draft.isEmpty) {
+                    copyToClipboard()
+                }
+                if isDirty {
+                    Button(saving ? "Saving…" : "Save") {
+                        Task { await save() }
                     }
-                }
-            } else {
-                FreeRow {
-                    HStack(spacing: 8) {
-                        StatusPill(status: .custom(
-                            color: theme.amberDot, label: "Not configured", fillBg: true
-                        ))
-                        Text("Set an API key before exposing the server.")
-                            .font(.omlxText(12))
-                            .foregroundStyle(theme.textSecondary)
-                    }
-                }
-                Row(label: "New API Key",
-                    sublabel: "At least 4 printable characters, no whitespace") {
-                    TextInput(text: $setup1, placeholder: "sk-omlx-…", mono: true, width: 220)
-                }
-                Row(label: "Confirm") {
-                    TextInput(text: $setup2, placeholder: "Re-enter", mono: true, width: 220)
-                }
-                FreeRow(isLast: true) {
-                    HStack {
-                        Spacer()
-                        Button("Save API Key") {
-                            Task {
-                                let ok = await vm.setupApiKey(
-                                    key: setup1, confirm: setup2, client: client
-                                )
-                                if ok {
-                                    setup1 = ""
-                                    setup2 = ""
-                                }
-                            }
-                        }
-                        .buttonStyle(.omlx(.primary))
-                        .disabled(setup1.isEmpty || setup2.isEmpty || setup1 != setup2)
-                    }
+                    .buttonStyle(.omlx(.primary, size: .small))
+                    .disabled(!canSave)
                 }
             }
         }
+        .task(id: loaded) {
+            if !focused { draft = loaded }
+        }
+    }
+
+    @ViewBuilder
+    private var field: some View {
+        Group {
+            if showKey {
+                TextField("sk-omlx-…", text: $draft)
+            } else {
+                SecureField("sk-omlx-…", text: $draft)
+            }
+        }
+        .focused($focused)
+        .textFieldStyle(.plain)
+        .font(.omlxMono(13, weight: .medium))
+        .foregroundStyle(theme.text)
+        .padding(.horizontal, 10)
+        .frame(height: 28)
+        .frame(width: 260)
+        .background(theme.inputBg)
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(
+                    focused ? theme.inputBorderFocus : theme.inputBorder,
+                    lineWidth: 0.5
+                )
+        )
+        .onSubmit { Task { await save() } }
+    }
+
+    @ViewBuilder
+    private func iconButton(
+        systemName: String,
+        help: String,
+        tint: Color? = nil,
+        disabled: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(tint ?? theme.textSecondary)
+                .frame(width: 26, height: 26)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .help(help)
+    }
+
+    private func copyToClipboard() {
+        guard !draft.isEmpty else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(draft, forType: .string)
+        copied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { copied = false }
+    }
+
+    private func save() async {
+        guard canSave else { return }
+        saving = true
+        defer { saving = false }
+        let next = trimmed
+        let ok = await vm.applyApiKey(next, client: client)
+        if ok {
+            // Drop focus so the next `.task(id:)` mirror picks up the fresh
+            // loaded value without fighting an in-progress edit.
+            focused = false
+            draft = next
+        }
+    }
+
+}
+
+/// File-scoped so unit tests can exercise the shape without reaching into
+/// the View. Kept tiny — anything more elaborate (e.g. crypto-grade RNG,
+/// configurable prefix) earns its own type.
+enum APIKeyGenerator {
+    static let prefix = "sk-omlx-"
+    static let bodyAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    static let bodyLength = 24
+
+    /// 24-char alphanumeric body — ~143 bits of entropy, comfortably above
+    /// the server's "≥ 4 printable, no whitespace" floor and short enough
+    /// to fit the editor row's field without truncation.
+    static func random() -> String {
+        let body = String((0..<bodyLength).map { _ in bodyAlphabet.randomElement()! })
+        return "\(prefix)\(body)"
     }
 }
 
@@ -291,6 +399,32 @@ final class SecurityScreenVM: ObservableObject {
         } catch {
             self.lastError = describe(error)
             return false
+        }
+    }
+
+    /// Unified write path for the editor row. Routes through /setup-api-key
+    /// for first-time setup (server rejects the PATCH path when no key is
+    /// configured) and through PATCH /global-settings for updates.
+    func applyApiKey(_ key: String, client: OMLXClient) async -> Bool {
+        if apiKeySet {
+            do {
+                _ = try await client.updateGlobalSettings(
+                    GlobalSettingsPatch(apiKey: key)
+                )
+                client.configure(host: client.host, port: client.port, apiKey: key)
+                await load(client: client)
+                return true
+            } catch {
+                self.lastError = describe(error)
+                return false
+            }
+        } else {
+            // First-time setup: the dedicated endpoint requires a confirm
+            // value, which the editor row collapses into a single field. We
+            // mirror the draft as the confirm so the server-side equality
+            // check passes — typo protection lives in the field's own
+            // show/copy affordances now, not in a duplicate input.
+            return await setupApiKey(key: key, confirm: key, client: client)
         }
     }
 

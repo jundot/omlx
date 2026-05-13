@@ -11,7 +11,6 @@ import SwiftUI
 
 struct AppView: View {
     @State private var selection: AppSection = .server
-    @State private var search: String = ""
 
     @Environment(\.colorScheme) private var scheme
     @EnvironmentObject private var services: AppServices
@@ -20,7 +19,7 @@ struct AppView: View {
         let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
 
         NavigationSplitView {
-            Sidebar(selection: bindingForSelection(), search: $search)
+            Sidebar(selection: bindingForSelection())
                 .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 260)
         } detail: {
             ContentScaffold(section: selection, detailTitle: detailTitle) {
@@ -32,6 +31,17 @@ struct AppView: View {
         .frame(minWidth: 880, idealWidth: 1140, minHeight: 600, idealHeight: 760)
         .background(theme.windowBg)
         .environment(\.omlxTheme, theme)
+        .onChange(of: services.requestedSection) { _, requested in
+            // A screen asked us to navigate elsewhere (e.g. "Edit on
+            // Server →" from the per-model Profiles tab). Clear the
+            // request after applying so the same section can be requested
+            // twice in a row.
+            if let requested {
+                if requested != .models { services.modelDetailID = nil }
+                selection = requested
+                services.requestedSection = nil
+            }
+        }
     }
 
     /// Drilling out of ModelSettingsScreen via the sidebar (changing section)
@@ -87,15 +97,30 @@ private struct ContentScaffold<Content: View>: View {
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-                content()
-                    .frame(maxWidth: 720, alignment: .topLeading)
-                    .frame(maxWidth: .infinity, alignment: .top)
+        Group {
+            if section.fillsContentArea {
+                // Skip the outer ScrollView so the screen can claim the
+                // available height (Logs uses this for its monospace pane).
+                VStack(alignment: .leading, spacing: 0) {
+                    content()
+                        .frame(maxWidth: 720, alignment: .topLeading)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                }
+                .padding(.top, 20)
+                .padding(.horizontal, 28)
+                .padding(.bottom, 18)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        content()
+                            .frame(maxWidth: 720, alignment: .topLeading)
+                            .frame(maxWidth: .infinity, alignment: .top)
+                    }
+                    .padding(.top, 20)
+                    .padding(.horizontal, 28)
+                    .padding(.bottom, 36)
+                }
             }
-            .padding(.top, 20)
-            .padding(.horizontal, 28)
-            .padding(.bottom, 36)
         }
         .background(theme.contentBg)
         .navigationTitle(detailTitle ?? section.title)

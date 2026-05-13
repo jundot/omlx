@@ -49,7 +49,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         let vm = WelcomeViewModel(
             services: services,
             server: server,
-            isReentry: AppConfig.configFileExists
+            isReentry: AppConfig.hasExistingConfig
         )
         vm.onFinish = { [weak self] config, server in
             guard let self else { return }
@@ -249,10 +249,19 @@ final class WelcomeViewModel: ObservableObject {
             return false
         }
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespaces)
+        let resolvedBase = ((basePath.trimmingCharacters(in: .whitespaces)
+                             as NSString).expandingTildeInPath as NSString)
+            .standardizingPath
         var config = services.config
-        config.basePath = basePath.trimmingCharacters(in: .whitespaces)
+        config.basePath = resolvedBase
         config.port = port
-        config.modelDir = modelDir.trimmingCharacters(in: .whitespaces)
+        // modelDir is always a literal path. The wizard's "Reset" button
+        // clears the field — interpret that as "use the default for the
+        // basePath I just picked" rather than persisting an empty string.
+        let trimmedDir = modelDir.trimmingCharacters(in: .whitespaces)
+        config.modelDir = trimmedDir.isEmpty
+            ? AppConfig.defaultModelDir(forBasePath: resolvedBase)
+            : trimmedDir
         config.hfEndpoint = hfMirror.trimmingCharacters(in: .whitespaces)
         config.apiKey = trimmedKey
 
@@ -261,12 +270,29 @@ final class WelcomeViewModel: ObservableObject {
         // directory is missing, it bails with "Cannot create directory".
         do {
             try FileManager.default.createDirectory(
-                at: URL(fileURLWithPath: (config.basePath as NSString).expandingTildeInPath),
+                at: URL(fileURLWithPath: resolvedBase),
                 withIntermediateDirectories: true
             )
         } catch {
             lastError = "Cannot create base directory: \(error.localizedDescription)"
             return false
+        }
+
+        // Persist the basePath so every relaunch path resolves to it:
+        //   • setenv() for this process (and the child we're about to spawn)
+        //   • bootstrap file for Finder relaunches (launchd env doesn't
+        //     inherit shell rc, so the env var alone isn't enough)
+        //   • shell rc for terminal-launched processes
+        // When the user kept the default ~/.omlx, every override is cleared.
+        let isDefault = (resolvedBase == AppConfig.defaultBasePath())
+        if isDefault {
+            unsetenv(ShellEnvWriter.variableName)
+            try? AppConfig.writeBootstrapBasePath(nil)
+            ShellEnvWriter.apply(value: nil)
+        } else {
+            setenv(ShellEnvWriter.variableName, resolvedBase, 1)
+            try? AppConfig.writeBootstrapBasePath(resolvedBase)
+            ShellEnvWriter.apply(value: resolvedBase)
         }
 
         do {
@@ -288,7 +314,8 @@ final class WelcomeViewModel: ObservableObject {
                 proc = ServerProcess(
                     runtime: runtime,
                     host: config.host,
-                    port: config.port
+                    port: config.port,
+                    basePath: URL(fileURLWithPath: config.basePath, isDirectory: true)
                 )
             } catch {
                 lastError = "Failed to locate Python runtime: \(error.localizedDescription)"

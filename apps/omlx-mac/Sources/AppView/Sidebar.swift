@@ -1,12 +1,12 @@
 // PR 6 — sidebar for the AppView shell.
 //
-// Mirrors omlx-components.jsx: SidebarSearch (143-167), SidebarItem (169-209),
-// SidebarGroupLabel (211-220), Sidebar (222-245). Sections + ordering match
-// VariantClassic (omlx-variants.jsx:12-26).
+// Mirrors omlx-components.jsx: SidebarItem (169-209), SidebarGroupLabel
+// (211-220), Sidebar (222-245). Sections + ordering match VariantClassic
+// (omlx-variants.jsx:12-26).
 //
-// Search is wired to a binding but does NOT filter the list — that lands in a
-// later PR. Keeping it inert here mirrors the design canvas, which captures
-// the user's typed string but never reduces the nav set.
+// The design canvas had a search field above the nav list; we shipped it
+// inert in PR 6, then ripped it out — without filtering wired up it was
+// just visual noise.
 
 import SwiftUI
 
@@ -67,15 +67,25 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
     var group: SidebarGroup {
         switch self {
         case .server, .status, .logs:                return .server
-        case .models, .downloads, .integrations:     return .ai
+        case .models, .downloads, .integrations:     return .models
         case .security, .about:                      return .general
+        }
+    }
+
+    /// True when the screen wants to fill the content area vertically rather
+    /// than ride inside the default outer scroll view. The Logs pane uses
+    /// this so its monospace text block grows with the window.
+    var fillsContentArea: Bool {
+        switch self {
+        case .logs: return true
+        default:    return false
         }
     }
 }
 
 enum SidebarGroup: String, CaseIterable, Hashable, Sendable {
     case server  = "Server"
-    case ai      = "AI"
+    case models  = "Models"
     case general = "General"
 
     var sections: [AppSection] {
@@ -91,30 +101,25 @@ enum SidebarGroup: String, CaseIterable, Hashable, Sendable {
 
 struct Sidebar: View {
     @Binding var selection: AppSection
-    @Binding var search: String
 
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        VStack(spacing: 0) {
-            SidebarSearchField(text: $search)
-                .padding(.top, 6)
-
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(SidebarGroup.allCases, id: \.self) { group in
-                        SidebarGroupLabel(title: group.localizedTitle)
-                        ForEach(group.sections) { section in
-                            SidebarItem(
-                                section: section,
-                                isSelected: selection == section,
-                                onTap: { selection = section }
-                            )
-                        }
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(SidebarGroup.allCases, id: \.self) { group in
+                    SidebarGroupLabel(title: group.localizedTitle)
+                    ForEach(group.sections) { section in
+                        SidebarItem(
+                            section: section,
+                            isSelected: selection == section,
+                            onTap: { selection = section }
+                        )
                     }
                 }
-                .padding(.bottom, 10)
             }
+            .padding(.top, 6)
+            .padding(.bottom, 10)
         }
         .background(theme.sidebarBg)
         .overlay(alignment: .trailing) {
@@ -122,35 +127,6 @@ struct Sidebar: View {
                 .fill(theme.sidebarBorder)
                 .frame(width: 0.5)
         }
-    }
-}
-
-// MARK: - Search field
-
-private struct SidebarSearchField: View {
-    @Binding var text: String
-
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 11, weight: .regular))
-                .foregroundStyle(theme.textTertiary)
-
-            TextField("Search", text: $text)
-                .textFieldStyle(.plain)
-                .font(.omlxText(12))
-                .foregroundStyle(theme.text)
-        }
-        .padding(.horizontal, 6)
-        .frame(height: 22)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(theme.isDark ? Color.black.opacity(0.25) : Color.black.opacity(0.06))
-        )
-        .padding(.horizontal, 14)
-        .padding(.bottom, 6)
     }
 }
 
@@ -237,10 +213,9 @@ private struct SidebarItem: View {
 
 private struct SidebarPreview: View {
     @State private var selection: AppSection = .server
-    @State private var search: String = ""
 
     var body: some View {
-        Sidebar(selection: $selection, search: $search)
+        Sidebar(selection: $selection)
             .frame(width: 220, height: 600)
             .omlxThemed()
     }

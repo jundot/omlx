@@ -70,11 +70,30 @@ final class ServerProcess: @unchecked Sendable {
 
     // Inputs
 
-    let host: String
-    let port: Int
-    let basePath: URL
+    private(set) var host: String
+    private(set) var port: Int
+    private(set) var basePath: URL
     private let runtime: PythonRuntime
-    private let resolver: PortConflictResolver
+    private var resolver: PortConflictResolver
+
+    /// Apply a new host/port/basePath. Only legal while the server is
+    /// stopped — won't take effect until the next `start()`. Caller is
+    /// responsible for stopping first; we throw if asked to mutate a live
+    /// process so a stale resolver / spawn args can never reach a running
+    /// uvicorn.
+    enum ReconfigureError: Error { case serverIsLive }
+    func reconfigure(host: String? = nil, port: Int? = nil, basePath: URL? = nil) throws {
+        switch state {
+        case .running, .starting, .stopping, .unresponsive:
+            throw ReconfigureError.serverIsLive
+        case .stopped, .failed:
+            break
+        }
+        if let host { self.host = host }
+        if let port { self.port = port }
+        if let basePath { self.basePath = basePath }
+        self.resolver = PortConflictResolver(host: self.host, port: self.port)
+    }
 
     // Tunables (mirror server_manager.py)
 
@@ -140,11 +159,7 @@ final class ServerProcess: @unchecked Sendable {
             )
             update(.failed(message: "Port \(port) in use" +
                            (conflict.isOMLX ? " (oMLX server already running)" : "")))
-            NotificationCenter.default.post(
-                name: Self.portConflictNotification,
-                object: self,
-                userInfo: ["conflict": conflict]
-            )
+            postPortConflict(conflict)
             return .portConflict(conflict)
         }
 
@@ -378,7 +393,32 @@ final class ServerProcess: @unchecked Sendable {
     private func update(_ next: State) {
         guard state != next else { return }
         state = next
-        NotificationCenter.default.post(name: Self.stateDidChangeNotification, object: self)
+        // Observers (MenubarController.serverStateChanged, AppServices) are
+        // `@MainActor`. We can be called from the cooperative executor pool
+        // (via `await stop()` / `await forceRestart()` / `tickHealth`), so a
+        // direct synchronous post trips Swift 6's actor-isolation check and
+        // crashes the parent — see crash report 2026-05-09. Hop to main.
+        let note = Self.stateDidChangeNotification
+        if Thread.isMainThread {
+            NotificationCenter.default.post(name: note, object: self)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                NotificationCenter.default.post(name: note, object: self)
+            }
+        }
+    }
+
+    private func postPortConflict(_ conflict: PortConflict) {
+        let note = Self.portConflictNotification
+        if Thread.isMainThread {
+            NotificationCenter.default.post(name: note, object: self, userInfo: ["conflict": conflict])
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                NotificationCenter.default.post(name: note, object: self, userInfo: ["conflict": conflict])
+            }
+        }
     }
 
     private func ensureDir(_ url: URL) throws {

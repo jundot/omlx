@@ -269,13 +269,13 @@
         }
       }
     },
-    "sidebar.group.ai": {
+    "sidebar.group.models": {
       "extractionState": "manual",
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "AI"
+            "value": "Models"
           }
         }
       }

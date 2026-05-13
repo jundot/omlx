@@ -69,7 +69,7 @@ KEY_MAP: dict[str, str | None] = {
     "sidebar.security":         None,
     "sidebar.about":            None,
     "sidebar.group.server":     None,
-    "sidebar.group.ai":         None,
+    "sidebar.group.models":     None,
     "sidebar.group.general":    None,
 
     # Server screen
@@ -120,7 +120,7 @@ NATIVE_DEFAULTS: dict[str, str] = {
     "sidebar.security":          "Security",
     "sidebar.about":             "About",
     "sidebar.group.server":      "Server",
-    "sidebar.group.ai":          "AI",
+    "sidebar.group.models":      "Models",
     "sidebar.group.general":     "General",
 
     # Server screen

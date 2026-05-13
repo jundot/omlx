@@ -31,6 +31,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var welcomeController: WelcomeWindowController?
     private var welcomeCloseObserver: NSObjectProtocol?
 
+    private var appViewController: AppViewWindowController?
+
+    /// Show (or re-show) the AppView window. Lazily creates the controller
+    /// on first call, then reuses the same window for the app's lifetime.
+    func presentAppView() {
+        if appViewController == nil {
+            appViewController = AppViewWindowController(services: services)
+        }
+        appViewController?.present()
+    }
+
     nonisolated func applicationWillFinishLaunching(_ notification: Notification) {
         // Regular policy until the status item registers; we flip to Accessory
         // after creating the menubar (next runloop tick).
@@ -43,14 +54,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let config = AppConfig.load()
         services.updateConfig(config)
 
-        if AppConfig.configFileExists {
+        if AppConfig.hasExistingConfig {
+            // Returning user. AppConfig.load() picks the highest-priority
+            // file (`~/.omlx/settings.json` first, Library config.json
+            // second) and stamps `config.source` so future saves route to
+            // the same file. No re-write needed here.
             bootstrapServer(config: config)
             scheduleAccessoryPolicyFlip()
         } else {
             // First run: stand up the menubar without a server, then run the
             // wizard. The wizard's "Start Server" creates a ServerProcess via
             // `services.bind(server:)`; AppDelegate adopts it back on close.
-            self.menubar = MenubarController(server: nil, config: config)
+            self.menubar = MenubarController(
+                server: nil,
+                config: config,
+                openAppView: { [weak self] in self?.presentAppView() }
+            )
             // Stay in .regular until the wizard closes so the user sees the
             // window in the Dock.
             NSApp.activate(ignoringOtherApps: true)
@@ -64,10 +83,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let server = ServerProcess(
                 runtime: runtime,
                 host: config.host,
-                port: config.port
+                port: config.port,
+                basePath: URL(fileURLWithPath: config.basePath, isDirectory: true)
             )
             self.server = server
-            self.menubar = MenubarController(server: server, config: config)
+            self.menubar = MenubarController(
+                server: server,
+                config: config,
+                openAppView: { [weak self] in self?.presentAppView() }
+            )
             services.bind(server: server)
 
             // Install signal handlers BEFORE the spawn so a fast crash of
@@ -88,7 +112,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         } catch {
             // Surface the failure in the menubar; in-app banner lands in PR 6.
-            self.menubar = MenubarController(server: nil, config: config, lastError: error)
+            self.menubar = MenubarController(
+                server: nil,
+                config: config,
+                lastError: error,
+                openAppView: { [weak self] in self?.presentAppView() }
+            )
             NSLog("oMLX-next: server bootstrap failed — \(error)")
         }
     }
@@ -148,7 +177,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let server, menubar != nil {
             self.menubar = MenubarController(
                 server: server,
-                config: services.config
+                config: services.config,
+                openAppView: { [weak self] in self?.presentAppView() }
             )
         }
         scheduleAccessoryPolicyFlip()

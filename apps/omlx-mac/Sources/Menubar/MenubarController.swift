@@ -7,9 +7,9 @@
 //   • Stop Server     (RUNNING / STARTING / STOPPING / UNRESPONSIVE)
 //   • Start Server    (STOPPED / IDLE / FAILED)
 //   • Serving Stats   (Session + All-Time submenu)
-//   • Admin Panel     (enabled when running — brings up the SwiftUI AppView)
+//   • Admin Panel     (enabled when running — opens the SwiftUI AppView
+//                      window via the openAppView callback)
 //   • Chat with oMLX  (enabled when running — opens /admin/chat in browser)
-//   • Settings…       (Cmd-, → SwiftUI Settings scene = AppView)
 //   • About oMLX
 //   • Quit oMLX       (Cmd-Q)
 //
@@ -27,6 +27,7 @@ final class MenubarController: NSObject {
     private let server: ServerProcess?
     private let config: AppConfig
     private let bootstrapError: Error?
+    private let openAppView: () -> Void
 
     private var statusItem: NSStatusItem
     private let menu = NSMenu()
@@ -51,10 +52,16 @@ final class MenubarController: NSObject {
 
     // MARK: - Init
 
-    init(server: ServerProcess?, config: AppConfig, lastError: Error? = nil) {
+    init(
+        server: ServerProcess?,
+        config: AppConfig,
+        lastError: Error? = nil,
+        openAppView: @escaping () -> Void = {}
+    ) {
         self.server = server
         self.config = config
         self.bootstrapError = lastError
+        self.openAppView = openAppView
 
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
@@ -144,7 +151,8 @@ final class MenubarController: NSObject {
 
         adminPanelItem = item("Admin Panel",
                               action: #selector(openAdminPanel),
-                              symbol: "globe")
+                              symbol: "globe",
+                              keyEquivalent: ",")
         menu.addItem(adminPanelItem)
 
         chatItem = item("Chat with oMLX",
@@ -153,12 +161,6 @@ final class MenubarController: NSObject {
         menu.addItem(chatItem)
 
         menu.addItem(.separator())
-
-        let prefs = item("Settings…",
-                         action: #selector(openSettings),
-                         symbol: "gearshape",
-                         keyEquivalent: ",")
-        menu.addItem(prefs)
 
         let about = item("About oMLX-next",
                          action: #selector(showAbout),
@@ -388,29 +390,15 @@ final class MenubarController: NSObject {
     }
 
     @objc private func openAdminPanel() {
-        // Routes to the SwiftUI AppView (the same `Settings` scene Cmd-, opens).
-        // We're an .accessory app — without `activate` the window opens behind
-        // the foreground app. Browser fallback is gone as of PR 6.
-        openAppViewWindow()
+        // The AppDelegate owns AppViewWindowController; we just ask it to
+        // present. This avoids the Settings-scene + .accessory bug where
+        // `showSettingsWindow:` silently no-ops when no window is up.
+        openAppView()
     }
 
     @objc private func openChat() {
         guard let url = URL(string: "http://\(config.host):\(config.port)/admin/chat") else { return }
         NSWorkspace.shared.open(url)
-    }
-
-    @objc private func openSettings() {
-        openAppViewWindow()
-    }
-
-    /// Brings the SwiftUI Settings scene (i.e., the AppView shell) to the
-    /// front. macOS 14+ exposes `showSettingsWindow:`; older selectors still
-    /// route through AppKit, so we try both.
-    private func openAppViewWindow() {
-        NSApp.activate(ignoringOtherApps: true)
-        if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: self) {
-            _ = NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: self)
-        }
     }
 
     @objc private func showAbout() {
