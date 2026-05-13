@@ -377,6 +377,7 @@ async def create_transcription(
     response_format: str = Form("json"),
     temperature: float = Form(0.0),
     max_tokens: Optional[int] = Form(None),
+    word_timestamps: bool = Form(False),
 ):
     """OpenAI-compatible audio transcription endpoint (Speech-to-Text).
 
@@ -387,6 +388,12 @@ async def create_transcription(
     output cap. Useful for long audio with models like VibeVoice-ASR whose
     mlx-audio default (8192) truncates ~24 min files. When omitted, the
     model's own default applies.
+
+    ``word_timestamps`` is an oMLX extension that exposes mlx-audio's native
+    word-level alignment for Whisper models. When True, each segment in the
+    response includes a ``words`` array of
+    ``{word, start, end, probability}`` objects. Default False preserves the
+    existing response shape for every current caller.
     """
     from omlx.engine.stt import STTEngine
     from omlx.exceptions import ModelNotFoundError
@@ -444,6 +451,8 @@ async def create_transcription(
         transcribe_kwargs: dict = {"language": language}
         if effective_max_tokens is not None:
             transcribe_kwargs["max_tokens"] = effective_max_tokens
+        if word_timestamps:
+            transcribe_kwargs["word_timestamps"] = True
         result = await engine.transcribe(tmp_path, **transcribe_kwargs)
     except HTTPException:
         raise
