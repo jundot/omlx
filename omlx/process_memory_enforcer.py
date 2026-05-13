@@ -393,8 +393,13 @@ class ProcessMemoryEnforcer:
             )
 
     def get_status(self) -> dict:
-        """Get enforcer status for monitoring endpoints."""
-        current = mx.get_active_memory() if self._running else 0
+        """Get enforcer status for monitoring endpoints.
+
+        Reports the same `max(active, phys_footprint)` value the enforcer
+        uses internally so admin UI / /health utilization matches the
+        watermark the enforcer is actually comparing against.
+        """
+        current = self._current_usage_bytes() if self._running else 0
         return {
             "enabled": self._running,
             "max_bytes": self._max_bytes,

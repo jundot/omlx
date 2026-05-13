@@ -813,3 +813,16 @@ class TestTwoWatermarkPressureLevels:
             await enforcer_2wm._check_and_enforce()
 
         assert loading_entry.abort_loading is True
+
+    def test_get_status_uses_max_active_and_phys(self, enforcer_2wm):
+        """get_status must report the same value enforcer compares against,
+        so admin UI / /health utilization matches the watermark logic."""
+        enforcer_2wm._running = True
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            mock_mx.get_active_memory.return_value = 50 * 1024**3
+            gpf.return_value = 88 * 1024**3  # phys dominates
+            status = enforcer_2wm.get_status()
+        assert status["current_bytes"] == 88 * 1024**3
+        # Utilization computed against the max value
+        assert abs(status["utilization"] - 0.88) < 0.01
