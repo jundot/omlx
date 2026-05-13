@@ -2199,7 +2199,7 @@
                     return entry?.cache_rates?.cumulative || {};
                 }
 
-                const sumKeys = ['prefix_hits', 'prefix_misses', 'evictions', 'ssd_hot_hits', 'ssd_disk_loads', 'ssd_saves', 'hot_cache_evictions', 'hot_cache_promotions'];
+                const sumKeys = ['prefix_hits', 'prefix_misses', 'evictions', 'ssd_hot_hits', 'ssd_disk_loads', 'ssd_saves', 'hot_cache_evictions', 'hot_cache_promotions', 'mru_partial_stashes', 'mru_partial_hits', 'mru_partial_evictions', 'mru_partial_tokens_saved'];
                 let agg = {};
 
                 for (const m of entries) {
@@ -2214,8 +2214,11 @@
                 const pm = agg.prefix_misses || 0;
                 const sh = agg.ssd_hot_hits || 0;
                 const sd = agg.ssd_disk_loads || 0;
+                const ms = agg.mru_partial_stashes || 0;
+                const mh = agg.mru_partial_hits || 0;
                 agg.prefix_hit_rate = (ph + pm) > 0 ? ph / (ph + pm) : 0;
                 agg.ssd_hot_rate = (sh + sd) > 0 ? sh / (sh + sd) : 0;
+                agg.mru_partial_hit_rate = ms > 0 ? mh / ms : 0;
 
                 return agg;
             },
@@ -2285,6 +2288,12 @@
                 const rc = this.stats.runtime_cache;
                 if (!rc || !rc.hot_cache_max_bytes) return 0;
                 return Math.min(100, (rc.hot_cache_size_bytes / rc.hot_cache_max_bytes) * 100);
+            },
+
+            get runtimeMruPartialPercent() {
+                const rc = this.stats.runtime_cache;
+                if (!rc || !rc.mru_partial_max_entries) return 0;
+                return Math.min(100, (rc.mru_partial_entries / rc.mru_partial_max_entries) * 100);
             },
 
             get runtimeSsdCachePercent() {

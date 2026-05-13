@@ -3437,6 +3437,224 @@ class TestMRUPartialMultiSlot:
         assert len(cache._mru_partials) == 2
 
 
+class TestMRUPartialCounters:
+    """The observability counters mirror PR #1183's pattern so operators
+    can answer "is the MRU cache paying off" with the same dashboard
+    surface they use for prefix-hit and memory-hit rates.
+
+    Counters: ``mru_partial_stashes``, ``mru_partial_hits``,
+    ``mru_partial_evictions``, ``mru_partial_tokens_saved``.
+    Gauges:    ``mru_partial_entries``, ``mru_partial_max_entries``.
+    """
+
+    @pytest.fixture
+    def mx(self):
+        try:
+            import mlx.core as mx
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    @pytest.fixture
+    def paged_cache(self):
+        return PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+
+    @pytest.fixture
+    def mock_ssd(self):
+        mock = MagicMock()
+        mock.save_block.return_value = True
+        mock.load_block.return_value = None
+        mock.load_block_with_metadata.return_value = (None, None)
+        mock.has_block.return_value = False
+        return mock
+
+    def _cache(self, paged_cache, mock_ssd, max_entries=4):
+        return BlockAwarePrefixCache(
+            model=MockModel(num_layers=4),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+            mru_partial_max_entries=max_entries,
+        )
+
+    def _kv_layer(self, mx, n_tokens, head_dim=4):
+        return {
+            "state": (
+                mx.full((1, 1, n_tokens, head_dim), 1.0),
+                mx.full((1, 1, n_tokens, head_dim), 1.0),
+            ),
+            "cache_type": "KVCache",
+            "class_name": "KVCache",
+        }
+
+    def _make_reconstructed_cache(self, mx, n_layers, n_tokens, head_dim=4):
+        class MockKVCache:
+            def __init__(self, k, v, offset):
+                self.keys = k
+                self.values = v
+                self.offset = offset
+
+        return [
+            MockKVCache(
+                mx.ones((1, 1, n_tokens, head_dim)),
+                mx.ones((1, 1, n_tokens, head_dim)),
+                n_tokens,
+            )
+            for _ in range(n_layers)
+        ]
+
+    def _stash_with_prefix(self, cache, mx, prefix_marker, tail_token):
+        tokens = [prefix_marker * 10 + i for i in range(4)] + [tail_token]
+        cache_data = [self._kv_layer(mx, 5) for _ in range(4)]
+        block_table = cache.store_cache(
+            f"req-{prefix_marker}", tokens, cache_data
+        )
+        parent_hash = cache.paged_cache.allocated_blocks[
+            block_table.block_ids[-1]
+        ].block_hash
+        return block_table, parent_hash
+
+    def test_initial_counters_are_zero(self, paged_cache, mock_ssd):
+        cache = self._cache(paged_cache, mock_ssd, max_entries=4)
+        stats = cache.get_stats()
+        assert stats.mru_partial_stashes == 0
+        assert stats.mru_partial_hits == 0
+        assert stats.mru_partial_evictions == 0
+        assert stats.mru_partial_tokens_saved == 0
+        assert stats.mru_partial_entries == 0
+        assert stats.mru_partial_max_entries == 4
+
+    def test_stash_increments_stash_counter(self, paged_cache, mock_ssd, mx):
+        cache = self._cache(paged_cache, mock_ssd, max_entries=4)
+        self._stash_with_prefix(cache, mx, prefix_marker=1, tail_token=99)
+        self._stash_with_prefix(cache, mx, prefix_marker=2, tail_token=88)
+
+        stats = cache.get_stats()
+        assert stats.mru_partial_stashes == 2
+        assert stats.mru_partial_entries == 2
+
+    def test_same_key_replacement_counts_as_stash_not_eviction(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """Replacing an existing entry under the same key counts as a
+        stash but NOT as an eviction.  Eviction is reserved for entries
+        that leave the dict (capacity overflow, apply-miss, clear)."""
+        cache = self._cache(paged_cache, mock_ssd, max_entries=4)
+        self._stash_with_prefix(cache, mx, prefix_marker=1, tail_token=99)
+        self._stash_with_prefix(cache, mx, prefix_marker=1, tail_token=77)
+
+        stats = cache.get_stats()
+        assert stats.mru_partial_stashes == 2
+        assert stats.mru_partial_evictions == 0
+        assert stats.mru_partial_entries == 1
+
+    def test_capacity_overflow_increments_eviction_counter(
+        self, paged_cache, mock_ssd, mx
+    ):
+        cache = self._cache(paged_cache, mock_ssd, max_entries=2)
+        for i in (1, 2, 3):
+            self._stash_with_prefix(cache, mx, prefix_marker=i, tail_token=100 + i)
+
+        stats = cache.get_stats()
+        assert stats.mru_partial_stashes == 3
+        assert stats.mru_partial_evictions == 1  # one entry pushed out
+        assert stats.mru_partial_entries == 2
+
+    def test_apply_success_increments_hits_and_tokens_saved(
+        self, paged_cache, mock_ssd, mx
+    ):
+        cache = self._cache(paged_cache, mock_ssd, max_entries=4)
+        bt, _ = self._stash_with_prefix(
+            cache, mx, prefix_marker=1, tail_token=901
+        )
+
+        reconstructed = self._make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+        _, _, applied = cache.apply_mru_partial(reconstructed, bt, [901])
+        assert applied == 1
+
+        stats = cache.get_stats()
+        assert stats.mru_partial_hits == 1
+        assert stats.mru_partial_tokens_saved == 1
+        assert stats.mru_partial_evictions == 0  # success, not eviction
+
+    def test_apply_miss_on_found_key_increments_eviction(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """Token-mismatch eviction pops the matched key and counts."""
+        cache = self._cache(paged_cache, mock_ssd, max_entries=4)
+        bt, _ = self._stash_with_prefix(
+            cache, mx, prefix_marker=1, tail_token=99
+        )
+
+        reconstructed = self._make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+        _, _, applied = cache.apply_mru_partial(reconstructed, bt, [77])  # wrong tail
+        assert applied == 0
+
+        stats = cache.get_stats()
+        assert stats.mru_partial_hits == 0
+        assert stats.mru_partial_evictions == 1
+
+    def test_clear_mru_partials_counts_all_wiped_entries(
+        self, paged_cache, mock_ssd, mx
+    ):
+        cache = self._cache(paged_cache, mock_ssd, max_entries=4)
+        self._stash_with_prefix(cache, mx, prefix_marker=1, tail_token=99)
+        self._stash_with_prefix(cache, mx, prefix_marker=2, tail_token=88)
+        self._stash_with_prefix(cache, mx, prefix_marker=3, tail_token=77)
+
+        n = cache.clear_mru_partials()
+        assert n == 3
+
+        stats = cache.get_stats()
+        assert stats.mru_partial_evictions == 3
+        assert stats.mru_partial_entries == 0
+
+    def test_clear_wipes_partials_and_resets_counters(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """clear() is the "restart everything" path (cache-corruption
+        recovery).  It wipes the dict AND resets every counter,
+        including mru_partial_evictions — incrementing evictions just
+        to have them zeroed by the same call would be incoherent.
+        Operators tracking partial wipes specifically use
+        clear_mru_partials() instead.
+        """
+        cache = self._cache(paged_cache, mock_ssd, max_entries=4)
+        self._stash_with_prefix(cache, mx, prefix_marker=1, tail_token=99)
+        self._stash_with_prefix(cache, mx, prefix_marker=2, tail_token=88)
+
+        cache.clear()
+
+        stats = cache.get_stats()
+        assert stats.mru_partial_entries == 0  # dict wiped
+        assert stats.mru_partial_stashes == 0  # counters reset
+        assert stats.mru_partial_evictions == 0
+        assert stats.mru_partial_hits == 0
+
+    def test_reset_stats_zeros_mru_counters_but_keeps_live_state(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """reset_stats() is the analyst's reset — it zeros cumulative
+        counters but leaves the live cache state alone.  Use
+        clear_mru_partials() if entries should be dropped too."""
+        cache = self._cache(paged_cache, mock_ssd, max_entries=4)
+        self._stash_with_prefix(cache, mx, prefix_marker=1, tail_token=99)
+
+        cache.reset_stats()
+
+        stats = cache.get_stats()
+        assert stats.mru_partial_stashes == 0
+        assert stats.mru_partial_hits == 0
+        assert stats.mru_partial_evictions == 0
+        assert stats.mru_partial_tokens_saved == 0
+        # But the live entry is still there.
+        assert stats.mru_partial_entries == 1
+
+
 class TestHasMRUPartial:
     """The has_mru_partial() accessor is the public API the scheduler
     uses to decide whether to suppress the deferred Metal cache clear."""

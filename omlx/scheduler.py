@@ -6175,6 +6175,12 @@ class Scheduler:
             "prefix_tokens_requested": prefix_stats.tokens_requested_total,
             "prefix_tokens_saved": prefix_stats.tokens_saved,
             "evictions": prefix_stats.evictions,
+            "mru_partial_stashes": prefix_stats.mru_partial_stashes,
+            "mru_partial_hits": prefix_stats.mru_partial_hits,
+            "mru_partial_evictions": prefix_stats.mru_partial_evictions,
+            "mru_partial_tokens_saved": prefix_stats.mru_partial_tokens_saved,
+            "mru_partial_entries": prefix_stats.mru_partial_entries,
+            "mru_partial_max_entries": prefix_stats.mru_partial_max_entries,
         }
 
         if self.paged_ssd_cache_manager is not None:

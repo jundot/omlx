@@ -90,6 +90,16 @@ class PrefixCacheStats(BaseCacheStats):
     last_tokens_to_next_block: int = 0
     tokens_matched_total: int = 0
     tokens_requested_total: int = 0
+    # MRU partial cache observability.  Cumulative counters that pair
+    # naturally — hits/stashes gives the "stash payoff" rate, evictions
+    # tracks churn, tokens_saved is the direct compute-saved measure.
+    # Gauges (entries / max_entries) describe live capacity utilisation.
+    mru_partial_stashes: int = 0
+    mru_partial_hits: int = 0
+    mru_partial_evictions: int = 0
+    mru_partial_tokens_saved: int = 0
+    mru_partial_entries: int = 0
+    mru_partial_max_entries: int = 0
     _total_queries: int = field(default=0, repr=False)
 
     @property
@@ -115,6 +125,12 @@ class PrefixCacheStats(BaseCacheStats):
         self.last_tokens_to_next_block = 0
         self.tokens_matched_total = 0
         self.tokens_requested_total = 0
+        self.mru_partial_stashes = 0
+        self.mru_partial_hits = 0
+        self.mru_partial_evictions = 0
+        self.mru_partial_tokens_saved = 0
+        # mru_partial_entries and mru_partial_max_entries are gauges
+        # populated by get_stats() from live state — not reset here.
         self._total_queries = 0
 
 

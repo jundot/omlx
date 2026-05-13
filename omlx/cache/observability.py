@@ -101,6 +101,10 @@ def _compute_window(
     d_ssd_disk = delta("ssd_disk_loads")
     d_tokens_matched = delta("prefix_tokens_matched")
     d_tokens_requested = delta("prefix_tokens_requested")
+    d_mru_stashes = delta("mru_partial_stashes")
+    d_mru_hits = delta("mru_partial_hits")
+    d_mru_evictions = delta("mru_partial_evictions")
+    d_mru_tokens_saved = delta("mru_partial_tokens_saved")
 
     minutes = elapsed / 60.0
 
@@ -120,6 +124,15 @@ def _compute_window(
         "ssd_hot_rate": round(
             _safe_ratio(d_ssd_hot, d_ssd_hot + d_ssd_disk), 4
         ),
+        # MRU partial stash payoff: fraction of stashes that paid off as
+        # an apply-time splice.  Workload with rate ≈ 0 means stashes
+        # are mostly wasted (uniform/unrepeated prompts); rate near 1
+        # means almost every stash got reused.
+        "mru_partial_stashes": d_mru_stashes,
+        "mru_partial_hits": d_mru_hits,
+        "mru_partial_evictions": d_mru_evictions,
+        "mru_partial_tokens_saved": d_mru_tokens_saved,
+        "mru_partial_hit_rate": round(_safe_ratio(d_mru_hits, d_mru_stashes), 4),
     }
 
 
@@ -130,6 +143,8 @@ def _compute_cumulative(counters: dict[str, int]) -> dict[str, Any]:
     ssd_disk = counters.get("ssd_disk_loads", 0)
     tokens_matched = counters.get("prefix_tokens_matched", 0)
     tokens_requested = counters.get("prefix_tokens_requested", 0)
+    mru_stashes = counters.get("mru_partial_stashes", 0)
+    mru_hits = counters.get("mru_partial_hits", 0)
 
     return {
         "prefix_hits": prefix_hits,
@@ -146,4 +161,9 @@ def _compute_cumulative(counters: dict[str, int]) -> dict[str, Any]:
         "hot_cache_evictions": counters.get("hot_cache_evictions", 0),
         "hot_cache_promotions": counters.get("hot_cache_promotions", 0),
         "ssd_hot_rate": round(_safe_ratio(ssd_hot, ssd_hot + ssd_disk), 4),
+        "mru_partial_stashes": mru_stashes,
+        "mru_partial_hits": mru_hits,
+        "mru_partial_evictions": counters.get("mru_partial_evictions", 0),
+        "mru_partial_tokens_saved": counters.get("mru_partial_tokens_saved", 0),
+        "mru_partial_hit_rate": round(_safe_ratio(mru_hits, mru_stashes), 4),
     }

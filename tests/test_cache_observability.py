@@ -24,6 +24,10 @@ def _make_counters(
     ssd_errors=0,
     hot_cache_evictions=0,
     hot_cache_promotions=0,
+    mru_partial_stashes=0,
+    mru_partial_hits=0,
+    mru_partial_evictions=0,
+    mru_partial_tokens_saved=0,
 ):
     return {
         "prefix_hits": prefix_hits,
@@ -38,6 +42,10 @@ def _make_counters(
         "ssd_errors": ssd_errors,
         "hot_cache_evictions": hot_cache_evictions,
         "hot_cache_promotions": hot_cache_promotions,
+        "mru_partial_stashes": mru_partial_stashes,
+        "mru_partial_hits": mru_partial_hits,
+        "mru_partial_evictions": mru_partial_evictions,
+        "mru_partial_tokens_saved": mru_partial_tokens_saved,
     }
 
 
@@ -119,6 +127,33 @@ class TestCacheRateTrackerRates:
         new = _make_counters(ssd_hot_hits=80, ssd_disk_loads=20)
         result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
         assert result["windows"]["1m"]["ssd_hot_rate"] == 0.8
+
+    def test_mru_partial_hit_rate(self):
+        """Stash payoff = hits / stashes.  Workload that stashed 100 and
+        only got 75 hits has rate 0.75; high enough to justify the
+        feature, low enough that a smaller capacity might do."""
+        old = _make_counters(mru_partial_stashes=0, mru_partial_hits=0)
+        new = _make_counters(mru_partial_stashes=100, mru_partial_hits=75)
+        result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
+        assert result["windows"]["1m"]["mru_partial_hit_rate"] == 0.75
+        assert result["cumulative"]["mru_partial_hit_rate"] == 0.75
+
+    def test_mru_partial_zero_stashes_no_nan(self):
+        """If no stashes happened in the window, hit_rate must be 0.0
+        not NaN.  Mirrors the prefix_hit_rate empty-window guard."""
+        counters = _make_counters(mru_partial_stashes=0, mru_partial_hits=0)
+        result = self._tracker_with_two_snapshots(counters, counters, elapsed=60.0)
+        assert result["windows"]["1m"]["mru_partial_hit_rate"] == 0.0
+        assert result["cumulative"]["mru_partial_hit_rate"] == 0.0
+
+    def test_mru_partial_tokens_saved_delta(self):
+        """Tokens saved is the direct compute-saved measure; it
+        accumulates regardless of hit rate."""
+        old = _make_counters(mru_partial_tokens_saved=0)
+        new = _make_counters(mru_partial_tokens_saved=12345)
+        result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
+        assert result["windows"]["1m"]["mru_partial_tokens_saved"] == 12345
+        assert result["cumulative"]["mru_partial_tokens_saved"] == 12345
 
     def test_insufficient_data_returns_empty_window(self):
         tracker = CacheRateTracker(min_interval=0.0)

@@ -200,6 +200,11 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
+        # MRU partial cache cumulative counters (see PrefixCacheStats).
+        self._mru_partial_stashes = 0
+        self._mru_partial_hits = 0
+        self._mru_partial_evictions = 0
+        self._mru_partial_tokens_saved = 0
 
     def _get_model_num_layers(self, model: Any) -> int:
         """
@@ -919,6 +924,9 @@ class BlockAwarePrefixCache(CacheManager):
         # LRU put: pop any existing entry first so the re-insert lands at
         # the tail with fresh order; then evict the oldest entry if over
         # capacity.  Mirrors PagedSSDCacheManager._hot_cache_put.
+        # Note: same-key replacement does NOT count as an eviction —
+        # the operator sees stash payoff via the stashes/hits ratio, not
+        # via replacement churn.
         if parent_hash in self._mru_partials:
             self._mru_partials.pop(parent_hash)
         self._mru_partials[parent_hash] = _MRUPartialBlock(
@@ -926,8 +934,10 @@ class BlockAwarePrefixCache(CacheManager):
             tokens=new_tokens[partial_start:],
             kv_data=partial_kv,
         )
+        self._mru_partial_stashes += 1
         while len(self._mru_partials) > self._mru_partial_max_entries:
             self._mru_partials.popitem(last=False)
+            self._mru_partial_evictions += 1
 
         logger.debug(
             "Stashed MRU partial: %d tokens, parent_hash=%s, layers=%d, "
@@ -1001,9 +1011,11 @@ class BlockAwarePrefixCache(CacheManager):
         n_partial = len(partial.tokens)
         if len(remaining_tokens) < n_partial:
             self._mru_partials.pop(last_hash, None)
+            self._mru_partial_evictions += 1
             return cache, remaining_tokens, 0
         if remaining_tokens[:n_partial] != partial.tokens:
             self._mru_partials.pop(last_hash, None)
+            self._mru_partial_evictions += 1
             return cache, remaining_tokens, 0
 
         if len(partial.kv_data) != len(cache):
@@ -1012,10 +1024,12 @@ class BlockAwarePrefixCache(CacheManager):
                 len(partial.kv_data), len(cache),
             )
             self._mru_partials.pop(last_hash, None)
+            self._mru_partial_evictions += 1
             return cache, remaining_tokens, 0
 
         if not HAS_MLX:
             self._mru_partials.pop(last_hash, None)
+            self._mru_partial_evictions += 1
             return cache, remaining_tokens, 0
 
         # Phase 1: build per-layer replacements without touching the cache.
@@ -1032,6 +1046,7 @@ class BlockAwarePrefixCache(CacheManager):
                 "MRU partial splice build failed: %s, evicting entry", e
             )
             self._mru_partials.pop(last_hash, None)
+            self._mru_partial_evictions += 1
             return cache, remaining_tokens, 0
 
         # Phase 2: commit. All concatenates have already succeeded; the
@@ -1045,6 +1060,8 @@ class BlockAwarePrefixCache(CacheManager):
 
         # Promote this entry to the LRU tail (most-recently-used).
         self._mru_partials.move_to_end(last_hash)
+        self._mru_partial_hits += 1
+        self._mru_partial_tokens_saved += n_partial
 
         new_remaining = remaining_tokens[n_partial:]
         logger.debug(
@@ -2763,6 +2780,12 @@ class BlockAwarePrefixCache(CacheManager):
             last_tokens_to_next_block=self._last_tokens_to_next_block,
             tokens_matched_total=self._tokens_matched_total,
             tokens_requested_total=self._tokens_requested_total,
+            mru_partial_stashes=self._mru_partial_stashes,
+            mru_partial_hits=self._mru_partial_hits,
+            mru_partial_evictions=self._mru_partial_evictions,
+            mru_partial_tokens_saved=self._mru_partial_tokens_saved,
+            mru_partial_entries=len(self._mru_partials),
+            mru_partial_max_entries=self._mru_partial_max_entries,
         )
 
     def get_stats_dict(self) -> dict[str, Any]:
@@ -2796,7 +2819,13 @@ class BlockAwarePrefixCache(CacheManager):
         }
 
     def reset_stats(self) -> None:
-        """Reset statistics."""
+        """Reset statistics.
+
+        Note: ``_mru_partials`` is live state (the cache itself), not a
+        counter — its size is reported as a gauge by ``get_stats()`` and
+        is not affected by stats reset.  Use ``clear_mru_partials()`` if
+        the entries themselves should be wiped.
+        """
         self._hits = 0
         self._misses = 0
         self._tokens_saved = 0
@@ -2806,6 +2835,10 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
+        self._mru_partial_stashes = 0
+        self._mru_partial_hits = 0
+        self._mru_partial_evictions = 0
+        self._mru_partial_tokens_saved = 0
         self.paged_cache.reset_stats()
 
     def clear(self) -> int:
@@ -2824,6 +2857,10 @@ class BlockAwarePrefixCache(CacheManager):
         # recovery (Scheduler._recover_from_cache_error) routes through
         # here, so stale partials would otherwise survive exactly the
         # recovery path that exists because something was wrong.
+        # No eviction-counter bump here: clear() also calls reset_stats()
+        # which zeros every counter (this is the "restart everything"
+        # path).  Operators tracking partial wipes specifically should
+        # use clear_mru_partials() instead — that path leaves stats alone.
         self._mru_partials.clear()
         self.reset_stats()
         return cleared_count
@@ -2841,13 +2878,15 @@ class BlockAwarePrefixCache(CacheManager):
         evicted by LRU.
 
         Distinct from ``clear()``: this method only drops MRU entries
-        and does not touch the paged cache, prefix index, or stats.
+        and does not touch the paged cache, prefix index, or stats
+        (other than incrementing ``mru_partial_evictions``).
 
         Returns:
             Number of MRU entries that were wiped.
         """
         n = len(self._mru_partials)
         self._mru_partials.clear()
+        self._mru_partial_evictions += n
         return n
 
     def set_cold_restore_callback(
