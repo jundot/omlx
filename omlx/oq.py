@@ -2645,7 +2645,7 @@ CALIB_DATASETS = {
     "c4": "C4 (Web Crawl)",
     "code": "Code (StarCoder)",
     "multilingual": "Multilingual (CulturaX)",
-    "code_multilingual": "Code + Multilingual",
+    "code_multilingual": "Code + Multilingual + Reasoning",
 }
 
 
@@ -2712,13 +2712,13 @@ def _load_builtin_calibration(tokenizer, dataset: str, num_samples: int,
 
     if dataset == "code_multilingual":
         texts = []
-        for key in ("code", "en", "ko", "zh", "ja", "tool_calling"):
+        for key in ("code", "en", "zh", "tool_calling", "reasoning"):
             texts.extend(all_data.get(key, []))
     elif dataset == "code":
         texts = all_data.get("code", []) + all_data.get("en", [])
     elif dataset == "multilingual":
         texts = []
-        for key in ("en", "ko", "zh", "ja"):
+        for key in ("en", "zh"):
             texts.extend(all_data.get(key, []))
     else:
         texts = []

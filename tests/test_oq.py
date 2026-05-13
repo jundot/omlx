@@ -2234,3 +2234,54 @@ class TestBuildProxyForSensitivityMtpPatch:
 
         assert isinstance(result, Path)
         mock_convert.assert_called_once()
+
+
+# =============================================================================
+# Test built-in calibration data
+# =============================================================================
+
+
+class TestBuiltinCalibration:
+
+    def _load_json(self):
+        import json
+        p = Path(__file__).parent.parent / "omlx" / "oq_calibration_data.json"
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_json_has_all_required_categories(self):
+        data = self._load_json()
+        required = {
+            "code", "en", "zh", "tool_calling", "reasoning",
+            "mixed", "chat", "bartowski",
+        }
+        assert "ko" not in data, "ko category should not exist"
+        assert "ja" not in data, "ja category should not exist"
+        assert required.issubset(set(data.keys())), (
+            f"Missing categories: {required - set(data.keys())}"
+        )
+
+    def test_json_minimum_samples_per_category(self):
+        data = self._load_json()
+        for key, texts in data.items():
+            assert len(texts) >= 40, (
+                f"Category {key!r} has only {len(texts)} samples"
+            )
+
+    def test_json_texts_are_nonempty_strings(self):
+        data = self._load_json()
+        for key, texts in data.items():
+            for t in texts[:5]:
+                assert isinstance(t, str) and len(t) > 0, (
+                    f"Category {key!r} has invalid entry"
+                )
+
+    def test_total_sample_count(self):
+        data = self._load_json()
+        total = sum(len(v) for v in data.values())
+        assert total >= 3000, f"Only {total} total samples"
+
+    def test_code_multilingual_includes_reasoning(self):
+        from omlx.oq import _load_builtin_calibration
+        keys_used = ("code", "en", "ko", "zh", "ja", "tool_calling", "reasoning")
+        assert "reasoning" in keys_used
