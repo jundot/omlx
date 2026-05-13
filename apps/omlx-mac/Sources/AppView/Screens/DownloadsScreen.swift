@@ -15,7 +15,14 @@ struct DownloadsScreen: View {
             AddFromHFSection(
                 repoText: $vm.repoText,
                 isStarting: vm.isStarting,
-                onSubmit: { vm.startDownload(client: services.client) }
+                mirrorHost: vm.mirrorHost,
+                mirrorIsCustom: vm.mirrorIsCustom,
+                isEditingMirror: $vm.isEditingMirror,
+                mirrorDraft: $vm.mirrorDraft,
+                mirrorBusy: vm.mirrorBusy,
+                onSubmit: { vm.startDownload(client: services.client) },
+                onSaveMirror: { vm.saveMirror(client: services.client) },
+                onResetMirror: { vm.resetMirror(client: services.client) }
             )
 
             ActiveDownloadsSection(
@@ -31,7 +38,8 @@ struct DownloadsScreen: View {
             )
 
             SuggestedSection(
-                models: vm.recommended,
+                models: vm.sortedRecommended,
+                sort: $vm.recommendedSort,
                 isLoading: vm.recommendedLoading,
                 onGet: { repo in vm.startDownload(repo: repo, client: services.client) },
                 onRefresh: { Task { await vm.loadRecommended(client: services.client) } }
@@ -55,9 +63,17 @@ struct DownloadsScreen: View {
 private struct AddFromHFSection: View {
     @Binding var repoText: String
     let isStarting: Bool
+    let mirrorHost: String
+    let mirrorIsCustom: Bool
+    @Binding var isEditingMirror: Bool
+    @Binding var mirrorDraft: String
+    let mirrorBusy: Bool
     let onSubmit: () -> Void
+    let onSaveMirror: () -> Void
+    let onResetMirror: () -> Void
 
     @Environment(\.omlxTheme) private var theme
+    @FocusState private var mirrorFocused: Bool
 
     var body: some View {
         SectionHeader("Add Model from Hugging Face")
@@ -82,17 +98,73 @@ private struct AddFromHFSection: View {
                         .buttonStyle(.omlx(.primary))
                         .disabled(repoText.isEmpty || isStarting)
                     }
-                    HStack(spacing: 6) {
-                        Image(systemName: "info.circle")
-                            .font(.system(size: 11))
-                            .foregroundStyle(theme.textTertiary)
-                        Text("Configure the Hugging Face mirror in Server → Network. ModelScope downloads run from the browser.")
-                            .font(.omlxText(11))
-                            .foregroundStyle(theme.textTertiary)
+                    if isEditingMirror {
+                        mirrorEditor
+                    } else {
+                        mirrorSummary
                     }
                 }
             }
         }
+    }
+
+    private var mirrorSummary: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "globe")
+                .font(.system(size: 11))
+                .foregroundStyle(theme.textTertiary)
+            Text("Mirror:")
+                .font(.omlxText(11))
+                .foregroundStyle(theme.textTertiary)
+            Text(mirrorHost)
+                .font(.omlxMono(11))
+                .foregroundStyle(theme.textSecondary)
+            if mirrorIsCustom {
+                Text("custom")
+                    .font(.omlxText(10, weight: .medium))
+                    .foregroundStyle(theme.blueDot)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(theme.blueDot.opacity(0.12))
+                    .clipShape(Capsule())
+            }
+            Spacer(minLength: 8)
+            Button("Configure mirror…") {
+                mirrorDraft = mirrorIsCustom ? mirrorHost : ""
+                isEditingMirror = true
+            }
+            .buttonStyle(.omlx(.plain, size: .small))
+            .disabled(mirrorBusy)
+        }
+    }
+
+    private var mirrorEditor: some View {
+        HStack(spacing: 8) {
+            TextInput(
+                text: $mirrorDraft,
+                placeholder: "https://hf-mirror.com  (empty = huggingface.co)",
+                mono: true
+            )
+            .frame(maxWidth: .infinity)
+            .focused($mirrorFocused)
+            .onSubmit { onSaveMirror() }
+            Button("Reset") {
+                mirrorDraft = ""
+                onResetMirror()
+            }
+            .buttonStyle(.omlx(.plain, size: .small))
+            .disabled(mirrorBusy || (!mirrorIsCustom && mirrorDraft.isEmpty))
+            Button("Cancel") {
+                isEditingMirror = false
+                mirrorDraft = ""
+            }
+            .buttonStyle(.omlx(.normal, size: .small))
+            .disabled(mirrorBusy)
+            Button("Save") { onSaveMirror() }
+                .buttonStyle(.omlx(.primary, size: .small))
+                .disabled(mirrorBusy)
+        }
+        .onAppear { mirrorFocused = true }
     }
 }
 
@@ -251,6 +323,7 @@ private struct CompletedTasksSection: View {
 
 private struct SuggestedSection: View {
     let models: [HFModelInfo]
+    @Binding var sort: SuggestedSort
     let isLoading: Bool
     let onGet: (String) -> Void
     let onRefresh: () -> Void
@@ -259,13 +332,20 @@ private struct SuggestedSection: View {
 
     var body: some View {
         SectionHeader("Suggested Models", subtitle: hint) {
-            Button {
-                onRefresh()
-            } label: {
-                Image(systemName: "arrow.clockwise")
+            HStack(spacing: 6) {
+                Popup(
+                    selection: $sort,
+                    width: 170,
+                    options: SuggestedSort.allCases.map { ($0, $0.label) }
+                )
+                Button {
+                    onRefresh()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.omlx(.normal, size: .small))
+                .disabled(isLoading)
             }
-            .buttonStyle(.omlx(.normal, size: .small))
-            .disabled(isLoading)
         }
 
         ListGroup {
@@ -329,10 +409,24 @@ private struct SuggestedSection: View {
 
     private func secondaryLine(for m: HFModelInfo) -> String {
         var bits: [String] = []
-        if let p = m.totalParamsFormatted { bits.append(p) }
-        if let s = m.estimatedSizeFormatted { bits.append(s) }
+        if let p = m.paramsFormatted { bits.append(p) }
+        if let s = m.sizeFormatted { bits.append(s) }
         if let dl = m.downloads { bits.append("\(formatNumber(dl)) ↓") }
         return bits.isEmpty ? "—" : bits.joined(separator: " · ")
+    }
+}
+
+// MARK: - Sort
+
+enum SuggestedSort: String, Hashable, CaseIterable {
+    case downloads, params, size
+
+    var label: String {
+        switch self {
+        case .downloads: return "Most downloaded"
+        case .params:    return "Parameters: high to low"
+        case .size:      return "Size: high to low"
+        }
     }
 }
 
@@ -345,7 +439,43 @@ final class DownloadsScreenVM: ObservableObject {
     @Published private(set) var recommended: [HFModelInfo] = []
     @Published private(set) var isStarting: Bool = false
     @Published private(set) var recommendedLoading: Bool = false
+    @Published var recommendedSort: SuggestedSort = .downloads
     @Published var lastError: String?
+
+    /// Configured HF mirror endpoint. Empty when using the HF default
+    /// (huggingface.co). Loaded once on screen start, kept in sync with
+    /// PATCH /admin/api/global-settings (`hf_endpoint`).
+    @Published private(set) var mirrorEndpoint: String = ""
+    @Published var isEditingMirror: Bool = false
+    @Published var mirrorDraft: String = ""
+    @Published private(set) var mirrorBusy: Bool = false
+
+    /// Host the user sees on the Downloads screen. Strips scheme so the
+    /// inline label reads like `huggingface.co` / `hf-mirror.com` per design.
+    var mirrorHost: String {
+        let trimmed = mirrorEndpoint.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return "huggingface.co" }
+        if let url = URL(string: trimmed), let host = url.host { return host }
+        return trimmed
+    }
+
+    var mirrorIsCustom: Bool {
+        !mirrorEndpoint.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    /// Re-sorted view of `recommended`. Always descending; entries missing
+    /// the sort key fall to the bottom so they don't shove valid models out
+    /// of the top 15 the section displays.
+    var sortedRecommended: [HFModelInfo] {
+        switch recommendedSort {
+        case .downloads:
+            return recommended.sorted { ($0.downloads ?? -1) > ($1.downloads ?? -1) }
+        case .params:
+            return recommended.sorted { ($0.params ?? -1) > ($1.params ?? -1) }
+        case .size:
+            return recommended.sorted { ($0.size ?? -1) > ($1.size ?? -1) }
+        }
+    }
 
     private weak var client: OMLXClient?
     private var pollTask: Task<Void, Never>?
@@ -364,10 +494,47 @@ final class DownloadsScreenVM: ObservableObject {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
+        await refreshMirror(client: client)
         if !hasLoadedRecommended {
             hasLoadedRecommended = true
             await loadRecommended(client: client)
         }
+    }
+
+    private func refreshMirror(client: OMLXClient) async {
+        do {
+            let settings = try await client.getGlobalSettings()
+            self.mirrorEndpoint = settings.huggingface?.endpoint ?? ""
+        } catch {
+            // Non-fatal — leave mirror as default and don't clobber an
+            // existing error from a download call.
+        }
+    }
+
+    func saveMirror(client: OMLXClient) {
+        let draft = mirrorDraft.trimmingCharacters(in: .whitespaces)
+        // Server treats empty string as "reset to default" — pass it through.
+        Task { [weak self] in
+            guard let self else { return }
+            self.mirrorBusy = true
+            defer { Task { @MainActor [weak self] in self?.mirrorBusy = false } }
+            do {
+                _ = try await client.updateGlobalSettings(
+                    GlobalSettingsPatch(hfEndpoint: draft)
+                )
+                self.mirrorEndpoint = draft
+                self.isEditingMirror = false
+                self.mirrorDraft = ""
+                self.lastError = nil
+            } catch {
+                self.lastError = self.describe(error)
+            }
+        }
+    }
+
+    func resetMirror(client: OMLXClient) {
+        mirrorDraft = ""
+        saveMirror(client: client)
     }
 
     func stop() {
@@ -432,7 +599,16 @@ final class DownloadsScreenVM: ObservableObject {
         self.recommendedLoading = true
         defer { self.recommendedLoading = false }
         do {
-            self.recommended = try await client.getHFRecommended().models
+            let resp = try await client.getHFRecommended()
+            // Trending-first, then popular, deduped by repoId. Mirrors how
+            // the original dashboard surfaces both lists side-by-side; the
+            // Swift screen renders one combined feed.
+            var seen = Set<String>()
+            var merged: [HFModelInfo] = []
+            for m in resp.trending + resp.popular where seen.insert(m.repoId).inserted {
+                merged.append(m)
+            }
+            self.recommended = merged
             self.lastError = nil
         } catch {
             // 502/504 are common (HF unreachable, dev offline). Surface but

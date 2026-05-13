@@ -26,9 +26,11 @@ struct ModelsScreen: View {
             LibrarySection(
                 models: vm.libraryModels,
                 isModelLoaded: { id in vm.activeModels.contains(where: { $0.id == id }) },
+                deletingID: vm.deletingID,
                 onLoad: { id in vm.load(id: id, client: services.client) },
                 onUnload: { id in vm.unload(id: id, client: services.client) },
-                onOpenSettings: { id in services.modelDetailID = id }
+                onOpenSettings: { id in services.modelDetailID = id },
+                onRequestRemove: { id in vm.pendingRemoveID = id }
             )
 
             if let error = vm.lastError {
@@ -41,6 +43,22 @@ struct ModelsScreen: View {
         }
         .task { await vm.start(client: services.client) }
         .onDisappear { vm.stop() }
+        .confirmationDialog(
+            "Delete this model from disk?",
+            isPresented: Binding(
+                get: { vm.pendingRemoveID != nil },
+                set: { if !$0 { vm.pendingRemoveID = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: vm.pendingRemoveID
+        ) { id in
+            Button("Delete \(id)", role: .destructive) {
+                vm.remove(id: id, client: services.client)
+            }
+            Button("Cancel", role: .cancel) { vm.pendingRemoveID = nil }
+        } message: { id in
+            Text("The model files will be permanently removed from disk and unloaded if currently running.")
+        }
     }
 }
 
@@ -125,9 +143,11 @@ private struct ActiveBadge: View {
 private struct LibrarySection: View {
     let models: [ModelDTO]
     let isModelLoaded: (String) -> Bool
+    let deletingID: String?
     let onLoad: (String) -> Void
     let onUnload: (String) -> Void
     let onOpenSettings: (String) -> Void
+    let onRequestRemove: (String) -> Void
 
     @Environment(\.omlxTheme) private var theme
 
@@ -189,6 +209,21 @@ private struct LibrarySection: View {
                             }
                             .buttonStyle(.omlx(.plain, size: .small))
                             .help("Settings")
+                            Button {
+                                onRequestRemove(m.id)
+                            } label: {
+                                if deletingID == m.id {
+                                    ProgressView()
+                                        .controlSize(.mini)
+                                } else {
+                                    Image(systemName: "trash")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(theme.redDot)
+                                }
+                            }
+                            .buttonStyle(.omlx(.plain, size: .small))
+                            .disabled(deletingID != nil)
+                            .help("Remove from disk")
                         }
                     }
                 }
@@ -222,6 +257,13 @@ private struct LibrarySection: View {
 final class ModelsScreenVM: ObservableObject {
     @Published private(set) var allModels: [ModelDTO] = []
     @Published var lastError: String?
+    /// Library row the user just clicked "trash" on; non-nil drives the
+    /// confirmation dialog. Cleared on cancel or after delete completes.
+    @Published var pendingRemoveID: String?
+    /// While a delete is in flight, the row shows a spinner instead of the
+    /// trash glyph and the whole row's button-stack is disabled to prevent
+    /// double-tap deletes against a model the server is still unloading.
+    @Published private(set) var deletingID: String?
 
     private weak var client: OMLXClient?
     private var pollTask: Task<Void, Never>?
@@ -265,6 +307,22 @@ final class ModelsScreenVM: ObservableObject {
             do {
                 _ = try await client.unloadModel(id: id)
                 await self?.refresh()
+            } catch {
+                guard let self else { return }
+                self.lastError = self.describe(error)
+            }
+        }
+    }
+
+    func remove(id: String, client: OMLXClient) {
+        pendingRemoveID = nil
+        deletingID = id
+        Task { [weak self] in
+            defer { Task { @MainActor [weak self] in self?.deletingID = nil } }
+            do {
+                _ = try await client.deleteHFModel(modelName: id)
+                await self?.refresh()
+                self?.lastError = nil
             } catch {
                 guard let self else { return }
                 self.lastError = self.describe(error)
