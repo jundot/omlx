@@ -67,6 +67,13 @@ class ModelSettings:
         dflash_draft_quant_activation_bits: Quantization activation bits (16, 32).
         dflash_draft_quant_group_size: Quantization group size (32, 64, 128).
         dflash_max_ctx: Token threshold to fall back to BatchedEngine (None = unlimited).
+        dflash_max_concurrent: Cap on simultaneously in-flight DFlash requests (default 4,
+            None = unlimited). Above this count, new requests block on an asyncio.Semaphore
+            until a slot opens. DFlash decode is single-stream by design — this is NOT a
+            throughput knob; it is an admission-control gate that bounds memory under
+            bursts (each in-flight request holds its own KV cache, hundreds of MB to
+            several GB) and keeps tail latency predictable. Lower (1-2) on tight RAM
+            (< 64 GB); 8 on 128 GB+; leave None only if upstream load shape is trusted.
         dflash_in_memory_cache: Enable DFlash L1 (RAM) prefix cache.
         dflash_in_memory_cache_max_entries: L1 cache max entries (default 4, matches dflash balanced profile).
         dflash_in_memory_cache_max_bytes: L1 cache byte budget.
@@ -130,6 +137,8 @@ class ModelSettings:
     dflash_draft_quant_activation_bits: Optional[int] = None  # 16, 32
     dflash_draft_quant_group_size: Optional[int] = None  # 32, 64, 128
     dflash_max_ctx: Optional[int] = None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
+    dflash_max_concurrent: Optional[int] = 4  # In-flight admission cap (semaphore queue); None = unlimited. Default 4 bounds memory under bursts; raise on 128GB+ machines, lower on tight RAM.
+    dflash_kv_pressure_threshold: Optional[float] = None  # Float in (0,1] — embedded VLM KV cache usage above this routes new requests to BG path. None defers to DFlashEngine default 0.7.
     # DFlash prefix cache (private to dflash; separate from omlx tiered cache because
     # snapshots include draft model GDN state and target hidden chunks omlx never tracks)
     dflash_in_memory_cache: bool = True

@@ -188,7 +188,7 @@
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.ttft_ms.toFixed(1)"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.tpot_ms.toFixed(2)"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.processing_tps.toFixed(1) + ' tok/s'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.gen_tps.toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="(r.wall_tg_tps ?? r.gen_tps).toFixed(1) + ' tok/s'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.total_throughput.toFixed(1) + ' tok/s'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFormatMemory(r.peak_memory_bytes)"></td>
@@ -225,7 +225,7 @@
                                     <!-- 1x baseline from single request -->
                                     <tr x-show="benchSingleResults.some(r => r.pp === 1024)" class="border-b border-neutral-100 bg-neutral-50/50">
                                         <td class="px-4 py-3 font-medium text-neutral-500">{{ t('bench.results.batch.baseline') }}</td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.gen_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="((benchSingleResults.find(r => r.pp === 1024)?.wall_tg_tps ?? benchSingleResults.find(r => r.pp === 1024)?.gen_tps)?.toFixed(1) || '-') + ' tok/s'"></td>
                                         <td class="px-4 py-3 text-right tabular-nums text-neutral-500">1.00x</td>
                                         <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
                                         <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>

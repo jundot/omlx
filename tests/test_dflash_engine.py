@@ -216,8 +216,14 @@ class TestDFlashEngineInit:
         )
         assert engine.get_cache_stats() is None
 
-    def test_should_fallback_unlimited_when_max_ctx_none(self):
-        """A None threshold means dflash handles every prompt size."""
+    def test_route_unlimited_when_max_ctx_none(self):
+        """A None threshold means dflash handles every prompt size.
+
+        Path A renamed ``_should_fallback`` to ``_route`` and made it return
+        a string (``"dflash"`` vs ``"bg"``) instead of a bool. The underlying
+        ``dflash_max_ctx`` gate still exists; this test preserves the same
+        coverage in the new ergonomics.
+        """
         try:
             from omlx.engine.dflash import DFlashEngine
         except ImportError:
@@ -228,9 +234,13 @@ class TestDFlashEngineInit:
             draft_model_path="test-draft",
             model_settings=ModelSettings(dflash_max_ctx=None),
         )
-        assert engine._should_fallback([0] * 10_000) is False
+        assert engine._route([0] * 10_000) == "dflash"
 
-    def test_should_fallback_triggers_at_threshold(self):
+    def test_route_triggers_bg_at_max_ctx_threshold(self):
+        """Path A: prompts >= dflash_max_ctx route to the BG engine.
+
+        Successor to ``test_should_fallback_triggers_at_threshold``.
+        """
         try:
             from omlx.engine.dflash import DFlashEngine
         except ImportError:
@@ -241,8 +251,8 @@ class TestDFlashEngineInit:
             draft_model_path="test-draft",
             model_settings=ModelSettings(dflash_max_ctx=4096),
         )
-        assert engine._should_fallback([0] * 4095) is False
-        assert engine._should_fallback([0] * 4096) is True
+        assert engine._route([0] * 4095) == "dflash"
+        assert engine._route([0] * 4096) == "bg"
 
     def test_build_quant_spec(self):
         try:

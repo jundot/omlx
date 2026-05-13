@@ -1568,6 +1568,7 @@
                     dflash_draft_quant_activation_bits: settings.dflash_draft_quant_activation_bits || 16,
                     dflash_draft_quant_group_size: settings.dflash_draft_quant_group_size || 64,
                     dflash_max_ctx: settings.dflash_max_ctx ?? null,
+                    dflash_max_concurrent: settings.dflash_max_concurrent ?? null,
                     dflash_in_memory_cache: settings.dflash_in_memory_cache !== false,
                     dflash_in_memory_cache_max_entries: settings.dflash_in_memory_cache_max_entries || 4,
                     dflash_in_memory_cache_max_gib: settings.dflash_in_memory_cache_max_bytes
@@ -1676,6 +1677,9 @@
                                 dflash_max_ctx: this.modelSettings.dflash_enabled && this.modelSettings.dflash_max_ctx
                                     ? parseInt(this.modelSettings.dflash_max_ctx)
                                     : null,
+                                dflash_max_concurrent: this.modelSettings.dflash_enabled && this.modelSettings.dflash_max_concurrent
+                                    ? parseInt(this.modelSettings.dflash_max_concurrent)
+                                    : null,
                                 dflash_in_memory_cache: this.modelSettings.dflash_enabled
                                     ? !!this.modelSettings.dflash_in_memory_cache
                                     : true,
@@ -1771,6 +1775,7 @@
                         this.modelSettings.dflash_draft_quant_activation_bits = null;
                         this.modelSettings.dflash_draft_quant_group_size = null;
                         this.modelSettings.dflash_max_ctx = null;
+                        this.modelSettings.dflash_max_concurrent = null;
                         this.modelSettings.dflash_in_memory_cache = true;
                         this.modelSettings.dflash_in_memory_cache_max_entries = 4;
                         this.modelSettings.dflash_in_memory_cache_max_gib = 8;
@@ -2432,9 +2437,14 @@
             },
 
             benchGetSpeedup(batchResult) {
+                // Symmetric metric: batch tg_tps is wall-aggregate (total_gen /
+                // wall_time), so baseline must also be wall-aggregate. Using
+                // gen_tps (gen-only, excludes prefill) makes the ratio look
+                // sub-1x for any engine that doesn't parallelize prefill.
                 const baseline = this.benchSingleResults.find(r => r.pp === 1024);
-                if (!baseline || !baseline.gen_tps || baseline.gen_tps <= 0) return 0;
-                return batchResult.tg_tps / baseline.gen_tps;
+                const base = baseline && baseline.wall_tg_tps ? baseline.wall_tg_tps : (baseline ? baseline.gen_tps : 0);
+                if (!base || base <= 0) return 0;
+                return batchResult.tg_tps / base;
             },
 
             benchFormatMemory(bytes) {
@@ -2468,7 +2478,7 @@
                             pad(r.ttft_ms.toFixed(1), 10),
                             pad(r.tpot_ms.toFixed(2), 10),
                             pad(r.processing_tps.toFixed(1) + ' tok/s', 12),
-                            pad(r.gen_tps.toFixed(1) + ' tok/s', 12),
+                            pad(((r.wall_tg_tps ?? r.gen_tps)).toFixed(1) + ' tok/s', 12),
                             pad(r.e2e_latency_s.toFixed(3), 10),
                             pad(r.total_throughput.toFixed(1) + ' tok/s', 12),
                             pad(this.benchFormatMemory(r.peak_memory_bytes), 10),
@@ -2487,10 +2497,13 @@
                     lines.push('-'.repeat(80));
                     const hdr = [rpad('Batch', 8), pad('tg TPS', 12), pad('Speedup', 8), pad('pp TPS', 12), pad('pp TPS/req', 12), pad('TTFT(ms)', 10), pad('E2E(s)', 10)];
                     lines.push(hdr.join('  '));
+                    // 1x baseline uses wall_tg_tps (wall-aggregate) to stay
+                    // symmetric with batch tg_tps below. See benchGetSpeedup.
+                    const baseTg = baseline && baseline.wall_tg_tps ? baseline.wall_tg_tps : (baseline ? baseline.gen_tps : 0);
                     if (baseline) {
                         const row = [
                             rpad('1x', 8),
-                            pad(baseline.gen_tps.toFixed(1) + ' tok/s', 12),
+                            pad(baseTg.toFixed(1) + ' tok/s', 12),
                             pad('1.00x', 8),
                             pad(baseline.processing_tps.toFixed(1) + ' tok/s', 12),
                             pad(baseline.processing_tps.toFixed(1) + ' tok/s', 12),
@@ -2500,7 +2513,7 @@
                         lines.push(row.join('  '));
                     }
                     for (const r of results) {
-                        const speedup = baseline && baseline.gen_tps > 0 ? (r.tg_tps / baseline.gen_tps).toFixed(2) + 'x' : '-';
+                        const speedup = baseTg > 0 ? (r.tg_tps / baseTg).toFixed(2) + 'x' : '-';
                         const row = [
                             rpad(r.batch_size + 'x', 8),
                             pad(r.tg_tps.toFixed(1) + ' tok/s', 12),

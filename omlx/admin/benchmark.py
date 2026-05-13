@@ -152,6 +152,10 @@ def _compute_single_metrics(
     ttft_ms = ttft_s * 1000
     tpot_ms = (gen_duration / max(completion_tokens - 1, 1)) * 1000
     gen_tps = completion_tokens / max(gen_duration, 1e-9)
+    # wall_tg_tps: gen tokens over total wall (includes prefill). Used as the
+    # 1x baseline for Continuous Batching speedup so the ratio is symmetric
+    # with batch tg_tps (which is also total_gen / wall_time).
+    wall_tg_tps = completion_tokens / max(e2e_duration, 1e-9)
     processing_tps = prompt_tokens / max(ttft_s, 1e-9)
     total_throughput = (prompt_tokens + completion_tokens) / max(e2e_duration, 1e-9)
 
@@ -159,6 +163,7 @@ def _compute_single_metrics(
         "ttft_ms": round(ttft_ms, 1),
         "tpot_ms": round(tpot_ms, 2),
         "gen_tps": round(gen_tps, 1),
+        "wall_tg_tps": round(wall_tg_tps, 1),
         "processing_tps": round(processing_tps, 1),
         "e2e_latency_s": round(e2e_duration, 3),
         "total_throughput": round(total_throughput, 1),
@@ -238,6 +243,76 @@ async def _run_single_test(
     )
 
 
+
+async def _run_batch_test_via_stream_generate(
+    engine: Any,
+    prompts: list[str],
+    prompt_tokens: int,
+    max_tokens: int,
+    batch_size: int,
+) -> dict:
+    """Batch test path for engines that only expose high-level stream_generate
+    (no engine_core). Used for DFlashEngine where concurrent requests
+    serialize through _active_request; metrics will reflect serial behavior.
+    """
+
+    async def _single_request(prompt: str) -> dict:
+        start = time.perf_counter()
+        first_token = None
+        completion_tokens = 0
+        async for output in engine.stream_generate(
+            prompt=prompt, max_tokens=max_tokens, temperature=0.0
+        ):
+            ct = getattr(output, "completion_tokens", None)
+            if ct is not None and ct > 0 and first_token is None:
+                first_token = time.perf_counter()
+            if ct is not None:
+                completion_tokens = ct
+            if getattr(output, "finished", False):
+                break
+        end = time.perf_counter()
+        if first_token is None:
+            first_token = end
+        return {
+            "ttft_s": first_token - start,
+            "first_token_abs": first_token,
+            "completion_tokens": completion_tokens,
+            "wall_s": end - start,
+        }
+
+    wall_start = time.perf_counter()
+    results = await asyncio.gather(
+        *[_single_request(prompts[i]) for i in range(batch_size)]
+    )
+    wall_end = time.perf_counter()
+
+    total_gen_tokens = sum(r["completion_tokens"] for r in results)
+    total_prompt_tokens = prompt_tokens * batch_size
+    wall_time = wall_end - wall_start
+    avg_ttft_ms = (sum(r["ttft_s"] for r in results) / batch_size) * 1000
+
+    # pp TPS: total prompt tokens / time until ALL requests finish prefill
+    max_first_token = max(r["first_token_abs"] for r in results)
+    prefill_wall_time = max_first_token - wall_start
+    pp_tps = total_prompt_tokens / max(prefill_wall_time, 1e-9)
+
+    # tg TPS: wall-aggregate (total_gen / wall_time). Same formula used in
+    # the engine_core batch path so DFlash ↔ BatchedEngine ratios are
+    # symmetric. The alternative (gen_wall_time = wall_end - max_first_token)
+    # is inflated for any engine that serializes prefill or decode, and
+    # makes cross-engine speedup columns meaningless. See _run_batch_test.
+    tg_tps = total_gen_tokens / max(wall_time, 1e-9)
+
+    return {
+        "pp_tps": round(pp_tps, 1),
+        "tg_tps": round(tg_tps, 1),
+        "avg_ttft_ms": round(avg_ttft_ms, 1),
+        "e2e_latency_s": round(wall_time, 3),
+        "total_gen_tokens": total_gen_tokens,
+        "batch_size": batch_size,
+    }
+
+
 async def _run_batch_test(
     engine: Any,
     prompts: list[str],
@@ -247,7 +322,7 @@ async def _run_batch_test(
 ) -> dict:
     """Run a continuous batching benchmark test.
 
-    Submits batch_size concurrent requests via the engine core and measures
+    Submits batch_size concurrent requests via the engine and measures
     aggregate throughput including pp TPS and tg TPS.
 
     Args:
@@ -256,6 +331,18 @@ async def _run_batch_test(
                  has a unique UUID prefix.
         prompt_tokens: Number of prompt tokens per request (for pp TPS calc).
     """
+    # Dispatch: engines exposing engine_core (BatchedEngine, VLMBatchedEngine)
+    # use add_request/stream_outputs; DFlashEngine uses stream_generate (high
+    # level) and serializes requests via its _active_request lock.
+    if not hasattr(engine, "_engine"):
+        return await _run_batch_test_via_stream_generate(
+            engine=engine,
+            prompts=prompts,
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+            batch_size=batch_size,
+        )
+
     from ..request import SamplingParams
 
     engine_core = engine._engine
@@ -314,10 +401,10 @@ async def _run_batch_test(
     prefill_wall_time = max_first_token - wall_start
     pp_tps = total_prompt_tokens / max(prefill_wall_time, 1e-9)
 
-    # tg TPS: total generated tokens / generation wall time
-    # Generation starts when the last request finishes prefill
-    gen_wall_time = wall_end - max_first_token
-    tg_tps = total_gen_tokens / max(gen_wall_time, 1e-9)
+    # tg TPS: wall-aggregate (total_gen / wall_time), same as the DFlash
+    # path. Honest cross-engine ratio with the Single Request wall_tg_tps
+    # baseline — see _run_batch_test_via_stream_generate.
+    tg_tps = total_gen_tokens / max(wall_time, 1e-9)
 
     return {
         "pp_tps": round(pp_tps, 1),
@@ -502,7 +589,11 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
         (r for r in single_results if r.get("pp") == 1024), None
     )
     if pp1024_single and batch_results:
-        baseline_tps = pp1024_single["gen_tps"]
+        # Use wall-aggregate baseline so 1x ↔ Nx ratios stay honest across
+        # engine types. Single Request table keeps showing gen_tps (peak
+        # decode rate) for context-length comparisons; Continuous Batching
+        # column needs the symmetric metric.
+        baseline_tps = pp1024_single["wall_tg_tps"]
         batching_results.append({
             "batch_size": 1,
             "tg_tps": baseline_tps,
@@ -536,6 +627,9 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
             "quantization": quantization,
             "context_length": context_length,
             "pp_tps": result["processing_tps"],
+            # Community board metric: peak decode rate (gen_tps, gen-only),
+            # NOT the wall-aggregate used for in-UI Continuous Batching
+            # speedup. Do not "tidy" this to wall_tg_tps.
             "tg_tps": result["gen_tps"],
             "ttft_ms": result.get("ttft_ms"),
             "peak_memory_gb": peak_mem_gb,
@@ -760,13 +854,12 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         batch_prompts = [_generate_prompt(tokenizer, 1024) for _ in range(max_batch)]
 
         # Skip batch tests for engines without scheduler core (e.g. DFlashEngine)
-        if request.batch_sizes and not hasattr(engine, "_engine"):
-            logger.info(
-                "Batch test skipped: engine does not support concurrent batching"
-            )
-            current_test += len(request.batch_sizes)
-
-        for batch_size in request.batch_sizes if hasattr(engine, "_engine") else []:
+        # NOTE: DFlashEngine doesn't expose engine_core (`_engine`) but does
+        # support concurrent requests by serializing them through its
+        # _active_request lock. Running batch test on DFlash yields valid
+        # metrics that show serialization behavior (4x wall time, no
+        # aggregate gain) — strictly more useful than silently skipping.
+        for batch_size in request.batch_sizes:
             current_test += 1
             await _send_event(run, {
                 "type": "progress",

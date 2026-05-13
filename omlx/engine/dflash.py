@@ -1,12 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-DFlash engine for block diffusion speculative decoding.
+DFlash engine for block diffusion speculative decoding (Path A layout).
 
-This engine wraps dflash-mlx (>= 0.1.5) to provide 3-4x faster decoding on
-Apple Silicon for Qwen and Gemma4 model families. By default it serves all
-requests through dflash; setting ``model_settings.dflash_max_ctx`` opts into
-evicting the dflash models and delegating long-context requests to omlx's
-BatchedEngine/VLMBatchedEngine (paged cache, SSD cache, continuous batching).
+Wraps dflash-mlx (>= 0.1.5) to provide 3-4x faster decoding on Apple Silicon
+for Qwen and Gemma4 model families.
+
+Path A layout: eagerly stands up **both** an embedded ``VLMBatchedEngine``
+(BG path: paged cache + SSD cache + continuous batching) **and** a DFlash
+drafter attached to the same target weights (dflash path: speculative
+decode). Per-request the engine routes between them based on concurrency,
+KV pressure, and context length; weights are shared (not re-loaded), so
+the only extra cost over plain VLM is the small drafter checkpoint.
+
+This replaces the pre-Path-A one-way eviction layout where exceeding
+``dflash_max_ctx`` permanently tore down dflash and started a fallback
+engine. The ``_in_fallback_mode`` flag and ``_evict_dflash_and_start_fallback``
+helper are gone; both paths coexist for the engine's lifetime.
 """
 
 import asyncio
@@ -65,14 +74,15 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
 
 class DFlashEngine(BaseEngine):
     """
-    DFlash speculative decoding engine with optional batched fallback.
+    DFlash speculative decoding engine with a long-lived embedded BG engine.
 
-    For prompts within ``model_settings.dflash_max_ctx`` (or always, when the
-    threshold is None), uses block diffusion speculative decoding for 3-4x
-    faster generation. When the threshold is exceeded, evicts dflash models
-    from memory and delegates to a fallback engine (BatchedEngine or
-    VLMBatchedEngine) that provides paged cache, SSD cache, and continuous
-    batching.
+    Path A layout: ``start()`` brings up both an embedded
+    ``VLMBatchedEngine``/``BatchedEngine`` (paged cache, SSD cache,
+    continuous batching) AND a DFlash drafter attached to the **same**
+    target weights via ``DFlashVLMTargetWrapper``. Per-request, ``_route``
+    decides between the dflash decode path (fast, capped concurrency,
+    bounded context) and the BG path (everything else). Weights are not
+    duplicated; the only extra memory cost is the small drafter.
     """
 
     def __init__(
@@ -84,9 +94,12 @@ class DFlashEngine(BaseEngine):
         draft_quant_activation_bits: int | None = None,
         draft_quant_group_size: int | None = None,
         model_settings: Any | None = None,
-        fallback_engine_type: str = "batched",
+        fallback_engine_type: str = "auto",
         scheduler_config: Any | None = None,
         omlx_ssd_cache_dir: str | Path | None = None,
+        dflash_max_concurrent: int = 4,
+        dflash_kv_pressure_threshold: float = 0.7,
+        dflash_lazy_drafter: bool = False,
     ):
         self._model_name = model_name
         self._draft_model_path = draft_model_path
@@ -95,7 +108,7 @@ class DFlashEngine(BaseEngine):
         self._draft_quant_activation_bits = draft_quant_activation_bits
         self._draft_quant_group_size = draft_quant_group_size
         self._model_settings = model_settings
-        self._fallback_engine_type = fallback_engine_type
+        self._fallback_engine_type = self._resolve_fallback_engine_type(fallback_engine_type, model_name)
         self._scheduler_config = scheduler_config
         self._omlx_ssd_cache_dir = (
             Path(omlx_ssd_cache_dir) if omlx_ssd_cache_dir else None
@@ -108,16 +121,51 @@ class DFlashEngine(BaseEngine):
         self._tokenizer_obj = None
         self._executor_tokenizer = None
         self._loaded = False
-        self._active_request = False
+        self._active_count = 0
         self._model_type_str = None
-        self._fallback_engine: BaseEngine | None = None
-        self._in_fallback_mode = False
+        self._target_ops: Any | None = None
+        self._draft_backend: Any | None = None
+        self._draft_meta: dict[str, Any] | None = None
+        # Path A double-engine layout: embedded VLM stays up for the
+        # engine's lifetime; the dflash bundle hooks into the same
+        # already-loaded target weights.
+        self._embedded_vlm: BaseEngine | None = None
+        self._dflash_bundle: Any | None = None
         self._runtime_context: Any | None = None
         self._dflash_prefix_cache: Any | None = None
+        # Routing counters (read by get_stats; also used by smoke test).
+        self._dflash_routed_count = 0
+        self._bg_routed_count = 0
+        self._last_route: str | None = None
 
         self._max_dflash_ctx = (
             getattr(model_settings, "dflash_max_ctx", None) if model_settings else None
         )
+        # Path A behavioural change: previously this defaulted to None
+        # (unlimited concurrent dflash requests, only context fallback
+        # ever bumped them off); Path A defaults to 1 so the BG path is
+        # actually exercised under concurrency. The model_settings value
+        # still wins when set explicitly.
+        settings_concurrent = (
+            getattr(model_settings, "dflash_max_concurrent", None) if model_settings else None
+        )
+        self._max_dflash_concurrent = (
+            int(settings_concurrent) if settings_concurrent is not None
+            else int(dflash_max_concurrent)
+        )
+        self._kv_pressure_threshold = float(dflash_kv_pressure_threshold)
+        # Lazy drafter loading: defer wrapper + factory call until first
+        # dflash-routed request. Saves ~28% throughput when workload is
+        # bg-heavy (drafter co-loaded in Metal causes contention even when
+        # idle, confirmed by D5 bench 2026-05-12). Cold-start cost: first
+        # dflash request includes ~3s drafter load latency.
+        self._dflash_lazy_drafter = bool(dflash_lazy_drafter)
+        # Lazily created in start() — asyncio.Semaphore needs a running event
+        # loop in some Python versions, and __init__ is sync.
+        self._concurrent_sem: asyncio.Semaphore | None = None
+        # Created in start() too; guards lazy-drafter race when multiple
+        # concurrent requests trigger first load simultaneously.
+        self._drafter_load_lock: asyncio.Lock | None = None
         self._in_memory_cache_enabled = (
             bool(getattr(model_settings, "dflash_in_memory_cache", True))
             if model_settings
@@ -150,6 +198,21 @@ class DFlashEngine(BaseEngine):
     @property
     def model_type(self) -> str | None:
         return self._model_type_str
+
+    @staticmethod
+    def _resolve_fallback_engine_type(requested: str, model_name: str) -> str:
+        """Resolve fallback_engine_type='auto' by inspecting model config.
+
+        Path A is initially Gemma 4 focused (multimodal). Defaulting to
+        'batched' was wrong for VLM models because mlx_lm cannot load
+        Gemma 4 ConditionalGeneration architecture. Auto-detect via
+        omlx.speculative.detect_fallback_engine_type (vision_config /
+        audio_config markers in config.json).
+        """
+        if requested != "auto":
+            return requested
+        from ..speculative import detect_fallback_engine_type
+        return detect_fallback_engine_type(model_name)
 
     @staticmethod
     def _build_quant_spec(
@@ -214,144 +277,232 @@ class DFlashEngine(BaseEngine):
 
         loop = asyncio.get_running_loop()
 
-        def _load_models():
-            from dflash_mlx.draft_backend import make_draft_backend
-            from dflash_mlx.runtime.loading import (
-                load_draft_bundle,
-                load_target_bundle,
-            )
-
-            target_bundle = load_target_bundle(self._model_name)
-            draft, draft_meta = load_draft_bundle(
-                self._draft_model_path,
-                draft_quant=self._build_quant_spec(
-                    self._draft_quant_weight_bits,
-                    self._draft_quant_activation_bits,
-                    self._draft_quant_group_size,
-                ) if self._draft_quant_enabled else None,
-            )
-            draft_backend = make_draft_backend()
-            return target_bundle, draft, draft_backend
-
-        result = await loop.run_in_executor(get_mlx_executor(), _load_models)
-        target_bundle, self._draft_model, self._draft_backend = result
-        self._target_model = target_bundle.model
-        self._tokenizer_obj = target_bundle.tokenizer
-        self._target_ops = target_bundle.target_ops
-        target_meta = target_bundle.meta
-
-        # Deep-copy tokenizer for executor-thread usage (dflash generation).
-        # The original self._tokenizer_obj stays for event-loop operations
-        # (encode, apply_chat_template, count_chat_tokens).
-        # See: https://github.com/huggingface/tokenizers/issues/537
-        self._executor_tokenizer = copy.deepcopy(self._tokenizer_obj)
-
-        # Extract model_type from config
-        config = target_meta.get("config", {})
-        if isinstance(config, dict):
-            self._model_type_str = config.get("model_type")
-        elif hasattr(config, "model_type"):
-            self._model_type_str = config.model_type
-
+        # Build runtime context first — the dflash factory consults it for
+        # verify_config and cache setup.
         self._runtime_context = self._build_runtime_context()
 
-        self._loaded = True
-        self._in_fallback_mode = False
-        max_ctx_display = "unlimited" if self._max_dflash_ctx is None else self._max_dflash_ctx
-        logger.info(
-            f"DFlashEngine loaded: target={self._model_name}, "
-            f"draft={self._draft_model_path}, "
-            f"max_ctx={max_ctx_display}, "
-            f"fallback={self._fallback_engine_type}, "
-            f"l1_cache={self._in_memory_cache_enabled}, "
-            f"l2_cache={self._resolve_dflash_l2_dir() is not None}"
-        )
-
-    async def _evict_dflash_and_start_fallback(self) -> None:
-        """Evict dflash models from memory, verify release, then start fallback engine."""
-        from dflash_mlx.cache.manager import shutdown_runtime_cache_manager
-
-        from ..engine_core import get_mlx_executor
-
-        loop = asyncio.get_running_loop()
-        pre_active = mx.get_active_memory()
-
-        # Release dflash model and cache references
-        shutdown_runtime_cache_manager()
-        self._dflash_prefix_cache = None
-        self._runtime_context = None
-        self._target_model = None
-        self._target_ops = None
-        self._draft_model = None
-        self._draft_backend = None
-        self._executor_tokenizer = None
-
-        # Force memory reclaim with settle barrier
-        gc.collect()
-        await loop.run_in_executor(
-            get_mlx_executor(),
-            lambda: (mx.synchronize(), mx.clear_cache()),
-        )
-
-        # Poll for actual memory release (same pattern as engine_pool._unload_engine)
-        for settle_round in range(10):
-            active_now = mx.get_active_memory()
-            freed = pre_active - active_now
-            if freed > 0:
-                logger.info(
-                    f"DFlash models evicted: freed={freed / 1024**3:.2f}GB "
-                    f"(round {settle_round + 1})"
-                )
-                break
-            await asyncio.sleep(0.5)
-            gc.collect()
-            await loop.run_in_executor(
-                get_mlx_executor(),
-                lambda: (mx.synchronize(), mx.clear_cache()),
-            )
-        else:
-            logger.warning("DFlash model eviction: memory settle timed out")
-
-        # Start fallback engine
+        # 1) Bring up the embedded BG engine. This is the canonical owner
+        #    of the target weights; the dflash drafter will attach to the
+        #    SAME ``_vlm_model`` instance, so memory does not double.
         if self._fallback_engine_type == "vlm":
             from .vlm import VLMBatchedEngine
-            self._fallback_engine = VLMBatchedEngine(
+            self._embedded_vlm = VLMBatchedEngine(
                 model_name=self._model_name,
                 scheduler_config=self._scheduler_config,
                 model_settings=self._model_settings,
             )
         else:
             from .batched import BatchedEngine
-            self._fallback_engine = BatchedEngine(
+            self._embedded_vlm = BatchedEngine(
                 model_name=self._model_name,
                 scheduler_config=self._scheduler_config,
                 model_settings=self._model_settings,
             )
-        await self._fallback_engine.start()
-        self._in_fallback_mode = True
+        await self._embedded_vlm.start()
+
+        # Discover the loaded model + tokenizer on the embedded engine.
+        # VLMBatchedEngine: ``_vlm_model`` / ``_tokenizer``.
+        # BatchedEngine: ``_model`` / ``_tokenizer``.
+        embedded_model = getattr(self._embedded_vlm, "_vlm_model", None) \
+            or getattr(self._embedded_vlm, "_model", None)
+        if embedded_model is None:
+            raise RuntimeError(
+                "DFlashEngine: embedded engine did not expose a loaded model "
+                "after start() — neither _vlm_model nor _model is set"
+            )
+        self._tokenizer_obj = getattr(self._embedded_vlm, "_tokenizer", None) \
+            or getattr(self._embedded_vlm, "tokenizer", None)
+        # Deep-copy tokenizer for executor-thread usage (dflash generation).
+        # See: https://github.com/huggingface/tokenizers/issues/537
+        self._executor_tokenizer = copy.deepcopy(self._tokenizer_obj)
+
+        # 2-3) Drafter loading. Eager path runs now; lazy path defers
+        # until first dflash-routed request via _ensure_drafter_loaded.
+        self._drafter_load_lock = asyncio.Lock()
+        if self._dflash_lazy_drafter:
+            logger.info(
+                "DFlashEngine: lazy_drafter mode — drafter NOT loaded yet "
+                "(loads on first dflash-routed request)"
+            )
+        else:
+            await self._load_drafter_bundle(embedded_model)
+
+        # Extract model_type from the embedded engine's config so the API
+        # layer's reasoning detection still works.
+        cfg = getattr(embedded_model, "config", None)
+        if cfg is not None:
+            if isinstance(cfg, dict):
+                self._model_type_str = cfg.get("model_type")
+            else:
+                self._model_type_str = getattr(cfg, "model_type", None)
+
+        self._loaded = True
+        if self._max_dflash_concurrent:
+            self._concurrent_sem = asyncio.Semaphore(self._max_dflash_concurrent)
+        max_ctx_display = "unlimited" if self._max_dflash_ctx is None else self._max_dflash_ctx
         logger.info(
-            f"DFlash fallback engine started: {self._fallback_engine_type}"
+            f"DFlashEngine loaded (Path A double-engine): target={self._model_name}, "
+            f"draft={self._draft_model_path}, "
+            f"embedded_engine={self._fallback_engine_type}, "
+            f"max_ctx={max_ctx_display}, "
+            f"max_concurrent={self._max_dflash_concurrent}, "
+            f"kv_pressure_threshold={self._kv_pressure_threshold}, "
+            f"l1_cache={self._in_memory_cache_enabled}, "
+            f"l2_cache={self._resolve_dflash_l2_dir() is not None}"
         )
+
+    async def _load_drafter_bundle(self, embedded_model: Any | None = None) -> None:
+        """Load the dflash drafter bundle (wrapper + factory attach).
+
+        Used by start() in eager mode and _ensure_drafter_loaded() in lazy
+        mode. Caller is responsible for serialization (start() runs once;
+        lazy path holds self._drafter_load_lock).
+
+        ``embedded_model`` is passed when called from start() (avoids a
+        second getattr); lazy path resolves it from self._embedded_vlm.
+        """
+        from ..speculative.dflash_factory import attach_dflash_to_loaded_target
+        from ..engine_core import get_mlx_executor
+
+        if embedded_model is None:
+            embedded_model = getattr(self._embedded_vlm, "_vlm_model", None) \
+                or getattr(self._embedded_vlm, "_model", None)
+            if embedded_model is None:
+                raise RuntimeError(
+                    "DFlashEngine._load_drafter_bundle: embedded engine "
+                    "did not expose a loaded model"
+                )
+
+        # Path A generalization: probe upstream dflash_mlx target_ops directly
+        # first. Apply the mlx_vlm→mlx_lm shape wrapper only when the upstream
+        # ops can't recognize the model.
+        #
+        # Currently:
+        #   - QwenGdnTargetOps walks `target.language_model` + uses structural
+        #     hasattr checks, so it accepts both mlx_lm-loaded Qwen and
+        #     mlx_vlm-loaded Qwen 3.x natively. NO wrapper.
+        #   - Gemma4TargetOps reads `text_wrapper.args.layer_types` and
+        #     `inner._get_per_layer_inputs` (mlx_lm-only attribute names), so
+        #     mlx_vlm-loaded Gemma 4 falls through. WRAPPER required.
+        #
+        # The try/except below auto-routes each family without family
+        # hardcoding here. When `bstnxbt/dflash-mlx` upstream generalizes
+        # Gemma4TargetOps to match QwenGdnTargetOps's VLM-aware pattern,
+        # the wrapper path goes idle for Gemma 4 too and we can eventually
+        # delete the wrapper module.
+        target_for_dflash = embedded_model
+        try:
+            from dflash_mlx.engine.target_ops import resolve_target_ops
+            resolve_target_ops(target_for_dflash)
+            logger.info(
+                "DFlashEngine: upstream dflash_mlx ops resolved embedded model "
+                "directly — no wrapper needed (family: %s)",
+                type(target_for_dflash).__name__,
+            )
+        except Exception as e:  # NotImplementedError or other rejection
+            from ..speculative.dflash_vlm_target_wrap import DFlashVLMTargetWrapper
+            logger.info(
+                "DFlashEngine: upstream ops rejected embedded model "
+                "(%s: %s); applying DFlashVLMTargetWrapper for mlx_vlm→mlx_lm "
+                "shape bridge",
+                type(e).__name__, str(e)[:120],
+            )
+            target_for_dflash = DFlashVLMTargetWrapper(embedded_model)
+
+        self._target_model = target_for_dflash
+        draft_quant_spec = (
+            self._build_quant_spec(
+                self._draft_quant_weight_bits,
+                self._draft_quant_activation_bits,
+                self._draft_quant_group_size,
+            )
+            if self._draft_quant_enabled
+            else None
+        )
+
+        def _attach_drafter() -> Any:
+            return attach_dflash_to_loaded_target(
+                target_model=target_for_dflash,
+                draft_path=self._draft_model_path,
+                draft_quant=draft_quant_spec,
+                runtime_context=self._runtime_context,
+            )
+
+        loop = asyncio.get_running_loop()
+        self._dflash_bundle = await loop.run_in_executor(
+            get_mlx_executor(), _attach_drafter
+        )
+        self._draft_model = self._dflash_bundle.draft_model
+        self._target_ops = self._dflash_bundle.target_ops
+        self._draft_backend = self._dflash_bundle.draft_backend
+
+    async def _ensure_drafter_loaded(self) -> None:
+        """Lazy-load drafter on first dflash-routed request. Idempotent and
+        concurrent-safe via self._drafter_load_lock (double-checked).
+
+        Called from generate / stream_generate just before entering the
+        DFlash decode path. No-op if drafter already loaded (eager mode or
+        previous lazy invocation).
+        """
+        if self._dflash_bundle is not None:
+            return
+        # _drafter_load_lock is created in start(); if we got here without
+        # start() having run, the engine is in an invalid state.
+        if self._drafter_load_lock is None:
+            raise RuntimeError(
+                "DFlashEngine._ensure_drafter_loaded called before start()"
+            )
+        async with self._drafter_load_lock:
+            if self._dflash_bundle is not None:  # double-check after lock
+                return
+            logger.info(
+                "DFlashEngine: loading drafter on first dflash-routed request "
+                "(lazy mode)"
+            )
+            await self._load_drafter_bundle()
+            logger.info("DFlashEngine: drafter loaded")
 
     async def stop(self) -> None:
         from dflash_mlx.cache.manager import shutdown_runtime_cache_manager
 
-        if self._fallback_engine is not None:
-            await self._fallback_engine.stop()
-            self._fallback_engine = None
+        # Tear down dflash drafter side first (releases prefix-cache /
+        # snapshot service / kernel state) before the embedded engine
+        # disposes of the shared target weights.
         try:
             shutdown_runtime_cache_manager()
         except Exception as exc:
             logger.debug(f"shutdown_runtime_cache_manager: {exc}")
         self._dflash_prefix_cache = None
         self._runtime_context = None
-        self._target_model = None
-        self._target_ops = None
+        self._dflash_bundle = None
         self._draft_model = None
+        self._target_ops = None
         self._draft_backend = None
+        # Wrapper; underlying weights belong to embedded_vlm and get torn
+        # down when the embedded engine stops below.
+        self._target_model = None
         self._tokenizer_obj = None
         self._executor_tokenizer = None
-        self._in_fallback_mode = False
+
+        # Force a barrier so MLX releases any draft buffers before the
+        # embedded engine starts its own teardown.
+        gc.collect()
+        try:
+            from ..engine_core import get_mlx_executor
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                lambda: (mx.synchronize(), mx.clear_cache()),
+            )
+        except Exception as exc:
+            logger.debug(f"DFlashEngine.stop barrier: {exc}")
+
+        if self._embedded_vlm is not None:
+            await self._embedded_vlm.stop()
+            self._embedded_vlm = None
+
+        self._runtime_context = None
+        self._tokenizer_obj = None
         self._loaded = False
         logger.info("DFlashEngine stopped")
 
@@ -436,10 +587,123 @@ class DFlashEngine(BaseEngine):
         )
         return len(self._tokenizer_obj.encode(prompt))
 
-    def _should_fallback(self, prompt_tokens: list[int]) -> bool:
-        if self._max_dflash_ctx is None:
-            return False
-        return len(prompt_tokens) >= self._max_dflash_ctx
+    def _kv_pressure(self) -> float | None:
+        """Read the embedded engine's paged KV cache usage ratio.
+
+        Returns a float in [0.0, 1.0] or None if the cache isn't exposed yet
+        (engine still starting, or accessor path drifted on an omlx upgrade).
+        The accessor chain — ``_embedded_vlm._engine.engine.scheduler.
+        paged_cache_manager.usage`` — was verified against omlx 0.x
+        (cache/paged_cache.py: ``PagedCacheManager.usage`` is a @property).
+        Falls back through a few common attr names just in case the upstream
+        renames it, so routing still works without a hot fix.
+
+        Wrapped in a broad except: this is best-effort telemetry feeding
+        a routing heuristic; it must never break the inference path.
+        """
+        try:
+            scheduler = self._embedded_vlm._engine.engine.scheduler  # type: ignore[union-attr]
+        except (AttributeError, RuntimeError):
+            return None
+        # 1) Most direct: PagedCacheManager.usage (current omlx 0.x).
+        mgr = getattr(scheduler, "paged_cache_manager", None)
+        if mgr is not None:
+            # NOTE: do NOT use mgr.usage property — it computes
+            # 1 - free_block_queue.num_free_blocks/(max_blocks-1), but
+            # num_free_blocks is the bounded FREE QUEUE size (capped ~256),
+            # not the unallocated block count. On a near-empty cache it
+            # still returns ~0.997 because the free queue size << max_blocks.
+            # Correct: allocated_count / max_blocks.
+            try:
+                max_blocks = getattr(mgr, "max_blocks", None)
+                if max_blocks and max_blocks > 0:
+                    alloc_count = getattr(mgr, "_current_allocated_count", None)
+                    if alloc_count is None:
+                        allocated = getattr(mgr, "allocated_blocks", None) or {}
+                        alloc_count = len(allocated)
+                    if alloc_count is not None:
+                        return float(alloc_count) / float(max_blocks)
+            except (AttributeError, TypeError, ZeroDivisionError):
+                pass
+        return None
+
+    def _route(self, prompt_tokens: list[int]) -> str:
+        """Decide whether this request runs on dflash or the embedded BG engine.
+
+        Path A signals (D3 layout):
+
+          * If we're already at the dflash concurrency cap, route to BG.
+          * If the embedded engine's paged KV cache usage exceeds the
+            configured pressure threshold, route to BG (avoid evicting
+            unrelated requests just to fit a dflash decode).
+          * If the prompt is at or past ``dflash_max_ctx``, route to BG.
+          * Otherwise route to dflash.
+
+        ``_active_count`` is sampled (not held); the increment for the
+        accepted request happens in the dflash decode path under
+        ``_concurrent_sem``, so the cap is enforced even when several
+        requests race here. Reading without locking is OK: the worst case
+        is a marginal request getting routed to dflash and then blocking
+        on the semaphore, which is the same behaviour the BG-route would
+        produce.
+
+        Side effect: records the decision via ``_record_route`` (counters
+        + jsonl metric line). Callers should NOT call ``_record_route``
+        again from ``generate`` / ``stream_generate``.
+        """
+        ctx_len = len(prompt_tokens)
+        if self._max_dflash_concurrent is not None \
+                and self._active_count >= self._max_dflash_concurrent:
+            self._record_route("bg", "concurrency", ctx_len, None)
+            return "bg"
+
+        kv_pressure = self._kv_pressure()
+        if kv_pressure is not None and kv_pressure > self._kv_pressure_threshold:
+            self._record_route("bg", "kv_pressure", ctx_len, kv_pressure)
+            return "bg"
+
+        if self._max_dflash_ctx is not None and ctx_len >= self._max_dflash_ctx:
+            self._record_route("bg", "max_ctx", ctx_len, kv_pressure)
+            return "bg"
+
+        self._record_route("dflash", "default", ctx_len, kv_pressure)
+        return "dflash"
+
+    def _record_route(
+        self,
+        routed_to: str,
+        reason: str,
+        ctx_len: int,
+        kv_pressure: float | None,
+    ) -> None:
+        """Bookkeeping for one routing decision: counters + jsonl metric.
+
+        Metric write is best-effort (size-capped, env-disable-able); see
+        ``omlx.metrics.dflash_routing`` for the size guard and disable
+        knobs. ``request_id`` is intentionally omitted — dflash.py has no
+        handle on the API-layer request id; threading one through is a
+        D3.x cleanup.
+        """
+        import time
+
+        from ..metrics.dflash_routing import write_routing_decision
+
+        self._last_route = routed_to
+        if routed_to == "dflash":
+            self._dflash_routed_count += 1
+        else:
+            self._bg_routed_count += 1
+
+        write_routing_decision({
+            "ts": time.time(),
+            "model_name": self._model_name,
+            "ctx_len": ctx_len,
+            "active_count": self._active_count,
+            "kv_usage_ratio": kv_pressure,
+            "projected_kv_after": None,  # spec A.2 — D3.x placeholder.
+            "routed_to": routed_to,
+            "reason": reason,
+        })
 
     def _get_think_token_id(self, attr: str) -> int | None:
         """Safely read think_start_id / think_end_id from the tokenizer."""
@@ -578,6 +842,9 @@ class DFlashEngine(BaseEngine):
             except ImportError:
                 pass
 
+            from dflash_mlx.engine.events import TokenEvent, SummaryEvent
+
+            prompt_token_count = 0
             for event in event_iter:
                 if stop_event.is_set():
                     logger.info("DFlash generation aborted by client")
@@ -622,6 +889,9 @@ class DFlashEngine(BaseEngine):
                     asyncio.run_coroutine_threadsafe(
                         queue.put(("", [], True, metrics)), loop
                     )
+                # Other event types (PrefillProgressEvent, PrefillCompleteEvent,
+                # SnapshotPublishedEvent, etc.) are informational — skip silently.
+                # snapshot_service handles snapshot lifecycle automatically.
 
                 # Cycle, memory, prefill, and snapshot events are consumed by the
                 # runtime cache manager and metrics layers — omlx does not surface
@@ -648,7 +918,7 @@ class DFlashEngine(BaseEngine):
                 queue.put(("", [], True, {"aborted": stop_event.is_set()})),
                 loop,
             )
-            self._active_request = False
+            self._active_count -= 1
 
     async def generate(
         self,
@@ -668,108 +938,118 @@ class DFlashEngine(BaseEngine):
 
         prompt_tokens = self._tokenizer_obj.encode(prompt)
 
-        # Fallback: evict dflash models, start LLM/VLM engine
-        if self._should_fallback(prompt_tokens):
-            if not self._in_fallback_mode:
-                logger.info(
-                    f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
-                    f"evicting dflash models and switching to {self._fallback_engine_type} engine"
-                )
-                await self._evict_dflash_and_start_fallback()
-            return await self._fallback_engine.generate(
+        # Path A routing: decide between dflash and the long-lived embedded
+        # BG engine. Both stay loaded for the engine's lifetime, so no
+        # eviction / reload is involved on either branch. ``_route`` records
+        # the decision internally (counters + jsonl metric); callers must
+        # NOT invoke ``_record_route`` again.
+        route = self._route(prompt_tokens)
+        if route == "bg":
+            return await self._embedded_vlm.generate(
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, min_p=min_p,
                 repetition_penalty=repetition_penalty,
                 presence_penalty=presence_penalty, stop=stop, **kwargs,
             )
 
-        # Already in fallback mode but short context came in.
-        # Stay in fallback mode (reloading dflash models is expensive).
-        if self._in_fallback_mode:
-            return await self._fallback_engine.generate(
-                prompt=prompt, max_tokens=max_tokens, temperature=temperature,
-                top_p=top_p, top_k=top_k, min_p=min_p,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty, stop=stop, **kwargs,
-            )
+        # Lazy drafter: load now if not yet loaded (no-op in eager mode).
+        await self._ensure_drafter_loaded()
 
-        from ..engine_core import get_mlx_executor
+        # Concurrent cap: hold at most ``dflash_max_concurrent`` requests
+        # inside the DFlash decode path. ``_route`` already bounced excess
+        # callers to the BG engine, but the semaphore stays as a guard
+        # against in-flight races where ``_active_count`` was sampled
+        # before the previous request incremented it.
+        if self._concurrent_sem is not None:
+            await self._concurrent_sem.acquire()
 
-        loop = asyncio.get_running_loop()
-        stop_event = threading.Event()
-
-        def _run():
-            from dflash_mlx.engine.events import SummaryEvent, TokenEvent
-
-            event_iter = None
-            try:
-                event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
-                    prompt_tokens=prompt_tokens,
-                    max_tokens=max_tokens,
-                )
-                tokens: list[int] = []
-                summary: SummaryEvent | None = None
-                for event in event_iter:
-                    if stop_event.is_set():
-                        logger.info("DFlash generation aborted by client")
-                        break
-                    if isinstance(event, TokenEvent):
-                        token_id = int(event.token_id)
-                        if token_id in stop_ids:
-                            continue
-                        tokens.append(token_id)
-                    elif isinstance(event, SummaryEvent):
-                        summary = event
-                return summary, tokens
-            finally:
-                if event_iter is not None:
-                    close = getattr(event_iter, "close", None)
-                    if close is not None:
-                        try:
-                            close()
-                        except Exception as exc:
-                            logger.debug(f"event_iter.close() raised: {exc}")
-                self._active_request = False
-
-        self._active_request = True
-        future = loop.run_in_executor(get_mlx_executor(), _run)
         try:
-            summary, generated = await asyncio.shield(asyncio.wrap_future(future))
-        except asyncio.CancelledError:
-            stop_event.set()
-            logger.info("DFlash generate cancelled, waiting for executor to drain")
+            from ..engine_core import get_mlx_executor
+
+            loop = asyncio.get_running_loop()
+            stop_event = threading.Event()
+
+            def _run():
+                event_iter = None
+                try:
+                    event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
+                        prompt_tokens=prompt_tokens,
+                        max_tokens=max_tokens,
+                    )
+                    from dflash_mlx.engine.events import TokenEvent, SummaryEvent
+
+                    tokens: list[int] = []
+                    summary: Any = None
+                    for event in event_iter:
+                        if stop_event.is_set():
+                            logger.info("DFlash generation aborted by client")
+                            break
+                        if isinstance(event, TokenEvent):
+                            token_id = int(event.token_id)
+                            if token_id in stop_ids:
+                                continue
+                            tokens.append(token_id)
+                        elif isinstance(event, SummaryEvent):
+                            summary = event
+                        # Other events (progress, snapshots) are informational.
+                    return summary, tokens
+                finally:
+                    if event_iter is not None:
+                        close = getattr(event_iter, "close", None)
+                        if close is not None:
+                            try:
+                                close()
+                            except Exception as exc:
+                                logger.debug(f"event_iter.close() raised: {exc}")
+                    self._active_count -= 1
+
+            self._active_count += 1
+            future = loop.run_in_executor(get_mlx_executor(), _run)
             try:
-                await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.warning("DFlash executor did not exit within 10s after abort")
-            except Exception:
-                pass
-            raise
-        text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
-        text = clean_special_tokens(text)
+                summary, generated = await asyncio.shield(asyncio.wrap_future(future))
+            except asyncio.CancelledError:
+                stop_event.set()
+                logger.info("DFlash generate cancelled, waiting for executor to drain")
+                try:
+                    await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.warning("DFlash executor did not exit within 10s after abort")
+                except Exception:
+                    pass
+                raise
+            # summary is a SummaryEvent dataclass (upstream API) or None.
 
-        # Reasoning models (Qwen3.x with enable_thinking, DeepSeek, MiniMax, ...)
-        # have <think>\n at the END of the prompt, so the model's first
-        # generated token is already INSIDE the thinking block. The opening
-        # tag never appears in the output, which would prevent extract_thinking
-        # / ThinkingParser from separating reasoning from content. Prepend
-        # the tag here so the API layer can split them correctly.
-        if self._detect_needs_think_prefix(prompt_tokens):
-            text = self._think_prefix_text() + text
+            text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
+            text = clean_special_tokens(text)
 
-        prompt_token_count = (
-            int(summary.prompt_token_count) if summary is not None else len(prompt_tokens)
-        )
-        completion_token_count = (
-            int(summary.generation_tokens) if summary is not None else len(generated)
-        )
-        return GenerationOutput(
-            text=text,
-            tokens=generated,
-            prompt_tokens=prompt_token_count,
-            completion_tokens=completion_token_count,
-            finish_reason="stop",
-        )
+            # Reasoning models (Qwen3.x with enable_thinking, DeepSeek, MiniMax, ...)
+            # have <think>\n at the END of the prompt, so the model's first
+            # generated token is already INSIDE the thinking block. The opening
+            # tag never appears in the output, which would prevent extract_thinking
+            # / ThinkingParser from separating reasoning from content. Prepend
+            # the tag here so the API layer can split them correctly.
+            if self._detect_needs_think_prefix(prompt_tokens):
+                text = self._think_prefix_text() + text
+
+            # summary is a SummaryEvent dataclass (upstream API) or None if
+            # generation ended before reaching the summary event.
+            prompt_tokens_count = (
+                int(summary.prompt_token_count) if summary is not None else len(prompt_tokens)
+            )
+            completion_tokens_count = (
+                int(summary.generation_tokens) if summary is not None else len(generated)
+            )
+
+            return GenerationOutput(
+                text=text,
+                tokens=generated,
+                prompt_tokens=prompt_tokens_count,
+                completion_tokens=completion_tokens_count,
+                finish_reason="stop",
+            )
+        finally:
+            if self._concurrent_sem is not None:
+                self._concurrent_sem.release()
 
     async def stream_generate(
         self,
@@ -789,15 +1069,13 @@ class DFlashEngine(BaseEngine):
 
         prompt_tokens = self._tokenizer_obj.encode(prompt)
 
-        # Fallback: evict dflash models, start LLM/VLM engine
-        if self._should_fallback(prompt_tokens):
-            if not self._in_fallback_mode:
-                logger.info(
-                    f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
-                    f"evicting dflash models and switching to {self._fallback_engine_type} engine"
-                )
-                await self._evict_dflash_and_start_fallback()
-            async for output in self._fallback_engine.stream_generate(
+        # Path A routing: see ``generate``. Streaming mirrors the same
+        # routing decision; the dflash side keeps its concurrency cap via
+        # the semaphore released in the finally clause below. ``_route``
+        # records the decision; do not call ``_record_route`` again here.
+        route = self._route(prompt_tokens)
+        if route == "bg":
+            async for output in self._embedded_vlm.stream_generate(
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, min_p=min_p,
                 repetition_penalty=repetition_penalty,
@@ -806,16 +1084,15 @@ class DFlashEngine(BaseEngine):
                 yield output
             return
 
-        # Already in fallback mode — stay there
-        if self._in_fallback_mode:
-            async for output in self._fallback_engine.stream_generate(
-                prompt=prompt, max_tokens=max_tokens, temperature=temperature,
-                top_p=top_p, top_k=top_k, min_p=min_p,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty, stop=stop, **kwargs,
-            ):
-                yield output
-            return
+        # Lazy drafter: load now if not yet loaded (no-op in eager mode).
+        await self._ensure_drafter_loaded()
+
+        # Concurrent cap: hold at most ``dflash_max_concurrent`` requests
+        # inside the DFlash streaming path. Released in the finally clause
+        # below so it fires even when the async generator is cancelled
+        # mid-iteration.
+        if self._concurrent_sem is not None:
+            await self._concurrent_sem.acquire()
 
         prompt_len = len(prompt_tokens)
         loop = asyncio.get_running_loop()
@@ -831,7 +1108,7 @@ class DFlashEngine(BaseEngine):
         think_prefix_pending = needs_think_prefix
 
         from ..engine_core import get_mlx_executor
-        self._active_request = True
+        self._active_count += 1
         future = loop.run_in_executor(
             get_mlx_executor(),
             self._run_generate_streaming,
@@ -894,6 +1171,8 @@ class DFlashEngine(BaseEngine):
                 )
             except Exception as exc:
                 logger.debug(f"DFlash executor future raised: {exc}")
+            if self._concurrent_sem is not None:
+                self._concurrent_sem.release()
 
     async def chat(
         self,
@@ -959,9 +1238,9 @@ class DFlashEngine(BaseEngine):
             yield output
 
     def has_active_requests(self) -> bool:
-        if self._fallback_engine is not None and self._fallback_engine.has_active_requests():
+        if self._embedded_vlm is not None and self._embedded_vlm.has_active_requests():
             return True
-        return self._active_request
+        return self._active_count > 0
 
     def get_stats(self) -> dict[str, Any]:
         return {
@@ -969,14 +1248,22 @@ class DFlashEngine(BaseEngine):
             "model_name": self._model_name,
             "draft_model": self._draft_model_path,
             "max_dflash_ctx": self._max_dflash_ctx,
-            "fallback_engine_type": self._fallback_engine_type,
-            "in_fallback_mode": self._in_fallback_mode,
+            "max_dflash_concurrent": self._max_dflash_concurrent,
+            "kv_pressure_threshold": self._kv_pressure_threshold,
+            "active_count": self._active_count,
+            "embedded_engine_type": self._fallback_engine_type,
+            "last_route": self._last_route,
+            "dflash_routed_count": self._dflash_routed_count,
+            "bg_routed_count": self._bg_routed_count,
+            "concurrent_sem_locked": (
+                self._concurrent_sem.locked() if self._concurrent_sem is not None else False
+            ),
             "loaded": self._loaded,
             "in_memory_cache": self._in_memory_cache_enabled,
             "ssd_cache": self._resolve_dflash_l2_dir() is not None,
         }
 
     def get_cache_stats(self) -> dict[str, Any] | None:
-        if self._fallback_engine is not None:
-            return self._fallback_engine.get_cache_stats()
+        if self._embedded_vlm is not None:
+            return self._embedded_vlm.get_cache_stats()
         return None

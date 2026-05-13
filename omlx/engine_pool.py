@@ -645,6 +645,20 @@ class EnginePool:
                             omlx_ssd_cache_dir=getattr(
                                 self._scheduler_config, "paged_ssd_cache_dir", None
                             ),
+                            # Path A: pass routing knobs explicitly. ``model_settings``
+                            # values still win inside DFlashEngine.__init__; these
+                            # are the engine-pool-level defaults when the per-model
+                            # settings don't set them. D3 fix: ``or 1`` collapsed
+                            # an explicit 0 (user disables dflash decode path) into
+                            # the default 1. Now None -> 1, explicit 0 stays 0.
+                            dflash_max_concurrent=(
+                                1
+                                if getattr(model_settings, "dflash_max_concurrent", None) is None
+                                else int(getattr(model_settings, "dflash_max_concurrent"))
+                            ),
+                            dflash_kv_pressure_threshold=getattr(
+                                model_settings, "dflash_kv_pressure_threshold", 0.7
+                            ) or 0.7,
                         )
                         logger.info(f"DFlash enabled for {model_id}, draft={dflash_draft}")
                     except ImportError:
@@ -700,7 +714,10 @@ class EnginePool:
                         model_settings=model_settings,
                     )
 
-            _is_dflash_engine = engine is not None and type(engine).__name__ == "DFlashEngine"
+            # D3: replace string-name sniff with duck typing on the Path A
+            # ``_dflash_bundle`` attr. Survives renames / subclassing and is a
+            # stronger contract than ``type().__name__``.
+            _is_dflash_engine = engine is not None and hasattr(engine, "_dflash_bundle")
 
             try:
                 await engine.start()

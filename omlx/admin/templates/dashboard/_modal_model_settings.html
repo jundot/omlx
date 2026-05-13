@@ -661,10 +661,10 @@
                                     </div>
                                     <div x-show="modelSettings.specprefill_enabled" x-transition class="space-y-3 pt-1">
                                         <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft Model</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_draft_model') }}</label>
                                             <select x-model="modelSettings.specprefill_draft_model"
                                                     class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                <option value="">Select draft model...</option>
+                                                <option value="">{{ t('modal.model_settings.dflash_draft_model_placeholder') }}</option>
                                                 <template x-for="m in models.filter(m => m.id !== selectedModel?.id)" :key="m.id">
                                                     <option :value="m.model_path || m.id" x-text="m.id" :selected="modelSettings.specprefill_draft_model === (m.model_path || m.id)"></option>
                                                 </template>
@@ -770,15 +770,21 @@
                                             </div>
                                         </div>
                                         <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Max Context (fallback threshold)</label>
-                                            <input type="number" x-model.number="modelSettings.dflash_max_ctx" min="1" step="1024" placeholder="unlimited"
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_max_ctx') }}</label>
+                                            <input type="number" x-model.number="modelSettings.dflash_max_ctx" min="1" step="1024" :placeholder="t('modal.model_settings.dflash_max_ctx_placeholder')"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <p class="text-xs text-neutral-400 mt-1">Prompts at or above this token count switch to BatchedEngine. Leave empty for unlimited.</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_max_ctx_help') }}</p>
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_max_concurrent') }}</label>
+                                            <input type="number" x-model.number="modelSettings.dflash_max_concurrent" min="1" step="1" :placeholder="t('modal.model_settings.dflash_max_concurrent_placeholder')"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_max_concurrent_help') }}</p>
                                         </div>
                                         <div class="flex items-start justify-between gap-3 pt-2 border-t border-neutral-200">
                                             <div class="min-w-0">
-                                                <span class="text-sm font-medium text-neutral-700">In-memory cache</span>
-                                                <p class="text-xs text-neutral-500 mt-0.5">DFlash L1 prefix snapshot cache in RAM. Speeds up multi-turn chats with shared prefixes.</p>
+                                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash_l1_cache') }}</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash_l1_cache_hint') }}</p>
                                             </div>
                                             <button type="button" @click="modelSettings.dflash_in_memory_cache = !modelSettings.dflash_in_memory_cache; if (!modelSettings.dflash_in_memory_cache) modelSettings.dflash_ssd_cache = false"
                                                     :class="modelSettings.dflash_in_memory_cache ? 'bg-black' : 'bg-neutral-200'"
@@ -788,23 +794,23 @@
                                             </button>
                                         </div>
                                         <div x-show="modelSettings.dflash_in_memory_cache" x-transition>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">In-memory cache max entries</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_l1_max_entries') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_in_memory_cache_max_entries" min="1" max="128" step="1" placeholder="4"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <p class="text-xs text-neutral-400 mt-1">Maximum number of prefix snapshots kept in L1 cache. Each entry stores KV + draft GDN state for one conversation prefix.</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_l1_max_entries_help') }}</p>
                                         </div>
                                         <div x-show="modelSettings.dflash_in_memory_cache" x-transition>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">In-memory cache size (GiB)</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_l1_max_gib') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_in_memory_cache_max_gib" min="1" max="256" step="1" placeholder="8"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <p class="text-xs text-neutral-400 mt-1">Byte budget for L1 snapshots; LRU evicts when exceeded.</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_l1_max_gib_help') }}</p>
                                         </div>
                                         <div class="flex items-start justify-between gap-3">
                                             <div class="min-w-0">
-                                                <span class="text-sm font-medium text-neutral-700">SSD cache</span>
-                                                <p class="text-xs text-neutral-500 mt-0.5">L2 spill of evicted L1 entries to disk. Uses the oMLX paged SSD cache directory (<code>dflash_l2/</code>).</p>
-                                                <p x-show="!modelSettings.dflash_ssd_cache_available" class="text-xs text-amber-600 mt-1">Enable oMLX paged SSD cache first (<code>--paged-ssd-cache-dir</code>).</p>
-                                                <p x-show="modelSettings.dflash_ssd_cache_available && !modelSettings.dflash_in_memory_cache" class="text-xs text-amber-600 mt-1">Requires in-memory cache to be enabled.</p>
+                                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash_l2_cache') }}</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash_l2_cache_hint') | safe }}</p>
+                                                <p x-show="!modelSettings.dflash_ssd_cache_available" class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.dflash_l2_unavailable') | safe }}</p>
+                                                <p x-show="modelSettings.dflash_ssd_cache_available && !modelSettings.dflash_in_memory_cache" class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.dflash_l2_requires_l1') }}</p>
                                             </div>
                                             <button type="button"
                                                     @click="if (modelSettings.dflash_ssd_cache_available && modelSettings.dflash_in_memory_cache) modelSettings.dflash_ssd_cache = !modelSettings.dflash_ssd_cache"
