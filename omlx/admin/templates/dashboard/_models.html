@@ -291,7 +291,7 @@
                                 </div>
                                 <!-- Filter panel -->
                                 <div x-show="hfSearchFiltersOpen" x-cloak class="mt-3 p-4 bg-neutral-50 rounded-xl border border-neutral-200">
-                                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                    <div class="grid grid-cols-2 md:grid-cols-5 gap-4">
                                         <!-- Quantization filter -->
                                         <div>
                                             <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.search.filter.quant') }}</label>
@@ -327,6 +327,17 @@
                                                 <span class="text-xs text-neutral-400">B</span>
                                             </div>
                                         </div>
+                                        <!-- Min Size -->
+                                        <div>
+                                            <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.search.filter.min_size') }}</label>
+                                            <div class="flex items-center gap-1">
+                                                <input type="number" x-model="hfSearchMinSize"
+                                                       @input="debounceSearch()"
+                                                       placeholder="0"
+                                                       class="w-full px-3 py-2 border border-neutral-200 rounded-lg text-sm bg-white focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                                <span class="text-xs text-neutral-400">GB</span>
+                                            </div>
+                                        </div>
                                         <!-- Max Size -->
                                         <div>
                                             <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.search.filter.max_size') }}</label>
@@ -342,7 +353,7 @@
                                     <!-- Clear filters -->
                                     <div class="mt-3 flex justify-end">
                                         <button @click="clearHFSearchFilters()"
-                                                x-show="hfSearchQuant || hfSearchMinParams || hfSearchMaxParams || hfSearchMaxSize"
+                                                x-show="hfSearchQuant || hfSearchMinParams || hfSearchMaxParams || hfSearchMinSize || hfSearchMaxSize"
                                                 x-cloak
                                                 class="text-xs text-neutral-500 hover:text-neutral-700 underline">
                                             {{ t('models.search.filter.clear') }}
@@ -475,6 +486,7 @@
                                                         <td class="px-4 py-3">
                                                             <button @click="openModelDetail(model.repo_id)"
                                                                     class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer max-w-[200px] lg:max-w-[300px]" x-text="model.name"></button>
+                                                            <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
                                                         </td>
                                                         <td class="px-4 py-3">
                                                             <span x-show="model.quantization"
@@ -485,7 +497,15 @@
                                                         <td class="px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="formatDownloads(model.downloads)"></td>
                                                         <td class="px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="model.likes"></td>
                                                         <td class="px-4 py-3">
-                                                            <div class="flex justify-center">
+                                                            <div class="flex justify-center items-center gap-2">
+                                                                <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
+                                                                      class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200 shrink-0">
+                                                                    {{ t('models.browse.tight_fit') }}
+                                                                </span>
+                                                                <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
+                                                                      class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200 shrink-0">
+                                                                    {{ t('models.browse.high_oom_risk') }}
+                                                                </span>
                                                                 <button @click="downloadRecommended(model.repo_id)"
                                                                         :disabled="hfDownloading"
                                                                         class="px-3 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100 hover:bg-neutral-900 hover:text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5">
@@ -587,6 +607,7 @@
                                                             <td class="px-4 py-3">
                                                                 <button @click="openModelDetail(model.repo_id)"
                                                                         class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer font-mono text-xs max-w-[200px] lg:max-w-[300px]" x-text="model.repo_id"></button>
+                                                                <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
                                                             </td>
                                                             <td class="px-4 py-3">
                                                                 <span x-show="model.quantization"
@@ -597,7 +618,15 @@
                                                             <td class="px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="formatDownloads(model.downloads)"></td>
                                                             <td class="px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="model.likes"></td>
                                                             <td class="px-4 py-3">
-                                                                <div class="flex justify-center">
+                                                                <div class="flex justify-center items-center gap-2">
+                                                                    <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
+                                                                          class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200 shrink-0">
+                                                                        {{ t('models.browse.tight_fit') }}
+                                                                    </span>
+                                                                    <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
+                                                                          class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200 shrink-0">
+                                                                        {{ t('models.browse.high_oom_risk') }}
+                                                                    </span>
                                                                     <button @click="downloadRecommended(model.repo_id)"
                                                                             :disabled="hfDownloading"
                                                                             class="px-3 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100 hover:bg-neutral-900 hover:text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5">

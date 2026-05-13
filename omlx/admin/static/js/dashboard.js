@@ -258,13 +258,14 @@
             hfSearchMinParams: '',
             hfSearchMaxParams: '',
             hfSearchMaxSize: '',
+            hfSearchMinSize: '',
             // Table sort state for Browse Models
             hfTableSort: 'downloads',
             hfTableSortDir: 'desc',
 
             // Computed: check if any filters are active
             get hfSearchFiltersActive() {
-                return this.hfSearchQuant || this.hfSearchMinParams || this.hfSearchMaxParams || this.hfSearchMaxSize;
+                return this.hfSearchQuant || this.hfSearchMinParams || this.hfSearchMaxParams || this.hfSearchMaxSize || this.hfSearchMinSize;
             },
 
             // Search history
@@ -4119,6 +4120,15 @@
                     if (this.hfSearchMinParams) params.set('min_params', (parseFloat(this.hfSearchMinParams) * 1e9).toString());
                     if (this.hfSearchMaxParams) params.set('max_params', (parseFloat(this.hfSearchMaxParams) * 1e9).toString());
                     if (this.hfSearchMaxSize) params.set('max_size', (parseFloat(this.hfSearchMaxSize) * 1e9).toString());
+                    if (this.hfSearchMinSize) params.set('min_size', (parseFloat(this.hfSearchMinSize) * 1e9).toString());
+                    // Wire largest/smallest sort params to backend
+                    if (this.hfSearchSort === 'largest') {
+                        params.set('sort_by_size', 'true');
+                        params.set('sort_ascending', 'false');
+                    } else if (this.hfSearchSort === 'smallest') {
+                        params.set('sort_by_size', 'true');
+                        params.set('sort_ascending', 'true');
+                    }
                     
                     const response = await fetch(`/admin/api/hf/search?${params}`, { signal: controller.signal });
                     if (response.ok) {
@@ -4153,6 +4163,7 @@
                 this.hfSearchMinParams = '';
                 this.hfSearchMaxParams = '';
                 this.hfSearchMaxSize = '';
+                this.hfSearchMinSize = '';
                 if (this.hfSearchQuery.trim()) this.immediateSearch();
             },
 

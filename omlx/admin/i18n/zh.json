@@ -703,10 +703,11 @@
   "js.error.delete_model_connection": "删除模型失败，请检查服务器连接。",
   "js.success.download_started": "已开始下载：{repo_id}",
   "js.success.settings_saved": "设置已成功保存",
-  "models.table.name": "Name",
-  "models.table.size": "Size",
-  "models.table.downloads": "Downloads",
-  "models.table.likes": "Likes",
-  "models.table.action": "Action",
-  "models.table.quantization": "Quant"
+  "models.table.name": "名称",
+  "models.table.size": "大小",
+  "models.table.downloads": "下载",
+  "models.table.likes": "喜欢",
+  "models.table.action": "操作",
+  "models.table.quantization": "量化",
+  "models.search.filter.min_size": "最小体积"
 }
