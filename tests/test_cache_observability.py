@@ -11,42 +11,46 @@ import pytest
 from omlx.cache.observability import CacheRateTracker
 
 
-def _make_counters(
-    prefix_hits=0,
-    prefix_misses=0,
-    prefix_tokens_matched=0,
-    prefix_tokens_requested=0,
-    prefix_tokens_saved=0,
-    evictions=0,
-    ssd_hot_hits=0,
-    ssd_disk_loads=0,
-    ssd_saves=0,
-    ssd_errors=0,
-    hot_cache_evictions=0,
-    hot_cache_promotions=0,
-    mru_partial_stashes=0,
-    mru_partial_hits=0,
-    mru_partial_evictions=0,
-    mru_partial_tokens_saved=0,
-):
-    return {
-        "prefix_hits": prefix_hits,
-        "prefix_misses": prefix_misses,
-        "prefix_tokens_matched": prefix_tokens_matched,
-        "prefix_tokens_requested": prefix_tokens_requested,
-        "prefix_tokens_saved": prefix_tokens_saved,
-        "evictions": evictions,
-        "ssd_hot_hits": ssd_hot_hits,
-        "ssd_disk_loads": ssd_disk_loads,
-        "ssd_saves": ssd_saves,
-        "ssd_errors": ssd_errors,
-        "hot_cache_evictions": hot_cache_evictions,
-        "hot_cache_promotions": hot_cache_promotions,
-        "mru_partial_stashes": mru_partial_stashes,
-        "mru_partial_hits": mru_partial_hits,
-        "mru_partial_evictions": mru_partial_evictions,
-        "mru_partial_tokens_saved": mru_partial_tokens_saved,
-    }
+# Counter keys produced by Scheduler._collect_cache_counters.  Adding a new
+# observability counter means adding it here and in the production code
+# in lockstep; the explicit-kwargs alternative duplicated the schema once
+# in the function signature and once in the dict construction.
+_COUNTER_KEYS = (
+    "prefix_hits",
+    "prefix_misses",
+    "prefix_tokens_matched",
+    "prefix_tokens_requested",
+    "prefix_tokens_saved",
+    "evictions",
+    "ssd_hot_hits",
+    "ssd_disk_loads",
+    "ssd_saves",
+    "ssd_errors",
+    "hot_cache_evictions",
+    "hot_cache_promotions",
+    "mru_partial_stashes",
+    "mru_partial_hits",
+    "mru_partial_evictions",
+    "mru_partial_tokens_saved",
+)
+
+
+def _make_counters(**overrides):
+    """Build a counter dict for snapshot testing.
+
+    All keys default to ``0``; override individual values via kwargs.
+    Unknown keys raise — the typo-catching the explicit-signature form
+    used to provide.
+    """
+    unknown = set(overrides) - set(_COUNTER_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Unknown counter keys: {sorted(unknown)}. "
+            f"Known: {sorted(_COUNTER_KEYS)}"
+        )
+    counters = {k: 0 for k in _COUNTER_KEYS}
+    counters.update(overrides)
+    return counters
 
 
 class TestCacheRateTrackerSnapshot:

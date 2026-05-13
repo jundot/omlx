@@ -2296,6 +2296,21 @@
                 return Math.min(100, (rc.mru_partial_entries / rc.mru_partial_max_entries) * 100);
             },
 
+            get mruEnabled() {
+                return (this.stats.runtime_cache?.mru_partial_max_entries || 0) > 0;
+            },
+
+            get hotCacheEnabled() {
+                return (this.stats.runtime_cache?.hot_cache_max_bytes || 0) > 0;
+            },
+
+            get cacheRatesGridCols() {
+                const both = this.hotCacheEnabled && this.mruEnabled;
+                if (both) return 'grid-cols-2 sm:grid-cols-6';
+                if (this.hotCacheEnabled || this.mruEnabled) return 'grid-cols-2 sm:grid-cols-4';
+                return 'grid-cols-2';
+            },
+
             get runtimeSsdCachePercent() {
                 const rc = this.stats.runtime_cache;
                 if (!rc || !rc.disk_max_bytes) return 0;

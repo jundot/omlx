@@ -71,33 +71,26 @@ class _MRUPartialBlock:
     -----------------
     ``kv_data`` holds real ``mx.array`` allocations (produced by
     ``_clone_tensor`` → ``mx.copy``), so each entry's memory cost is
-    automatically counted by ``mx.get_active_memory()``. Every runtime
-    memory enforcement and telemetry path in this codebase reads from
-    there: the process-level enforcer, the scheduler's prefill mid-loop
-    limit check, the prefill pre-flight peak check, the generation
-    admission guard, and the periodic-clear threshold.
+    automatically counted by ``mx.get_active_memory()`` and is therefore
+    visible to every runtime memory enforcement and telemetry path in
+    this codebase (process enforcer, scheduler limit checks,
+    periodic-clear threshold, prefill pre-flight peak check).
 
-    Upstream of those, ``EnginePool`` reserves a fraction of each model's
-    weight size as KV headroom when deciding whether to evict other models
-    before loading. MRU partials are one tenant of that headroom alongside
-    in-flight prompt caches; they are not separately reserved because at
-    one ``block_size``-worth of KV per entry (~17 MiB for Kimi K2.5 /
-    DeepSeek MLA, ~41 MiB for full-attention 70B models) and the default
-    cap of 4 entries, the worst case (~68-165 MiB) is well below the
-    in-flight caches the headroom was sized for.
-
-    Under ``hot_cache_only=True`` (settings or ``OMLX_HOT_CACHE_ONLY``
-    env), the hot cache and the MRU dict both live in the same KV headroom
-    envelope. Both are bounded — the operator should be aware they share
-    a budget and tune ``--mru-partial-max-entries`` and
-    ``--hot-cache-max-size`` together rather than treating them as
-    independent dials.
+    Upstream of those, the engine pool reserves a fraction of each
+    model's weight size as KV headroom before admission.  MRU partials
+    are one tenant of that headroom alongside in-flight prompt caches;
+    they are not separately reserved because each entry is bounded at
+    one ``block_size``-worth of KV and the default cap is small.  Under
+    ``hot_cache_only=True``, the hot cache and the MRU dict share that
+    envelope — tune ``--mru-partial-max-entries`` and
+    ``--hot-cache-max-size`` together in that mode rather than treating
+    them as independent dials.
 
     Future maintainers: do **not** add a separate accounting hook for
-    these entries. The invariant that ``kv_data`` holds ``mx.array``
-    instances (not numpy/CPU copies) is what makes the implicit accounting
-    work; the test
-    ``test_kv_data_holds_mlx_arrays_for_active_memory_accounting`` pins it.
+    these entries.  The invariant that ``kv_data`` holds ``mx.array``
+    instances (not numpy/CPU copies) is what makes the implicit
+    accounting work; ``test_kv_data_holds_mlx_arrays_for_active_memory_accounting``
+    pins it.
     """
 
     parent_hash: bytes | None
@@ -1008,29 +1001,32 @@ class BlockAwarePrefixCache(CacheManager):
         if partial is None:
             return cache, remaining_tokens, 0
 
+        def _evict_miss() -> tuple[list[Any], list[int], int]:
+            """Pop the matched entry and return the no-op tuple.
+
+            Used by every apply-time mismatch arm.  Inlines to one line
+            at each call site and keeps the eviction-counter bookkeeping
+            in one place.
+            """
+            self._mru_partials.pop(last_hash, None)
+            self._mru_partial_evictions += 1
+            return cache, remaining_tokens, 0
+
         n_partial = len(partial.tokens)
         if len(remaining_tokens) < n_partial:
-            self._mru_partials.pop(last_hash, None)
-            self._mru_partial_evictions += 1
-            return cache, remaining_tokens, 0
+            return _evict_miss()
         if remaining_tokens[:n_partial] != partial.tokens:
-            self._mru_partials.pop(last_hash, None)
-            self._mru_partial_evictions += 1
-            return cache, remaining_tokens, 0
+            return _evict_miss()
 
         if len(partial.kv_data) != len(cache):
             logger.debug(
                 "MRU partial layer count mismatch: %d vs %d, evicting entry",
                 len(partial.kv_data), len(cache),
             )
-            self._mru_partials.pop(last_hash, None)
-            self._mru_partial_evictions += 1
-            return cache, remaining_tokens, 0
+            return _evict_miss()
 
         if not HAS_MLX:
-            self._mru_partials.pop(last_hash, None)
-            self._mru_partial_evictions += 1
-            return cache, remaining_tokens, 0
+            return _evict_miss()
 
         # Phase 1: build per-layer replacements without touching the cache.
         # Any failure here is a clean rollback — no layer has been mutated.
@@ -1045,9 +1041,7 @@ class BlockAwarePrefixCache(CacheManager):
             logger.debug(
                 "MRU partial splice build failed: %s, evicting entry", e
             )
-            self._mru_partials.pop(last_hash, None)
-            self._mru_partial_evictions += 1
-            return cache, remaining_tokens, 0
+            return _evict_miss()
 
         # Phase 2: commit. All concatenates have already succeeded; the
         # only operations remaining are attribute writes and an integer
