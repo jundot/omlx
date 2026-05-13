@@ -20,7 +20,7 @@ import signal
 import sys
 import time
 from collections import deque
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, fields as dataclass_fields, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -1632,53 +1632,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         # Add settings if available
         if settings:
             model_data["settings"] = {
-                "model_alias": settings.model_alias,
-                "model_type_override": settings.model_type_override,
-                "max_context_window": settings.max_context_window,
-                "max_tokens": settings.max_tokens,
-                "temperature": settings.temperature,
-                "top_p": settings.top_p,
-                "top_k": settings.top_k,
-                "repetition_penalty": settings.repetition_penalty,
-                "min_p": settings.min_p,
-                "presence_penalty": settings.presence_penalty,
-                "force_sampling": settings.force_sampling,
-                "max_tool_result_tokens": settings.max_tool_result_tokens,
-                "enable_thinking": settings.enable_thinking,
-                "thinking_budget_enabled": settings.thinking_budget_enabled,
-                "thinking_budget_tokens": settings.thinking_budget_tokens,
-                "reasoning_parser": settings.reasoning_parser,
-                "chat_template_kwargs": settings.chat_template_kwargs,
-                "forced_ct_kwargs": settings.forced_ct_kwargs,
-                "ttl_seconds": settings.ttl_seconds,
-                "index_cache_freq": settings.index_cache_freq,
-                "turboquant_kv_enabled": settings.turboquant_kv_enabled,
-                "turboquant_kv_bits": settings.turboquant_kv_bits,
-                "specprefill_enabled": settings.specprefill_enabled,
-                "specprefill_draft_model": settings.specprefill_draft_model,
-                "specprefill_keep_pct": settings.specprefill_keep_pct,
-                "specprefill_threshold": settings.specprefill_threshold,
-                "dflash_enabled": settings.dflash_enabled,
-                "dflash_draft_model": settings.dflash_draft_model,
-                "dflash_draft_quant_enabled": settings.dflash_draft_quant_enabled,
-                "dflash_draft_quant_weight_bits": settings.dflash_draft_quant_weight_bits,
-                "dflash_draft_quant_activation_bits": settings.dflash_draft_quant_activation_bits,
-                "dflash_draft_quant_group_size": settings.dflash_draft_quant_group_size,
-                "dflash_max_ctx": settings.dflash_max_ctx,
-                "dflash_in_memory_cache": settings.dflash_in_memory_cache,
-                "dflash_in_memory_cache_max_entries": settings.dflash_in_memory_cache_max_entries,
-                "dflash_in_memory_cache_max_bytes": settings.dflash_in_memory_cache_max_bytes,
-                "dflash_ssd_cache": settings.dflash_ssd_cache,
-                "mtp_enabled": settings.mtp_enabled,
-                "vlm_mtp_enabled": settings.vlm_mtp_enabled,
-                "vlm_mtp_draft_model": settings.vlm_mtp_draft_model,
-                "vlm_mtp_draft_block_size": settings.vlm_mtp_draft_block_size,
-                "is_pinned": settings.is_pinned,
-                "is_default": settings.is_default,
-                "trust_remote_code": settings.trust_remote_code,
-                "display_name": settings.display_name,
-                "description": settings.description,
-                "active_profile_name": settings.active_profile_name,
+                f.name: getattr(settings, f.name)
+                for f in dataclass_fields(settings)
             }
 
         models.append(model_data)
