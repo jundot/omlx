@@ -43,6 +43,7 @@ class ClaudeCodeIntegration(Integration):
         model: str,
         host: str = "127.0.0.1",
         context_window: int | None = None,
+        extra_args: list[str] | None = None,
         **kwargs,
     ) -> None:
         env = os.environ.copy()
@@ -72,7 +73,8 @@ class ClaudeCodeIntegration(Integration):
             env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(context_window)
 
         binary = self._find_claude_binary()
+        argv = [binary, *(extra_args or [])]
         print(f"Launching Claude Code with model {model}...")
         if context_window:
             print(f"Auto-compact window: {context_window:,} tokens")
-        os.execvpe(binary, [binary], env)
+        os.execvpe(binary, argv, env)

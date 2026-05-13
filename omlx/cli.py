@@ -274,8 +274,12 @@ def serve_command(args):
 
 
 
-def launch_command(args):
-    """Launch an external tool integrated with oMLX."""
+def launch_command(args, extra_args: list[str] | None = None):
+    """Launch an external tool integrated with oMLX.
+
+    extra_args are unknown CLI tokens forwarded to the underlying tool binary
+    (e.g. ``-r`` / ``--resume <id>`` for Claude Code).
+    """
     import requests
 
     from .integrations import get_integration, list_integrations
@@ -390,6 +394,7 @@ def launch_command(args):
         context_window=context_window,
         max_tokens=max_tokens,
         model_type=model_type,
+        extra_args=extra_args,
     )
 
 
@@ -724,17 +729,23 @@ Example directory structure:
         help="What to diagnose. 'menubar' checks Tahoe ControlCenter visibility.",
     )
 
-    args = parser.parse_args()
+    # Use parse_known_args so `omlx launch <tool> -- ...` can forward unknown
+    # tokens (e.g. `-r`, `--resume <id>`) to the underlying tool binary.
+    # Non-launch commands keep the previous strictness by rejecting unknowns.
+    args, extra_args = parser.parse_known_args()
 
-    if args.command == "serve":
-        serve_command(args)
-    elif args.command == "launch":
-        launch_command(args)
-    elif args.command == "diagnose":
-        sys.exit(diagnose_command(args))
+    if args.command == "launch":
+        launch_command(args, extra_args=extra_args)
     else:
-        parser.print_help()
-        sys.exit(1)
+        if extra_args:
+            parser.error(f"unrecognized arguments: {' '.join(extra_args)}")
+        if args.command == "serve":
+            serve_command(args)
+        elif args.command == "diagnose":
+            sys.exit(diagnose_command(args))
+        else:
+            parser.print_help()
+            sys.exit(1)
 
 
 if __name__ == "__main__":

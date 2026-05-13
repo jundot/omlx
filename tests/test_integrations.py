@@ -659,6 +659,64 @@ class TestClaudeCodeIntegration:
         assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in env
         assert "CLAUDE_CODE_SUBAGENT_MODEL" not in env
 
+    def test_launch_default_argv_has_no_extra(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"),
+        ):
+            cc.launch(port=8000, api_key="key", model="qwen3.5")
+
+        assert captured["argv"] == ["claude"]
+
+    def test_launch_forwards_extra_args(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"),
+        ):
+            cc.launch(
+                port=8000,
+                api_key="key",
+                model="qwen3.5",
+                extra_args=["--resume", "abc123"],
+            )
+
+        assert captured["argv"] == ["claude", "--resume", "abc123"]
+
+    def test_launch_forwards_short_resume(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"),
+        ):
+            cc.launch(
+                port=8000,
+                api_key="key",
+                model="qwen3.5",
+                extra_args=["-r", "xyz"],
+            )
+
+        assert captured["argv"] == ["claude", "-r", "xyz"]
+
 
 class TestCopilotIntegration:
     def test_get_command(self):

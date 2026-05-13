@@ -284,7 +284,68 @@ class TestLaunchCommandFunction:
             context_window=32768,
             max_tokens=8192,
             model_type="vlm",
+            extra_args=None,
         )
+
+    def test_launch_command_forwards_extra_args(self):
+        """Unknown CLI tokens (e.g. --resume <id>) should reach integration.launch."""
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "Claude Code"
+        integration.is_installed.return_value = True
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [
+                {
+                    "id": "qwen2.5-vl",
+                    "model_type": "llm",
+                    "max_context_window": 32768,
+                    "max_tokens": 8192,
+                }
+            ]
+        }
+
+        settings = MagicMock()
+        settings.server.host = "127.0.0.1"
+        settings.server.port = 8000
+
+        args = argparse.Namespace(
+            tool="claude",
+            host=None,
+            port=None,
+            api_key="test-key",
+            model="qwen2.5-vl",
+            tools_profile="coding",
+        )
+
+        with patch("requests.get", side_effect=[health_response, status_response]):
+            with patch("omlx.integrations.get_integration", return_value=integration):
+                with patch("omlx.settings.GlobalSettings.load", return_value=settings):
+                    launch_command(args, extra_args=["--resume", "abc123"])
+
+        _, kwargs = integration.launch.call_args
+        assert kwargs["extra_args"] == ["--resume", "abc123"]
+
+
+class TestLaunchArgvParsing:
+    """Tests for top-level argv parsing of `omlx launch ...`."""
+
+    def test_serve_still_rejects_unknown_args(self):
+        """Non-launch commands must keep strict argparse rejection."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "serve", "--bogus-flag"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode != 0
+        assert "unrecognized arguments" in result.stderr or "--bogus-flag" in result.stderr
 
 
 class TestServeCommandFunctions:
