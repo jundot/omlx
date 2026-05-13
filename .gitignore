@@ -116,3 +116,6 @@ omlx/admin/tailwindcss-*
 
 # UV lockfile
 uv.lock
+
+# Calibration data build cache
+scripts/.calibration_cache/
