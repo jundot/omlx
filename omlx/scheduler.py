@@ -1927,14 +1927,13 @@ class Scheduler:
         """Process one prefill chunk from *state*.
 
         Runs the model on at most prefill_step_size tokens, evals the cache,
-        emits any due boundary snapshot, checks for abort, and clears Metal
-        intermediates.
+        emits any due boundary snapshot, updates the prefill progress
+        tracker, and clears Metal intermediates.
 
         Returns:
             True when all tokens_remaining have been consumed (prefill done).
 
         Raises:
-            _PrefillAbortedError: If the request is aborted between chunks.
             RuntimeError: If the hard memory limit is exceeded.
         """
         if state.tokens_remaining.shape[1] == 0:
@@ -1969,18 +1968,46 @@ class Scheduler:
                 self._emit_prefill_boundary_snapshot(state.request, state.cache, total_tokens)
                 state.emitted_boundaries[rid] = total_tokens
 
-        # Hard memory limit
-        if self._memory_hard_limit_bytes > 0:
-            active = mx.get_active_memory()
-            if active > self._memory_hard_limit_bytes:
+        # Progress callback so the admin UI prefilling list advances during
+        # chunked prefill. _do_external_prefill calls _on_prompt_progress
+        # via the temp_uid mapping; the chunked path has no temp uid so we
+        # talk to the tracker directly with the request_id.
+        get_prefill_tracker().update(
+            state.request.request_id,
+            state.tokens_processed,
+            state.total_length - 1,
+            os.path.basename(self.config.model_name.rstrip("/"))
+            if self.config.model_name
+            else "",
+        )
+
+        # Memory monitoring — use max(active, phys_footprint) so MLX cache
+        # pool and IOAccelerator-backed allocations that don't show up in
+        # mx.get_active_memory() still trigger the guard. Matches the
+        # _do_external_prefill check; on macOS jetsam watches
+        # phys_footprint, so the active-only check could miss the page
+        # before the kernel kills us.
+        if self._memory_limit_bytes > 0:
+            current = max(mx.get_active_memory(), get_phys_footprint())
+            if (
+                self._memory_hard_limit_bytes > 0
+                and current > self._memory_hard_limit_bytes
+            ):
                 raise RuntimeError(
                     f"Memory limit exceeded during chunked prefill at "
-                    f"{state.tokens_processed}/{state.total_length - 1} tokens"
+                    f"{state.tokens_processed}/{state.total_length - 1} tokens: "
+                    f"{current / 1024**3:.1f}GB exceeds hard limit "
+                    f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
                 )
-
-        # Abort check (direct request_id lookup — no temp uid in chunked path)
-        if state.request.request_id in self._pending_abort_ids:
-            raise _PrefillAbortedError([], state.tokens_processed)
+            elif current > self._memory_limit_bytes:
+                logger.warning(
+                    f"Chunked prefill memory soft limit exceeded at "
+                    f"{state.tokens_processed} tokens: "
+                    f"{current / 1024**3:.1f}GB > "
+                    f"{self._memory_limit_bytes / 1024**3:.1f}GB "
+                    f"(hard limit: "
+                    f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
+                )
 
         _sync_and_clear_cache()
         return state.tokens_remaining.shape[1] == 0
