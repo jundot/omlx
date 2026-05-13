@@ -11,10 +11,15 @@ dataclasses and helpers to filter incoming setting dicts to the
 allowed keys.
 """
 
+import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Universal fields — eligible for global templates AND per-model profiles.
 UNIVERSAL_PROFILE_FIELDS = (
@@ -68,6 +73,43 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "specprefill_threshold",
     "index_cache_freq",
 )
+
+# Built-in global templates ship in `omlx/template/default_global_profile.json`
+# and are merged in at read time by GlobalSettingsManager — they are never
+# copied to the user's disk. Curation is purely textual via the JSON; the
+# subdir gives us a home for additional ship-default data files later
+# (e.g. per-model profile presets) without further Python edits.
+_DEFAULTS_PATH = Path(__file__).parent / "template" / "default_global_profile.json"
+
+
+def load_default_global_templates() -> list[dict[str, Any]]:
+    """Return the list of built-in template seed entries.
+
+    Each entry has the shape ``{name, display_name, description, settings}``.
+    The ``_comment`` key at the file's top level is documentation for the
+    file's editors and is ignored here. Missing/malformed file → empty list
+    plus a warning, so a packaging accident degrades to "no seed" rather
+    than crashing the server.
+    """
+    try:
+        with _DEFAULTS_PATH.open(encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        logger.warning(f"Default templates file not found: {_DEFAULTS_PATH}")
+        return []
+    except json.JSONDecodeError as e:
+        logger.warning(f"Default templates file is malformed: {e}")
+        return []
+
+    entries = data.get("templates", [])
+    if not isinstance(entries, list):
+        logger.warning(
+            "Default templates file has unexpected shape "
+            "(expected list at .templates)"
+        )
+        return []
+    return entries
+
 
 # Excluded — never stored in a profile or template.
 EXCLUDED_FROM_PROFILES = frozenset({
