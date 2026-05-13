@@ -843,13 +843,43 @@
                 </div>
             </div>
 
-            <button @click="systemPromptDraft = systemPrompt; showSystemPromptModal = true"
-                class="p-2 hover:bg-surface-muted rounded-lg relative" style="color: var(--text-primary);"
-                :title="window.t('chat.system_prompt.title')">
-                <i data-lucide="settings" class="w-5 h-5"></i>
-                <span x-show="systemPrompt.trim()" x-cloak
-                    class="absolute top-1 right-1 w-2 h-2 bg-accent rounded-full"></span>
-            </button>
+            <div class="flex items-center gap-2">
+                <div class="relative" x-data="{ open: false }" @keydown.escape.window="open = false">
+                    <button @click="open = !open"
+                        class="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium hover:bg-surface-muted rounded-lg"
+                        style="color: var(--text-primary);" :title="window.t('settings.generation.temperature')">
+                        <i data-lucide="thermometer" class="w-4 h-4"></i>
+                        <span x-text="formatTemperature(temperature)"></span>
+                    </button>
+                    <div x-show="open" x-cloak @click.away="open = false"
+                        class="absolute top-full right-0 mt-2 w-64 p-3 border border-line rounded-xl shadow-lg z-50"
+                        style="background: var(--bg-primary); border-color: var(--border-faint);">
+                        <div class="mb-3">
+                            <span class="text-xs font-medium" style="color: var(--text-secondary);"
+                                x-text="window.t('settings.generation.temperature')"></span>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <input type="range" min="0" max="2" step="0.1" :value="temperature"
+                                @input="setTemperature($event.target.value)"
+                                class="flex-1 h-1.5 rounded-full appearance-none cursor-pointer"
+                                style="background: var(--bg-tertiary); accent-color: var(--text-primary);">
+                            <input type="number" min="0" max="2" step="0.1" :value="formatTemperature(temperature)"
+                                @input="setTemperature($event.target.value)"
+                                @blur="$event.target.value = formatTemperature(temperature)"
+                                class="w-20 shrink-0 box-border px-2 py-1.5 text-sm text-right rounded-lg border"
+                                style="background: var(--bg-primary); border-color: var(--border-faint); color: var(--text-primary);">
+                        </div>
+                    </div>
+                </div>
+
+                <button @click="systemPromptDraft = systemPrompt; showSystemPromptModal = true"
+                    class="p-2 hover:bg-surface-muted rounded-lg relative" style="color: var(--text-primary);"
+                    :title="window.t('chat.system_prompt.title')">
+                    <i data-lucide="settings" class="w-5 h-5"></i>
+                    <span x-show="systemPrompt.trim()" x-cloak
+                        class="absolute top-1 right-1 w-2 h-2 bg-accent rounded-full"></span>
+                </button>
+            </div>
         </header>
 
         <!-- Messages Area -->
@@ -953,10 +983,16 @@
                         <!-- Assistant Message -->
                         <div x-show="msg.role === 'assistant' && msg._ui !== false" class="assistant-message">
                             <div class="message-header">
-                                <div class="flex items-center gap-2 text-sm font-medium"
+                                <div class="flex items-center gap-2 text-sm font-medium flex-wrap"
                                     style="color: var(--text-primary);">
                                     <i data-lucide="cpu" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                                     <span x-text="msg.model || currentModel || window.t('chat.assistant_label')"></span>
+                                    <span x-show="msg.temperature != null"
+                                        class="inline-flex items-center gap-1.5 text-xs font-medium px-2 py-0.5 rounded-full"
+                                        style="color: var(--text-secondary); background: var(--bg-secondary); border: 1px solid var(--border-faint);">
+                                        <i data-lucide="thermometer" class="w-3.5 h-3.5"></i>
+                                        <span x-text="formatTemperature(msg.temperature)"></span>
+                                    </span>
                                 </div>
                                 <div class="flex gap-1">
                                     <!-- Timeline toggle: only visible when timeline data is attached -->
@@ -1279,6 +1315,7 @@
             // Model State
             availableModels: [],
             currentModel: null,
+            modelTemperatureMap: {},
 
             // Streaming State
             isStreaming: false,
@@ -1334,6 +1371,13 @@
             systemPrompt: localStorage.getItem('omlx_chat_system_prompt') || '',
             showSystemPromptModal: false,
             systemPromptDraft: '',
+            temperature: (() => {
+                const stored = Number.parseFloat(localStorage.getItem('omlx_chat_temperature'));
+                if (Number.isNaN(stored)) {
+                    return 1.0;
+                }
+                return Math.min(2, Math.max(0, Math.round(stored * 10) / 10));
+            })(),
             // MCP Tool Call Limits
             MAX_TOOL_DEPTH: 10,          // Max recursive streamResponse calls for tool loops
             TOOL_TIMEOUT_MS: 30000,      // Per-tool execution timeout (ms)
@@ -1634,11 +1678,14 @@
             async loadModels() {
         try {
             // Fetch models and server health in parallel
-            const [modelsResponse, healthResponse] = await Promise.all([
+            const [modelsResponse, adminModelsResponse, healthResponse] = await Promise.all([
                 fetch('/v1/models', {
                     headers: {
                         'Authorization': `Bearer ${this.getApiKey()}`
                     }
+                }),
+                fetch('/admin/api/models', {
+                    credentials: 'same-origin'
                 }),
                 fetch('/health')
             ]);
@@ -1658,6 +1705,18 @@
             const modelsData = await modelsResponse.json();
             const allModels = modelsData.data || [];
 
+            if (adminModelsResponse.ok) {
+                const adminModelsData = await adminModelsResponse.json();
+                this.modelTemperatureMap = Object.fromEntries(
+                    (adminModelsData.models || []).map(model => [
+                        model.id,
+                        model.settings?.temperature,
+                    ])
+                );
+            } else {
+                this.modelTemperatureMap = {};
+            }
+
             // Fetch model types first (needed for filtering and VLM detection)
             await this.fetchModelTypes();
 
@@ -1676,9 +1735,9 @@
             // Auto-select default model if set, otherwise first model
             if (!this.currentModel && this.availableModels.length > 0) {
                 if (defaultModel && this.availableModels.some(m => m.id === defaultModel)) {
-                    this.currentModel = defaultModel;
+                    this.selectModel(defaultModel, { persistChat: false });
                 } else {
-                    this.currentModel = this.availableModels[0].id;
+                    this.selectModel(this.availableModels[0].id, { persistChat: false });
                 }
             }
         } catch (error) {
@@ -1686,8 +1745,48 @@
         }
     },
 
-    selectModel(modelId) {
+    getModelConfiguredTemperature(modelId) {
+        return this.modelTemperatureMap[modelId];
+    },
+
+    applyModelTemperature(modelId) {
+        const configuredTemperature = this.getModelConfiguredTemperature(modelId);
+        if (configuredTemperature == null) {
+            return false;
+        }
+        this.temperature = this.normalizeTemperature(configuredTemperature);
+        localStorage.setItem('omlx_chat_temperature', String(this.temperature));
+        return true;
+    },
+
+    selectModel(modelId, { persistChat = true } = {}) {
         this.currentModel = modelId;
+        this.applyModelTemperature(modelId);
+        if (persistChat) {
+            this.saveCurrentChat();
+        }
+    },
+
+    normalizeTemperature(value) {
+        const parsed = Number.parseFloat(value);
+        if (Number.isNaN(parsed)) {
+            return 1.0;
+        }
+        return Math.min(2, Math.max(0, Math.round(parsed * 10) / 10));
+    },
+
+    getStoredTemperature() {
+        return this.normalizeTemperature(localStorage.getItem('omlx_chat_temperature'));
+    },
+
+    formatTemperature(value) {
+        return this.normalizeTemperature(value).toFixed(1);
+    },
+
+    setTemperature(value) {
+        this.temperature = this.normalizeTemperature(value);
+        localStorage.setItem('omlx_chat_temperature', String(this.temperature));
+        this.saveCurrentChat();
     },
 
     loadChatHistory() {
@@ -1710,6 +1809,10 @@
         this.messages = [];
         this.uploadImages = [];
         this.systemPrompt = localStorage.getItem('omlx_chat_system_prompt') || '';
+        this.temperature = this.getStoredTemperature();
+        if (this.currentModel) {
+            this.applyModelTemperature(this.currentModel);
+        }
         this.isMobile = window.innerWidth < 768;
         this.sidebarOpen = window.innerWidth >= 768;
         this.resetStreamRenderState();
@@ -1724,6 +1827,14 @@
             if (chat.model) {
                 this.currentModel = chat.model;
             }
+            const configuredTemperature = chat.model
+                ? this.getModelConfiguredTemperature(chat.model)
+                : null;
+            this.temperature = this.normalizeTemperature(
+                chat.temperature
+                ?? configuredTemperature
+                ?? localStorage.getItem('omlx_chat_temperature')
+            );
             this.scheduleEnhanceMessages();
         }
         this.isMobile = window.innerWidth < 768;
@@ -1762,6 +1873,7 @@
             messages: messagesForStorage,
             model: this.currentModel,
             systemPrompt: this.systemPrompt,
+            temperature: this.temperature,
             updatedAt: new Date().toISOString()
         };
 
@@ -1836,12 +1948,13 @@
         await this.streamResponse();
     },
 
-            async streamResponse(depth = 0) {
+            async streamResponse(depth = 0, requestTemperature = null) {
         if (depth > this.MAX_TOOL_DEPTH) {
             this.messages.push({
                 role: 'assistant',
                 content: `Error: Maximum tool call depth (${this.MAX_TOOL_DEPTH}) exceeded. The model may be stuck in a loop.`,
                 model: this.currentModel,
+                temperature: requestTemperature ?? this.temperature,
                 _perfVisible: false,
             });
             this.saveCurrentChat();
@@ -1866,6 +1979,7 @@
         this.isStreaming = true;
         this.streamingContent = '';
         this.abortController = new AbortController();
+        requestTemperature = requestTemperature ?? this.temperature;
         this.autoScrollEnabled = true;
         this.setEngineStatus({ text: 'Starting' });
         this.startPrefillPolling();
@@ -1897,6 +2011,7 @@
                 body: JSON.stringify({
                     model: this.currentModel,
                     messages: messagesForApi,
+                    temperature: requestTemperature,
                     stream: true,
                     stream_options: { include_usage: true },
                     ...(this.mcpTools.length > 0 && { tools: this.mcpTools })
@@ -2044,6 +2159,7 @@
                     role: 'assistant',
                     content: this.streamingContent || null,
                     model: this.currentModel,
+                    temperature: requestTemperature,
                     tool_calls: toolCalls,
                     _ui: false,
                 });
@@ -2107,7 +2223,7 @@
                 this.resetStreamRenderState();
 
                 // Recurse — model synthesises final answer using tool results
-                await this.streamResponse(depth + 1);
+                await this.streamResponse(depth + 1, requestTemperature);
                 return;
             }
             // --- end MCP tool call loop ---
@@ -2119,6 +2235,7 @@
                 role: 'assistant',
                 content: this.streamingContent || '',
                 model: this.currentModel,
+                temperature: requestTemperature,
                 _perfVisible: false,
                 _thinking: this.streamingThinking || null,
                 _thinkingOpen: false,
@@ -2141,6 +2258,7 @@
                         role: 'assistant',
                         content: this.streamingContent,
                         model: this.currentModel,
+                        temperature: requestTemperature,
                         _perfVisible: false,
                         _thinking: this.streamingThinking || null,
                         _thinkingOpen: false,
@@ -2154,6 +2272,7 @@
                     role: 'assistant',
                     content: `Error: ${error.message}`,
                     model: this.currentModel,
+                    temperature: requestTemperature,
                     _perfVisible: false,
                 });
                 this.scheduleEnhanceMessages();
