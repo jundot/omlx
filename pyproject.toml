@@ -102,7 +102,7 @@ paroquant = [
     # with --no-deps semantics here because the official [mlx] extra pulls
     # torchvision, which the load path doesn't actually use (verified end
     # to end on 0.1.14). The DMG build installs the same pin via build.py.
-    "paroquant==0.1.14",
+    "paroquant==0.1.14; python_version >= '3.11'",
 ]
 dev = [
     "pytest>=7.0.0",
