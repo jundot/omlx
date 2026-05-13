@@ -91,6 +91,19 @@ final class OMLXClient: ObservableObject {
         return try await get(AdminAPI.logs, query: q)
     }
 
+    /// Delete rotated log files. With `file == nil`, wipes every rotated
+    /// `server.log.YYYY-MM-DD` but keeps the live `server.log`. With a
+    /// specific name, deletes only that file. Server refuses to delete
+    /// `server.log` itself.
+    @discardableResult
+    func deleteLogs(file: String? = nil) async throws -> DeleteLogsResponse {
+        var q: [URLQueryItem] = []
+        if let file, !file.isEmpty {
+            q.append(URLQueryItem(name: "file", value: file))
+        }
+        return try await deleteQ(AdminAPI.logs, query: q)
+    }
+
     // PR 8 — Models / Profiles / HF
 
     func listModels() async throws -> ListModelsResponse {
@@ -125,6 +138,10 @@ final class OMLXClient: ObservableObject {
         try await post(AdminAPI.modelProfiles(id), body: body)
     }
 
+    func updateModelProfile(id: String, name: String, body: UpdateProfileRequest) async throws -> UpdateProfileResponse {
+        try await put(AdminAPI.modelProfile(id, name), body: body)
+    }
+
     @discardableResult
     func deleteModelProfile(id: String, name: String) async throws -> DeleteResponse {
         try await delete(AdminAPI.modelProfile(id, name))
@@ -143,9 +160,13 @@ final class OMLXClient: ObservableObject {
         try await post(AdminAPI.profileTemplates, body: body)
     }
 
+    func updateProfileTemplate(name: String, body: UpdateTemplateRequest) async throws -> UpdateTemplateResponse {
+        try await put(AdminAPI.profileTemplate(name), body: body)
+    }
+
     @discardableResult
     func deleteProfileTemplate(name: String) async throws -> DeleteResponse {
-        try await delete("\(AdminAPI.profileTemplates)/\(name)")
+        try await delete(AdminAPI.profileTemplate(name))
     }
 
     func listHFTasks() async throws -> HFTaskListResponse {
@@ -177,6 +198,32 @@ final class OMLXClient: ObservableObject {
         try await get(AdminAPI.hfRecommended, query: [
             URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
         ])
+    }
+
+    /// Search HF Hub for repos matching a free-text query. Same endpoint the
+    /// browser admin panel uses for its model picker (dashboard.js:3879).
+    /// Defaults match the JS caller: trending sort, MLX-only filter, cap 20
+    /// rows (we render at most 8 in the dropdown anyway).
+    func searchHFModels(
+        query: String,
+        sort: String = "trending",
+        limit: Int = 20,
+        mlxOnly: Bool = true
+    ) async throws -> HFSearchResponse {
+        try await get(AdminAPI.hfSearch, query: [
+            URLQueryItem(name: "q", value: query),
+            URLQueryItem(name: "sort", value: sort),
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+        ])
+    }
+
+    /// Delete a downloaded model directory from disk. The server unloads
+    /// the engine first if it's currently loaded, then rmtree's the model
+    /// directory and refreshes the pool. 404 if the name doesn't resolve.
+    @discardableResult
+    func deleteHFModel(modelName: String) async throws -> SimpleStatusResponse {
+        try await delete(AdminAPI.hfModel(modelName))
     }
 
     // PR 9 — Security
@@ -220,6 +267,10 @@ final class OMLXClient: ObservableObject {
 
     private func delete<T: Decodable>(_ path: String) async throws -> T {
         try await request("DELETE", path: path, body: nil)
+    }
+
+    private func deleteQ<T: Decodable>(_ path: String, query: [URLQueryItem]) async throws -> T {
+        try await request("DELETE", path: path, query: query, body: nil)
     }
 
     /// DELETE with a JSON body. The /admin/api/sub-keys endpoint is the

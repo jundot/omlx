@@ -13,18 +13,43 @@ struct ProfileListResponse: Codable, Sendable {
     let profiles: [ProfileDTO]
 }
 
+/// Three logical scopes the editor's chip groups split profiles into. The
+/// distinction is purely client-side: built-in templates render as Preset
+/// (read-only), user templates render as Global (editable, cross-model),
+/// and per-model profiles render as Model (editable, this-model-only).
+/// The server stores them in just two collections — `profile-templates`
+/// (with an `is_builtin` flag) and `models/{id}/profiles`.
+enum ProfileScope: String, Hashable, CaseIterable, Sendable {
+    case preset, global, model
+}
+
 struct ProfileDTO: Codable, Equatable, Sendable, Identifiable {
     let name: String
     let displayName: String
     let description: String?
-    let createdAt: String
-    let updatedAt: String
+    /// Nullable: built-in global templates ship inside the bundle and have
+    /// no per-instance creation moment, so the server sends `null` for both
+    /// timestamps. User-created profiles and templates always have stamps.
+    let createdAt: String?
+    let updatedAt: String?
     let sourceTemplate: String?
+    /// True for shipped built-in templates (read-only on the server side —
+    /// save/update/delete with a built-in name returns 400). UI should
+    /// render the Edit/Delete affordances disabled when this is true.
+    let isBuiltin: Bool?
     /// Free-form. We re-shape on apply via `applyProfile()`, not by reading
     /// every setting individually.
     let settings: [String: AnyCodable]?
 
     var id: String { name }
+
+    /// Splits a template list into preset/global by `isBuiltin`. Defaults
+    /// to Global for legacy server responses where the field is missing —
+    /// the server is the source of truth for builtin status, so an absent
+    /// flag means "the server didn't say built-in, therefore user-managed".
+    var templateScope: ProfileScope {
+        (isBuiltin == true) ? .preset : .global
+    }
 }
 
 struct CreateProfileRequest: Encodable, Sendable {
@@ -66,6 +91,80 @@ struct CreateProfileResponse: Decodable, Sendable {
 struct ApplyProfileResponse: Decodable, Sendable {
     let modelId: String
     let settings: [String: AnyCodable]
+}
+
+/// Body for PUT /admin/api/models/{id}/profiles/{name}. Mirrors the Python
+/// `UpdateProfileRequest` — every field is optional so the server merges
+/// instead of resetting. The Profiles tab's "Update <name>" action uses
+/// just `settings` to push the working profile into an existing slot.
+struct UpdateProfileRequest: Encodable, Sendable {
+    let newName: String?
+    let displayName: String?
+    let description: String?
+    let settings: [String: AnyCodable]?
+    let sourceTemplate: String?
+    let alsoSaveAsTemplate: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case newName = "new_name"
+        case displayName = "display_name"
+        case description
+        case settings
+        case sourceTemplate = "source_template"
+        case alsoSaveAsTemplate = "also_save_as_template"
+    }
+
+    init(
+        newName: String? = nil,
+        displayName: String? = nil,
+        description: String? = nil,
+        settings: [String: AnyCodable]? = nil,
+        sourceTemplate: String? = nil,
+        alsoSaveAsTemplate: Bool = false
+    ) {
+        self.newName = newName
+        self.displayName = displayName
+        self.description = description
+        self.settings = settings
+        self.sourceTemplate = sourceTemplate
+        self.alsoSaveAsTemplate = alsoSaveAsTemplate
+    }
+}
+
+struct UpdateProfileResponse: Decodable, Sendable {
+    let profile: ProfileDTO
+}
+
+/// Body for PUT /admin/api/profile-templates/{name}. Same merge semantics
+/// as `UpdateProfileRequest`.
+struct UpdateTemplateRequest: Encodable, Sendable {
+    let newName: String?
+    let displayName: String?
+    let description: String?
+    let settings: [String: AnyCodable]?
+
+    enum CodingKeys: String, CodingKey {
+        case newName = "new_name"
+        case displayName = "display_name"
+        case description
+        case settings
+    }
+
+    init(
+        newName: String? = nil,
+        displayName: String? = nil,
+        description: String? = nil,
+        settings: [String: AnyCodable]? = nil
+    ) {
+        self.newName = newName
+        self.displayName = displayName
+        self.description = description
+        self.settings = settings
+    }
+}
+
+struct UpdateTemplateResponse: Decodable, Sendable {
+    let template: ProfileDTO
 }
 
 struct DeleteResponse: Decodable, Sendable {

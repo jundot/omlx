@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		1DDDDDDDDDDDDDDDDDDDDDD1 /* oMLXApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC1 /* oMLXApp.swift */; };
 		1DDDDDDDDDDDDDDDDDDDDDD2 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC2 /* AppDelegate.swift */; };
+		1DDDDDDDDDDDDDDDDDDDDDD7 /* AppViewWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCCA /* AppViewWindowController.swift */; };
 		1DDDDDDDDDDDDDDDDDDDDDD3 /* MenubarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC3 /* MenubarController.swift */; };
 		1DDDDDDDDDDDDDDDDDDDDDD4 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC6 /* Assets.xcassets */; };
 		1DDDDDDDDDDDDDDDDDDDDDD5 /* PythonRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */; };
@@ -26,6 +27,7 @@
 		2BB00000000000000000000B /* StatusPill.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000B /* StatusPill.swift */; };
 		2BB00000000000000000000C /* CodeChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000C /* CodeChip.swift */; };
 		3BB000000000000000000001 /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000001 /* AppConfig.swift */; };
+		3BB000000000000000000004 /* ShellEnvWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000004 /* ShellEnvWriter.swift */; };
 		3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000002 /* MenubarStatsPoller.swift */; };
 		3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */; };
 		4BB000000000000000000001 /* PortConflictResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000001 /* PortConflictResolver.swift */; };
@@ -53,16 +55,43 @@
 		8BB000000000000000000002 /* ProfileDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000002 /* ProfileDTO.swift */; };
 		8BB000000000000000000003 /* HFTaskDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000003 /* HFTaskDTO.swift */; };
 		8BB000000000000000000004 /* ModelSettingsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000004 /* ModelSettingsScreen.swift */; };
+		8BB000000000000000000005 /* ChatTemplateKwargs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000005 /* ChatTemplateKwargs.swift */; };
+		8BB000000000000000000006 /* DflashByteSize.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000006 /* DflashByteSize.swift */; };
+		8BB000000000000000000007 /* SystemMetrics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000007 /* SystemMetrics.swift */; };
+		8BB000000000000000000008 /* ProfileViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000008 /* ProfileViews.swift */; };
+		8BB000000000000000000009 /* ProfileWorkingState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000009 /* ProfileWorkingState.swift */; };
 		9BB000000000000000000001 /* SubKeyDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000001 /* SubKeyDTO.swift */; };
 		ABB000000000000000000001 /* WelcomeWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACC000000000000000000001 /* WelcomeWindow.swift */; };
 		BBB000000000000000000001 /* SparkleUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000001 /* SparkleUpdater.swift */; };
 		BBB000000000000000000002 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000002 /* Localizable.xcstrings */; };
 		BBB000000000000000000003 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = BDD000000000000000000001 /* Sparkle */; };
+		DBB000000000000000000001 /* AppServicesPathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000001 /* AppServicesPathTests.swift */; };
+		DBB000000000000000000002 /* AppConfigTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000002 /* AppConfigTests.swift */; };
+		DBB000000000000000000003 /* ServerScreenVMStorageDiffTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */; };
+		DBB000000000000000000004 /* ProfileDTODecodeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000004 /* ProfileDTODecodeTests.swift */; };
+		DBB000000000000000000005 /* SamplingValidatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000005 /* SamplingValidatorTests.swift */; };
+		DBB000000000000000000006 /* APIKeyGeneratorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000006 /* APIKeyGeneratorTests.swift */; };
+		DBB000000000000000000007 /* ChatTemplateKwargsCodecTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000007 /* ChatTemplateKwargsCodecTests.swift */; };
+		DBB000000000000000000008 /* DflashByteSizeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000008 /* DflashByteSizeTests.swift */; };
+		DBB000000000000000000009 /* GlobalSettingsSamplingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */; };
+		DBB00000000000000000000A /* ProfileScopeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000A /* ProfileScopeTests.swift */; };
+		DBB00000000000000000000B /* SystemMetricsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000B /* SystemMetricsTests.swift */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		DAA000000000000000000008 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1AAAAAAAAAAAAAAAAAAAAAA1 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1AAAAAAAAAAAAAAAAAAAAAA2;
+			remoteInfo = "oMLX-next";
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		1CCCCCCCCCCCCCCCCCCCCCC1 /* oMLXApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = oMLXApp.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC2 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		1CCCCCCCCCCCCCCCCCCCCCCA /* AppViewWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppViewWindowController.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC3 /* MenubarController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarController.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC4 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC5 /* oMLX-next.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "oMLX-next.entitlements"; sourceTree = "<group>"; };
@@ -83,6 +112,7 @@
 		2CC00000000000000000000B /* StatusPill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusPill.swift; sourceTree = "<group>"; };
 		2CC00000000000000000000C /* CodeChip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeChip.swift; sourceTree = "<group>"; };
 		3CC000000000000000000001 /* AppConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfig.swift; sourceTree = "<group>"; };
+		3CC000000000000000000004 /* ShellEnvWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellEnvWriter.swift; sourceTree = "<group>"; };
 		3CC000000000000000000002 /* MenubarStatsPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarStatsPoller.swift; sourceTree = "<group>"; };
 		3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarVisibilityWatcher.swift; sourceTree = "<group>"; };
 		4CC000000000000000000001 /* PortConflictResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortConflictResolver.swift; sourceTree = "<group>"; };
@@ -110,10 +140,27 @@
 		8CC000000000000000000002 /* ProfileDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileDTO.swift; sourceTree = "<group>"; };
 		8CC000000000000000000003 /* HFTaskDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HFTaskDTO.swift; sourceTree = "<group>"; };
 		8CC000000000000000000004 /* ModelSettingsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSettingsScreen.swift; sourceTree = "<group>"; };
+		8CC000000000000000000005 /* ChatTemplateKwargs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTemplateKwargs.swift; sourceTree = "<group>"; };
+		8CC000000000000000000006 /* DflashByteSize.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DflashByteSize.swift; sourceTree = "<group>"; };
+		8CC000000000000000000007 /* SystemMetrics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemMetrics.swift; sourceTree = "<group>"; };
+		8CC000000000000000000008 /* ProfileViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileViews.swift; sourceTree = "<group>"; };
+		8CC000000000000000000009 /* ProfileWorkingState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileWorkingState.swift; sourceTree = "<group>"; };
 		9CC000000000000000000001 /* SubKeyDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubKeyDTO.swift; sourceTree = "<group>"; };
 		ACC000000000000000000001 /* WelcomeWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeWindow.swift; sourceTree = "<group>"; };
 		BCC000000000000000000001 /* SparkleUpdater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SparkleUpdater.swift; sourceTree = "<group>"; };
 		BCC000000000000000000002 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
+		DCC000000000000000000001 /* AppServicesPathTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppServicesPathTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000002 /* AppConfigTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfigTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerScreenVMStorageDiffTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000004 /* ProfileDTODecodeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileDTODecodeTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000005 /* SamplingValidatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SamplingValidatorTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000006 /* APIKeyGeneratorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIKeyGeneratorTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000007 /* ChatTemplateKwargsCodecTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTemplateKwargsCodecTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000008 /* DflashByteSizeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DflashByteSizeTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlobalSettingsSamplingTests.swift; sourceTree = "<group>"; };
+		DCC00000000000000000000A /* ProfileScopeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileScopeTests.swift; sourceTree = "<group>"; };
+		DCC00000000000000000000B /* SystemMetricsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemMetricsTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000010 /* oMLXNextTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = oMLXNextTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -125,6 +172,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		DAA000000000000000000006 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -132,9 +186,36 @@
 			isa = PBXGroup;
 			children = (
 				1BBBBBBBBBBBBBBBBBBBBBB2 /* Sources */,
+				DEE000000000000000000001 /* Tests */,
 				1BBBBBBBBBBBBBBBBBBBBBB5 /* Resources */,
 				1BBBBBBBBBBBBBBBBBBBBBB6 /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		DEE000000000000000000001 /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				DEE000000000000000000002 /* oMLXNextTests */,
+			);
+			path = Tests;
+			sourceTree = "<group>";
+		};
+		DEE000000000000000000002 /* oMLXNextTests */ = {
+			isa = PBXGroup;
+			children = (
+				DCC000000000000000000001 /* AppServicesPathTests.swift */,
+				DCC000000000000000000002 /* AppConfigTests.swift */,
+				DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */,
+				DCC000000000000000000004 /* ProfileDTODecodeTests.swift */,
+				DCC000000000000000000005 /* SamplingValidatorTests.swift */,
+				DCC000000000000000000006 /* APIKeyGeneratorTests.swift */,
+				DCC000000000000000000007 /* ChatTemplateKwargsCodecTests.swift */,
+				DCC000000000000000000008 /* DflashByteSizeTests.swift */,
+				DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */,
+				DCC00000000000000000000A /* ProfileScopeTests.swift */,
+				DCC00000000000000000000B /* SystemMetricsTests.swift */,
+			);
+			path = oMLXNextTests;
 			sourceTree = "<group>";
 		};
 		1BBBBBBBBBBBBBBBBBBBBBB2 /* Sources */ = {
@@ -216,6 +297,11 @@
 				6CC000000000000000000007 /* ModelsScreen.swift */,
 				6CC000000000000000000008 /* DownloadsScreen.swift */,
 				8CC000000000000000000004 /* ModelSettingsScreen.swift */,
+				8CC000000000000000000005 /* ChatTemplateKwargs.swift */,
+				8CC000000000000000000006 /* DflashByteSize.swift */,
+				8CC000000000000000000007 /* SystemMetrics.swift */,
+				8CC000000000000000000008 /* ProfileViews.swift */,
+				8CC000000000000000000009 /* ProfileWorkingState.swift */,
 				6CC000000000000000000009 /* IntegrationsScreen.swift */,
 				6CC00000000000000000000A /* SecurityScreen.swift */,
 				6CC00000000000000000000B /* AboutScreen.swift */,
@@ -227,6 +313,7 @@
 			isa = PBXGroup;
 			children = (
 				3CC000000000000000000001 /* AppConfig.swift */,
+				3CC000000000000000000004 /* ShellEnvWriter.swift */,
 			);
 			path = Config;
 			sourceTree = "<group>";
@@ -274,6 +361,7 @@
 			children = (
 				1CCCCCCCCCCCCCCCCCCCCCC1 /* oMLXApp.swift */,
 				1CCCCCCCCCCCCCCCCCCCCCC2 /* AppDelegate.swift */,
+				1CCCCCCCCCCCCCCCCCCCCCCA /* AppViewWindowController.swift */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -303,6 +391,7 @@
 			isa = PBXGroup;
 			children = (
 				1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX-next.app */,
+				DCC000000000000000000010 /* oMLXNextTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -330,6 +419,23 @@
 			productReference = 1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX-next.app */;
 			productType = "com.apple.product-type.application";
 		};
+		DAA000000000000000000001 /* oMLXNextTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = DAA000000000000000000002 /* Build configuration list for PBXNativeTarget "oMLXNextTests" */;
+			buildPhases = (
+				DAA000000000000000000005 /* Sources */,
+				DAA000000000000000000006 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				DAA000000000000000000007 /* PBXTargetDependency */,
+			);
+			name = oMLXNextTests;
+			productName = oMLXNextTests;
+			productReference = DCC000000000000000000010 /* oMLXNextTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -342,6 +448,10 @@
 				TargetAttributes = {
 					1AAAAAAAAAAAAAAAAAAAAAA2 = {
 						CreatedOnToolsVersion = 16.4;
+					};
+					DAA000000000000000000001 = {
+						CreatedOnToolsVersion = 16.4;
+						TestTargetID = 1AAAAAAAAAAAAAAAAAAAAAA2;
 					};
 				};
 			};
@@ -362,6 +472,7 @@
 			projectRoot = "";
 			targets = (
 				1AAAAAAAAAAAAAAAAAAAAAA2 /* oMLX-next */,
+				DAA000000000000000000001 /* oMLXNextTests */,
 			);
 		};
 /* End PBXProject section */
@@ -404,6 +515,7 @@
 			files = (
 				1DDDDDDDDDDDDDDDDDDDDDD1 /* oMLXApp.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD2 /* AppDelegate.swift in Sources */,
+				1DDDDDDDDDDDDDDDDDDDDDD7 /* AppViewWindowController.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD3 /* MenubarController.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD5 /* PythonRuntime.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD6 /* ServerProcess.swift in Sources */,
@@ -420,6 +532,7 @@
 				2BB00000000000000000000B /* StatusPill.swift in Sources */,
 				2BB00000000000000000000C /* CodeChip.swift in Sources */,
 				3BB000000000000000000001 /* AppConfig.swift in Sources */,
+				3BB000000000000000000004 /* ShellEnvWriter.swift in Sources */,
 				3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */,
 				3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */,
 				4BB000000000000000000001 /* PortConflictResolver.swift in Sources */,
@@ -447,13 +560,44 @@
 				8BB000000000000000000002 /* ProfileDTO.swift in Sources */,
 				8BB000000000000000000003 /* HFTaskDTO.swift in Sources */,
 				8BB000000000000000000004 /* ModelSettingsScreen.swift in Sources */,
+				8BB000000000000000000005 /* ChatTemplateKwargs.swift in Sources */,
+				8BB000000000000000000006 /* DflashByteSize.swift in Sources */,
+				8BB000000000000000000007 /* SystemMetrics.swift in Sources */,
+				8BB000000000000000000008 /* ProfileViews.swift in Sources */,
+				8BB000000000000000000009 /* ProfileWorkingState.swift in Sources */,
 				9BB000000000000000000001 /* SubKeyDTO.swift in Sources */,
 				ABB000000000000000000001 /* WelcomeWindow.swift in Sources */,
 				BBB000000000000000000001 /* SparkleUpdater.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		DAA000000000000000000005 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				DBB000000000000000000001 /* AppServicesPathTests.swift in Sources */,
+				DBB000000000000000000002 /* AppConfigTests.swift in Sources */,
+				DBB000000000000000000003 /* ServerScreenVMStorageDiffTests.swift in Sources */,
+				DBB000000000000000000004 /* ProfileDTODecodeTests.swift in Sources */,
+				DBB000000000000000000005 /* SamplingValidatorTests.swift in Sources */,
+				DBB000000000000000000006 /* APIKeyGeneratorTests.swift in Sources */,
+				DBB000000000000000000007 /* ChatTemplateKwargsCodecTests.swift in Sources */,
+				DBB000000000000000000008 /* DflashByteSizeTests.swift in Sources */,
+				DBB000000000000000000009 /* GlobalSettingsSamplingTests.swift in Sources */,
+				DBB00000000000000000000A /* ProfileScopeTests.swift in Sources */,
+				DBB00000000000000000000B /* SystemMetricsTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		DAA000000000000000000007 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1AAAAAAAAAAAAAAAAAAAAAA2 /* oMLX-next */;
+			targetProxy = DAA000000000000000000008 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		1AAAAAAAAAAAAAAAAAAAAAA5 /* Debug */ = {
@@ -625,6 +769,40 @@
 			};
 			name = Release;
 		};
+		DAA000000000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx-next.tests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 6.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/oMLX-next.app/Contents/MacOS/oMLX-next";
+			};
+			name = Debug;
+		};
+		DAA000000000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx-next.tests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 6.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/oMLX-next.app/Contents/MacOS/oMLX-next";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -642,6 +820,15 @@
 			buildConfigurations = (
 				1AAAAAAAAAAAAAAAAAAAAAA7 /* Debug */,
 				1AAAAAAAAAAAAAAAAAAAAAA8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		DAA000000000000000000002 /* Build configuration list for PBXNativeTarget "oMLXNextTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				DAA000000000000000000003 /* Debug */,
+				DAA000000000000000000004 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

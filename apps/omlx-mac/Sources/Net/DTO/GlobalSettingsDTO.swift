@@ -16,6 +16,14 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     let cache: CacheSettings?
     let auth: AuthSettings?
     let system: SystemInfo?
+    /// Server-wide default sampling parameters. Patched through the flat
+    /// `sampling_*` keys on `GlobalSettingsPatch` (the Python endpoint is
+    /// non-nested for write but the read response is nested under
+    /// `sampling`). Falls back per-model when a model profile leaves a
+    /// field empty — this is the "server defaults" the design's profile
+    /// fallback chain points to.
+    let sampling: SamplingDTO?
+    let huggingface: HuggingFaceDTO?
     let claudeCode: ClaudeCodeSettings?
     let integrations: IntegrationsSettings?
 
@@ -55,6 +63,26 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     struct SystemInfo: Codable, Equatable, Sendable {
         let totalMemoryBytes: Int64?
         let totalMemory: String?
+    }
+
+    /// Mirrors `omlx.settings.HuggingFaceSettings`. Empty string means
+    /// "use HF default" (huggingface.co). When set, the server applies
+    /// the value via env var (HF_ENDPOINT) so the HF library picks it up.
+    struct HuggingFaceDTO: Codable, Equatable, Sendable {
+        let endpoint: String
+    }
+
+    /// Mirrors `omlx.settings.SamplingSettings`. The full server surface
+    /// today is six fields; min_p / presence_penalty / TTL / behavior flags
+    /// the design mocks at the server level don't exist server-side and
+    /// stay per-model.
+    struct SamplingDTO: Codable, Equatable, Sendable {
+        let maxContextWindow: Int
+        let maxTokens: Int
+        let temperature: Double
+        let topP: Double
+        let topK: Int
+        let repetitionPenalty: Double
     }
 
     struct ClaudeCodeSettings: Codable, Equatable, Sendable {
@@ -103,6 +131,27 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
 
     // Auth (PR 9)
     var skipApiKeyVerification: Bool? = nil
+    /// Update the configured API key. Server applies and persists via
+    /// /admin/api/global-settings (`api_key` field). Only valid when an
+    /// admin session is already authenticated — first-time setup still
+    /// goes through /admin/api/setup-api-key.
+    var apiKey: String? = nil
+
+    // Server-wide default sampling parameters. The Python `GlobalSettingsRequest`
+    // accepts these as flat snake-cased fields (sampling_temperature, etc.) —
+    // see `omlx/admin/routes.py:229-234`. They patch in-place; non-nil fields
+    // overwrite the corresponding `GlobalSettings.sampling.*` value.
+    var samplingMaxContextWindow: Int? = nil
+    var samplingMaxTokens: Int? = nil
+    var samplingTemperature: Double? = nil
+    var samplingTopP: Double? = nil
+    var samplingTopK: Int? = nil
+    var samplingRepetitionPenalty: Double? = nil
+
+    /// Hugging Face mirror endpoint. Empty string resets the server-side
+    /// HF_ENDPOINT env var to the HF default (huggingface.co). Patches in-
+    /// place via `omlx/admin/routes.py:2804`.
+    var hfEndpoint: String? = nil
 }
 
 struct UpdateGlobalSettingsResponse: Decodable, Sendable {

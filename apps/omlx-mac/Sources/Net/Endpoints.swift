@@ -31,6 +31,9 @@ enum AdminAPI {
         "\(models)/\(id)/profiles/\(name)/apply"
     }
     static let profileTemplates = "\(prefix)/profile-templates"
+    static func profileTemplate(_ name: String) -> String {
+        "\(profileTemplates)/\(name)"
+    }
 
     static let hfTasks         = "\(prefix)/hf/tasks"
     static let hfDownload      = "\(prefix)/hf/download"
@@ -38,6 +41,8 @@ enum AdminAPI {
     static func hfRetry(_ taskId: String) -> String  { "\(prefix)/hf/retry/\(taskId)" }
     static func hfTask(_ taskId: String) -> String   { "\(prefix)/hf/task/\(taskId)" }
     static let hfRecommended   = "\(prefix)/hf/recommended"
+    static let hfSearch        = "\(prefix)/hf/search"
+    static func hfModel(_ name: String) -> String { "\(prefix)/hf/models/\(name)" }
 
     // PR 9
     static let setupApiKey     = "\(prefix)/setup-api-key"
