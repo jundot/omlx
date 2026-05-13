@@ -410,6 +410,50 @@ class TestSTTEndpointBasic:
         assert response.status_code == 200
         assert captured.get("max_tokens") == 4096
 
+    def test_word_timestamps_forwarded_to_engine(self, server_audio_client):
+        """word_timestamps=true is passed through to engine.transcribe()."""
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny", "word_timestamps": "true"},
+        )
+
+        assert response.status_code == 200
+        assert captured.get("word_timestamps") is True
+
+    def test_word_timestamps_omitted_by_default(self, server_audio_client):
+        """word_timestamps is not forwarded when the form field is absent."""
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny"},
+        )
+
+        assert response.status_code == 200
+        assert "word_timestamps" not in captured
+
 
 # ---------------------------------------------------------------------------
 # TestSTTEndpointResponseFormat
