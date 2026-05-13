@@ -583,12 +583,12 @@
                                             <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.turboquant_kv_hint') }}</p>
                                         </div>
                                         <button type="button"
-                                                @click="if (!modelSettings.is_paroquant) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
-                                                :disabled="modelSettings.is_paroquant"
-                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : ''"
+                                                @click="if (!modelSettings.is_paroquant && !modelSettings.mtp_enabled && !modelSettings.vlm_mtp_enabled) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
+                                                :disabled="modelSettings.is_paroquant || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled"
+                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.mtp_conflict_turboquant') }}' : '')"
                                                 :class="[
                                                     modelSettings.turboquant_kv_enabled ? 'bg-black' : 'bg-neutral-200',
-                                                    modelSettings.is_paroquant ? 'opacity-40 cursor-not-allowed' : ''
+                                                    (modelSettings.is_paroquant || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
                                                 ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.turboquant_kv_enabled ? 'translate-x-5' : 'translate-x-0'"
@@ -647,12 +647,12 @@
                                             <p class="text-xs text-neutral-500 mt-0.5">Attention-based sparse prefill for MoE/hybrid models. (<a href="https://arxiv.org/abs/2502.02789" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">Paper</a>) (<a href="https://huggingface.co/Thump604/specprefill-paper" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">HuggingFace</a>)</p>
                                         </div>
                                         <button type="button"
-                                                @click="if (!modelSettings.is_paroquant) modelSettings.specprefill_enabled = !modelSettings.specprefill_enabled"
-                                                :disabled="modelSettings.is_paroquant"
-                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : ''"
+                                                @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.specprefill_enabled = !modelSettings.specprefill_enabled"
+                                                :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled"
+                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict') }}' : '')"
                                                 :class="[
                                                     modelSettings.specprefill_enabled ? 'bg-black' : 'bg-neutral-200',
-                                                    modelSettings.is_paroquant ? 'opacity-40 cursor-not-allowed' : ''
+                                                    (modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
                                                 ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.specprefill_enabled ? 'translate-x-5' : 'translate-x-0'"
@@ -703,12 +703,12 @@
                                                x-text="modelSettings.dflash_compatibility_reason"></p>
                                         </div>
                                         <button type="button"
-                                                @click="if (modelSettings.dflash_compatible) modelSettings.dflash_enabled = !modelSettings.dflash_enabled"
-                                                :disabled="!modelSettings.dflash_compatible"
-                                                :title="modelSettings.dflash_compatible ? '' : (modelSettings.dflash_compatibility_reason || 'Unsupported model')"
+                                                @click="if (modelSettings.dflash_compatible && !modelSettings.mtp_enabled && !modelSettings.vlm_mtp_enabled) modelSettings.dflash_enabled = !modelSettings.dflash_enabled"
+                                                :disabled="!modelSettings.dflash_compatible || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled"
+                                                :title="modelSettings.dflash_compatible ? (modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.mtp_conflict') }}' : '') : (modelSettings.dflash_compatibility_reason || 'Unsupported model')"
                                                 :class="[
                                                     modelSettings.dflash_enabled ? 'bg-black' : 'bg-neutral-200',
-                                                    !modelSettings.dflash_compatible ? 'opacity-40 cursor-not-allowed' : ''
+                                                    (!modelSettings.dflash_compatible || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
                                                 ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.dflash_enabled ? 'translate-x-5' : 'translate-x-0'"
@@ -834,18 +834,20 @@
                                                class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.mtp_conflict') }}</p>
                                         </div>
                                         <button type="button"
-                                                @click="if ((modelSettings.mtp_compatible || modelSettings.mtp_enabled) && !modelSettings.dflash_enabled && !modelSettings.turboquant_kv_enabled) modelSettings.mtp_enabled = !modelSettings.mtp_enabled"
-                                                :disabled="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.turboquant_kv_enabled"
+                                                @click="if ((modelSettings.mtp_compatible || modelSettings.mtp_enabled) && !modelSettings.dflash_enabled && !modelSettings.turboquant_kv_enabled && !modelSettings.vlm_mtp_enabled) modelSettings.mtp_enabled = !modelSettings.mtp_enabled"
+                                                :disabled="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.turboquant_kv_enabled || modelSettings.vlm_mtp_enabled"
                                                 :title="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled)
                                                             ? (modelSettings.mtp_compatibility_reason || 'Unsupported model')
                                                             : (modelSettings.dflash_enabled
                                                                 ? '{{ t('modal.model_settings.mtp_conflict_dflash') }}'
                                                                 : (modelSettings.turboquant_kv_enabled
                                                                     ? '{{ t('modal.model_settings.mtp_conflict_turboquant') }}'
-                                                                    : ''))"
+                                                                    : (modelSettings.vlm_mtp_enabled
+                                                                        ? '{{ t('modal.model_settings.vlm_mtp_conflict') }}'
+                                                                        : '')))"
                                                 :class="[
                                                     modelSettings.mtp_enabled ? 'bg-black' : 'bg-neutral-200',
-                                                    ((!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.turboquant_kv_enabled) ? 'opacity-40 cursor-not-allowed' : ''
+                                                    ((!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.turboquant_kv_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
                                                 ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.mtp_enabled ? 'translate-x-5' : 'translate-x-0'"
