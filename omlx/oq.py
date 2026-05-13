@@ -2257,48 +2257,12 @@ def quantize_oq_streaming(
 
     cb("loading", 12.0)
 
-    sanitize_fn = _build_model_sanitizer(config, text_only=text_only)
-    # When preserve_mtp is True, the patched sanitize functions
-    # (mlx_lm_mtp/qwen35_model.py and mlx_vlm_mtp/qwen35_vlm_model.py)
-    # keep mtp.* in the output and apply the +1 RMSNorm shift to MTP
-    # norms. No stash/merge wrapper needed — the patch covers both paths.
-    if sanitize_fn is not None:
-        try:
-            plan = _discover_sanitize_plan(sanitize_fn, all_weights)
-            all_weights = _DiscoveredPlan(plan, all_weights)
-            logger.info(
-                f"oQ{oq_level:g}: discovered streaming sanitize plan, "
-                f"{len(all_weights)} output tensors"
-            )
-        except Exception as e:
-            if _model_exceeds_ram:
-                # Silent skip used to produce broken artifacts (see #1204):
-                # the source layout (e.g. fused experts.gate_up_proj) never
-                # got remapped to inference-expected names, and load failed
-                # with "Received N parameters not in model". Hard-fail so the
-                # caller sees the cause immediately.
-                raise RuntimeError(
-                    f"oQ{oq_level:g}: streaming sanitize-plan discovery "
-                    f"failed ({e}) and the eager fallback is unsafe with "
-                    f"model size {_model_bytes / 1e9:.1f} GB exceeding "
-                    f"{int(_MAX_MODEL_RAM_FRACTION * 100)}% of system RAM "
-                    f"({_system_ram / 1e9:.1f} GB). Run on a machine with "
-                    "enough RAM, or extend _TrackedTensor to cover the "
-                    "indexing pattern the sanitize uses."
-                ) from e
-            logger.warning(
-                f"Streaming discovery failed ({e}), falling back to eager sanitize"
-            )
-            try:
-                all_weights = sanitize_fn(all_weights)
-                logger.info(f"oQ{oq_level:g}: eager sanitize applied, {len(all_weights)} tensors")
-            except Exception as e2:
-                logger.warning(f"Sanitize failed ({e2}), using original names")
-
-    config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
-
-    cb("loading", 15.0)
-
+    # --- Sensitivity measurement (before sanitize-plan discovery) ---------
+    # Must run before _build_model_sanitizer + _discover_sanitize_plan,
+    # because the discovery pass feeds _TrackedTensor proxies through
+    # Model.sanitize which corrupts mutable state in the MTP sanitize
+    # patch (weights.pop on tracked objects). Running sensitivity first
+    # ensures vlm_load_model sees a pristine patch chain.
     if sensitivity_model_path:
         logger.info(f"oQ{oq_level:g}: measuring sensitivity via proxy model")
         sensitivity_map = _measure_sensitivity_from_quantized_model(
@@ -2362,6 +2326,44 @@ def quantize_oq_streaming(
             "calibration data, or layer discovery), and either fix it or "
             "pass an explicit sensitivity_model_path."
         )
+
+    cb("loading", 15.0)
+
+    # --- Sanitize-plan discovery ------------------------------------------
+    sanitize_fn = _build_model_sanitizer(config, text_only=text_only)
+    # When preserve_mtp is True, the patched sanitize functions
+    # (mlx_lm_mtp/qwen35_model.py and mlx_vlm_mtp/qwen35_vlm_model.py)
+    # keep mtp.* in the output and apply the +1 RMSNorm shift to MTP
+    # norms. No stash/merge wrapper needed — the patch covers both paths.
+    if sanitize_fn is not None:
+        try:
+            plan = _discover_sanitize_plan(sanitize_fn, all_weights)
+            all_weights = _DiscoveredPlan(plan, all_weights)
+            logger.info(
+                f"oQ{oq_level:g}: discovered streaming sanitize plan, "
+                f"{len(all_weights)} output tensors"
+            )
+        except Exception as e:
+            if _model_exceeds_ram:
+                raise RuntimeError(
+                    f"oQ{oq_level:g}: streaming sanitize-plan discovery "
+                    f"failed ({e}) and the eager fallback is unsafe with "
+                    f"model size {_model_bytes / 1e9:.1f} GB exceeding "
+                    f"{int(_MAX_MODEL_RAM_FRACTION * 100)}% of system RAM "
+                    f"({_system_ram / 1e9:.1f} GB). Run on a machine with "
+                    "enough RAM, or extend _TrackedTensor to cover the "
+                    "indexing pattern the sanitize uses."
+                ) from e
+            logger.warning(
+                f"Streaming discovery failed ({e}), falling back to eager sanitize"
+            )
+            try:
+                all_weights = sanitize_fn(all_weights)
+                logger.info(f"oQ{oq_level:g}: eager sanitize applied, {len(all_weights)} tensors")
+            except Exception as e2:
+                logger.warning(f"Sanitize failed ({e2}), using original names")
+
+    config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
     config["_oq_sensitivity_map"] = {
         str(k): v for k, v in sensitivity_map.items()
     }
@@ -2645,7 +2647,7 @@ CALIB_DATASETS = {
     "c4": "C4 (Web Crawl)",
     "code": "Code (StarCoder)",
     "multilingual": "Multilingual (CulturaX)",
-    "code_multilingual": "Code + Multilingual",
+    "code_multilingual": "Code + Multilingual + Reasoning",
 }
 
 
@@ -2712,7 +2714,7 @@ def _load_builtin_calibration(tokenizer, dataset: str, num_samples: int,
 
     if dataset == "code_multilingual":
         texts = []
-        for key in ("code", "en", "ko", "zh", "ja", "tool_calling"):
+        for key in ("code", "en", "ko", "zh", "ja", "tool_calling", "reasoning"):
             texts.extend(all_data.get(key, []))
     elif dataset == "code":
         texts = all_data.get("code", []) + all_data.get("en", [])
@@ -3056,57 +3058,35 @@ def _measure_sensitivity(
     num_samples=32, seq_length=256,
 ):
     """Measure sensitivity by loading model temporarily. Used by streaming path."""
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    # Reuse the centralised pre-load dispatch so every current and future
+    # patch (MTP, DeepSeek V4, nested-visual, load_config, …) is applied
+    # exactly as in the production load path.  model_settings is not
+    # passed — sensitivity runs on the *source* checkpoint which may not
+    # have MTP weights yet; maybe_apply_pre_load_patches without settings
+    # installs patches for sanitize correctness but leaves mtp_active
+    # False so Model.__init__ won't try to attach a missing MTP head.
+    maybe_apply_pre_load_patches(model_path)
+
     is_vlm = "vision_config" in config
-
-    # Apply the same MTP runtime patches that production load and the
-    # main quantize path use. Sanitize patches are already global (from
-    # _build_model_sanitizer above), so loaded weights arrive with
-    # ``language_model.mtp.*`` keys; without the runtime patch the
-    # mlx-vlm LanguageModel.__init__ never attaches ``self.mtp`` and
-    # load_weights rejects the MTP tensors with "parameters not in model".
     try:
-        from omlx.patches.mlx_lm_mtp import (
-            apply_mlx_lm_mtp_patch,
-            is_mtp_active,
-            set_mtp_active,
+        if is_vlm:
+            from mlx_vlm.utils import load_model as vlm_load_model
+
+            model = vlm_load_model(Path(model_path), lazy=True)
+            from mlx_lm.tokenizer_utils import load as load_tokenizer
+
+            tokenizer = load_tokenizer(Path(model_path))
+        else:
+            from mlx_lm import load as lm_load
+
+            model, tokenizer = lm_load(model_path, lazy=True)
+    except Exception as e:
+        logger.error(
+            f"Sensitivity measurement: model load failed ({e})"
         )
-        _have_lm_patch = apply_mlx_lm_mtp_patch()
-    except Exception:
-        _have_lm_patch = False
-        is_mtp_active = None
-        set_mtp_active = None
-
-    if is_vlm:
-        try:
-            from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
-            apply_mlx_vlm_mtp_runtime_patch()
-        except Exception as e:
-            logger.debug(f"mlx-vlm runtime MTP patch skipped: {e}")
-
-    prev_active = is_mtp_active() if _have_lm_patch else False
-    try:
-        if _have_lm_patch:
-            set_mtp_active(True)
-        try:
-            if is_vlm:
-                from mlx_vlm.utils import load_model as vlm_load_model
-
-                model = vlm_load_model(Path(model_path), lazy=True)
-                from mlx_lm import load as lm_load
-
-                _, tokenizer = lm_load(model_path, lazy=True)
-            else:
-                from mlx_lm import load as lm_load
-
-                model, tokenizer = lm_load(model_path, lazy=True)
-        except Exception as e:
-            logger.error(
-                f"Sensitivity measurement: model load failed ({e})"
-            )
-            return {}
-    finally:
-        if _have_lm_patch:
-            set_mtp_active(prev_active)
+        return {}
 
     sensitivity = _measure_sensitivity_from_model(
         model, tokenizer, config, oq_level,
