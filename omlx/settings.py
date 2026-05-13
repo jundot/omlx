@@ -310,6 +310,10 @@ class MemorySettings:
 
     max_process_memory: str = "auto"  # "auto" (RAM - 8GB), "disabled", or "XX%"
     prefill_memory_guard: bool = True  # Memory guard: prefill estimation + generation scheduling defer
+    # Two-stage watermark on max_process_memory. soft triggers admission pause + LRU eviction,
+    # hard triggers in-flight abort. Gap >= 10% absorbs macOS compressed-memory oscillation.
+    soft_threshold: float = 0.85
+    hard_threshold: float = 0.95
 
     def get_max_process_memory_bytes(self) -> int | None:
         """
@@ -347,6 +351,8 @@ class MemorySettings:
         return {
             "max_process_memory": self.max_process_memory,
             "prefill_memory_guard": self.prefill_memory_guard,
+            "soft_threshold": self.soft_threshold,
+            "hard_threshold": self.hard_threshold,
         }
 
     @classmethod
@@ -355,6 +361,8 @@ class MemorySettings:
         return cls(
             max_process_memory=data.get("max_process_memory", "auto"),
             prefill_memory_guard=data.get("prefill_memory_guard", True),
+            soft_threshold=float(data.get("soft_threshold", 0.85)),
+            hard_threshold=float(data.get("hard_threshold", 0.95)),
         )
 
 

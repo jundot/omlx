@@ -176,6 +176,70 @@ class BatchingError(SchedulerError):
     pass
 
 
+class SchedulerQueueFullError(SchedulerError):
+    """
+    Waiting queue depth cap exceeded.
+
+    Raised when admission control rejects a request because the scheduler's
+    waiting queue is already at the configured depth cap. Server layer maps
+    this to HTTP 503 with a short Retry-After.
+
+    Attributes:
+        current_depth: Current number of waiting requests.
+        max_depth: Configured queue depth cap.
+    """
+
+    def __init__(
+        self,
+        current_depth: int,
+        max_depth: int,
+        details: Optional[dict] = None,
+    ):
+        super().__init__(
+            f"Scheduler waiting queue full: {current_depth} >= {max_depth}",
+            details,
+        )
+        self.current_depth = current_depth
+        self.max_depth = max_depth
+
+
+class MemoryPressureRejection(SchedulerError):
+    """
+    Request rejected due to current process memory pressure.
+
+    Raised by the HTTP admission layer when the projected peak memory
+    (current phys_footprint + estimated prefill peak) would exceed the
+    hard limit. Server layer maps this to HTTP 503 with a Retry-After
+    proportional to the pressure level.
+
+    Attributes:
+        pressure_level: "soft" or "hard".
+        current_bytes: Current phys_footprint in bytes.
+        estimated_peak_bytes: Estimated peak after admitting this request.
+        limit_bytes: Configured hard limit.
+    """
+
+    def __init__(
+        self,
+        pressure_level: str,
+        current_bytes: int,
+        estimated_peak_bytes: int,
+        limit_bytes: int,
+        details: Optional[dict] = None,
+    ):
+        super().__init__(
+            f"Memory pressure ({pressure_level}): projected peak "
+            f"{estimated_peak_bytes / 1024**3:.1f}GB "
+            f"(current {current_bytes / 1024**3:.1f}GB) "
+            f"exceeds limit {limit_bytes / 1024**3:.1f}GB",
+            details,
+        )
+        self.pressure_level = pressure_level
+        self.current_bytes = current_bytes
+        self.estimated_peak_bytes = estimated_peak_bytes
+        self.limit_bytes = limit_bytes
+
+
 # =============================================================================
 # Model-related Exceptions
 # =============================================================================

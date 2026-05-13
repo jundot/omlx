@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
+from .utils.proc_memory import get_phys_footprint
+
 if TYPE_CHECKING:
     from .engine_pool import EnginePool
     from .model_settings import ModelSettingsManager
@@ -48,18 +50,25 @@ class ProcessMemoryEnforcer:
         settings_manager: ModelSettingsManager | None = None,
         prefill_memory_guard: bool = True,
         global_settings: GlobalSettings | None = None,
+        soft_threshold: float = 0.85,
+        hard_threshold: float = 0.95,
     ):
         """
         Initialize the process memory enforcer.
 
         Args:
             engine_pool: The engine pool to evict models from.
-            max_bytes: Maximum allowed Metal memory in bytes.
+            max_bytes: Maximum allowed process memory in bytes (compared
+                against max(mx.get_active_memory(), phys_footprint)).
             poll_interval: Seconds between memory checks.
             settings_manager: Optional settings manager for TTL checks.
             prefill_memory_guard: Whether to enable pre-flight memory
                 estimation to reject requests that would exceed limits.
             global_settings: Optional global settings for idle timeout.
+            soft_threshold: Fraction of max_bytes that triggers soft action
+                (LRU non-pinned eviction + admission pause; in-flight allowed).
+            hard_threshold: Fraction of max_bytes that triggers hard action
+                (also abort in-flight when all loaded models are pinned).
         """
         self._engine_pool = engine_pool
         self._max_bytes = max_bytes
@@ -67,8 +76,13 @@ class ProcessMemoryEnforcer:
         self._settings_manager = settings_manager
         self._prefill_memory_guard = prefill_memory_guard
         self._global_settings = global_settings
+        self._soft_threshold = soft_threshold
+        self._hard_threshold = hard_threshold
         self._task: asyncio.Task | None = None
         self._running = False
+        # Most recently observed pressure level, consumed by scheduler /
+        # admission control. Updated on every poll iteration.
+        self._pressure_level: str = "ok"
 
     @property
     def max_bytes(self) -> int:
@@ -111,12 +125,48 @@ class ProcessMemoryEnforcer:
 
         Returns 0 if enforcement is disabled (max_bytes <= 0).
         Always >= max_bytes so prefill gets headroom above the soft limit.
+
+        Note: this is the absolute system ceiling for the scheduler's prefill
+        check, distinct from the enforcer's own soft/hard watermarks
+        (`_soft_bytes` / `_hard_bytes`) which trigger LRU eviction.
         """
         if self._max_bytes <= 0:
             return 0
         from .settings import get_system_memory
 
         return max(get_system_memory() - 4 * 1024**3, self._max_bytes)
+
+    @property
+    def _soft_bytes(self) -> int:
+        """Soft watermark: max_bytes * soft_threshold."""
+        if self._max_bytes <= 0:
+            return 0
+        return int(self._max_bytes * self._soft_threshold)
+
+    @property
+    def _hard_bytes(self) -> int:
+        """Hard watermark: max_bytes * hard_threshold."""
+        if self._max_bytes <= 0:
+            return 0
+        return int(self._max_bytes * self._hard_threshold)
+
+    def _current_usage_bytes(self) -> int:
+        """Process memory usage as seen by macOS jetsam.
+
+        Combines MLX-reported active memory and the kernel phys_footprint
+        ledger. phys_footprint covers anonymous + IOAccelerator + dirty
+        file-backed, so it usually dominates; we take max() so MLX-internal
+        cache that hasn't been mirrored into phys yet still triggers.
+        """
+        return max(mx.get_active_memory(), get_phys_footprint())
+
+    def get_pressure_level(self) -> str:
+        """Return cached pressure level: 'ok', 'soft', or 'hard'.
+
+        Consumed by scheduler `_schedule_waiting` and HTTP admission control.
+        Updated on every enforcer poll iteration.
+        """
+        return self._pressure_level if self._running else "ok"
 
     def _set_metal_memory_limit(self) -> None:
         """No-op. Metal-level limits removed to prevent model load swap.
@@ -151,6 +201,7 @@ class ProcessMemoryEnforcer:
     def _propagate_memory_limit(self) -> None:
         """Propagate soft/hard memory limits to schedulers for inline prefill checking."""
         hard_limit = self._get_hard_limit_bytes()
+        admission_paused = self._pressure_level != "ok"
         for entry in self._engine_pool._entries.values():
             if entry.engine is not None:
                 scheduler = getattr(entry.engine, "scheduler", None)
@@ -158,6 +209,7 @@ class ProcessMemoryEnforcer:
                     scheduler._memory_limit_bytes = self._max_bytes
                     scheduler._memory_hard_limit_bytes = hard_limit
                     scheduler._prefill_memory_guard = self._prefill_memory_guard
+                    scheduler._admission_paused = admission_paused
                     bg = getattr(scheduler, "batch_generator", None)
                     if bg is not None and hasattr(bg, "_memory_limit_bytes"):
                         bg._memory_limit_bytes = self._max_bytes
@@ -200,49 +252,67 @@ class ProcessMemoryEnforcer:
         )
 
     async def _check_and_enforce(self) -> None:
-        """Check current memory and enforce limit if exceeded.
+        """Check current memory and enforce 2-watermark policy.
 
-        Handles three scenarios via the while loop:
-        1. Multiple models, one inferring: evict LRU (idle) model,
-           inference on the other continues.
-        2. Single model: abort all requests, keep model loaded.
-           Short-context requests can be served afterward.
-        3. Multiple models, both inferring: first iteration evicts LRU
-           (aborting its requests), second iteration aborts remaining
-           single model's requests.
+        Pressure levels:
+        - ok (current < soft): no action, ensure admission unpaused.
+        - soft (soft <= current < hard): LRU non-pinned eviction + signal
+          schedulers to pause new admissions (in-flight requests proceed).
+        - hard (current >= hard): full enforcement — LRU evict, abort
+          in-flight when only pinned remain, abort in-progress model loads.
+
+        Pressure target on recovery is the soft threshold (always evict
+        back below soft to avoid oscillation when single eviction lands
+        just under hard).
         """
         if self._max_bytes <= 0:
+            self._pressure_level = "ok"
             return
 
-        current = mx.get_active_memory()
-        if current <= self._max_bytes:
+        current = self._current_usage_bytes()
+        soft = self._soft_bytes
+        hard = self._hard_bytes
+        prev_level = self._pressure_level
+
+        if current < soft:
+            new_level = "ok"
+        elif current < hard:
+            new_level = "soft"
+        else:
+            new_level = "hard"
+
+        # Update cached level and propagate admission_paused immediately so
+        # the scheduler stops admitting new prefills before we start evicting.
+        if new_level != prev_level:
+            self._pressure_level = new_level
+            self._propagate_memory_limit()
+            logger.info(
+                f"Memory pressure level: {prev_level} -> {new_level} "
+                f"(current={_format_gb(current)}, "
+                f"soft={_format_gb(soft)}, hard={_format_gb(hard)})"
+            )
+
+        if new_level == "ok":
             return
 
-        overage = current - self._max_bytes
-        logger.warning(
-            f"Process memory limit exceeded: "
-            f"{_format_gb(current)} / {_format_gb(self._max_bytes)} "
-            f"(over by {_format_gb(overage)})"
-        )
+        # Recover below soft regardless of level — prevents oscillation
+        # at the boundary.
+        target = soft
 
-        # Acquire EnginePool lock and unload LRU models until under limit.
-        # Note: prefill loops self-check via _memory_limit_bytes (same thread,
-        # no GIL issue), so they will abort independently of this enforcer.
         async with self._engine_pool._lock:
-            while mx.get_active_memory() > self._max_bytes:
+            while self._current_usage_bytes() > target:
                 victim = self._engine_pool._find_lru_victim()
                 if victim is not None:
-                    # Count loaded non-pinned models
                     loaded_non_pinned = [
                         mid
                         for mid, e in self._engine_pool._entries.items()
                         if e.engine is not None and not e.is_pinned
                     ]
                     if len(loaded_non_pinned) > 1:
-                        # Multiple models: evict LRU victim.
-                        # First abort active requests so clients receive
-                        # error messages — EngineCore.stop() only cancels
-                        # the engine loop silently without notifying collectors.
+                        # Multiple non-pinned: evict LRU victim cleanly.
+                        # abort_all_requests is fired before _unload_engine
+                        # so clients receive proper error responses instead
+                        # of silent disconnect.
                         entry = self._engine_pool._entries.get(victim)
                         if entry and entry.engine is not None:
                             if hasattr(entry.engine, "abort_all_requests"):
@@ -253,16 +323,15 @@ class ProcessMemoryEnforcer:
                                         f"'{victim}' before eviction"
                                     )
                         logger.warning(
-                            f"Evicting model '{victim}' to enforce "
-                            f"process memory limit"
+                            f"Evicting model '{victim}' (pressure={new_level})"
                         )
                         await self._engine_pool._unload_engine(victim)
                         continue
-                    else:
-                        # Single model: abort all requests, keep model
-                        # loaded. This frees KV cache blocks internally
-                        # so short-context requests can be served without
-                        # new Metal allocation.
+
+                    # Only one non-pinned model remains.
+                    if new_level == "hard":
+                        # Abort in-flight requests, keep model loaded —
+                        # frees KV blocks so short-context follow-ups work.
                         entry = self._engine_pool._entries.get(victim)
                         if entry and entry.engine is not None:
                             if hasattr(entry.engine, "abort_all_requests"):
@@ -270,42 +339,58 @@ class ProcessMemoryEnforcer:
                                 if aborted > 0:
                                     logger.warning(
                                         f"Aborted {aborted} requests on "
-                                        f"'{victim}' due to memory pressure "
-                                        f"(model kept loaded)"
+                                        f"'{victim}' due to hard memory "
+                                        f"pressure (model kept loaded)"
                                     )
-                        break
+                    # soft: leave in-flight alone — admission pause already
+                    # signaled, eviction can't help further without aborts.
+                    break
 
-                # No loaded non-pinned model to evict.
-                # Check if any model is currently loading — request abort.
-                aborted_any = False
-                for entry in self._engine_pool._entries.values():
-                    if entry.is_loading and not entry.abort_loading:
-                        logger.warning(
-                            f"Requesting abort of loading model "
-                            f"'{entry.model_id}' — process memory "
-                            f"limit exceeded"
+                # No non-pinned victim. All loaded models are pinned.
+                if new_level == "hard":
+                    # Hard only: abort any in-progress model loads.
+                    aborted_any = False
+                    for entry in self._engine_pool._entries.values():
+                        if entry.is_loading and not entry.abort_loading:
+                            logger.warning(
+                                f"Aborting in-progress load of "
+                                f"'{entry.model_id}' (hard memory pressure)"
+                            )
+                            entry.abort_loading = True
+                            aborted_any = True
+                    if not aborted_any:
+                        has_loaded = any(
+                            e.engine is not None
+                            for e in self._engine_pool._entries.values()
                         )
-                        entry.abort_loading = True
-                        aborted_any = True
-
-                if not aborted_any:
-                    # Nothing we can do — all models are either pinned
-                    # or there are no loaded/loading models
-                    has_loaded = any(
-                        e.engine is not None
-                        for e in self._engine_pool._entries.values()
-                    )
-                    if has_loaded:
-                        logger.warning(
-                            "Process memory limit exceeded but all "
-                            "loaded models are pinned — cannot evict."
-                        )
-                    else:
-                        logger.warning(
-                            "Process memory limit exceeded but no "
-                            "models are loaded to evict."
-                        )
+                        if has_loaded:
+                            logger.warning(
+                                "Hard memory pressure but all loaded models "
+                                "are pinned and no loads in progress."
+                            )
+                        else:
+                            logger.warning(
+                                "Hard memory pressure but no models loaded."
+                            )
+                # soft + all pinned: nothing to do beyond admission pause.
                 break
+
+        # Re-evaluate level after eviction completes so admission state
+        # reflects post-eviction reality on the next propagate.
+        post_current = self._current_usage_bytes()
+        if post_current < soft:
+            post_level = "ok"
+        elif post_current < hard:
+            post_level = "soft"
+        else:
+            post_level = "hard"
+        if post_level != self._pressure_level:
+            self._pressure_level = post_level
+            self._propagate_memory_limit()
+            logger.info(
+                f"Memory pressure post-eviction: {new_level} -> {post_level} "
+                f"(current={_format_gb(post_current)})"
+            )
 
     def get_status(self) -> dict:
         """Get enforcer status for monitoring endpoints."""

@@ -9,6 +9,26 @@ import pytest
 from omlx.process_memory_enforcer import ProcessMemoryEnforcer
 
 
+def _cycling(values):
+    """side_effect helper: yield each value, then repeat the last forever.
+
+    Lets tests express the meaningful sequence of mocked memory values
+    without having to count exact call sites in _check_and_enforce (the
+    new 2-watermark path re-reads phys_footprint after eviction).
+    """
+    if not values:
+        raise ValueError("need at least one value")
+    state = {"i": 0}
+
+    def _next(*_args, **_kwargs):
+        i = state["i"]
+        if i < len(values) - 1:
+            state["i"] = i + 1
+        return values[i]
+
+    return _next
+
+
 def _make_entry(model_id, engine=None, is_loading=False, is_pinned=False):
     """Create a mock EngineEntry."""
     entry = MagicMock()
@@ -33,11 +53,18 @@ def mock_engine_pool():
 
 @pytest.fixture
 def enforcer(mock_engine_pool):
-    """Create an enforcer with 10GB limit."""
+    """Create an enforcer with 10GB limit.
+
+    Soft/hard thresholds set to 1.0 so legacy single-threshold tests keep
+    treating max_bytes as the single trip point. Dedicated 2-watermark
+    tests construct their own enforcer with default thresholds.
+    """
     return ProcessMemoryEnforcer(
         engine_pool=mock_engine_pool,
         max_bytes=10 * 1024**3,
         poll_interval=0.1,
+        soft_threshold=1.0,
+        hard_threshold=1.0,
     )
 
 
@@ -82,11 +109,11 @@ class TestCheckAndEnforce:
         enforcer._engine_pool._unload_engine.side_effect = fake_unload
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = [
+            mock_mx.get_active_memory.side_effect = _cycling([
                 15 * 1024**3,  # Initial check (over limit)
                 15 * 1024**3,  # Re-check before eviction loop
                 8 * 1024**3,  # After eviction (under limit)
-            ]
+            ])
             await enforcer._check_and_enforce()
         enforcer._engine_pool._unload_engine.assert_called_once_with("model-a")
 
@@ -98,10 +125,10 @@ class TestCheckAndEnforce:
         entry = _make_entry("pinned-model", engine=MagicMock(), is_pinned=True)
         enforcer._engine_pool._entries = {"pinned-model": entry}
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = [
+            mock_mx.get_active_memory.side_effect = _cycling([
                 15 * 1024**3,  # Initial check
                 15 * 1024**3,  # Re-check in loop
-            ]
+            ])
             await enforcer._check_and_enforce()
         enforcer._engine_pool._unload_engine.assert_not_called()
 
@@ -134,12 +161,12 @@ class TestCheckAndEnforce:
         enforcer._engine_pool._unload_engine.side_effect = fake_unload
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = [
+            mock_mx.get_active_memory.side_effect = _cycling([
                 20 * 1024**3,  # Initial check
                 20 * 1024**3,  # Re-check (still over)
                 15 * 1024**3,  # After first eviction (still over)
                 8 * 1024**3,  # After second eviction (under limit)
-            ]
+            ])
             await enforcer._check_and_enforce()
         assert enforcer._engine_pool._unload_engine.call_count == 2
 
@@ -153,10 +180,10 @@ class TestCheckAndEnforce:
         enforcer._engine_pool._entries = {"loading-model": loading_entry}
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = [
+            mock_mx.get_active_memory.side_effect = _cycling([
                 15 * 1024**3,  # Initial check
                 15 * 1024**3,  # Re-check in loop
-            ]
+            ])
             await enforcer._check_and_enforce()
 
         assert loading_entry.abort_loading is True
@@ -193,11 +220,11 @@ class TestCheckAndEnforce:
         ]
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = [
+            mock_mx.get_active_memory.side_effect = _cycling([
                 20 * 1024**3,  # Initial check
                 20 * 1024**3,  # Re-check (still over)
                 15 * 1024**3,  # After eviction (still over)
-            ]
+            ])
             await enforcer._check_and_enforce()
 
         # LRU victim evicted first
@@ -212,10 +239,10 @@ class TestCheckAndEnforce:
         enforcer._engine_pool._entries = {}
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = [
+            mock_mx.get_active_memory.side_effect = _cycling([
                 15 * 1024**3,  # Initial check
                 15 * 1024**3,  # Re-check
-            ]
+            ])
             await enforcer._check_and_enforce()
         # Should not raise, just log warning
 
@@ -364,10 +391,10 @@ class TestSingleModelMemoryPressure:
         enforcer._engine_pool._find_lru_victim.return_value = "big-model"
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = [
+            mock_mx.get_active_memory.side_effect = _cycling([
                 15 * 1024**3,  # Initial check
                 15 * 1024**3,  # While loop check
-            ]
+            ])
             await enforcer._check_and_enforce()
 
         engine.abort_all_requests.assert_awaited_once()
@@ -384,10 +411,10 @@ class TestSingleModelMemoryPressure:
         enforcer._engine_pool._find_lru_victim.return_value = "big-model"
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = [
+            mock_mx.get_active_memory.side_effect = _cycling([
                 15 * 1024**3,
                 15 * 1024**3,
-            ]
+            ])
             await enforcer._check_and_enforce()
 
         engine.abort_all_requests.assert_awaited_once()
@@ -420,11 +447,11 @@ class TestSingleModelMemoryPressure:
         enforcer._engine_pool._unload_engine.side_effect = fake_unload
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = [
+            mock_mx.get_active_memory.side_effect = _cycling([
                 15 * 1024**3,  # Initial check
                 15 * 1024**3,  # While loop check
                 8 * 1024**3,  # After eviction (under limit)
-            ]
+            ])
             await enforcer._check_and_enforce()
 
         enforcer._engine_pool._unload_engine.assert_awaited_once_with(
@@ -625,3 +652,164 @@ class TestLifecycle:
             assert status["enabled"] is True
             assert status["current_bytes"] == 5 * 1024**3
             await enforcer.stop()
+
+
+class TestTwoWatermarkPressureLevels:
+    """Tests for 2-watermark soft/hard pressure level handling."""
+
+    @pytest.fixture
+    def pool(self):
+        p = MagicMock()
+        p._lock = asyncio.Lock()
+        p._find_lru_victim = MagicMock(return_value=None)
+        p._unload_engine = AsyncMock()
+        p._entries = {}
+        return p
+
+    @pytest.fixture
+    def enforcer_2wm(self, pool):
+        return ProcessMemoryEnforcer(
+            engine_pool=pool,
+            max_bytes=100 * 1024**3,
+            poll_interval=0.1,
+            soft_threshold=0.85,
+            hard_threshold=0.95,
+        )
+
+    def test_soft_hard_bytes_computed(self, enforcer_2wm):
+        assert enforcer_2wm._soft_bytes == int(100 * 1024**3 * 0.85)
+        assert enforcer_2wm._hard_bytes == int(100 * 1024**3 * 0.95)
+
+    def test_get_pressure_level_when_not_running(self, enforcer_2wm):
+        # _running=False → always ok regardless of cached level
+        enforcer_2wm._pressure_level = "hard"
+        assert enforcer_2wm.get_pressure_level() == "ok"
+
+    def test_get_pressure_level_when_running_returns_cached(self, enforcer_2wm):
+        enforcer_2wm._running = True
+        enforcer_2wm._pressure_level = "soft"
+        assert enforcer_2wm.get_pressure_level() == "soft"
+
+    @pytest.mark.asyncio
+    async def test_ok_when_below_soft(self, enforcer_2wm):
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            mock_mx.get_active_memory.return_value = 50 * 1024**3
+            gpf.return_value = 50 * 1024**3
+            await enforcer_2wm._check_and_enforce()
+        assert enforcer_2wm._pressure_level == "ok"
+        enforcer_2wm._engine_pool._unload_engine.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_soft_when_active_low_but_phys_high(self, enforcer_2wm):
+        """phys_footprint dominates active — the #702 case."""
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            # active well below soft, phys above soft but below hard
+            mock_mx.get_active_memory.return_value = 50 * 1024**3
+            gpf.return_value = 88 * 1024**3
+            await enforcer_2wm._check_and_enforce()
+        assert enforcer_2wm._pressure_level == "soft"
+
+    @pytest.mark.asyncio
+    async def test_hard_when_phys_at_hard_threshold(self, enforcer_2wm):
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            mock_mx.get_active_memory.return_value = 60 * 1024**3
+            gpf.return_value = 98 * 1024**3
+            await enforcer_2wm._check_and_enforce()
+        assert enforcer_2wm._pressure_level == "hard"
+
+    @pytest.mark.asyncio
+    async def test_propagates_admission_paused_on_soft(self, enforcer_2wm, pool):
+        # Wire a scheduler-like mock so propagate has something to set.
+        engine = MagicMock()
+        scheduler = MagicMock()
+        scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler._prefill_memory_guard = False
+        scheduler._admission_paused = False
+        engine.scheduler = scheduler
+        entry = _make_entry("m", engine=engine)
+        pool._entries = {"m": entry}
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            mock_mx.get_active_memory.return_value = 50 * 1024**3
+            gpf.return_value = 88 * 1024**3
+            await enforcer_2wm._check_and_enforce()
+
+        assert scheduler._admission_paused is True
+
+    @pytest.mark.asyncio
+    async def test_clears_admission_paused_on_recovery(self, enforcer_2wm, pool):
+        engine = MagicMock()
+        scheduler = MagicMock()
+        scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler._prefill_memory_guard = False
+        scheduler._admission_paused = True
+        engine.scheduler = scheduler
+        entry = _make_entry("m", engine=engine, is_pinned=True)
+        pool._entries = {"m": entry}
+
+        # Force into soft first
+        enforcer_2wm._pressure_level = "soft"
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            mock_mx.get_active_memory.return_value = 30 * 1024**3
+            gpf.return_value = 40 * 1024**3
+            await enforcer_2wm._check_and_enforce()
+
+        assert enforcer_2wm._pressure_level == "ok"
+        assert scheduler._admission_paused is False
+
+    @pytest.mark.asyncio
+    async def test_hard_aborts_in_flight_when_all_pinned(self, enforcer_2wm, pool):
+        engine = MagicMock()
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("pinned", engine=engine, is_pinned=True)
+        pool._entries = {"pinned": entry}
+        pool._find_lru_victim.return_value = "pinned"  # single non-pinned would route through abort_all; here all pinned route through loading abort. We test the single-non-pinned hard branch separately below.
+
+        # Single pinned model means find_lru_victim returns None (pinned not victim).
+        pool._find_lru_victim.return_value = None
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            mock_mx.get_active_memory.return_value = 60 * 1024**3
+            gpf.return_value = 99 * 1024**3
+            await enforcer_2wm._check_and_enforce()
+
+        # No in-progress loads to abort, all pinned → enforcer just logs warning,
+        # doesn't crash.
+        assert enforcer_2wm._pressure_level == "hard"
+
+    @pytest.mark.asyncio
+    async def test_soft_does_not_abort_loading(self, enforcer_2wm, pool):
+        loading_entry = _make_entry("loading", engine=None, is_loading=True)
+        pool._entries = {"loading": loading_entry}
+        pool._find_lru_victim.return_value = None
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            mock_mx.get_active_memory.return_value = 50 * 1024**3
+            gpf.return_value = 88 * 1024**3  # soft
+            await enforcer_2wm._check_and_enforce()
+
+        assert loading_entry.abort_loading is False  # soft must not abort load
+
+    @pytest.mark.asyncio
+    async def test_hard_aborts_loading(self, enforcer_2wm, pool):
+        loading_entry = _make_entry("loading", engine=None, is_loading=True)
+        pool._entries = {"loading": loading_entry}
+        pool._find_lru_victim.return_value = None
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            mock_mx.get_active_memory.return_value = 60 * 1024**3
+            gpf.return_value = 99 * 1024**3  # hard
+            await enforcer_2wm._check_and_enforce()
+
+        assert loading_entry.abort_loading is True

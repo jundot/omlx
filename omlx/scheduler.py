@@ -43,6 +43,7 @@ from .exceptions import is_cache_corruption_error
 from .prefill_progress import get_prefill_tracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
+from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
 
 
@@ -686,6 +687,10 @@ class Scheduler:
         self._memory_limit_bytes: int = 0  # soft limit
         self._memory_hard_limit_bytes: int = 0  # hard limit (system_ram - 4GB)
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
+        # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
+        # soft_threshold. Schedulers stop admitting new prefills while this is
+        # set; in-flight requests proceed.
+        self._admission_paused: bool = False
 
         # SpecPrefill: draft model for attention-based sparse prefill
         self._specprefill_draft_model: Any | None = None
@@ -1765,25 +1770,28 @@ class Scheduler:
                     )
                     emitted_boundaries[request.request_id] = total_tokens
 
-            # Memory monitoring
+            # Memory monitoring — use max(active, phys_footprint) so MLX
+            # cache pool and IOAccelerator-backed allocations that don't
+            # show in mx.get_active_memory() still trigger the guard.
+            # See utils/proc_memory.py for why phys_footprint matters.
             if self._memory_limit_bytes > 0:
-                active = mx.get_active_memory()
+                current = max(mx.get_active_memory(), get_phys_footprint())
                 if (
                     self._memory_hard_limit_bytes > 0
-                    and active > self._memory_hard_limit_bytes
+                    and current > self._memory_hard_limit_bytes
                 ):
                     logger.warning(
                         f"Prefill force-stopped at {processed_tokens} "
-                        f"tokens: memory {active / 1024**3:.1f}GB "
+                        f"tokens: memory {current / 1024**3:.1f}GB "
                         f"exceeds hard limit "
                         f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
                     )
                     raise RuntimeError("Memory limit exceeded during prefill")
-                elif active > self._memory_limit_bytes:
+                elif current > self._memory_limit_bytes:
                     logger.warning(
                         f"Prefill memory soft limit exceeded at "
                         f"{processed_tokens} tokens: "
-                        f"{active / 1024**3:.1f}GB > "
+                        f"{current / 1024**3:.1f}GB > "
                         f"{self._memory_limit_bytes / 1024**3:.1f}GB "
                         f"(hard limit: "
                         f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
@@ -2910,11 +2918,26 @@ class Scheduler:
         """
         Add a new request to the scheduler.
 
+        Raises SchedulerQueueFullError when the waiting queue is at or above
+        the configured cap (max(max_num_seqs * 4, 32)). Server layer maps
+        this to HTTP 503 + Retry-After.
+
         Args:
             request: The request to add
         """
         if request.request_id in self.requests:
             raise ValueError(f"Request {request.request_id} already exists")
+
+        # Cap the waiting queue so client-side polling can't accumulate
+        # unbounded work and the scheduler can apply backpressure via 503.
+        max_waiting = max(self.config.max_num_seqs * 4, 32)
+        if len(self.waiting) >= max_waiting:
+            from .exceptions import SchedulerQueueFullError
+
+            raise SchedulerQueueFullError(
+                current_depth=len(self.waiting),
+                max_depth=max_waiting,
+            )
 
         # Tokenize if needed
         if request.prompt_token_ids is None:
@@ -3851,14 +3874,14 @@ class Scheduler:
         if peak == 0:
             return None  # can't estimate, skip
 
-        current = mx.get_active_memory()
+        current = max(mx.get_active_memory(), get_phys_footprint())
 
         if current + peak > self._memory_hard_limit_bytes:
             from .utils.hardware import format_bytes
 
             return (
                 f"Prefill would require ~{format_bytes(current + peak)} peak "
-                f"(model {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
+                f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
                 f"but limit is {format_bytes(self._memory_hard_limit_bytes)}. "
                 f"Reduce context length or increase --max-process-memory."
             )
@@ -3891,6 +3914,17 @@ class Scheduler:
         batch_specprefill_status: bool | None = None
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
+            # Admission pause: set by ProcessMemoryEnforcer when phys
+            # crosses soft_threshold. New prefills wait; in-flight requests
+            # continue. First request always passes (self.running is empty)
+            # so admission can recover by completing the current generation.
+            if self._admission_paused and self.running:
+                logger.debug(
+                    "Admission paused by memory pressure, %d running",
+                    len(self.running),
+                )
+                break
+
             # Generation memory guard: when requests are already running,
             # defer scheduling if memory pressure is high to prevent
             # Metal allocation failures during batch_generator.next().
@@ -3900,12 +3934,12 @@ class Scheduler:
                 and self._memory_limit_bytes > 0
                 and self.running
             ):
-                active = mx.get_active_memory()
-                if active > self._memory_limit_bytes:
+                current = max(mx.get_active_memory(), get_phys_footprint())
+                if current > self._memory_limit_bytes:
                     logger.debug(
                         "Generation memory guard: deferring scheduling "
                         "(%s > %s), %d running",
-                        active,
+                        current,
                         self._memory_limit_bytes,
                         len(self.running),
                     )
