@@ -365,6 +365,11 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
 
     def _patched(path, **kwargs):
         cfg = original(path, **kwargs)
+
+        from ..utils.model_loading import expand_per_layer_quant_keys
+
+        expand_per_layer_quant_keys(cfg)
+
         if cfg.get("audio_config") is None:
             return cfg
         try:
