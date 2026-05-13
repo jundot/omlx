@@ -252,6 +252,11 @@ class CacheSettings:
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
+    # Bounded LRU stash for the trailing sub-block partial of a previous
+    # prefill, keyed by parent-block hash.  Each entry holds at most one
+    # block_size of KV memory.  ``0`` disables the feature; default of 4
+    # matches the dflash max_entries precedent (PR #1120).
+    mru_partial_max_entries: int = 4
 
     def get_ssd_cache_dir(self, base_path: Path) -> Path:
         """
@@ -295,6 +300,7 @@ class CacheSettings:
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
             "initial_cache_blocks": self.initial_cache_blocks,
+            "mru_partial_max_entries": self.mru_partial_max_entries,
         }
 
     @classmethod
@@ -307,6 +313,7 @@ class CacheSettings:
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=data.get("hot_cache_max_size", "0"),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
+            mru_partial_max_entries=data.get("mru_partial_max_entries", 4),
         )
 
 

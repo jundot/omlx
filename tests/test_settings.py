@@ -342,6 +342,7 @@ class TestCacheSettings:
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",
             "initial_cache_blocks": 256,
+            "mru_partial_max_entries": 4,
         }
 
     def test_from_dict(self):

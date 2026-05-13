@@ -549,6 +549,11 @@ class SchedulerConfig:
     hot_cache_only: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
+    # Bounded LRU stash for trailing sub-block partials of previous
+    # prefills, keyed by parent-block hash.  Each entry holds at most
+    # one block_size of KV memory.  ``0`` disables the feature; default
+    # of 4 matches the dflash max_entries precedent (PR #1120).
+    mru_partial_max_entries: int = 4
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
@@ -799,6 +804,7 @@ class Scheduler:
             self.block_aware_cache = BlockAwarePrefixCache(
                 model=model,
                 paged_cache_manager=self.paged_cache_manager,
+                mru_partial_max_entries=self.config.mru_partial_max_entries,
             )
 
             # Initialize paged SSD cache
@@ -3468,6 +3474,7 @@ class Scheduler:
                     model=draft_model,
                     paged_cache_manager=draft_paged,
                     paged_ssd_cache_manager=self.paged_ssd_cache_manager,
+                    mru_partial_max_entries=self.config.mru_partial_max_entries,
                 )
                 self._draft_prefix_cache.set_cold_restore_callback(
                     self._restore_block_from_cold

@@ -2419,27 +2419,42 @@ class TestPerBlockMetaStates:
         )
 
 
+def _get_mru_partial(cache, parent_hash):
+    """Test-only accessor for one MRU partial entry by parent_hash key.
+
+    Lives in the test module rather than on ``BlockAwarePrefixCache``
+    itself: production code has no consumer that looks up entries by
+    arbitrary key (the scheduler only needs the boolean predicate via
+    ``has_mru_partial()`` and the dict lookup inside ``apply_mru_partial``).
+    Tests use this helper to assert on individual entries without
+    coupling to the internal ``_mru_partials`` container shape.
+    """
+    return cache._mru_partials.get(parent_hash)
+
+
 class TestMRUPartialBlockCache:
     """Tests for the MRU partial block cache.
 
-    The MRU is a single-slot in-memory cache holding the trailing sub-block
-    tail from the most recent ``store_cache`` call. It lets exact-repeat
-    requests skip re-prefilling those tail tokens.
+    The MRU is a bounded LRU dict of trailing sub-block tails keyed by
+    ``parent_hash``.  It lets exact-repeat requests skip re-prefilling
+    those tail tokens, and tolerates interleaving (multi-user / multi-
+    conversation workloads) by keeping multiple distinct-prefix entries
+    coexistent up to ``mru_partial_max_entries``.
 
     Threat-model coverage these tests enforce:
 
     - **Hybrid refusal:** when any layer is non-sliceable (RotatingKVCache,
-      ArraysCache, etc.), the stash is suppressed entirely. Splicing into
+      ArraysCache, etc.), the stash is suppressed entirely.  Splicing into
       only the sliceable layers would create per-layer offset skew at
       decode time.
     - **Transactional splice:** if any layer's concatenate fails, no layer
-      sees a mutated keys/values/offset. Half-mutated caches are silent
+      sees a mutated keys/values/offset.  Half-mutated caches are silent
       generation corruption.
-    - **Real round-trip:** store_cache populates ``_mru_partial`` via the
-      production extraction path; apply_mru_partial then splices it. The
-      tests do not hand-build ``_MRUPartialBlock`` objects for the splice
+    - **Real round-trip:** ``store_cache`` populates entries via the
+      production extraction path; ``apply_mru_partial`` then splices.
+      Tests do not hand-build ``_MRUPartialBlock`` objects for splice
       cases — that hides the extraction-vs-apply boundary the original
-      branch's tests missed.
+      single-slot branch's tests missed.
     """
 
     @pytest.fixture
@@ -2547,7 +2562,7 @@ class TestMRUPartialBlockCache:
     # --- initial state ---
 
     def test_init_state_empty(self, prefix_cache):
-        assert prefix_cache._mru_partial is None
+        assert not prefix_cache._mru_partials
         assert prefix_cache.has_mru_partial() is False
 
     # --- stash semantics on uniformly sliceable layers ---
@@ -2557,64 +2572,87 @@ class TestMRUPartialBlockCache:
         tokens = [10, 20, 30, 40, 50, 60]
         cache_data = [self._kv_layer(mx, 6) for _ in range(4)]
 
-        prefix_cache.store_cache("req-stash", tokens, cache_data)
+        block_table = prefix_cache.store_cache("req-stash", tokens, cache_data)
 
-        partial = prefix_cache._mru_partial
+        parent_hash = prefix_cache.paged_cache.allocated_blocks[
+            block_table.block_ids[-1]
+        ].block_hash
+        partial = _get_mru_partial(prefix_cache, parent_hash)
         assert partial is not None
         assert partial.tokens == [50, 60]
         assert len(partial.kv_data) == 4
         assert prefix_cache.has_mru_partial() is True
 
     def test_no_stash_when_block_aligned(self, prefix_cache, mx):
-        """Block-aligned tokens leave no trailing partial → slot cleared."""
+        """Block-aligned tokens leave no trailing partial → no entry written."""
         tokens = [10, 20, 30, 40]
         cache_data = [self._kv_layer(mx, 4) for _ in range(4)]
 
         prefix_cache.store_cache("req-aligned", tokens, cache_data)
 
-        assert prefix_cache._mru_partial is None
+        assert not prefix_cache._mru_partials
         assert prefix_cache.has_mru_partial() is False
 
-    def test_stash_replaced_on_subsequent_store(self, prefix_cache, mx):
-        """Each store_cache replaces the previous slot — single-slot semantics."""
+    def test_same_prefix_store_replaces_entry(self, prefix_cache, mx):
+        """Same prefix → same parent_hash → same dict key → replace.
+
+        Two stores with identical prefix tokens but different tails
+        collide on the same key (parent_hash chains from identical
+        prefix blocks).  The newer tail replaces the older one in the
+        single dict entry — that is correct LRU put behavior.
+        """
         for tail in (50, 99):
             tokens = [10, 20, 30, 40, tail]
             cache_data = [self._kv_layer(mx, 5) for _ in range(4)]
             prefix_cache.store_cache(f"req-{tail}", tokens, cache_data)
 
-        assert prefix_cache._mru_partial is not None
-        assert prefix_cache._mru_partial.tokens == [99]
+        # Exactly one entry; its tokens are the latest tail.
+        assert len(prefix_cache._mru_partials) == 1
+        partial = next(iter(prefix_cache._mru_partials.values()))
+        assert partial.tokens == [99]
 
-    def test_stash_clears_when_subsequent_store_is_block_aligned(
+    def test_no_eligible_tail_does_not_evict_siblings(
         self, prefix_cache, mx
     ):
-        """Stash from request A is cleared when request B has no trailing partial."""
-        # First: stash a partial
+        """Behavioral change vs single-slot: a block-aligned store (no
+        trailing tail) MUST NOT wipe sibling entries from other prefixes.
+
+        Single-slot mode used to clear the lone slot in this branch.
+        Multi-slot mode treats "nothing eligible to stash this time"
+        as a local signal — sibling entries for distinct prefixes are
+        unrelated and stay.
+        """
+        # First: stash a partial via prefix A.
         prefix_cache.store_cache(
             "req-a", [10, 20, 30, 40, 50], [self._kv_layer(mx, 5) for _ in range(4)]
         )
-        assert prefix_cache._mru_partial is not None
+        assert len(prefix_cache._mru_partials) == 1
+        before_key = next(iter(prefix_cache._mru_partials.keys()))
 
-        # Second: block-aligned, must clear the stash so an apply attempt
-        # against a stale partial cannot succeed.
+        # Second: block-aligned store on a DIFFERENT prefix — no tail to
+        # stash, but must not evict the existing sibling.
         prefix_cache.store_cache(
             "req-b", [11, 22, 33, 44], [self._kv_layer(mx, 4) for _ in range(4)]
         )
-        assert prefix_cache._mru_partial is None
+        assert len(prefix_cache._mru_partials) == 1
+        assert next(iter(prefix_cache._mru_partials.keys())) == before_key
 
     def test_stash_records_parent_hash_from_last_block(self, prefix_cache, mx):
-        """Stashed partial chains from the hash of the last full block."""
+        """Stashed entry is keyed by the hash of the last full block."""
         tokens = [10, 20, 30, 40, 50, 60]
         cache_data = [self._kv_layer(mx, 6) for _ in range(4)]
 
         block_table = prefix_cache.store_cache("req-hash", tokens, cache_data)
 
-        # The last (and only) block's hash should be the partial's parent.
+        # The last (and only) block's hash should be the dict key AND
+        # the partial's stored parent_hash.
         last_block = prefix_cache.paged_cache.allocated_blocks[
             block_table.block_ids[-1]
         ]
-        assert prefix_cache._mru_partial.parent_hash == last_block.block_hash
         assert last_block.block_hash is not None
+        partial = _get_mru_partial(prefix_cache, last_block.block_hash)
+        assert partial is not None
+        assert partial.parent_hash == last_block.block_hash
 
     # --- threat model: hybrid refusal (B1, B2) ---
 
@@ -2645,7 +2683,7 @@ class TestMRUPartialBlockCache:
 
         cache.store_cache("req-hybrid", tokens, cache_data, model_cache_config=config)
 
-        assert cache._mru_partial is None
+        assert not cache._mru_partials
         assert cache.has_mru_partial() is False
 
     def test_refuse_stash_when_all_layers_non_sliceable(self, prefix_cache, mx):
@@ -2662,7 +2700,7 @@ class TestMRUPartialBlockCache:
             "req-rotating", tokens, cache_data, model_cache_config=config
         )
 
-        assert prefix_cache._mru_partial is None
+        assert not prefix_cache._mru_partials
 
     def test_refuse_stash_when_layer_falls_through_to_default_handler(
         self, prefix_cache, mx
@@ -2704,34 +2742,30 @@ class TestMRUPartialBlockCache:
             "req-batch-rotating", tokens, cache_data, model_cache_config=config
         )
 
-        assert prefix_cache._mru_partial is None
+        assert not prefix_cache._mru_partials
         assert prefix_cache.has_mru_partial() is False
 
     # --- threat model: stale-slot eviction at clear() (C2) ---
 
-    def test_clear_wipes_mru_partial(self, prefix_cache, mx):
-        """``BlockAwarePrefixCache.clear()`` must drop the MRU slot.
+    def test_clear_wipes_mru_partials(self, prefix_cache, mx):
+        """``BlockAwarePrefixCache.clear()`` must drop the entire MRU dict.
 
         The scheduler's cache-corruption recovery routes through
-        ``clear()``.  A surviving partial chains from a paged-block hash
-        whose backing block was just freed; if a future request happens
-        to reproduce the same prompt prefix, ``compute_block_hash`` could
-        coincidentally yield the same hash and the partial would splice
-        into a freshly-reconstructed cache.  The KV would happen to be
-        correct (the model is deterministic) but the chain-of-trust is
-        gone — and the survival happens via *exactly the recovery path
-        that exists because something was wrong*.
+        ``clear()``.  Surviving partials chain from paged-block hashes
+        whose backing blocks were just freed; the dict is wiped so no
+        entry can survive into the recovery path that exists because
+        something was wrong.
         """
         prefix_cache.store_cache(
             "req-clear",
             [10, 20, 30, 40, 50, 60],
             [self._kv_layer(mx, 6) for _ in range(4)],
         )
-        assert prefix_cache._mru_partial is not None
+        assert bool(prefix_cache._mru_partials)
 
         prefix_cache.clear()
 
-        assert prefix_cache._mru_partial is None
+        assert not prefix_cache._mru_partials
         assert prefix_cache.has_mru_partial() is False
 
     # --- threat model: H2 ambiguous cache layout ---
@@ -2776,7 +2810,7 @@ class TestMRUPartialBlockCache:
         # Refuse rather than guess.  Stash must be the previous turn's
         # state cleared (block-aligned turn 1 has no stash anyway), not
         # a guessed-wrong turn 2.
-        assert prefix_cache._mru_partial is None
+        assert not prefix_cache._mru_partials
 
     # --- accounting invariant ---
 
@@ -2798,13 +2832,16 @@ class TestMRUPartialBlockCache:
         under load.  Pin the invariant so that change is caught at test
         time, not in production.
         """
-        prefix_cache.store_cache(
+        block_table = prefix_cache.store_cache(
             "req-accounting",
             [10, 20, 30, 40, 50, 60],
             [self._kv_layer(mx, 6) for _ in range(4)],
         )
 
-        partial = prefix_cache._mru_partial
+        parent_hash = prefix_cache.paged_cache.allocated_blocks[
+            block_table.block_ids[-1]
+        ].block_hash
+        partial = _get_mru_partial(prefix_cache, parent_hash)
         assert partial is not None
         assert len(partial.kv_data) == 4
         for layer_idx, (keys, values) in enumerate(partial.kv_data):
@@ -2845,7 +2882,7 @@ class TestMRUPartialBlockCache:
             [self._kv_layer(mx, 6) for _ in range(4)],
         )
 
-        assert cache._mru_partial is None
+        assert not cache._mru_partials
         assert cache.has_mru_partial() is False
 
     def test_can_reconstruct_helper_reflects_manager_presence(
@@ -2918,25 +2955,42 @@ class TestMRUPartialBlockCache:
 
     # --- apply: eviction reasons ---
 
-    def test_apply_evicts_on_parent_hash_mismatch(self, prefix_cache, mx):
-        """If the matched prefix's last block hash differs from the
-        partial's parent_hash, the partial is from a different prefix
-        and must be evicted."""
-        tokens = [10, 20, 30, 40, 50, 60]
-        cache_data = [self._kv_layer(mx, 6) for _ in range(4)]
-        block_table = prefix_cache.store_cache("req-evict-h", tokens, cache_data)
+    def test_apply_noop_on_parent_hash_mismatch_preserves_sibling(
+        self, prefix_cache, mx, paged_cache
+    ):
+        """A request keyed by a parent_hash that isn't in the dict
+        returns no-op WITHOUT evicting unrelated sibling entries.
 
-        # Tamper with the partial's parent_hash so it doesn't chain.
-        prefix_cache._mru_partial.parent_hash = b"different-prefix"
+        Behavioral change from single-slot: the single slot used to be
+        evicted whenever the lookup key didn't match.  In multi-slot,
+        the lookup simply misses and other entries are preserved.
+        """
+        # Stash a partial under prefix A.
+        tokens = [10, 20, 30, 40, 50, 60]
+        block_table_a = prefix_cache.store_cache(
+            "req-a", tokens, [self._kv_layer(mx, 6) for _ in range(4)]
+        )
+        before = dict(prefix_cache._mru_partials)
+        assert len(before) == 1
+
+        # Construct a synthetic block_table pointing at a block whose
+        # hash is NOT a key in the dict (simulate "request for a
+        # different prefix that has its own paged block").
+        other_block = paged_cache.allocate_block()
+        other_block.block_hash = b"\x00" * 32  # not in the MRU dict
+        synthetic_bt = BlockTable(request_id="req-other")
+        synthetic_bt.block_ids.append(other_block.block_id)
+        synthetic_bt.num_tokens = 4
 
         reconstructed = self._make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
         _, new_remaining, applied = prefix_cache.apply_mru_partial(
-            reconstructed, block_table, [50, 60],
+            reconstructed, synthetic_bt, [50, 60],
         )
 
         assert applied == 0
         assert new_remaining == [50, 60]
-        assert prefix_cache._mru_partial is None
+        # Prefix A's entry must still be present — no false eviction.
+        assert dict(prefix_cache._mru_partials) == before
 
     def test_apply_evicts_on_token_mismatch(self, prefix_cache, mx):
         """Different trailing tokens → partial cannot apply, evict."""
@@ -2951,7 +3005,7 @@ class TestMRUPartialBlockCache:
 
         assert applied == 0
         assert new_remaining == [99, 60]
-        assert prefix_cache._mru_partial is None
+        assert not prefix_cache._mru_partials
 
     def test_apply_evicts_on_remaining_shorter_than_partial(
         self, prefix_cache, mx
@@ -2968,7 +3022,7 @@ class TestMRUPartialBlockCache:
         )
 
         assert applied == 0
-        assert prefix_cache._mru_partial is None
+        assert not prefix_cache._mru_partials
 
     def test_apply_evicts_on_layer_count_mismatch(self, prefix_cache, mx):
         """If the reconstructed cache layer count differs from the
@@ -2984,7 +3038,7 @@ class TestMRUPartialBlockCache:
         )
 
         assert applied == 0
-        assert prefix_cache._mru_partial is None
+        assert not prefix_cache._mru_partials
 
     def test_apply_noop_when_no_stash(self, prefix_cache, paged_cache, mx):
         """No partial → no-op, remaining unchanged."""
@@ -3013,7 +3067,7 @@ class TestMRUPartialBlockCache:
         assert applied == 0
         # Stash must NOT be evicted on empty-remaining no-op — it could
         # still match a *future* request that does have tail tokens.
-        assert prefix_cache._mru_partial is not None
+        assert bool(prefix_cache._mru_partials)
 
     # --- threat model: transactional splice rollback (B3) ---
 
@@ -3061,7 +3115,7 @@ class TestMRUPartialBlockCache:
         # No layer's keys shape changed.
         assert [layer.keys.shape for layer in reconstructed] == before_key_shapes
         # Slot is evicted on splice failure (don't retry a failing partial).
-        assert prefix_cache._mru_partial is None
+        assert not prefix_cache._mru_partials
 
     # --- threat model: multi-turn (existing_tokens > 0) ---
 
@@ -3107,9 +3161,14 @@ class TestMRUPartialBlockCache:
                 "class_name": "KVCache",
             })
 
-        prefix_cache.store_cache("req-turn-2", full_tokens, full_cache)
+        block_table = prefix_cache.store_cache(
+            "req-turn-2", full_tokens, full_cache
+        )
 
-        partial = prefix_cache._mru_partial
+        parent_hash = prefix_cache.paged_cache.allocated_blocks[
+            block_table.block_ids[-1]
+        ].block_hash
+        partial = _get_mru_partial(prefix_cache, parent_hash)
         assert partial is not None
         assert partial.tokens == [9, 10]
         # Each layer's stashed slice must be the trailing region (fill=2.0).
@@ -3119,11 +3178,270 @@ class TestMRUPartialBlockCache:
             assert mx.allclose(values, mx.full((1, 1, 2, 4), 2.0))
 
 
+class TestMRUPartialMultiSlot:
+    """Multi-slot LRU semantics: coexistence, capacity, eviction discipline.
+
+    These tests cover the mechanics that single-slot mode could not
+    exercise — multiple entries keyed by distinct ``parent_hash`` values,
+    LRU promotion on apply success, sibling preservation on apply miss,
+    capacity-bounded eviction, ``max_entries=0`` feature disable, and
+    the freed-paged-block guard introduced by the multi-slot design.
+    """
+
+    @pytest.fixture
+    def mx(self):
+        try:
+            import mlx.core as mx
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    @pytest.fixture
+    def paged_cache(self):
+        return PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+
+    @pytest.fixture
+    def mock_ssd(self):
+        mock = MagicMock()
+        mock.save_block.return_value = True
+        mock.load_block.return_value = None
+        mock.load_block_with_metadata.return_value = (None, None)
+        mock.has_block.return_value = False
+        return mock
+
+    def _cache(self, paged_cache, mock_ssd, max_entries=4):
+        return BlockAwarePrefixCache(
+            model=MockModel(num_layers=4),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+            mru_partial_max_entries=max_entries,
+        )
+
+    def _kv_layer(self, mx, n_tokens, head_dim=4):
+        return {
+            "state": (
+                mx.full((1, 1, n_tokens, head_dim), 1.0),
+                mx.full((1, 1, n_tokens, head_dim), 1.0),
+            ),
+            "cache_type": "KVCache",
+            "class_name": "KVCache",
+        }
+
+    def _make_reconstructed_cache(self, mx, n_layers, n_tokens, head_dim=4):
+        class MockKVCache:
+            def __init__(self, k, v, offset):
+                self.keys = k
+                self.values = v
+                self.offset = offset
+
+        return [
+            MockKVCache(
+                mx.ones((1, 1, n_tokens, head_dim)),
+                mx.ones((1, 1, n_tokens, head_dim)),
+                n_tokens,
+            )
+            for _ in range(n_layers)
+        ]
+
+    def _stash_with_prefix(self, cache, mx, prefix_marker, tail_token):
+        """Store a partial under a distinct parent_hash.
+
+        Builds a prompt whose first 4 tokens are unique to ``prefix_marker``
+        (forcing a unique parent block hash) and whose 5th token is the
+        partial tail.  Returns (block_table, parent_hash).
+        """
+        tokens = [prefix_marker * 10 + i for i in range(4)] + [tail_token]
+        cache_data = [self._kv_layer(mx, 5) for _ in range(4)]
+        block_table = cache.store_cache(
+            f"req-{prefix_marker}", tokens, cache_data
+        )
+        parent_hash = cache.paged_cache.allocated_blocks[
+            block_table.block_ids[-1]
+        ].block_hash
+        return block_table, parent_hash
+
+    # --- multi-entry coexistence ---
+
+    def test_distinct_prefixes_coexist_as_separate_entries(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """Two stashes with different parent prefixes produce two entries."""
+        cache = self._cache(paged_cache, mock_ssd, max_entries=4)
+        _, hash_a = self._stash_with_prefix(cache, mx, prefix_marker=1, tail_token=99)
+        _, hash_b = self._stash_with_prefix(cache, mx, prefix_marker=2, tail_token=88)
+
+        assert hash_a != hash_b
+        assert len(cache._mru_partials) == 2
+        assert hash_a in cache._mru_partials
+        assert hash_b in cache._mru_partials
+
+    # --- LRU mechanics (parameterized) ---
+
+    @pytest.mark.parametrize(
+        "scenario",
+        [
+            # (capacity, n_stashes_in_order, expected_dict_keys_in_order)
+            # Capacity respected; oldest evicted on overflow.
+            ("evict_oldest_at_capacity", 2, [1, 2, 3], [2, 3]),
+            # Below capacity, all retained, insertion order preserved.
+            ("under_capacity_keeps_all", 4, [1, 2, 3], [1, 2, 3]),
+        ],
+        ids=lambda s: s[0] if isinstance(s, tuple) else str(s),
+    )
+    def test_lru_capacity_bounds(
+        self, paged_cache, mock_ssd, mx, scenario
+    ):
+        _, capacity, order, expected = scenario
+        cache = self._cache(paged_cache, mock_ssd, max_entries=capacity)
+        hashes = {}
+        for marker in order:
+            _, h = self._stash_with_prefix(
+                cache, mx, prefix_marker=marker, tail_token=900 + marker
+            )
+            hashes[marker] = h
+
+        expected_keys = [hashes[m] for m in expected]
+        assert list(cache._mru_partials.keys()) == expected_keys
+
+    def test_apply_success_promotes_entry_to_lru_tail(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """Applying an entry moves it to the LRU tail; a subsequent
+        capacity-eviction drops a now-older sibling, not the just-used
+        entry."""
+        cache = self._cache(paged_cache, mock_ssd, max_entries=2)
+        bt_a, hash_a = self._stash_with_prefix(
+            cache, mx, prefix_marker=1, tail_token=901
+        )
+        _, hash_b = self._stash_with_prefix(
+            cache, mx, prefix_marker=2, tail_token=902
+        )
+        assert list(cache._mru_partials.keys()) == [hash_a, hash_b]
+
+        # Apply A → A promoted to tail.
+        reconstructed = self._make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+        # Remaining must equal A's stashed tokens.  Tail token was 901,
+        # placed at index 4 of A's prompt.
+        _, _, applied = cache.apply_mru_partial(reconstructed, bt_a, [901])
+        assert applied == 1
+        assert list(cache._mru_partials.keys()) == [hash_b, hash_a]
+
+        # Stash C at capacity 2 → B evicted (oldest after promote), A kept.
+        _, hash_c = self._stash_with_prefix(
+            cache, mx, prefix_marker=3, tail_token=903
+        )
+        assert list(cache._mru_partials.keys()) == [hash_a, hash_c]
+        assert hash_b not in cache._mru_partials
+
+    # --- max_entries=0 disables ---
+
+    def test_max_entries_zero_disables_stashing(
+        self, paged_cache, mock_ssd, mx
+    ):
+        cache = self._cache(paged_cache, mock_ssd, max_entries=0)
+        self._stash_with_prefix(cache, mx, prefix_marker=1, tail_token=99)
+
+        assert len(cache._mru_partials) == 0
+        assert cache.has_mru_partial() is False
+
+    # --- clear_mru_partials() leaves siblings alone ---
+
+    def test_clear_mru_partials_wipes_only_partials(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """``clear_mru_partials()`` is the admin-clear hook.  It wipes the
+        MRU dict but must not touch ``paged_cache``, the prefix index,
+        or stats — those have their own clear paths."""
+        cache = self._cache(paged_cache, mock_ssd, max_entries=4)
+        bt, _ = self._stash_with_prefix(cache, mx, prefix_marker=1, tail_token=99)
+
+        prefix_index_before = dict(cache._prefix_index)
+        request_tables_before = dict(cache._request_tables)
+        assert len(cache._mru_partials) == 1
+        assert prefix_index_before  # was populated by store_cache
+
+        n_wiped = cache.clear_mru_partials()
+
+        assert n_wiped == 1
+        assert len(cache._mru_partials) == 0
+        # Paged blocks, prefix index, request tables all unchanged.
+        assert cache._prefix_index == prefix_index_before
+        assert cache._request_tables == request_tables_before
+        assert bt.block_ids[-1] in cache.paged_cache.allocated_blocks
+
+    # --- freed-block guard (new in multi-slot) ---
+
+    def test_apply_noop_when_parent_block_freed(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """If the parent paged block is freed between stash and apply,
+        the apply path must not fall through to a None-keyed lookup
+        (which could falsely match a short-prompt entry).
+
+        This race is new in multi-slot: single-slot tolerated it because
+        there was only ever one slot to match against.
+        """
+        cache = self._cache(paged_cache, mock_ssd, max_entries=4)
+        # Stash a short-prompt entry (parent_hash=None) — the false-match
+        # bait for the freed-block scenario.
+        short_tokens = [99, 100, 101]  # < block_size=4
+        cache.store_cache(
+            "req-short", short_tokens, [self._kv_layer(mx, 3) for _ in range(4)]
+        )
+        # Confirm the short-prompt entry landed under None.
+        assert None in cache._mru_partials
+
+        # Construct a block_table whose last block has been freed.
+        freed_block = paged_cache.allocate_block()
+        freed_block_id = freed_block.block_id
+        paged_cache.free_block(freed_block_id)
+        bt = BlockTable(request_id="req-freed")
+        bt.block_ids.append(freed_block_id)
+        bt.num_tokens = 4
+
+        reconstructed = self._make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+        _, new_remaining, applied = cache.apply_mru_partial(
+            reconstructed, bt, [99, 100, 101]
+        )
+
+        # Must NOT splice the short-prompt entry even though the
+        # remaining tokens happen to match.
+        assert applied == 0
+        assert new_remaining == [99, 100, 101]
+        # Short-prompt entry preserved (not falsely evicted by the guard).
+        assert None in cache._mru_partials
+
+    # --- short-prompt None-key coexists with hash-keyed entry ---
+
+    def test_short_prompt_none_key_coexists_with_block_aligned_entry(
+        self, paged_cache, mock_ssd, mx
+    ):
+        cache = self._cache(paged_cache, mock_ssd, max_entries=4)
+        # Short prompt (< block_size) → parent_hash=None
+        cache.store_cache(
+            "req-short", [10, 20, 30],
+            [self._kv_layer(mx, 3) for _ in range(4)],
+        )
+        # Longer prompt → distinct parent_hash
+        _, hash_long = self._stash_with_prefix(
+            cache, mx, prefix_marker=1, tail_token=99
+        )
+
+        assert None in cache._mru_partials
+        assert hash_long in cache._mru_partials
+        assert len(cache._mru_partials) == 2
+
+
 class TestHasMRUPartial:
     """The has_mru_partial() accessor is the public API the scheduler
     uses to decide whether to suppress the deferred Metal cache clear."""
 
-    def test_has_mru_partial_reflects_slot(self):
+    def test_has_mru_partial_reflects_dict_emptiness(self):
         cache = BlockAwarePrefixCache(
             model=MockModel(num_layers=2),
             paged_cache_manager=PagedCacheManager(
@@ -3133,10 +3451,10 @@ class TestHasMRUPartial:
         )
         assert cache.has_mru_partial() is False
 
-        cache._mru_partial = _MRUPartialBlock(
+        cache._mru_partials[b"x"] = _MRUPartialBlock(
             parent_hash=b"x", tokens=[1], kv_data=[],
         )
         assert cache.has_mru_partial() is True
 
-        cache._mru_partial = None
+        cache._mru_partials.clear()
         assert cache.has_mru_partial() is False

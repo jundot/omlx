@@ -9,6 +9,7 @@ with SSD persistence. oMLX only supports paged SSD-based caching.
 import logging
 import math
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -46,53 +47,57 @@ class BlockCacheEntry:
 
 @dataclass
 class _MRUPartialBlock:
-    """Single-slot most-recent stash for a trailing sub-block partial.
+    """One entry in the bounded LRU stash for trailing sub-block partials.
 
     The paged SSD cache only persists full ``block_size`` blocks; trailing
     sub-block tokens (e.g. 139 out of 256) are otherwise discarded and
-    re-prefilled on every repeat request. ``_MRUPartialBlock`` keeps the
-    last partial in memory so an immediate repeat skips re-prefilling
-    those tail tokens.
+    re-prefilled on every repeat request. The MRU stash keeps the partial
+    in memory so an immediate repeat skips re-prefilling those tail tokens.
 
-    Single slot, replaced on every ``store_cache`` that produces a new
-    trailing partial. Evicted on any mismatch — parent-hash chain, token
-    prefix, layer count, splice failure — so a stale or mistargeted
-    partial cannot accumulate.
+    Entries are stored in ``BlockAwarePrefixCache._mru_partials`` as an
+    ``OrderedDict`` keyed by ``parent_hash``. New entries land at the tail;
+    LRU eviction pops the oldest when the dict exceeds
+    ``mru_partial_max_entries``. A successful apply promotes the matched
+    entry to the tail (move_to_end). Apply-time miss for a found entry
+    pops only that key, leaving siblings intact. Same-key replacement on
+    stash is correct LRU put behavior.
 
     Stash and apply are gated on **uniform layer sliceability**: if any
     layer in the model is non-sliceable (RotatingKVCache, ArraysCache,
-    etc.) the slot is left empty. Splicing into only the sliceable
+    etc.) no entries are ever written. Splicing into only the sliceable
     layers would create per-layer offset skew at decode time.
 
     Memory accounting
     -----------------
     ``kv_data`` holds real ``mx.array`` allocations (produced by
-    ``_clone_tensor`` → ``mx.copy``), so the slot's memory cost is
-    automatically counted by ``mx.get_active_memory()``.  Every runtime
+    ``_clone_tensor`` → ``mx.copy``), so each entry's memory cost is
+    automatically counted by ``mx.get_active_memory()``. Every runtime
     memory enforcement and telemetry path in this codebase reads from
-    there: the process-level enforcer, the scheduler's prefill
-    mid-loop limit check, the prefill pre-flight peak check, the
-    generation admission guard, and the periodic-clear threshold.
+    there: the process-level enforcer, the scheduler's prefill mid-loop
+    limit check, the prefill pre-flight peak check, the generation
+    admission guard, and the periodic-clear threshold.
 
-    Upstream of those, ``EnginePool`` reserves a fraction of each
-    model's weight size as KV headroom when deciding whether to evict
-    other models before loading.  The MRU partial is one tenant of
-    that headroom alongside in-flight prompt caches; it is not
-    separately reserved because at one ``block_size``-worth of KV per
-    cache instance (~17 MiB for Kimi K2.5 / DeepSeek MLA, ~41 MiB for
-    full-attention 70B models) it is dominated by the concurrent
+    Upstream of those, ``EnginePool`` reserves a fraction of each model's
+    weight size as KV headroom when deciding whether to evict other models
+    before loading. MRU partials are one tenant of that headroom alongside
+    in-flight prompt caches; they are not separately reserved because at
+    one ``block_size``-worth of KV per entry (~17 MiB for Kimi K2.5 /
+    DeepSeek MLA, ~41 MiB for full-attention 70B models) and the default
+    cap of 4 entries, the worst case (~68-165 MiB) is well below the
     in-flight caches the headroom was sized for.
 
-    There is no separate up-front KV memory budget that the slot could
-    escape (``_calculate_max_blocks`` is paged-SSD-only and returns a
-    fixed block-metadata count, not a memory budget).
+    Under ``hot_cache_only=True`` (settings or ``OMLX_HOT_CACHE_ONLY``
+    env), the hot cache and the MRU dict both live in the same KV headroom
+    envelope. Both are bounded — the operator should be aware they share
+    a budget and tune ``--mru-partial-max-entries`` and
+    ``--hot-cache-max-size`` together rather than treating them as
+    independent dials.
 
     Future maintainers: do **not** add a separate accounting hook for
-    this slot.  The invariant that ``kv_data`` holds ``mx.array``
-    instances (not numpy/CPU copies) is what makes the implicit
-    accounting work; the test
-    ``test_kv_data_holds_mlx_arrays_for_active_memory_accounting``
-    pins it.
+    these entries. The invariant that ``kv_data`` holds ``mx.array``
+    instances (not numpy/CPU copies) is what makes the implicit accounting
+    work; the test
+    ``test_kv_data_holds_mlx_arrays_for_active_memory_accounting`` pins it.
     """
 
     parent_hash: bytes | None
@@ -138,6 +143,7 @@ class BlockAwarePrefixCache(CacheManager):
         model: Any,
         paged_cache_manager: PagedCacheManager,
         paged_ssd_cache_manager: PagedSSDCacheManager | None = None,
+        mru_partial_max_entries: int = 4,
     ):
         """
         Initialize block-aware prefix cache.
@@ -146,6 +152,12 @@ class BlockAwarePrefixCache(CacheManager):
             model: The MLX model (used for identification)
             paged_cache_manager: The PagedCacheManager instance for block management
             paged_ssd_cache_manager: The PagedSSDCacheManager for SSD storage (required for paged SSD-only mode)
+            mru_partial_max_entries: Maximum simultaneous MRU partial-block
+                stashes.  Each entry is bounded at one ``block_size`` of KV
+                memory.  ``0`` disables the MRU feature entirely (silent
+                fallback to "no MRU" behavior, mirroring
+                ``hot_cache_max_size="0"`` convention).  Default of 4 matches
+                the dflash ``max_entries`` precedent (PR #1120).
         """
         self.model = model
         self.model_key = id(model)
@@ -167,10 +179,16 @@ class BlockAwarePrefixCache(CacheManager):
         # Kept for API compatibility
         self._cold_restore_callback: Callable[[int, bytes], bool] | None = None
 
-        # Single-slot stash for the trailing sub-block tail (see
-        # _MRUPartialBlock). Populated by store_cache, consumed by
-        # apply_mru_partial. Always None for hybrid models.
-        self._mru_partial: _MRUPartialBlock | None = None
+        # Bounded LRU map for trailing sub-block tails (see _MRUPartialBlock).
+        # Keyed by parent_hash (block_hash of the last full block in the
+        # prefix, or None for short prompts whose prefix is < block_size).
+        # Populated by store_cache via _update_mru_partial, consumed by
+        # apply_mru_partial.  Mirrors the OrderedDict + LRU pattern from
+        # PagedSSDCacheManager._hot_cache.  Empty dict for hybrid models.
+        self._mru_partials: OrderedDict[
+            bytes | None, _MRUPartialBlock
+        ] = OrderedDict()
+        self._mru_partial_max_entries: int = mru_partial_max_entries
 
         # Statistics
         self._hits = 0
@@ -746,13 +764,15 @@ class BlockAwarePrefixCache(CacheManager):
         return block_table
 
     def has_mru_partial(self) -> bool:
-        """Whether a trailing-tail partial is currently stashed.
+        """Whether any trailing-tail partial is currently stashed.
 
         Used by the scheduler to decide whether to suppress a deferred
         Metal cache clear (a fresh stash is a strong signal that the
-        same prompt may return immediately).
+        same prompt may return immediately).  The "any entry present"
+        semantic is the right predicate regardless of multi-slot count
+        — one warm prompt is enough to merit suppression.
         """
-        return self._mru_partial is not None
+        return bool(self._mru_partials)
 
     def _can_reconstruct(self) -> bool:
         """Whether ``reconstruct_cache`` has a path to return non-``None``.
@@ -817,21 +837,29 @@ class BlockAwarePrefixCache(CacheManager):
         layer_cache_types: list[str] | None,
         model_cache_config: ModelCacheConfig | None,
     ) -> None:
-        """Refresh the MRU partial slot from a just-completed store_cache.
+        """Stash the trailing partial from a just-completed ``store_cache``.
 
-        Clears the slot in every "no eligible tail" branch — no trailing
-        tokens, non-tensor data, no reconstruct path configured (see
-        ``_can_reconstruct``), hybrid model, extraction failure, or
-        ambiguous cache layout — so a stale partial cannot survive into
-        a future ``apply_mru_partial``.
+        On success, writes one entry into the LRU map keyed by
+        ``parent_hash``.  If the map is at capacity, the oldest entry is
+        evicted via ``popitem(last=False)``.
+
+        The "no eligible tail" branches (no trailing tokens, non-tensor
+        data, no reconstruct path configured, hybrid model, extraction
+        failure, ambiguous cache layout) bare-return — they signal a
+        local "nothing to stash this time," NOT a global "wipe the map."
+        That distinction is what lets multiple distinct-prefix entries
+        coexist under interleaving.
         """
+        if self._mru_partial_max_entries <= 0:
+            # Feature disabled.  Match the hot_cache_max_size="0" convention:
+            # silent fallback to "no MRU" behavior.
+            return
         if (
             trailing_partial_tokens == 0
             or not is_tensor_data
             or not self._can_reconstruct()
             or not self._all_layers_sliceable(layer_cache_types)
         ):
-            self._mru_partial = None
             return
 
         partial_start = num_new_blocks * self.block_size
@@ -866,7 +894,6 @@ class BlockAwarePrefixCache(CacheManager):
         else:
             # Ambiguous: cache_seq_len is short of global_end but does
             # not equal local_len either.  Refuse rather than guess.
-            self._mru_partial = None
             return
 
         # is_last_block=False is the correct intent for partial extraction:
@@ -880,7 +907,6 @@ class BlockAwarePrefixCache(CacheManager):
             is_last_block=False,
         )
         if not partial_kv:
-            self._mru_partial = None
             return
 
         parent_hash: bytes | None = None
@@ -890,16 +916,27 @@ class BlockAwarePrefixCache(CacheManager):
             if last_block is not None and last_block.block_hash:
                 parent_hash = last_block.block_hash
 
-        self._mru_partial = _MRUPartialBlock(
+        # LRU put: pop any existing entry first so the re-insert lands at
+        # the tail with fresh order; then evict the oldest entry if over
+        # capacity.  Mirrors PagedSSDCacheManager._hot_cache_put.
+        if parent_hash in self._mru_partials:
+            self._mru_partials.pop(parent_hash)
+        self._mru_partials[parent_hash] = _MRUPartialBlock(
             parent_hash=parent_hash,
             tokens=new_tokens[partial_start:],
             kv_data=partial_kv,
         )
+        while len(self._mru_partials) > self._mru_partial_max_entries:
+            self._mru_partials.popitem(last=False)
+
         logger.debug(
-            "Stashed MRU partial: %d tokens, parent_hash=%s, layers=%d",
-            len(self._mru_partial.tokens),
+            "Stashed MRU partial: %d tokens, parent_hash=%s, layers=%d, "
+            "entries=%d/%d",
+            trailing_partial_tokens,
             parent_hash[:8].hex() + "..." if parent_hash else "None",
             len(partial_kv),
+            len(self._mru_partials),
+            self._mru_partial_max_entries,
         )
 
     def apply_mru_partial(
@@ -908,21 +945,24 @@ class BlockAwarePrefixCache(CacheManager):
         block_table: BlockTable,
         remaining_tokens: list[int],
     ) -> tuple[list[Any], list[int], int]:
-        """Splice the MRU partial into a reconstructed cache, atomically.
+        """Splice an MRU partial entry into a reconstructed cache, atomically.
 
-        On a match (parent-hash chain ok, partial tokens are a prefix of
-        ``remaining_tokens``, layer count matches, every layer is sliceable
-        and accepts the concatenate), every layer's keys/values/offset are
-        advanced by ``len(partial.tokens)`` and the partial tokens are
-        consumed from the front of ``remaining_tokens``.
+        Looks up an entry in the multi-slot LRU map keyed by the block
+        hash of the last full block in ``block_table`` (``None`` for
+        short prompts).  On a match (entry exists, partial tokens are a
+        prefix of ``remaining_tokens``, layer count matches, every layer
+        accepts the concatenate), every layer's keys/values/offset are
+        advanced by ``len(partial.tokens)``, the partial tokens are
+        consumed from the front of ``remaining_tokens``, and the entry
+        is moved to the LRU tail (most-recently-used).
 
-        On any miss or splice failure, the slot is evicted and the cache
-        is returned unchanged.
+        On any miss, only the matching entry is evicted; sibling entries
+        for other prefixes remain.
 
         The splice is **transactional**: replacement keys/values are
-        materialized for every layer before any layer is mutated. A
+        materialized for every layer before any layer is mutated.  A
         failure on layer N rolls everything back; the caller never sees
-        a half-mutated cache. (This is the fix for review B3.)
+        a half-mutated cache.
 
         Args:
             cache: Reconstructed per-layer cache objects from
@@ -935,39 +975,47 @@ class BlockAwarePrefixCache(CacheManager):
             ``(cache, remaining_tokens, tokens_applied)``. On miss,
             ``tokens_applied == 0`` and the inputs are returned unchanged.
         """
-        partial = self._mru_partial
-        if partial is None or not remaining_tokens:
+        if not self._mru_partials or not remaining_tokens:
             return cache, remaining_tokens, 0
 
-        # Parent-hash chain check
+        # Compute the parent_hash key.  Multi-slot freed-block guard:
+        # if block_table is non-empty but the parent paged block has
+        # been freed (allocated_blocks.get returns None), do NOT fall
+        # through to a None-keyed dict lookup — that would falsely match
+        # a short-prompt entry against a request whose parent is just
+        # gone.  Return no-op instead.  This race is new in multi-slot
+        # mode; single-slot tolerated it because there was only ever
+        # one entry to match against.
         last_hash: bytes | None = None
         if block_table and block_table.block_ids:
             last_bid = block_table.block_ids[-1]
             last_block = self.paged_cache.allocated_blocks.get(last_bid)
-            if last_block is not None:
-                last_hash = last_block.block_hash
-        if partial.parent_hash != last_hash:
-            self._mru_partial = None
+            if last_block is None:
+                return cache, remaining_tokens, 0
+            last_hash = last_block.block_hash
+
+        partial = self._mru_partials.get(last_hash)
+        if partial is None:
             return cache, remaining_tokens, 0
 
         n_partial = len(partial.tokens)
         if len(remaining_tokens) < n_partial:
-            self._mru_partial = None
+            self._mru_partials.pop(last_hash, None)
             return cache, remaining_tokens, 0
         if remaining_tokens[:n_partial] != partial.tokens:
-            self._mru_partial = None
+            self._mru_partials.pop(last_hash, None)
             return cache, remaining_tokens, 0
 
         if len(partial.kv_data) != len(cache):
             logger.debug(
-                "MRU partial layer count mismatch: %d vs %d, evicting",
+                "MRU partial layer count mismatch: %d vs %d, evicting entry",
                 len(partial.kv_data), len(cache),
             )
-            self._mru_partial = None
+            self._mru_partials.pop(last_hash, None)
             return cache, remaining_tokens, 0
 
         if not HAS_MLX:
-            self._mru_partial = None
+            self._mru_partials.pop(last_hash, None)
             return cache, remaining_tokens, 0
 
         # Phase 1: build per-layer replacements without touching the cache.
@@ -980,8 +1028,10 @@ class BlockAwarePrefixCache(CacheManager):
                 new_values = mx.concatenate([cache_obj.values, p_values], axis=2)
                 replacements.append((layer_idx, new_keys, new_values))
         except Exception as e:
-            logger.debug("MRU partial splice build failed: %s, evicting", e)
-            self._mru_partial = None
+            logger.debug(
+                "MRU partial splice build failed: %s, evicting entry", e
+            )
+            self._mru_partials.pop(last_hash, None)
             return cache, remaining_tokens, 0
 
         # Phase 2: commit. All concatenates have already succeeded; the
@@ -993,10 +1043,13 @@ class BlockAwarePrefixCache(CacheManager):
             cache_obj.values = new_values
             cache_obj.offset += n_partial
 
+        # Promote this entry to the LRU tail (most-recently-used).
+        self._mru_partials.move_to_end(last_hash)
+
         new_remaining = remaining_tokens[n_partial:]
         logger.debug(
-            "Applied MRU partial: %d tokens, %d remaining",
-            n_partial, len(new_remaining),
+            "Applied MRU partial: %d tokens, %d remaining, entries=%d",
+            n_partial, len(new_remaining), len(self._mru_partials),
         )
         return cache, new_remaining, n_partial
 
@@ -2766,15 +2819,36 @@ class BlockAwarePrefixCache(CacheManager):
         self._request_tables.clear()
         self._prefix_index.clear()
         self.paged_cache.clear()
-        # The MRU partial chains from a paged-block hash; once the paged
-        # cache is wiped, the partial cannot be safely applied even if a
-        # future request happens to reproduce the same parent_hash.
-        # Cache-corruption recovery (Scheduler._recover_from_cache_error)
-        # routes through here, so a stale partial would otherwise survive
-        # exactly the recovery path that exists because something was wrong.
-        self._mru_partial = None
+        # MRU partials chain from paged-block hashes; once the paged
+        # cache is wiped, no entry can be safely applied.  Cache-corruption
+        # recovery (Scheduler._recover_from_cache_error) routes through
+        # here, so stale partials would otherwise survive exactly the
+        # recovery path that exists because something was wrong.
+        self._mru_partials.clear()
         self.reset_stats()
         return cleared_count
+
+    def clear_mru_partials(self) -> int:
+        """Wipe only the MRU partial cache, leaving paged blocks intact.
+
+        Intended consumer: admin-triggered cache-tier clears that drop
+        the backing block storage (``clear_ssd_cache`` admin endpoint,
+        and the future ``clear_hot_cache`` endpoint once PR #1183
+        lands).  Without this hook, a stash whose ``parent_hash`` chains
+        from a paged block whose underlying KV bytes were just flushed
+        from the hot/SSD tier would survive in memory and waste a
+        reconstruct attempt on the next request before being naturally
+        evicted by LRU.
+
+        Distinct from ``clear()``: this method only drops MRU entries
+        and does not touch the paged cache, prefix index, or stats.
+
+        Returns:
+            Number of MRU entries that were wiped.
+        """
+        n = len(self._mru_partials)
+        self._mru_partials.clear()
+        return n
 
     def set_cold_restore_callback(
         self,
