@@ -3364,6 +3364,70 @@ async def get_logs(
     }
 
 
+@router.delete("/api/logs")
+async def delete_logs(
+    file: Optional[str] = None,
+    is_admin: bool = Depends(require_admin),
+):
+    """Delete rotated log files.
+
+    With no `file` query param, deletes every rotated log file in the log
+    directory but keeps the live `server.log` intact. With `file=<name>`,
+    deletes just that single rotated file. Refuses to delete `server.log`
+    itself — the running process holds a file handle on it and clearing
+    it via the admin API would silently truncate the live tail.
+
+    Returns:
+        JSON with `deleted` (list of filenames) and `deleted_count`.
+    """
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    log_dir = global_settings.logging.get_log_dir(global_settings.base_path)
+    if not log_dir.exists():
+        return {"deleted": [], "deleted_count": 0}
+
+    deleted: list[str] = []
+
+    if file is not None:
+        # Single-file delete. Same path-traversal guards as the GET handler.
+        if "/" in file or "\\" in file or ".." in file:
+            raise HTTPException(status_code=400, detail="Invalid file name")
+        if file == "server.log":
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot delete the active log file; clear it via "
+                "log rotation or restart the server.",
+            )
+        target = log_dir / file
+        if not target.exists() or not target.is_file():
+            raise HTTPException(status_code=404, detail=f"Log file not found: {file}")
+        try:
+            target.unlink()
+            deleted.append(file)
+            logger.info(f"Deleted log file: {target}")
+        except OSError as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to delete log file: {e}"
+            ) from e
+    else:
+        # Bulk delete: every rotated file (anything that isn't server.log).
+        for name in _get_available_log_files(log_dir):
+            if name == "server.log":
+                continue
+            target = log_dir / name
+            try:
+                target.unlink()
+                deleted.append(name)
+            except OSError as e:
+                logger.warning(f"Failed to delete log file {target}: {e}")
+        if deleted:
+            logger.info(f"Cleared {len(deleted)} rotated log file(s)")
+
+    return {"deleted": deleted, "deleted_count": len(deleted)}
+
+
 # =============================================================================
 # Stats API Routes
 # =============================================================================
