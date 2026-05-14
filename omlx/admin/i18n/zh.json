@@ -510,6 +510,8 @@
   "logs.showing_lines": "显示 {lines} / {total} 行",
   "logs.placeholder": "暂无日志。启动服务器后将产生日志。",
   "logs.last_updated": "最后更新：{time}",
+  "logs.level_label": "最低显示级别",
+  "logs.level_tooltip": "仅过滤页面显示，不影响日志文件的保存级别",
   "bench.section_label": "基准测试",
   "bench.heading": "性能基准测试",
   "bench.description": "测量单请求和连续批处理的推理速度。基准测试前将卸载所有其他模型。",

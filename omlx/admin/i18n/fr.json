@@ -510,6 +510,8 @@
   "logs.showing_lines": "Affichage de {lines} des {total} lignes",
   "logs.placeholder": "Aucun log disponible. Démarrez le serveur pour générer des logs.",
   "logs.last_updated": "Dernière mise à jour : {time}",
+  "logs.level_label": "Niveau min. affiché",
+  "logs.level_tooltip": "Filtre l'affichage uniquement — n'affecte pas le niveau d'enregistrement du fichier journal",
   "bench.section_label": "Benchmark",
   "bench.heading": "Benchmark de performance",
   "bench.description": "Mesurez la vitesse d'inférence pour les requêtes uniques et le traitement par lot continu. Tous les autres modèles seront déchargés avant le benchmarking.",

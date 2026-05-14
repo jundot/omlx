@@ -204,6 +204,7 @@
             logAvailableFiles: ['server.log'],
             logTotalLines: 0,
             logLastUpdated: '',
+            logMinLevel: 'TRACE',
             _logRefreshTimer: null,
 
             // Models sub-tab state
@@ -2934,6 +2935,28 @@
             },
 
             // Log viewer functions
+            filteredLogContent() {
+                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+                const minIdx = LEVELS.indexOf(this.logMinLevel);
+                if (minIdx <= 0) return this.logContent;
+                const levelRe = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - \S+ - (TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL) - /;
+                let visible = true;
+                return this.logContent.split('\n').filter(line => {
+                    const m = line.match(levelRe);
+                    if (m) visible = LEVELS.indexOf(m[1]) >= minIdx;
+                    return visible;
+                }).join('\n');
+            },
+
+            levelButtonClass(lvl) {
+                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+                const idx = LEVELS.indexOf(lvl);
+                const minIdx = LEVELS.indexOf(this.logMinLevel);
+                if (idx < minIdx) return 'bg-neutral-100 text-neutral-300';
+                if (idx === minIdx) return 'bg-neutral-900 text-white';
+                return 'bg-neutral-200 text-neutral-700';
+            },
+
             async loadLogs() {
                 this.logLoading = true;
                 this.logError = '';

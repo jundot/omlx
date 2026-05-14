@@ -510,6 +510,8 @@
   "logs.showing_lines": "顯示 {lines} / {total} 行",
   "logs.placeholder": "暫無記錄。啟動伺服器後將產生記錄。",
   "logs.last_updated": "最後更新：{time}",
+  "logs.level_label": "最低顯示級別",
+  "logs.level_tooltip": "僅過濾頁面顯示，不影響日誌檔案的儲存級別",
   "bench.section_label": "基準測試",
   "bench.heading": "效能基準測試",
   "bench.description": "測量單一請求和連續批次處理的推論速度。基準測試前將卸載其他模型。",

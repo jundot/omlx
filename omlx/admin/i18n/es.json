@@ -510,6 +510,8 @@
   "logs.showing_lines": "Mostrando {lines} de {total} líneas",
   "logs.placeholder": "No hay registros disponibles. Inicia el servidor para generar registros.",
   "logs.last_updated": "Última actualización: {time}",
+  "logs.level_label": "Nivel mín. de visualización",
+  "logs.level_tooltip": "Filtra solo la visualización — no afecta el nivel de guardado del archivo de registro",
   "bench.section_label": "Benchmark",
   "bench.heading": "Benchmark de Rendimiento",
   "bench.description": "Medir la velocidad de inferencia para solicitudes individuales y batching continuo. Todos los demás modelos se descargarán antes del benchmark.",

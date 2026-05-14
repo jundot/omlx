@@ -510,6 +510,8 @@
   "logs.showing_lines": "{total}行中{lines}行表示",
   "logs.placeholder": "ログがありません。サーバーを起動するとログが生成されます。",
   "logs.last_updated": "最終更新: {time}",
+  "logs.level_label": "最低表示レベル",
+  "logs.level_tooltip": "表示のみフィルタします。ログファイルの保存レベルは変更されません",
   "bench.section_label": "ベンチマーク",
   "bench.heading": "パフォーマンスベンチマーク",
   "bench.description": "単一リクエストと連続バッチングの推論速度を測定します。ベンチマーク前に他のすべてのモデルがアンロードされます。",
