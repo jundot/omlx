@@ -90,6 +90,9 @@ def apply() -> bool:
                 # vs e.g. 6-bit packed weight on disk → shape error.
                 key = "language_model." + key
 
+            if key.startswith("language_model.model.visual."):
+                key = "vision_tower." + key[len("language_model.model.visual."):]
+
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
             if should_shift_norm_weights and any(

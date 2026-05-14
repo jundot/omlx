@@ -423,6 +423,9 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
             elif key.startswith("mtp."):
                 key = "language_model." + key
 
+            if key.startswith("language_model.model.visual."):
+                key = "vision_tower." + key[len("language_model.model.visual."):]
+
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 # Use the module-level mx.moveaxis so it goes through the
                 # streaming-discovery monkey-patch (in ``omlx.oq``) when

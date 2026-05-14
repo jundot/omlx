@@ -35,8 +35,6 @@ logger = logging.getLogger(__name__)
 _NESTED_PREFIX = "language_model.model.visual."
 _TARGET_PREFIX = "vision_tower."
 
-_class_patch_applied = False
-
 
 def _rewrite_key(key: str) -> str:
     if key.startswith(_NESTED_PREFIX):
@@ -64,20 +62,18 @@ def _make_patched_sanitize(original_sanitize):
             )
         return out
 
+    patched_sanitize._omlx_nested_visual_wrapped = True
     return patched_sanitize
 
 
 def apply_qwen3_6_nested_visual_patch() -> bool:
     """Install the sanitize wrapper on mlx-vlm's Qwen3_5MoE VLM Model class.
 
-    Idempotent. Returns True on first successful application, False if the
-    module is unavailable or the patch was already applied.
+    Idempotent: skips if the current ``Model.sanitize`` already carries the
+    ``_omlx_nested_visual_wrapped`` marker. Uses a function-attribute marker
+    instead of a module-level flag so that if another patch replaces
+    ``Model.sanitize`` (e.g. MTP runtime), this wrapper can re-apply.
     """
-    global _class_patch_applied
-
-    if _class_patch_applied:
-        return False
-
     try:
         from mlx_vlm.models.qwen3_5_moe import qwen3_5_moe as qwen3_5_moe_module
     except ImportError:
@@ -94,6 +90,9 @@ def apply_qwen3_6_nested_visual_patch() -> bool:
         logger.debug("qwen3_6_nested_visual: Model has no sanitize attr")
         return False
 
+    if getattr(original_sanitize, "_omlx_nested_visual_wrapped", False):
+        return False
+
     try:
         import inspect
 
@@ -103,12 +102,10 @@ def apply_qwen3_6_nested_visual_patch() -> bool:
                 "qwen3_6_nested_visual: upstream sanitize already handles "
                 "nested visual; skipping"
             )
-            _class_patch_applied = True
             return False
     except (OSError, TypeError):
         pass
 
     model_cls.sanitize = _make_patched_sanitize(original_sanitize)
-    _class_patch_applied = True
     logger.info("qwen3_6_nested_visual: patched mlx_vlm.qwen3_5_moe Model.sanitize")
     return True
