@@ -637,11 +637,12 @@ class ClaudeCodeSettings:
 
 @dataclass
 class IntegrationSettings:
-    """Other integrations settings (Codex, OpenCode, OpenClaw, Pi, Copilot)."""
+    """Other integrations settings (Codex, OpenCode, OpenClaw, Hermes, Pi, Copilot)."""
 
     codex_model: str | None = None
     opencode_model: str | None = None
     openclaw_model: str | None = None
+    hermes_model: str | None = None
     pi_model: str | None = None
     copilot_model: str | None = None
     openclaw_tools_profile: str = "coding"
@@ -652,6 +653,7 @@ class IntegrationSettings:
             "codex_model": self.codex_model,
             "opencode_model": self.opencode_model,
             "openclaw_model": self.openclaw_model,
+            "hermes_model": self.hermes_model,
             "pi_model": self.pi_model,
             "copilot_model": self.copilot_model,
             "openclaw_tools_profile": self.openclaw_tools_profile,
@@ -664,6 +666,7 @@ class IntegrationSettings:
             codex_model=data.get("codex_model", None),
             opencode_model=data.get("opencode_model", None),
             openclaw_model=data.get("openclaw_model", None),
+            hermes_model=data.get("hermes_model", None),
             pi_model=data.get("pi_model", None),
             copilot_model=data.get("copilot_model", None),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),

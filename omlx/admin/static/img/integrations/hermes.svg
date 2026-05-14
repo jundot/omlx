@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Hermes Agent">
+  <rect width="128" height="128" rx="24" fill="#111827"/>
+  <path d="M64 18c-18 0-32 14-32 32 0 11 6 21 15 27v25h34V77c9-6 15-16 15-27 0-18-14-32-32-32Z" fill="#f8fafc"/>
+  <path d="M47 51h34M52 39h24M52 63h24" stroke="#111827" stroke-width="8" stroke-linecap="round"/>
+  <path d="M41 102h46M50 114h28" stroke="#f8fafc" stroke-width="8" stroke-linecap="round"/>
+  <path d="M25 25l13 11M103 25 90 36" stroke="#38bdf8" stroke-width="8" stroke-linecap="round"/>
+</svg>
