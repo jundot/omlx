@@ -87,7 +87,7 @@ Python 3.10+와 Apple Silicon (M1/M2/M3/M4)이 필요합니다.
 
 ### macOS 앱
 
-Applications 폴더에서 oMLX를 실행하세요. 환영 화면에서 세 단계만 따라하면 됩니다 — 모델 디렉토리 설정, 서버 시작, 첫 모델 다운로드. 끝입니다. OpenClaw, OpenCode, Codex, Copilot에 연결하려면 [통합](#통합)을 참조하세요.
+Applications 폴더에서 oMLX를 실행하세요. 환영 화면에서 세 단계만 따라하면 됩니다 — 모델 디렉토리 설정, 서버 시작, 첫 모델 다운로드. 끝입니다. OpenClaw, OpenCode, Codex, Hermes Agent, Copilot에 연결하려면 [통합](#통합)을 참조하세요.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX 환영 화면" width="360">
@@ -194,7 +194,7 @@ Claude Code에서 작은 컨텍스트 모델을 실행하기 위한 컨텍스트
 
 ### 통합
 
-관리자 대시보드에서 OpenClaw, OpenCode, Codex, Copilot, Pi를 원클릭으로 설정합니다. 설정 파일을 수동으로 편집할 필요가 없습니다.
+관리자 대시보드에서 OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi를 원클릭으로 설정합니다. 설정 파일을 수동으로 편집할 필요가 없습니다.
 
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX 통합" width="720">

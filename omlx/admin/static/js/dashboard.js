@@ -41,7 +41,7 @@
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
-                integrations: { copilot_model: null, codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
+                integrations: { copilot_model: null, codex_model: null, opencode_model: null, openclaw_model: null, hermes_model: null, pi_model: null, openclaw_tools_profile: 'full' },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
@@ -204,6 +204,7 @@
             logAvailableFiles: ['server.log'],
             logTotalLines: 0,
             logLastUpdated: '',
+            logMinLevel: 'TRACE',
             _logRefreshTimer: null,
 
             // Models sub-tab state
@@ -2045,6 +2046,10 @@
                 return `${this._launchCmd('openclaw')} --tools-profile ${profile}`;
             },
 
+            get hermesCommand() {
+                return this._launchCmd('hermes');
+            },
+
             get piCommand() {
                 return this._launchCmd('pi');
             },
@@ -2059,6 +2064,7 @@
                             integrations_codex_model: this.globalSettings.integrations.codex_model,
                             integrations_opencode_model: this.globalSettings.integrations.opencode_model,
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
+                            integrations_hermes_model: this.globalSettings.integrations.hermes_model,
                             integrations_pi_model: this.globalSettings.integrations.pi_model,
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
                         }),
@@ -2929,6 +2935,28 @@
             },
 
             // Log viewer functions
+            filteredLogContent() {
+                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+                const minIdx = LEVELS.indexOf(this.logMinLevel);
+                if (minIdx <= 0) return this.logContent;
+                const levelRe = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - \S+ - (TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL) - /;
+                let visible = true;
+                return this.logContent.split('\n').filter(line => {
+                    const m = line.match(levelRe);
+                    if (m) visible = LEVELS.indexOf(m[1]) >= minIdx;
+                    return visible;
+                }).join('\n');
+            },
+
+            levelButtonClass(lvl) {
+                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+                const idx = LEVELS.indexOf(lvl);
+                const minIdx = LEVELS.indexOf(this.logMinLevel);
+                if (idx < minIdx) return 'bg-neutral-100 text-neutral-300';
+                if (idx === minIdx) return 'bg-neutral-900 text-white';
+                return 'bg-neutral-200 text-neutral-700';
+            },
+
             async loadLogs() {
                 this.logLoading = true;
                 this.logError = '';

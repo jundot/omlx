@@ -256,6 +256,7 @@ class GlobalSettingsRequest(BaseModel):
     integrations_codex_model: str | None = None
     integrations_opencode_model: str | None = None
     integrations_openclaw_model: str | None = None
+    integrations_hermes_model: str | None = None
     integrations_pi_model: str | None = None
     integrations_openclaw_tools_profile: Literal["minimal", "coding", "messaging", "full"] | None = None
 
@@ -1631,10 +1632,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
         # Add settings if available
         if settings:
-            model_data["settings"] = {
-                f.name: getattr(settings, f.name)
-                for f in dataclass_fields(settings)
-            }
+            model_data["settings"] = asdict(settings)
 
         models.append(model_data)
 
@@ -2724,6 +2722,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "codex_model": global_settings.integrations.codex_model,
             "opencode_model": global_settings.integrations.opencode_model,
             "openclaw_model": global_settings.integrations.openclaw_model,
+            "hermes_model": global_settings.integrations.hermes_model,
             "pi_model": global_settings.integrations.pi_model,
             "copilot_model": global_settings.integrations.copilot_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
@@ -3126,6 +3125,9 @@ async def update_global_settings(
             request.integrations_openclaw_model
         )
         integrations_changed = True
+    if "integrations_hermes_model" in request.model_fields_set:
+        global_settings.integrations.hermes_model = request.integrations_hermes_model
+        integrations_changed = True
     if "integrations_pi_model" in request.model_fields_set:
         global_settings.integrations.pi_model = request.integrations_pi_model
         integrations_changed = True
@@ -3143,6 +3145,7 @@ async def update_global_settings(
             f"codex={global_settings.integrations.codex_model}, "
             f"opencode={global_settings.integrations.opencode_model}, "
             f"openclaw={global_settings.integrations.openclaw_model}, "
+            f"hermes={global_settings.integrations.hermes_model}, "
             f"pi={global_settings.integrations.pi_model}"
         )
 

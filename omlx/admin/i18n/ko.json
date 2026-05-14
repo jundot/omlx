@@ -510,6 +510,8 @@
   "logs.showing_lines": "{total}줄 중 {lines}줄 표시",
   "logs.placeholder": "로그가 없습니다. 서버를 시작하면 로그가 생성됩니다.",
   "logs.last_updated": "마지막 업데이트: {time}",
+  "logs.level_label": "최소 표시 레벨",
+  "logs.level_tooltip": "화면 표시만 필터링합니다. 로그 파일의 저장 레벨에는 영향을 미치지 않습니다",
   "bench.section_label": "벤치마크",
   "bench.heading": "성능 벤치마크",
   "bench.description": "단일 요청 및 연속 배칭의 추론 속도를 측정합니다. 벤치마크 전에 다른 모든 모델이 언로드됩니다.",

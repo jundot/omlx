@@ -14,8 +14,8 @@ from pathlib import Path
 class Integration:
     """Base integration definition."""
 
-    name: str  # "codex", "opencode", "openclaw", "pi"
-    display_name: str  # "Codex", "OpenCode", "OpenClaw", "Pi"
+    name: str  # "codex", "opencode", "openclaw", "hermes", "pi"
+    display_name: str  # "Codex", "OpenCode", "OpenClaw", "Hermes Agent", "Pi"
     type: str  # "env_var" or "config_file"
     install_check: str  # binary name to check with `which`
     install_hint: str  # installation instructions
