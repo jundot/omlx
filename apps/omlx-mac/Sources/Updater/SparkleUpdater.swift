@@ -35,9 +35,10 @@ final class SparkleUpdater: NSObject, ObservableObject {
 
     private let updaterController: SPUStandardUpdaterController
     private let driver: SparkleDriver
+    private let onResult: @MainActor (CheckResult) -> Void
 
-    /// The most recent feed result; mirrored back into UpdateController's
-    /// `state` by the binding wired from AppServices.
+    /// The most recent feed result, also forwarded synchronously through
+    /// `onResult` so `UpdateController` can update its `state`.
     @Published private(set) var lastResult: CheckResult?
 
     /// Bound at init time. Sparkle reads this on every check so changing
@@ -56,15 +57,25 @@ final class SparkleUpdater: NSObject, ObservableObject {
         set { updaterController.updater.automaticallyDownloadsUpdates = newValue }
     }
 
-    override init() {
+    init(onResult: @escaping @MainActor (CheckResult) -> Void) {
         let driver = SparkleDriver()
         self.driver = driver
+        self.onResult = onResult
         self.updaterController = SPUStandardUpdaterController(
             startingUpdater: true,
             updaterDelegate: driver,
             userDriverDelegate: driver
         )
         super.init()
+        driver.deliver = { [weak self] result in
+            // Sparkle invokes delegate callbacks on the main thread for
+            // SPUStandardUpdaterController, so we're already on MainActor.
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.lastResult = result
+                self.onResult(result)
+            }
+        }
     }
 
     /// User-initiated check. Equivalent to clicking "Check Now" — Sparkle
@@ -78,15 +89,12 @@ final class SparkleUpdater: NSObject, ObservableObject {
         updaterController.updater.checkForUpdatesInBackground()
     }
 
-    /// Triggers Sparkle's install + relaunch flow if an update is
-    /// already staged. No-op otherwise.
+    /// Routes through Sparkle's standard panel. Sparkle 2.x dedupes against
+    /// any in-flight or staged download, so the user lands on the install
+    /// confirmation without re-fetching the feed. Bypassing that one
+    /// confirmation requires implementing a custom `SPUUserDriver`; that's
+    /// a feature, not a wiring fix.
     func installAndRestart() {
-        // Sparkle handles staging internally; if the user hit "Install &
-        // Restart" while a download was in flight, Sparkle's UI would
-        // prompt and we'd have nothing to do. From the AppView's button,
-        // the user only sees the action when an update is actually
-        // available, so kicking off `checkForUpdates` is the right call —
-        // Sparkle re-uses its cached data and shows the install pane.
         updaterController.checkForUpdates(nil)
     }
 }
@@ -96,6 +104,10 @@ final class SparkleUpdater: NSObject, ObservableObject {
 private final class SparkleDriver: NSObject, SPUUpdaterDelegate, SPUStandardUserDriverDelegate {
     var channel: UpdateChannel = .stable
 
+    /// Set by SparkleUpdater right after construction. We forward feed
+    /// results through this so UpdateController.state can react.
+    var deliver: ((SparkleUpdater.CheckResult) -> Void)?
+
     func allowedChannels(for updater: SPUUpdater) -> Set<String> {
         switch channel {
         case .stable:  return ["stable"]
@@ -104,11 +116,29 @@ private final class SparkleDriver: NSObject, SPUUpdaterDelegate, SPUStandardUser
         }
     }
 
-    /// Skip the version check on dev builds — without an EdDSA pub key,
-    /// Sparkle would otherwise refuse to install. Real release builds ship
-    /// `SUPublicEDKey` populated by `build.py`.
     func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
-        // No-op; Sparkle's UI takes over from here.
+        let size: String? = item.contentLength > 0
+            ? ByteCountFormatter.string(fromByteCount: Int64(item.contentLength), countStyle: .file)
+            : nil
+        deliver?(.available(version: item.displayVersionString, sizeText: size))
+    }
+
+    func updaterDidNotFindUpdate(_ updater: SPUUpdater) {
+        deliver?(.upToDate)
+    }
+
+    func updater(_ updater: SPUUpdater, didAbortWithError error: any Error) {
+        let nsError = error as NSError
+        // Sparkle reports the user cancelling a check, or the feed
+        // returning "no update", as SUError.noUpdateError (1001) inside
+        // its own error domain. Treat both as "up to date" — they aren't
+        // failures.
+        if nsError.domain == SUSparkleErrorDomain,
+           nsError.code == SUError.noUpdateError.rawValue {
+            deliver?(.upToDate)
+        } else {
+            deliver?(.error(error.localizedDescription))
+        }
     }
 }
 
@@ -119,9 +149,19 @@ private final class SparkleDriver: NSObject, SPUUpdaterDelegate, SPUStandardUser
 // stay on its built-in 1.4 s simulator from PR 7.
 @MainActor
 final class SparkleUpdater: NSObject, ObservableObject {
+    enum CheckResult: Sendable {
+        case upToDate
+        case available(version: String, sizeText: String?)
+        case error(String)
+    }
+
     var channel: UpdateChannel = .stable
     var automaticallyChecksForUpdates: Bool = true
     var automaticallyDownloadsUpdates: Bool = false
+
+    init(onResult: @escaping @MainActor (CheckResult) -> Void) {
+        _ = onResult
+    }
 
     func checkForUpdates() {}
     func backgroundCheckForUpdates() {}

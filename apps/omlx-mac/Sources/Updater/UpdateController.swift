@@ -60,7 +60,9 @@ final class UpdateController: ObservableObject {
     /// actually drives an update check. The shim variant of `SparkleUpdater`
     /// is also lazy — same hook, no behavior.
     private lazy var sparkle: SparkleUpdater = {
-        let s = SparkleUpdater()
+        let s = SparkleUpdater { [weak self] result in
+            self?.handleSparkleResult(result)
+        }
         s.channel = channel
         s.automaticallyChecksForUpdates = autoCheck
         s.automaticallyDownloadsUpdates = autoDownload
@@ -90,15 +92,15 @@ final class UpdateController: ObservableObject {
     func checkForUpdates() {
         #if canImport(Sparkle)
         sparkle.checkForUpdates()
-        // The Sparkle UI takes over from here. We still flip our local
-        // state to `checking` so the AppView's button shows the spinner
-        // while Sparkle's panel is fetching the appcast.
+        // Flip to `checking` immediately so the AppView's button shows
+        // the spinner while Sparkle's panel fetches the appcast.
+        // `handleSparkleResult` will flip us back to `.idle` or
+        // `.available` once Sparkle's delegate fires. The timeout is a
+        // belt-and-suspenders so the spinner doesn't hang forever if
+        // Sparkle silently aborts (rare, but seen in dev when the feed
+        // host is unreachable).
         state = .checking
-        // Sparkle's `userDriverDelegate` callbacks will eventually flip
-        // us back to idle/available, but we don't bind those yet — the
-        // feed is a TODO endpoint. Provide a 5 s safety so the spinner
-        // doesn't hang forever in dev.
-        scheduleCheckTimeout(seconds: 5)
+        scheduleCheckTimeout(seconds: 30)
         #else
         runSimulator()
         #endif
@@ -113,6 +115,23 @@ final class UpdateController: ObservableObject {
     }
 
     // MARK: - Internals
+
+    /// Bridges Sparkle's delegate callbacks back into the AppView's
+    /// observable state. Errors are logged but not surfaced in the pill —
+    /// `CheckState` has no `.error` case yet, and the user already sees
+    /// Sparkle's own error panel for user-initiated checks.
+    private func handleSparkleResult(_ result: SparkleUpdater.CheckResult) {
+        simulationTask?.cancel()
+        switch result {
+        case .upToDate:
+            state = .idle(lastChecked: Date())
+        case .available(let version, let sizeText):
+            state = .available(AvailableUpdate(version: version, sizeText: sizeText))
+        case .error(let message):
+            NSLog("oMLX-next: update check failed — %@", message)
+            state = .idle(lastChecked: Date())
+        }
+    }
 
     private func onPrefsChanged() {
         persist()
