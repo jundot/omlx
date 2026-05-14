@@ -512,6 +512,8 @@
   "logs.showing_lines": "Showing {lines} of {total} lines",
   "logs.placeholder": "No logs available. Start the server to generate logs.",
   "logs.last_updated": "Last updated: {time}",
+  "logs.level_label": "Min display level",
+  "logs.level_tooltip": "Filters what is shown here only — does not affect the log file's save level",
   "bench.section_label": "Benchmark",
   "bench.heading": "Performance Benchmark",
   "bench.description": "Measure inference speed for single requests and continuous batching. All other models will be unloaded before benchmarking.",

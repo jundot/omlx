@@ -204,6 +204,7 @@
             logAvailableFiles: ['server.log'],
             logTotalLines: 0,
             logLastUpdated: '',
+            logMinLevel: 'TRACE',
             _logRefreshTimer: null,
 
             // Models sub-tab state
@@ -2929,6 +2930,33 @@
             },
 
             // Log viewer functions
+            filteredLogContent() {
+                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+                const minIdx = LEVELS.indexOf(this.logMinLevel);
+                if (minIdx <= 0) return this.logContent;
+                const levelRe = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - \S+ - (TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL) - /;
+                let visible = true;
+                return this.logContent.split('\n').filter(line => {
+                    const m = line.match(levelRe);
+                    if (m) visible = LEVELS.indexOf(m[1]) >= minIdx;
+                    return visible;
+                }).join('\n');
+            },
+
+            levelButtonClass(lvl) {
+                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+                const active = LEVELS.indexOf(lvl) >= LEVELS.indexOf(this.logMinLevel);
+                if (!active) return 'bg-neutral-100 text-neutral-400';
+                return {
+                    TRACE:    'bg-neutral-500 text-white',
+                    DEBUG:    'bg-neutral-700 text-white',
+                    INFO:     'bg-green-600 text-white',
+                    WARNING:  'bg-yellow-500 text-black',
+                    ERROR:    'bg-red-600 text-white',
+                    CRITICAL: 'bg-purple-600 text-white',
+                }[lvl];
+            },
+
             async loadLogs() {
                 this.logLoading = true;
                 this.logError = '';
