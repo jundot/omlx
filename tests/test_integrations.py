@@ -6,11 +6,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from omlx.integrations import get_integration, list_integrations
 from omlx.integrations.claude import ClaudeCodeIntegration
 from omlx.integrations.codex import CodexIntegration
 from omlx.integrations.copilot import CopilotIntegration
+from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
 from omlx.integrations.pi import PiIntegration
@@ -19,9 +21,17 @@ from omlx.integrations.pi import PiIntegration
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 6
+        assert len(integrations) == 7
         names = {i.name for i in integrations}
-        assert names == {"claude", "copilot", "codex", "opencode", "openclaw", "pi"}
+        assert names == {
+            "claude",
+            "copilot",
+            "codex",
+            "opencode",
+            "openclaw",
+            "hermes",
+            "pi",
+        }
 
     def test_get_integration(self):
         assert get_integration("claude") is not None
@@ -29,6 +39,7 @@ class TestIntegrationRegistry:
         assert get_integration("codex") is not None
         assert get_integration("opencode") is not None
         assert get_integration("openclaw") is not None
+        assert get_integration("hermes") is not None
         assert get_integration("pi") is not None
         assert get_integration("nonexistent") is None
 
@@ -434,6 +445,212 @@ class TestOpenClawIntegration:
         ocl = OpenClawIntegration()
         assert ocl.type == "config_file"
         assert ocl.display_name == "OpenClaw"
+
+
+class TestHermesIntegration:
+    def test_get_command(self):
+        hermes = HermesIntegration()
+        cmd = hermes.get_command(port=8000, api_key="key", model="qwen3.5")
+        assert "omlx launch hermes" in cmd
+        assert "--model qwen3.5" in cmd
+
+    def test_get_command_no_model(self):
+        hermes = HermesIntegration()
+        cmd = hermes.get_command(port=8000, api_key="", model="")
+        assert "select-a-model" in cmd
+
+    def test_configure_new_file(self, tmp_path):
+        config_path = tmp_path / "hermes" / "config.yaml"
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(
+                port=8000,
+                api_key="test-key",
+                model="qwen3.5",
+                context_window=131072,
+                max_tokens=8192,
+            )
+
+        assert config_path.exists()
+        config = yaml.safe_load(config_path.read_text())
+        provider = config["providers"]["omlx"]
+        assert provider["name"] == "oMLX"
+        assert provider["base_url"] == "http://127.0.0.1:8000/v1"
+        assert provider["api_key"] == "test-key"
+        assert provider["api_mode"] == "chat_completions"
+        assert provider["default_model"] == "qwen3.5"
+        assert config["model"]["provider"] == "omlx"
+        assert config["model"]["default"] == "qwen3.5"
+        assert config["model"]["context_length"] == 131072
+        assert config["model"]["max_tokens"] == 8192
+
+    def test_configure_custom_host(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(port=9000, api_key="", model="llama", host="10.0.0.5")
+
+        provider = yaml.safe_load(config_path.read_text())["providers"]["omlx"]
+        assert provider["base_url"] == "http://10.0.0.5:9000/v1"
+        assert provider["api_key"] == "omlx"
+
+    def test_configure_preserves_existing(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "theme": "dark",
+                    "providers": {
+                        "anthropic": {"base_url": "https://api.anthropic.com"},
+                        "omlx": {"timeout": 120},
+                    },
+                    "model": {
+                        "temperature": 0.2,
+                        "base_url": "https://inference-api.nousresearch.com/v1",
+                        "api_key": "old-key",
+                    },
+                },
+                sort_keys=False,
+            )
+        )
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(port=8000, api_key="key", model="qwen3.5")
+
+        config = yaml.safe_load(config_path.read_text())
+        assert config["theme"] == "dark"
+        assert config["providers"]["anthropic"]["base_url"] == "https://api.anthropic.com"
+        assert config["providers"]["omlx"]["timeout"] == 120
+        assert config["providers"]["omlx"]["base_url"] == "http://127.0.0.1:8000/v1"
+        assert config["model"]["temperature"] == 0.2
+        assert config["model"]["provider"] == "omlx"
+        assert config["model"]["default"] == "qwen3.5"
+        assert "base_url" not in config["model"]
+        assert "api_key" not in config["model"]
+
+    def test_configure_creates_backup(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("existing: true\n")
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(port=8000, api_key="", model="test")
+
+        backups = list(tmp_path.glob("config.*.bak"))
+        assert len(backups) == 1
+        assert backups[0].read_text() == "existing: true\n"
+
+    def test_configure_clears_stale_limits_when_unknown(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "model": {
+                        "provider": "omlx",
+                        "default": "old",
+                        "context_length": 32768,
+                        "max_tokens": 8192,
+                    }
+                }
+            )
+        )
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(port=8000, api_key="key", model="new")
+
+        model_config = yaml.safe_load(config_path.read_text())["model"]
+        assert model_config["default"] == "new"
+        assert "context_length" not in model_config
+        assert "max_tokens" not in model_config
+
+    def test_configure_uses_hermes_min_context_length(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(
+                port=8000,
+                api_key="key",
+                model="qwen3.5",
+                context_window=32768,
+            )
+
+        model_config = yaml.safe_load(config_path.read_text())["model"]
+        assert model_config["context_length"] == 64000
+
+    def test_launch_sets_config_and_execs(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        hermes = HermesIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["binary"] = binary
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch.object(HermesIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.hermes.os.environ", base_env),
+            patch("omlx.integrations.hermes.os.execvpe", side_effect=fake_execvpe),
+        ):
+            hermes.launch(
+                port=8000,
+                api_key="secret",
+                model="qwen3.5",
+                context_window=131072,
+                max_tokens=8192,
+            )
+
+        assert captured["binary"] == "hermes"
+        assert captured["argv"] == [
+            "hermes",
+            "--provider",
+            "omlx",
+            "--tui",
+            "--model",
+            "qwen3.5",
+        ]
+        assert "PYTHONHOME" not in captured["env"]
+        assert "PYTHONPATH" not in captured["env"]
+        assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+
+        config = yaml.safe_load(config_path.read_text())
+        assert config["providers"]["omlx"]["api_key"] == "secret"
+        assert config["model"]["context_length"] == 131072
+        assert config["model"]["max_tokens"] == 8192
+
+    def test_launch_without_model(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        hermes = HermesIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch.object(HermesIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.hermes.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.hermes.os.execvpe", side_effect=fake_execvpe),
+        ):
+            hermes.launch(port=8000, api_key="", model="")
+
+        assert captured["argv"] == ["hermes", "--provider", "omlx", "--tui"]
+
+    def test_type(self):
+        hermes = HermesIntegration()
+        assert hermes.type == "config_file"
+        assert hermes.display_name == "Hermes Agent"
+        assert hermes.install_check == "hermes"
 
 
 class TestPiIntegration:
@@ -846,6 +1063,7 @@ class TestIntegrationSettings:
         assert settings.codex_model is None
         assert settings.opencode_model is None
         assert settings.openclaw_model is None
+        assert settings.hermes_model is None
         assert settings.pi_model is None
         assert settings.openclaw_tools_profile == "coding"
 
@@ -857,6 +1075,7 @@ class TestIntegrationSettings:
         assert d["copilot_model"] is None
         assert d["codex_model"] == "qwen3.5"
         assert d["opencode_model"] is None
+        assert d["hermes_model"] is None
         assert d["pi_model"] is None
         assert d["openclaw_tools_profile"] == "coding"
 
@@ -864,12 +1083,18 @@ class TestIntegrationSettings:
         from omlx.settings import IntegrationSettings
 
         settings = IntegrationSettings.from_dict(
-            {"copilot_model": "gpt-oss", "codex_model": "llama", "opencode_model": "qwen"}
+            {
+                "copilot_model": "gpt-oss",
+                "codex_model": "llama",
+                "opencode_model": "qwen",
+                "hermes_model": "hermes-qwen",
+            }
         )
         assert settings.copilot_model == "gpt-oss"
         assert settings.codex_model == "llama"
         assert settings.opencode_model == "qwen"
         assert settings.openclaw_model is None
+        assert settings.hermes_model == "hermes-qwen"
         assert settings.pi_model is None
 
     def test_from_dict_empty(self):

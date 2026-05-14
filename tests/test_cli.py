@@ -229,6 +229,18 @@ class TestLaunchCommandOptions:
         )
         assert "--model" in result.stdout
 
+    def test_launch_lists_hermes(self):
+        """Test that launch help lists Hermes as an available integration."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "launch", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0
+        assert "hermes" in result.stdout
+        assert "Hermes Agent" in result.stdout
+
 
 class TestLaunchCommandFunction:
     """Tests for launch command runtime behavior."""

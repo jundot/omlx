@@ -676,13 +676,13 @@ Example directory structure:
     launch_parser = subparsers.add_parser(
         "launch",
         help="Launch an external tool with oMLX integration",
-        description="Configure and launch external coding tools (Claude Code, Copilot, Codex, OpenCode, OpenClaw, Pi) "
+        description="Configure and launch external coding tools (Claude Code, Copilot, Codex, OpenCode, OpenClaw, Hermes Agent, Pi) "
         "to use the running oMLX server.",
     )
     launch_parser.add_argument(
         "tool",
         type=str,
-        help="Tool to launch: claude, copilot, codex, opencode, openclaw, pi, or 'list' to show available",
+        help="Tool to launch: claude, copilot, codex, opencode, openclaw, hermes, pi, or 'list' to show available",
     )
     launch_parser.add_argument(
         "--model",
