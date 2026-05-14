@@ -2945,16 +2945,11 @@
 
             levelButtonClass(lvl) {
                 const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
-                const active = LEVELS.indexOf(lvl) >= LEVELS.indexOf(this.logMinLevel);
-                if (!active) return 'bg-neutral-100 text-neutral-400';
-                return {
-                    TRACE:    'bg-neutral-500 text-white',
-                    DEBUG:    'bg-neutral-700 text-white',
-                    INFO:     'bg-green-600 text-white',
-                    WARNING:  'bg-yellow-500 text-black',
-                    ERROR:    'bg-red-600 text-white',
-                    CRITICAL: 'bg-purple-600 text-white',
-                }[lvl];
+                const idx = LEVELS.indexOf(lvl);
+                const minIdx = LEVELS.indexOf(this.logMinLevel);
+                if (idx < minIdx) return 'bg-neutral-100 text-neutral-300';
+                if (idx === minIdx) return 'bg-neutral-900 text-white';
+                return 'bg-neutral-200 text-neutral-700';
             },
 
             async loadLogs() {

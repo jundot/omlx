@@ -83,7 +83,7 @@
                                     <template x-for="lvl in ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']" :key="lvl">
                                         <button type="button"
                                                 @click="logMinLevel = lvl"
-                                                :class="[levelButtonClass(lvl), logMinLevel === lvl ? 'ring-2 ring-offset-1 ring-neutral-900' : '']"
+                                                :class="[levelButtonClass(lvl), logMinLevel === lvl ? 'ring-2 ring-offset-1 ring-neutral-500' : '']"
                                                 class="px-2 py-1 text-xs font-mono font-semibold rounded transition-all"
                                                 x-text="lvl">
                                         </button>
