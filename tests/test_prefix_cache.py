@@ -3578,6 +3578,70 @@ class TestMRUPartialCounters:
         # But the live entry is still there.
         assert stats.mru_partial_entries == 1
 
+    def test_get_stats_dict_mirrors_dataclass_after_round_trip(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """``get_stats_dict`` must surface every MRU field that ``get_stats``
+        (the dataclass) does.  The admin dashboard reads MRU state via the
+        dict path (``Scheduler.get_ssd_cache_stats`` -> ``get_stats_dict``);
+        when the dict drops any of these keys, the admin payload's
+        ``mru_partial_max_entries`` aggregates to 0 and the dashboard's
+        ``mruEnabled`` gate hides every MRU panel even when the feature
+        is enabled.
+
+        Uses the production round-trip (real stashes via ``store_cache``,
+        real apply via ``apply_mru_partial``, real capacity overflow) so
+        the live gauge ``mru_partial_entries`` and every counter reach the
+        dict via the same path the scheduler exercises.
+        """
+        cache = _make_mru_cache(paged_cache, mock_ssd, max_entries=2)
+        # Stash two distinct prefixes (both fit in the cap).  The first
+        # one (``bt_kept``) will be applied below to bump hits; the LRU
+        # touch from a successful apply leaves it at the MRU end, so the
+        # later capacity-overflow stash evicts the *other* survivor and
+        # not the one we just touched.
+        bt_kept, _ = _stash_with_prefix(
+            cache, mx, prefix_marker=2, tail_token=88
+        )
+        _stash_with_prefix(cache, mx, prefix_marker=3, tail_token=77)
+
+        reconstructed = _make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+        _, _, applied = cache.apply_mru_partial(reconstructed, bt_kept, [88])
+        assert applied == 1  # guard: the apply path actually fired
+
+        # Third stash forces capacity-overflow eviction of the un-touched
+        # entry.  After this: 3 stashes, 1 hit, 1 token saved, 1 eviction,
+        # 2 live entries.
+        _stash_with_prefix(cache, mx, prefix_marker=4, tail_token=66)
+
+        stats = cache.get_stats()
+        stats_dict = cache.get_stats_dict()
+
+        # Every MRU field on the dataclass must surface in the dict with
+        # the same value — this is the contract the admin route depends on.
+        for field in (
+            "mru_partial_stashes",
+            "mru_partial_hits",
+            "mru_partial_evictions",
+            "mru_partial_tokens_saved",
+            "mru_partial_entries",
+            "mru_partial_max_entries",
+        ):
+            assert field in stats_dict, f"{field} missing from get_stats_dict()"
+            assert stats_dict[field] == getattr(stats, field), (
+                f"{field}: dict={stats_dict[field]} dataclass={getattr(stats, field)}"
+            )
+
+        # Sanity: the round-trip actually moved every counter off its
+        # initial zero, so a future regression that hardwires zeros into
+        # the dict would still fail this test.
+        assert stats_dict["mru_partial_stashes"] == 3
+        assert stats_dict["mru_partial_hits"] == 1
+        assert stats_dict["mru_partial_evictions"] == 1  # capacity overflow
+        assert stats_dict["mru_partial_tokens_saved"] == 1
+        assert stats_dict["mru_partial_entries"] == 2
+        assert stats_dict["mru_partial_max_entries"] == 2
+
 
 class TestHasMRUPartial:
     """The has_mru_partial() accessor is the public API the scheduler

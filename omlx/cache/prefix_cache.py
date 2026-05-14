@@ -2809,6 +2809,16 @@ class BlockAwarePrefixCache(CacheManager):
             "tokens_matched_total": self._tokens_matched_total,
             "tokens_requested_total": self._tokens_requested_total,
             "active_requests": len(self._request_tables),
+            # MRU partial cache: counters mirror the dataclass surface so the
+            # admin dashboard's `mruEnabled` gate (sourced from this dict
+            # via Scheduler.get_ssd_cache_stats) can see the configured
+            # capacity.  Omitting them silently hides every MRU panel.
+            "mru_partial_stashes": self._mru_partial_stashes,
+            "mru_partial_hits": self._mru_partial_hits,
+            "mru_partial_evictions": self._mru_partial_evictions,
+            "mru_partial_tokens_saved": self._mru_partial_tokens_saved,
+            "mru_partial_entries": len(self._mru_partials),
+            "mru_partial_max_entries": self._mru_partial_max_entries,
             **paged_stats,
         }
 
