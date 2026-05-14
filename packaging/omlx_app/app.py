@@ -1849,6 +1849,9 @@ class OMLXAppDelegate(NSObject):
         # Always refresh icon in case theme changed
         self._update_menubar_icon()
 
+        # Check once per day; self-gates on a 24h timestamp cache.
+        self._check_for_updates()
+
     # --- Menu actions ---
 
     def _handle_port_conflict(self, conflict: PortConflict) -> None:

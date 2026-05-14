@@ -710,15 +710,28 @@ class VLMBatchedEngine(BaseEngine):
                     from ..utils.model_loading import maybe_load_custom_quantization
 
                     def _load_draft():
-                        custom_loaded = maybe_load_custom_quantization(
-                            specprefill_draft,
-                            is_vlm=False,
-                        )
-                        if custom_loaded is not None:
-                            draft_model, _ = custom_loaded
+                        from ..patches.mlx_lm_mtp import set_mtp_active
+
+                        was_mtp = False
+                        try:
+                            from ..patches.mlx_lm_mtp import is_mtp_active
+
+                            was_mtp = is_mtp_active()
+                        except Exception:
+                            pass
+                        set_mtp_active(False)
+                        try:
+                            custom_loaded = maybe_load_custom_quantization(
+                                specprefill_draft,
+                                is_vlm=False,
+                            )
+                            if custom_loaded is not None:
+                                draft_model, _ = custom_loaded
+                                return draft_model
+                            draft_model, _ = mlx_lm_load(specprefill_draft)
                             return draft_model
-                        draft_model, _ = mlx_lm_load(specprefill_draft)
-                        return draft_model
+                        finally:
+                            set_mtp_active(was_mtp)
                     draft_model = await loop.run_in_executor(get_mlx_executor(), _load_draft)
                     self._engine.engine.scheduler.set_specprefill_draft_model(
                         draft_model, draft_model_name=specprefill_draft

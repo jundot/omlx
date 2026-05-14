@@ -176,6 +176,33 @@ class BatchingError(SchedulerError):
     pass
 
 
+class SchedulerQueueFullError(SchedulerError):
+    """
+    Waiting queue depth cap exceeded.
+
+    Raised when admission control rejects a request because the scheduler's
+    waiting queue is already at the configured depth cap. Server layer maps
+    this to HTTP 503 with a short Retry-After.
+
+    Attributes:
+        current_depth: Current number of waiting requests.
+        max_depth: Configured queue depth cap.
+    """
+
+    def __init__(
+        self,
+        current_depth: int,
+        max_depth: int,
+        details: Optional[dict] = None,
+    ):
+        super().__init__(
+            f"Scheduler waiting queue full: {current_depth} >= {max_depth}",
+            details,
+        )
+        self.current_depth = current_depth
+        self.max_depth = max_depth
+
+
 # =============================================================================
 # Model-related Exceptions
 # =============================================================================

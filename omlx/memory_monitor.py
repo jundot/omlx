@@ -367,7 +367,13 @@ class MemoryMonitor:
         self, total_prompt_tokens: int, chunk_size: int
     ) -> int:
         """
-        Estimate worst-case peak memory during prefill (last chunk).
+        Estimate per-request prefill peak memory contribution (KV + SDPA).
+
+        Returns only the part directly attributable to this request's prefill:
+        KV cache for the prompt + SDPA attention activation peak for the last
+        chunk. Does NOT include model weights (already in active baseline) or
+        MLX cache pool / python heap overhead (absorbed by enforcer's hard
+        threshold margin — see MemorySettings.hard_threshold).
 
         MLX SDPA internals (C++ fallback path, head_dim > 128):
           1. scores = scale*Q @ K^T → [B, n_q, chunk, kv_len] float32
@@ -383,8 +389,10 @@ class MemoryMonitor:
             chunk_size: Prefill step size (default 2048).
 
         Returns:
-            Estimated peak memory in bytes (KV cache + SDPA activation).
-            Returns 0 if model info is not available.
+            Per-request peak contribution in bytes (KV + SDPA). Returns 0 if
+            model info is not available. Caller compares this against
+            `(hard_threshold * max_bytes) - max(active, phys_footprint())` —
+            the margin handles cache pool / python heap / compressed memory.
         """
         hd = self._head_dim or 0
         n_q = self._num_attention_heads or 0

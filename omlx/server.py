@@ -164,6 +164,7 @@ from .exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    SchedulerQueueFullError,
 )
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
@@ -341,6 +342,8 @@ async def lifespan(app: FastAPI):
                 settings_manager=_server_state.settings_manager,
                 prefill_memory_guard=_server_state.global_settings.memory.prefill_memory_guard,
                 global_settings=_server_state.global_settings,
+                soft_threshold=_server_state.global_settings.memory.soft_threshold,
+                hard_threshold=_server_state.global_settings.memory.hard_threshold,
             )
             _server_state.process_memory_enforcer = enforcer
             _server_state.engine_pool._process_memory_enforcer = enforcer
@@ -524,6 +527,32 @@ async def validation_exception_handler(
     else:
         content = {"detail": exc.errors()}
     return JSONResponse(status_code=422, content=content)
+
+
+@app.exception_handler(SchedulerQueueFullError)
+async def scheduler_queue_full_handler(
+    request: FastAPIRequest, exc: SchedulerQueueFullError
+):
+    """Map scheduler queue cap exhaustion to HTTP 503 + Retry-After."""
+    logger.warning(
+        "%s %s → 503: %s",
+        request.method,
+        request.url.path,
+        exc,
+    )
+    detail = (
+        f"Scheduler waiting queue full ({exc.current_depth}/{exc.max_depth}). "
+        f"Try again shortly."
+    )
+    if _is_api_route(request):
+        content = _openai_error_body(detail, 503)
+    else:
+        content = {"detail": detail}
+    return JSONResponse(
+        status_code=503,
+        content=content,
+        headers={"Retry-After": "1"},
+    )
 
 
 @app.exception_handler(Exception)

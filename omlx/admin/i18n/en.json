@@ -322,6 +322,8 @@
   "settings.resource.prefill_memory_guard_description": "Estimate memory before prefill and defer scheduling under memory pressure to prevent Metal allocation failures.",
   "settings.resource.max_concurrent_requests": "Max Concurrent Requests",
   "settings.resource.max_concurrent_requests_hint": "Maximum number of requests processed simultaneously. Higher values increase throughput but use more memory.",
+  "settings.resource.chunked_prefill": "Chunked Prefill",
+  "settings.resource.chunked_prefill_description": "Interleave prefill chunks with decode steps. Reduces time-to-first-token for concurrent requests by processing one prefill chunk per step instead of blocking decode.",
   "settings.resource.restart_badge": "Restart needed",
   "settings.cache.section_label": "Cache",
   "settings.cache.enabled": "Cache Enabled",

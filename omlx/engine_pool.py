@@ -42,6 +42,7 @@ from .exceptions import (
 from .model_discovery import DiscoveredModel, discover_models, format_size
 from .engine_core import get_mlx_executor
 from .scheduler import SchedulerConfig
+from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
@@ -378,12 +379,14 @@ class EnginePool:
             # Check process memory limit before loading.
             # Try evicting LRU models first to free actual Metal memory.
             # max_bytes <= 0 means enforcement is disabled (no limit).
+            # max(active, phys_footprint) matches what jetsam sees and what
+            # ProcessMemoryEnforcer uses, so load decisions are consistent.
             if self._process_memory_enforcer is not None:
                 enforcer = self._process_memory_enforcer
                 if enforcer.max_bytes > 0:
                     while True:
-                        current_active = mx.get_active_memory()
-                        projected = current_active + entry.estimated_size
+                        current = max(mx.get_active_memory(), get_phys_footprint())
+                        projected = current + entry.estimated_size
                         if projected <= enforcer.max_bytes:
                             break
                         # Try to evict an LRU model to free memory
@@ -400,12 +403,12 @@ class EnginePool:
                         # No more victims — cannot fit
                         raise InsufficientMemoryError(
                             required=entry.estimated_size,
-                            current=current_active,
+                            current=current,
                             message=(
                                 f"Cannot load {model_id}: projected memory "
                                 f"{format_size(projected)} would exceed process "
                                 f"limit {format_size(enforcer.max_bytes)} "
-                                f"(current: {format_size(current_active)}, "
+                                f"(current: {format_size(current)}, "
                                 f"model: {format_size(entry.estimated_size)})"
                             ),
                         )
