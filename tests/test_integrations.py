@@ -148,6 +148,28 @@ name = "old-omlx"
         assert 'model = "llama-3.1-8b"' in content
         assert "model_reasoning_effort" not in content
 
+    def test_launch_forwards_extra_args(self, tmp_path):
+        codex = CodexIntegration()
+        config_path = tmp_path / "codex" / "config.toml"
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch.object(CodexIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.codex.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.codex.os.execvpe", side_effect=fake_execvpe),
+        ):
+            codex.launch(
+                port=8000,
+                api_key="key",
+                model="qwen3.5",
+                extra_args=["--yolo"],
+            )
+
+        assert captured["argv"] == ["codex", "-m", "qwen3.5", "--yolo"]
+
 
 class TestOpenCodeIntegration:
     def test_get_command(self):

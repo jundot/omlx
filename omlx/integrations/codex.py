@@ -108,7 +108,15 @@ class CodexIntegration(Integration):
         config_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
         print(f"Config updated: {config_path}")
 
-    def launch(self, port: int, api_key: str, model: str, host: str = "127.0.0.1", **kwargs) -> None:
+    def launch(
+        self,
+        port: int,
+        api_key: str,
+        model: str,
+        host: str = "127.0.0.1",
+        extra_args: list[str] | None = None,
+        **kwargs,
+    ) -> None:
         self.configure(port, api_key, model, host=host)
 
         env = os.environ.copy()
@@ -117,5 +125,6 @@ class CodexIntegration(Integration):
         args = ["codex"]
         if model:
             args.extend(["-m", model])
+        args.extend(extra_args or [])
 
         os.execvpe("codex", args, env)
