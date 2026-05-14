@@ -4110,8 +4110,15 @@ async def create_response(
                     )
                 )
 
+        reasoning_token_count = (
+            len(engine.tokenizer.encode(reasoning_text))
+            if reasoning_text else 0
+        )
         usage = build_response_usage(
-            output.prompt_tokens, output.completion_tokens, output.cached_tokens
+            input_tokens=output.prompt_tokens,
+            output_tokens=output.completion_tokens,
+            reasoning_tokens=reasoning_token_count,
+            cached_tokens=output.cached_tokens,
         )
 
         response_obj = ResponseObject(
@@ -4624,12 +4631,16 @@ async def stream_responses_api(
             generation_duration=gen_duration,
             model_id=resolved_model or request.model,
         )
+        reasoning_token_count = (
+            len(engine.tokenizer.encode(accumulated_reasoning))
+            if accumulated_reasoning else 0
+        )
         usage_data = {
             "input_tokens": last_output.prompt_tokens,
             "output_tokens": last_output.completion_tokens,
             "total_tokens": last_output.prompt_tokens + last_output.completion_tokens,
             "input_tokens_details": {"cached_tokens": last_output.cached_tokens},
-            "output_tokens_details": {"reasoning_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": reasoning_token_count},
         }
 
     # 13. response.completed — MUST always be sent
