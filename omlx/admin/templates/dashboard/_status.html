@@ -725,17 +725,25 @@
                         </div>
                         <div class="divide-y divide-neutral-100">
                             <template x-for="[key, engine] in Object.entries(stats.engines || {})" :key="key">
-                                <div class="flex items-center justify-between px-6 py-4">
+                                <div class="flex items-center justify-between px-6 py-4 hover:bg-neutral-50 transition-colors cursor-pointer group"
+                                     @click="openEnginePackageModal(engine.name)">
                                     <label class="text-sm text-neutral-700 font-medium" x-text="engine.name"></label>
                                     <div class="flex items-center gap-2">
                                         <template x-if="engine.commit && engine.url">
-                                            <a :href="engine.url" target="_blank" rel="noopener noreferrer"
-                                               class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono text-blue-600 hover:text-blue-800 hover:bg-blue-50 transition-all"
-                                               x-text="engine.commit.substring(0, 7)"></a>
+                                            <div class="flex items-center gap-2">
+                                                <a :href="engine.url" target="_blank" rel="noopener noreferrer"
+                                                   class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono text-blue-600 hover:text-blue-800 hover:bg-blue-50 transition-all"
+                                                   x-text="engine.commit.substring(0, 7)"
+                                                   @click.stop></a>
+                                                <i data-lucide="chevron-right" class="w-4 h-4 text-neutral-300 group-hover:text-neutral-500 transition-colors"></i>
+                                            </div>
                                         </template>
                                         <template x-if="!engine.commit">
-                                            <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
-                                                  x-text="engine.version || 'unknown'"></code>
+                                            <div class="flex items-center gap-2">
+                                                <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
+                                                      x-text="engine.version || 'unknown'"></code>
+                                                <i data-lucide="chevron-right" class="w-4 h-4 text-neutral-300 group-hover:text-neutral-500 transition-colors"></i>
+                                            </div>
                                         </template>
                                     </div>
                                 </div>

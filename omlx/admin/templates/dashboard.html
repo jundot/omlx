@@ -81,6 +81,104 @@
             </div>
         </div>
     </div>
+
+    <!-- Engine Package Management Modal -->
+    <div x-show="showEnginePackageModal" x-cloak
+         class="fixed inset-0 z-50 overflow-y-auto"
+         @keydown.escape.window="closeEnginePackageModal()">
+        <div class="fixed inset-0 bg-black/50" @click="closeEnginePackageModal()"></div>
+        <div class="flex min-h-full items-center justify-center p-4">
+            <div class="relative bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[80vh] overflow-hidden flex flex-col"
+                 @click.stop>
+                <!-- Header -->
+                <div class="flex items-center justify-between px-6 py-4 border-b border-neutral-200 flex-shrink-0">
+                    <div>
+                        <h3 class="text-base font-semibold text-neutral-900" x-text="selectedEnginePackage + ' Package Manager'"></h3>
+                        <p class="text-xs text-neutral-400 mt-0.5">
+                            Current: <span x-text="stats.engines[selectedEnginePackage]?.version || stats.engines[selectedEnginePackage]?.commit?.substring(0, 7) || 'unknown'"></span>
+                        </p>
+                    </div>
+                    <button @click="closeEnginePackageModal()"
+                            class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all">
+                        <i data-lucide="x" class="w-4 h-4"></i>
+                    </button>
+                </div>
+
+                <!-- Content -->
+                <div class="flex-1 overflow-y-auto px-6 py-5">
+                    <!-- Loading State -->
+                    <div x-show="!enginePackageVersions[selectedEnginePackage]" class="flex items-center justify-center py-8">
+                        <svg class="animate-spin h-6 w-6 text-neutral-400" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                        <span class="ml-2 text-sm text-neutral-500">Fetching available versions...</span>
+                    </div>
+
+                    <!-- Error State -->
+                    <div x-show="enginePackageVersions[selectedEnginePackage]?.error" x-cloak
+                         class="p-4 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">
+                        <span x-text="'Error: ' + enginePackageVersions[selectedEnginePackage]?.error"></span>
+                    </div>
+
+                    <!-- Version List -->
+                    <div x-show="enginePackageVersions[selectedEnginePackage] && !enginePackageVersions[selectedEnginePackage]?.error" x-cloak>
+                        <div class="mb-4">
+                            <label class="block text-sm font-medium text-neutral-700 mb-2">Available Versions</label>
+                            <p class="text-xs text-neutral-400 mb-3">Select a version to install. Models will need to be reloaded after update.</p>
+                            <div class="max-h-60 overflow-y-auto border border-neutral-200 rounded-lg">
+                                <template x-for="version in (enginePackageVersions[selectedEnginePackage]?.versions || [])" :key="version">
+                                    <label class="flex items-center px-4 py-2.5 hover:bg-neutral-50 cursor-pointer border-b border-neutral-100 last:border-b-0"
+                                           :class="{ 'bg-blue-50 hover:bg-blue-50': selectedVersion === version }">
+                                        <input type="radio" name="version" :value="version" x-model="selectedVersion"
+                                               class="w-4 h-4 text-blue-600 border-neutral-300 focus:ring-blue-500">
+                                        <div class="ml-3 flex-1">
+                                            <span class="text-sm font-mono" x-text="version"></span>
+                                            <span x-show="version === enginePackageVersions[selectedEnginePackage]?.latest"
+                                                  class="ml-2 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">latest</span>
+                                        </div>
+                                    </label>
+                                </template>
+                            </div>
+                        </div>
+
+                        <!-- Install Button -->
+                        <div class="flex items-center justify-between">
+                            <p class="text-xs text-amber-600">
+                                <i data-lucide="alert-triangle" class="w-3.5 h-3.5 inline mr-1"></i>
+                                Models will need to be reloaded after installation
+                            </p>
+                            <button @click="installEnginePackage(selectedEnginePackage, selectedVersion)"
+                                    :disabled="!selectedVersion || enginePackageLoading[selectedEnginePackage]"
+                                    class="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center gap-2">
+                                <span x-show="!enginePackageLoading[selectedEnginePackage]">Install</span>
+                                <span x-show="enginePackageLoading[selectedEnginePackage]" class="flex items-center gap-2">
+                                    <svg class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                                    Installing...
+                                </span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Install Progress/Terminal Output -->
+                <div x-show="enginePackageTask" x-cloak
+                     class="border-t border-neutral-200 px-6 py-4 bg-neutral-50 flex-shrink-0">
+                    <div class="flex items-center gap-2 mb-2">
+                        <span class="text-xs font-medium text-neutral-700">Installation Output:</span>
+                        <span x-show="enginePackageTask?.status === 'running'"
+                              class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800">
+                            <svg class="animate-spin h-3 w-3 mr-1" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                            Running
+                        </span>
+                        <span x-show="enginePackageTask?.status === 'completed'"
+                              class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">Completed</span>
+                        <span x-show="enginePackageTask?.status === 'failed'"
+                              class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">Failed</span>
+                    </div>
+                    <pre class="text-xs font-mono text-neutral-600 bg-white border border-neutral-200 rounded-lg p-3 max-h-32 overflow-auto whitespace-pre-wrap"
+                         x-text="enginePackageTask?.output || enginePackageTask?.error || ''"></pre>
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
 {% endblock %}
 
