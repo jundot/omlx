@@ -450,7 +450,13 @@
                                                 <td class="px-3 py-2 text-right" x-text="formatSizeBytes(m.total_size_bytes || 0)"></td>
                                                 <td x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right" x-text="m.hot_cache_entries || 0"></td>
                                                 <td x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right" x-text="formatSizeBytes(m.hot_cache_size_bytes || 0)"></td>
-                                                <td x-show="mruEnabled" class="px-3 py-2 text-right" x-text="(m.mru_partial_entries || 0) + ' / ' + (m.mru_partial_max_entries || 0)"></td>
+                                                <td x-show="mruEnabled" class="px-3 py-2 text-right">
+                                                    <span x-show="m.mru_partial_supported === false"
+                                                          class="text-neutral-400"
+                                                          title="Model uses non-sliceable cache layers; MRU tail stash refused at safety gate. See server log for offending types.">N/A (see log)</span>
+                                                    <span x-show="m.mru_partial_supported !== false"
+                                                          x-text="(m.mru_partial_entries || 0) + ' / ' + (m.mru_partial_max_entries || 0)"></span>
+                                                </td>
                                             </tr>
                                         </template>
                                     </tbody>

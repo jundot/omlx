@@ -3670,6 +3670,12 @@ def _build_runtime_cache_observability(
             "mru_partial_max_entries": int(
                 prefix_stats.get("mru_partial_max_entries", 0) or 0
             ),
+            # Tri-state: None (unknown / no inference yet), True (eligible),
+            # False (model uses non-sliceable cache layers — every stash
+            # refused at the safety gate; dashboard renders 'N/A (see log)').
+            "mru_partial_supported": prefix_stats.get(
+                "mru_partial_supported", None
+            ),
         }
 
         cache_rates = runtime_stats.get("cache_rates")

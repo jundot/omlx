@@ -100,6 +100,14 @@ class PrefixCacheStats(BaseCacheStats):
     mru_partial_tokens_saved: int = 0
     mru_partial_entries: int = 0
     mru_partial_max_entries: int = 0
+    # Tri-state eligibility flag for the MRU partial-block feature:
+    #   None  → unknown (default; no detection has fired yet)
+    #   True  → model has only sliceable cache layers
+    #   False → at least one layer type is not in the sliceable whitelist,
+    #           so every stash attempt is refused at the safety gate.
+    # Surfaces to the admin dashboard so per-model rows can show
+    # "N/A (see log)" instead of a misleading "0/N entries" gauge.
+    mru_partial_supported: bool | None = None
     _total_queries: int = field(default=0, repr=False)
 
     @property

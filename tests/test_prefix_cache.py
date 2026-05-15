@@ -6,6 +6,7 @@ This module tests the block-aware prefix caching system that uses
 PagedCacheManager for block-based storage with SSD persistence.
 """
 
+import logging
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -3641,6 +3642,214 @@ class TestMRUPartialCounters:
         assert stats_dict["mru_partial_tokens_saved"] == 1
         assert stats_dict["mru_partial_entries"] == 2
         assert stats_dict["mru_partial_max_entries"] == 2
+
+
+def _model_with_make_cache(num_layers: int, layer_class_names: list[str]):
+    """Build a MockModel whose ``make_cache()`` returns objects whose
+    ``type(obj).__name__`` matches the requested cache class names.
+
+    ``ModelCacheConfig.from_cache_list`` identifies cache types by class
+    name (with isinstance fallback for SizedArraysCache only), so dynamic
+    classes are enough to exercise the eager init-time eligibility check
+    without pulling in real mlx-lm cache implementations.
+    """
+    cache_objs = [
+        type(name, (object,), {"max_size": 64})()
+        for name in layer_class_names
+    ]
+    model = MockModel(num_layers=num_layers)
+    model.make_cache = lambda: cache_objs  # type: ignore[attr-defined]
+    return model
+
+
+class TestMRUPartialEligibility:
+    """The ``mru_partial_supported`` tri-state flag and its one-shot
+    warning.  Surfaces structurally-incompatible models on the admin
+    dashboard so operators see ``N/A (see log)`` instead of a misleading
+    ``0/N entries`` gauge.  Mirrors the prior-art Pattern B (real
+    ``store_cache`` round-trip) for the lazy fallback path, and exercises
+    the eager init-time path through a model with ``make_cache()``.
+    """
+
+    @pytest.fixture
+    def mx(self):
+        try:
+            import mlx.core as mx
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    @pytest.fixture
+    def paged_cache(self):
+        return PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+
+    @pytest.fixture
+    def mock_ssd(self):
+        mock = MagicMock()
+        mock.save_block.return_value = True
+        mock.load_block.return_value = None
+        mock.load_block_with_metadata.return_value = (None, None)
+        mock.has_block.return_value = False
+        return mock
+
+    def test_supported_is_none_without_make_cache_and_no_inference(
+        self, paged_cache, mock_ssd
+    ):
+        """``MockModel`` has no ``make_cache``; eager check bare-returns and
+        lazy fallback hasn't fired yet — flag stays ``None``."""
+        cache = _make_mru_cache(paged_cache, mock_ssd, max_entries=4)
+        stats = cache.get_stats()
+        assert stats.mru_partial_supported is None
+        assert cache.get_stats_dict()["mru_partial_supported"] is None
+
+    def test_supported_latches_true_on_sliceable_observation(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """A successful KVCache stash latches ``supported=True`` via the
+        lazy path (eager skipped because MockModel has no make_cache)."""
+        cache = _make_mru_cache(paged_cache, mock_ssd, max_entries=4)
+        _stash_with_prefix(cache, mx, prefix_marker=1, tail_token=99)
+        assert cache.get_stats().mru_partial_supported is True
+
+    def test_supported_latches_false_lazy_on_non_sliceable(
+        self, paged_cache, mock_ssd, mx, caplog
+    ):
+        """A store_cache with RotatingKVCache layers latches
+        ``supported=False`` and emits exactly one warning."""
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        cache = _make_mru_cache(paged_cache, mock_ssd, max_entries=4)
+        # Eager init skipped (MockModel has no make_cache), so flag is
+        # None at this point — the lazy path is what we're testing.
+        assert cache.get_stats().mru_partial_supported is None
+
+        tokens = [10, 20, 30, 40, 50]
+        cache_data = [_rotating_layer(mx, 5) for _ in range(4)]
+        config = ModelCacheConfig.from_type_list(
+            ["RotatingKVCache"] * 4, model_name="test"
+        )
+        with caplog.at_level(logging.WARNING, logger="omlx.cache.prefix_cache"):
+            cache.store_cache("req-rot", tokens, cache_data, model_cache_config=config)
+
+        stats = cache.get_stats()
+        assert stats.mru_partial_supported is False
+        assert stats.mru_partial_stashes == 0  # gate refused, no stash
+        warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warns) == 1
+        assert "MRU tail cache disabled" in warns[0].getMessage()
+        assert "RotatingKVCache" in warns[0].getMessage()
+
+    def test_warning_does_not_repeat_on_subsequent_non_sliceable(
+        self, paged_cache, mock_ssd, mx, caplog
+    ):
+        """Once the flag is latched False, further non-sliceable store_cache
+        calls must NOT re-emit the warning (operator log spam guard)."""
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        cache = _make_mru_cache(paged_cache, mock_ssd, max_entries=4)
+        config = ModelCacheConfig.from_type_list(
+            ["RotatingKVCache"] * 4, model_name="test"
+        )
+        with caplog.at_level(logging.WARNING, logger="omlx.cache.prefix_cache"):
+            for i in range(3):
+                cache.store_cache(
+                    f"req-rot-{i}",
+                    [10 * i + j for j in range(5)],
+                    [_rotating_layer(mx, 5) for _ in range(4)],
+                    model_cache_config=config,
+                )
+
+        warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warns) == 1
+        assert cache.get_stats().mru_partial_supported is False
+
+    def test_eager_check_latches_false_at_init_with_non_sliceable_make_cache(
+        self, paged_cache, mock_ssd, caplog
+    ):
+        """When ``model.make_cache()`` is available and returns non-sliceable
+        cache instances, the flag latches False at construction and the
+        warning fires BEFORE any inference — true model-load-time signal."""
+        model = _model_with_make_cache(
+            num_layers=4,
+            layer_class_names=["RotatingKVCache"] * 4,
+        )
+        with caplog.at_level(logging.WARNING, logger="omlx.cache.prefix_cache"):
+            cache = BlockAwarePrefixCache(
+                model=model,
+                paged_cache_manager=paged_cache,
+                paged_ssd_cache_manager=mock_ssd,
+                mru_partial_max_entries=4,
+            )
+
+        assert cache.get_stats().mru_partial_supported is False
+        warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warns) == 1
+        assert "RotatingKVCache" in warns[0].getMessage()
+
+    def test_eager_check_latches_true_at_init_with_sliceable_make_cache(
+        self, paged_cache, mock_ssd, caplog
+    ):
+        """When ``model.make_cache()`` returns only sliceable cache
+        instances, the flag latches True at construction and no warning
+        is emitted."""
+        model = _model_with_make_cache(
+            num_layers=4,
+            layer_class_names=["KVCache"] * 4,
+        )
+        with caplog.at_level(logging.WARNING, logger="omlx.cache.prefix_cache"):
+            cache = BlockAwarePrefixCache(
+                model=model,
+                paged_cache_manager=paged_cache,
+                paged_ssd_cache_manager=mock_ssd,
+                mru_partial_max_entries=4,
+            )
+
+        assert cache.get_stats().mru_partial_supported is True
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_eager_check_skipped_when_feature_disabled(
+        self, paged_cache, mock_ssd, caplog
+    ):
+        """``max_entries=0`` disables the feature; no eager check runs even
+        for an obviously incompatible model.  No warning, no flag change —
+        the operator already opted out by setting the capacity to zero."""
+        model = _model_with_make_cache(
+            num_layers=4,
+            layer_class_names=["RotatingKVCache"] * 4,
+        )
+        with caplog.at_level(logging.WARNING, logger="omlx.cache.prefix_cache"):
+            cache = BlockAwarePrefixCache(
+                model=model,
+                paged_cache_manager=paged_cache,
+                paged_ssd_cache_manager=mock_ssd,
+                mru_partial_max_entries=0,
+            )
+
+        assert cache.get_stats().mru_partial_supported is None
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_eager_check_survives_make_cache_failure(
+        self, paged_cache, mock_ssd, caplog
+    ):
+        """If ``model.make_cache()`` raises, the eager check bare-returns
+        and the flag stays ``None``.  Lazy fallback picks up at first
+        inference instead — no startup crash."""
+        model = MockModel(num_layers=4)
+        model.make_cache = lambda: (_ for _ in ()).throw(  # type: ignore[attr-defined]
+            RuntimeError("model not fully initialized")
+        )
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+            mru_partial_max_entries=4,
+        )
+        assert cache.get_stats().mru_partial_supported is None
 
 
 class TestHasMRUPartial:

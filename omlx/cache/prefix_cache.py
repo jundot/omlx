@@ -199,6 +199,97 @@ class BlockAwarePrefixCache(CacheManager):
         self._mru_partial_evictions = 0
         self._mru_partial_tokens_saved = 0
 
+        # Tri-state MRU eligibility flag (see PrefixCacheStats.mru_partial_supported).
+        # Latched True once a sliceable layer set is observed; latched False
+        # the first time a non-sliceable set is observed (eager check below
+        # or lazy fallback inside _update_mru_partial).
+        self._mru_partial_supported: bool | None = None
+        self._mru_partial_warn_emitted: bool = False
+        if self._mru_partial_max_entries > 0:
+            self._check_mru_eligibility_at_init(model)
+
+    def _check_mru_eligibility_at_init(self, model: Any) -> None:
+        """Best-effort load-time check: does this model have sliceable layers?
+
+        The MRU partial-block stash safety gate rejects any layer set that
+        contains a non-sliceable cache type (``RotatingKVCache``,
+        ``PoolingCache``, ``ArraysCache``, ``CacheList``, etc.) — splicing
+        a partial into a sliceable subset only would cause per-layer offset
+        skew at decode (silent generation corruption).  For affected
+        models the entire MRU feature is structurally unavailable, and the
+        dashboard would otherwise show a confusing "0/N entries" gauge
+        forever.  Warn the operator at load time so they can grep this
+        exact line for the offending types.
+
+        Best-effort: if ``model.make_cache()`` is absent or raises, the
+        lazy fallback inside ``_update_mru_partial`` picks the same signal
+        up at first inference instead.
+        """
+        if not hasattr(model, "make_cache"):
+            return
+        try:
+            sample_cache = model.make_cache()
+        except Exception as exc:
+            logger.debug(
+                "MRU eager eligibility check skipped (make_cache failed: %s)",
+                exc,
+            )
+            return
+        try:
+            mcc = ModelCacheConfig.from_cache_list(sample_cache)
+            layer_types = mcc.get_type_names() if mcc is not None else None
+        except Exception as exc:
+            logger.debug(
+                "MRU eager eligibility check skipped (ModelCacheConfig failed: %s)",
+                exc,
+            )
+            return
+        finally:
+            # Drop the sample cache refs ASAP — only used for type-name
+            # introspection.  No tensor buffers were allocated yet (those
+            # arrive on first prefill), but keeping the wrappers around
+            # serves no purpose.
+            del sample_cache
+        if not layer_types:
+            return
+        if self._all_layers_sliceable(layer_types):
+            self._mru_partial_supported = True
+        else:
+            self._record_mru_unsupported(layer_types)
+
+    def _record_mru_unsupported(
+        self, layer_cache_types: list[str] | None
+    ) -> None:
+        """Latch ``mru_partial_supported=False`` and emit a one-shot warning.
+
+        Called from both the eager init-time check and the lazy fallback
+        inside ``_update_mru_partial``.  The warning identifies the
+        offending cache types so an operator can decide whether to disable
+        the feature (``--mru-partial-max-entries=0``) or accept the gauge
+        showing 'N/A (see log)' on this model's dashboard row.
+        """
+        already_recorded = self._mru_partial_supported is False
+        self._mru_partial_supported = False
+        if already_recorded or self._mru_partial_warn_emitted:
+            return
+        self._mru_partial_warn_emitted = True
+        if layer_cache_types:
+            offenders = sorted(
+                set(layer_cache_types) - KNOWN_SLICEABLE_CACHE_TYPES
+            )
+        else:
+            offenders = ["<unknown>"]
+        logger.warning(
+            "MRU tail cache disabled for this model: layer types %s are not in "
+            "the sliceable whitelist %s.  Splicing a partial into a "
+            "non-sliceable subset would cause per-layer offset skew at decode "
+            "(silent generation corruption), so every stash attempt will be "
+            "refused.  The admin dashboard's per-model 'MRU Tails' cell will "
+            "display 'N/A (see log)'.",
+            offenders,
+            sorted(KNOWN_SLICEABLE_CACHE_TYPES),
+        )
+
     def _get_model_num_layers(self, model: Any) -> int:
         """
         Get the expected number of *cache layers* for validation.
@@ -852,11 +943,19 @@ class BlockAwarePrefixCache(CacheManager):
             # Feature disabled.  Match the hot_cache_max_size="0" convention:
             # silent fallback to "no MRU" behavior.
             return
+        # Sliceable-layer guard is checked first and recorded so the
+        # eligibility flag flips at the same instant the warning fires —
+        # later branches in this chain are per-call ("no eligible tail
+        # this time") and must not pollute the structural flag.
+        if not self._all_layers_sliceable(layer_cache_types):
+            self._record_mru_unsupported(layer_cache_types)
+            return
+        if self._mru_partial_supported is None:
+            self._mru_partial_supported = True
         if (
             trailing_partial_tokens == 0
             or not is_tensor_data
             or not self._can_reconstruct()
-            or not self._all_layers_sliceable(layer_cache_types)
         ):
             return
 
@@ -2780,6 +2879,7 @@ class BlockAwarePrefixCache(CacheManager):
             mru_partial_tokens_saved=self._mru_partial_tokens_saved,
             mru_partial_entries=len(self._mru_partials),
             mru_partial_max_entries=self._mru_partial_max_entries,
+            mru_partial_supported=self._mru_partial_supported,
         )
 
     def get_stats_dict(self) -> dict[str, Any]:
@@ -2819,6 +2919,7 @@ class BlockAwarePrefixCache(CacheManager):
             "mru_partial_tokens_saved": self._mru_partial_tokens_saved,
             "mru_partial_entries": len(self._mru_partials),
             "mru_partial_max_entries": self._mru_partial_max_entries,
+            "mru_partial_supported": self._mru_partial_supported,
             **paged_stats,
         }
 

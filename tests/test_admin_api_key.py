@@ -751,6 +751,7 @@ class TestRuntimeCacheObservability:
                 "hot_cache_entries": 0,
                 "mru_partial_entries": 0,
                 "mru_partial_max_entries": 0,
+                "mru_partial_supported": None,
             },
             {
                 "id": "model-b",
@@ -770,6 +771,7 @@ class TestRuntimeCacheObservability:
                 "hot_cache_entries": 0,
                 "mru_partial_entries": 0,
                 "mru_partial_max_entries": 0,
+                "mru_partial_supported": None,
             },
         ]
         manager_a.get_stats_for_model.assert_called_once_with("/models/model-a")
