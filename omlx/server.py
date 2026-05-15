@@ -2042,8 +2042,10 @@ async def create_completion(
                 prompt_tokens_details=PromptTokensDetails(
                     cached_tokens=total_cached_tokens,
                 ),
+                model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
+                total_time=round(elapsed, 2),
             ),
-        ).model_dump_json()
+        ).model_dump_json(exclude_none=True)
 
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_completion()),
@@ -2399,8 +2401,10 @@ async def create_chat_completion(
                 prompt_tokens_details=PromptTokensDetails(
                     cached_tokens=output.cached_tokens,
                 ),
+                model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
+                total_time=round(elapsed, 2),
             ),
-        ).model_dump_json()
+        ).model_dump_json(exclude_none=True)
 
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_chat_completion()),
