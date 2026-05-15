@@ -1043,6 +1043,11 @@ class BlockAwarePrefixCache(CacheManager):
         )
         if not partial_kv:
             return
+        # Materialize now, on this (store-cache worker) thread.  The
+        # tensors are lazy ops bound to this thread's stream; the splice
+        # in apply_mru_partial runs on the separate inference thread and
+        # must not inherit a cross-thread stream dependency.
+        self._materialize_mru_kv(partial_kv)
 
         # Key by the PROMPT's last full block (block index
         # prompt_full_blocks - 1), so a prompt-only repeat — which is what
@@ -1775,6 +1780,39 @@ class BlockAwarePrefixCache(CacheManager):
                 pass
 
         return mx.array(tensor)
+
+    def _materialize_mru_kv(self, partial_kv: list[Any]) -> None:
+        """Force-evaluate a freshly-extracted MRU partial's KV tensors.
+
+        ``_extract_block_tensor_slice`` builds the tensors as lazy
+        ``mx.copy`` ops on whichever thread ``store_cache`` runs on — the
+        ``omlx-store-cache`` worker.  ``apply_mru_partial`` later splices
+        them into a live cache on the separate ``mlx-global`` inference
+        thread; while the tensors are still lazy, that thread's
+        ``mx.async_eval`` would walk the compute graph back to a
+        per-thread stream the inference thread cannot see, and MLX raises
+        ``RuntimeError: There is no Stream(gpu, N) in current thread``.
+        Evaluating here, on the worker, leaves concrete stream-free data
+        safe to splice and evaluate from any thread.
+
+        Walks the nested ``(keys, values)`` / TurboQuant ``(tag, (k, v))``
+        shapes ``_extract_block_tensor_slice`` returns and evaluates every
+        ``mx.array`` leaf in one batched call.
+        """
+        if not HAS_MLX:
+            return
+        leaves: list[Any] = []
+
+        def _collect(obj: Any) -> None:
+            if isinstance(obj, mx.array):
+                leaves.append(obj)
+            elif isinstance(obj, (list, tuple)):
+                for item in obj:
+                    _collect(item)
+
+        _collect(partial_kv)
+        if leaves:
+            mx.eval(*leaves)
 
     def _apply_window_padding(
         self,

@@ -4039,6 +4039,113 @@ class TestMRUPromptBoundaryStash:
         assert cache.get_stats().mru_partial_hits == 1
 
 
+class TestMRUPartialCrossThreadSafety:
+    """An MRU partial is extracted on the store-cache worker thread but
+    spliced into a live cache on the separate inference thread.
+
+    ``_extract_block_tensor_slice`` builds the partial as lazy
+    ``mx.copy`` ops; an unevaluated tensor carries a pending op bound to
+    the worker's per-thread MLX stream, and evaluating the splice on the
+    inference thread raises ``RuntimeError: There is no Stream(gpu, N)
+    in current thread``.  ``_update_mru_partial`` must materialize the
+    partial at stash time so the stashed data is concrete and
+    stream-free.
+    """
+
+    @pytest.fixture
+    def mx(self):
+        try:
+            import mlx.core as mx
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    @pytest.fixture
+    def paged_cache(self):
+        return PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+
+    @pytest.fixture
+    def mock_ssd(self):
+        mock = MagicMock()
+        mock.save_block.return_value = True
+        mock.load_block.return_value = None
+        mock.load_block_with_metadata.return_value = (None, None)
+        mock.has_block.return_value = False
+        return mock
+
+    def test_materialize_mru_kv_handles_extract_shapes(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """``_materialize_mru_kv`` evaluates every ``mx.array`` leaf across
+        the plain ``(keys, values)`` and TurboQuant ``(tag, (k, v))``
+        shapes ``_extract_block_tensor_slice`` returns, and tolerates the
+        non-array tag string and an empty list."""
+        cache = _make_mru_cache(paged_cache, mock_ssd)
+        plain = [(mx.ones((1, 1, 2, 4)), mx.ones((1, 1, 2, 4)))]
+        tagged = [
+            ("__turboquant_v2__", (mx.ones((1, 1, 2, 4)), mx.ones((1, 1, 2, 4))))
+        ]
+        # None of these should raise.
+        cache._materialize_mru_kv(plain)
+        cache._materialize_mru_kv(tagged)
+        cache._materialize_mru_kv([])
+
+    def test_stashed_partial_splices_across_threads(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """Extract+stash on a worker thread, splice+evaluate on the main
+        thread.  Without stash-time materialization the final ``mx.eval``
+        raises a foreign-stream ``RuntimeError``; with it, the cross-
+        thread handoff is clean.
+        """
+        import concurrent.futures
+
+        cache = _make_mru_cache(paged_cache, mock_ssd, max_entries=4)
+        prompt = [10, 11, 12, 13, 14, 15]
+        stored = prompt + [90, 91, 92]
+        cache_data = [_kv_layer(mx, len(stored)) for _ in range(4)]
+        # Mirror production: the inference thread materializes the
+        # extracted cache (mx.async_eval + the worker's mx.synchronize)
+        # before the store worker runs.  Without this the cache_data
+        # arrays would still be lazy ops bound to THIS thread's stream —
+        # a different cross-thread failure than the one under test.
+        for layer in cache_data:
+            mx.eval(*layer["state"])
+
+        # Stash on a dedicated worker thread, mirroring the production
+        # _store_cache_executor (a pool distinct from the inference one).
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            store_bt = pool.submit(
+                cache.store_cache,
+                "store",
+                stored,
+                cache_data,
+                prompt_token_count=len(prompt),
+            ).result()
+
+        # Splice on this (the "inference") thread.
+        fetch_bt = BlockTable(request_id="resubmit")
+        fetch_bt.block_ids = [store_bt.block_ids[0]]
+        fetch_bt.num_tokens = 4
+        reconstructed = _make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+
+        spliced, new_remaining, applied = cache.apply_mru_partial(
+            reconstructed, fetch_bt, [14, 15]
+        )
+        assert applied == 2
+        assert new_remaining == []
+
+        # Force evaluation on this thread — the point a partial still
+        # carrying the worker thread's stream would fail.
+        for layer in spliced:
+            mx.eval(layer.keys, layer.values)
+
+
 class TestHasMRUPartial:
     """The has_mru_partial() accessor is the public API the scheduler
     uses to decide whether to suppress the deferred Metal cache clear."""
