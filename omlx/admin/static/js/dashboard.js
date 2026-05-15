@@ -2296,12 +2296,11 @@
                 return Math.min(100, (rc.hot_cache_size_bytes / rc.hot_cache_max_bytes) * 100);
             },
 
-            get runtimeMruPartialPercent() {
-                const rc = this.stats.runtime_cache;
-                if (!rc || !rc.mru_partial_max_entries) return 0;
-                return Math.min(100, (rc.mru_partial_entries / rc.mru_partial_max_entries) * 100);
-            },
-
+            // mruEnabled is a feature-on gate (drives the rate strip and the
+            // per-model MRU Tails column).  It reads the payload-level
+            // mru_partial_max_entries purely as "configured for any loaded
+            // model" — there is deliberately no aggregate MRU-tails gauge,
+            // since the slots are per-model, not a shared budget.
             get mruEnabled() {
                 return (this.stats.runtime_cache?.mru_partial_max_entries || 0) > 0;
             },

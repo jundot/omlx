@@ -3502,10 +3502,11 @@ def _build_runtime_cache_observability(
         "hot_cache_max_bytes": 0,
         "hot_cache_size_bytes": 0,
         "hot_cache_entries": 0,
-        # MRU partial cache (memory-only, sub-block tail of prior prefills).
-        # Capacity sums across models; current entries sum across models;
-        # max-capacity is the highest configured per-model value.
-        "mru_partial_entries": 0,
+        # MRU partial cache feature gate.  Per-model occupancy lives on each
+        # models[] entry; there is no payload-level entries aggregate
+        # because MRU tail slots are per-model, not a shared budget — only
+        # this max-entries sum is kept, purely so the dashboard can tell
+        # whether the feature is configured for any loaded model.
         "mru_partial_max_entries": 0,
     }
 
@@ -3659,23 +3660,21 @@ def _build_runtime_cache_observability(
     disk_max = payload["disk_max_bytes"]
     hot_cache_size_total = 0
     hot_cache_entries_total = 0
-    mru_entries_total = 0
     mru_max_entries_total = 0
     for m in payload["models"]:
         hot_cache_size_total += m.get("hot_cache_size_bytes", 0)
         hot_cache_entries_total += m.get("hot_cache_entries", 0)
         hot_cache_max += m.get("hot_cache_max_bytes", 0)
         disk_max = max(disk_max, m.get("max_size_bytes", 0))
-        # MRU partials: each model has its own dict; entries sum across
-        # models the same way the hot cache does.  max_entries sums for
-        # the same reason (each model reserves its own slice of capacity).
-        mru_entries_total += m.get("mru_partial_entries", 0)
+        # MRU: only the max-entries sum is kept, and only as a feature-on
+        # gate for the dashboard.  Per-model occupancy is on each models[]
+        # entry; an aggregate live count would be meaningless because the
+        # slots are per-model, not a shared budget.
         mru_max_entries_total += m.get("mru_partial_max_entries", 0)
     payload["hot_cache_max_bytes"] = hot_cache_max
     payload["hot_cache_size_bytes"] = hot_cache_size_total
     payload["hot_cache_entries"] = hot_cache_entries_total
     payload["disk_max_bytes"] = disk_max
-    payload["mru_partial_entries"] = mru_entries_total
     payload["mru_partial_max_entries"] = mru_max_entries_total
 
     # Fallback: if no loaded models contributed stats, scan the cache

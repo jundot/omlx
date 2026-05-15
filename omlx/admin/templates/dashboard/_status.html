@@ -313,17 +313,10 @@
                                 </div>
                                 <!-- Separator (only when both tiers visible) -->
                                 <span x-show="stats.runtime_cache?.hot_cache_max_bytes > 0 && stats.runtime_cache?.models?.length > 0" class="text-neutral-300 text-xs select-none">|</span>
-                                <!-- MRU partial gauge (only when feature is enabled AND models are loaded) -->
-                                <div x-show="mruEnabled && stats.runtime_cache?.models?.length > 0" class="flex items-center gap-2">
-                                    <span class="text-xs text-neutral-400">MRU tails</span>
-                                    <div class="w-20 h-2 rounded-full overflow-hidden gauge-track">
-                                        <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
-                                             :style="'width: ' + runtimeMruPartialPercent + '%'"></div>
-                                    </div>
-                                    <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
-                                          x-text="(stats.runtime_cache.mru_partial_entries || 0) + ' / ' + (stats.runtime_cache.mru_partial_max_entries || 0) + ' entries'"></span>
-                                </div>
-                                <span x-show="mruEnabled && stats.runtime_cache?.models?.length > 0" class="text-neutral-300 text-xs select-none">|</span>
+                                <!-- No global MRU-tails gauge: unlike Memory and SSD (one
+                                     exhaustible budget shared across models), MRU tail slots
+                                     are per-model, so an aggregate is not meaningful.  MRU
+                                     occupancy is shown per-model in the table below. -->
                                 <!-- SSD gauge (always visible) -->
                                 <div class="flex items-center gap-2">
                                     <span class="text-xs text-neutral-400">SSD</span>
