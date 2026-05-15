@@ -47,4 +47,12 @@ enum AdminAPI {
     // PR 9
     static let setupApiKey     = "\(prefix)/setup-api-key"
     static let subKeys         = "\(prefix)/sub-keys"
+
+    // PR 12 — oQ Quantization
+    static let oqModels        = "\(prefix)/oq/models"
+    static let oqEstimate      = "\(prefix)/oq/estimate"
+    static let oqStart         = "\(prefix)/oq/start"
+    static let oqTasks         = "\(prefix)/oq/tasks"
+    static func oqCancel(_ taskId: String) -> String { "\(prefix)/oq/cancel/\(taskId)" }
+    static func oqTask(_ taskId: String) -> String   { "\(prefix)/oq/task/\(taskId)" }
 }

@@ -60,6 +60,7 @@ enum SquircleGradient {
     static let models: [Color]       = [Color(rgb24: 0xAF52DE), Color(rgb24: 0x5E5CE6)]
     static let downloads: [Color]    = [Color(rgb24: 0x0A84FF), Color(rgb24: 0x5E5CE6)]
     static let integrations: [Color] = [Color(rgb24: 0xFF9F0A), Color(rgb24: 0xFF453A)]
+    static let quantization: [Color] = [Color(rgb24: 0xFF2D55), Color(rgb24: 0xAF52DE)]
 
     static let security: [Color] = server          // same dark gunmetal as Server
     static let about: [Color]    = logs            // same light gray as Logs

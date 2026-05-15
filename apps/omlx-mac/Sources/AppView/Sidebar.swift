@@ -14,7 +14,7 @@ import SwiftUI
 
 enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
     case server, status, logs
-    case models, downloads, integrations
+    case models, downloads, integrations, quantization
     case security, about
 
     var id: String { rawValue }
@@ -27,6 +27,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
         case .models:       return "Models"
         case .downloads:    return "Downloads"
         case .integrations: return "Integrations"
+        case .quantization: return "Quantization"
         case .security:     return "Security"
         case .about:        return "About oMLX"
         }
@@ -46,6 +47,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
         case .models:       return "cube.transparent"
         case .downloads:    return "icloud.and.arrow.down"
         case .integrations: return "powerplug"
+        case .quantization: return "sparkles"
         case .security:     return "lock"
         case .about:        return "info.circle"
         }
@@ -59,6 +61,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
         case .models:       return SquircleGradient.models
         case .downloads:    return SquircleGradient.downloads
         case .integrations: return SquircleGradient.integrations
+        case .quantization: return SquircleGradient.quantization
         case .security:     return SquircleGradient.security
         case .about:        return SquircleGradient.about
         }
@@ -66,9 +69,9 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
 
     var group: SidebarGroup {
         switch self {
-        case .server, .status, .logs:                return .server
-        case .models, .downloads, .integrations:     return .models
-        case .security, .about:                      return .general
+        case .server, .status, .logs:                              return .server
+        case .models, .downloads, .integrations, .quantization:    return .models
+        case .security, .about:                                    return .general
         }
     }
 

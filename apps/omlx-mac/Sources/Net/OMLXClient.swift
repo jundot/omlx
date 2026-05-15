@@ -245,6 +245,52 @@ final class OMLXClient: ObservableObject {
         try await deleteWithBody(AdminAPI.subKeys, body: DeleteSubKeyRequest(key: key))
     }
 
+    // PR 12 — oQ Quantization
+
+    /// List quantizable source models + every on-disk model (sensitivity picker).
+    func listOQModels() async throws -> OQModelsResponse {
+        try await get(AdminAPI.oqModels)
+    }
+
+    /// Server-side precise estimate of effective bpw + output size for a
+    /// given source model at the chosen oQ level. Result is cheap (no
+    /// quantization happens); the screen debounces calls at ~300 ms.
+    func estimateOQ(
+        modelPath: String,
+        oqLevel: Double,
+        preserveMtp: Bool = false
+    ) async throws -> OQEstimateResponse {
+        // `oq_level` accepts ints (2,3,4,5,6,8) and 3.5. Send it without a
+        // trailing `.0` so the server parses an int when the user picked one.
+        let levelStr: String = (oqLevel.rounded() == oqLevel)
+            ? String(Int(oqLevel))
+            : String(oqLevel)
+        return try await get(AdminAPI.oqEstimate, query: [
+            URLQueryItem(name: "model_path", value: modelPath),
+            URLQueryItem(name: "oq_level", value: levelStr),
+            URLQueryItem(name: "preserve_mtp", value: preserveMtp ? "true" : "false"),
+        ])
+    }
+
+    @discardableResult
+    func startOQQuantization(_ body: OQStartRequest) async throws -> OQStartResponse {
+        try await post(AdminAPI.oqStart, body: body)
+    }
+
+    func listOQTasks() async throws -> OQTasksResponse {
+        try await get(AdminAPI.oqTasks)
+    }
+
+    @discardableResult
+    func cancelOQTask(taskId: String) async throws -> SimpleSuccessResponse {
+        try await postEmpty(AdminAPI.oqCancel(taskId))
+    }
+
+    @discardableResult
+    func removeOQTask(taskId: String) async throws -> SimpleSuccessResponse {
+        try await delete(AdminAPI.oqTask(taskId))
+    }
+
     // MARK: - Core request
 
     private func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {

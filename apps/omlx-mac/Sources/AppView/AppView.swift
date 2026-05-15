@@ -78,6 +78,7 @@ struct AppView: View {
             }
         case .downloads:    DownloadsScreen()
         case .integrations: IntegrationsScreen()
+        case .quantization: QuantizationScreen()
         case .security:     SecurityScreen()
         case .about:        AboutScreen()
         }
