@@ -505,6 +505,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_keys: tuple[Any, ...] | None = None,
         extra_key_token_start: int | None = None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
+        prompt_token_count: int | None = None,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -525,6 +526,14 @@ class BlockAwarePrefixCache(CacheManager):
             boundary_snapshots: Optional mapping of token_count -> extracted cache
                 states for intermediate block boundaries. Used to store per-block
                 ArraysCache state instead of placeholders in hybrid models.
+            prompt_token_count: Number of prompt tokens at the front of
+                ``tokens``.  ``tokens`` is typically ``prompt + output``;
+                the MRU partial cache must stash the prompt's trailing
+                tail (the part a repeat request will resubmit), not the
+                sequence's. ``None`` means "no prompt boundary known" —
+                the MRU stash then treats the whole sequence as the
+                prompt (pre-MRU-fix behavior; correct for verbatim-repeat
+                callers like the generic CacheManager.store path).
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -825,18 +834,17 @@ class BlockAwarePrefixCache(CacheManager):
             last_access=time.time(),
         )
 
-        # Stash the trailing sub-block tail in memory so an immediate
-        # repeat request can splice it back in without a re-prefill.
-        # The slot is replaced unconditionally — if there's no eligible
-        # tail (block-aligned, hybrid model, extraction failure) we clear
-        # it so a stale partial from a previous store cannot survive.
+        # Stash the prompt's trailing sub-block tail in memory so an
+        # immediate repeat request can splice it back in without a
+        # re-prefill.  Keyed by the prompt's last full block so the
+        # lookup in apply_mru_partial (which sees a prompt-only repeat)
+        # finds it — see _update_mru_partial.
         self._update_mru_partial(
             new_tokens=new_tokens,
             cache_data=cache_data,
             block_table=block_table,
             existing_tokens=existing_tokens,
-            num_new_blocks=num_new_blocks,
-            trailing_partial_tokens=trailing_partial_tokens,
+            prompt_token_count=prompt_token_count,
             is_tensor_data=bool(is_tensor_data),
             layer_cache_types=layer_cache_types,
             model_cache_config=model_cache_config,
@@ -918,19 +926,28 @@ class BlockAwarePrefixCache(CacheManager):
         cache_data: list[Any],
         block_table: BlockTable,
         existing_tokens: int,
-        num_new_blocks: int,
-        trailing_partial_tokens: int,
+        prompt_token_count: int | None,
         is_tensor_data: bool,
         layer_cache_types: list[str] | None,
         model_cache_config: ModelCacheConfig | None,
     ) -> None:
-        """Stash the trailing partial from a just-completed ``store_cache``.
+        """Stash the prompt's trailing partial from a just-completed ``store_cache``.
+
+        ``store_cache`` is given the full ``prompt + output`` sequence,
+        but a repeat request resubmits the *prompt* only — and
+        ``apply_mru_partial`` looks the entry up by the prompt's last
+        full block.  So the stash must key off, and slice, the
+        **prompt's** trailing partial, not the stored sequence's.
+        ``prompt_token_count`` carries the prompt boundary; ``None``
+        falls back to "whole sequence is the prompt" (pre-fix behavior,
+        correct for verbatim-repeat callers).
 
         On success, writes one entry into the LRU map keyed by
-        ``parent_hash``.  If the map is at capacity, the oldest entry is
-        evicted via ``popitem(last=False)``.
+        ``parent_hash`` (the prompt's last full block, or ``None`` for a
+        prompt shorter than one block).  If the map is at capacity, the
+        oldest entry is evicted via ``popitem(last=False)``.
 
-        The "no eligible tail" branches (no trailing tokens, non-tensor
+        The "no eligible tail" branches (block-aligned prompt, non-tensor
         data, no reconstruct path configured, hybrid model, extraction
         failure, ambiguous cache layout) bare-return — they signal a
         local "nothing to stash this time," NOT a global "wipe the map."
@@ -950,22 +967,45 @@ class BlockAwarePrefixCache(CacheManager):
             return
         if self._mru_partial_supported is None:
             self._mru_partial_supported = True
-        if (
-            trailing_partial_tokens == 0
-            or not is_tensor_data
-            or not self._can_reconstruct()
-        ):
+        if not is_tensor_data or not self._can_reconstruct():
             return
 
-        partial_start = num_new_blocks * self.block_size
-        partial_global_start = existing_tokens + partial_start
-        partial_global_end = partial_global_start + trailing_partial_tokens
+        # Resolve the prompt boundary within the stored sequence.  None
+        # means "no boundary known" — treat the whole stored sequence as
+        # the prompt, which reproduces the pre-fix whole-sequence stash.
+        sequence_len = existing_tokens + len(new_tokens)
+        if prompt_token_count is None:
+            prompt_token_count = sequence_len
+        else:
+            prompt_token_count = min(prompt_token_count, sequence_len)
+        # Prompt fully covered by already-cached full blocks: its tail (if
+        # any) is partial and partials are never stored as blocks, so a
+        # prompt that ends at or before existing_tokens is block-aligned
+        # and has nothing for the MRU to add.
+        if prompt_token_count <= existing_tokens:
+            return
+
+        # Prompt's trailing partial: global range
+        # [prompt_partial_start, prompt_token_count).  Block-aligned
+        # prompt (partial_len == 0) → every token lands in a full paged
+        # block, nothing to stash.
+        prompt_partial_len = prompt_token_count % self.block_size
+        if prompt_partial_len == 0:
+            return
+        prompt_partial_start = prompt_token_count - prompt_partial_len
+        prompt_full_blocks = prompt_token_count // self.block_size
+        # new_tokens-relative offset of the prompt's trailing partial.
+        # existing_tokens is block-aligned and <= prompt_partial_start,
+        # so this is a valid index into new_tokens.
+        partial_start = prompt_partial_start - existing_tokens
+        partial_global_start = prompt_partial_start
+        partial_global_end = prompt_token_count
 
         # Decide which axis-2 index range covers the trailing partial:
         # - Global: cache_data spans the full sequence (prefix + new tail);
         #   slice at [partial_global_start:partial_global_end].
         # - Local: cache_data spans only the newly-processed suffix;
-        #   slice at [partial_start:partial_start + trailing_partial_tokens].
+        #   slice at [partial_start:partial_start + prompt_partial_len].
         #
         # We classify by exact cache length, not the previous
         # ``cache_seq_len >= existing_tokens + 1`` heuristic — that one
@@ -985,7 +1025,7 @@ class BlockAwarePrefixCache(CacheManager):
         elif existing_tokens == 0 or cache_seq_len == local_len:
             # Cache covers only the new suffix (or there is no prefix).
             p_cache_start = partial_start
-            p_cache_end = partial_start + trailing_partial_tokens
+            p_cache_end = partial_start + prompt_partial_len
         else:
             # Ambiguous: cache_seq_len is short of global_end but does
             # not equal local_len either.  Refuse rather than guess.
@@ -1004,12 +1044,27 @@ class BlockAwarePrefixCache(CacheManager):
         if not partial_kv:
             return
 
+        # Key by the PROMPT's last full block (block index
+        # prompt_full_blocks - 1), so a prompt-only repeat — which is what
+        # apply_mru_partial sees — finds this entry.  block_table.block_ids
+        # is ordered [fetched-prefix blocks..., newly-built blocks...] in
+        # sequence order, and the stored sequence has at least
+        # prompt_full_blocks full blocks (the prompt is a prefix of it),
+        # so the index is in range.  prompt_full_blocks == 0 (prompt
+        # shorter than one block) keeps parent_hash = None — the
+        # short-prompt None-key path.
         parent_hash: bytes | None = None
-        if block_table.block_ids:
-            last_bid = block_table.block_ids[-1]
-            last_block = self.paged_cache.allocated_blocks.get(last_bid)
-            if last_block is not None and last_block.block_hash:
-                parent_hash = last_block.block_hash
+        if prompt_full_blocks >= 1:
+            if len(block_table.block_ids) < prompt_full_blocks:
+                # Prompt's last full block isn't in the table (block build
+                # rolled back on an extraction failure).  Skip rather than
+                # mis-key against the None short-prompt slot.
+                return
+            parent_bid = block_table.block_ids[prompt_full_blocks - 1]
+            parent_block = self.paged_cache.allocated_blocks.get(parent_bid)
+            if parent_block is None or not parent_block.block_hash:
+                return
+            parent_hash = parent_block.block_hash
 
         # LRU put: pop any existing entry first so the re-insert lands at
         # the tail with fresh order; then evict the oldest entry if over
@@ -1021,7 +1076,7 @@ class BlockAwarePrefixCache(CacheManager):
             self._mru_partials.pop(parent_hash)
         self._mru_partials[parent_hash] = _MRUPartialBlock(
             parent_hash=parent_hash,
-            tokens=new_tokens[partial_start:],
+            tokens=new_tokens[partial_start : partial_start + prompt_partial_len],
             kv_data=partial_kv,
         )
         self._mru_partial_stashes += 1
@@ -1032,7 +1087,7 @@ class BlockAwarePrefixCache(CacheManager):
         logger.debug(
             "Stashed MRU partial: %d tokens, parent_hash=%s, layers=%d, "
             "entries=%d/%d",
-            trailing_partial_tokens,
+            prompt_partial_len,
             parent_hash[:8].hex() + "..." if parent_hash else "None",
             len(partial_kv),
             len(self._mru_partials),

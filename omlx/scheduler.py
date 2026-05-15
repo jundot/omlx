@@ -1039,6 +1039,7 @@ class Scheduler:
         extra_keys: tuple[Any, ...] | None,
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
+        prompt_token_count: int,
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
@@ -1081,6 +1082,7 @@ class Scheduler:
                     extra_keys=extra_keys,
                     extra_key_token_start=extra_key_token_start,
                     extra_key_ranges=extra_key_ranges,
+                    prompt_token_count=prompt_token_count,
                 )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
@@ -3474,7 +3476,10 @@ class Scheduler:
                     model=draft_model,
                     paged_cache_manager=draft_paged,
                     paged_ssd_cache_manager=self.paged_ssd_cache_manager,
-                    mru_partial_max_entries=self.config.mru_partial_max_entries,
+                    # MRU disabled on the draft cache: apply_mru_partial is
+                    # only ever called on the main block_aware_cache, so a
+                    # draft-cache stash is dead work that never pays off.
+                    mru_partial_max_entries=0,
                 )
                 self._draft_prefix_cache.set_cold_restore_callback(
                     self._restore_block_from_cold
@@ -5184,6 +5189,10 @@ class Scheduler:
                                     if pre_eval_arrays:
                                         mx.async_eval(*pre_eval_arrays)
 
+                            # Prompt boundary for the MRU partial stash:
+                            # token_sequence_to_store is prompt+output, but a
+                            # repeat request resubmits the prompt only.
+                            prompt_token_count = len(request.prompt_token_ids)
                             if self._store_cache_executor is not None:
                                 store_future = self._store_cache_executor.submit(
                                     self._async_store_cache_worker,
@@ -5195,6 +5204,7 @@ class Scheduler:
                                     request.vlm_extra_keys_for_cache,
                                     request.vlm_extra_key_token_start_for_cache,
                                     request.vlm_extra_key_ranges_for_cache,
+                                    prompt_token_count,
                                 )
                                 self._inflight_store_futures[request_id] = store_future
                             else:
@@ -5208,6 +5218,7 @@ class Scheduler:
                                     request.vlm_extra_keys_for_cache,
                                     request.vlm_extra_key_token_start_for_cache,
                                     request.vlm_extra_key_ranges_for_cache,
+                                    prompt_token_count,
                                 )
                             logger.debug(
                                 f"Submitted async store_cache for {request_id} "

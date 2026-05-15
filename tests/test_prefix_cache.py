@@ -3853,6 +3853,192 @@ class TestMRUPartialEligibility:
         assert cache.get_stats().mru_partial_supported is None
 
 
+def _store_seq(cache, mx, request_id, tokens, *, prompt_token_count=None):
+    """``store_cache`` a full token sequence; return the BlockTable.
+
+    ``cache_data`` spans the whole sequence so ``_update_mru_partial``
+    takes the global index path (the cache covers ``prompt + output``),
+    matching the production resubmission layout.
+    """
+    cache_data = [_kv_layer(mx, len(tokens)) for _ in range(4)]
+    return cache.store_cache(
+        request_id, tokens, cache_data, prompt_token_count=prompt_token_count,
+    )
+
+
+class TestMRUPromptBoundaryStash:
+    """The MRU stash must key off the *prompt's* trailing partial, not the
+    stored sequence's.
+
+    ``store_cache`` is handed ``prompt + output``, but a repeat request
+    resubmits the prompt only and ``apply_mru_partial`` looks the entry
+    up by the prompt's last full block.  Before the prompt boundary was
+    threaded in, the stash keyed off ``prompt + output``'s last full
+    block — a key a prompt-only resubmit could never compute — so the
+    feature never produced a hit for ordinary chat completions.
+
+    block_size is 4 in this fixture.
+    """
+
+    @pytest.fixture
+    def mx(self):
+        try:
+            import mlx.core as mx
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    @pytest.fixture
+    def paged_cache(self):
+        return PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+
+    @pytest.fixture
+    def mock_ssd(self):
+        mock = MagicMock()
+        mock.save_block.return_value = True
+        mock.load_block.return_value = None
+        mock.load_block_with_metadata.return_value = (None, None)
+        mock.has_block.return_value = False
+        return mock
+
+    def test_prompt_boundary_stash_hits_on_prompt_only_resubmit(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """The decisive regression test: store ``prompt + output`` with the
+        prompt boundary, then resubmit the prompt only — apply must HIT.
+        """
+        cache = _make_mru_cache(paged_cache, mock_ssd, max_entries=4)
+        # prompt = 1 full block [10..13] + 2-token tail [14,15]; output = 3.
+        prompt = [10, 11, 12, 13, 14, 15]
+        stored = prompt + [90, 91, 92]
+        store_bt = _store_seq(
+            cache, mx, "store", stored, prompt_token_count=len(prompt)
+        )
+
+        # Keyed by the prompt's last full block (block 0) — NOT the stored
+        # sequence's last full block (block 1) — and stashing the prompt
+        # tail [14,15], not the sequence tail [92].
+        prompt_block = paged_cache.allocated_blocks[store_bt.block_ids[0]]
+        assert prompt_block.block_hash in cache._mru_partials
+        assert cache._mru_partials[prompt_block.block_hash].tokens == [14, 15]
+
+        # Simulate fetch_cache(prompt): a block table with the prompt's
+        # full blocks only — apply_mru_partial keys off block_ids[-1].
+        fetch_bt = BlockTable(request_id="resubmit")
+        fetch_bt.block_ids = [store_bt.block_ids[0]]
+        fetch_bt.num_tokens = 4
+        reconstructed = _make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+
+        _, new_remaining, applied = cache.apply_mru_partial(
+            reconstructed, fetch_bt, [14, 15]
+        )
+        assert applied == 2
+        assert new_remaining == []
+        stats = cache.get_stats()
+        assert stats.mru_partial_hits == 1
+        assert stats.mru_partial_tokens_saved == 2
+
+    def test_whole_sequence_stash_misses_on_prompt_only_resubmit(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """Pins the original bug: with no prompt boundary
+        (``prompt_token_count=None``) the stash keys off the stored
+        sequence's last full block, which a prompt-only resubmit never
+        reaches — 0 hits, and 0 evictions because the lookup key is never
+        found (no entry to evict).
+        """
+        cache = _make_mru_cache(paged_cache, mock_ssd, max_entries=4)
+        prompt = [10, 11, 12, 13, 14, 15]
+        stored = prompt + [90, 91, 92]
+        store_bt = _store_seq(cache, mx, "store", stored)  # boundary unknown
+
+        # None falls back to whole-sequence: keyed off block 1 (the stored
+        # sequence's last full block), unreachable by a prompt-only fetch.
+        seq_block = paged_cache.allocated_blocks[store_bt.block_ids[1]]
+        assert seq_block.block_hash in cache._mru_partials
+
+        fetch_bt = BlockTable(request_id="resubmit")
+        fetch_bt.block_ids = [store_bt.block_ids[0]]
+        fetch_bt.num_tokens = 4
+        reconstructed = _make_reconstructed_cache(mx, n_layers=4, n_tokens=4)
+
+        _, _, applied = cache.apply_mru_partial(reconstructed, fetch_bt, [14, 15])
+        assert applied == 0
+        stats = cache.get_stats()
+        assert stats.mru_partial_hits == 0
+        assert stats.mru_partial_evictions == 0  # key miss — nothing evicted
+
+    def test_block_aligned_prompt_does_not_stash(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """A prompt that is an exact multiple of block_size has no partial
+        tail — every prompt token lands in a full paged block, so the MRU
+        has nothing to add."""
+        cache = _make_mru_cache(paged_cache, mock_ssd, max_entries=4)
+        prompt = [10, 11, 12, 13, 14, 15, 16, 17]  # 8 tokens = 2 full blocks
+        stored = prompt + [90, 91, 92]
+        _store_seq(cache, mx, "store", stored, prompt_token_count=len(prompt))
+        assert not cache._mru_partials
+        assert cache.get_stats().mru_partial_stashes == 0
+
+    def test_short_prompt_stashes_under_none_key(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """A prompt shorter than one block has no last full block; the
+        stash is keyed by None (the short-prompt path) and holds the
+        whole prompt as its tail."""
+        cache = _make_mru_cache(paged_cache, mock_ssd, max_entries=4)
+        prompt = [10, 11, 12]  # 3 tokens < block_size 4
+        stored = prompt + [90, 91, 92, 93, 94]
+        _store_seq(cache, mx, "store", stored, prompt_token_count=len(prompt))
+        assert None in cache._mru_partials
+        assert cache._mru_partials[None].tokens == [10, 11, 12]
+
+    def test_prompt_boundary_stash_with_existing_cached_prefix(
+        self, paged_cache, mock_ssd, mx
+    ):
+        """Resubmission path: store_cache runs with ``existing_tokens > 0``
+        (the prompt's leading blocks are already cached) and works in
+        ``new_tokens`` space.  The prompt-boundary arithmetic must still
+        resolve the prompt's last full block — not an index shifted by
+        ``existing_tokens``.
+        """
+        cache = _make_mru_cache(paged_cache, mock_ssd, max_entries=4)
+        # prompt = 2 full blocks [10..17] + 2-token tail [18,19]; output = 3.
+        prompt = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        stored = prompt + [90, 91, 92]
+        # Round 1: store the prompt's first full block only, same
+        # request_id, so round 2's store sees existing_tokens > 0.
+        _store_seq(cache, mx, "req", prompt[:8], prompt_token_count=8)
+        assert not cache._mru_partials  # block-aligned round-1, no stash
+        # Round 2: same request_id — existing_tokens == 8.
+        store_bt = _store_seq(
+            cache, mx, "req", stored, prompt_token_count=len(prompt)
+        )
+
+        # Prompt's last full block is index 1 ([14..17]); the stash must
+        # key off it despite existing_tokens=8 and new_tokens-space math.
+        prompt_block = paged_cache.allocated_blocks[store_bt.block_ids[1]]
+        assert prompt_block.block_hash in cache._mru_partials
+        assert cache._mru_partials[prompt_block.block_hash].tokens == [18, 19]
+
+        fetch_bt = BlockTable(request_id="resubmit")
+        fetch_bt.block_ids = store_bt.block_ids[:2]
+        fetch_bt.num_tokens = 8
+        reconstructed = _make_reconstructed_cache(mx, n_layers=4, n_tokens=8)
+        _, new_remaining, applied = cache.apply_mru_partial(
+            reconstructed, fetch_bt, [18, 19]
+        )
+        assert applied == 2
+        assert new_remaining == []
+        assert cache.get_stats().mru_partial_hits == 1
+
+
 class TestHasMRUPartial:
     """The has_mru_partial() accessor is the public API the scheduler
     uses to decide whether to suppress the deferred Metal cache clear."""
