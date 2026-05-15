@@ -3741,7 +3741,8 @@ class TestMRUPartialEligibility:
         assert stats.mru_partial_stashes == 0  # gate refused, no stash
         warns = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warns) == 1
-        assert "MRU tail cache disabled" in warns[0].getMessage()
+        assert "MRU tails will be inactive" in warns[0].getMessage()
+        assert "incompatible" in warns[0].getMessage()
         assert "RotatingKVCache" in warns[0].getMessage()
 
     def test_warning_does_not_repeat_on_subsequent_non_sliceable(

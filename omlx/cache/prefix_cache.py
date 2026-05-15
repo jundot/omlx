@@ -263,10 +263,13 @@ class BlockAwarePrefixCache(CacheManager):
         """Latch ``mru_partial_supported=False`` and emit a one-shot warning.
 
         Called from both the eager init-time check and the lazy fallback
-        inside ``_update_mru_partial``.  The warning identifies the
-        offending cache types so an operator can decide whether to disable
-        the feature (``--mru-partial-max-entries=0``) or accept the gauge
-        showing 'N/A (see log)' on this model's dashboard row.
+        inside ``_update_mru_partial``.  The warning matches the in-tree
+        load-phase warning style ("condition + consequence, plain words")
+        — see ``utils/model_loading.py`` mtp warning and ``engine/dflash``
+        L2 warning for the reference voice.  Mechanism details
+        (sliceable whitelist, offset-skew failure mode) live in the
+        ``_all_layers_sliceable`` docstring where developers read them,
+        not in the operator log.
         """
         already_recorded = self._mru_partial_supported is False
         self._mru_partial_supported = False
@@ -278,16 +281,11 @@ class BlockAwarePrefixCache(CacheManager):
                 set(layer_cache_types) - KNOWN_SLICEABLE_CACHE_TYPES
             )
         else:
-            offenders = ["<unknown>"]
+            offenders = ["unknown"]
         logger.warning(
-            "MRU tail cache disabled for this model: layer types %s are not in "
-            "the sliceable whitelist %s.  Splicing a partial into a "
-            "non-sliceable subset would cause per-layer offset skew at decode "
-            "(silent generation corruption), so every stash attempt will be "
-            "refused.  The admin dashboard's per-model 'MRU Tails' cell will "
-            "display 'N/A (see log)'.",
-            offenders,
-            sorted(KNOWN_SLICEABLE_CACHE_TYPES),
+            "MRU tail cache enabled but this model is incompatible "
+            "(cache layers: %s); MRU tails will be inactive for this model.",
+            ", ".join(offenders),
         )
 
     def _get_model_num_layers(self, model: Any) -> int:
