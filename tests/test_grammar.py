@@ -20,6 +20,16 @@ import pytest
 
 from omlx.api.openai_models import StructuredOutputOptions
 
+try:
+    import xgrammar  # noqa: F401
+    HAS_XGRAMMAR = True
+except ImportError:
+    HAS_XGRAMMAR = False
+
+requires_xgrammar = pytest.mark.skipif(
+    not HAS_XGRAMMAR, reason="xgrammar not installed"
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -222,7 +232,8 @@ class TestCompileWithStructuralTag:
         from omlx.server import _compile_with_structural_tag
         return _compile_with_structural_tag(compiler, fmt, reasoning_parser, chat_template_kwargs)
 
-    @patch("omlx.server.xgr" if False else "xgrammar.get_builtin_structural_tag")
+    @requires_xgrammar
+    @patch("xgrammar.get_builtin_structural_tag")
     def test_calls_get_builtin_structural_tag(self, mock_get_tag):
         """Verifies xgrammar.get_builtin_structural_tag is called with correct args."""
         xgr = pytest.importorskip("xgrammar")
@@ -244,6 +255,7 @@ class TestCompileWithStructuralTag:
         compiler.compile_structural_tag.assert_called_once()
         assert result == "compiled"
 
+    @requires_xgrammar
     @patch("xgrammar.get_builtin_structural_tag")
     def test_reasoning_false_when_thinking_disabled(self, mock_get_tag):
         xgr = pytest.importorskip("xgrammar")
@@ -263,6 +275,7 @@ class TestCompileWithStructuralTag:
 
         mock_get_tag.assert_called_once_with("qwen", reasoning=False)
 
+    @requires_xgrammar
     @patch("xgrammar.get_builtin_structural_tag")
     def test_patches_user_grammar_into_tag(self, mock_get_tag):
         """The user's grammar should replace the any_text in the tag."""
@@ -399,6 +412,7 @@ class TestCompileGrammarForRequest:
         assert result == "compiled_builtin"
         compiler.compile_builtin_json_grammar.assert_called_once()
 
+    @requires_xgrammar
     @patch("xgrammar.get_builtin_structural_tag")
     def test_reasoning_parser_uses_structural_tag(self, mock_get_tag):
         """When reasoning_parser is set, compile_structural_tag is used."""
@@ -423,6 +437,7 @@ class TestCompileGrammarForRequest:
         compiler.compile_structural_tag.assert_called_once()
         mock_get_tag.assert_called_once_with("qwen", reasoning=True)
 
+    @requires_xgrammar
     @patch("xgrammar.get_builtin_structural_tag")
     def test_reasoning_parser_with_thinking_disabled(self, mock_get_tag):
         """enable_thinking=False → reasoning=False passed to get_builtin_structural_tag."""

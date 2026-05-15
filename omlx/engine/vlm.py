@@ -365,6 +365,11 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
 
     def _patched(path, **kwargs):
         cfg = original(path, **kwargs)
+
+        from ..utils.model_loading import expand_per_layer_quant_keys
+
+        expand_per_layer_quant_keys(cfg)
+
         if cfg.get("audio_config") is None:
             return cfg
         try:
@@ -397,6 +402,62 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
         yield
     finally:
         _vu.load_config = original
+
+
+_NESTED_VIS_PREFIX = "language_model.model.visual."
+_VISION_TOWER_PREFIX = "vision_tower."
+
+
+@contextlib.contextmanager
+def _remap_nested_visual_on_load(model_dir: Path):
+    """Remap ``language_model.model.visual.*`` → ``vision_tower.*`` during
+    ``load_model`` for MLX-format models where sanitize is skipped.
+
+    mlx-vlm's ``load_model`` skips ``Model.sanitize`` when the safetensors
+    metadata declares ``format=mlx``. oQ output is MLX-format, so the
+    nested-visual key fixup that sanitize normally applies never fires.
+    This context manager wraps ``load_model`` to intercept the weight dict
+    and perform the remap before ``nn.Module.load_weights`` is called.
+
+    Scoped to a single ``vlm_load(...)`` call.
+    """
+    import mlx_vlm.utils as _vu
+
+    original_load_model = _vu.load_model
+
+    def _patched_load_model(model_path, lazy=False, **kwargs):
+        import mlx.nn as _nn
+
+        orig_load_weights = _nn.Module.load_weights
+        def _remapping_load_weights(self, weights_items, *args, **kw):
+            if isinstance(weights_items, str):
+                return orig_load_weights(self, weights_items, *args, **kw)
+            remapped = []
+            n = 0
+            for k, v in weights_items:
+                if k.startswith(_NESTED_VIS_PREFIX):
+                    k = _VISION_TOWER_PREFIX + k[len(_NESTED_VIS_PREFIX):]
+                    n += 1
+                remapped.append((k, v))
+            if n:
+                logger.info(
+                    "remap_nested_visual_on_load: remapped %d keys "
+                    "'language_model.model.visual.*' -> 'vision_tower.*'",
+                    n,
+                )
+            return orig_load_weights(self, remapped, *args, **kw)
+
+        _nn.Module.load_weights = _remapping_load_weights
+        try:
+            return original_load_model(model_path, lazy, **kwargs)
+        finally:
+            _nn.Module.load_weights = orig_load_weights
+
+    _vu.load_model = _patched_load_model
+    try:
+        yield
+    finally:
+        _vu.load_model = original_load_model
 
 
 # Models that only support a single image per request
@@ -605,7 +666,8 @@ class VLMBatchedEngine(BaseEngine):
         def _load_vlm_sync():
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
-            with _strip_audio_config_if_orphaned(Path(self._model_name)):
+            with _strip_audio_config_if_orphaned(Path(self._model_name)), \
+                 _remap_nested_visual_on_load(Path(self._model_name)):
                 custom_loaded = maybe_load_custom_quantization(
                     self._model_name,
                     is_vlm=True,
