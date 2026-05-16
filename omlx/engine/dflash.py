@@ -605,14 +605,30 @@ class DFlashEngine(BaseEngine):
                     elapsed_s = elapsed_us / 1e6 if elapsed_us else 0
                     gen_tps = gen_tokens / elapsed_s if elapsed_s > 0 else 0
                     fallback = bool(event.fallback_ar)
+                    prompt_ctx = int(event.prompt_token_count)
                     logger.info(
                         f"DFlash generation complete: "
                         f"{gen_tokens} tokens, "
                         f"{gen_tps:.1f} tok/s, "
                         f"acceptance={accept_ratio:.1%}, "
-                        f"cycles={cycles}"
+                        f"cycles={cycles}, "
+                        f"ctx={prompt_ctx}"
                         f"{', fallback=AR' if fallback else ''}"
                     )
+                    if accept_ratio < 0.55:
+                        max_ctx = self._max_dflash_ctx
+                        near_limit = (
+                            max_ctx is not None and prompt_ctx >= int(max_ctx * 0.85)
+                        )
+                        limit_note = (
+                            f" (approaching fallback threshold {max_ctx})"
+                            if near_limit else ""
+                        )
+                        logger.warning(
+                            f"DFlash acceptance low: {accept_ratio:.1%} at "
+                            f"{prompt_ctx} context tokens{limit_note} — "
+                            "consider starting a new conversation soon"
+                        )
                     metrics = {
                         "prompt_tokens": int(event.prompt_token_count),
                         "completion_tokens": gen_tokens,
