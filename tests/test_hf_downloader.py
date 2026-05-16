@@ -297,9 +297,9 @@ class TestHFDownloader:
 
     @pytest.mark.asyncio
     async def test_cancel_download(self, downloader, model_dir):
-        # Create partial files to verify they are preserved after cancel
-        target = model_dir / "model"
-        target.mkdir(exist_ok=True)
+        # Create partial files to verify they are removed after cancel.
+        target = model_dir / "owner" / "model"
+        target.mkdir(parents=True, exist_ok=True)
         (target / "partial.bin").write_bytes(b"x" * 100)
 
         with patch(
@@ -319,15 +319,80 @@ class TestHFDownloader:
             # Give it a moment to start
             await asyncio.sleep(0.2)
 
+            active_task = downloader._active_tasks[task.task_id]
             success = await downloader.cancel_download(task.task_id)
             assert success is True
             assert task.status == DownloadStatus.CANCELLED
+            await active_task
 
-            # Partial files should be preserved for resume
-            assert target.exists()
-            assert (target / "partial.bin").exists()
+            assert not target.exists()
 
             await downloader.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_download_cleans_up_partial_target_dir(
+        self, downloader, model_dir
+    ):
+        target = model_dir / "owner" / "model"
+        target.mkdir(parents=True)
+        (target / "._____temp").mkdir()
+        (target / "._____temp" / "model-00001-of-00002.safetensors").write_bytes(
+            b"x"
+        )
+
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = {}
+        mock_api.model_info.return_value = mock_info
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            raise asyncio.CancelledError()
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert task.status == DownloadStatus.CANCELLED
+        assert not target.exists()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_download_logs_cleanup_failure(self, downloader, caplog):
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = {}
+        mock_api.model_info.return_value = mock_info
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            raise asyncio.CancelledError()
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ), patch.object(
+            downloader, "_cleanup_partial", side_effect=Exception("boom")
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert task.status == DownloadStatus.CANCELLED
+        assert "Failed to clean up cancelled download owner/model: boom" in caplog.text
 
     @pytest.mark.asyncio
     async def test_cancel_nonexistent_returns_false(self, downloader):
