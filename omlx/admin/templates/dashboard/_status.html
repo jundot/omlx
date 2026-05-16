@@ -110,12 +110,18 @@
                             <div class="flex items-center gap-3">
                                 <!-- Memory progress bar -->
                                 <div class="flex items-center gap-2">
-                                    <div class="w-24 h-2 bg-neutral-200 rounded-full overflow-hidden">
-                                        <div class="h-full bg-neutral-700 rounded-full transition-all duration-500"
-                                             :style="'width: ' + activeModelsMemoryPercent + '%'"></div>
+                                     <div class="bg-neutral-200 rounded-full overflow-hidden relative shrink-0"
+                                         style="width: 9rem; height: 0.625rem;">
+                                        <div class="rounded-full transition-all duration-300"
+                                            :style="activeModelsPressureBarStyle"></div>
+                                        <div x-show="stats.active_models.memory_pressure && stats.active_models.memory_pressure.enabled && activeModelsSoftPercent > 0"
+                                             x-cloak
+                                            class="absolute inset-y-0"
+                                            :style="activeModelsSoftMarkerStyle">
+                                        </div>
                                     </div>
                                     <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
-                                          x-text="formatSizeBytes(stats.active_models.model_memory_used) + ' / ' + formatSizeBytes(stats.active_models.model_memory_max)"></span>
+                                          x-text="activeModelsPressureLabel()"></span>
                                 </div>
                             </div>
                         </div>
@@ -169,7 +175,7 @@
                                                 </template>
                                             </div>
                                             <!-- Memory size -->
-                                            <span class="text-xs text-neutral-400 font-mono w-16 text-right" x-text="m.estimated_size_formatted"></span>
+                                                <span class="text-xs text-neutral-400 font-mono w-60 text-right" x-text="activeModelSizeLabel(m)"></span>
                                             <!-- Unload button -->
                                             <div x-show="!m.is_loading" class="relative opacity-0 group-hover:opacity-100 transition-all"
                                                  x-data="{ showTip: false }"

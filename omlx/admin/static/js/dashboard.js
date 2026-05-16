@@ -149,6 +149,14 @@
                     models: [],
                     model_memory_used: 0,
                     model_memory_max: 0,
+                    model_memory_used_actual: 0,
+                    memory_pressure: {
+                        enabled: false,
+                        current_bytes: 0,
+                        soft_bytes: 0,
+                        hard_bytes: 0,
+                        pressure_level: 'ok',
+                    },
                     total_active_requests: 0,
                     total_waiting_requests: 0,
                 },
@@ -2113,7 +2121,7 @@
                 }
             },
 
-            async loadStats() {
+            async loadStats(includeAlltime = true) {
                 try {
                     const params = new URLSearchParams();
                     if (this.selectedStatsModel) {
@@ -2126,6 +2134,10 @@
                         this.stats = { ...this.stats, ...data };
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
+                    }
+
+                    if (!includeAlltime) {
+                        return;
                     }
 
                     // Load all-time stats
@@ -2192,9 +2204,10 @@
 
             startStatsRefresh() {
                 this.stopStatsRefresh();
+                this.loadStats();
                 this._statsRefreshTimer = setInterval(() => {
-                    this.loadStats();
-                }, 1000);
+                    this.loadStats(false);
+                }, 500);
             },
 
             stopStatsRefresh() {
@@ -2313,10 +2326,61 @@
                 return Math.min(100, (rc.total_size_bytes / rc.disk_max_bytes) * 100);
             },
 
-            get activeModelsMemoryPercent() {
-                const am = this.stats.active_models;
-                if (!am || !am.model_memory_max) return 0;
-                return Math.min(100, (am.model_memory_used / am.model_memory_max) * 100);
+            get activeModelsPressurePercent() {
+                const mp = this.stats.active_models?.memory_pressure;
+                if (!mp || !mp.hard_bytes) return 0;
+                return Math.min(100, (mp.current_bytes / mp.hard_bytes) * 100);
+            },
+
+            get activeModelsSoftPercent() {
+                const mp = this.stats.active_models?.memory_pressure;
+                if (!mp || !mp.hard_bytes || !mp.soft_bytes) return 0;
+                return Math.min(100, (mp.soft_bytes / mp.hard_bytes) * 100);
+            },
+
+            get activeModelsPressureBarColor() {
+                const pct = this.activeModelsPressurePercent;
+                if (pct >= 90) return '#ef4444';
+                if (pct >= 80) return '#f97316';
+                if (pct >= 70) return '#f59e0b';
+                if (pct >= 60) return '#facc15';
+                return '#22c55e';
+            },
+
+            get activeModelsPressureBarStyle() {
+                return `width: ${this.activeModelsPressurePercent}%; height: 100%; display: block; background-color: ${this.activeModelsPressureBarColor};`;
+            },
+
+            get activeModelsSoftMarkerStyle() {
+                return `left: ${this.activeModelsSoftPercent}%; width: 1px; background-color: rgba(64, 64, 64, 0.6);`;
+            },
+
+            activeModelsPressureLabel() {
+                const mp = this.stats.active_models?.memory_pressure;
+                if (!mp || !mp.enabled || !mp.hard_bytes) {
+                    return 'Enforcer disabled';
+                }
+                return `${this.formatSizeBytes(mp.current_bytes)} / ${this.formatSizeBytes(mp.soft_bytes)} soft / ${this.formatSizeBytes(mp.hard_bytes)} hard`;
+            },
+
+            modelSizeLabel(model) {
+                if (!model) return '-';
+                const estimated = model.estimated_size_formatted || '-';
+                if (model.is_loading) {
+                    return estimated;
+                }
+                const actual = model.actual_size_formatted;
+                if (!actual) {
+                    return estimated;
+                }
+                if (!estimated || estimated === actual) {
+                    return `${actual}`;
+                }
+                return `${actual} / ${estimated} est`;
+            },
+
+            activeModelSizeLabel(model) {
+                return this.modelSizeLabel(model);
             },
 
             copyToClipboard(text) {
