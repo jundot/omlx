@@ -320,28 +320,30 @@ def test_patch_wraps_target_processors():
     fake_transformers = types.ModuleType("transformers")
     fake_transformers.AutoImageProcessor = fake_aip
 
-    # Build two fake mlx-vlm processor modules.
+    # Build two fake mlx-vlm processor modules. Module paths and class names
+    # must match the (module_path, cls_name) tuples in vlm.py's
+    # _patch_torch_free_image_processor.
     class FakeGlmOcrProcessor:
         @classmethod
         def from_pretrained(cls, path, **kwargs):
             return "glm"
 
-    class FakeDotsOcrProcessor:
+    class FakeDotsVLProcessor:
         @classmethod
         def from_pretrained(cls, path, **kwargs):
             return "dots"
 
     glm_mod = types.ModuleType("mlx_vlm.models.glm_ocr.processing")
     glm_mod.GlmOcrProcessor = FakeGlmOcrProcessor
-    dots_mod = types.ModuleType("mlx_vlm.models.dots_ocr.processing")
-    dots_mod.DotsOcrProcessor = FakeDotsOcrProcessor
+    dots_mod = types.ModuleType("mlx_vlm.models.dots_ocr.processing_dots_ocr")
+    dots_mod.DotsVLProcessor = FakeDotsVLProcessor
 
     real_import = importlib.import_module
 
     def fake_import(name, *args, **kwargs):
         if name == "mlx_vlm.models.glm_ocr.processing":
             return glm_mod
-        if name == "mlx_vlm.models.dots_ocr.processing":
+        if name == "mlx_vlm.models.dots_ocr.processing_dots_ocr":
             return dots_mod
         return real_import(name, *args, **kwargs)
 
@@ -353,5 +355,5 @@ def test_patch_wraps_target_processors():
         FakeGlmOcrProcessor.from_pretrained, "_omlx_torch_free_patched", False
     )
     assert getattr(
-        FakeDotsOcrProcessor.from_pretrained, "_omlx_torch_free_patched", False
+        FakeDotsVLProcessor.from_pretrained, "_omlx_torch_free_patched", False
     )
