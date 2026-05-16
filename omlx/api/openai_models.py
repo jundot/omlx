@@ -13,7 +13,7 @@ These models define the request and response schemas for:
 import json
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 from omlx.api.shared_models import (
     BaseUsage,
@@ -419,7 +419,9 @@ class MCPServersResponse(BaseModel):
 
 class MCPExecuteRequest(BaseModel):
     """Request to execute an MCP tool."""
-    tool_name: str
+    model_config = {"populate_by_name": True}
+
+    tool_name: str = Field(validation_alias=AliasChoices("tool_name", "tool"))
     arguments: dict = Field(default_factory=dict)
 
 
