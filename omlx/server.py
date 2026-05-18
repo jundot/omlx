@@ -976,21 +976,56 @@ def get_sampling_params(
     return temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold
 
 
+# Default reasoning_effort -> thinking-token budget. "off" carries no
+# budget (it disables thinking outright); low/medium/high select a budget.
+# Per-model overrides live in ModelSettings.reasoning_effort_budgets.
+_REASONING_EFFORT_BUDGETS = {"low": 512, "medium": 2048, "high": 8192}
+
+
+def _effort_to_budget(effort: str | None, ms) -> int | None:
+    """Map an OpenAI ``reasoning_effort`` level to a thinking-token budget.
+
+    Returns None for ``off`` / None / unknown — ``off`` disables thinking
+    and carries no budget; the caller suppresses it via ``enable_thinking``.
+    """
+    if not effort or effort == "off":
+        return None
+    table = dict(_REASONING_EFFORT_BUDGETS)
+    overrides = getattr(ms, "reasoning_effort_budgets", None) if ms else None
+    if overrides:
+        table.update(overrides)
+    return table.get(effort)
+
+
 def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
-    """Resolve thinking budget: request param > model settings > None."""
-    # Check request-level override (OpenAI format)
+    """Resolve thinking budget.
+
+    Precedence: explicit numeric budget (OpenAI ``thinking_budget`` /
+    Anthropic ``thinking.budget_tokens``) > OpenAI ``reasoning_effort``
+    sugar > per-model ``thinking_budget_tokens`` setting.
+    """
+    # Explicit numeric budget — request-level, highest priority.
     req_budget = getattr(request, 'thinking_budget', None)
     # For Anthropic: check thinking.budget_tokens
     if req_budget is None and hasattr(request, 'thinking') and request.thinking:
         req_budget = getattr(request.thinking, 'budget_tokens', None)
     if req_budget is not None:
         return req_budget
-    # Check model settings
+
     resolved = resolve_model_id(model_id)
+    ms = None
     if resolved and _server_state.settings_manager:
         ms = _server_state.settings_manager.get_settings(resolved)
-        if ms.thinking_budget_enabled and ms.thinking_budget_tokens:
-            return ms.thinking_budget_tokens
+
+    # reasoning_effort sugar (OpenAI). An explicit effort — including
+    # "off" — overrides the per-model default budget.
+    effort = getattr(request, 'reasoning_effort', None)
+    if effort:
+        return _effort_to_budget(effort, ms)
+
+    # Per-model default.
+    if ms and ms.thinking_budget_enabled and ms.thinking_budget_tokens:
+        return ms.thinking_budget_tokens
     return None
 
 
@@ -2241,9 +2276,13 @@ async def create_chat_completion(
     # Auto-set enable_thinking in chat template kwargs when a thinking
     # budget is active (from request or model settings).  Some chat
     # templates (e.g. Gemma 4) explicitly suppress thinking unless this
-    # kwarg is True.
+    # kwarg is True.  reasoning_effort="off" is the inverse: an explicit
+    # request-level opt-out that forces thinking off regardless of the
+    # model default.
     if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
         merged_ct_kwargs["enable_thinking"] = True
+    elif request.reasoning_effort == "off":
+        merged_ct_kwargs["enable_thinking"] = False
 
     # Auto-set preserve_thinking only when the template advertises support
     # for it (Qwen 3.6+). Other templates silently ignore unknown kwargs

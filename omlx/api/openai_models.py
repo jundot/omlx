@@ -263,6 +263,11 @@ class ChatCompletionRequest(BaseModel):
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     # Thinking budget (max thinking tokens, None = unlimited)
     thinking_budget: Optional[int] = None
+    # Reasoning effort: OpenAI-standard syntactic sugar over thinking_budget.
+    # "off" disables thinking; "low"/"medium"/"high" select a token budget
+    # (per-model overridable via ModelSettings.reasoning_effort_budgets).
+    # An explicit thinking_budget always wins over reasoning_effort.
+    reasoning_effort: Optional[str] = None
     # SpecPrefill: per-request enable/disable (None = use model setting)
     specprefill: Optional[bool] = None
     # SpecPrefill: per-request keep percentage (0.1-0.5, None = use model setting)
@@ -278,6 +283,22 @@ class ChatCompletionRequest(BaseModel):
         """Accept stop as a single string (OpenAI compat) and wrap in a list."""
         if isinstance(v, str):
             return [v]
+        return v
+
+    @field_validator("reasoning_effort", mode="before")
+    @classmethod
+    def validate_reasoning_effort(cls, v):
+        """Normalise reasoning_effort and reject unknown levels."""
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise ValueError("reasoning_effort must be a string")
+        v = v.strip().lower()
+        allowed = {"off", "low", "medium", "high"}
+        if v not in allowed:
+            raise ValueError(
+                f"reasoning_effort must be one of {sorted(allowed)}, got {v!r}"
+            )
         return v
 
 

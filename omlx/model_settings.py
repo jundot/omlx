@@ -52,6 +52,10 @@ class ModelSettings:
         enable_thinking: Explicit toggle for thinking/reasoning mode (None = auto).
         thinking_budget_enabled: Whether a thinking token budget is active.
         thinking_budget_tokens: Max tokens for thinking/reasoning.
+        reasoning_effort_budgets: Per-model override for the OpenAI
+            reasoning_effort -> token budget map, e.g.
+            {"low": 256, "medium": 1024, "high": 4096}. Unset keys fall
+            back to the server default.
         reasoning_parser: xgrammar builtin name: "qwen", "harmony", "llama", etc.
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
         turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
@@ -116,6 +120,7 @@ class ModelSettings:
     preserve_thinking: Optional[bool] = None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
+    reasoning_effort_budgets: Optional[Dict[str, int]] = None  # Per-model reasoning_effort -> token budget override
     reasoning_parser: Optional[str] = None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
 
     # TurboQuant KV cache (mlx-vlm backend)

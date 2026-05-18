@@ -15,6 +15,9 @@ English version first. Chinese translation follows below.
 1. **`reasoning_content` / `content` separation in chat-completions response**
    *(was item 3 on the original list, promoted)*
 
+   **Status: shipped 2026-05-18.** Both shapes are live; see
+   `docs/reasoning-api.md`.
+
    Reasoning-capable models (Qwen3, DeepSeek V4, GPT-OSS, etc.) emit
    `<think>...</think>` blocks that today get glued into a single
    `message.content` string. Downstream agent loops have to parse the
@@ -30,6 +33,12 @@ English version first. Chinese translation follows below.
 
 2. **`reasoning_effort` / thinking budget control**
    *(was item 2 on the original list)*
+
+   **Status: shipped 2026-05-18.** OpenAI `reasoning_effort`
+   (`off`/`low`/`medium`/`high`), numeric `thinking_budget`, and
+   Anthropic `thinking.budget_tokens` are all live, with per-model
+   budget overrides via `ModelSettings.reasoning_effort_budgets`. See
+   `docs/reasoning-api.md`.
 
    Two complementary APIs in one feature:
 
@@ -185,6 +194,9 @@ English version first. Chinese translation follows below.
 1. **chat-completions response 里 `reasoning_content` / `content` 分离**
    *(原清单 #3, 提级)*
 
+   **状态: 2026-05-18 已 ship.** 两种 shape 都上线了, 见
+   `docs/reasoning-api.md`.
+
    推理模型 (Qwen3, DeepSeek V4, GPT-OSS 等) 产出的
    `<think>...</think>` 块现在被粘进单个 `message.content` 字符串.
    下游 agent loop 要手工解析标签, 一次漏解析整条循环就废. 修法
@@ -200,6 +212,12 @@ English version first. Chinese translation follows below.
 
 2. **`reasoning_effort` / 思考预算控制**
    *(原清单 #2)*
+
+   **状态: 2026-05-18 已 ship.** OpenAI `reasoning_effort`
+   (`off`/`low`/`medium`/`high`)、数字 `thinking_budget`、Anthropic
+   `thinking.budget_tokens` 都已上线, 并支持按模型用
+   `ModelSettings.reasoning_effort_budgets` 覆盖预算. 见
+   `docs/reasoning-api.md`.
 
    一个功能两套互补 API:
 

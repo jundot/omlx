@@ -274,3 +274,95 @@ class TestResolveThinkingBudget:
         req = MagicMock(spec=[])
         result = resolve(req, None)
         assert result is None
+
+    def test_reasoning_effort_maps_to_budget(self):
+        resolve = self._import_resolve()
+        for effort, expected in [("low", 512), ("medium", 2048), ("high", 8192)]:
+            req = MagicMock(spec=[])
+            req.reasoning_effort = effort
+            assert resolve(req, None) == expected
+
+    def test_reasoning_effort_off_returns_none(self):
+        resolve = self._import_resolve()
+        req = MagicMock(spec=[])
+        req.reasoning_effort = "off"
+        assert resolve(req, None) is None
+
+    def test_explicit_budget_beats_reasoning_effort(self):
+        resolve = self._import_resolve()
+        req = MagicMock(spec=[])
+        req.thinking_budget = 1024
+        req.reasoning_effort = "high"
+        assert resolve(req, None) == 1024
+
+
+# ---------------------------------------------------------------------------
+# _effort_to_budget (server.py helper)
+# ---------------------------------------------------------------------------
+
+
+class TestEffortToBudget:
+    """Test the reasoning_effort -> token budget mapping."""
+
+    def _import(self):
+        from omlx.server import _effort_to_budget
+        return _effort_to_budget
+
+    def test_default_table(self):
+        effort_to_budget = self._import()
+        assert effort_to_budget("low", None) == 512
+        assert effort_to_budget("medium", None) == 2048
+        assert effort_to_budget("high", None) == 8192
+
+    def test_off_and_none_have_no_budget(self):
+        effort_to_budget = self._import()
+        assert effort_to_budget("off", None) is None
+        assert effort_to_budget(None, None) is None
+
+    def test_per_model_override(self):
+        effort_to_budget = self._import()
+        ms = MagicMock(spec=["reasoning_effort_budgets"])
+        ms.reasoning_effort_budgets = {"high": 4096}
+        # Overridden key uses the model value, others fall back to default.
+        assert effort_to_budget("high", ms) == 4096
+        assert effort_to_budget("low", ms) == 512
+
+
+# ---------------------------------------------------------------------------
+# reasoning_effort request validation
+# ---------------------------------------------------------------------------
+
+
+class TestReasoningEffortValidation:
+    """Test ChatCompletionRequest.reasoning_effort validation."""
+
+    def _request(self):
+        from omlx.api.openai_models import ChatCompletionRequest
+        return ChatCompletionRequest
+
+    def test_accepts_known_levels(self):
+        ChatCompletionRequest = self._request()
+        for level in ["off", "low", "medium", "high"]:
+            req = ChatCompletionRequest(
+                model="m", messages=[], reasoning_effort=level
+            )
+            assert req.reasoning_effort == level
+
+    def test_normalises_case_and_whitespace(self):
+        ChatCompletionRequest = self._request()
+        req = ChatCompletionRequest(
+            model="m", messages=[], reasoning_effort="  HIGH "
+        )
+        assert req.reasoning_effort == "high"
+
+    def test_rejects_unknown_level(self):
+        ChatCompletionRequest = self._request()
+        with pytest.raises(ValueError):
+            ChatCompletionRequest(
+                model="m", messages=[], reasoning_effort="extreme"
+            )
+
+    def test_defaults_to_none(self):
+        ChatCompletionRequest = self._request()
+        req = ChatCompletionRequest(model="m", messages=[])
+        assert req.reasoning_effort is None
