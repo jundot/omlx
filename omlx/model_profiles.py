@@ -30,6 +30,7 @@ UNIVERSAL_PROFILE_FIELDS = (
     "enable_thinking",
     "thinking_budget_enabled",
     "thinking_budget_tokens",
+    "reasoning_effort_budgets",
     "reasoning_parser",
     "max_tool_result_tokens",
     "chat_template_kwargs",
@@ -53,6 +54,11 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "specprefill_keep_pct",
     "specprefill_threshold",
     "index_cache_freq",
+    # STT forced-aligner / diarization (STT models only)
+    "aligner_model",
+    "aligner_max_audio_seconds",
+    "default_aligner_overflow",
+    "default_diarize_quality",
 )
 
 # Excluded — never stored in a profile or template.
