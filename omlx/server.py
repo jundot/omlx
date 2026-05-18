@@ -2203,6 +2203,7 @@ async def create_chat_completion(
         response_format=response_format,
         chat_template_kwargs=merged_ct_kwargs or None,
         reasoning_parser=reasoning_parser,
+        enforce_required=_is_strict_json_schema(response_format),
     )
     # Fall back to prompt injection when grammar is not compiled
     if compiled_grammar is None and response_format:
@@ -2612,12 +2613,34 @@ def _compile_bare_grammar(compiler, fmt: dict):
     return None
 
 
+def _is_strict_json_schema(response_format) -> bool:
+    """True when ``response_format`` requests json_schema with ``strict=True``.
+
+    Accepts both a ``ResponseFormat`` model and a raw dict.  When strict, an
+    unenforceable schema is a hard error (HTTP 400) instead of a silent
+    degrade to prompt injection — callers pass the result as
+    ``enforce_required`` to :func:`_compile_grammar_for_request`.
+    """
+    if response_format is None:
+        return False
+    if isinstance(response_format, dict):
+        if response_format.get("type") != "json_schema":
+            return False
+        js = response_format.get("json_schema")
+        return bool(js.get("strict")) if isinstance(js, dict) else False
+    if getattr(response_format, "type", None) != "json_schema":
+        return False
+    js = getattr(response_format, "json_schema", None)
+    return bool(getattr(js, "strict", False)) if js is not None else False
+
+
 def _compile_grammar_for_request(
     engine: BaseEngine,
     structured_outputs=None,
     response_format=None,
     chat_template_kwargs=None,
     reasoning_parser=None,
+    enforce_required: bool = False,
 ):
     """Compile a grammar from structured_outputs or response_format.
 
@@ -2629,6 +2652,12 @@ def _compile_grammar_for_request(
     Returns a compiled grammar object or ``None``.  Raises
     :class:`HTTPException` on compilation errors or when xgrammar is
     required but not installed.
+
+    ``enforce_required`` makes a ``response_format`` request behave like
+    ``structured_outputs``: when the grammar cannot be compiled (no xgrammar,
+    or schema rejected) it raises HTTP 400 instead of returning ``None``.
+    Callers set it for ``json_schema`` requests with ``strict=True`` so a
+    strict request never silently degrades to prompt injection.
     """
     compiler = getattr(engine, 'grammar_compiler', None)
 
@@ -2637,7 +2666,7 @@ def _compile_grammar_for_request(
         return None
 
     if compiler is None:
-        if structured_outputs is not None:
+        if structured_outputs is not None or enforce_required:
             from omlx.utils.install import get_install_method
 
             method = get_install_method()
@@ -2667,7 +2696,7 @@ def _compile_grammar_for_request(
             )
         return _compile_bare_grammar(compiler, fmt)
     except Exception as e:
-        if structured_outputs is not None:
+        if structured_outputs is not None or enforce_required:
             raise HTTPException(
                 status_code=400,
                 detail=f"Grammar compilation error: {e}",
@@ -3939,6 +3968,7 @@ async def create_response(
                 engine, response_format=rf,
                 chat_template_kwargs=merged_ct_kwargs or None,
                 reasoning_parser=reasoning_parser,
+                enforce_required=_is_strict_json_schema(rf),
             )
             if compiled_grammar is None:
                 json_instruction = build_json_system_prompt(rf)
