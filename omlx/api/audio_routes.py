@@ -44,6 +44,21 @@ MIN_NATIVE_TTS_STREAMING_INTERVAL_SECONDS = 0.01
 # actual format from file content, not the extension.
 _VIDEO_CONTAINERS = {".mp4", ".mkv", ".mov", ".m4v", ".webm", ".avi"}
 
+# Forced aligners (e.g. Qwen3-ForcedAligner-0.6B) can only align audio up to a
+# fixed single-segment length; past it word timestamps silently clamp to the
+# window edge. The server rejects over-long alignment requests (HTTP 400) so
+# the caller splits the audio itself — it knows where silence / speaker turns
+# are. 300 s is the Qwen3-ForcedAligner model-card limit; the default gate is
+# 90% of it for margin (alignment quality already degrades before the cap).
+_ALIGNER_CARD_LIMIT_S = 300.0
+_DEFAULT_ALIGNER_MAX_AUDIO_S = _ALIGNER_CARD_LIMIT_S * 0.9  # 270 s
+
+# on_aligner_overflow: what to do when audio exceeds the aligner limit.
+# "error" (default) — reject with HTTP 400; "chunk" — opt in to server-side
+# windowed alignment. Inter-window overlap avoids cutting words at a boundary.
+_ALIGNER_OVERFLOW_VALUES = {"error", "chunk"}
+_ALIGNER_CHUNK_OVERLAP_S = 5.0
+
 
 # ---------------------------------------------------------------------------
 # Engine pool accessor — patched in tests via omlx.api.audio_routes._get_engine_pool
@@ -87,6 +102,157 @@ def _get_settings_manager():
     except Exception:
         return None
     return getattr(_server_state, "settings_manager", None)
+
+
+def _audio_duration_seconds(audio_path: str) -> Optional[float]:
+    """Return an audio file's duration in seconds, or None if unmeasurable.
+
+    None means the duration gate is skipped — better to let the aligner try
+    than to false-reject when the format cannot be probed.
+    """
+    try:
+        import soundfile as sf
+        return float(sf.info(audio_path).duration)
+    except Exception:
+        return None
+
+
+def _resolve_aligner_limit(aligner_model_id: str) -> float:
+    """Effective single-segment audio limit (seconds) for an aligner model.
+
+    The aligner model's ``aligner_max_audio_seconds`` setting, falling back
+    to ``_DEFAULT_ALIGNER_MAX_AUDIO_S``.
+    """
+    limit = _DEFAULT_ALIGNER_MAX_AUDIO_S
+    sm = _get_settings_manager()
+    if sm is not None:
+        try:
+            ms = sm.get_settings(aligner_model_id)
+            configured = getattr(ms, "aligner_max_audio_seconds", None) if ms else None
+            if configured and configured > 0:
+                limit = float(configured)
+        except Exception:
+            pass
+    return limit
+
+
+def _check_aligner_audio_length(aligner_model_id: str, audio_path: str, *,
+                                overflow: str,
+                                allow_chunk: bool) -> tuple[bool, float]:
+    """Check audio length against the forced aligner's single-segment limit.
+
+    Returns ``(should_chunk, limit)``. ``should_chunk`` is True only when the
+    audio is over-limit, ``overflow == "chunk"`` and ``allow_chunk`` — the
+    caller then aligns in windows. Raises HTTP 400 when the audio is
+    over-limit and chunking is not chosen or not available. Within the limit
+    (or when the duration cannot be probed) it returns ``(False, limit)``.
+    """
+    limit = _resolve_aligner_limit(aligner_model_id)
+    duration = _audio_duration_seconds(audio_path)
+    if duration is None or duration <= limit:
+        return (False, limit)
+    if overflow == "chunk" and allow_chunk:
+        return (True, limit)
+    hints = [
+        f"split the audio into segments of {limit:.0f}s or less and call "
+        f"once per segment"
+    ]
+    if allow_chunk:
+        hints.append("pass on_aligner_overflow=chunk to let the server "
+                     "split it (with re-ASR per window)")
+        hints.append("omit word_timestamps for a plain transcript")
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Audio is {duration:.0f}s, but the forced aligner "
+            f"'{aligner_model_id}' aligns at most {limit:.0f}s per request "
+            f"— word timestamps past that point would be truncated. "
+            + "; ".join(hints) + "."
+        ),
+    )
+
+
+def _stitch_aligner_windows(windows: list) -> list:
+    """Merge per-window forced-aligner word lists onto one timeline.
+
+    ``windows`` is an ordered list of ``(window_start_s, words)`` tuples,
+    where each ``words`` entry is a ``{word, start, end}`` dict with
+    window-relative times. Each window's times are offset by its start.
+    A word whose offset start falls before the previous window's last
+    word ended is treated as an overlap-region duplicate and dropped,
+    keeping the earlier window's copy.
+    """
+    merged: list = []
+    for start_s, words in windows:
+        for w in words:
+            ws = float(w["start"]) + start_s
+            we = float(w["end"]) + start_s
+            if merged and ws < merged[-1]["end"] - 0.05:
+                continue
+            merged.append({"word": w["word"], "start": ws, "end": we})
+    return merged
+
+
+async def _chunk_align(asr_engine, aligner_engine, audio_path: str, *,
+                       language, max_tokens, window_s: float) -> list:
+    """Align audio longer than the forced aligner's single-segment limit.
+
+    Only reached when the caller opted in via ``on_aligner_overflow=chunk``.
+    Splits ``audio_path`` into overlapping windows of ``window_s`` seconds;
+    for each window re-runs ASR to get a window-local reference transcript,
+    then runs the forced aligner on that window. Returns the stitched word
+    list with global timestamps.
+
+    Re-running ASR per window — rather than slicing the full transcript by
+    time — keeps each window's reference text matched to its own audio; the
+    aligner is unforgiving of text/audio drift. The cost (a second, chunked
+    ASR pass) is the documented price of opting into server-side chunking.
+    """
+    import os
+    import tempfile
+
+    import soundfile as sf
+
+    audio, sr = sf.read(audio_path, dtype="float32")
+    if getattr(audio, "ndim", 1) == 2:  # down-mix to mono for safety
+        audio = audio.mean(axis=1)
+    total_s = len(audio) / sr if sr else 0.0
+
+    step_s = max(1.0, window_s - _ALIGNER_CHUNK_OVERLAP_S)
+    starts: list = []
+    t = 0.0
+    while t < total_s:
+        starts.append(t)
+        t += step_s
+
+    windows: list = []
+    for start_s in starts:
+        end_s = min(start_s + window_s, total_s)
+        seg = audio[int(start_s * sr):int(end_s * sr)]
+        if len(seg) < int(0.1 * sr):  # skip sub-100ms slivers
+            continue
+        tf = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        tf.close()
+        try:
+            sf.write(tf.name, seg, sr, subtype="FLOAT")
+            asr_kwargs: dict = {"language": language}
+            if max_tokens is not None:
+                asr_kwargs["max_tokens"] = max_tokens
+            asr_res = await asr_engine.transcribe(tf.name, **asr_kwargs)
+            win_text = (asr_res.get("text") or "").strip()
+            if not win_text:
+                continue
+            align_res = await aligner_engine.transcribe(
+                tf.name, text=win_text, **asr_kwargs
+            )
+            windows.append((start_s, align_res.get("words") or []))
+        finally:
+            try:
+                os.unlink(tf.name)
+            except OSError:
+                pass
+
+    return _stitch_aligner_windows(windows)
 
 
 def _fmt_srt_time(t: float) -> str:
@@ -557,6 +723,7 @@ async def create_transcription(
     presence_context_size: Optional[int] = Form(None),
     max_tokens: Optional[int] = Form(None),
     word_timestamps: bool = Form(False),
+    on_aligner_overflow: Optional[str] = Form(None),
     n: int = Form(1),
     # ---- Diarization: Phase 1 energy backend for stereo+L/R, Phase 2 pyannote
     # for mono / multi-speaker / conference audio.
@@ -967,6 +1134,53 @@ async def create_transcription(
                 ),
             )
 
+        # Resolve aligner-overflow behaviour: request param > per-model
+        # default > "error". "error" rejects over-long audio with HTTP 400;
+        # "chunk" opts into server-side windowed alignment (auto-chain only).
+        effective_overflow = "error"
+        try:
+            _sm = _get_settings_manager()
+            _ms = _sm.get_settings(resolved_model) if _sm else None
+            _pm_overflow = getattr(_ms, "default_aligner_overflow", None) if _ms else None
+            if _pm_overflow in _ALIGNER_OVERFLOW_VALUES:
+                effective_overflow = _pm_overflow
+        except Exception:
+            pass
+        if on_aligner_overflow is not None:
+            if on_aligner_overflow not in _ALIGNER_OVERFLOW_VALUES:
+                raise HTTPException(
+                    status_code=400,
+                    detail="on_aligner_overflow must be 'error' or 'chunk'.",
+                )
+            effective_overflow = on_aligner_overflow
+
+        # Fail fast on audio too long for forced alignment — before burning
+        # ASR compute. The direct aligner call always errors (caller-supplied
+        # text cannot be split); the word_timestamps auto-chain errors, or
+        # chunks when on_aligner_overflow=chunk. Per-channel tripass files
+        # share the uploaded audio's duration, so checking tmp_path once
+        # covers all passes.
+        _align_should_chunk = False
+        _align_window_s = _DEFAULT_ALIGNER_MAX_AUDIO_S
+        if is_aligner:
+            _check_aligner_audio_length(
+                resolved_model, tmp_path,
+                overflow=effective_overflow, allow_chunk=False,
+            )
+        elif word_timestamps:
+            _auto_aligner = None
+            try:
+                _sm = _get_settings_manager()
+                _ms = _sm.get_settings(resolved_model) if _sm else None
+                _auto_aligner = getattr(_ms, "aligner_model", None) if _ms else None
+            except Exception:
+                pass
+            if _auto_aligner:
+                _align_should_chunk, _align_window_s = _check_aligner_audio_length(
+                    _resolve_model(_auto_aligner), tmp_path,
+                    overflow=effective_overflow, allow_chunk=True,
+                )
+
         async def _maybe_align_inplace(res: dict, audio_path: str) -> None:
             """Run the ASR's configured forced-aligner on `audio_path` to fill
             res["segments"][0]["words"] if word_timestamps was requested and
@@ -997,14 +1211,22 @@ async def create_transcription(
                 aligner_engine = await pool.get_engine(aligner_resolved)
                 if not isinstance(aligner_engine, STTEngine):
                     return
-                align_kwargs: dict = {"language": language}
-                if effective_max_tokens is not None:
-                    align_kwargs["max_tokens"] = effective_max_tokens
-                align_kwargs["text"] = res["text"]
-                align_result = await aligner_engine.transcribe(
-                    audio_path, **align_kwargs
-                )
-                words = align_result.get("words") or []
+                if _align_should_chunk:
+                    # Opted into server-side chunking via on_aligner_overflow.
+                    words = await _chunk_align(
+                        engine, aligner_engine, audio_path,
+                        language=language, max_tokens=effective_max_tokens,
+                        window_s=_align_window_s,
+                    )
+                else:
+                    align_kwargs: dict = {"language": language}
+                    if effective_max_tokens is not None:
+                        align_kwargs["max_tokens"] = effective_max_tokens
+                    align_kwargs["text"] = res["text"]
+                    align_result = await aligner_engine.transcribe(
+                        audio_path, **align_kwargs
+                    )
+                    words = align_result.get("words") or []
                 if not words:
                     return
                 segments = res.get("segments") or []

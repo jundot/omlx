@@ -918,6 +918,22 @@
                             <option :value="m.id" x-text="m.id" :selected="modelSettings.aligner_model === m.id"></option>
                         </template>
                     </select>
+                    <div class="min-w-0 pt-1">
+                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.aligner_max_audio') }}</span>
+                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.aligner_max_audio_hint') }}</p>
+                    </div>
+                    <input type="number" x-model.number="modelSettings.aligner_max_audio_seconds"
+                           placeholder="270" min="1" step="10"
+                           class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-black bg-white">
+                    <div class="min-w-0 pt-1">
+                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.aligner_overflow') }}</span>
+                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.aligner_overflow_hint') }}</p>
+                    </div>
+                    <select x-model="modelSettings.default_aligner_overflow"
+                            class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-black bg-white">
+                        <option value="">{{ t('modal.model_settings.aligner_overflow_error') }}</option>
+                        <option value="chunk">{{ t('modal.model_settings.aligner_overflow_chunk') }}</option>
+                    </select>
                 </div>
 
                 <!-- Actions -->

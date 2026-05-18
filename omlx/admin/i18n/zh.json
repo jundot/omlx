@@ -714,5 +714,11 @@
   "modal.model_settings.dflash_l2_requires_l1": "需要先启用内存缓存。",
   "modal.model_settings.aligner_model": "强制对齐器",
   "modal.model_settings.aligner_model_hint": "仅 STT 模型有效。设置后，对该模型调 <code class=\"text-xs bg-neutral-100 px-1 rounded\">/v1/audio/transcriptions</code> 带 <code class=\"text-xs bg-neutral-100 px-1 rounded\">word_timestamps=true</code>，server 会自动 chain 这个 aligner，在 <code class=\"text-xs bg-neutral-100 px-1 rounded\">segments[0].words</code> 里输出每字/词时间戳。Qwen3-ASR 系列必须靠它才能拿到 word timestamps（mlx-audio Qwen3-ASR 自己不返）。",
-  "modal.model_settings.aligner_model_placeholder": "不设 aligner（默认）"
+  "modal.model_settings.aligner_model_placeholder": "不设 aligner（默认）",
+  "modal.model_settings.aligner_max_audio": "对齐器最大音频时长（秒）",
+  "modal.model_settings.aligner_max_audio_hint": "仅强制对齐器模型有效。aligner 单次能对齐的最大音频时长（秒）。超过该时长的 word_timestamps 请求会被 HTTP 400 拒绝，而不是返回被截断的时间戳——调用方需自行切分音频。留空 = server 默认值（270s，即 Qwen3-ForcedAligner 模型卡 300s 上限的 90%）。",
+  "modal.model_settings.aligner_overflow": "长音频超限处理",
+  "modal.model_settings.aligner_overflow_hint": "word_timestamps 请求音频超过 aligner 上限时的默认行为。每次请求可用 on_aligner_overflow 表单字段覆盖。设在 ASR 模型上。",
+  "modal.model_settings.aligner_overflow_error": "拒绝，返回 HTTP 400（默认）",
+  "modal.model_settings.aligner_overflow_chunk": "自动切段——server 切分音频"
 }

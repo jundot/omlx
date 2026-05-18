@@ -83,6 +83,12 @@ English version first. Chinese translation follows below.
 10. **BUG: word_timestamps truncated past ~5 min on long audio**
     *(added 2026-05-18 after a field report)*
 
+    **Status: fixed 2026-05-18.** Default is fail-loud — over-long
+    alignment requests get HTTP 400 instead of silent truncation. An
+    explicit opt-in (`on_aligner_overflow=chunk`, per-request or a
+    per-model default) enables server-side windowed alignment for
+    callers that want it.
+
     A correctness bug, not a feature — it silently corrupts the
     sales-call QC pipeline that the STT surface exists to serve.
 
@@ -106,21 +112,30 @@ English version first. Chinese translation follows below.
     Client-side cannot recover this — the upstream timestamps are
     genuinely missing.
 
-    Fix: chunk inside `_maybe_align_inplace` when audio exceeds the
-    aligner limit.
+    Fix: fail loud by default, opt-in chunking.
 
-    - detect duration > aligner single-segment cap (~300 s)
-    - split into ≤ 4 min windows with ~5 s inter-window overlap
-    - run the aligner per window — each window needs its *own*
-      reference text, so either slice the ASR transcript by segment
-      boundary or re-run ASR per window (re-ASR is simpler and the ASR
-      chunk loop already exists; slicing risks misaligned text)
-    - offset each window's `word.start/end` by the window start
-    - de-duplicate the overlap region (word text + adjacent timestamp)
-    - return unified timestamps — transparent to the caller
+    - `on_aligner_overflow` — request form field (`error` | `chunk`),
+      with a per-model `default_aligner_overflow` default. `error`
+      (the default) rejects over-long audio with HTTP 400 before
+      burning ASR compute; `chunk` opts into server-side windowed
+      alignment.
+    - the limit is a per-model `aligner_max_audio_seconds` on the
+      aligner model (admin-UI configurable; default 90% of the 300 s
+      model-card limit = 270 s).
+    - `chunk` mode splits the audio into overlapping windows, re-runs
+      ASR per window for a window-local reference transcript, aligns
+      each, and stitches the timelines. This costs a second ASR pass
+      and slightly drifts the `words` text from the canonical
+      transcript — which is why it is opt-in, not default.
+    - the direct aligner-model call always errors when over-limit —
+      the caller-supplied reference text cannot be split.
+    - if the audio duration cannot be probed, the gate is skipped.
 
-    Estimate ~150–250 LOC + tests. The per-window reference text is the
-    real complexity; chunk-and-offset alone is easy.
+    Auto-chunking is deliberately not the default: it hides the
+    aligner's real limit, doubles ASR cost, and drifts the words text.
+    Splitting long audio cleanly (at silence / speaker turns) is best
+    done by the caller — so the default is honest failure, and
+    server-side chunking is there only when explicitly requested.
 
     Repro:
 
@@ -309,6 +324,10 @@ English version first. Chinese translation follows below.
 10. **BUG: 长音频超 ~5min 后 word_timestamps 被截断**
     *(2026-05-18 据一次实地报告加上)*
 
+    **状态: 2026-05-18 已修.** 默认 fail-loud —— 超长对齐请求抛
+    HTTP 400, 不再静默截断. 另有显式 opt-in (`on_aligner_overflow=chunk`,
+    请求级或 per-model 默认), 给想要的调用方启用服务端切段对齐.
+
     这是正确性 bug, 不是 feature —— 它静默损坏 STT 面本来要服务的
     销售通话质检 pipeline.
 
@@ -328,19 +347,24 @@ English version first. Chinese translation follows below.
 
     客户端救不回 —— 上游时间戳是真缺失.
 
-    修复: 在 `_maybe_align_inplace` 里, 音频超 aligner 上限时切段.
+    修复: 默认 fail loud, opt-in 切段.
 
-    - 检测时长 > aligner 单段上限 (~300s)
-    - 切成 ≤4min window, window 间 ~5s overlap
-    - 每个 window 单独跑 aligner —— 每段需要**自己的**参考 text, 所以
-      要么按 ASR segment 边界切 text, 要么每段重跑 ASR (重跑 ASR 更
-      简单, ASR 的 chunk loop 现成; 切 text 有错位风险)
-    - 每个 window 的 `word.start/end` 加上 window 起始 offset
-    - overlap 区去重 (按 word 文本 + 相邻时间戳判断)
-    - 返回统一时间戳 —— 对调用方透明
+    - `on_aligner_overflow` —— 请求 form 字段 (`error` | `chunk`), 配
+      per-model 默认 `default_aligner_overflow`. `error` (默认) 在烧
+      ASR 算力之前就以 HTTP 400 拒掉超长音频; `chunk` 才启用服务端
+      切段对齐.
+    - 上限是 aligner 模型上的 per-model `aligner_max_audio_seconds`
+      (admin UI 可配; 默认 300s 模型卡上限的 90% = 270s).
+    - `chunk` 模式把音频切成有重叠的 window, 每段重跑 ASR 拿 window
+      本地参考转写、各自对齐, 再拼时间线. 这要多花一趟 ASR、且 `words`
+      文本会和 canonical 转写轻微漂移 —— 所以是 opt-in 而非默认.
+    - 直接调 aligner model 的路径超长时永远报错 —— 调用方传的参考
+      text 没法切.
+    - 探测不到音频时长时跳过该 gate.
 
-    估 ~150-250 LOC + 测试. 真正的复杂点是每段的参考 text; 单纯
-    切段 + offset 很简单.
+    auto-chunk 故意不做默认: 它把 aligner 真实上限藏起来、ASR 成本
+    翻倍、words 文本漂移. 干净地切长音频 (按静音/换人) 调用方做得最
+    好 —— 所以默认是诚实报错, 服务端切段只在显式请求时才走.
 
     复现:
 

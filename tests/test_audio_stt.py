@@ -794,3 +794,199 @@ class TestSTTIntegration:
             asyncio.run(engine.stop())
         except Exception as e:
             pytest.skip(f"Could not run integration test: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Forced-aligner overflow handling — fail loud or opt-in chunk (roadmap P0 #10)
+# ---------------------------------------------------------------------------
+
+from fastapi import HTTPException  # noqa: E402
+
+
+class TestCheckAlignerAudioLength:
+    """Over-limit audio errors, or signals chunking when opted in."""
+
+    def _check(self):
+        from omlx.api.audio_routes import _check_aligner_audio_length
+        return _check_aligner_audio_length
+
+    def test_rejects_over_limit_when_overflow_error(self):
+        check = self._check()
+        with patch("omlx.api.audio_routes._audio_duration_seconds",
+                   return_value=480.0), \
+             patch("omlx.api.audio_routes._get_settings_manager",
+                   return_value=None):
+            with pytest.raises(HTTPException) as exc:
+                check("Qwen3-ForcedAligner-0.6B", "/tmp/long.wav",
+                      overflow="error", allow_chunk=True)
+        assert exc.value.status_code == 400
+        assert "split" in exc.value.detail.lower()
+
+    def test_signals_chunk_when_overflow_chunk(self):
+        check = self._check()
+        with patch("omlx.api.audio_routes._audio_duration_seconds",
+                   return_value=480.0), \
+             patch("omlx.api.audio_routes._get_settings_manager",
+                   return_value=None):
+            should_chunk, limit = check(
+                "Qwen3-ForcedAligner-0.6B", "/tmp/long.wav",
+                overflow="chunk", allow_chunk=True,
+            )
+        assert should_chunk is True
+        assert limit == 270.0
+
+    def test_chunk_unavailable_still_errors(self):
+        # Direct aligner call: caller-supplied text cannot be split, so
+        # chunk mode is unavailable and over-limit audio still 400s.
+        check = self._check()
+        with patch("omlx.api.audio_routes._audio_duration_seconds",
+                   return_value=480.0), \
+             patch("omlx.api.audio_routes._get_settings_manager",
+                   return_value=None):
+            with pytest.raises(HTTPException):
+                check("Qwen3-ForcedAligner-0.6B", "/tmp/long.wav",
+                      overflow="chunk", allow_chunk=False)
+
+    def test_within_limit_returns_no_chunk(self):
+        check = self._check()
+        with patch("omlx.api.audio_routes._audio_duration_seconds",
+                   return_value=120.0), \
+             patch("omlx.api.audio_routes._get_settings_manager",
+                   return_value=None):
+            should_chunk, _limit = check(
+                "Qwen3-ForcedAligner-0.6B", "/tmp/short.wav",
+                overflow="error", allow_chunk=True,
+            )
+        assert should_chunk is False
+
+    def test_skips_gate_when_duration_unknown(self):
+        check = self._check()
+        with patch("omlx.api.audio_routes._audio_duration_seconds",
+                   return_value=None), \
+             patch("omlx.api.audio_routes._get_settings_manager",
+                   return_value=None):
+            should_chunk, _limit = check(
+                "Qwen3-ForcedAligner-0.6B", "/tmp/weird.mp3",
+                overflow="error", allow_chunk=True,
+            )
+        assert should_chunk is False
+
+    def test_per_model_limit_override(self):
+        check = self._check()
+        sm = MagicMock()
+        sm.get_settings.return_value = SimpleNamespace(
+            aligner_max_audio_seconds=600.0
+        )
+        with patch("omlx.api.audio_routes._audio_duration_seconds",
+                   return_value=480.0), \
+             patch("omlx.api.audio_routes._get_settings_manager",
+                   return_value=sm):
+            should_chunk, limit = check(
+                "Qwen3-ForcedAligner-0.6B", "/tmp/long.wav",
+                overflow="error", allow_chunk=True,
+            )
+        assert should_chunk is False  # 480 < 600
+        assert limit == 600.0
+
+    def test_default_limit_is_90pct_of_card(self):
+        from omlx.api.audio_routes import (
+            _ALIGNER_CARD_LIMIT_S,
+            _DEFAULT_ALIGNER_MAX_AUDIO_S,
+        )
+        assert _ALIGNER_CARD_LIMIT_S == 300.0
+        assert _DEFAULT_ALIGNER_MAX_AUDIO_S == 270.0
+
+
+class TestStitchAlignerWindows:
+    """_stitch_aligner_windows: offset + overlap dedup (pure function)."""
+
+    def _stitch(self):
+        from omlx.api.audio_routes import _stitch_aligner_windows
+        return _stitch_aligner_windows
+
+    def test_empty(self):
+        assert self._stitch()([]) == []
+
+    def test_offsets_window_relative_times(self):
+        stitch = self._stitch()
+        out = stitch([
+            (0.0, [{"word": "a", "start": 1.0, "end": 1.5}]),
+            (235.0, [{"word": "b", "start": 2.0, "end": 2.5}]),
+        ])
+        assert [w["word"] for w in out] == ["a", "b"]
+        assert out[1]["start"] == 237.0 and out[1]["end"] == 237.5
+
+    def test_drops_overlap_duplicates(self):
+        stitch = self._stitch()
+        out = stitch([
+            (0.0, [{"word": "x", "start": 238.0, "end": 239.0}]),
+            (235.0, [
+                {"word": "dup", "start": 1.0, "end": 1.5},   # global 236.0
+                {"word": "new", "start": 10.0, "end": 10.5},  # global 245.0
+            ]),
+        ])
+        assert [w["word"] for w in out] == ["x", "new"]
+
+
+class TestChunkAlign:
+    """_chunk_align splits long audio, re-ASRs, and aligns per window."""
+
+    def test_stitches_three_windows(self):
+        import asyncio
+        import sys
+
+        import numpy as np
+
+        fake_sf = MagicMock()
+        # 480 s of audio at sr=1000; window 240 s, step 235 s -> 3 windows.
+        fake_sf.read.return_value = (np.zeros(480_000, dtype="float32"), 1000)
+
+        asr = MagicMock()
+        asr.transcribe = AsyncMock(return_value={"text": "hello world"})
+        aligner = MagicMock()
+        aligner.transcribe = AsyncMock(return_value={
+            "words": [{"word": "hi", "start": 1.0, "end": 1.4}],
+        })
+
+        with patch.dict(sys.modules, {"soundfile": fake_sf}):
+            from omlx.api.audio_routes import _chunk_align
+            words = asyncio.run(_chunk_align(
+                asr, aligner, "/tmp/long.wav",
+                language="zh", max_tokens=None, window_s=240.0,
+            ))
+
+        assert [w["start"] for w in words] == [1.0, 236.0, 471.0]
+        assert asr.transcribe.await_count == 3
+        assert aligner.transcribe.await_count == 3
+        # The aligner must receive a per-window reference transcript.
+        for call in aligner.transcribe.await_args_list:
+            assert call.kwargs.get("text") == "hello world"
+
+    def test_skips_window_with_no_asr_text(self):
+        import asyncio
+        import sys
+
+        import numpy as np
+
+        fake_sf = MagicMock()
+        fake_sf.read.return_value = (np.zeros(480_000, dtype="float32"), 1000)
+
+        asr = MagicMock()
+        # Middle window transcribes to blank — skipped, not aligned.
+        asr.transcribe = AsyncMock(side_effect=[
+            {"text": "a"}, {"text": "   "}, {"text": "c"},
+        ])
+        aligner = MagicMock()
+        aligner.transcribe = AsyncMock(return_value={
+            "words": [{"word": "w", "start": 0.5, "end": 0.9}],
+        })
+
+        with patch.dict(sys.modules, {"soundfile": fake_sf}):
+            from omlx.api.audio_routes import _chunk_align
+            words = asyncio.run(_chunk_align(
+                asr, aligner, "/tmp/long.wav",
+                language="zh", max_tokens=None, window_s=240.0,
+            ))
+
+        assert aligner.transcribe.await_count == 2
+        assert [w["start"] for w in words] == [0.5, 470.5]

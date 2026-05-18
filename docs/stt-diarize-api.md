@@ -69,6 +69,7 @@ The `auto` dispatcher resolves as follows:
 |---|---|---|---|
 | `language` | string | (auto) | `zh`, `en`, … — recommended to set explicitly |
 | `word_timestamps` | bool | `false` | Auto-enabled when diarize backend ≠ `none` or `auto`-resolved-to-`none` |
+| `on_aligner_overflow` | string | `error` | `error` or `chunk` — what to do when audio exceeds the forced aligner's length limit (see limitation 6) |
 | `response_format` | string | `json` | `json`, `verbose_json`, `text`, `srt`, `vtt` |
 | `prompt` | string | | ASR-specific bias prompt, passed straight to the model |
 | `temperature` | float | `0` | Greedy by default; >0 only when ASR loops on quasi-silent input |
@@ -429,6 +430,29 @@ close.
    into coherent turns. Server-side because the model is already
    loaded on the same host.
 
+6. **Forced-aligner audio length limit.** A forced aligner aligns
+   audio only up to a fixed single-segment length (the
+   `Qwen3-ForcedAligner` model card states 300 s). The limit is the
+   aligner model's `aligner_max_audio_seconds` setting (configurable in
+   the admin UI; default 270 s, i.e. 90% of the card limit).
+
+   By default, a `word_timestamps=true` request — or a direct
+   aligner-model call — on longer audio is rejected with **HTTP 400**
+   rather than returning timestamps truncated to the first window.
+
+   `on_aligner_overflow=chunk` (or a per-model `default_aligner_overflow`
+   setting) opts into server-side handling: the server splits the audio
+   into overlapping windows, re-runs ASR per window, aligns each, and
+   stitches the timelines. This costs a second ASR pass and slightly
+   drifts the `words` text from the canonical transcript, so it is
+   opt-in. The direct aligner-model call cannot chunk (the supplied
+   reference text cannot be split) and always errors when over-limit.
+
+   Otherwise, split long recordings into segments under the limit and
+   call once per segment, or omit `word_timestamps` for a plain
+   transcript. Plain ASR (without `word_timestamps`) is unaffected — it
+   chunks internally and handles arbitrarily long audio.
+
 ---
 
 ## 中文
@@ -489,6 +513,7 @@ Authorization: Bearer <api_key>
 |---|---|---|---|
 | `language` | string | (自动) | `zh`, `en`, … 推荐显式指定 |
 | `word_timestamps` | bool | `false` | diarize backend 非 `none` 时自动启 |
+| `on_aligner_overflow` | string | `error` | `error` 或 `chunk` —— 音频超过 forced aligner 时长上限时怎么处理 (见限制 6) |
 | `response_format` | string | `json` | `json` / `verbose_json` / `text` / `srt` / `vtt` |
 | `prompt` | string | | ASR-specific bias prompt, 直接透传给模型 |
 | `temperature` | float | `0` | 默认 greedy; >0 仅当 ASR 在准静音输入上循环时启用 |
@@ -812,3 +837,22 @@ pass 的标点 — 这正是 LLM 后处理层要补回的标点缺失.
    diarize 之后串一次 LLM 清洗. 过滤幻觉 + 补回标点 + 按语义重映射
    speaker + 合并碎 segment 成顺畅 turn. 服务端而不是客户端做, 因为
    LLM 模型已经在同一台服务器上加载着了.
+
+6. **强制对齐器的音频时长上限.** forced aligner 单次只能对齐固定长度
+   以内的音频 (`Qwen3-ForcedAligner` 模型卡写的是 300s). 上限是
+   aligner 模型的 `aligner_max_audio_seconds` 设置 (admin UI 可配;
+   默认 270s, 即模型卡上限的 90%).
+
+   默认情况下, 对更长音频发 `word_timestamps=true` 请求 —— 或直接调
+   aligner model —— 会被 **HTTP 400** 拒绝, 而不是返回截断到第一个
+   window 的时间戳.
+
+   `on_aligner_overflow=chunk` (或 per-model 的 `default_aligner_overflow`
+   设置) 启用服务端处理: server 把音频切成有重叠的 window, 每段重跑
+   ASR、各自对齐、再拼时间线. 这要多花一趟 ASR、`words` 文本也会和
+   canonical 转写轻微漂移, 所以是 opt-in. 直接调 aligner model 的路径
+   没法切 (传入的参考 text 切不了), 超长时永远报错.
+
+   不想用切段就把长录音切成上限以内的段、每段调一次, 或者去掉
+   `word_timestamps` 取纯转写. 纯 ASR (不带 `word_timestamps`) 不受
+   影响 —— 它内部会切段, 任意长音频都能处理.

@@ -152,6 +152,11 @@ class ModelSettingsRequest(BaseModel):
     # auto-chains this aligner on the (audio, ASR transcript) pair and
     # populates segments[0].words with per-character/word timestamps.
     aligner_model: str | None = None
+    # Forced-aligner single-segment audio limit (seconds); set on the aligner
+    # model. word_timestamps requests on longer audio are rejected with 400.
+    aligner_max_audio_seconds: float | None = None
+    # Default over-limit behaviour: "error" (reject) or "chunk" (server splits).
+    default_aligner_overflow: str | None = None
     # "standard" (or None) keeps the cheap 1-pass energy backend on stereo +
     # L/R speakers; "high" auto-upgrades to 3-pass energy_tripass (3x ASR).
     # Per-request diarize_backend always wins over this preference.
@@ -1685,6 +1690,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "vlm_mtp_draft_model": settings.vlm_mtp_draft_model,
                 "vlm_mtp_draft_block_size": settings.vlm_mtp_draft_block_size,
                 "aligner_model": settings.aligner_model,
+                "aligner_max_audio_seconds": settings.aligner_max_audio_seconds,
+                "default_aligner_overflow": settings.default_aligner_overflow,
                 "default_diarize_quality": settings.default_diarize_quality,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
@@ -1951,6 +1958,19 @@ async def update_model_settings(
         current_settings.dflash_draft_model = request.dflash_draft_model or None
     if "aligner_model" in sent:
         current_settings.aligner_model = request.aligner_model or None
+    if "aligner_max_audio_seconds" in sent:
+        current_settings.aligner_max_audio_seconds = (
+            request.aligner_max_audio_seconds
+            if request.aligner_max_audio_seconds
+            and request.aligner_max_audio_seconds > 0
+            else None
+        )
+    if "default_aligner_overflow" in sent:
+        current_settings.default_aligner_overflow = (
+            request.default_aligner_overflow
+            if request.default_aligner_overflow in ("error", "chunk")
+            else None
+        )
     if "default_diarize_quality" in sent:
         # Normalize: empty / unknown values reset to None (= "standard"
         # behavior). Only "high" actually enables tripass auto-upgrade.

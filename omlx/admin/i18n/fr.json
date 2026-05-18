@@ -691,5 +691,11 @@
   "js.success.settings_saved": "Paramètres enregistrés avec succès",
   "modal.model_settings.aligner_model": "Forced Aligner",
   "modal.model_settings.aligner_model_hint": "STT models only. When set, calling <code class=\"text-xs bg-neutral-100 px-1 rounded\">/v1/audio/transcriptions</code> on this model with <code class=\"text-xs bg-neutral-100 px-1 rounded\">word_timestamps=true</code> auto-chains the configured aligner and returns per-word/char timestamps in <code class=\"text-xs bg-neutral-100 px-1 rounded\">segments[0].words</code>. Required for Qwen3-ASR family — mlx-audio Qwen3-ASR does not produce word timestamps on its own.",
-  "modal.model_settings.aligner_model_placeholder": "No aligner (default)"
+  "modal.model_settings.aligner_model_placeholder": "No aligner (default)",
+  "modal.model_settings.aligner_max_audio": "Aligner Max Audio (s)",
+  "modal.model_settings.aligner_max_audio_hint": "Forced-aligner models only. Maximum audio length, in seconds, the aligner can align in one request. word_timestamps requests on longer audio are rejected with HTTP 400 instead of returning truncated timestamps — the caller must split the audio. Empty = server default (270s, 90% of the Qwen3-ForcedAligner 300s model-card limit).",
+  "modal.model_settings.aligner_overflow": "Long-Audio Overflow",
+  "modal.model_settings.aligner_overflow_hint": "Default behaviour when a word_timestamps request exceeds the aligner audio limit. A per-request on_aligner_overflow form field overrides this. Set on the ASR model.",
+  "modal.model_settings.aligner_overflow_error": "Reject with HTTP 400 (default)",
+  "modal.model_settings.aligner_overflow_chunk": "Auto-chunk — server splits the audio"
 }

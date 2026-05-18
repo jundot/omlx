@@ -1587,6 +1587,8 @@
                     vlm_mtp_draft_model: settings.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: settings.vlm_mtp_draft_block_size ?? null,
                     aligner_model: settings.aligner_model || '',
+                    aligner_max_audio_seconds: settings.aligner_max_audio_seconds ?? null,
+                    default_aligner_overflow: settings.default_aligner_overflow || '',
                     ctKwargEntries,
                     trust_remote_code: settings.trust_remote_code || false,
                 };
@@ -1704,6 +1706,8 @@
                                     ? parseInt(this.modelSettings.vlm_mtp_draft_block_size)
                                     : null,
                                 aligner_model: this.modelSettings.aligner_model || null,
+                                aligner_max_audio_seconds: this.modelSettings.aligner_max_audio_seconds || null,
+                                default_aligner_overflow: this.modelSettings.default_aligner_overflow || null,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
                             };
                         })()),

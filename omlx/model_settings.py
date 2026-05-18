@@ -174,6 +174,23 @@ class ModelSettings:
     # model returns only coarse segment-level times).
     aligner_model: Optional[str] = None
 
+    # Forced-aligner single-segment audio limit, in seconds. A forced aligner
+    # (e.g. Qwen3-ForcedAligner-0.6B) can only align audio up to a fixed
+    # length — past it, word timestamps silently clamp to the window edge.
+    # Set this on the *aligner* model. When a word_timestamps request would
+    # send audio longer than this to the aligner, the server rejects it with
+    # HTTP 400 rather than returning truncated timestamps; the caller must
+    # split the audio itself. None = server default (90% of the
+    # Qwen3-ForcedAligner 300 s model-card limit = 270 s).
+    aligner_max_audio_seconds: Optional[float] = None
+
+    # Default behaviour when word_timestamps audio exceeds the aligner limit.
+    # Set on the *ASR* model (the one word_timestamps is called on).
+    #   None / "error" — reject the request with HTTP 400 (caller splits)
+    #   "chunk"        — server splits the audio into windows and aligns each
+    # A per-request ``on_aligner_overflow`` form field overrides this.
+    default_aligner_overflow: Optional[str] = None
+
     # Diarization quality preference for the ``auto`` backend routing on
     # /v1/audio/transcriptions. Values:
     #   None / "standard" — keep the 1-pass energy backend on stereo +
