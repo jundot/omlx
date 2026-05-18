@@ -377,10 +377,15 @@ class TestVLMFallback:
             side_effect=Exception("Missing vision_tower parameters")
         )
         mock_vlm_engine.stop = AsyncMock()
+        # A bare MagicMock answers hasattr() for any name, so _load_engine's
+        # Path A duck-type check `hasattr(engine, "_dflash_bundle")` would
+        # misclassify this plain VLM engine as a DFlash engine. Drop the attr.
+        del mock_vlm_engine._dflash_bundle
 
         # Batched engine that succeeds
         mock_batched_engine = MagicMock()
         mock_batched_engine.start = AsyncMock()
+        del mock_batched_engine._dflash_bundle
 
         with patch(
             "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
@@ -433,10 +438,14 @@ class TestVLMFallback:
             )
         )
         mock_batched_engine.stop = AsyncMock()
+        # Plain engines must not look like a DFlash engine to the Path A
+        # duck-type check in _load_engine (hasattr would be True on a Mock).
+        del mock_batched_engine._dflash_bundle
 
         # VLMBatchedEngine succeeds
         mock_vlm_engine = MagicMock()
         mock_vlm_engine.start = AsyncMock()
+        del mock_vlm_engine._dflash_bundle
 
         with patch(
             "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
