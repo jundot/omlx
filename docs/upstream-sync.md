@@ -31,13 +31,19 @@ commit)。
   (基于 `main` @ `0d28e26`)。已 push 到 origin,在 m2max `~/Code/omlx`
   的 `.venv` 跑过 `pytest`:
   - 7 个 PR 直接相关的 4 个测试文件:**248 / 248 pass**。
-  - 完整套件 **4403 pass / 12 fail**。12 个 fail 全部在 `main` 上也 fail
-    —— cherry-pick **零回归**。该 suite 有很重的 ordering / 内存污染
-    (`main` 自己完整套件跑出 47 fail;两个 suspect test 单独跑都 pass,
-    full-suite 才 flake)。pre-existing fail 集对应上游 issue #1259。
+  - 初次完整套件 **4403 pass / 12 fail**;12 个 fail 全部在 `main` 上也 fail
+    —— cherry-pick **零回归**。pre-existing fail 集对应上游 issue #1259。
   - 顺带修了一个 `main` 既有 bug:`list_models` 的显式 settings dict
     漏了 4 个 `ModelSettings` 字段(`e3f0912`)。
+  - **12 个 pre-existing fail 已全部修掉**(见下「上游 issue 处理记录」
+    #1259 + flyto-divergence stale test):cherry-pick 上游 #1268/#1286/
+    #1287 修 6 个,flyto 自己改 4 个(model_profiles 漏分类字段、
+    server_manager auto-restart cap、`_prepare_vision_inputs` audios kwarg、
+    engine_pool MagicMock 误判 DFlash),2 个 full-suite 污染 flake 也修了
+    (`test_includes_python_heap` 加大分配防 allocator 复用)。
+    **最终完整套件:4415 pass / 0 fail**(2026-05-18 m2max)。
   - **仍未并回 main**,等人工 review 后 `git merge --ff-only`。
+  - #1241(structured output strict enforcement)同批修复 —— 见下。
 
 ## 已引入(cherry-picked)
 
@@ -111,9 +117,21 @@ Qwen-Gemma / oQ)的相关度。
 记录 flyto 修掉的、与上游 issue 对应的问题(flyto 自身 bug 见
 `docs/roadmap.md`)。
 
-- **#1259** "some failing tests" —— flyto 已引入 #1244 的测试修复
-  (`cdaec79`),覆盖其中一部分;上游 #1268/#1286/#1287 是其余 follow-up,
-  见上面"待引入"。
+- **#1259** "some failing tests" —— **已全部解决**(2026-05-18,分支
+  `sync/upstream-prs-2026-05-18`)。flyto 完整套件初始 12 个 fail:
+  - cherry-pick 上游 #1244(`cdaec79`,早先)+ #1268 / #1286 / #1287
+    修掉 6 个(profiles 字段分类、Scheduler/Memory `to_dict`、
+    `test_mlx_lm_mtp_patch`、`test_vlm_torch_free_image_processor`)。
+  - 另 4 个是 flyto 自身 divergence 的 stale test,上游 PR 不覆盖,
+    flyto 自己改:`model_profiles` 补分类 `dflash_max_concurrent` /
+    `dflash_kv_pressure_threshold`;`test_omlx_app` 跟进 server_manager
+    auto-restart cap 3→10000(`3bed072`);`test_vlm_engine` 跟进
+    `_prepare_vision_inputs` 的 `audios` kwarg;`test_engine_pool`
+    的 MagicMock 被 Path A 的 `hasattr(engine,"_dflash_bundle")`
+    duck-type 误判成 DFlash engine,给 mock `del _dflash_bundle`。
+  - 2 个 full-suite ordering/内存污染 flake 也修:`test_includes_python_heap`
+    加大分配额防 allocator page 复用。
+  - 结果:**4415 pass / 0 fail**。
 - **#1241** `response_format json_schema strict` 不强制 —— flyto 在
   `sync/upstream-prs-2026-05-18` 分支上自己修(上游 issue 开着没修):
   - 根因有两层:① 服务器 venv 没装 xgrammar(可选依赖)→ `grammar_compiler`
