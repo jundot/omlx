@@ -2224,11 +2224,16 @@ async def create_chat_completion(
     # enforced at the logit level (grammar) or only soft-injected into the
     # prompt. strict:true + unenforceable already raised 400 above, so a
     # None grammar here means strict was false — a deliberate soft degrade.
+    # 'enforced-risky' flags a grammar that was enforced but whose schema
+    # has non-ASCII forced literals (mojibake/truncation hazard).
     structured_output_headers = {}
     if response_format:
-        structured_output_headers["X-OMLX-Structured-Output"] = (
-            "enforced" if compiled_grammar is not None else "prompt-only"
-        )
+        if compiled_grammar is None:
+            structured_output_headers["X-OMLX-Structured-Output"] = "prompt-only"
+        elif _scan_schema_non_ascii_literals(response_format):
+            structured_output_headers["X-OMLX-Structured-Output"] = "enforced-risky"
+        else:
+            structured_output_headers["X-OMLX-Structured-Output"] = "enforced"
 
     # Merge MCP tools with user-provided tools
     effective_tools = request.tools
@@ -2670,6 +2675,54 @@ def _is_strict_json_schema(response_format) -> bool:
     return bool(getattr(js, "strict", False)) if js is not None else False
 
 
+def _scan_schema_non_ascii_literals(response_format) -> list:
+    """Non-ASCII string literals a json_schema forces into the grammar.
+
+    Object property names, enum values and const values become *forced
+    literals* in the compiled grammar. Multi-byte UTF-8 in such literals
+    triggers character corruption (mojibake) and early truncation under
+    grammar-constrained decoding — xgrammar drives the model down a
+    byte-token path that yields ill-formed UTF-8, desyncing the parse
+    state. Returns the offending literals (deduped) so callers can warn;
+    ASCII property names / enum values avoid the issue entirely.
+    """
+    if response_format is None:
+        return []
+    if isinstance(response_format, dict):
+        js = response_format.get("json_schema")
+        schema = js.get("schema") if isinstance(js, dict) else None
+    else:
+        js = getattr(response_format, "json_schema", None)
+        schema = getattr(js, "schema_", None) if js is not None else None
+    if not isinstance(schema, (dict, list)):
+        return []
+
+    found = []
+
+    def _non_ascii(s):
+        return isinstance(s, str) and any(ord(c) > 0x7f for c in s)
+
+    def _walk(node):
+        if isinstance(node, dict):
+            props = node.get("properties")
+            if isinstance(props, dict):
+                found.extend(k for k in props if _non_ascii(k))
+            enum = node.get("enum")
+            if isinstance(enum, list):
+                found.extend(v for v in enum if _non_ascii(v))
+            if _non_ascii(node.get("const")):
+                found.append(node["const"])
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                _walk(v)
+
+    _walk(schema)
+    seen = set()
+    return [x for x in found if not (x in seen or seen.add(x))]
+
+
 def _compile_grammar_for_request(
     engine: BaseEngine,
     structured_outputs=None,
@@ -2726,6 +2779,16 @@ def _compile_grammar_for_request(
         return None
 
     try:
+        if response_format is not None:
+            risky = _scan_schema_non_ascii_literals(response_format)
+            if risky:
+                logger.warning(
+                    "response_format json_schema has non-ASCII forced "
+                    "literal(s) %s — grammar-constrained decoding can corrupt "
+                    "multi-byte UTF-8 (mojibake / early truncation). Use ASCII "
+                    "property names and enum values.",
+                    risky,
+                )
         if reasoning_parser:
             return _compile_with_structural_tag(
                 compiler, fmt, reasoning_parser, chat_template_kwargs,
