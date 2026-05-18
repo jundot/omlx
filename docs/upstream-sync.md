@@ -28,8 +28,16 @@ commit)。
 - **2026-05-18 (一)** — 对齐 `upstream/main` @ `51907f0`
 - **2026-05-18 (二)** — review 上游 71 个 open PR + 74 个 open issue。
   挑出 7 个 PR cherry-pick 到分支 `sync/upstream-prs-2026-05-18`
-  (基于 `main` @ `0d28e26`,**尚未并回 main** —— 等 m5max 上 `pytest`
-  跑过再 fast-forward;本机 Linux 无 mlx 跑不了测试,仅做了 `ast` 语法检查)。
+  (基于 `main` @ `0d28e26`)。已 push 到 origin,在 m2max `~/Code/omlx`
+  的 `.venv` 跑过 `pytest`:
+  - 7 个 PR 直接相关的 4 个测试文件:**248 / 248 pass**。
+  - 完整套件 **4403 pass / 12 fail**。12 个 fail 全部在 `main` 上也 fail
+    —— cherry-pick **零回归**。该 suite 有很重的 ordering / 内存污染
+    (`main` 自己完整套件跑出 47 fail;两个 suspect test 单独跑都 pass,
+    full-suite 才 flake)。pre-existing fail 集对应上游 issue #1259。
+  - 顺带修了一个 `main` 既有 bug:`list_models` 的显式 settings dict
+    漏了 4 个 `ModelSettings` 字段(`e3f0912`)。
+  - **仍未并回 main**,等人工 review 后 `git merge --ff-only`。
 
 ## 已引入(cherry-picked)
 
