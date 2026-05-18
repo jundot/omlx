@@ -297,6 +297,14 @@ async def verify_api_key(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
+    # Startup: report structured-output enforcement capability up front, so
+    # operators can see whether response_format json_schema is enforced at
+    # the logit level (xgrammar present) or only soft-injected.
+    logger.info(
+        "Structured output enforcement: %s",
+        "ENABLED (xgrammar)" if _xgrammar_available()
+        else "DISABLED — xgrammar not importable, json_schema will soft-degrade",
+    )
     # Startup: Auto-populate server aliases for the admin dashboard
     # so users get sensible hostname/IP options for API URL hints
     # without manual configuration. Only runs when the persisted list
@@ -1669,6 +1677,7 @@ async def server_status(_: bool = Depends(verify_api_key)):
         "model_memory_max": model_memory_max,
         "model_memory_used_formatted": format_size(model_memory_used) if model_memory_used else "0B",
         "model_memory_max_formatted": format_size(model_memory_max) if model_memory_max else "unlimited",
+        "structured_output": "enforced" if _xgrammar_available() else "unavailable",
     }
 
 
@@ -2211,6 +2220,16 @@ async def create_chat_completion(
         if json_instruction:
             messages = _inject_json_instruction(messages, json_instruction)
 
+    # Advisory response header: tells the client whether json_schema was
+    # enforced at the logit level (grammar) or only soft-injected into the
+    # prompt. strict:true + unenforceable already raised 400 above, so a
+    # None grammar here means strict was false — a deliberate soft degrade.
+    structured_output_headers = {}
+    if response_format:
+        structured_output_headers["X-OMLX-Structured-Output"] = (
+            "enforced" if compiled_grammar is not None else "prompt-only"
+        )
+
     # Merge MCP tools with user-provided tools
     effective_tools = request.tools
     if _server_state.mcp_manager:
@@ -2348,7 +2367,8 @@ async def create_chat_completion(
                 keepalive_chunk=_resolve_keepalive("openai_chat"),
             ),
             media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache",
+                     **structured_output_headers},
         )
 
     # Non-streaming response with keepalive during prefill
@@ -2450,6 +2470,7 @@ async def create_chat_completion(
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_chat_completion()),
         media_type="application/json",
+        headers=structured_output_headers or None,
     )
 
 
@@ -2611,6 +2632,21 @@ def _compile_bare_grammar(compiler, fmt: dict):
     elif fmt["type"] == "regex":
         return compiler.compile_regex(fmt["pattern"])
     return None
+
+
+def _xgrammar_available() -> bool:
+    """Whether xgrammar (grammar-constrained decoding) can be imported.
+
+    Reflects whether json_schema / structured output is enforced at the
+    logit level.  xgrammar is a core dependency since 2026-05-18, so this
+    is normally True — it stays a runtime check to stay honest about a
+    broken or partial environment.
+    """
+    try:
+        import xgrammar  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
 def _is_strict_json_schema(response_format) -> bool:
