@@ -508,6 +508,7 @@ class TestProcessChatMessages:
         engine._prepare_vision_inputs.assert_called_once_with(
             text_msgs,
             [],
+            audios=None,
             chat_template_kwargs=None,
             tools=None,
         )

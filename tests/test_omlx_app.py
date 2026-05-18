@@ -980,7 +980,9 @@ class TestServerManager:
         """Test initial auto-restart related state."""
         assert manager._consecutive_health_failures == 0
         assert manager._max_health_failures == 3
-        assert manager._max_auto_restarts == 3
+        # Cap lifted to effectively-unlimited so transient crashes self-heal
+        # instead of latching ERROR after 3 (see server_manager._max_auto_restarts).
+        assert manager._max_auto_restarts == 10_000
         assert manager._auto_restart_count == 0
         assert manager._last_healthy_time == 0.0
         assert manager._stable_threshold == 60.0
@@ -1041,9 +1043,9 @@ class TestServerManager:
         assert manager._auto_restart_count == 1
 
     def test_try_auto_restart_gives_up(self, manager: ServerManager):
-        """Test auto-restart gives up after max attempts."""
+        """Test auto-restart gives up once the (now-large) cap is reached."""
         manager._process = Mock(pid=123)
-        manager._auto_restart_count = 3  # Already at max
+        manager._auto_restart_count = manager._max_auto_restarts  # at the cap
         manager._last_healthy_time = time.time()  # Recent crash (no reset)
 
         with patch("omlx_app.server_manager.os.killpg"), \
@@ -1051,7 +1053,10 @@ class TestServerManager:
             manager._try_auto_restart("Server exited with code -9")
 
         assert manager.status == ServerStatus.ERROR
-        assert "Auto-restart failed after 3 attempts" in manager.error_message
+        assert (
+            f"Auto-restart failed after {manager._max_auto_restarts} attempts"
+            in manager.error_message
+        )
 
     @patch.object(ServerManager, "check_health", return_value=False)
     def test_health_check_loop_detects_unresponsive(self, mock_health, manager: ServerManager):
