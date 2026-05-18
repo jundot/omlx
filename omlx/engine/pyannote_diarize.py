@@ -73,14 +73,24 @@ _PIPELINE_LOCK = threading.Lock()
 
 
 def _resolve_hf_token(explicit: Optional[str]) -> Optional[str]:
-    """Look up an HF token from explicit arg, then env vars."""
+    """Look up an HF token: explicit arg, env vars, then HF cached token."""
     if explicit:
         return explicit
-    return (
+    tok = (
         os.environ.get("HF_TOKEN")
         or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         or os.environ.get("HUGGINGFACE_HUB_TOKEN")
     )
+    if tok:
+        return tok
+    # huggingface_hub Pipeline.from_pretrained auto-resolves token from
+    # ~/.cache/huggingface/token; mirror that fallback so `hf auth login`
+    # alone is enough (no env var needed in spawned server env).
+    try:
+        from huggingface_hub import get_token as _hf_get_token
+        return _hf_get_token()
+    except Exception:
+        return None
 
 
 def _get_pipeline(
@@ -123,7 +133,7 @@ def _get_pipeline(
             )
 
         logger.info("Loading pyannote pipeline %s ...", model_id)
-        pipeline = Pipeline.from_pretrained(model_id, use_auth_token=token)
+        pipeline = Pipeline.from_pretrained(model_id, token=token)
         _PIPELINE = pipeline
         logger.info("pyannote pipeline ready")
         return _PIPELINE
@@ -245,11 +255,15 @@ def diarize_words(
         {"waveform": waveform, "sample_rate": sr}, **pipe_kwargs
     )
 
+    # pyannote 4.x wraps the Annotation in DiarizeOutput.speaker_diarization;
+    # 3.x returns the Annotation directly. Accept both.
+    annotation = getattr(diarization, "speaker_diarization", diarization)
+
     # pyannote.core.Annotation.itertracks(yield_label=True) yields
     #   (Segment(start, end), track_label, speaker_label)
     turns: list[tuple[float, float, str]] = [
         (float(seg.start), float(seg.end), spk)
-        for seg, _trk, spk in diarization.itertracks(yield_label=True)
+        for seg, _trk, spk in annotation.itertracks(yield_label=True)
     ]
 
     label_map: dict[str, str] = {}
