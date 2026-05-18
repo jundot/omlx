@@ -79,6 +79,8 @@ struct AppView: View {
         case .downloads:    DownloadsScreen()
         case .integrations: IntegrationsScreen()
         case .quantization: QuantizationScreen()
+        case .throughputBench: ThroughputBenchScreen(vm: services.throughputBench)
+        case .accuracyBench:   AccuracyBenchScreen(vm: services.accuracyBench)
         case .security:     SecurityScreen()
         case .about:        AboutScreen()
         }

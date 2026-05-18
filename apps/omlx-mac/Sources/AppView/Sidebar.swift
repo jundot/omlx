@@ -15,21 +15,24 @@ import SwiftUI
 enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
     case server, status, logs
     case models, downloads, integrations, quantization
+    case throughputBench, accuracyBench
     case security, about
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .server:       return "Server"
-        case .status:       return "Status"
-        case .logs:         return "Logs"
-        case .models:       return "Models"
-        case .downloads:    return "Downloads"
-        case .integrations: return "Integrations"
-        case .quantization: return "Quantization"
-        case .security:     return "Security"
-        case .about:        return "About oMLX"
+        case .server:           return "Server"
+        case .status:           return "Status"
+        case .logs:             return "Logs"
+        case .models:           return "Models"
+        case .downloads:        return "Downloads"
+        case .integrations:     return "Integrations"
+        case .quantization:     return "Quantization"
+        case .throughputBench:  return "Throughput"
+        case .accuracyBench:    return "Accuracy"
+        case .security:         return "Security"
+        case .about:            return "About oMLX"
         }
     }
 
@@ -41,29 +44,33 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
 
     var symbol: String {
         switch self {
-        case .server:       return "server.rack"
-        case .status:       return "gauge.with.dots.needle.50percent"
-        case .logs:         return "scroll"
-        case .models:       return "cube.transparent"
-        case .downloads:    return "icloud.and.arrow.down"
-        case .integrations: return "powerplug"
-        case .quantization: return "sparkles"
-        case .security:     return "lock"
-        case .about:        return "info.circle"
+        case .server:          return "server.rack"
+        case .status:          return "gauge.with.dots.needle.50percent"
+        case .logs:            return "scroll"
+        case .models:          return "cube.transparent"
+        case .downloads:       return "icloud.and.arrow.down"
+        case .integrations:    return "powerplug"
+        case .quantization:    return "sparkles"
+        case .throughputBench: return "speedometer"
+        case .accuracyBench:   return "target"
+        case .security:        return "lock"
+        case .about:           return "info.circle"
         }
     }
 
     var gradient: [Color] {
         switch self {
-        case .server:       return SquircleGradient.server
-        case .status:       return SquircleGradient.status
-        case .logs:         return SquircleGradient.logs
-        case .models:       return SquircleGradient.models
-        case .downloads:    return SquircleGradient.downloads
-        case .integrations: return SquircleGradient.integrations
-        case .quantization: return SquircleGradient.quantization
-        case .security:     return SquircleGradient.security
-        case .about:        return SquircleGradient.about
+        case .server:          return SquircleGradient.server
+        case .status:          return SquircleGradient.status
+        case .logs:            return SquircleGradient.logs
+        case .models:          return SquircleGradient.models
+        case .downloads:       return SquircleGradient.downloads
+        case .integrations:    return SquircleGradient.integrations
+        case .quantization:    return SquircleGradient.quantization
+        case .throughputBench: return SquircleGradient.throughputBench
+        case .accuracyBench:   return SquircleGradient.accuracyBench
+        case .security:        return SquircleGradient.security
+        case .about:           return SquircleGradient.about
         }
     }
 
@@ -71,6 +78,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
         switch self {
         case .server, .status, .logs:                              return .server
         case .models, .downloads, .integrations, .quantization:    return .models
+        case .throughputBench, .accuracyBench:                     return .bench
         case .security, .about:                                    return .general
         }
     }
@@ -89,6 +97,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
 enum SidebarGroup: String, CaseIterable, Hashable, Sendable {
     case server  = "Server"
     case models  = "Models"
+    case bench   = "Bench"
     case general = "General"
 
     var sections: [AppSection] {

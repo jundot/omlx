@@ -291,6 +291,56 @@ final class OMLXClient: ObservableObject {
         try await delete(AdminAPI.oqTask(taskId))
     }
 
+    // PR 13 — Throughput bench
+
+    func getDeviceInfo() async throws -> DeviceInfoDTO {
+        try await get(AdminAPI.deviceInfo)
+    }
+
+    @discardableResult
+    func startThroughputBench(_ body: BenchStartRequest) async throws -> BenchStartResponse {
+        try await post(AdminAPI.benchStart, body: body)
+    }
+
+    func getBenchResults(benchId: String) async throws -> BenchResultsResponse {
+        try await get(AdminAPI.benchResults(benchId))
+    }
+
+    @discardableResult
+    func cancelBench(benchId: String) async throws -> BenchCancelResponse {
+        try await postEmpty(AdminAPI.benchCancel(benchId))
+    }
+
+    // PR 13 — Accuracy bench
+
+    @discardableResult
+    func addAccuracyQueue(_ body: AccuracyQueueAddRequest) async throws -> AccuracyQueueStatus {
+        try await post(AdminAPI.accuracyQueueAdd, body: body)
+    }
+
+    func getAccuracyQueueStatus() async throws -> AccuracyQueueStatus {
+        try await get(AdminAPI.accuracyQueueStatus)
+    }
+
+    @discardableResult
+    func removeAccuracyQueue(index: Int) async throws -> AccuracyQueueStatus {
+        try await delete(AdminAPI.accuracyQueueRemove(index))
+    }
+
+    func listAccuracyResults() async throws -> AccuracyResultsResponse {
+        try await get(AdminAPI.accuracyResults)
+    }
+
+    @discardableResult
+    func resetAccuracyResults() async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.accuracyReset)
+    }
+
+    @discardableResult
+    func cancelAccuracyBench() async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.accuracyCancel)
+    }
+
     // MARK: - Core request
 
     private func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {

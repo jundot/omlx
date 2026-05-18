@@ -62,6 +62,12 @@ enum SquircleGradient {
     static let integrations: [Color] = [Color(rgb24: 0xFF9F0A), Color(rgb24: 0xFF453A)]
     static let quantization: [Color] = [Color(rgb24: 0xFF2D55), Color(rgb24: 0xAF52DE)]
 
+    /// Bench group — speedometer (blue → teal) for Throughput, target
+    /// (orange → red) for Accuracy. Distinct from the Status gradient so
+    /// the two clusters don't visually collide in the sidebar.
+    static let throughputBench: [Color] = [Color(rgb24: 0x32ADE6), Color(rgb24: 0x30B0C7)]
+    static let accuracyBench: [Color]   = [Color(rgb24: 0xFF9500), Color(rgb24: 0xFF453A)]
+
     static let security: [Color] = server          // same dark gunmetal as Server
     static let about: [Color]    = logs            // same light gray as Logs
 

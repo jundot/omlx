@@ -55,4 +55,18 @@ enum AdminAPI {
     static let oqTasks         = "\(prefix)/oq/tasks"
     static func oqCancel(_ taskId: String) -> String { "\(prefix)/oq/cancel/\(taskId)" }
     static func oqTask(_ taskId: String) -> String   { "\(prefix)/oq/task/\(taskId)" }
+
+    // PR 13 — Throughput bench
+    static let deviceInfo      = "\(prefix)/device-info"
+    static let benchStart      = "\(prefix)/bench/start"
+    static func benchResults(_ benchId: String) -> String { "\(prefix)/bench/\(benchId)/results" }
+    static func benchCancel(_ benchId: String) -> String  { "\(prefix)/bench/\(benchId)/cancel" }
+
+    // PR 13 — Accuracy bench
+    static let accuracyQueueAdd    = "\(prefix)/bench/accuracy/queue/add"
+    static let accuracyQueueStatus = "\(prefix)/bench/accuracy/queue/status"
+    static func accuracyQueueRemove(_ idx: Int) -> String { "\(prefix)/bench/accuracy/queue/\(idx)" }
+    static let accuracyResults     = "\(prefix)/bench/accuracy/results"
+    static let accuracyReset       = "\(prefix)/bench/accuracy/results/reset"
+    static let accuracyCancel      = "\(prefix)/bench/accuracy/cancel"
 }

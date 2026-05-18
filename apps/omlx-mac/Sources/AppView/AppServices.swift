@@ -27,6 +27,16 @@ final class AppServices: NSObject, ObservableObject {
     let client: OMLXClient
     let updates: UpdateController
 
+    /// Long-lived view models for the Bench screens. Owned here (not by
+    /// the screen's `@StateObject`) so a running benchmark survives
+    /// leaving the screen — the server keeps producing results while
+    /// we're off-screen and the poll task continues updating these VMs,
+    /// so coming back shows the in-flight state instead of an empty
+    /// form. The HTML admin panel got this for free via Alpine's
+    /// app-scoped store; SwiftUI needs the lifetime promoted manually.
+    let throughputBench = ThroughputBenchScreenVM()
+    let accuracyBench   = AccuracyBenchScreenVM()
+
     private weak var server: ServerProcess?
 
     init(config: AppConfig = .default, server: ServerProcess? = nil) {
