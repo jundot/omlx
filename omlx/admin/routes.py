@@ -152,6 +152,10 @@ class ModelSettingsRequest(BaseModel):
     # auto-chains this aligner on the (audio, ASR transcript) pair and
     # populates segments[0].words with per-character/word timestamps.
     aligner_model: str | None = None
+    # "standard" (or None) keeps the cheap 1-pass energy backend on stereo +
+    # L/R speakers; "high" auto-upgrades to 3-pass energy_tripass (3x ASR).
+    # Per-request diarize_backend always wins over this preference.
+    default_diarize_quality: str | None = None
     is_pinned: bool | None = None
     is_default: bool | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
@@ -1681,6 +1685,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "vlm_mtp_draft_model": settings.vlm_mtp_draft_model,
                 "vlm_mtp_draft_block_size": settings.vlm_mtp_draft_block_size,
                 "aligner_model": settings.aligner_model,
+                "default_diarize_quality": settings.default_diarize_quality,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "trust_remote_code": settings.trust_remote_code,
@@ -1946,6 +1951,19 @@ async def update_model_settings(
         current_settings.dflash_draft_model = request.dflash_draft_model or None
     if "aligner_model" in sent:
         current_settings.aligner_model = request.aligner_model or None
+    if "default_diarize_quality" in sent:
+        # Normalize: empty / unknown values reset to None (= "standard"
+        # behavior). Only "high" actually enables tripass auto-upgrade.
+        _q = (request.default_diarize_quality or "").strip().lower() or None
+        if _q not in (None, "standard", "high"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid default_diarize_quality={_q!r}; "
+                    "must be 'standard', 'high', or null."
+                ),
+            )
+        current_settings.default_diarize_quality = _q
     if "dflash_draft_quant_enabled" in sent:
         current_settings.dflash_draft_quant_enabled = bool(request.dflash_draft_quant_enabled) if request.dflash_draft_quant_enabled is not None else None
     if "dflash_draft_quant_weight_bits" in sent:

@@ -169,6 +169,16 @@ class ModelSettings:
     # model returns only coarse segment-level times).
     aligner_model: Optional[str] = None
 
+    # Diarization quality preference for the ``auto`` backend routing on
+    # /v1/audio/transcriptions. Values:
+    #   None / "standard" — keep the 1-pass energy backend on stereo +
+    #     L/R speakers (fast; current default).
+    #   "high" — auto-route to 3-pass energy_tripass (L mono, R mono, mix
+    #     mono ASR + merge). Eliminates the [overlap] tag and recovers
+    #     words the mix-down lost to simultaneous speech, at 3x ASR cost.
+    # Per-request ``diarize_backend`` always wins over this setting.
+    default_diarize_quality: Optional[str] = None
+
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default

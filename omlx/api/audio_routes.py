@@ -627,8 +627,17 @@ async def create_transcription(
     model's own default applies.
 
     ``diarize_backend`` selects the speaker-attribution backend:
-      * ``energy`` — stereo only; per-word RMS comparison of L/R channels.
-        Requires both ``left_speaker`` and ``right_speaker`` form fields.
+      * ``energy`` — stereo only; single mix-pass ASR + per-word RMS
+        comparison of L/R channels. Cheap, but words spoken simultaneously
+        on both channels get a fallback ``[overlap]`` label and may be
+        dropped by the mix-down (decoder can't separate two voices in
+        one channel). Requires ``left_speaker`` / ``right_speaker``.
+      * ``energy_tripass`` — stereo only; runs ASR three times (L mono,
+        R mono, mix mono). Mix gives canonical text; L / R give
+        deterministic speaker attribution + recover words the mix lost
+        to simultaneous speech. 3x ASR latency, no overlap label,
+        zero word loss on simultaneous talk. Requires
+        ``left_speaker`` / ``right_speaker``.
       * ``pyannote`` — mono / multi-speaker; runs pyannote-audio's
         speaker-diarization-3.1 pipeline. First call lazily downloads and
         loads the ~400 MB model; subsequent calls are free. Requires the
@@ -665,12 +674,14 @@ async def create_transcription(
     # (auto routes to energy when stereo+L/R speakers given). pyannote backend
     # is reserved for Phase 2 — reject with 501 if explicitly requested.
     diarize_backend = (diarize_backend or "auto").lower().strip()
-    if diarize_backend not in ("auto", "energy", "pyannote", "none"):
+    if diarize_backend not in (
+        "auto", "energy", "energy_tripass", "pyannote", "none"
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Unknown diarize_backend='{diarize_backend}'. "
-                "Supported: auto, energy, pyannote, none."
+                "Supported: auto, energy, energy_tripass, pyannote, none."
             ),
         )
     # pyannote backend (Phase 2) is now wired below the ASR call. Its install
@@ -689,6 +700,14 @@ async def create_transcription(
         or (diarize_backend == "auto" and left_speaker and right_speaker)
     )
     if energy_diarize_requested and not word_timestamps:
+        word_timestamps = True
+    # 3-pass energy: explicit opt-in only (3x ASR cost), never auto-routed.
+    # Eats the boundary-disambiguation tax of per-channel ASR by also running
+    # a mix pass for canonical text, while keeping the per-channel passes for
+    # deterministic speaker attribution + recovery of words the mix dropped
+    # to simultaneous speech.
+    energy_tripass_requested = (diarize_backend == "energy_tripass")
+    if energy_tripass_requested and not word_timestamps:
         word_timestamps = True
     # pyannote (Phase 2) routing. Explicit when diarize_backend=pyannote;
     # auto routes here when the caller signalled diarization intent via any
@@ -731,6 +750,37 @@ async def create_transcription(
     pool = _get_engine_pool()
     resolved_model = _resolve_model(model)
 
+    # Settings-driven default for the ``auto`` backend's quality/cost tradeoff
+    # on stereo + L/R recordings. When the per-model
+    # ``default_diarize_quality`` is "high", auto-routes upgrade the cheap
+    # 1-pass energy backend to 3-pass energy_tripass. Per-request explicit
+    # ``diarize_backend=energy`` / ``=energy_tripass`` always wins (caller
+    # already declared intent). Plain transcription requests (no L/R given)
+    # are unaffected — quality preference only fires when energy auto-route
+    # would already have triggered.
+    if (
+        diarize_backend == "auto"
+        and energy_diarize_requested
+        and not energy_tripass_requested
+    ):
+        try:
+            _sm = _get_settings_manager()
+            if _sm is not None:
+                _ms = _sm.get_settings(resolved_model)
+                if (
+                    _ms is not None
+                    and (getattr(_ms, "default_diarize_quality", None) or "").lower() == "high"
+                ):
+                    energy_diarize_requested = False
+                    energy_tripass_requested = True
+                    if not word_timestamps:
+                        word_timestamps = True
+        except Exception:
+            # Settings lookup failure → fall through to standard energy
+            # routing rather than 500. The diarize feature itself works
+            # without settings; this just optimizes the default.
+            pass
+
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
         engine = await pool.get_engine(resolved_model)
@@ -757,6 +807,8 @@ async def create_transcription(
         suffix = ".m4a"
     tmp_path = None
     mono_tmp_path = None
+    tripass_L_path: Optional[str] = None
+    tripass_R_path: Optional[str] = None
     stereo_audio_for_diarize = None
     stereo_sr_for_diarize = None
     try:
@@ -770,8 +822,9 @@ async def create_transcription(
         # and feed a mono mix-down to the ASR (preserves the full-context
         # decoding advantage over per-channel ASR — boundary words like
         # "对" / "你/您" disambiguate much better when the model sees both
-        # sides of the conversation).
-        if energy_diarize_requested:
+        # sides of the conversation). Tripass additionally writes per-channel
+        # mono temp files for the L / R ASR passes.
+        if energy_diarize_requested or energy_tripass_requested:
             if not left_speaker or not right_speaker:
                 raise HTTPException(
                     status_code=400,
@@ -809,6 +862,28 @@ async def create_transcription(
                 mono_tmp_path = mtf.name
             _sf.write(mono_tmp_path, mono, audio_sr, subtype="FLOAT")
             tmp_path = mono_tmp_path
+            if energy_tripass_requested:
+                # Per-channel passes get pure L / R mono (no clipping concern;
+                # each is already a single channel). The mix file above
+                # serves as the third pass — keep tmp_path pointed at it so
+                # the standard transcribe() call uses it as the canonical
+                # decode, and L / R are run alongside.
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=".wav"
+                ) as ltf:
+                    tripass_L_path = ltf.name
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=".wav"
+                ) as rtf:
+                    tripass_R_path = rtf.name
+                _sf.write(
+                    tripass_L_path, audio_data[:, 0], audio_sr,
+                    subtype="FLOAT",
+                )
+                _sf.write(
+                    tripass_R_path, audio_data[:, 1], audio_sr,
+                    subtype="FLOAT",
+                )
 
         # Effective max_tokens precedence: request > per-model setting (if any) >
         # model's own ``generate(max_tokens=...)`` default. The per-model lookup
@@ -892,18 +967,20 @@ async def create_transcription(
                 ),
             )
 
-        result = await engine.transcribe(tmp_path, **transcribe_kwargs)
-
-        # Auto-chain: when caller asked for word_timestamps on an ASR that has
-        # an aligner companion configured (ModelSettings.aligner_model), run
-        # the aligner on the (same audio, ASR transcript) pair and graft the
-        # word-level timestamps into segments[0].words.
-        if (
-            word_timestamps
-            and not is_aligner
-            and result.get("text")
-            and not (result.get("segments") and result["segments"][0].get("words"))
-        ):
+        async def _maybe_align_inplace(res: dict, audio_path: str) -> None:
+            """Run the ASR's configured forced-aligner on `audio_path` to fill
+            res["segments"][0]["words"] if word_timestamps was requested and
+            the ASR engine itself didn't emit per-word timestamps. No-op if
+            current model is the aligner itself, if no aligner is configured
+            via ModelSettings, or if the result already has words. Used by
+            both the 1-pass and tripass code paths."""
+            if not word_timestamps or is_aligner:
+                return
+            if not res.get("text"):
+                return
+            _segs = res.get("segments") or []
+            if _segs and _segs[0].get("words"):
+                return
             aligner_name = None
             sm = _get_settings_manager()
             if sm is not None:
@@ -913,43 +990,69 @@ async def create_transcription(
                         aligner_name = getattr(ms, "aligner_model", None)
                 except Exception:
                     pass
-            if aligner_name:
-                try:
-                    aligner_resolved = _resolve_model(aligner_name)
-                    aligner_engine = await pool.get_engine(aligner_resolved)
-                    if isinstance(aligner_engine, STTEngine):
-                        align_kwargs: dict = {"language": language}
-                        if effective_max_tokens is not None:
-                            align_kwargs["max_tokens"] = effective_max_tokens
-                        align_kwargs["text"] = result["text"]
-                        align_result = await aligner_engine.transcribe(
-                            tmp_path, **align_kwargs
-                        )
-                        words = align_result.get("words") or []
-                        if words:
-                            segments = result.get("segments") or []
-                            if not segments:
-                                segments = [{
-                                    "text": result["text"],
-                                    "language": result.get("language"),
-                                    "start": float(min(
-                                        (w["start"] for w in words), default=0.0
-                                    )),
-                                    "end": float(max(
-                                        (w["end"] for w in words),
-                                        default=result.get("duration", 0.0),
-                                    )),
-                                }]
-                            segments[0] = {**segments[0], "words": words}
-                            result["segments"] = segments
-                except HTTPException:
-                    raise
-                except Exception as exc:
-                    logger.warning(
-                        "Aligner companion %s failed for %s: %s — returning "
-                        "transcript without word timestamps",
-                        aligner_name, resolved_model, exc,
-                    )
+            if not aligner_name:
+                return
+            try:
+                aligner_resolved = _resolve_model(aligner_name)
+                aligner_engine = await pool.get_engine(aligner_resolved)
+                if not isinstance(aligner_engine, STTEngine):
+                    return
+                align_kwargs: dict = {"language": language}
+                if effective_max_tokens is not None:
+                    align_kwargs["max_tokens"] = effective_max_tokens
+                align_kwargs["text"] = res["text"]
+                align_result = await aligner_engine.transcribe(
+                    audio_path, **align_kwargs
+                )
+                words = align_result.get("words") or []
+                if not words:
+                    return
+                segments = res.get("segments") or []
+                if not segments:
+                    segments = [{
+                        "text": res["text"],
+                        "language": res.get("language"),
+                        "start": float(min(
+                            (w["start"] for w in words), default=0.0
+                        )),
+                        "end": float(max(
+                            (w["end"] for w in words),
+                            default=res.get("duration", 0.0),
+                        )),
+                    }]
+                segments[0] = {**segments[0], "words": words}
+                res["segments"] = segments
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Aligner companion %s failed for %s: %s — returning "
+                    "transcript without word timestamps",
+                    aligner_name, resolved_model, exc,
+                )
+
+        if energy_tripass_requested:
+            # 3-pass: L only, R only, mix (mix = tmp_path). Serial — the
+            # underlying MLX engine is single-threaded so asyncio.gather
+            # wouldn't actually overlap the compute, only the python
+            # bookkeeping. 3x ASR latency is the documented cost. Each pass
+            # gets its own aligner companion run so per-pass words[] is
+            # populated for the merge.
+            result_L = await engine.transcribe(tripass_L_path, **transcribe_kwargs)
+            await _maybe_align_inplace(result_L, tripass_L_path)
+            result_R = await engine.transcribe(tripass_R_path, **transcribe_kwargs)
+            await _maybe_align_inplace(result_R, tripass_R_path)
+            result_mix = await engine.transcribe(tmp_path, **transcribe_kwargs)
+            await _maybe_align_inplace(result_mix, tmp_path)
+            from omlx.engine.diarize import tripass_merge
+            result = tripass_merge(
+                stereo_audio_for_diarize, stereo_sr_for_diarize,
+                result_L, result_R, result_mix,
+                left_speaker=left_speaker, right_speaker=right_speaker,
+            )
+        else:
+            result = await engine.transcribe(tmp_path, **transcribe_kwargs)
+            await _maybe_align_inplace(result, tmp_path)
 
         # pyannote diarization (Phase 2). Mono / multi-speaker / conference
         # audio. Must run BEFORE the finally block unlinks tmp_path —
@@ -1040,13 +1143,23 @@ async def create_transcription(
                 os.unlink(mono_tmp_path)
             except OSError:
                 pass
+        for _extra in (tripass_L_path, tripass_R_path):
+            if _extra and os.path.exists(_extra):
+                try:
+                    os.unlink(_extra)
+                except OSError:
+                    pass
 
     # Energy-based diarization: annotate each word with a speaker label
     # based on which stereo channel dominates its time window. We do this
     # AFTER ASR so we get the high-accuracy transcript from the mono mix
     # (full conversational context for the decoder) PLUS speaker labels
     # from the original stereo — without paying for two separate ASR runs.
-    if energy_diarize_requested and stereo_audio_for_diarize is not None:
+    if (
+        energy_diarize_requested
+        and not energy_tripass_requested
+        and stereo_audio_for_diarize is not None
+    ):
         from omlx.engine.diarize import energy_diarize_words
         segments = result.get("segments") or []
         for seg in segments:
