@@ -291,6 +291,35 @@ final class OMLXClient: ObservableObject {
         try await delete(AdminAPI.oqTask(taskId))
     }
 
+    // PR 13 — HF Upload (merged into QuantizationScreen)
+
+    func validateHFUploadToken(hfToken: String) async throws -> HFValidateTokenResponse {
+        try await post(AdminAPI.uploadValidateToken, body: HFValidateTokenRequest(hfToken: hfToken))
+    }
+
+    func listHFUploadModels() async throws -> HFUploadModelsResponse {
+        try await get(AdminAPI.uploadModels)
+    }
+
+    @discardableResult
+    func startHFUpload(_ body: HFUploadStartRequest) async throws -> HFUploadStartResponse {
+        try await post(AdminAPI.uploadStart, body: body)
+    }
+
+    func listHFUploadTasks() async throws -> HFUploadTasksResponse {
+        try await get(AdminAPI.uploadTasks)
+    }
+
+    @discardableResult
+    func cancelHFUploadTask(taskId: String) async throws -> SimpleSuccessResponse {
+        try await postEmpty(AdminAPI.uploadCancel(taskId))
+    }
+
+    @discardableResult
+    func removeHFUploadTask(taskId: String) async throws -> SimpleSuccessResponse {
+        try await delete(AdminAPI.uploadTask(taskId))
+    }
+
     // PR 13 — Throughput bench
 
     func getDeviceInfo() async throws -> DeviceInfoDTO {

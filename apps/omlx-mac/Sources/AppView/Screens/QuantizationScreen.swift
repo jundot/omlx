@@ -20,12 +20,25 @@
 //
 //   Queue                 — every task `_oq_manager` returns. Polls at 2 Hz
 //                            while any task is active, idles otherwise.
+//                            Completed quant tasks expose an "Upload to HF"
+//                            button that opens the upload sheet.
+//
+//   Upload sheet          — credentials + repo + README configuration, then
+//                            POST /admin/api/upload/start. The HF token
+//                            lives only in the macOS Keychain (service
+//                            "app.omlx-next.hf-upload"); never persisted to
+//                            UserDefaults or files.
+//
+//   Upload Tasks          — mirror of the Queue section for upload jobs.
+//                            Polled in the same iteration as quant tasks
+//                            (2 s while either side is active, 6 s idle).
 //
 //   About                 — static documentation card (matches the marketing
 //                            copy in the HTML so users get the same context
 //                            in either UI).
 
 import SwiftUI
+import Security
 
 struct QuantizationScreen: View {
     @EnvironmentObject private var services: AppServices
@@ -72,7 +85,14 @@ struct QuantizationScreen: View {
             QueueSection(
                 tasks: vm.tasks,
                 onCancel: { id in vm.cancelTask(taskId: id, client: services.client) },
-                onRemove: { id in vm.removeTask(taskId: id, client: services.client) }
+                onRemove: { id in vm.removeTask(taskId: id, client: services.client) },
+                onUpload: { task in vm.uploadTarget = task }
+            )
+
+            UploadTasksSection(
+                tasks: vm.uploadTasks,
+                onCancel: { id in vm.cancelUpload(taskId: id, client: services.client) },
+                onRemove: { id in vm.removeUpload(taskId: id, client: services.client) }
             )
 
             AboutSection()
@@ -90,6 +110,9 @@ struct QuantizationScreen: View {
         }
         .onChange(of: vm.preserveMtp) { _, _ in
             vm.scheduleEstimateRefresh(client: services.client)
+        }
+        .sheet(item: $vm.uploadTarget) { task in
+            UploadModalView(task: task, vm: vm, client: services.client)
         }
     }
 }
@@ -397,6 +420,7 @@ private struct QueueSection: View {
     let tasks: [OQTaskDTO]
     let onCancel: (String) -> Void
     let onRemove: (String) -> Void
+    let onUpload: (OQTaskDTO) -> Void
 
     @Environment(\.omlxTheme) private var theme
 
@@ -412,7 +436,8 @@ private struct QueueSection: View {
                         QueueRow(
                             task: task,
                             onCancel: { onCancel(task.taskId) },
-                            onRemove: { onRemove(task.taskId) }
+                            onRemove: { onRemove(task.taskId) },
+                            onUpload: { onUpload(task) }
                         )
                     }
                 }
@@ -425,6 +450,7 @@ private struct QueueRow: View {
     let task: OQTaskDTO
     let onCancel: () -> Void
     let onRemove: () -> Void
+    let onUpload: () -> Void
 
     @Environment(\.omlxTheme) private var theme
 
@@ -444,6 +470,16 @@ private struct QueueRow: View {
                 Text(elapsedText)
                     .font(.omlxMono(11))
                     .foregroundStyle(theme.textTertiary)
+                if task.statusEnum == .completed {
+                    Button {
+                        onUpload()
+                    } label: {
+                        Label("Upload to HF", systemImage: "arrow.up.circle")
+                            .labelStyle(.titleAndIcon)
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                    .help("Upload to Hugging Face Hub")
+                }
                 Button {
                     if task.isActive { onCancel() } else { onRemove() }
                 } label: {
@@ -542,6 +578,442 @@ private struct ProgressBar: View {
     }
 }
 
+// MARK: - Upload tasks
+
+// Renders the HF upload queue. Mirrors `QueueSection` for visual parity but
+// reads from `vm.uploadTasks` and exposes an "Open" link for completed jobs
+// so the user can jump to the freshly published repo on huggingface.co.
+private struct UploadTasksSection: View {
+    let tasks: [HFUploadTaskDTO]
+    let onCancel: (String) -> Void
+    let onRemove: (String) -> Void
+
+    @Environment(\.omlxTheme) private var theme
+
+    private var activeCount: Int { tasks.filter { $0.isActive }.count }
+    private var completedCount: Int { tasks.filter { $0.statusEnum == .completed }.count }
+
+    var body: some View {
+        if tasks.isEmpty {
+            EmptyView()
+        } else {
+            SectionHeader(
+                "Uploads",
+                subtitle: "\(activeCount) active / \(completedCount) completed"
+            )
+
+            ListGroup {
+                ForEach(Array(tasks.enumerated()), id: \.element.id) { idx, task in
+                    FreeRow(isLast: idx == tasks.count - 1) {
+                        UploadRow(
+                            task: task,
+                            onCancel: { onCancel(task.taskId) },
+                            onRemove: { onRemove(task.taskId) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct UploadRow: View {
+    let task: HFUploadTaskDTO
+    let onCancel: () -> Void
+    let onRemove: () -> Void
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.up.circle")
+                    .font(.system(size: 12))
+                    .foregroundStyle(theme.blueDot)
+                Text(task.modelName)
+                    .font(.omlxMono(12))
+                    .foregroundStyle(theme.text)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                UploadStatusChip(status: task.statusEnum)
+                Spacer(minLength: 4)
+                if task.statusEnum == .completed, !task.repoUrl.isEmpty,
+                   let url = URL(string: task.repoUrl) {
+                    Button {
+                        NSWorkspace.shared.open(url)
+                    } label: {
+                        Label("Open", systemImage: "arrow.up.right.square")
+                            .labelStyle(.titleAndIcon)
+                    }
+                    .buttonStyle(.omlx(.plain, size: .small))
+                    .help(task.repoUrl)
+                }
+                Button {
+                    if task.isActive { onCancel() } else { onRemove() }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.omlx(.plain, size: .small))
+                .help(task.isActive ? "Cancel" : "Remove")
+            }
+            if task.isActive {
+                ProgressBar(progress: max(0, min(task.progress / 100, 1)))
+                HStack(spacing: 8) {
+                    Text(task.repoId)
+                        .font(.omlxMono(11))
+                        .foregroundStyle(theme.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 0)
+                    Text("\(Int(task.progress.rounded()))%")
+                        .font(.omlxMono(11))
+                        .foregroundStyle(theme.textTertiary)
+                }
+            } else if !task.repoId.isEmpty {
+                Text(task.repoId)
+                    .font(.omlxMono(11))
+                    .foregroundStyle(theme.textTertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            if !task.error.isEmpty {
+                Text(task.error)
+                    .font(.omlxMono(10.5))
+                    .foregroundStyle(theme.redDot)
+                    .lineLimit(3)
+            }
+        }
+    }
+}
+
+private struct UploadStatusChip: View {
+    let status: HFUploadTaskDTO.Status?
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        let cfg: (Color, String) = {
+            switch status {
+            case .pending:   return (theme.textTertiary, "Pending")
+            case .uploading: return (theme.blueDot, "Uploading")
+            case .completed: return (theme.greenDot, "Completed")
+            case .failed:    return (theme.redDot, "Failed")
+            case .cancelled: return (theme.textTertiary, "Cancelled")
+            case .none:      return (theme.textTertiary, "—")
+            }
+        }()
+        Text(cfg.1)
+            .font(.omlxText(10, weight: .semibold))
+            .foregroundStyle(cfg.0)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1)
+            .background(cfg.0.opacity(0.12))
+            .clipShape(Capsule())
+    }
+}
+
+// MARK: - Upload modal
+
+// Sheet presented when the user taps "Upload to HF" on a completed quant
+// task. Three sections (Credentials / Repository / README) feed
+// `POST /admin/api/upload/start` once the token has been validated and a
+// repo name entered. Body submission closes the sheet via uploadTarget=nil.
+private struct UploadModalView: View {
+    let task: OQTaskDTO
+    @ObservedObject var vm: QuantizationScreenVM
+    let client: OMLXClient
+
+    @Environment(\.omlxTheme) private var theme
+
+    /// Editable repo name. Pre-filled with the quant task's output name —
+    /// users are free to rename before publish.
+    @State private var repoName: String = ""
+    @State private var isPrivate: Bool = false
+    /// "" sentinel triggers the auto-generated README path. Any other value
+    /// is the absolute path of another local model whose README will be
+    /// copied verbatim.
+    @State private var readmeSourcePath: String = ""
+    @State private var addRedownloadNotice: Bool = true
+    @State private var isStarting: Bool = false
+    @State private var localError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Sheet header — explicit since `SectionHeader` styles map to a
+            // scrollable screen, not a modal.
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Upload to Hugging Face")
+                    .font(.omlxText(15, weight: .semibold))
+                    .foregroundStyle(theme.text)
+                Text(task.outputName)
+                    .font(.omlxMono(11.5))
+                    .foregroundStyle(theme.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 16)
+            .padding(.bottom, 8)
+
+            credentialsSection
+            repositorySection
+            readmeSection
+
+            if let err = localError, !err.isEmpty {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(theme.redDot)
+                        .font(.system(size: 11))
+                        .padding(.top, 1)
+                    Text(err)
+                        .font(.omlxText(11.5))
+                        .foregroundStyle(theme.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .padding(10)
+                .background(theme.redDot.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .padding(.horizontal, 14)
+                .padding(.top, 6)
+            }
+
+            footer
+        }
+        .frame(width: 560)
+        .frame(minHeight: 480)
+        .background(theme.windowBg)
+        .onAppear {
+            repoName = task.outputName
+            readmeSourcePath = ""
+            addRedownloadNotice = true
+            localError = nil
+        }
+    }
+
+    // MARK: Credentials
+
+    private var credentialsSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            SectionHeader(
+                "Credentials",
+                subtitle: vm.uploadValidatedUsername.map { "Logged in as @\($0)" }
+                    ?? "Validate a token to enable upload"
+            )
+
+            ListGroup {
+                Row(
+                    label: "HF token",
+                    sublabel: "Stored in macOS Keychain. Needs write access to your account."
+                ) {
+                    HStack(spacing: 6) {
+                        TextInput(
+                            text: $vm.uploadToken,
+                            placeholder: "hf_…",
+                            isSecure: true,
+                            mono: true,
+                            width: 220
+                        )
+                        Button {
+                            Task { await vm.validateUploadToken(client: client) }
+                        } label: {
+                            if vm.isValidatingToken {
+                                ProgressView().controlSize(.small)
+                                Text("Validating…")
+                            } else {
+                                Text(vm.uploadValidatedUsername == nil ? "Validate" : "Re-validate")
+                            }
+                        }
+                        .buttonStyle(.omlx(.normal, size: .small))
+                        .disabled(vm.isValidatingToken || vm.uploadToken.isEmpty)
+                    }
+                }
+
+                if vm.uploadValidatedUsername != nil && !vm.uploadOrgs.isEmpty {
+                    Row(
+                        label: "Target namespace",
+                        sublabel: "Publish under your account or one of your orgs",
+                        isLast: true
+                    ) {
+                        Popup(
+                            selection: $vm.uploadNamespace,
+                            width: 220,
+                            options: namespaceOptions
+                        )
+                    }
+                } else {
+                    // Make the last visible row in the group flush with the
+                    // bottom rounded edge by toggling `isLast` on it.
+                    Row(
+                        label: "Target namespace",
+                        sublabel: vm.uploadValidatedUsername == nil
+                            ? "Available after validation"
+                            : "Your account is the only available namespace",
+                        isLast: true
+                    ) {
+                        Text(vm.uploadNamespace.isEmpty ? "—" : "@\(vm.uploadNamespace)")
+                            .font(.omlxText(13, weight: .medium))
+                            .foregroundStyle(theme.textSecondary)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: Repository
+
+    private var repositorySection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            SectionHeader("Repository")
+            ListGroup {
+                Row(
+                    label: "Repo name",
+                    sublabel: "Full repo id will be \(vm.uploadNamespace.isEmpty ? "<namespace>" : vm.uploadNamespace)/<repo-name>"
+                ) {
+                    HStack(spacing: 6) {
+                        Text(vm.uploadNamespace.isEmpty ? "<namespace>/" : "\(vm.uploadNamespace)/")
+                            .font(.omlxMono(11.5))
+                            .foregroundStyle(theme.textSecondary)
+                        TextInput(
+                            text: $repoName,
+                            placeholder: "model-id",
+                            mono: true,
+                            width: 240
+                        )
+                    }
+                }
+
+                Row(
+                    label: "Private repo",
+                    sublabel: "Only you and your org will see this model",
+                    isLast: true
+                ) {
+                    Toggle("", isOn: $isPrivate).labelsHidden().toggleStyle(.switch)
+                }
+            }
+        }
+    }
+
+    // MARK: README
+
+    private var readmeSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            SectionHeader("README")
+            ListGroup {
+                Row(
+                    label: "Source",
+                    sublabel: "Generate a default card or copy from another local model"
+                ) {
+                    Popup(
+                        selection: $readmeSourcePath,
+                        width: 260,
+                        options: readmeOptions
+                    )
+                }
+                if readmeSourcePath.isEmpty {
+                    Row(
+                        label: "Add re-download notice",
+                        sublabel: "Append a banner reminding downstream users to re-pull",
+                        isLast: true
+                    ) {
+                        Toggle("", isOn: $addRedownloadNotice).labelsHidden().toggleStyle(.switch)
+                    }
+                } else {
+                    // Trailing row stays flush even when the toggle is hidden.
+                    Row(
+                        label: "Re-download notice",
+                        sublabel: "Disabled when copying an existing README",
+                        isLast: true
+                    ) {
+                        Text("Off")
+                            .font(.omlxText(13, weight: .medium))
+                            .foregroundStyle(theme.textTertiary)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: Footer
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            Spacer()
+            Button("Cancel") { vm.uploadTarget = nil }
+                .buttonStyle(.omlx(.normal, size: .regular))
+                .keyboardShortcut(.cancelAction)
+            Button {
+                submit()
+            } label: {
+                if isStarting {
+                    ProgressView().controlSize(.small)
+                    Text("Uploading…")
+                } else {
+                    Label("Upload", systemImage: "arrow.up.circle.fill")
+                        .labelStyle(.titleAndIcon)
+                }
+            }
+            .buttonStyle(.omlx(.primary))
+            .disabled(!canSubmit || isStarting)
+            .keyboardShortcut(.defaultAction)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+    }
+
+    // MARK: Helpers
+
+    private var canSubmit: Bool {
+        vm.uploadValidatedUsername != nil
+        && !vm.uploadNamespace.isEmpty
+        && !repoName.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    private var namespaceOptions: [PopupOption<String>] {
+        var opts: [PopupOption<String>] = []
+        if let user = vm.uploadValidatedUsername {
+            opts.append(PopupOption(value: user, label: "@\(user)"))
+        }
+        for org in vm.uploadOrgs {
+            opts.append(PopupOption(value: org.name, label: org.name))
+        }
+        return opts
+    }
+
+    private var readmeOptions: [PopupOption<String>] {
+        var opts = [PopupOption(value: "", label: "Auto-generate")]
+        opts += vm.uploadCandidateModels.map { m in
+            PopupOption(value: m.path, label: "Copy from \(m.name)")
+        }
+        return opts
+    }
+
+    private func submit() {
+        let trimmed = repoName.trimmingCharacters(in: .whitespaces)
+        guard canSubmit else { return }
+        isStarting = true
+        localError = nil
+        let body = HFUploadStartRequest(
+            modelPath: task.outputPath,
+            repoId: "\(vm.uploadNamespace)/\(trimmed)",
+            hfToken: vm.uploadToken,
+            readmeSourcePath: readmeSourcePath,
+            autoReadme: readmeSourcePath.isEmpty,
+            redownloadNotice: readmeSourcePath.isEmpty && addRedownloadNotice,
+            private: isPrivate
+        )
+        Task { @MainActor in
+            await vm.startUpload(body: body, client: client)
+            isStarting = false
+            if let err = vm.lastUploadError, !err.isEmpty {
+                localError = err
+            } else {
+                vm.uploadTarget = nil
+            }
+        }
+    }
+}
+
 // MARK: - About
 
 private struct AboutSection: View {
@@ -590,6 +1062,21 @@ final class QuantizationScreenVM: ObservableObject {
     @Published private(set) var modelsLoaded: Bool = false
     @Published private(set) var tasks: [OQTaskDTO] = []
     @Published private(set) var estimate: OQEstimateResponse?
+
+    // Upload state — covers the sheet + the Upload Tasks section. The token
+    // is hydrated from Keychain on `start()` and re-written after a
+    // successful `validateHFUploadToken` round-trip. We hold it in plain
+    // memory while the screen is mounted so the sheet's SecureField stays
+    // bound; it never gets persisted anywhere except the Keychain.
+    @Published var uploadTasks: [HFUploadTaskDTO] = []
+    @Published var uploadTarget: OQTaskDTO?
+    @Published var uploadCandidateModels: [HFUploadModelInfo] = []
+    @Published var uploadToken: String = ""
+    @Published var uploadValidatedUsername: String?
+    @Published var uploadOrgs: [HFOrgInfo] = []
+    @Published var uploadNamespace: String = ""
+    @Published var isValidatingToken: Bool = false
+    @Published var lastUploadError: String?
 
     // UI state
     @Published private(set) var isStarting: Bool = false
@@ -658,8 +1145,15 @@ final class QuantizationScreenVM: ObservableObject {
 
     func start(client: OMLXClient) async {
         self.client = client
+        // Hydrate the HF token from Keychain. Silent on miss — the sheet
+        // shows an empty SecureField and the user can paste a new token.
+        if let stored = Keychain.read(), !stored.isEmpty {
+            self.uploadToken = stored
+        }
         await loadModels()
+        await loadUploadCandidates()
         await loadTasks()
+        await loadUploadTasks()
         startPollingIfNeeded()
     }
 
@@ -689,17 +1183,44 @@ final class QuantizationScreenVM: ObservableObject {
         do {
             let resp = try await client.listOQTasks()
             // If a task just transitioned from active → completed, refresh
-            // the model list so the new quantized model shows up as a
-            // sensitivity candidate without a manual reload.
+            // the model list (so the new quantized model shows up as a
+            // sensitivity candidate) and the upload candidate list (so the
+            // README picker can copy from it). No manual reload required.
             let hadActive = self.tasks.contains(where: { $0.isActive })
             let hasActiveNow = resp.tasks.contains(where: { $0.isActive })
             self.tasks = resp.tasks
             if hadActive && !hasActiveNow {
                 await loadModels()
+                await loadUploadCandidates()
             }
         } catch {
             // Polling failure is expected during server restarts — don't
             // clobber the user-facing banner with transient errors.
+        }
+    }
+
+    /// Loads local oQ models that can serve as a README source when the user
+    /// picks "Copy from <model>" in the upload sheet. Filtered to oQ output
+    /// (matching the HTML panel's `oq_models` slot) so the dropdown stays
+    /// short.
+    func loadUploadCandidates() async {
+        guard let client else { return }
+        do {
+            let resp = try await client.listHFUploadModels()
+            self.uploadCandidateModels = resp.oqModels
+        } catch {
+            // Soft-fail — the auto-generate path still works without
+            // candidates, so we don't block the sheet on this.
+        }
+    }
+
+    private func loadUploadTasks() async {
+        guard let client else { return }
+        do {
+            let resp = try await client.listHFUploadTasks()
+            self.uploadTasks = resp.tasks
+        } catch {
+            // Polling failure: stay quiet (same rationale as loadTasks).
         }
     }
 
@@ -712,16 +1233,19 @@ final class QuantizationScreenVM: ObservableObject {
                 guard let self else { return }
                 let hasActive = await MainActor.run {
                     self.tasks.contains(where: { $0.isActive })
+                    || self.uploadTasks.contains(where: { $0.isActive })
                 }
                 if hasActive {
                     try? await Task.sleep(for: .seconds(2))
                     if Task.isCancelled { return }
                     await self.loadTasks()
+                    await self.loadUploadTasks()
                 } else {
                     // Idle poll cadence — 6 s while no work is queued.
                     try? await Task.sleep(for: .seconds(6))
                     if Task.isCancelled { return }
                     await self.loadTasks()
+                    await self.loadUploadTasks()
                 }
             }
         }
@@ -834,5 +1358,149 @@ final class QuantizationScreenVM: ObservableObject {
             if Task.isCancelled { return }
             await MainActor.run { self?.lastSuccess = nil }
         }
+    }
+
+    // MARK: Upload actions
+
+    /// Validates the current `uploadToken` against `/api/upload/validate-token`.
+    /// On success the token is persisted to the Keychain so the next session
+    /// skips this round-trip, and the namespace defaults to the returned
+    /// username (with orgs available via the Popup in the sheet).
+    func validateUploadToken(client: OMLXClient) async {
+        let token = uploadToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            lastUploadError = "Token is empty"
+            return
+        }
+        isValidatingToken = true
+        lastUploadError = nil
+        defer { isValidatingToken = false }
+        do {
+            let resp = try await client.validateHFUploadToken(hfToken: token)
+            self.uploadValidatedUsername = resp.username
+            self.uploadOrgs = resp.orgs
+            self.uploadNamespace = resp.username
+            Keychain.write(token)
+        } catch {
+            self.uploadValidatedUsername = nil
+            self.uploadOrgs = []
+            self.uploadNamespace = ""
+            self.lastUploadError = "Validate failed: \(describe(error))"
+        }
+    }
+
+    /// Submits a configured upload job. The caller (the sheet) clears
+    /// `uploadTarget` on success; on failure we surface the message via
+    /// `lastUploadError` and leave the sheet open so the user can correct
+    /// the body and retry without losing their inputs.
+    func startUpload(body: HFUploadStartRequest, client: OMLXClient) async {
+        lastUploadError = nil
+        do {
+            let resp = try await client.startHFUpload(body)
+            if resp.success == false {
+                lastUploadError = "Server refused the request"
+            }
+            await loadUploadTasks()
+            // Make sure the polling loop picks up the new active task even
+            // if nothing else was running before this submission.
+            startPollingIfNeeded()
+        } catch {
+            lastUploadError = "Upload failed: \(describe(error))"
+        }
+    }
+
+    func cancelUpload(taskId: String, client: OMLXClient) {
+        Task { [weak self] in
+            do {
+                _ = try await client.cancelHFUploadTask(taskId: taskId)
+                await self?.loadUploadTasks()
+            } catch {
+                await MainActor.run {
+                    self?.lastUploadError = "Cancel failed: \(error)"
+                }
+            }
+        }
+    }
+
+    func removeUpload(taskId: String, client: OMLXClient) {
+        Task { [weak self] in
+            do {
+                _ = try await client.removeHFUploadTask(taskId: taskId)
+                await self?.loadUploadTasks()
+            } catch {
+                await MainActor.run {
+                    self?.lastUploadError = "Remove failed: \(error)"
+                }
+            }
+        }
+    }
+
+    private func describe(_ error: Error) -> String {
+        if let omlx = error as? OMLXClientError { return String(describing: omlx) }
+        return error.localizedDescription
+    }
+}
+
+// MARK: - Keychain helper
+
+// Thin SecItem wrapper. Single account/service pair — the upload screen is
+// the only consumer right now, so we keep the surface small. All accesses
+// happen on the main actor (called from the VM); the SecItem APIs are
+// thread-safe so we don't need additional locking.
+enum Keychain {
+    private static let service = "app.omlx-next.hf-upload"
+    private static let account = "huggingface-token"
+
+    /// Returns the stored token or `nil` if no item exists / the read fails.
+    static func read() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecReturnData as String: true,
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let str = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return str
+    }
+
+    /// Writes (or updates) the stored token. No-op on empty input so we
+    /// don't accidentally clobber an existing entry with an empty string.
+    @discardableResult
+    static func write(_ value: String) -> Bool {
+        guard let data = value.data(using: .utf8), !value.isEmpty else { return false }
+        let baseQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let updateStatus = SecItemUpdate(
+            baseQuery as CFDictionary,
+            [kSecValueData as String: data] as CFDictionary
+        )
+        if updateStatus == errSecSuccess { return true }
+        if updateStatus == errSecItemNotFound {
+            var addQuery = baseQuery
+            addQuery[kSecValueData as String] = data
+            return SecItemAdd(addQuery as CFDictionary, nil) == errSecSuccess
+        }
+        return false
+    }
+
+    @discardableResult
+    static func delete() -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 }

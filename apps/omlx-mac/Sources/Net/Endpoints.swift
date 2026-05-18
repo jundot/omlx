@@ -56,6 +56,14 @@ enum AdminAPI {
     static func oqCancel(_ taskId: String) -> String { "\(prefix)/oq/cancel/\(taskId)" }
     static func oqTask(_ taskId: String) -> String   { "\(prefix)/oq/task/\(taskId)" }
 
+    // PR 13 — HF Upload
+    static let uploadValidateToken = "\(prefix)/upload/validate-token"
+    static let uploadModels        = "\(prefix)/upload/oq-models"
+    static let uploadStart         = "\(prefix)/upload/start"
+    static let uploadTasks         = "\(prefix)/upload/tasks"
+    static func uploadCancel(_ taskId: String) -> String { "\(prefix)/upload/cancel/\(taskId)" }
+    static func uploadTask(_ taskId: String) -> String   { "\(prefix)/upload/task/\(taskId)" }
+
     // PR 13 — Throughput bench
     static let deviceInfo      = "\(prefix)/device-info"
     static let benchStart      = "\(prefix)/bench/start"
