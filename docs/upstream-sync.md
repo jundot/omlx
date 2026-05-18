@@ -114,7 +114,20 @@ Qwen-Gemma / oQ)的相关度。
 - **#1259** "some failing tests" —— flyto 已引入 #1244 的测试修复
   (`cdaec79`),覆盖其中一部分;上游 #1268/#1286/#1287 是其余 follow-up,
   见上面"待引入"。
-- 其余暂无。
+- **#1241** `response_format json_schema strict` 不强制 —— flyto 在
+  `sync/upstream-prs-2026-05-18` 分支上自己修(上游 issue 开着没修):
+  - 根因有两层:① 服务器 venv 没装 xgrammar(可选依赖)→ `grammar_compiler`
+    为 `None` → 100% 走 prompt 注入;② 即便 xgrammar 在,`response_format`
+    路径在编译失败时**静默降级**(`structured_outputs` 路径会抛 400),
+    且 `strict` 字段全程没代码读。
+  - 2026-05-18 已做:m5max venv 装 `xgrammar 0.2.1`(0.2.x 不再拽 torch,
+    ~24MB)+ 重启 server,enum 排除测试实证 grammar 在 logit 层硬强制了;
+    `pyproject.toml` 把 xgrammar 提为**核心依赖**(不再可选,免再踩坑)。
+  - 代码修复 layer ①(`09ed68b`):`strict:true` 且 grammar 强制不了时
+    抛 HTTP 400,不再静默 200。layer ②③(降级响应头 + `/api/status`
+    能力位 + 启动日志)待做。
+  - 注:数值 `minimum/maximum` 即便 grammar 成功也不强制,仍需客户端
+    `jsonschema` 兜底。
 
 ## 上游未解决 issue 观察(2026-05-18 review,74 个 open issue)
 

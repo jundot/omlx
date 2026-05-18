@@ -79,13 +79,18 @@ dependencies = [
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.5.1 (20d68db) — original bstnxbt repo. Gemma4 support, runtime package refactor, stable prefix snapshot reuse
     "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@20d68db3b3c0ae3dd6d3a2f0d3c10b2344ee514e",
+    # Grammar-constrained decoding for structured-output enforcement
+    # (response_format json_schema). Core dependency since 2026-05-18:
+    # xgrammar 0.2.x dropped torch (~24MB total: xgrammar + apache-tvm-ffi),
+    # so structured output works out of the box — no silent prompt-only
+    # degrade when the extra was simply never installed.
+    "xgrammar>=0.1.32",
 ]
 
 [project.optional-dependencies]
-grammar = [
-    # Grammar-constrained decoding for structured output (requires torch ~2GB)
-    "xgrammar>=0.1.32",
-]
+# Back-compat no-op: xgrammar moved to core dependencies (2026-05-18).
+# `pip install omlx[grammar]` still resolves so existing install docs work.
+grammar = []
 mcp = [
     "mcp>=1.0.0",
 ]
