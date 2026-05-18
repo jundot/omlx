@@ -131,11 +131,17 @@ English version first. Chinese translation follows below.
       the caller-supplied reference text cannot be split.
     - if the audio duration cannot be probed, the gate is skipped.
 
-    Auto-chunking is deliberately not the default: it hides the
-    aligner's real limit, doubles ASR cost, and drifts the words text.
-    Splitting long audio cleanly (at silence / speaker turns) is best
-    done by the caller — so the default is honest failure, and
-    server-side chunking is there only when explicitly requested.
+    The design principle: **deciding whether to chunk over-long audio
+    is the caller's call** — not something the server does silently.
+    Chunking has real costs (a second ASR pass; `words` text that
+    drifts from the canonical transcript), so the default is `error`
+    and the caller must consciously opt in. It is *not* a claim that
+    the caller should do the splitting: once the caller decides to
+    chunk, `on_aligner_overflow=chunk` has the server do it well —
+    overlapping windows plus de-dup keep boundary words intact, which
+    a naive client-side cut at a hard offset does not. Client-side
+    splitting beats `chunk` only when the caller can cut at clean
+    points (silence / speaker turns).
 
     Repro:
 
@@ -362,9 +368,13 @@ English version first. Chinese translation follows below.
       text 没法切.
     - 探测不到音频时长时跳过该 gate.
 
-    auto-chunk 故意不做默认: 它把 aligner 真实上限藏起来、ASR 成本
-    翻倍、words 文本漂移. 干净地切长音频 (按静音/换人) 调用方做得最
-    好 —— 所以默认是诚实报错, 服务端切段只在显式请求时才走.
+    设计原则: **超长音频是否切, 是调用方的决定权** —— 不是服务端
+    默默替它定. 切段有真实代价 (多一趟 ASR; `words` 文本和 canonical
+    转写漂移), 所以默认 `error`, 调用方必须有意识地 opt in. 这**不是**
+    说切这个动作该调用方做: 调用方一旦决定切, `on_aligner_overflow=chunk`
+    让服务端切得更好 —— 重叠窗口 + 去重能保住边界词, 调用方在硬
+    偏移上盲切则保不住. 只有当调用方能切在干净的点上 (静音/换人)
+    时, 自己切才胜过 `chunk`.
 
     复现:
 

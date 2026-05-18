@@ -448,10 +448,14 @@ close.
    opt-in. The direct aligner-model call cannot chunk (the supplied
    reference text cannot be split) and always errors when over-limit.
 
-   Otherwise, split long recordings into segments under the limit and
-   call once per segment, or omit `word_timestamps` for a plain
-   transcript. Plain ASR (without `word_timestamps`) is unaffected — it
-   chunks internally and handles arbitrarily long audio.
+   Splitting the recording client-side and calling once per segment is
+   also valid — but it beats `chunk` only when the cuts land on clean
+   boundaries (silence / speaker turns); a blind cut at a hard offset
+   splits words across segments and is worse than `chunk` (which
+   overlaps windows and de-dups). Or omit `word_timestamps` for a
+   plain transcript. Plain ASR (without `word_timestamps`) is
+   unaffected — it chunks internally and handles arbitrarily long
+   audio.
 
 ---
 
@@ -853,6 +857,8 @@ pass 的标点 — 这正是 LLM 后处理层要补回的标点缺失.
    canonical 转写轻微漂移, 所以是 opt-in. 直接调 aligner model 的路径
    没法切 (传入的参考 text 切不了), 超长时永远报错.
 
-   不想用切段就把长录音切成上限以内的段、每段调一次, 或者去掉
+   也可以自己在客户端切、每段调一次 —— 但只有切在干净的边界上
+   (静音/换人) 才胜过 `chunk`; 在硬偏移上盲切会把词切到两段、反而
+   比 `chunk` 差 (`chunk` 用重叠窗口 + 去重). 或者去掉
    `word_timestamps` 取纯转写. 纯 ASR (不带 `word_timestamps`) 不受
    影响 —— 它内部会切段, 任意长音频都能处理.
