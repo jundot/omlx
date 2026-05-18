@@ -237,10 +237,26 @@ class BatchedEngine(BaseEngine):
                 model, processor = custom_loaded
                 return model, getattr(processor, "tokenizer", processor)
 
-            return load(
-                self._model_name,
-                tokenizer_config=tokenizer_config,
-            )
+            try:
+                return load(
+                    self._model_name,
+                    tokenizer_config=tokenizer_config,
+                )
+            except ValueError as e:
+                if "parameters not in model" in str(e):
+                    import inspect
+
+                    load_sig = inspect.signature(load)
+                    if "strict" in load_sig.parameters:
+                        logger.warning(
+                            f"Caught parameter mismatch error. Retrying load with strict=False. Details: {e}"
+                        )
+                        return load(
+                            self._model_name,
+                            tokenizer_config=tokenizer_config,
+                            strict=False,
+                        )
+                raise
 
         loop = asyncio.get_running_loop()
         self._model, self._tokenizer = await loop.run_in_executor(
