@@ -80,6 +80,59 @@ English version first. Chinese translation follows below.
    `[[gemma4_26b_a4b_sweet_spot]]`) has zero load cost.
    Estimate ~150–200 LOC + prompt template + tests.
 
+10. **BUG: word_timestamps truncated past ~5 min on long audio**
+    *(added 2026-05-18 after a field report)*
+
+    A correctness bug, not a feature — it silently corrupts the
+    sales-call QC pipeline that the STT surface exists to serve.
+
+    Symptom: `POST /v1/audio/transcriptions` with `word_timestamps=true`
+    on a 480 s recording returns complete `text` (full 8-min transcript)
+    but `segments[0].words` stops at `~284 s` — every word past that
+    point has its `start`/`end` clamped to the edge of the first
+    aligner window. Verified on `long.wav` across L / R / mix passes
+    (last word ends at 274 / 264 / 284 s against 480 s of real audio).
+
+    Root cause: `Qwen3-ForcedAligner-0.6B` has a ~5 min (300 s)
+    single-segment limit (Qwen model card). The ASR text path already
+    chunks (`stt.py` `split_audio_into_chunks`, 1200 s windows) so the
+    transcript is complete — but the aligner auto-chain does not.
+    `audio_routes.py` `_maybe_align_inplace` calls
+    `aligner_engine.transcribe(audio_path, ...)` with the whole file
+    and the whole reference text in one shot; `stt.py`
+    `model.generate(audio_path, ...)` is a single pass. Words past the
+    first window get the window-edge timestamp.
+
+    Client-side cannot recover this — the upstream timestamps are
+    genuinely missing.
+
+    Fix: chunk inside `_maybe_align_inplace` when audio exceeds the
+    aligner limit.
+
+    - detect duration > aligner single-segment cap (~300 s)
+    - split into ≤ 4 min windows with ~5 s inter-window overlap
+    - run the aligner per window — each window needs its *own*
+      reference text, so either slice the ASR transcript by segment
+      boundary or re-run ASR per window (re-ASR is simpler and the ASR
+      chunk loop already exists; slicing risks misaligned text)
+    - offset each window's `word.start/end` by the window start
+    - de-duplicate the overlap region (word text + adjacent timestamp)
+    - return unified timestamps — transparent to the caller
+
+    Estimate ~150–250 LOC + tests. The per-window reference text is the
+    real complexity; chunk-and-offset alone is easy.
+
+    Repro:
+
+    ```bash
+    curl -X POST :8000/v1/audio/transcriptions \
+      -H "Authorization: Bearer <key>" \
+      -F "model=Qwen3-ASR-1.7B-audio8-text4-mlx" \
+      -F "file=@long.wav" -F "language=zh" \
+      -F "word_timestamps=true" -F "response_format=verbose_json"
+    # segments[0].words[-1].end ≈ 284 s; expected ≈ 480 s
+    ```
+
 ### P1 — quality-of-life, ship in order
 
 4. **`response_format={"type":"json_object"}` for chat-completions**
@@ -252,6 +305,53 @@ English version first. Chinese translation follows below.
    LLM 调用走同一个 `engine_pool`, 共驻模型 (当前候选 Gemma 4 26B-A4B,
    按 `[[gemma4_26b_a4b_sweet_spot]]`) 零加载成本.
    估 ~150-200 LOC + prompt 模板 + 测试.
+
+10. **BUG: 长音频超 ~5min 后 word_timestamps 被截断**
+    *(2026-05-18 据一次实地报告加上)*
+
+    这是正确性 bug, 不是 feature —— 它静默损坏 STT 面本来要服务的
+    销售通话质检 pipeline.
+
+    现象: `POST /v1/audio/transcriptions` 带 `word_timestamps=true`,
+    480s 录音, 返回的 `text` 完整 (整通 8min 转写) 但
+    `segments[0].words` 停在 `~284s` —— 之后每个 word 的 `start`/`end`
+    全被 clamp 到第一个 aligner window 的边缘. 在 `long.wav` 上 L / R /
+    mix 三路都复现 (last word end = 274 / 264 / 284s, 真实音频 480s).
+
+    根因: `Qwen3-ForcedAligner-0.6B` 单段上限 ~5min (300s, 见 Qwen
+    model card). ASR text 路径本身有切段 (`stt.py` 的
+    `split_audio_into_chunks`, 1200s window) 所以转写完整 —— 但
+    aligner auto-chain 没有. `audio_routes.py` 的 `_maybe_align_inplace`
+    用整个文件 + 整段参考 text 一次调 `aligner_engine.transcribe(
+    audio_path, ...)`; `stt.py` 的 `model.generate(audio_path, ...)` 是
+    单 pass. 第一个 window 之后的 word 拿到的是 window 边缘时间戳.
+
+    客户端救不回 —— 上游时间戳是真缺失.
+
+    修复: 在 `_maybe_align_inplace` 里, 音频超 aligner 上限时切段.
+
+    - 检测时长 > aligner 单段上限 (~300s)
+    - 切成 ≤4min window, window 间 ~5s overlap
+    - 每个 window 单独跑 aligner —— 每段需要**自己的**参考 text, 所以
+      要么按 ASR segment 边界切 text, 要么每段重跑 ASR (重跑 ASR 更
+      简单, ASR 的 chunk loop 现成; 切 text 有错位风险)
+    - 每个 window 的 `word.start/end` 加上 window 起始 offset
+    - overlap 区去重 (按 word 文本 + 相邻时间戳判断)
+    - 返回统一时间戳 —— 对调用方透明
+
+    估 ~150-250 LOC + 测试. 真正的复杂点是每段的参考 text; 单纯
+    切段 + offset 很简单.
+
+    复现:
+
+    ```bash
+    curl -X POST :8000/v1/audio/transcriptions \
+      -H "Authorization: Bearer <key>" \
+      -F "model=Qwen3-ASR-1.7B-audio8-text4-mlx" \
+      -F "file=@long.wav" -F "language=zh" \
+      -F "word_timestamps=true" -F "response_format=verbose_json"
+    # segments[0].words[-1].end ≈ 284s; 期望 ≈ 480s
+    ```
 
 ### P1 — quality-of-life, 按顺序 ship
 
