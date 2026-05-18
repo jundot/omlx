@@ -30,13 +30,19 @@ class TestGetPhysFootprintDarwin:
 
     def test_includes_python_heap(self):
         baseline = get_phys_footprint()
-        # Allocate a sizeable buffer to force phys growth.
-        big = bytearray(64 * 1024 * 1024)
+        # Allocate a large buffer to force phys growth. The allocation is
+        # deliberately much larger than the >32MB assertion threshold:
+        # under a full-suite run a warm allocator can satisfy a smaller
+        # buffer from already-resident cached pages, so phys would not grow
+        # and the test would flake. 256MB against a 32MB floor leaves wide
+        # headroom for allocator page reuse while still proving the heap
+        # is counted.
+        big = bytearray(256 * 1024 * 1024)
         # Touch it so pages become resident.
         for i in range(0, len(big), 4096):
             big[i] = 1
         after = get_phys_footprint()
-        # phys should have grown by at least most of the allocation.
+        # phys should have grown by a meaningful fraction of the allocation.
         assert after - baseline > 32 * 1024 * 1024
         del big
 
