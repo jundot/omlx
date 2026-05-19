@@ -4164,6 +4164,19 @@ class Scheduler:
                 req._extracted_cache = None
                 req.prompt_cache = None
         self.waiting.clear()
+        # Catch in-flight orphans: a request popped from self.waiting but
+        # not yet added to self.running (or self.prefilling) sits as a
+        # local in _schedule_waiting. If _do_external_prefill raises, the
+        # request is unreachable through the three queues but still lives
+        # in self.requests (and the engine_core collector / finished_event
+        # for its id is still waiting). Without this pass, fail_all_requests
+        # returns an incomplete list and the HTTP request hangs forever.
+        for request_id in list(self.requests):
+            failed_ids.append(request_id)
+            req = self.requests.pop(request_id, None)
+            if req is not None:
+                req._extracted_cache = None
+                req.prompt_cache = None
         # Reset batch generator only (cache is not corrupted)
         self.batch_generator = None
         self._current_sampler_params = None

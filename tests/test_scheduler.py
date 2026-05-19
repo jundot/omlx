@@ -1669,6 +1669,37 @@ class TestCacheCorruptionRecovery:
         # Cache should NOT be cleared (not a corruption error)
         scheduler.block_aware_cache.clear.assert_not_called()
 
+    def test_fail_all_requests_includes_in_flight_orphans(
+        self, mock_model, mock_tokenizer
+    ):
+        """Catch requests popped from self.waiting but not yet in self.running.
+
+        Regression test for the hang triggered when ``_do_external_prefill``
+        raises inside ``_schedule_waiting``: the request has already been
+        popped from ``self.waiting`` and has not yet been inserted into
+        ``self.running``, so the three-queue sweep misses it. The orphan
+        still lives in ``self.requests`` and the HTTP collector for its id
+        keeps awaiting a result that never arrives.
+        """
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        orphan = Request(
+            request_id="req-orphan",
+            prompt="orphan",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=[6, 7],
+            num_prompt_tokens=2,
+        )
+        # Orphan only: present in self.requests, absent from all three queues.
+        scheduler.requests[orphan.request_id] = orphan
+        assert orphan.request_id not in scheduler.waiting
+        assert orphan.request_id not in scheduler.running
+        assert orphan.request_id not in scheduler.prefilling
+
+        failed_ids = scheduler.fail_all_requests()
+
+        assert "req-orphan" in failed_ids
+        assert "req-orphan" not in scheduler.requests
+
 
 class TestDetectNeedsThinkPrefix:
     """Tests for _detect_needs_think_prefix() method.
