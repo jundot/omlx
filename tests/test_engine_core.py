@@ -978,10 +978,8 @@ class TestGlobalMLXExecutor:
         executor2 = get_mlx_executor()
         assert executor1 is executor2
 
-    def test_engines_share_mlx_executor(self, mock_model, mock_tokenizer):
-        """Multiple EngineCore instances must share a single MLX executor (#85)."""
-        from omlx.engine_core import get_mlx_executor
-
+    def test_engines_have_per_engine_executors(self, mock_model, mock_tokenizer):
+        """Each EngineCore must have its own executor (#1248)."""
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
 
@@ -989,8 +987,7 @@ class TestGlobalMLXExecutor:
             engine2 = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
 
             try:
-                assert engine1._mlx_executor is engine2._mlx_executor
-                assert engine1._mlx_executor is get_mlx_executor()
+                assert engine1._mlx_executor is not engine2._mlx_executor
             finally:
                 engine1.close()
                 engine2.close()
@@ -1046,13 +1043,14 @@ class TestGlobalMLXExecutor:
         )
 
     @pytest.mark.asyncio
-    async def test_two_engine_loops_serialize_on_shared_executor(
+    async def test_two_engine_loops_run_concurrently_on_separate_executors(
         self, mock_model, mock_tokenizer
     ):
-        """Two engines running their loops must serialize step() calls (#85).
+        """Two engines with per-engine executors can run step() concurrently (#1248).
 
-        Creates two EngineCore instances with mock schedulers, starts both
-        engine loops, and verifies their scheduler.step() calls never overlap.
+        Each EngineCore has its own ThreadPoolExecutor and mx.Stream, so their
+        scheduler.step() calls can overlap. This test verifies that two engines
+        actually achieve concurrent execution.
         """
         import threading
         import time
@@ -1107,8 +1105,9 @@ class TestGlobalMLXExecutor:
         assert total_steps >= 4, (
             f"Expected at least 4 steps from two engines, got {total_steps}"
         )
-        assert max_concurrent == 1, (
-            f"Expected max 1 concurrent step(), got {max_concurrent}. "
-            f"Two engines ran MLX operations in parallel — would cause "
-            f"Metal command buffer races in production."
+        # With per-engine executors (#1248), two engines CAN run concurrently.
+        # max_concurrent >= 2 means both engines overlapped at least once.
+        assert max_concurrent >= 2, (
+            f"Expected concurrent execution (max_concurrent >= 2), got {max_concurrent}. "
+            f"Per-engine executors should allow parallel step() calls."
         )

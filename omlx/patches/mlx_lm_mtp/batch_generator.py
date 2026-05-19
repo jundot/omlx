@@ -308,24 +308,6 @@ class _MtpState:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_generation_stream():
-    """Return the ``mlx_lm.generate`` module-level generation stream.
-
-    The standard ``GenerationBatch._step`` runs all forward passes inside
-    ``mx.stream(generation_stream)``; the MTP cycle does the same so the
-    paged cache writes land on the same stream and ordering is preserved.
-    The stream lives on the *outer* ``BatchGenerator``, not on
-    ``GenerationBatch``, so we read it from the module.
-
-    Note: ``mlx_lm.__init__`` re-exports a ``generate`` *function*, so
-    ``import mlx_lm.generate as mlg`` resolves to the function, not the
-    module. We use ``sys.modules`` to grab the actual module.
-    """
-    import sys
-
-    return sys.modules["mlx_lm.generate"].generation_stream
-
-
 def _resolve_sampler(gen_batch: Any):
     """Match ``GenerationBatch._step``'s per-sequence sampler resolution (batch=1)."""
     if gen_batch.samplers and gen_batch.samplers[0] is not None:
@@ -507,9 +489,9 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         procs = _proc_list(gen_batch)
         _set_singleton_mrope_delta(gen_batch)
         tok_arr = _ensure_uint32(mx.array(list(tokens)))
-        with mx.stream(_get_generation_stream()):
-            logits, _, _ = _call_backbone(gen_batch.model, tok_arr[None, :], new_cache)
-            last_logits = logits[:, -1, :]  # (1, vocab) — dist after tokens[-1]
+        # Inherits the per-engine stream from the enclosing BatchGenerator context.
+        logits, _, _ = _call_backbone(gen_batch.model, tok_arr[None, :], new_cache)
+        last_logits = logits[:, -1, :]  # (1, vocab) — dist after tokens[-1]
 
         if state.queue:
             next_id, next_lp_1d, _src = state.queue[0]
@@ -760,10 +742,10 @@ def _post_init_mtp(gen_batch: Any) -> None:
 
     # 1-token backbone forward at main_tok with hidden state. No draft yet,
     # so no rollback is possible — discard gdn_states.
-    with mx.stream(_get_generation_stream()):
-        logits, hidden, _ = _call_backbone(
-            gen_batch.model, main_tok[:, None], gen_batch.prompt_cache
-        )
+    # Inherits the per-engine stream from the enclosing BatchGenerator context.
+    logits, hidden, _ = _call_backbone(
+        gen_batch.model, main_tok[:, None], gen_batch.prompt_cache
+    )
 
     next_main_logits = logits[:, -1, :]  # (1, vocab) — distribution after main_tok
     next_main_logits = _apply_processors(procs, prev_buf, next_main_logits)
@@ -775,8 +757,7 @@ def _post_init_mtp(gen_batch: Any) -> None:
     mtp_cache = gen_batch.model.make_mtp_cache()
     hidden_at_main = hidden[:, -1:, :]  # (1, 1, H)
     next_ids = next_main_tok.reshape(1, 1)
-    with mx.stream(_get_generation_stream()):
-        mtp_logits = gen_batch.model.mtp_forward(hidden_at_main, next_ids, mtp_cache)
+    mtp_logits = gen_batch.model.mtp_forward(hidden_at_main, next_ids, mtp_cache)
     mtp_logits_2d = mtp_logits[:, -1, :]
     if procs is not None:
         prev_with_main_and_next = mx.concatenate(
@@ -923,15 +904,14 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     # per cycle (negligible vs the forward compute) and keeps the
     # backbone_ms / sample_ms split accurate.
     t0 = time.perf_counter()
-    with mx.stream(_get_generation_stream()):
-        logits, hidden, gdn_states = _call_backbone(
-            gen_batch.model,
-            inputs[None, :],
-            gen_batch.prompt_cache,
-            n_confirmed=1,
-        )
-        verify_logits = logits[:, 0, :]
-        bonus_logits = logits[:, 1, :]
+    logits, hidden, gdn_states = _call_backbone(
+        gen_batch.model,
+        inputs[None, :],
+        gen_batch.prompt_cache,
+        n_confirmed=1,
+    )
+    verify_logits = logits[:, 0, :]
+    bonus_logits = logits[:, 1, :]
     mx.eval(logits)
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
@@ -1086,11 +1066,10 @@ def _step_mtp(
 
     t0 = time.perf_counter()
     next_ids = next_main_tok.reshape(1, 1)
-    with mx.stream(_get_generation_stream()):
-        mtp_logits = gen_batch.model.mtp_forward(
-            hidden_at_position, next_ids, state.mtp_cache
-        )
-        mtp_logits_2d = mtp_logits[:, -1, :]
+    mtp_logits = gen_batch.model.mtp_forward(
+        hidden_at_position, next_ids, state.mtp_cache
+    )
+    mtp_logits_2d = mtp_logits[:, -1, :]
     if procs is not None and prev_buf is not None:
         prev_with_next = mx.concatenate(
             [prev_buf, _ensure_uint32(next_main_tok)]
