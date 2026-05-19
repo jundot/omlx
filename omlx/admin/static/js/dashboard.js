@@ -1601,6 +1601,9 @@
                         ? Math.round(settings.dflash_in_memory_cache_max_bytes / (1024 ** 3))
                         : 8,
                     dflash_ssd_cache: settings.dflash_ssd_cache || false,
+                    dflash_draft_window_size: settings.dflash_draft_window_size ?? null,
+                    dflash_draft_sink_size: settings.dflash_draft_sink_size ?? null,
+                    dflash_verify_mode: settings.dflash_verify_mode || 'adaptive',
                     dflash_compatible: model.dflash_compatible !== false,
                     dflash_compatibility_reason: model.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model.dflash_ssd_cache_available,
@@ -1716,6 +1719,20 @@
                                     && !!this.modelSettings.dflash_in_memory_cache
                                     && !!this.modelSettings.dflash_ssd_cache_available
                                     && !!this.modelSettings.dflash_ssd_cache,
+                                // Long-context tuning. Null → server keeps it null → dflash-mlx default.
+                                dflash_draft_window_size: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_draft_window_size
+                                    ? parseInt(this.modelSettings.dflash_draft_window_size)
+                                    : null,
+                                dflash_draft_sink_size: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_draft_sink_size !== null
+                                    && this.modelSettings.dflash_draft_sink_size !== undefined
+                                    && this.modelSettings.dflash_draft_sink_size !== ''
+                                    ? parseInt(this.modelSettings.dflash_draft_sink_size)
+                                    : null,
+                                dflash_verify_mode: this.modelSettings.dflash_enabled
+                                    ? (this.modelSettings.dflash_verify_mode || 'adaptive')
+                                    : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
@@ -1802,6 +1819,9 @@
                         this.modelSettings.dflash_in_memory_cache_max_entries = 4;
                         this.modelSettings.dflash_in_memory_cache_max_gib = 8;
                         this.modelSettings.dflash_ssd_cache = false;
+                        this.modelSettings.dflash_draft_window_size = null;
+                        this.modelSettings.dflash_draft_sink_size = null;
+                        this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {

@@ -143,6 +143,23 @@ class DFlashEngine(BaseEngine):
             if model_settings
             else False
         )
+        # None → let dflash-mlx pick its own default (window=1024, sink=64, verify="adaptive").
+        # `getattr` returns None for missing attrs so older settings files keep working.
+        self._draft_window_size = (
+            getattr(model_settings, "dflash_draft_window_size", None)
+            if model_settings
+            else None
+        )
+        self._draft_sink_size = (
+            getattr(model_settings, "dflash_draft_sink_size", None)
+            if model_settings
+            else None
+        )
+        self._verify_mode = (
+            getattr(model_settings, "dflash_verify_mode", None)
+            if model_settings
+            else None
+        )
 
     @property
     def model_name(self) -> str:
@@ -205,6 +222,10 @@ class DFlashEngine(BaseEngine):
             # 1 TiB sentinel — disk usage is bounded by the omlx SSD cache
             # configuration, so dflash's own byte limit is intentionally large.
             prefix_cache_l2_max_bytes=1 << 40 if l2_enabled else 0,
+            # None → dflash-mlx fills in DEFAULT_RUNTIME_CONFIG values.
+            draft_window_size=self._draft_window_size,
+            draft_sink_size=self._draft_sink_size,
+            verify_mode=self._verify_mode,
         )
         return build_runtime_context(cfg)
 
@@ -273,13 +294,19 @@ class DFlashEngine(BaseEngine):
         self._loaded = True
         self._in_fallback_mode = False
         max_ctx_display = "unlimited" if self._max_dflash_ctx is None else self._max_dflash_ctx
+        # Resolved values dflash-mlx actually ended up using (None settings → dflash default).
+        runtime_cfg = getattr(self._runtime_context, "runtime", None)
+        window_used = getattr(runtime_cfg, "draft_window_size", "?")
+        sink_used = getattr(runtime_cfg, "draft_sink_size", "?")
+        verify_used = getattr(runtime_cfg, "verify_mode", "?")
         logger.info(
             f"DFlashEngine loaded: target={self._model_name}, "
             f"draft={self._draft_model_path}, "
             f"max_ctx={max_ctx_display}, "
             f"fallback={self._fallback_engine_type}, "
             f"l1_cache={self._in_memory_cache_enabled}, "
-            f"l2_cache={self._resolve_dflash_l2_dir() is not None}"
+            f"l2_cache={self._resolve_dflash_l2_dir() is not None}, "
+            f"draft_window={window_used}, draft_sink={sink_used}, verify={verify_used}"
         )
 
     async def _evict_dflash_and_start_fallback(self) -> None:

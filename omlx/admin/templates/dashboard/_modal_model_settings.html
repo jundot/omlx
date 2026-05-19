@@ -775,6 +775,34 @@
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <p class="text-xs text-neutral-400 mt-1">Prompts at or above this token count switch to BatchedEngine. Leave empty for unlimited.</p>
                                         </div>
+                                        <div class="pt-2 border-t border-neutral-200 space-y-3">
+                                            <p class="text-xs font-bold uppercase tracking-wider text-neutral-500">Long-context tuning</p>
+                                            <div class="grid grid-cols-2 gap-3">
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft window size</label>
+                                                    <input type="number" x-model.number="modelSettings.dflash_draft_window_size" min="1" step="128" placeholder="1024"
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                    <p class="text-xs text-neutral-400 mt-1">Draft model sliding-attention window. Helps stabilise acceptance on long contexts. Leave empty for dflash default (1024).</p>
+                                                </div>
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft sink size</label>
+                                                    <input type="number" x-model.number="modelSettings.dflash_draft_sink_size" min="0" step="8" placeholder="64"
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                    <p class="text-xs text-neutral-400 mt-1">Attention-sink tokens always kept regardless of window. Leave empty for dflash default (64).</p>
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Verify mode</label>
+                                                <select x-model="modelSettings.dflash_verify_mode"
+                                                        class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                    <option value="adaptive">adaptive (default)</option>
+                                                    <option value="dflash">dflash</option>
+                                                    <option value="ddtree">ddtree</option>
+                                                    <option value="off">off</option>
+                                                </select>
+                                                <p class="text-xs text-neutral-400 mt-1">Verifier algorithm. "adaptive" shrinks block size when acceptance drops; "off" disables speculative verify.</p>
+                                            </div>
+                                        </div>
                                         <div class="flex items-start justify-between gap-3 pt-2 border-t border-neutral-200">
                                             <div class="min-w-0">
                                                 <span class="text-sm font-medium text-neutral-700">In-memory cache</span>

@@ -24,11 +24,14 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache_max_entries == 4
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is False
+        # New long-context tuning knobs (issue #1276). None → dflash-mlx default.
+        assert settings.dflash_draft_window_size is None
+        assert settings.dflash_draft_sink_size is None
+        assert settings.dflash_verify_mode is None
 
-    def test_no_verify_mode_field(self):
-        """verify_mode and speculative_tokens were removed in v2."""
+    def test_no_speculative_tokens_field(self):
+        """dflash_speculative_tokens was removed in v2 and stays removed."""
         settings = ModelSettings()
-        assert not hasattr(settings, "dflash_verify_mode")
         assert not hasattr(settings, "dflash_speculative_tokens")
 
     def test_to_dict_includes_dflash_fields(self):
@@ -49,6 +52,10 @@ class TestDFlashModelSettings:
         assert "dflash_draft_quant_activation_bits" not in d
         assert "dflash_draft_quant_group_size" not in d
         assert "dflash_max_ctx" not in d
+        # Tuning knobs default to None → omitted from on-disk JSON.
+        assert "dflash_draft_window_size" not in d
+        assert "dflash_draft_sink_size" not in d
+        assert "dflash_verify_mode" not in d
 
     def test_from_dict_with_dflash_fields(self):
         data = {
@@ -90,15 +97,28 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is False
 
-    def test_from_dict_ignores_removed_fields(self):
-        """Old settings with verify_mode/speculative_tokens should be ignored."""
+    def test_from_dict_ignores_removed_speculative_tokens(self):
+        """dflash_speculative_tokens (removed in v2) is silently dropped."""
         data = {
             "dflash_enabled": True,
-            "dflash_verify_mode": "parallel-replay",
             "dflash_speculative_tokens": 16,
         }
         settings = ModelSettings.from_dict(data)
         assert settings.dflash_enabled is True
+        assert not hasattr(settings, "dflash_speculative_tokens")
+
+    def test_from_dict_accepts_new_tuning_fields(self):
+        """Issue #1276 — draft window / sink / verify_mode round-trip from JSON."""
+        data = {
+            "dflash_enabled": True,
+            "dflash_draft_window_size": 2048,
+            "dflash_draft_sink_size": 32,
+            "dflash_verify_mode": "adaptive",
+        }
+        settings = ModelSettings.from_dict(data)
+        assert settings.dflash_draft_window_size == 2048
+        assert settings.dflash_draft_sink_size == 32
+        assert settings.dflash_verify_mode == "adaptive"
 
     def test_roundtrip_serialization(self):
         original = ModelSettings(
@@ -316,6 +336,80 @@ class TestDFlashEngineInit:
             omlx_ssd_cache_dir=tmp_path,
         )
         assert engine._resolve_dflash_l2_dir() is None
+
+    def test_long_context_knobs_default_to_none(self):
+        """No settings → engine stores None → dflash-mlx fills DEFAULT_RUNTIME_CONFIG."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        assert engine._draft_window_size is None
+        assert engine._draft_sink_size is None
+        assert engine._verify_mode is None
+
+    def test_long_context_knobs_read_from_settings(self):
+        """Issue #1276 — DFlashEngine picks up window/sink/verify_mode from ModelSettings."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(
+                dflash_draft_window_size=2048,
+                dflash_draft_sink_size=32,
+                dflash_verify_mode="adaptive",
+            ),
+        )
+        assert engine._draft_window_size == 2048
+        assert engine._draft_sink_size == 32
+        assert engine._verify_mode == "adaptive"
+
+    def test_build_runtime_context_passes_knobs(self):
+        """The new kwargs reach dflash-mlx and end up in RuntimeContext.runtime."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(
+                dflash_draft_window_size=512,
+                dflash_draft_sink_size=16,
+                dflash_verify_mode="dflash",
+            ),
+        )
+        ctx = engine._build_runtime_context()
+        runtime = getattr(ctx, "runtime")
+        assert runtime.draft_window_size == 512
+        assert runtime.draft_sink_size == 16
+        assert runtime.verify_mode == "dflash"
+
+    def test_build_runtime_context_defaults_to_dflash_mlx_values(self):
+        """None settings → dflash-mlx fills DEFAULT_RUNTIME_CONFIG (1024 / 64 / 'adaptive')."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        ctx = engine._build_runtime_context()
+        runtime = getattr(ctx, "runtime")
+        assert runtime.draft_window_size == 1024
+        assert runtime.draft_sink_size == 64
+        assert runtime.verify_mode == "adaptive"
 
 
 class TestDFlashCompatibility:
