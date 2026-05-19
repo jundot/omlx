@@ -4299,9 +4299,32 @@ async def search_hf_models(
     sort: str = "trending",
     limit: int = 100,
     mlx_only: bool = True,
+    # Filtering
+    quant: str = "",
+    min_params: int = None,
+    max_params: int = None,
+    min_size: int = None,  # bytes
+    max_size: int = None,  # bytes
+    # Sorting
+    sort_by_size: bool = False,
+    sort_ascending: bool = False,
     is_admin: bool = Depends(require_admin),
 ):
-    """Search HuggingFace models by query."""
+    """Search HuggingFace models by query with filtering and sorting.
+
+    Query Parameters:
+        q: Search query string (required)
+        sort: Sort order - trending/downloads/created/updated/most_params/least_params/largest/smallest
+        limit: Maximum results (max 100)
+        mlx_only: Restrict to MLX library models
+        quant: Filter by quantization (e.g., '4bit', '8bit', 'bf16', 'fp16')
+        min_params: Minimum parameter count
+        max_params: Maximum parameter count
+        min_size: Minimum model size in bytes
+        max_size: Maximum model size in bytes
+        sort_by_size: Sort results by size instead of default sort
+        sort_ascending: Sort in ascending order
+    """
     if not q.strip():
         raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
 
@@ -4313,6 +4336,13 @@ async def search_hf_models(
             sort=sort,
             limit=min(limit, 100),
             mlx_only=mlx_only,
+            quant=quant or None,
+            min_params=min_params,
+            max_params=max_params,
+            min_size=min_size,
+            max_size=max_size,
+            sort_by_size=sort_by_size,
+            sort_ascending=sort_ascending,
         )
         return result
     except TimeoutError:

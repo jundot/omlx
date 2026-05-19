@@ -258,6 +258,21 @@
             hfSearchLoading: false,
             hfSearchLoaded: false,
             hfSearchDebounceTimer: null,
+            // Search filters
+            hfSearchFiltersOpen: false,
+            hfSearchQuant: '',
+            hfSearchMinParams: '',
+            hfSearchMaxParams: '',
+            hfSearchMaxSize: '',
+            hfSearchMinSize: '',
+            // Table sort state for Browse Models
+            hfTableSort: 'downloads',
+            hfTableSortDir: 'desc',
+
+            // Computed: check if any filters are active
+            get hfSearchFiltersActive() {
+                return this.hfSearchQuant || this.hfSearchMinParams || this.hfSearchMaxParams || this.hfSearchMaxSize || this.hfSearchMinSize;
+            },
 
             // Search history
             hfSearchHistory: JSON.parse(localStorage.getItem('hfSearchHistory') || '[]'),
@@ -4118,6 +4133,35 @@
                 return count.toString();
             },
 
+            // Table sort helpers for Browse Models
+            sortModels(list) {
+                const sortBy = this.hfTableSort;
+                const dir = this.hfTableSortDir === 'asc' ? 1 : -1;
+                return [...list].sort((a, b) => {
+                    if (sortBy === 'name') {
+                        return dir * (a.name || '').localeCompare(b.name || '');
+                    } else if (sortBy === 'downloads') {
+                        return dir * ((a.downloads || 0) - (b.downloads || 0));
+                    } else if (sortBy === 'likes') {
+                        return dir * ((a.likes || 0) - (b.likes || 0));
+                    } else if (sortBy === 'size') {
+                        return dir * ((a.size || 0) - (b.size || 0));
+                    } else if (sortBy === 'params') {
+                        return dir * ((a.params || 0) - (b.params || 0));
+                    }
+                    return 0;
+                });
+            },
+
+            toggleTableSort(column) {
+                if (this.hfTableSort === column) {
+                    this.hfTableSortDir = this.hfTableSortDir === 'asc' ? 'desc' : 'asc';
+                } else {
+                    this.hfTableSort = column;
+                    this.hfTableSortDir = column === 'name' ? 'asc' : 'desc';
+                }
+            },
+
             // Pagination helpers
             getPagedModels(tab) {
                 const page = this.hfPage[tab] || 1;
@@ -4126,7 +4170,9 @@
                 if (tab === 'trending') list = this.hfRecommended.trending || [];
                 else if (tab === 'popular') list = this.hfRecommended.popular || [];
                 else list = this.hfSearchResults || [];
-                return list.slice((page - 1) * size, page * size);
+                // Apply table sorting
+                const sorted = this.sortModels(list);
+                return sorted.slice((page - 1) * size, page * size);
             },
 
             getTotalPages(tab) {
@@ -4157,6 +4203,21 @@
                         limit: '100',
                         mlx_only: this.hfMlxOnly,
                     });
+                    // Add filter parameters if set
+                    if (this.hfSearchQuant) params.set('quant', this.hfSearchQuant);
+                    if (this.hfSearchMinParams) params.set('min_params', (parseFloat(this.hfSearchMinParams) * 1e9).toString());
+                    if (this.hfSearchMaxParams) params.set('max_params', (parseFloat(this.hfSearchMaxParams) * 1e9).toString());
+                    if (this.hfSearchMaxSize) params.set('max_size', (parseFloat(this.hfSearchMaxSize) * 1e9).toString());
+                    if (this.hfSearchMinSize) params.set('min_size', (parseFloat(this.hfSearchMinSize) * 1e9).toString());
+                    // Wire largest/smallest sort params to backend
+                    if (this.hfSearchSort === 'largest') {
+                        params.set('sort_by_size', 'true');
+                        params.set('sort_ascending', 'false');
+                    } else if (this.hfSearchSort === 'smallest') {
+                        params.set('sort_by_size', 'true');
+                        params.set('sort_ascending', 'true');
+                    }
+                    
                     const response = await fetch(`/admin/api/hf/search?${params}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
@@ -4183,6 +4244,15 @@
                     clearTimeout(timeoutId);
                     this.hfSearchLoading = false;
                 }
+            },
+
+            clearHFSearchFilters() {
+                this.hfSearchQuant = '';
+                this.hfSearchMinParams = '';
+                this.hfSearchMaxParams = '';
+                this.hfSearchMaxSize = '';
+                this.hfSearchMinSize = '';
+                if (this.hfSearchQuery.trim()) this.immediateSearch();
             },
 
             debounceSearch() {
