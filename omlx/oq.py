@@ -2246,6 +2246,8 @@ def quantize_oq_streaming(
 
     sensitivity_map_path = Path(model_path, "oq_sensitivity_map.json")
 
+    cb("loading", 12.0)
+
     if sensitivity_map_path.exists():
         sensitivity_map = json.loads(sensitivity_map_path.read_text(encoding="utf-8"))
         logger.info(f"{sensitivity_map_path} found, skipping measuring.")
@@ -2260,8 +2262,6 @@ def quantize_oq_streaming(
                 f"80% of system RAM ({_system_ram / 1e9:.1f} GB), "
                 "OOM-prone paths will be skipped"
             )
-
-        cb("loading", 12.0)
 
         # --- Sensitivity measurement (before sanitize-plan discovery) ---------
         # Must run before _build_model_sanitizer + _discover_sanitize_plan,
