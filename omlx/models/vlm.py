@@ -71,8 +71,23 @@ class VLMModelAdapter(nn.Module):
 
     @property
     def layers(self):
-        """Expose language model layers for cache creation."""
-        return self._language_model.model.layers
+        """Expose language model layers for cache creation.
+
+        Tries, in order: nested ``model.layers`` (Qwen2VL etc.), nested
+        ``model.blocks`` (Molmo / Molmo2 / molmo_point / Moondream3), flat
+        ``layers``, flat ``blocks``. Covers all four mlx-vlm conventions.
+        """
+        lm = self._language_model
+        for parent in (getattr(lm, "model", None), lm):
+            if parent is None:
+                continue
+            for attr in ("layers", "blocks"):
+                v = getattr(parent, attr, None)
+                if v is not None:
+                    return v
+        raise AttributeError(
+            f"{type(lm).__name__} has no .layers/.blocks (flat or nested)"
+        )
 
     @property
     def model_type(self) -> str:
