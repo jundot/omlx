@@ -123,6 +123,7 @@ SUPPORTED_RERANKER_ARCHITECTURES = {
 # Detected by architecture + heuristic (model name or tokenizer hints).
 CAUSAL_LM_RERANKER_ARCHITECTURES = {
     "Qwen3ForCausalLM",
+    "MistralForCausalLM",  # e.g. ContextualAI/reranker_v2_6b (dir-name gated)
 }
 
 # CausalLM-based embedding architectures.
