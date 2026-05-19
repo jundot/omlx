@@ -22,6 +22,7 @@ struct IntegrationsScreen: View {
             ClaudeCodeSection(vm: vm, client: services.client)
             SetupCommandSection(command: vm.claudeLaunchCommand)
             OtherIntegrationsSection(vm: vm, client: services.client)
+            MCPSection(vm: vm, client: services.client)
 
             if let error = vm.lastError {
                 Text(error)
@@ -92,12 +93,27 @@ private struct ClaudeCodeSection: View {
             Row(
                 label: "Context scaling",
                 sublabel: "Stretch context windows for long agentic sessions",
-                isLast: true
+                isLast: !vm.contextScaling
             ) {
                 Toggle("", isOn: vm.bind($vm.contextScaling, save: {
                     Task { await vm.save(.contextScaling, client: client) }
                 }))
                 .labelsHidden().toggleStyle(.switch)
+            }
+            if vm.contextScaling {
+                Row(
+                    label: "Target context size",
+                    sublabel: "Per-request context window Claude Code will scale toward",
+                    isLast: true
+                ) {
+                    TextInput(
+                        text: $vm.targetContextSizeText,
+                        mono: true,
+                        suffix: "tk",
+                        width: 130
+                    )
+                    .onSubmit { Task { await vm.save(.targetContextSize, client: client) } }
+                }
             }
         }
     }
@@ -222,10 +238,28 @@ private struct OtherIntegrationsSection: View {
                     ]
                 )
             }
-            Row(label: "Pi", isLast: true) {
+            Row(label: "Hermes Agent") {
+                Popup(
+                    selection: vm.bind($vm.hermesModel, save: {
+                        Task { await vm.save(.hermesModel, client: client) }
+                    }),
+                    width: 220,
+                    options: vm.modelOptions
+                )
+            }
+            Row(label: "Pi") {
                 Popup(
                     selection: vm.bind($vm.piModel, save: {
                         Task { await vm.save(.piModel, client: client) }
+                    }),
+                    width: 220,
+                    options: vm.modelOptions
+                )
+            }
+            Row(label: "Copilot CLI", isLast: true) {
+                Popup(
+                    selection: vm.bind($vm.copilotModel, save: {
+                        Task { await vm.save(.copilotModel, client: client) }
                     }),
                     width: 220,
                     options: vm.modelOptions
@@ -235,13 +269,58 @@ private struct OtherIntegrationsSection: View {
     }
 }
 
+// MARK: - MCP
+
+/// Path to an MCP server config file consumed by every integration launcher
+/// (Claude Code, OpenClaw, Hermes, …). Lives at the bottom of Integrations
+/// because it's a shared resource — putting it under any one integration
+/// would mislead.
+private struct MCPSection: View {
+    @ObservedObject var vm: IntegrationsScreenVM
+    let client: OMLXClient
+
+    var body: some View {
+        SectionHeader(
+            "MCP",
+            subtitle: "Path to an MCP server config file. Shared across all integration launchers."
+        )
+
+        ListGroup {
+            Row(
+                label: "Config Path",
+                sublabel: "Absolute path to an MCP config JSON. Leave blank to disable.",
+                isLast: true
+            ) {
+                TextInput(
+                    text: $vm.mcpConfigPath,
+                    placeholder: "/path/to/mcp.json",
+                    mono: true,
+                    width: 320
+                )
+            }
+        }
+        HStack {
+            Spacer()
+            Button("Apply") {
+                Task { await vm.save(.mcpConfig, client: client) }
+            }
+            .buttonStyle(.omlx(.primary))
+            .disabled(!vm.hasPendingMCPChanges)
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 6)
+    }
+}
+
 // MARK: - View model
 
 @MainActor
 final class IntegrationsScreenVM: ObservableObject {
     enum Field: Sendable {
-        case claudeMode, opusModel, sonnetModel, haikuModel, contextScaling
+        case claudeMode, opusModel, sonnetModel, haikuModel, contextScaling, targetContextSize
         case codexModel, opencodeModel, openclawModel, piModel, openclawToolsProfile
+        case hermesModel, copilotModel
+        case mcpConfig
     }
 
     // Claude Code
@@ -250,6 +329,11 @@ final class IntegrationsScreenVM: ObservableObject {
     @Published var sonnetModel: String = ""
     @Published var haikuModel: String = ""
     @Published var contextScaling: Bool = false
+    /// Free-text editor backing for `claude_code.target_context_size`. The
+    /// server stores an `int`; we keep the screen field as a string so the
+    /// user can type/clear without intermediate parse errors and we validate
+    /// on save.
+    @Published var targetContextSizeText: String = "200000"
 
     // Other integrations
     @Published var codexModel: String = ""
@@ -257,6 +341,19 @@ final class IntegrationsScreenVM: ObservableObject {
     @Published var openclawModel: String = ""
     @Published var piModel: String = ""
     @Published var openclawToolsProfile: String = "coding"
+    @Published var hermesModel: String = ""
+    @Published var copilotModel: String = ""
+
+    // MCP
+    @Published var mcpConfigPath: String = ""
+    /// Last value persisted to the server. Drives the Apply button's
+    /// enabled state — diverges from `mcpConfigPath` whenever the user
+    /// has unsaved edits, converges on a successful save.
+    @Published private(set) var mcpConfigLoaded: String = ""
+
+    var hasPendingMCPChanges: Bool {
+        mcpConfigPath.trimmingCharacters(in: .whitespaces) != mcpConfigLoaded
+    }
 
     @Published private(set) var availableModels: [String] = []
     @Published var lastError: String?
@@ -306,6 +403,9 @@ final class IntegrationsScreenVM: ObservableObject {
                 self.sonnetModel     = cc.sonnetModel ?? ""
                 self.haikuModel      = cc.haikuModel ?? ""
                 self.contextScaling  = cc.contextScalingEnabled ?? false
+                if let target = cc.targetContextSize {
+                    self.targetContextSizeText = String(target)
+                }
             }
             if let it = settings.integrations {
                 self.codexModel           = it.codexModel ?? ""
@@ -313,6 +413,13 @@ final class IntegrationsScreenVM: ObservableObject {
                 self.openclawModel        = it.openclawModel ?? ""
                 self.piModel              = it.piModel ?? ""
                 self.openclawToolsProfile = it.openclawToolsProfile ?? "coding"
+                self.hermesModel          = it.hermesModel ?? ""
+                self.copilotModel         = it.copilotModel ?? ""
+            }
+            if let mcp = settings.mcp {
+                let path = mcp.configPath ?? ""
+                self.mcpConfigPath = path
+                self.mcpConfigLoaded = path
             }
 
             // Available models
@@ -332,15 +439,29 @@ final class IntegrationsScreenVM: ObservableObject {
         case .sonnetModel:          patch.claudeCodeSonnetModel = sonnetModel
         case .haikuModel:           patch.claudeCodeHaikuModel = haikuModel
         case .contextScaling:       patch.claudeCodeContextScalingEnabled = contextScaling
+        case .targetContextSize:
+            let trimmed = targetContextSizeText.trimmingCharacters(in: .whitespaces)
+            guard let n = Int(trimmed), n > 0 else {
+                self.lastError = "Target context size must be a positive integer."
+                return
+            }
+            patch.claudeCodeTargetContextSize = n
         case .codexModel:           patch.integrationsCodexModel = codexModel
         case .opencodeModel:        patch.integrationsOpencodeModel = opencodeModel
         case .openclawModel:        patch.integrationsOpenclawModel = openclawModel
         case .piModel:              patch.integrationsPiModel = piModel
         case .openclawToolsProfile: patch.integrationsOpenclawToolsProfile = openclawToolsProfile
+        case .hermesModel:          patch.integrationsHermesModel = hermesModel
+        case .copilotModel:         patch.integrationsCopilotModel = copilotModel
+        case .mcpConfig:
+            patch.mcpConfig = mcpConfigPath.trimmingCharacters(in: .whitespaces)
         }
         do {
             _ = try await client.updateGlobalSettings(patch)
             self.lastError = nil
+            if case .mcpConfig = field {
+                self.mcpConfigLoaded = mcpConfigPath.trimmingCharacters(in: .whitespaces)
+            }
         } catch {
             self.lastError = describe(error)
         }

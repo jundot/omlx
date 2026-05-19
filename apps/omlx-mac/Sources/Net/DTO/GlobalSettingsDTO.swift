@@ -26,6 +26,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     let huggingface: HuggingFaceDTO?
     let claudeCode: ClaudeCodeSettings?
     let integrations: IntegrationsSettings?
+    let mcp: MCPSettings?
 
     struct ServerSettings: Codable, Equatable, Sendable {
         let host: String
@@ -100,6 +101,15 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let openclawModel: String?
         let piModel: String?
         let openclawToolsProfile: String?
+        let hermesModel: String?
+        let copilotModel: String?
+    }
+
+    /// Mirrors `omlx.settings.MCPSettings`. The server stores a single path to
+    /// an MCP config file consumed by every integration launcher (Claude
+    /// Code, OpenClaw, Hermes, …). Empty / nil means no MCP server is wired.
+    struct MCPSettings: Codable, Equatable, Sendable {
+        let configPath: String?
     }
 }
 
@@ -128,6 +138,13 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var integrationsOpenclawModel: String? = nil
     var integrationsPiModel: String? = nil
     var integrationsOpenclawToolsProfile: String? = nil
+    var integrationsHermesModel: String? = nil
+    var integrationsCopilotModel: String? = nil
+
+    /// Path to an MCP server config file. Empty string clears the field on
+    /// the server (`global_settings.mcp.config_path = None`). Shared across
+    /// every integration launcher.
+    var mcpConfig: String? = nil
 
     // Auth (PR 9)
     var skipApiKeyVerification: Bool? = nil
