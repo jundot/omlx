@@ -641,3 +641,60 @@ class TestDFlashApplyChatTemplatePartialMode:
         # continue_final_message=True (not add_generation_prompt=True).
         assert count_kwargs["continue_final_message"] is True
         assert count_kwargs["add_generation_prompt"] is False
+
+
+class TestDFlashOutputParserWiring:
+    """Regression tests for OutputParserSession integration on DFlashEngine.
+
+    Without this wiring gemma4's raw `<|channel>thought\\n` /  `<channel|>`
+    protocol markers leak into the response body because dflash bypasses
+    the scheduler that normally drives the parser. The tests below pin the
+    factory plumbing without booting the full mlx model — full marker
+    conversion is verified in the real-server smoke run.
+    """
+
+    def test_output_parser_factory_defaults_to_none(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        assert engine._output_parser_factory is None
+
+    def test_detect_output_parser_returns_gemma4_factory(self):
+        """``detect_output_parser`` (the helper dflash.start() uses) must
+        recognise gemma4 by config and hand back a factory whose
+        ``create_session`` produces a ``Gemma4OutputParserSession``."""
+        from unittest.mock import MagicMock
+
+        from omlx.adapter.gemma4 import Gemma4OutputParserSession
+        from omlx.adapter.output_parser import detect_output_parser
+
+        tokenizer = MagicMock()
+        factory = detect_output_parser(
+            "/some/path/gemma-4-26b-a4b-it-8bit",
+            tokenizer,
+            {"model_type": "gemma4_text"},
+        )
+        assert factory is not None
+        assert factory.kind == "gemma4"
+        session = factory.create_session(tokenizer)
+        assert isinstance(session, Gemma4OutputParserSession)
+
+    def test_detect_output_parser_returns_none_for_qwen(self):
+        """Qwen models have no protocol parser — dflash should stay on the
+        existing detokenizer / think_prefix path."""
+        from unittest.mock import MagicMock
+
+        from omlx.adapter.output_parser import detect_output_parser
+
+        factory = detect_output_parser(
+            "/some/path/Qwen3-4B-bf16",
+            MagicMock(),
+            {"model_type": "qwen3"},
+        )
+        assert factory is None
