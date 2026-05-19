@@ -98,6 +98,8 @@ struct ServerScreen: View {
             .padding(.horizontal, 18)
             .padding(.top, 6)
 
+            ServerAdvancedSection(vm: vm)
+
             HintFooter(error: vm.lastError)
         }
         .task {
@@ -387,6 +389,83 @@ private struct APIEndpointsList: View {
     }
 }
 
+// MARK: - Advanced disclosure
+
+/// Phase 4 — Server identity / protocol knobs that the average user never
+/// touches: `server_aliases` (extra host names the server identifies as for
+/// cookie + host-header purposes) and `sse_keepalive_mode`. Hidden behind a
+/// chevron so they don't crowd the main ServerScreen surface, but rendered
+/// inline (not in a popover) so power users can scroll-find them.
+private struct ServerAdvancedSection: View {
+    @ObservedObject var vm: ServerScreenVM
+
+    @State private var expanded: Bool = false
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Custom disclosure header — DisclosureGroup's default styling
+            // doesn't match the rest of the screen (uses SF Pro vs omlxText,
+            // adds its own padding). Roll our own to stay consistent with
+            // SectionHeader.
+            Button {
+                expanded.toggle()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(theme.textSecondary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                        .animation(.easeOut(duration: 0.12), value: expanded)
+                    Text("Advanced")
+                        .font(.omlxText(11, weight: .semibold))
+                        .foregroundStyle(theme.textSecondary)
+                        .textCase(.uppercase)
+                        .kerning(0.6)
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 18)
+            .padding(.top, 22)
+            .padding(.bottom, 8)
+
+            if expanded {
+                ListGroup {
+                    Row(
+                        label: "SSE Keep-Alive Mode",
+                        sublabel: "How the server keeps long-lived SSE streams open. \"chunk\" emits an empty data line, \"comment\" emits `: ping`, \"off\" disables."
+                    ) {
+                        Popup(
+                            selection: vm.bind($vm.sseKeepaliveMode, save: vm.saveSseKeepaliveMode),
+                            width: 130,
+                            options: [
+                                ("chunk",   "Chunk"),
+                                ("comment", "Comment"),
+                                ("off",     "Off"),
+                            ]
+                        )
+                    }
+                    Row(
+                        label: "Server Aliases",
+                        sublabel: "Extra host names the server identifies as. Comma-separated. Used for cookie / Host header matching.",
+                        isLast: true
+                    ) {
+                        TextInput(
+                            text: $vm.serverAliasesText,
+                            placeholder: "omlx.local, oMLX.lan",
+                            mono: true,
+                            width: 320
+                        )
+                        .onSubmit { vm.saveServerAliases() }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Footer hint
 
 private struct HintFooter: View {
@@ -421,6 +500,13 @@ final class ServerScreenVM: ObservableObject {
     @Published var host: String = "127.0.0.1"
     @Published var portText: String = "8080"
     @Published var logLevel: String = "info"
+
+    // Phase 4 — Advanced disclosure.
+    @Published var sseKeepaliveMode: String = "chunk"
+    /// Comma-separated text shown in the input. Parsed to `[String]` on save
+    /// so the user can edit incrementally without intermediate trips to the
+    /// server. Empty string clears all aliases.
+    @Published var serverAliasesText: String = ""
     @Published var basePathText: String = AppConfig.defaultBasePath()
     @Published var modelDirText: String = ""
     @Published var lastError: String?
@@ -452,6 +538,8 @@ final class ServerScreenVM: ObservableObject {
             self.logLevel = canonicalize(level: dto.server.logLevel)
             self.effectiveHost = dto.server.host
             self.effectivePort = dto.server.port
+            self.sseKeepaliveMode = dto.server.sseKeepaliveMode ?? "chunk"
+            self.serverAliasesText = dto.server.serverAliases.joined(separator: ", ")
             if let s = dto.sampling {
                 self.samplingContextText = String(s.maxContextWindow)
                 self.samplingMaxTokensText = String(s.maxTokens)
@@ -700,6 +788,25 @@ final class ServerScreenVM: ObservableObject {
 
     func saveLogLevel() {
         Task { await commit(GlobalSettingsPatch(logLevel: logLevel)) }
+    }
+
+    func saveSseKeepaliveMode() {
+        Task { await commit(GlobalSettingsPatch(sseKeepaliveMode: sseKeepaliveMode)) }
+    }
+
+    /// Parses the comma-separated text into a deduped, trimmed `[String]`
+    /// and pushes the patch. Empty input sends `[]`, which clears all
+    /// aliases on the server. Server treats a `null` field as "leave
+    /// alone" — we never want that here since we mean "this is the new
+    /// list" — so we always send an array even when empty.
+    func saveServerAliases() {
+        let parts = serverAliasesText
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        var seen = Set<String>()
+        let aliases = parts.filter { seen.insert($0).inserted }
+        Task { await commit(GlobalSettingsPatch(serverAliases: aliases)) }
     }
 
     /// Build a `Binding` that calls `save` after the value changes. Used for

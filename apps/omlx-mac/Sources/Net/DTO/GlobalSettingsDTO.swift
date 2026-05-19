@@ -161,6 +161,15 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var logLevel: String? = nil
     var maxConcurrentRequests: Int? = nil
 
+    // Server — Advanced (Phase 4).
+    /// Extra host names the server identifies as for cookie/host-header
+    /// purposes. Empty array clears. Encoded as a JSON array under
+    /// `server_aliases`.
+    var serverAliases: [String]? = nil
+    /// SSE keep-alive line strategy: `"chunk"` (default), `"comment"`, or
+    /// `"off"`. Server rejects anything else with a 400.
+    var sseKeepaliveMode: String? = nil
+
     // Claude Code (PR 9)
     var claudeCodeContextScalingEnabled: Bool? = nil
     var claudeCodeTargetContextSize: Int? = nil
