@@ -46,6 +46,7 @@ VLM_MODEL_TYPES = {
     "mistral3",
     "pixtral",
     "molmo",
+    "molmo2",
     "bunny_llama",
     "multi_modality",
     "florence2",
@@ -74,6 +75,7 @@ VLM_ARCHITECTURES = {
     "Phi3VForCausalLM",
     "Pixtral",
     "MolmoForCausalLM",
+    "Molmo2ForConditionalGeneration",
     "Florence2ForConditionalGeneration",
 }
 
@@ -461,13 +463,20 @@ def detect_model_type(model_path: Path) -> ModelType:
     # Check for VLM: architectures field
     # Some text-only quants (e.g., unsloth/gemma-4-31b-it-MLX-8bit) keep the VLM
     # architecture name but strip vision_config and vision weights.
-    # For model families known to have text-only variants, require vision_config.
+    # For model families known to have text-only variants, require evidence
+    # of a vision sub-config. The Molmo / Molmo2 family stores its vision
+    # sub-config under ``vit_config`` rather than ``vision_config``; accept
+    # either as evidence the model retains its vision tower.
     for arch in architectures:
         if arch in VLM_ARCHITECTURES:
-            if normalized_type in VLM_MODEL_TYPES and "vision_config" not in config:
+            has_vision_subconfig = (
+                "vision_config" in config or "vit_config" in config
+            )
+            if normalized_type in VLM_MODEL_TYPES and not has_vision_subconfig:
                 logger.info(
-                    f"Architecture '{arch}' is a VLM architecture but no vision_config "
-                    "found — treating as LLM (text-only quant)"
+                    f"Architecture '{arch}' is a VLM architecture but no "
+                    "vision_config / vit_config found — "
+                    "treating as LLM (text-only quant)"
                 )
                 break
             return "vlm"
