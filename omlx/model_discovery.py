@@ -38,6 +38,7 @@ VLM_MODEL_TYPES = {
     "llava",
     "llava_next",
     "llava-qwen2",
+    "llava_qwen2",  # underscore form — matches FastVLM checkpoints on disk
     "mllama",
     "idefics3",
     "internvl_chat",
@@ -76,6 +77,7 @@ VLM_ARCHITECTURES = {
     "Pixtral",
     "MolmoForCausalLM",
     "Molmo2ForConditionalGeneration",
+    "LlavaQwen2ForCausalLM",  # apple/FastVLM (all sizes)
     "Florence2ForConditionalGeneration",
 }
 
@@ -464,18 +466,24 @@ def detect_model_type(model_path: Path) -> ModelType:
     # Some text-only quants (e.g., unsloth/gemma-4-31b-it-MLX-8bit) keep the VLM
     # architecture name but strip vision_config and vision weights.
     # For model families known to have text-only variants, require evidence
-    # of a vision sub-config. The Molmo / Molmo2 family stores its vision
-    # sub-config under ``vit_config`` rather than ``vision_config``; accept
-    # either as evidence the model retains its vision tower.
+    # of a vision sub-config. Three keys cover the conventions in the wild:
+    # ``vision_config`` (most VLMs), ``vit_config`` (Molmo / Molmo2), and
+    # ``mm_vision_tower`` (older LLaVA family incl. FastVLM's
+    # ``llava_qwen2``). The ``mm_vision_tower`` check is non-empty-only: a
+    # config-stub text-only quant could in principle declare a tower path
+    # it doesn't ship weights for, but in practice bf16 FastVLM ships a
+    # real path string.
     for arch in architectures:
         if arch in VLM_ARCHITECTURES:
             has_vision_subconfig = (
-                "vision_config" in config or "vit_config" in config
+                "vision_config" in config
+                or "vit_config" in config
+                or bool(config.get("mm_vision_tower"))
             )
             if normalized_type in VLM_MODEL_TYPES and not has_vision_subconfig:
                 logger.info(
                     f"Architecture '{arch}' is a VLM architecture but no "
-                    "vision_config / vit_config found — "
+                    "vision_config / vit_config / mm_vision_tower found — "
                     "treating as LLM (text-only quant)"
                 )
                 break
